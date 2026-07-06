@@ -1,0 +1,32 @@
+# Hermes config for Sotto (SPEC §4). Copy to ~/.hermes/config.yaml and fill <…>.
+model: gemini-3-flash-preview               # NATIVE Gemini id (gemini provider + GEMINI_API_KEY);
+                                            # "google/…" would route via OpenRouter and need OPENROUTER_API_KEY
+
+mcp_servers:
+  sotto-local:                               # the Bridge
+    url: "https://<bridge-tunnel>"            # from Bridge pairing (stdio `command:` if Hermes is local)
+    headers:
+      Authorization: "Bearer <pairing_token>"
+  granola:                                    # optional; NOT in the Hermes MCP catalog — a community
+    command: "<granola-mcp-command>"          # stdio server (see RAILWAY.md §6c / GRANOLA_MCP_CMD)
+    env:
+      GRANOLA_API_TOKEN: "<token>"
+# Google Workspace: enable via Hermes' native integration (`hermes` setup), not an MCP block.
+
+gateways: [whatsapp]                          # default. or telegram / slack / signal / bluebubbles (iMessage)
+
+scheduler:
+  enabled: true                               # required for cron (SPEC §4.1)
+
+code_execution:
+  timeout: 600                                # brief = extraction + critic in one execute_code call;
+                                              # the 300s default can kill a 2–4 min brief mid-run
+
+
+# Cron jobs are created with the cronjob tool / CLI, not a config block:
+#   hermes cron create "30 6 * * *"  "Run my morning brief" --skill sotto-morning-brief
+#   hermes cron create "30 17 * * *" "Run my evening brief" --skill sotto-evening-brief
+# The real brief is normally fired by the Bridge online-push (SPEC §4.1); cron is the
+# "Mac already up at target" fallback.
+
+storage: /data                                # Railway volume → $SOTTO_DATA (knowledge/*, briefs/, style.json, …)

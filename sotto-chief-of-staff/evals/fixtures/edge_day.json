@@ -1,0 +1,90 @@
+{
+  "name": "edge_day",
+  "description": "Adversarial: a malformed ledger entry (must be skipped and left byte-identical), unicode/emoji/CJK-heavy messages, a phone-only-identity contact, an EMPTY Google section (coverage must say so), a muted person who appears in messages AND the attention queue, and an expired-loop candidate. The pipeline must complete with no exception.",
+  "preferences": {
+    "mute_senders": [],
+    "mute_people": ["Bob Vance"],
+    "mute_sections": [],
+    "tone_notes": ["no emoji in the brief"]
+  },
+  "signals": {"replied_thread_ids": [], "handled": []},
+  "new_actions": [],
+  "continuity_ledger": [
+    {
+      "filename": "loop-expired.md",
+      "frontmatter": {
+        "anchor_key": "imessage:follow_up:id:9995550000",
+        "status": "open",
+        "action_type": "reply",
+        "channel": "imessage",
+        "contact_name": "Old Thread",
+        "contact_identifier": "+19995550000",
+        "created_at": "{{TS-10d}}",
+        "times_surfaced": 4,
+        "summary": "Never heard back — should age out at 7 days"
+      }
+    },
+    {
+      "filename": "loop-active.md",
+      "frontmatter": {
+        "anchor_key": "imessage:follow_up:id:8005551000",
+        "status": "open",
+        "action_type": "reply",
+        "channel": "imessage",
+        "contact_name": "Nadia Ops",
+        "contact_identifier": "+18005551000",
+        "created_at": "{{TS-6h}}",
+        "times_surfaced": 1,
+        "summary": "Nadia asked for PO approval"
+      }
+    },
+    {
+      "filename": "loop-malformed.md",
+      "malformed": true,
+      "raw": "---\nanchor_key: broken\nstatus: open\ncontact_name: \"Unclosed [list, {mapping: oops\n  - dangling: : :\nthis file: has no closing fence and invalid yaml\ncontact_identifier: +12125550000\n"
+    }
+  ],
+  "stub_response": {
+    "brief_markdown": "# Your morning brief\n\nLocal-only today — Google isn't connected.\n\n## Should handle today\n- **Nadia Ops** is waiting on a PO approval.\n- **Yuki Tanaka** wants to confirm a meeting time.",
+    "actions": [
+      {"id": "e1", "type": "reply", "channel": "imessage", "contactName": "Nadia Ops", "contactIdentifier": "+18005551000"},
+      {"id": "e2", "type": "reply", "channel": "whatsapp", "contactName": "Yuki Tanaka", "contactIdentifier": "818012345678@s.whatsapp.net"}
+    ],
+    "extracted_knowledge": {"person_updates": [], "company_updates": []}
+  },
+  "inputs": {
+    "type": "morning",
+    "first_run": false,
+    "window_hours": 24,
+    "google": {
+      "userEmail": "you@sotto.com",
+      "userTimezone": "+00:00",
+      "events": [],
+      "emails": []
+    },
+    "granola": {"meetings": []},
+    "local": {
+      "generated_at": "{{TS}}",
+      "window_hours": 24,
+      "source_status": {"imessage": "ok", "whatsapp": "ok"},
+      "contacts": [
+        {"name": "Bob Vance", "emails": [], "phones": ["+17185550009"]},
+        {"name": "Nadia Ops", "emails": [], "phones": ["+18005551000"]},
+        {"name": "Yuki Tanaka", "emails": [], "phones": ["+818012345678"]}
+      ],
+      "attention_queue": [
+        {"display_name": "Bob Vance", "queue_type": "losing_touch", "reason": "going quiet for three weeks", "days_waiting": 21},
+        {"display_name": "Carol King", "queue_type": "waiting_on_you", "reason": "waiting five days on the proposal", "days_waiting": 5}
+      ],
+      "imessage": [
+        {"handle": "+17185550009", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-3h}}", "text": "🔥 we shipped it!! 🎉🎉 ¿todo bien? 你好 — call me?"},
+        {"handle": "+18005551000", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-2h}}", "text": "Can you approve the PO? 🙏 need it before EOD"},
+        {"handle": "+818012345678", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-4h}}", "text": "会議の時間を確認したいです 😊"}
+      ],
+      "whatsapp": [
+        {"contact_jid": "818012345678@s.whatsapp.net", "partner_name": "Yuki Tanaka", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-90m}}", "text": "資料ありがとう！ 👍 明日の会議は何時？"}
+      ],
+      "reminders": []
+    }
+  }
+}
