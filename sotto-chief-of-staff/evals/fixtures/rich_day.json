@@ -1,0 +1,139 @@
+{
+  "name": "rich_day",
+  "description": "A busy day: 6+ meetings with externals, 20+ emails (2 need reply, 1 muted-sender newsletter, 1 promo newsletter), iMessage/WhatsApp threads (unanswered ask + a group chat), an open continuity loop that SHOULD resolve (reply landed on another channel) and one that should surface, a birthday, and a calendar action with an event link. Critic must RUN on this brief.",
+  "preferences": {
+    "mute_senders": ["@news.example.com"],
+    "mute_people": [],
+    "mute_sections": [],
+    "tone_notes": ["keep it warm but brief"]
+  },
+  "signals": {
+    "replied_thread_ids": [],
+    "handled": []
+  },
+  "new_actions": [
+    {"type": "meeting_prep", "channel": "calendar", "contactName": "Dana Wells", "eventId": "evt-acme"}
+  ],
+  "continuity_ledger": [
+    {
+      "filename": "loop-dana.md",
+      "frontmatter": {
+        "anchor_key": "email:follow_up:id:dana@acme.com",
+        "status": "open",
+        "action_type": "reply",
+        "channel": "email",
+        "contact_name": "Dana Wells",
+        "contact_identifier": "dana@acme.com",
+        "created_at": "{{TS-28h}}",
+        "times_surfaced": 2,
+        "summary": "Dana asked for the redlined partnership agreement"
+      }
+    },
+    {
+      "filename": "loop-marcus.md",
+      "frontmatter": {
+        "anchor_key": "email:follow_up:id:marcus@beta.io",
+        "status": "open",
+        "action_type": "reply",
+        "channel": "email",
+        "contact_name": "Marcus Lee",
+        "contact_identifier": "marcus@beta.io",
+        "created_at": "{{TS-30h}}",
+        "times_surfaced": 1,
+        "summary": "Marcus is waiting on the pricing model for the pilot"
+      }
+    }
+  ],
+  "stub_response": {
+    "brief_markdown": "# Your morning brief\n\n## Needs attention now\n- **Nadia Cross** sent the Series B wire instructions and needs your sign-off.\n- **Ivy Park** left board-deck feedback that needs a reply before the board meeting.\n\n## Should handle today\n- **Ravi Menon** is waiting on WhatsApp about the pilot kickoff date.\n- **Jake Rosen** asked (iMessage) if you're still on for coffee Thursday.\n- Call **Priya Anand** back.\n\n## Coming up\n- Acme <> Sotto Partnership at 10 (Dana Wells).\n\n## Already handled\n- You answered Dana Wells on iMessage about the partnership agreement.",
+    "actions": [
+      {"id": "a1", "type": "reply", "channel": "email", "contactName": "Nadia Cross", "emailReplyTo": "nadia@sotto.com", "emailSubject": "Series B wire instructions"},
+      {"id": "a2", "type": "reply", "channel": "whatsapp", "contactName": "Ravi Menon", "contactIdentifier": "+15558887777"},
+      {"id": "a3", "type": "reply", "channel": "imessage", "contactName": "Jake Rosen", "contactIdentifier": "+12069994970"},
+      {"id": "a4", "type": "call_back", "channel": "phone", "contactName": "Priya Anand", "contactIdentifier": "+14155550123"},
+      {"id": "a5", "type": "meeting_prep", "channel": "calendar", "contactName": "Dana Wells", "eventId": "evt-acme"},
+      {"id": "a6", "type": "reply", "channel": "imessage", "contactName": "Weekend Trip", "contactIdentifier": "group_weekend_trip"},
+      {"id": "a7", "type": "reply", "channel": "email", "contactName": "Ivy Park", "emailThreadId": "t-board"}
+    ],
+    "extracted_knowledge": {
+      "person_updates": [
+        {"person_name": "Dana Wells", "identifier": "dana@acme.com", "profile_patch": {"title": "VP BD", "company": "Acme Corp"}, "facts": [{"fact": "Driving the Sotto partnership to close this quarter", "memory_type": "milestone", "confidence": 0.9}]}
+      ],
+      "company_updates": []
+    }
+  },
+  "inputs": {
+    "type": "morning",
+    "first_run": false,
+    "window_hours": 24,
+    "google": {
+      "userEmail": "you@sotto.com",
+      "userTimezone": "+00:00",
+      "events": [
+        {"id": "evt-acme", "summary": "Acme <> Sotto Partnership", "start": "{{ISO+3h}}", "meetingLink": "https://meet.google.com/rich-acme-abc", "description": "Walk through the redlined partnership agreement and pilot scope.", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "dana@acme.com", "displayName": "Dana Wells"}, {"email": "leo@acme.com", "displayName": "Leo Fry"}]},
+        {"id": "evt-board", "summary": "Board Meeting Q3", "start": "{{ISO+6h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "ivy@lumen.vc", "displayName": "Ivy Park"}, {"email": "sam@northstar.vc", "displayName": "Sam Ortiz"}]},
+        {"id": "evt-priya", "summary": "1:1 with Priya", "start": "{{ISO+2h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "priya@sotto.com", "displayName": "Priya Anand"}]},
+        {"id": "evt-design", "summary": "Design Review", "start": "{{ISO+4h}}", "meetingLink": "https://meet.google.com/rich-design-xyz", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "mara@sotto.com", "displayName": "Mara Diaz"}, {"email": "kenji@contractor.io", "displayName": "Kenji Watanabe"}]},
+        {"id": "evt-investor", "summary": "Investor Sync — Northstar", "start": "{{ISO+8h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "sam@northstar.vc", "displayName": "Sam Ortiz"}]},
+        {"id": "evt-standup", "summary": "Eng Standup", "start": "{{ISO+1h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "priya@sotto.com", "displayName": "Priya Anand"}, {"email": "mara@sotto.com", "displayName": "Mara Diaz"}]}
+      ],
+      "emails": [
+        {"from": "Nadia Cross <nadia@sotto.com>", "subject": "Series B wire instructions", "snippet": "Need your sign-off before the bank cutoff at noon.", "body": "Hi — the wire instructions for the Series B close are attached. I need your explicit sign-off before the bank cutoff at noon today, otherwise we slip to Monday. Can you confirm the account details and reply-all so legal has it on record?", "date": "{{ISO-3h}}", "threadId": "t-wire", "labelIds": ["INBOX", "IMPORTANT"]},
+        {"from": "Ivy Park <ivy@lumen.vc>", "subject": "Re: Board deck feedback", "snippet": "A few comments on slides 4-7 before the board meeting.", "body": "Went through the deck — strong overall. A few comments on slides 4-7 (the retention cohort chart needs a denominator, and the ARR bridge double-counts the pilot). Can you turn these before the board meeting? Happy to hop on a quick call.", "date": "{{ISO-5h}}", "threadId": "t-board", "labelIds": ["INBOX", "IMPORTANT"]},
+        {"from": "Daily Digest <digest@news.example.com>", "subject": "Your Morning Newsletter: 10 startups to watch", "snippet": "The hottest startups this week plus a sponsored deal.", "body": "Good morning! Here are the 10 startups everyone is watching this week. Sponsored: get 40% off our premium tier.", "date": "{{ISO-6h}}", "threadId": "t-news", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "ShopMail Deals <promo@shopmail.com>", "subject": "FLASH SALE ends tonight", "snippet": "Everything must go.", "body": "Our biggest flash sale of the year ends tonight at midnight.", "date": "{{ISO-7h}}", "threadId": "t-promo", "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"]},
+        {"from": "Leo Fry <leo@acme.com>", "subject": "Redlines attached", "snippet": "Dana asked me to send the redlined agreement.", "body": "Attaching the redlined partnership agreement Dana mentioned. Let us know if the indemnity clause works on your end.", "date": "{{ISO-4h}}", "threadId": "t-redlines", "labelIds": ["INBOX"]},
+        {"from": "Sam Ortiz <sam@northstar.vc>", "subject": "Sync later today", "snippet": "Looking forward to the investor sync.", "body": "See you at the sync later. I'd love an update on the enterprise pipeline and the two logos you mentioned last time.", "date": "{{ISO-8h}}", "threadId": "t-sam", "labelIds": ["INBOX"]},
+        {"from": "Mara Diaz <mara@sotto.com>", "subject": "Design review agenda", "snippet": "Here's what we'll cover.", "body": "For the design review: new onboarding flow, the settings redesign, and the dark-mode audit. Figma link inside.", "date": "{{ISO-9h}}", "threadId": "t-design", "labelIds": ["INBOX"]},
+        {"from": "GitHub <notifications@github.com>", "subject": "[sotto/app] PR #482 merged", "snippet": "Your pull request was merged.", "body": "PR #482 (fix: continuity ledger race) was merged into main.", "date": "{{ISO-10h}}", "threadId": "t-gh1", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Calendar <calendar-notification@google.com>", "subject": "Reminder: Board Meeting Q3", "snippet": "Starts in 6 hours.", "body": "This is a reminder for Board Meeting Q3.", "date": "{{ISO-2h}}", "threadId": "t-calrem", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Kenji Watanabe <kenji@contractor.io>", "subject": "Invoice for March", "snippet": "March hours attached.", "body": "Attaching my March invoice — 62 hours on the design system. Net-30 as usual.", "date": "{{ISO-11h}}", "threadId": "t-inv", "labelIds": ["INBOX"]},
+        {"from": "Priya Anand <priya@sotto.com>", "subject": "Standup notes", "snippet": "Notes from yesterday.", "body": "Standup notes: backend on track, the Bridge reconnection bug is fixed, QA starts Thursday.", "date": "{{ISO-12h}}", "threadId": "t-standup", "labelIds": ["INBOX"]},
+        {"from": "AWS <no-reply@amazon.com>", "subject": "Your March bill", "snippet": "Your bill is ready.", "body": "Your AWS bill for March is now available.", "date": "{{ISO-13h}}", "threadId": "t-aws", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Notion <team@makenotion.com>", "subject": "Weekly digest", "snippet": "Activity in your workspace.", "body": "Here is what happened in your workspace this week.", "date": "{{ISO-14h}}", "threadId": "t-notion", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Lena Ford <lena@recruiterx.com>", "subject": "Sr. Backend Engineer intro", "snippet": "Two strong candidates.", "body": "I have two strong senior backend candidates who'd be a great fit. Want intros?", "date": "{{ISO-15h}}", "threadId": "t-recruit", "labelIds": ["INBOX"]},
+        {"from": "Stripe <receipts@stripe.com>", "subject": "Receipt from Sotto Inc", "snippet": "Payment received.", "body": "You received a payment of $12,400 from Beta Labs.", "date": "{{ISO-16h}}", "threadId": "t-stripe", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Tomas Rey <tomas@vendorco.com>", "subject": "Contract renewal", "snippet": "Your plan renews next month.", "body": "A heads up that your annual plan renews next month. No action needed unless you want to change tiers.", "date": "{{ISO-17h}}", "threadId": "t-renew", "labelIds": ["INBOX"]},
+        {"from": "Slack <feedback@slack.com>", "subject": "How was your week?", "snippet": "Rate your experience.", "body": "We'd love a quick rating of your week in Slack.", "date": "{{ISO-18h}}", "threadId": "t-slack", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Grace Kim <grace@partnerfirm.com>", "subject": "Intro to your new counsel", "snippet": "Meet your deal counsel.", "body": "Introducing Ana, who will be your lead counsel for the Acme deal. Copying her here.", "date": "{{ISO-19h}}", "threadId": "t-counsel", "labelIds": ["INBOX"]},
+        {"from": "LinkedIn <messages@linkedin.com>", "subject": "You have 3 new messages", "snippet": "See who reached out.", "body": "You have 3 new messages waiting on LinkedIn.", "date": "{{ISO-20h}}", "threadId": "t-li", "labelIds": ["INBOX", "CATEGORY_SOCIAL"]},
+        {"from": "Omar Faraj <omar@bigco.com>", "subject": "Following up on our chat", "snippet": "Great to connect at the conference.", "body": "Great to connect at the conference. Would love to explore whether Sotto could work for our ops team. Free next week?", "date": "{{ISO-21h}}", "threadId": "t-omar", "labelIds": ["INBOX"]},
+        {"from": "Dropbox <no-reply@dropbox.com>", "subject": "Kenji shared a folder with you", "snippet": "Design system assets.", "body": "Kenji Watanabe shared 'Design System Assets' with you.", "date": "{{ISO-22h}}", "threadId": "t-dbx", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Nadia Cross <nadia@sotto.com>", "subject": "FYI: legal thread", "snippet": "For your records.", "body": "Forwarding the legal thread so you have context for the wire sign-off above.", "date": "{{ISO-23h}}", "threadId": "t-legal", "labelIds": ["INBOX"]}
+      ]
+    },
+    "granola": {
+      "meetings": [
+        {"title": "Acme partnership kickoff", "date": "{{D-3d}}", "attendee_emails": ["dana@acme.com", "leo@acme.com"], "ai_summary": "Agreed on pilot scope; Dana to send redlines, you to send pricing."}
+      ]
+    },
+    "local": {
+      "generated_at": "{{TS}}",
+      "window_hours": 24,
+      "source_status": {"imessage": "ok", "whatsapp": "ok", "calls": "ok", "reminders": "ok"},
+      "contacts": [
+        {"name": "Dana Wells", "emails": ["dana@acme.com"], "phones": ["+14155552211"]},
+        {"name": "Jake Rosen", "emails": [], "phones": ["+12069994970"]},
+        {"name": "Ravi Menon", "emails": [], "phones": ["+15558887777"]},
+        {"name": "Priya Anand", "emails": ["priya@sotto.com"], "phones": ["+14155550123"]},
+        {"name": "Mira Solberg", "emails": [], "phones": ["+13035551188"], "birthday": "{{MD+3d}}"}
+      ],
+      "imessage": [
+        {"handle": "+12069994970", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-5h}}", "text": "Still on for coffee Thursday? Would love your read on the pitch."},
+        {"handle": "+14155552211", "is_from_me": true, "is_group_chat": false, "timestamp": "{{TS-6h}}", "text": "Dana — redlines look good, sending the pricing model over now."},
+        {"handle": "group_weekend_trip", "is_from_me": false, "is_group_chat": true, "timestamp": "{{TS-7h}}", "text": "Who's driving up Saturday?"},
+        {"handle": "group_weekend_trip", "is_from_me": false, "is_group_chat": true, "timestamp": "{{TS-7h}}", "text": "I can take 4 people in the van."}
+      ],
+      "whatsapp": [
+        {"contact_jid": "15558887777@s.whatsapp.net", "partner_name": "Ravi Menon", "is_from_me": false, "is_group_chat": false, "timestamp": "{{TS-4h}}", "text": "Hey! What date works for the pilot kickoff on your side?"}
+      ],
+      "calls": [
+        {"phone": "+14155550123", "timestamp": "{{TS-9h}}", "is_outgoing": false, "is_answered": false, "call_type": "phone"}
+      ],
+      "reminders": [
+        {"title": "Send pricing model to Dana", "due_date": "{{D}}"},
+        {"title": "Review board deck", "due_date": "{{D}}"}
+      ]
+    }
+  }
+}
