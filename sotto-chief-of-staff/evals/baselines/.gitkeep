@@ -1,0 +1,2 @@
+# Live-mode baselines land here as scores.json (written by: run_evals.py --live --update-baseline).
+# Kept in git so the directory exists before the first baseline is recorded.

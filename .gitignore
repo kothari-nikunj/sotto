@@ -1,0 +1,10 @@
+**/.pytest_cache/
+**/__pycache__/
+*.pyc
+sotto-bridge/core/target/
+.DS_Store
+# Bridge build/release artifacts (build-app.sh + release.sh outputs — never committed;
+# users get the app via the signed DMG on GitHub Releases)
+sotto-bridge/app/Sotto Bridge.app/
+sotto-bridge/app/Sotto-Bridge-*.dmg
+sotto-bridge/app/.build/
