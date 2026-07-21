@@ -471,7 +471,7 @@ def test_gemini_fallback_on_429_when_backup_configured(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     out = cb.call_gemini("p", {})
     assert out == '{"markdown": "ok"}'
-    assert calls[0][0] == cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3-flash-preview")
+    assert calls[0][0] == cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
     assert calls[1][:2] == ("gemini-2.5-pro", "backup") and calls[1][2] == " [fallback]"  # used backup
 
 

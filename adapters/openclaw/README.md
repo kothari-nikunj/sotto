@@ -39,7 +39,7 @@ Override paths/CLI for your OpenClaw build via env: `OPENCLAW_BIN`, `OPENCLAW_HO
 
 ## What still needs YOUR OpenClaw CLI (printed by `install.sh`, not guessed)
 These need your timezone + delivery target, so the installer prints them instead of guess-executing:
-- **Model** → set OpenClaw's agent model to `gemini-3-flash-preview`.
+- **Model** → set OpenClaw's agent model to `gemini-3.6-flash`.
 - **Scheduler** → OpenClaw cron jobs are **prompt-based** (there is **no `--skill` flag**); `--tz`
   takes an IANA zone, and `--announce --channel --to` deliver the result to your chat:
   ```bash

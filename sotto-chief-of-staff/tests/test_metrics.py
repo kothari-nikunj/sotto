@@ -21,7 +21,7 @@ spec = importlib.util.spec_from_file_location("compose_brief", os.path.join(ROOT
 cb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cb)
 
-MODEL = "gemini-3-flash-preview"
+MODEL = "gemini-3.6-flash"
 
 
 def test_record_and_summary_aggregates_per_phase():

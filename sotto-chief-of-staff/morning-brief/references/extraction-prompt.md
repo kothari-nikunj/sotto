@@ -7,7 +7,7 @@ This file reproduces, VERBATIM, the core IP:
 Morning vs. evening share ONE prompt: the branch is the `Brief type:` field + the evening-only
 "Evening Accountability" section, both injected by compose_brief.py from the input contract.
 The rendered data (formatSourceForLLM equivalents) is appended by compose_brief.py under "## DATA"
-in the same shapes the Mac backend produces. Run by Gemini 3 Flash (1M context).
+in the same shapes the Mac backend produces. Run by Gemini 3.6 Flash (1M context).
 DO NOT summarize, paraphrase, or "improve" this prompt. It is the product.
 -->
 
