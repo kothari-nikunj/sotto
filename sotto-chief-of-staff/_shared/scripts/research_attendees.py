@@ -17,7 +17,7 @@ Input (argv files or stdin JSON):
   --attendees /tmp/sotto_research_in.json   [{name,email}, …]  (from select_attendees.py)
   --context   /tmp/sotto_cal.json           calendar/events for the meeting-context summary (optional)
 Output (stdout): {"attendees":[{email,title,company,relevance[],summary}, …]}
-Env: GOOGLE_AI_API_KEY (required), SOTTO_GEMINI_MODEL (default gemini-3-flash-preview).
+Env: GOOGLE_AI_API_KEY (required), SOTTO_GEMINI_MODEL (default gemini-3.6-flash).
 Test: SOTTO_LLM_STUB=/path/to/{"attendees":[...]}.json bypasses the network.
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ _LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3-flash-preview")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
 MAX_ATTENDEES = 25
 BATCH_SIZE = 5
 PER_BATCH_TIMEOUT = 60

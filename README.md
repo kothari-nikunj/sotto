@@ -24,7 +24,7 @@ The host runs on Railway, connects to the Bridge over MCP, gets Gmail/Calendar/G
 
 ## The model: a 1M-context Gemini model
 
-The brief's big multi-source extraction needs a **1M-context model**, and `compose_brief.py` calls the **Gemini API directly** (via `GOOGLE_AI_API_KEY` — the same key the host manages; no second key store). Get a **Gemini API key** ([Gemini 3 Flash](https://aistudio.google.com/apikey) — cheap, 1M, a great general driver too). Override the model with `SOTTO_GEMINI_MODEL`; set an **optional** backup (`SOTTO_FALLBACK_MODEL` / `SOTTO_FALLBACK_API_KEY`, also 1M-context) and the brief falls back to it on a quota/5xx error. (Non-Gemini providers aren't wired into the brief's direct call today — the fallback is Gemini-API-shaped.)
+The brief's big multi-source extraction needs a **1M-context model**, and `compose_brief.py` calls the **Gemini API directly** (via `GOOGLE_AI_API_KEY` — the same key the host manages; no second key store). Get a **Gemini API key** ([Gemini 3.6 Flash](https://aistudio.google.com/apikey) — cheap, 1M, a great general driver too). Override the model with `SOTTO_GEMINI_MODEL`; set an **optional** backup (`SOTTO_FALLBACK_MODEL` / `SOTTO_FALLBACK_API_KEY`, also 1M-context) and the brief falls back to it on a quota/5xx error. (Non-Gemini providers aren't wired into the brief's direct call today — the fallback is Gemini-API-shaped.)
 
 ## Setup
 
@@ -61,7 +61,7 @@ Docs: ONBOARDING.md (setup) · RAILWAY.md (deploy reference) · LOCAL-SETUP.md (
 
 ## The one-paragraph picture
 ```
-you ⇄ WhatsApp/Telegram/iMessage ── Agent host (Hermes or OpenClaw; Railway, Gemini 3 Flash key, cron, TTS, volume)
+you ⇄ WhatsApp/Telegram/iMessage ── Agent host (Hermes or OpenClaw; Railway, Gemini 3.6 Flash key, cron, TTS, volume)
                     │  runs the /sotto skills: extraction prompt + dedup/continuity scripts
                     ├── native: Gmail · Calendar · Granola · web
                     └── MCP (reverse link) ⇠ sotto-bridge (Mac, read-only): read_local · get_messages · health

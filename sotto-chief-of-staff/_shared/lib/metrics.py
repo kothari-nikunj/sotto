@@ -37,11 +37,12 @@ if _HERE not in sys.path:
 
 # ── PRICE TABLE ──────────────────────────────────────────────────────────────────────────────────
 # Per-1,000,000-token USD rates: {model: {"in": <prompt $/1M>, "out": <output $/1M>}}.
-# ⚠️  PLACEHOLDER RATES.  gemini-3-flash-preview is a preview model with no locked public price yet.
-# Published Gemini API rates, $ per 1M tokens (verified 2026-07-06 against Google's Gemini 3 Flash
-# announcement and OpenRouter's listing: $0.50 in / $3.00 out). Re-check when the model leaves
-# preview. A model NOT in this table yields est=n/a (cost None) — metrics never guesses a price.
+# Published Gemini API rates, $ per 1M tokens (verified 2026-07-21 against Google's Gemini 3.6 Flash
+# launch coverage: $1.50 in / $7.50 out). gemini-3-flash-preview stays priced for anyone still
+# pinning the old default via SOTTO_GEMINI_MODEL ($0.50 in / $3.00 out, preview placeholder rates).
+# A model NOT in this table yields est=n/a (cost None) — metrics never guesses a price.
 PRICE_TABLE = {
+    "gemini-3.6-flash": {"in": 1.50, "out": 7.50},
     "gemini-3-flash-preview": {"in": 0.50, "out": 3.00},
 }
 

@@ -156,7 +156,7 @@ note "Google: connect Gmail/Calendar to OpenClaw (MCP) — the brief auto-detect
 #    --tz takes an IANA zone; --announce --channel --to deliver the result to your chat.
 echo
 echo "== Wire these with the OpenClaw CLI (then you're done) =="
-echo "  • Model:     set the agent model to gemini-3-flash-preview (1M ctx) in openclaw.json."
+echo "  • Model:     set the agent model to gemini-3.6-flash (1M ctx) in openclaw.json."
 echo "  • Scheduler: create the fallback crons (the Bridge push fires the real brief). Prompt-based —"
 echo "    no --skill flag; --tz is an IANA zone (e.g. America/Los_Angeles):"
 echo "      $OPENCLAW_BIN cron add \"30 6 * * *\"   \"Run the sotto-morning-brief skill\"      --name sotto-morning-brief      --tz <zone> --announce --channel whatsapp --to <your-number>"

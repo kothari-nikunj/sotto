@@ -13,7 +13,7 @@ allowed only if it's in the grounded result's citations.
 Usage:
   web_research.py "Peyton Casper Browserbase"            # prints {query, text, citations:[{title,uri}]}
   web_research.py --json '["q1","q2"]'                    # batch: prints [{query,text,citations}, ...]
-Env: GOOGLE_AI_API_KEY (required), SOTTO_GEMINI_MODEL (default gemini-3-flash-preview).
+Env: GOOGLE_AI_API_KEY (required), SOTTO_GEMINI_MODEL (default gemini-3.6-flash).
 Test: SOTTO_LLM_STUB=/path/to/response.json bypasses the network (returns that file's text, no citations).
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import os
 import sys
 import urllib.request
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3-flash-preview")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
 
 
 def _diag(msg: str) -> None:

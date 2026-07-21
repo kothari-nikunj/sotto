@@ -1,5 +1,5 @@
 # Hermes config for Sotto (SPEC §4). Copy to ~/.hermes/config.yaml and fill <…>.
-model: gemini-3-flash-preview               # NATIVE Gemini id (gemini provider + GEMINI_API_KEY);
+model: gemini-3.6-flash                     # NATIVE Gemini id (gemini provider + GEMINI_API_KEY);
                                             # "google/…" would route via OpenRouter and need OPENROUTER_API_KEY
 
 mcp_servers:

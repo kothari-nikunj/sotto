@@ -31,7 +31,7 @@ Input  (stdin or argv[1], JSON): { type, window_hours, google, granola, local, p
   local:  the LocalData payload (the 16 sources + intelligence context). Missing fields are treated as empty.
 Output (stdout, JSON): { brief_markdown, actions[], meetings_needing_prep[], extracted_knowledge }
 
-Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3-flash-preview).
+Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3.6-flash).
 Test mode: set SOTTO_LLM_STUB=/path/to/response.json to bypass the network and return that file.
 """
 from __future__ import annotations
@@ -822,7 +822,7 @@ def call_gemini(prompt: str, inputs: dict) -> str:
     key = os.environ.get("GOOGLE_AI_API_KEY")
     if not key:
         raise RuntimeError("GOOGLE_AI_API_KEY not set (or use SOTTO_LLM_STUB for offline)")
-    model = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3-flash-preview")
+    model = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
     fb_model = (os.environ.get("SOTTO_FALLBACK_MODEL") or "").strip()
     fb_key = (os.environ.get("SOTTO_FALLBACK_API_KEY") or "").strip()
     try:

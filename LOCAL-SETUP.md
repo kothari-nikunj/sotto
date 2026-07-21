@@ -11,7 +11,7 @@ transport differs (stdio here vs the tunnel-free reverse dial-out relay in the c
 ## Prereqs
 - A Mac, Python 3.
 - A **1M-context model key** — a Google **Gemini API key** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey);
-  Gemini 3 Flash is cheap, 1M, and a fine driver). Sotto stores no keys — this goes in Hermes' native
+  Gemini 3.6 Flash is cheap, 1M, and a fine driver). Sotto stores no keys — this goes in Hermes' native
   `~/.hermes/.env`. Any 1M model works; Gemini is the recommendation.
 
 ## Steps
@@ -58,7 +58,7 @@ from the setup wizard; **local does not** — leave it unset and the 6:30/17:30 
 ```bash
 ./adapters/hermes/install.sh --dedicated
 ```
-`--dedicated` sets the chat model to the native `gemini-3-flash-preview` — the right default for a
+`--dedicated` sets the chat model to the native `gemini-3.6-flash` — the right default for a
 Sotto-dedicated local Hermes. The installer also copies the repo's local skills to
 `~/.hermes/skills/sotto` (no hub tap needed; `SOTTO_TAP` overrides the fallback), maps your Gemini key
 to all three names Hermes/Sotto read (`GOOGLE_AI_API_KEY` + `GEMINI_API_KEY` + `GOOGLE_API_KEY`),

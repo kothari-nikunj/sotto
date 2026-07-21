@@ -97,7 +97,7 @@ fi
 # 2) Model + scheduler (dedicated cloud instance → Gemini 1M as the driver too).
 #    Use the NATIVE Gemini model id (not the OpenRouter-style "google/…", which would route via
 #    OpenRouter and need OPENROUTER_API_KEY). The key is set as GEMINI_API_KEY/GOOGLE_API_KEY below.
-hermes config set model gemini-3-flash-preview || true
+hermes config set model gemini-3.6-flash || true
 hermes config set scheduler.enabled true || true
 # Timezone — Hermes cron + the system-prompt time injection default to UTC. Set the user's IANA zone so
 # the 6:30/17:30 briefs fire at their LOCAL morning/evening, AND so `hermes cron create` below doesn't
@@ -338,7 +338,7 @@ fi
 # configured model exists — a bad key/model otherwise only surfaces hours later as a silently failed
 # brief. Non-fatal by construction (`|| true` inside the substitution guards set -euo pipefail; 10s cap
 # so a network blip can't stall boot). Exactly one log line either way.
-GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3-flash-preview}"
+GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.6-flash}"
 if [ -n "$GKEY" ]; then
   GCHECK="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
     "https://generativelanguage.googleapis.com/v1beta/models/${GMODEL}?key=${GKEY}" 2>/dev/null || true)"
