@@ -1,0 +1,29 @@
+{
+  "today": "2026-06-23",
+  "signals": { "replied_thread_ids": ["t_old"] },
+  "actions": [
+    { "id": "a1", "section": "needs_attention", "channel": "email", "action_type": "reply",
+      "contact_name": "Sarah Chen", "source_thread_id": "t_sarah",
+      "summary": "Sarah asked for the signed contract by EOD" },
+    { "id": "a2", "section": "should_handle", "channel": "imessage", "action_type": "follow_up",
+      "contact_name": "Dev Patel", "source_thread_id": "t_dev",
+      "summary": "Follow up with Dev about the demo time" },
+    { "id": "a3", "section": "already_handled", "channel": "email", "action_type": "waiting_on",
+      "contact_name": "Maria Lopez", "source_thread_id": "t_old",
+      "summary": "Replied to Maria about the invoice" }
+  ],
+  "extracted_knowledge": {
+    "person_updates": [
+      { "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
+        "profile_patch": { "title": "CTO", "company": "Acme Corp" },
+        "facts": [
+          { "fact": "Pushing to close the Series B by end of quarter", "memory_type": "milestone", "confidence": 0.9 },
+          { "fact": "Prefers concise email, replies fast", "memory_type": "working_style", "confidence": 0.8 }
+        ] }
+    ],
+    "company_updates": [
+      { "company_name": "Acme Corp",
+        "news": [ { "text": "Raised Series B led by Sequoia", "url": "https://news.example/acme-b", "date": "2026-06" } ] }
+    ]
+  }
+}

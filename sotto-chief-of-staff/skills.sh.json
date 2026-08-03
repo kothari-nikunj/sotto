@@ -1,0 +1,27 @@
+{
+  "name": "sotto-chief-of-staff",
+  "description": "Sotto — your chief of staff. Morning/evening briefs, a learning knowledge graph of the people in your life, continuity on open loops, and one-tap actions, delivered in chat.",
+  "groupings": [
+    {
+      "title": "Chief of Staff",
+      "skills": [
+        "sotto-morning-brief",
+        "sotto-evening-brief",
+        "sotto-meeting-prep",
+        "sotto-followup",
+        "sotto-relationship-pulse",
+        "sotto-ask",
+        "sotto-draft-reply",
+        "sotto-triage",
+        "sotto-loops",
+        "sotto-schedule",
+        "sotto-proactive",
+        "sotto-feedback",
+        "sotto-retune",
+        "sotto-approval-tiers",
+        "sotto-people",
+        "sotto-setup"
+      ]
+    }
+  ]
+}
