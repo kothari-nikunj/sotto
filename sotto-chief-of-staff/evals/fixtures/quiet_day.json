@@ -1,0 +1,50 @@
+{
+  "name": "quiet_day",
+  "description": "A quiet day: 1 internal meeting, 3 routine emails, no messages, nothing urgent. The critic-auto-skip regime — small payload and few actions, so the second-pass critic must be SKIPPED.",
+  "preferences": {
+    "mute_senders": [],
+    "mute_people": [],
+    "mute_sections": [],
+    "tone_notes": []
+  },
+  "signals": {"replied_thread_ids": [], "handled": []},
+  "new_actions": [],
+  "continuity_ledger": [],
+  "stub_response": {
+    "brief_markdown": "# Your morning brief\n\nQuiet one today. Nothing needs a decision from you.\n\n## Coming up\n- Eng Standup at 9.\n\n## FYI\n- A couple of routine notifications, nothing actionable.",
+    "actions": [
+      {"id": "q1", "type": "reply", "channel": "email", "contactName": "Priya Anand", "emailReplyTo": "priya@sotto.com", "emailSubject": "Standup notes"},
+      {"id": "q2", "type": "review", "channel": "email", "contactName": "AWS", "emailThreadId": "t-aws"}
+    ],
+    "extracted_knowledge": {"person_updates": [], "company_updates": []}
+  },
+  "inputs": {
+    "type": "morning",
+    "first_run": false,
+    "window_hours": 24,
+    "google": {
+      "userEmail": "you@sotto.com",
+      "userTimezone": "+00:00",
+      "events": [
+        {"id": "evt-standup", "summary": "Eng Standup", "start": "{{ISO+1h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "priya@sotto.com", "displayName": "Priya Anand"}, {"email": "mara@sotto.com", "displayName": "Mara Diaz"}]}
+      ],
+      "emails": [
+        {"from": "Priya Anand <priya@sotto.com>", "subject": "Standup notes", "snippet": "Notes from yesterday's standup.", "body": "Quick standup notes: nothing blocking, QA on track for Thursday.", "date": "{{ISO-3h}}", "threadId": "t-standup", "labelIds": ["INBOX"]},
+        {"from": "AWS <no-reply@amazon.com>", "subject": "Your March bill", "snippet": "Your bill is ready.", "body": "Your AWS bill for March is now available.", "date": "{{ISO-5h}}", "threadId": "t-aws", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
+        {"from": "Notion <team@makenotion.com>", "subject": "Weekly digest", "snippet": "Workspace activity.", "body": "Here is what happened in your workspace this week.", "date": "{{ISO-7h}}", "threadId": "t-notion", "labelIds": ["INBOX", "CATEGORY_UPDATES"]}
+      ]
+    },
+    "granola": {"meetings": []},
+    "local": {
+      "generated_at": "{{TS}}",
+      "window_hours": 24,
+      "source_status": {"imessage": "ok", "whatsapp": "ok"},
+      "contacts": [
+        {"name": "Priya Anand", "emails": ["priya@sotto.com"], "phones": ["+14155550123"]}
+      ],
+      "imessage": [],
+      "whatsapp": [],
+      "reminders": []
+    }
+  }
+}

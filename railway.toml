@@ -1,0 +1,12 @@
+# Railway config-as-code (the "standard template" pattern). Lives at the Sotto folder root; with
+# Railway Root Directory = sotto-hermes (monorepo) or a standalone repo, this is the build context.
+# Eliminates the build-setting fiddling that bit us (Root Directory / Dockerfile Path confusion).
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# tini is the image ENTRYPOINT, so no startCommand needed here.
+healthcheckPath = "/health"               # the trigger receiver answers this on $PORT
+restartPolicyType = "ON_FAILURE"          # auto-restart if the gateway exits (we saw unpaired crashes)
+restartPolicyMaxRetries = 10
