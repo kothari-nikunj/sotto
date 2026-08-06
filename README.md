@@ -1,0 +1,105 @@
+# Sotto — your chief of staff, on your own infrastructure
+
+Sotto reads everything you'd check yourself — iMessage, WhatsApp, email, calendar, missed calls,
+meeting notes — and turns it into a few moments a day that actually matter:
+
+- **A morning and evening brief** in your chat app: who's waiting on you, what's at stake, what you
+  promised, what's coming up — written like a sharp chief of staff, not a notification digest.
+- **Real-time nudges** when something genuinely needs you: a friend texts with a real ask, a missed
+  call from someone you know — you get one short message *with a reply already drafted in your
+  voice*, one tap to send. Everything less urgent waits quietly for a midday catch-up or the next
+  brief.
+- **A memory.** Sotto keeps a knowledge graph of your people and companies, tracks open loops
+  ("you said you'd send the deck Tuesday"), notices who you're losing touch with, and learns your
+  writing style from how you actually text and email.
+- **Ask it anything, in chat:** *"prep me for my 2pm"* · *"what am I waiting on?"* · *"draft a reply
+  to Sarah"* · *"find 30 min with Alex next week"* · *"who am I losing touch with?"*
+
+Two principles, everywhere: **Sotto drafts, you send** — it never sends a message on its own. And
+**it runs on YOUR infrastructure** — your Railway container, your API key, your Mac. There is no
+Sotto server, no account, and nobody else in the loop.
+
+## How it works
+
+Two pieces:
+
+```
+you ⇄ WhatsApp / Telegram / iMessage
+         │
+   Sotto agent  — a container YOU deploy (Railway). Runs the brains: briefs, memory,
+         │        drafts, schedules. Connects natively to Gmail + Google Calendar.
+         │
+   Sotto Bridge — a tiny Mac menu-bar app. READ-ONLY: it reads iMessage, WhatsApp,
+                  calls, contacts, notes locally and streams them to YOUR agent —
+                  with a per-source toggle for anything you'd rather not share.
+```
+
+The Bridge **dials out** to your agent (no tunnels, no open ports, nothing to keep alive) and
+pushes new messages within seconds, so nudges are real-time. Close your laptop and everything
+degrades gracefully: cloud-side briefs and email still work; when the Mac wakes, the Bridge
+catches up quietly — old messages go to the digest, never a barrage of stale pings.
+
+## Install (~20 minutes)
+
+Full walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. The shape:
+
+1. **Deploy the agent** — one click via the Deploy button in [ONBOARDING.md](ONBOARDING.md)
+   (Railway sets up the container, storage, and secrets; you add a
+   [Gemini API key](https://aistudio.google.com/apikey) — the only key Sotto needs — and your
+   WhatsApp number).
+2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
+   drag to /Applications, and click the pairing link from your deploy logs. A 3-step wizard in the
+   app covers disk access and privacy toggles. Connect Google + scan the WhatsApp QR on the same
+   setup page.
+3. **Say "set up Sotto"** in chat. It verifies every connection honestly, seeds its memory and your
+   writing voice from ~6 weeks of history, and offers your first brief on the spot.
+
+**What it costs to run:** Railway ~$5/mo, plus your own Gemini usage — typically **$1–1.5/day**
+with the default models (briefs are the bulk; real-time triage runs on a model that costs pennies).
+No subscription, no per-seat anything.
+
+**Don't have a Mac, or don't want the Bridge?** Sotto still works — briefs from Gmail + Calendar
+alone, no local messages. The Bridge is additive.
+
+## The model
+
+The brief needs a **1M-context model**. Default: **Gemini 3.6 Flash**, with automatic fallback to
+`gemini-3-flash-preview` (cheaper, separate rate-limit bucket, same key) on quota errors. Override
+with `SOTTO_GEMINI_MODEL` / `SOTTO_FALLBACK_MODEL` — details in [RAILWAY.md](RAILWAY.md).
+
+## Integrations
+
+Beyond Google and the Bridge, services connect in **one click** from the `/setup` wizard's
+**Connected services** tiles: Sotto registers *itself* with a service's remote MCP (OAuth 2.1
+Dynamic Client Registration + PKCE) and keeps the tokens on your volume — no broker, no third
+party in the loop. Granola meeting notes are the first tile; the full doctrine (keys, OAuth,
+local material, and the escape hatch) plus how to add a service:
+**[INTEGRATIONS.md](INTEGRATIONS.md)**.
+
+## Docs
+
+| Doc | What |
+|---|---|
+| **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
+| [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
+| [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
+| [CHANNELS.md](CHANNELS.md) | Delivery channels: WhatsApp (easiest), Telegram, iMessage |
+| [INTEGRATIONS.md](INTEGRATIONS.md) | Connecting services (Granola, …): the one-click Connect tiles + the four-lane doctrine |
+| [docs/BLUEBUBBLES.md](docs/BLUEBUBBLES.md) | Optional: give Sotto its own iMessage identity |
+| [docs/UNINSTALL.md](docs/UNINSTALL.md) | Removing the Mac app cleanly |
+
+## For developers
+
+The backend is **host-agnostic**: a portable core (skills + Python pipeline over open standards —
+MCP, agentskills) with thin per-runtime adapters. It runs today on
+[Hermes](https://hermes-agent.nousresearch.com/) and has an [OpenClaw adapter](adapters/openclaw/README.md).
+
+| Directory | What |
+|---|---|
+| `sotto-chief-of-staff/` | The processing: 17 skills + deterministic Python (extraction, knowledge graph, continuity ledger, style, triage) over `$SOTTO_DATA` |
+| `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, wake triggers, real-time event ingestion + triage funnel |
+| `adapters/` | Per-host wiring (Hermes, OpenClaw) — see [adapters/README.md](adapters/README.md) |
+| `contracts/` | LocalData JSON Schema + the on-disk data layout |
+
+The Bridge app ships signed [on Releases](https://github.com/kothari-nikunj/sotto/releases/latest);
+its macOS data readers are not part of this source tree.
