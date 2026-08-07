@@ -1,0 +1,296 @@
+/* Sotto — /setup, the Connections page of the same product.
+   app.css is linked FIRST: fonts, :root tokens (light + dark), and the shared
+   shell (.site / .sidebar / .nav / .content) all come from there. This file
+   styles only the server-rendered setup markup: page header, the hero CTA,
+   the numbered connection tiles, forms, the QR block, and the narrow
+   transient pages. Every var() used here is defined in app.css — no new
+   tokens, no new fonts, nothing external. Dark mode falls out of the tokens. */
+
+/* ---------- Page header ---------- */
+
+.page-title {
+  font-family: var(--font-serif);
+  font-size: 1.65rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  margin: 0 0 var(--space-1);
+  text-wrap: balance;
+}
+
+.page-sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--ink-light);
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-5);
+}
+
+/* ---------- Hero CTA — the one Persuade moment (setup complete) ---------- */
+
+a.hero-cta {
+  display: block;
+  font-family: var(--font-serif);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  color: var(--ink);
+  background: var(--accent-muted);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border), 0 0 14px var(--accent-glow);
+  padding: var(--space-4) var(--space-5);
+  margin: 0 0 var(--space-5);
+  transition: box-shadow var(--dur-hover) ease,
+              background-color var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+a.hero-cta:hover {
+  text-decoration: none;
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-border-hover), 0 0 18px var(--accent-glow);
+}
+a.hero-cta:active { transform: scale(0.99); }
+
+/* ---------- Connection tiles ----------
+   section.tile is the wizard's step surface: paper-white, shadow-border,
+   numbered head, state word, stacked body. State reads from the mono state
+   label + the numeral's tint alone — no edge decoration. */
+
+.tile {
+  background: var(--paper-white);
+  box-shadow: var(--shadow-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--space-3);
+}
+
+.tile-num {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+  box-shadow: 0 0 0 1px var(--border);
+  background: var(--paper-alt);
+}
+.tile[data-state="done"] .tile-num {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  box-shadow: 0 0 0 1px var(--accent-underline);
+}
+
+h2.tile-title {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-serif);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+  margin: 0;
+  text-wrap: balance;
+}
+
+.tile-state {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--mono-2xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-wide);
+  color: var(--ink-muted);
+  margin-left: auto;
+}
+.tile[data-state="done"] .tile-state { color: var(--success); }
+.tile[data-state="optional"] .tile-state { color: var(--ink-faint); }
+/* "to do" — ink-muted with a still accent marker (no motion) */
+.tile[data-state="todo"] .tile-state::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+/* ---------- Tile body — status line, meta, hint, controls ---------- */
+
+.tile-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.tile-body form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  align-self: stretch;
+  margin: 0;
+}
+
+.tile-status {
+  font-family: var(--font-serif);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--ink-secondary);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.tile[data-state="done"] .tile-status { color: var(--success); }
+
+.tile-meta {
+  font-family: var(--font-mono);
+  font-style: normal;
+  font-size: var(--mono-2xs);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-faint);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.tile-hint {
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  letter-spacing: var(--ls-tight);
+  line-height: 1.6;
+  color: var(--ink-muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* the copyable pairing link */
+.code, code {
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  background: var(--paper-alt);
+  border-radius: var(--radius-xs);
+  padding: 1px 5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Buttons — the shared button language, element-agnostic ---------- */
+
+.btn-primary,
+.btn-quiet {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--mono-sm);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  padding: 0.5rem 0.85rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-hover) ease,
+              color var(--dur-hover) ease,
+              box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.btn-primary:hover,
+.btn-quiet:hover { text-decoration: none; }
+.btn-primary:active,
+.btn-quiet:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: var(--accent);
+  color: #f4efe4;
+  box-shadow: var(--shadow-border), 0 0 10px var(--accent-glow);
+}
+.btn-primary:hover { background: var(--accent-light); }
+@media (prefers-color-scheme: dark) {
+  .btn-primary { color: #12100b; }
+}
+
+.btn-quiet {
+  background: none;
+  color: var(--ink-muted);
+  box-shadow: none;
+}
+.btn-quiet:hover { color: var(--accent-text); background: var(--accent-muted); }
+
+/* ---------- Fields — paper-white, warm border, green focus ring ---------- */
+
+.field {
+  display: block;
+  width: 100%;
+  align-self: stretch;
+  font-family: var(--font-mono);
+  font-size: 1rem; /* ≥16px so iOS doesn't zoom the viewport on focus */
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--paper-white);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.field::placeholder { color: var(--ink-faint); }
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+textarea.field {
+  min-height: 132px;
+  resize: vertical;
+  font-size: var(--mono-md); /* JSON paste box — denser is fine, zoom matters less */
+}
+
+/* ---------- QR block — mono, scrollable, paper-alt ---------- */
+
+pre.qr {
+  align-self: stretch;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  line-height: 1.25;
+  color: var(--ink);
+  background: var(--paper-alt);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  margin: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* server-side error line */
+.err {
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  color: var(--urgent);
+  margin: 0 0 var(--space-3);
+}
+
+/* ---------- Narrow transient pages (QR / Google / connect) ---------- */
+
+.content.narrow { max-width: 592px; } /* ~560px column + the .content gutters */
+
+/* ---------- Wider screens ---------- */
+
+@media (min-width: 640px) {
+  .page-title { font-size: 1.85rem; }
+  .tile { padding: var(--space-5) var(--space-6); }
+}

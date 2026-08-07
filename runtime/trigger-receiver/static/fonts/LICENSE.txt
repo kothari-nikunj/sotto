@@ -1,0 +1,14 @@
+Vendored web fonts — all licensed under the SIL Open Font License 1.1 (OFL).
+
+Besley.woff2              Besley (variable, weights 400-900, upright, latin)
+Besley-italic.woff2       Besley Italic (variable, weights 400-900, latin)
+  Copyright 2017-2021 The Besley* Project Authors
+  Source: https://github.com/indestructibletype/Besley
+
+MartianMono.woff2         Martian Mono (variable, weights 100-800, latin)
+  Copyright 2022 The Martian Mono Project Authors
+  Source: https://github.com/evilmartians/mono
+
+The OFL permits bundling and redistributing these fonts with software,
+provided the fonts are not sold by themselves. Full license text:
+https://openfontlicense.org/open-font-license-official-text/

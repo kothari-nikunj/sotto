@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LocalData",
+  "description": "Output of the Sotto Bridge read_local tool. Field names + per-item shapes are pinned to the Mac app's extract_local_data (app/src-tauri/src/commands/brief.rs) and to what the consumer (sotto-chief-of-staff/_shared/scripts/compose_brief.py) reads, so the brief skill needs no remap. Messages are FLAT per-message arrays (the consumer groups into threads). granola_meetings is intentionally OUT of the Bridge — Hermes owns Granola via MCP.",
+  "type": "object",
+  "required": ["generated_at", "window_hours", "source_status"],
+  "properties": {
+    "generated_at": { "type": "string", "format": "date-time" },
+    "window_hours": { "type": "integer" },
+
+    "imessage": { "type": "array", "items": { "$ref": "#/$defs/imessage" } },
+    "whatsapp": { "type": "array", "items": { "$ref": "#/$defs/whatsapp" } },
+    "deferred_unread_imessage": { "type": "array", "items": { "$ref": "#/$defs/unread_imessage" } },
+    "deferred_unread_whatsapp": { "type": "array", "items": { "$ref": "#/$defs/unread_whatsapp" } },
+
+    "contacts": { "type": "array", "items": { "$ref": "#/$defs/contact" } },
+    "reminders": { "type": "array", "items": { "$ref": "#/$defs/reminder" } },
+
+    "calls": { "type": "array", "items": { "$ref": "#/$defs/call" } },
+    "whatsapp_calls": { "type": "array", "items": { "$ref": "#/$defs/whatsapp_call" } },
+
+    "apple_notes": { "type": "array", "items": { "$ref": "#/$defs/note" } },
+    "recent_files": { "type": "array", "items": { "$ref": "#/$defs/recent_file" } },
+    "screen_time": { "$ref": "#/$defs/screen_time" },
+
+    "chrome_history": { "type": "array", "items": { "$ref": "#/$defs/browser_visit" } },
+    "search_queries": { "type": "array", "items": { "type": "string" } },
+    "safari_history": { "type": "array", "items": { "$ref": "#/$defs/browser_visit" } },
+    "safari_search_queries": { "type": "array", "items": { "type": "string" } },
+
+    "source_status": {
+      "type": "object",
+      "additionalProperties": { "enum": ["ok", "unavailable", "needs_fda", "degraded"] }
+    }
+  },
+  "$defs": {
+    "imessage": {
+      "type": "object",
+      "required": ["handle", "is_from_me", "timestamp", "text", "is_group_chat"],
+      "properties": {
+        "handle": { "type": "string" },
+        "is_from_me": { "type": "boolean" },
+        "timestamp": { "type": "string" },
+        "text": { "type": "string" },
+        "is_group_chat": { "type": "boolean" },
+        "chat_guid": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL / backward-compatible. The group chat's stable id from the Bridge; null (or absent) for a 1:1. When present, the consumer keys the whole group into ONE thread by this id (all senders collapse) instead of splitting per-sender. Absent on pre-rebuild Bridges — the consumer falls back to sender keying."
+        },
+        "group_name": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL / backward-compatible. The user-set group display name; null (or absent) if the group is unnamed or this is a 1:1. Used VERBATIM as the group's bold name in the brief — the LLM is forbidden from inventing a topical group name."
+        },
+        "group_participants": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "OPTIONAL / backward-compatible. Raw handle ids (phones/emails) of the group's members; [] (or absent) for a 1:1. When the group is unnamed, the consumer builds an iMessage-style participant label (e.g. \"Alice, Bob & 2 others\") from these by resolving each handle to a contact name."
+        }
+      }
+    },
+    "whatsapp": {
+      "type": "object",
+      "required": ["contact_jid", "partner_name", "is_from_me", "timestamp", "text", "is_group_chat"],
+      "properties": {
+        "contact_jid": { "type": "string" },
+        "partner_name": { "type": "string" },
+        "is_from_me": { "type": "boolean" },
+        "timestamp": { "type": "string" },
+        "text": { "type": "string" },
+        "is_group_chat": { "type": "boolean" },
+        "chat_guid": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL / backward-compatible. The group's stable id (the group JID, …@g.us); null (or absent) for a 1:1. Same grouping semantics as the iMessage chat_guid."
+        },
+        "group_name": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL / backward-compatible. The group SUBJECT (ZPARTNERNAME) when set; null for unnamed groups + 1:1s. Used VERBATIM as the group's bold name in the brief."
+        },
+        "group_participants": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "OPTIONAL / backward-compatible. Member JIDs of the group session; [] (or absent) for a 1:1 or when this WhatsApp schema lacks the member table."
+        },
+        "sender_jid": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL / backward-compatible. The member JID of whoever SENT this inbound group message (ZWAMESSAGE.ZGROUPMEMBER → ZWAGROUPMEMBER.ZMEMBERJID). The consumer uses it to attribute group lines ('[THEY SENT — Name]'); absent → the line stays unattributed, never guessed. Null for 1:1s and the user's own messages."
+        }
+      }
+    },
+    "unread_imessage": {
+      "type": "object",
+      "required": ["handle", "timestamp", "text", "days_old"],
+      "properties": {
+        "handle": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "text": { "type": "string" },
+        "days_old": { "type": "integer" }
+      }
+    },
+    "unread_whatsapp": {
+      "type": "object",
+      "required": ["contact_jid", "partner_name", "timestamp", "text", "unread_count", "days_old"],
+      "properties": {
+        "contact_jid": { "type": "string" },
+        "partner_name": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "text": { "type": "string" },
+        "unread_count": { "type": "integer" },
+        "days_old": { "type": "integer" }
+      }
+    },
+    "contact": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "phones": { "type": "array", "items": { "type": "string" } },
+        "emails": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" }
+      }
+    },
+    "reminder": {
+      "type": "object",
+      "required": ["title"],
+      "properties": {
+        "title": { "type": "string" },
+        "due_date": { "type": "string" }
+      }
+    },
+    "call": {
+      "type": "object",
+      "required": ["phone", "timestamp", "is_outgoing", "is_answered", "call_type"],
+      "properties": {
+        "phone": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "is_outgoing": { "type": "boolean" },
+        "is_answered": { "type": "boolean" },
+        "call_type": { "enum": ["phone", "facetime_audio", "facetime_video"] },
+        "duration_seconds": { "type": "number" }
+      }
+    },
+    "whatsapp_call": {
+      "type": "object",
+      "required": ["jid", "timestamp", "is_outgoing", "is_missed"],
+      "properties": {
+        "jid": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "is_outgoing": { "type": "boolean" },
+        "is_missed": { "type": "boolean" }
+      }
+    },
+    "note": {
+      "type": "object",
+      "required": ["title", "snippet", "modified_date", "folder"],
+      "properties": {
+        "title": { "type": "string" },
+        "snippet": { "type": "string" },
+        "modified_date": { "type": "string" },
+        "folder": { "type": "string" }
+      }
+    },
+    "recent_file": {
+      "type": "object",
+      "required": ["filename", "path", "file_type", "status"],
+      "properties": {
+        "filename": { "type": "string" },
+        "path": { "type": "string" },
+        "last_used": { "type": "string" },
+        "date_added": { "type": "string" },
+        "file_type": { "type": "string" },
+        "status": { "enum": ["opened", "unopened"] },
+        "source_url": { "type": "string" }
+      }
+    },
+    "screen_time": {
+      "type": "object",
+      "properties": {
+        "top_apps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "app_bundle_id": { "type": "string" },
+              "app_name": { "type": "string" },
+              "minutes": { "type": "number" }
+            }
+          }
+        },
+        "first_active": { "type": ["string", "null"] },
+        "total_minutes": { "type": "number" }
+      }
+    },
+    "browser_visit": {
+      "type": "object",
+      "required": ["domain", "visit_count"],
+      "properties": {
+        "domain": { "type": "string" },
+        "visit_count": { "type": "integer" },
+        "top_titles": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
