@@ -1,0 +1,239 @@
+# Set up Sotto — step by step (cloud)
+
+The friendliest path: an always-on Sotto in the cloud + the read-only Mac Bridge. About **20 minutes**
+with the deploy button — closer to ~35 the very first time on the manual path — most of it waiting on
+builds. You'll finish with a morning brief in WhatsApp and a Mac link that
+survives sleep, redeploys, and laptop lids.
+
+> **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
+> fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
+> reads data and nudges timing. The Bridge never sends anything — replies are drafts you tap to send.
+
+## 0 · What you'll need
+
+| You need | Why | Where it goes |
+|---|---|---|
+| A **Railway** account (**paid/verified plan** — volumes + always-on need it) | hosts the agent + storage | — |
+| A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the LLM (only key Sotto needs) | once, into Railway |
+| Your **WhatsApp number** | where briefs are delivered | once, into Railway |
+| A **Google OAuth client** (5-minute console task, step 3②) | Gmail + Calendar | pasted in the wizard |
+| The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) | reads your Mac | drag to /Applications |
+
+Everything else — linking your Mac, connecting Google, the WhatsApp QR, your timezone, and optional
+extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
+
+## 1 · Deploy the backend on Railway
+
+**Option A — one-click (recommended once the template is published).** Click this: Railway builds the container, adds the `/data`
+volume, generates `BRIDGE_TOKEN`, and gives the service a public domain automatically. You fill in
+only your **Gemini key** and **WhatsApp number** (entered twice — once as the allowlist, once as the
+delivery channel) at the prompt — then jump to step 2.
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
+
+*(Button 404s? The Railway template for this repo isn't published yet — use Option B; same result,
+a few more clicks.)*
+
+**Option B — manual (four settings).** Prefer to wire it by hand (or deploying a repo with no
+template)? In [Railway](https://railway.app): **New Project → Deploy from GitHub repo** → pick this
+repo, then set **all four** (each is required; the deploy half-works without them and fails silently):
+
+1. **Settings → Root Directory**: leave blank — the Dockerfile is at the repo root (leave *Dockerfile Path* blank too; both are auto-detected).
+2. **Variables** — add four:
+   - `GOOGLE_AI_API_KEY` = your Gemini key
+   - `WHATSAPP_ALLOWED_USERS` = your number, country code, no `+` (e.g. `15551234567`)
+   - `WHATSAPP_HOME_CHANNEL` = the same number
+   - `BRIDGE_TOKEN` = a long random secret — run `openssl rand -hex 24` and paste the output.
+     *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
+3. **Add a Volume** mounted at `/data` (your knowledge graph + WhatsApp session live here).
+4. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2;
+   without a domain the logged link falls back to a dead `localhost` URL.
+
+Deploy and wait for the build (the container installs Hermes + Sotto automatically). The boot log
+prints `[sotto] Gemini key OK` if your key works — if you see a `WARNING` there instead, fix the key
+before going further.
+
+## 2 · Open your setup link
+
+Railway → your service → **Deployments → View logs** → find the line starting **`[sotto] Setup link`**
+and open it. That's your `/setup` wizard plus its private access code — only someone with this link can
+see your pairing token or WhatsApp QR. Open it once and your browser is remembered; lose it and it
+reprints on every boot.
+
+One page, five tiles (the fifth is optional), each flipping to ✓ live as you finish it.
+
+## 3 · The wizard, tile by tile
+
+**① Link your Mac** — [Download Sotto Bridge.app](https://github.com/kothari-nikunj/sotto/releases/latest),
+drag it to `/Applications`, open it.
+- **First run asks for an access code** — Sotto Bridge is invite-only for now; paste the code from
+  your invite (it's verified on your Mac, nothing is sent anywhere), and if you don't have one yet,
+  ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
+- **Before anything is sent**, the wizard's Privacy step lists the data sources the app can read
+  (Messages, calls, contacts, browser history, …) — **turn off anything you don't want shared**
+  right there. The engine only connects when you click **Save & Connect** at the end, never earlier
+  — even if you paired on the previous step.
+- At the bottom of that Data Sources list (once the app knows your host), a **"Meeting notes
+  (Granola) & more — Open setup page"** row jumps you to the wizard's Connected-services tile —
+  cloud sources connect there, not in the app.
+- On the wizard, click **"Open in Sotto Bridge"** — the app fills the host + token in one click
+  (different Mac? paste the pairing link into the app instead).
+- Click **Grant Full Disk Access** — the app deep-links you to the right Settings pane; flip the
+  switch, and the app restarts its engine automatically to pick up the grant.
+- **It keeps itself current.** The Bridge checks daily for a new signed release; when there is one
+  the menu shows **"Update available"** and one click installs it in place — no re-download, no
+  re-granting Full Disk Access, nothing to re-pair.
+- **Start at login** is enabled for you when you finish the wizard — flip it off later in
+  Settings → General if you prefer. Done — the app dials *out* to your cloud, so there's no tunnel,
+  no port, nothing to keep alive. Closing and reopening your laptop needs nothing from you.
+- Optional: **"Send my brief when I wake my Mac"** is on by default — open your laptop after 7am and
+  the morning brief arrives moments later (the 6:30 cloud schedule covers the closed-laptop case;
+  they coordinate, you never get two).
+
+**② Connect Google** — you create your own OAuth client once (this keeps you off Google's verification
+wall — it's your own data):
+1. [console.cloud.google.com](https://console.cloud.google.com) → **New Project** "Sotto" → select it.
+2. **APIs & Services → Enable APIs** → enable **Gmail API** and **Google Calendar API**.
+3. **OAuth consent screen** → **External** → app name "Sotto", your email → and then **publish the app
+   to "In production."** *This matters: left in "Testing," Google expires your access after ~7 days and
+   your briefs quietly lose email + calendar on day 8. "In production" needs no Google review for
+   personal use.*
+4. **Credentials → Create credentials → OAuth client ID** → **Desktop app** → Create → **Download JSON**.
+5. Paste the JSON into the wizard's Google box → **Save client** → **Authorize** → on the "unverified
+   app" screen click **Advanced → Continue → Allow** → you land on a `localhost:1/?code=…` page that
+   won't load — that's expected; copy the `code` value from the URL, paste it into the wizard,
+   **Connect**. You'll see "✅ Google connected."
+
+**③ Link WhatsApp** — click **Show WhatsApp QR** → on your phone: WhatsApp → **Linked Devices → Link a
+Device** → scan. (Missed the ~15-minute window? The container recycles and pairing reopens on the next
+boot — "No pairing in progress" is transient, just redeploy.)
+
+**④ Timezone** — auto-detected from your browser when the page loads; shows ✓ with your zone.
+
+**⑤ Connected services (optional)** — one-click OAuth for extra sources. Click **Connect** next to
+**Granola (meeting notes)**: your browser opens Granola's consent screen, you approve, and you land
+back on a ✓ page — meeting notes + transcripts now feed your briefs, meeting prep, and follow-ups.
+It works on **any Granola plan** (it's your login, not an API key), the tokens live only on your
+`/data` volume, and if anything fails the page tells you exactly which step broke. Skip freely —
+everything else works without it. More lanes + adding other services:
+[INTEGRATIONS.md](INTEGRATIONS.md).
+
+## 4 · Say hello
+
+Message yourself on WhatsApp (self-chat mode — you are the bot): **"set up Sotto."**
+
+**One-time approval:** the first time Sotto runs its pipeline it asks permission to run code
+(`execute_code`). Approve with **always** (reply `/approve always`) so it never re-asks. This is a
+one-time, interactive-only step — scheduled briefs run the same scripts through the terminal
+tool, which needs no approval.
+
+The guided setup verifies every connection, then seeds your memory and **writing voice** from ~6
+weeks of history — a few minutes, up to ~8 the very first time (it's researching the people in your
+calendar), and it narrates as it goes — schedules the briefs, and closes with an honest checklist:
+
+> Here's where you stand:
+> - **Bridge** (Mac: messages, calls, contacts) — ✓ connected
+> - **Google** (Gmail + Calendar) — ✓ connected
+> - **Granola** (meeting notes) — – optional, skipped
+> Briefs are scheduled for 6:30am and 5:30pm.
+
+Then it offers your first brief on the spot. Say **"good morning"** and you're running.
+
+From here it's all conversation:
+- *"good morning"* / *"good evening"* — the briefs
+- *"prep me for my 2pm"* / *"follow up on my meetings"*
+- *"find 30 min with Alex next week"* / *"accept my 3pm"* — proposes from your real calendar, then books/RSVPs on your OK
+- *"triage my inbox"* / *"what am I waiting on"*
+- *"draft a reply to Sarah"* — in your voice; **you** always send
+- *"who am I losing touch with"* / *"what do I know about Alex"*
+- *"what can you do?"* — the full map, any time
+
+And if a brief ever looks thin or wrong: say **"that's wrong about X"** (fixes its memory), **"stop
+surfacing newsletters"** (mutes), or **"clean up stale loops"** (retunes).
+
+## Your dashboard
+
+The same `/setup` page is part of a private web dashboard: once your tiles are green, click
+**"Open your dashboard"** (or visit `https://<your-domain>/app` — first visit asks for your setup
+code once, then remembers you for 30 days). It shows today at a glance, your open loops (resolve or
+dismiss in one tap), the archive of every delivered brief, everyone Sotto knows — with per-fact
+confidence and sources, editable in place — and what it has learned about your voice and
+preferences. Works great on your phone.
+
+## Your first 24 hours
+
+Day one is quiet on purpose — quiet ≠ broken:
+
+- **Your first brief** arrives at the next 6:30am / 5:30pm — or the moment you wake your Mac after 7am.
+- **Few or no nudges at first** — the triage funnel is deliberately strict; only a real ask from
+  someone you know or a missed call gets through.
+- **The 12:30 digest stays silent on light days** by design — no news is the feature.
+- **The relationship pulse** first fires Monday at 9am.
+- **The dashboard fills as briefs run** — the Briefs tab starts with your first delivered brief, and
+  the Learned page (voice + preferences) populates after the first brief runs.
+
+And three things Sotto will never do, worth knowing on day one:
+
+- **No bot joins your calls.** Meeting notes come from Granola reading the notes you already take.
+  Nothing of Sotto's dials into a meeting, and nothing records one.
+- **Sotto can't send as you.** The Mac Bridge refuses to send at all unless you start it with
+  `--allow-send`, and every message — brief, nudge, reply, follow-up — is a draft **you** send.
+- **Every silence is auditable.** Nudged, queued, or dropped, each event gets a ledger row with its
+  reason, readable in the dashboard's **Record** view (`/app#record`).
+
+The rules behind all three: [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md).
+
+## What runs on its own
+
+Once set up, Sotto works in the background without being asked — **everything below is draft-only; it
+never auto-sends**:
+
+- **Morning + evening briefs** — 6:30am and 5:30pm your time (and the instant you open your Mac past
+  7am; the two paths coordinate so you never get a double).
+- **Real-time nudges** — new messages and calls stream from your Mac within seconds and go through a
+  strict triage funnel; only the genuinely interruption-worthy (a real ask from someone you know, a
+  missed call) becomes a nudge — **with a reply drafted in your voice, one tap to send**. Everything
+  quieter waits for an adaptive **12:30 catch-up digest** (silent on light days) or the next brief.
+  If your Mac was offline for hours, the backlog drains silently — no barrage of stale pings.
+- **Scheduled watchers** — a mostly-silent check every ~15 min for time-sensitive items (a meeting
+  about to start, a due commitment, a birthday), with a draft ready when it does speak up.
+- **Follow-up drafts** — part of the 5:30pm evening brief, for meetings that ended that day; silent
+  when there's nothing to send.
+- **Relationship pulse** — Mondays at 9am (who you're losing touch with).
+
+Delivery lands in WhatsApp (your `WHATSAPP_HOME_CHANNEL`). Tune or disable any of them with the
+`SOTTO_PROACTIVE*` variables in [RAILWAY.md](RAILWAY.md).
+
+## If something's off
+
+The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: setup link says
+`localhost` (generate a domain), no reply in self-chat (allowlist number must match exactly), briefs
+never arrive (check the boot key-check line + `/debug/brief-log`), Google dying after a week (consent
+screen left in Testing — step 3②.3). Uninstalling the Mac app:
+**[docs/UNINSTALL.md](docs/UNINSTALL.md)**.
+
+**Staying current:** Sotto's skills update themselves on every redeploy, and your server tells you
+when a newer Sotto is published — one quiet line at the foot of your `/setup` (Integrations) page;
+merge Railway's update PR, or hit **Sync fork** on GitHub, and the redeploy is the update. The Bridge
+flags updates in its own menu and installs them itself after verifying the signature (pairing +
+permissions persist). The full picture — including upgrading the underlying Hermes runtime — is
+**RAILWAY.md § Staying updated**.
+
+---
+
+## Already have a Hermes or OpenClaw? (existing host)
+
+You just add the Sotto layer — no redeploy of your host:
+
+- **Existing Hermes:** `BRIDGE_TOKEN=<your-token> ./adapters/hermes/install.sh` — adds the skills,
+  persona, `sotto-local` MCP, and schedule without touching your global model. Cloud host → set
+  `BRIDGE_TOKEN` in its env; local host → the Bridge runs over stdio (pick **"This Mac"** in the app).
+- **OpenClaw:** `./adapters/openclaw/install.sh` — copies the skills, writes the persona + operating
+  rules into the agent workspace (`SOUL.md` / `IDENTITY.md` / `AGENTS.md`), and registers the Bridge
+  MCP via the OpenClaw CLI. See [adapters/openclaw/README.md](adapters/openclaw/README.md) for what
+  was validated live and the short "Still unverified" list.
+
+## Local instead of cloud?
+
+Everything runs on your Mac over stdio — no Railway, no pairing, no hosting bill; briefs only fire
+while the Mac is awake. Full walkthrough: **[LOCAL-SETUP.md](LOCAL-SETUP.md)**.

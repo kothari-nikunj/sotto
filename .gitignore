@@ -1,0 +1,28 @@
+**/.pytest_cache/
+**/__pycache__/
+*.pyc
+sotto-bridge/core/target/
+.DS_Store
+# Bridge build/release artifacts (build-app.sh + release.sh outputs — never committed;
+# users get the app via the signed DMG on GitHub Releases)
+sotto-bridge/app/Sotto Bridge.app/
+sotto-bridge/app/Sotto-Bridge-*.dmg
+sotto-bridge/app/.build/
+# Bridge access-code signing key — the ED25519 private key that mints access codes. Its durable home
+# is the GitHub Actions secret SOTTO_BRIDGE_SIGNING_KEY; the working copy lives at
+# ~/.sotto/bridge-signing.key (0600), OUTSIDE any checkout. These patterns are the belt to that
+# braces, and tools/prepare-public-repo.sh's SECRETS guard is the third layer.
+**/bridge-signing.key
+**/*signing.key
+**/bridge-access-codes.log
+# ship.sh markers: monorepo commit of the last Bridge DMG released from this machine +
+# the remembered notarytool keychain-profile name + the remembered Railway template URL
+sotto-bridge/.last-ship
+sotto-bridge/.notary-profile
+sotto-bridge/.template-url
+# The Golden Corpus — the owner's real history, pseudonymized. "Scrubbed" never means "shareable":
+# it lives on his infrastructure only (docs/plans/golden-corpus.md), is deleted by
+# tools/prepare-public-repo.sh, and is guarded there (CORPUS GUARD). The identity map lives on the
+# volume ($SOTTO_DATA/corpus-keys/), outside any checkout, and is never needed to run evals.
+sotto-chief-of-staff/evals/corpus/
+*.map.json

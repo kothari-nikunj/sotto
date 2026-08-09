@@ -1,0 +1,335 @@
+/* Sotto — /setup, the Integrations page of the same product.
+   app.css is linked FIRST: fonts, :root tokens (light + dark), and the shared
+   shell (.site / .sidebar / .nav / .content) all come from there. This file
+   styles only the server-rendered setup markup: page header, the hero CTA,
+   the numbered connection steps, forms, the QR block, and the narrow
+   transient pages. Every var() used here is defined in app.css — no new
+   tokens, no new fonts, nothing external. Dark mode falls out of the tokens.
+
+   Surfaces: the step tiles are the SAME borderless panel the dashboard uses
+   (--panel, --radius-panel, no border, no shadow) — the card edge IS the
+   boundary, so nothing here draws a rule. The only true borders left are form
+   controls (.field), which are inputs, not rules. */
+
+/* ---------- Page header ---------- */
+
+.page-title {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 600;
+  letter-spacing: -0.022em;
+  line-height: 1.08;
+  margin: 0 0 var(--space-3);
+  text-wrap: balance;
+}
+
+.page-sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--ink-light);
+  font-size: var(--text-body);
+  line-height: 1.55;
+  margin: 0 0 var(--space-8);
+  max-width: 46ch;
+}
+
+/* ---------- Hero CTA — the one deliberate accent moment (setup complete) ---------- */
+
+a.hero-cta {
+  display: block;
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  line-height: 1.35;
+  color: var(--ink);
+  text-decoration: none;
+  background: var(--panel);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+  padding: var(--space-5) var(--space-6);
+  margin: 0 0 var(--space-8);
+  transition: box-shadow var(--dur-hover) ease,
+              background-color var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+a.hero-cta:hover {
+  text-decoration: none;
+  color: var(--ink);
+  background: var(--accent-muted);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+a.hero-cta:active { transform: scale(0.99); }
+
+/* ---------- Connection steps ----------
+   section.tile is the wizard's step surface: the shared borderless panel
+   (--panel, --radius-panel), a numbered head, a state word, a stacked body.
+   State reads from the mono state word + the tiny to-do dot alone — sentences
+   stay ink, and the panel edge is the only boundary. */
+
+.tile {
+  background: var(--panel);
+  box-shadow: none;
+  border-radius: var(--radius-panel);
+  padding: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--space-4);
+}
+
+.tile-num {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+  box-shadow: none;
+  background: var(--panel-lift);
+}
+.tile[data-state="done"] .tile-num {
+  background: var(--accent-muted);
+  color: var(--ink-secondary);
+  box-shadow: inset 0 0 0 1px var(--accent-underline);
+}
+
+h2.tile-title {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  line-height: 1.25;
+  margin: 0;
+  text-wrap: balance;
+}
+
+.tile-state {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin-left: auto;
+}
+.tile[data-state="done"] .tile-state { color: var(--success); }
+.tile[data-state="optional"] .tile-state { color: var(--ink-muted); }
+/* "to do" — ink-muted with a still accent marker (no motion) */
+.tile[data-state="todo"] .tile-state::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+/* ---------- Step body — status line, meta, hint, controls ---------- */
+
+.tile-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.tile-body form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  align-self: stretch;
+  margin: 0;
+}
+
+/* Status sentences are ink — the state word above carries the state color. */
+.tile-status {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.6;
+  color: var(--ink-secondary);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.tile-meta {
+  font-family: var(--font-mono);
+  font-style: normal;
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-muted);   /* dates/host lines are read, not decoration */
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Hints are SENTENCES, so they read in the serif at the body size, a shade
+   quieter than a status line. Mono stays the label layer (.tile-state,
+   .tile-meta, buttons) — it was never meant to carry paragraphs. */
+.tile-hint {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.55;
+  color: var(--ink-light);
+  margin: 0;
+  max-width: 56ch;
+  overflow-wrap: anywhere;
+}
+.tile-hint a { color: var(--ink-secondary); }
+ol.tile-hint { padding-left: 1.25em; margin: 0; }
+ol.tile-hint li { margin: 0 0 var(--space-2); }
+ol.tile-hint li:last-child { margin-bottom: 0; }
+
+/* A long copyable string (the pairing link) is a BLOCK, not an inline pill —
+   inline it broke into three ragged rounded fragments across the wrap. */
+.code-block {
+  display: block;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  line-height: 1.6;
+  margin-bottom: var(--space-2);
+}
+
+/* the copyable pairing link */
+.code, code {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  background: var(--panel-lift);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Buttons — the shared quiet-paper language, element-agnostic ---------- */
+
+.btn-primary,
+.btn-quiet {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  padding: 0.5rem 0.9rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color var(--dur-hover) ease,
+              color var(--dur-hover) ease,
+              box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.btn-primary:hover,
+.btn-quiet:hover { text-decoration: none; }
+.btn-primary:active,
+.btn-quiet:active { transform: scale(0.97); }
+
+/* Primary = the lifted chip, a shade firmer — never a filled green block */
+.btn-primary {
+  background: var(--panel-lift);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--accent-underline);
+}
+.btn-primary:hover { background: var(--accent-muted); color: var(--ink); }
+
+.btn-quiet {
+  background: none;
+  color: var(--ink-muted);
+  box-shadow: none;
+}
+.btn-quiet:hover { color: var(--accent-text); background: var(--accent-muted); }
+
+/* ---------- Fields — paper-white, warm border, quiet focus ring ---------- */
+
+.field {
+  display: block;
+  width: 100%;
+  align-self: stretch;
+  font-family: var(--font-mono);
+  font-size: 1rem; /* ≥16px so iOS doesn't zoom the viewport on focus */
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--panel-lift);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+}
+.field::placeholder { color: var(--ink-faint); }
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+textarea.field {
+  min-height: 132px;
+  resize: vertical;
+}
+
+/* ---------- QR block — mono, scrollable, paper-alt ---------- */
+
+pre.qr {
+  align-self: stretch;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  line-height: 1.25;
+  color: var(--ink);
+  background: var(--panel-lift);
+  border-radius: var(--radius-panel);
+  padding: var(--space-4);
+  margin: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* server-side error line */
+.err {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  color: var(--urgent);
+  margin: 0 0 var(--space-3);
+}
+
+/* ---------- Narrow transient pages (QR / Google / connect) ---------- */
+
+.content.narrow { max-width: 592px; } /* ~560px column + the .content gutters */
+
+/* Page-foot lines: the closing sentence and the host/version facts sit OFF the
+   last panel, with the sectional gap between. */
+.tile + .tile-hint,
+.tile + .page-sub { margin-top: var(--space-10); }
+.tile-hint + .tile-meta,
+.page-sub + .tile-meta,
+.tile-meta + .tile-meta { margin-top: var(--space-3); }
+
+/* ---------- Wider screens ---------- */
+
+/* Same contract as app.css: a borderless panel gets an explicit edge back when
+   the reader asks for more contrast. */
+@media (prefers-contrast: more) {
+  .tile, a.hero-cta, pre.qr, .code-block { box-shadow: inset 0 0 0 1px var(--ink-muted); }
+}
+
+@media (min-width: 640px) {
+  .tile { padding: var(--space-6) var(--space-8); }
+}

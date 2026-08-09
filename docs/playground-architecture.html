@@ -1,0 +1,1534 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sotto — the machine, explorable</title>
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   Sotto's ledger design system, self-contained.
+   Besley + Martian Mono are referenced by NAME ONLY (no @font-face, no
+   network): served from the dashboard the reader may already have them; as a
+   loose file this falls to Georgia / ui-monospace and still reads as a ledger.
+   Surfaces: grouped content sits on a soft, BORDERLESS panel one shade off
+   the ground (--panel, --radius-panel) — the panel edge is the boundary the
+   old hairlines drew. The masthead double rule is the ONE rule left on the
+   page. Everything else separates by surface and air. Accent = punctuation.
+   ───────────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  color-scheme: light dark;
+
+  --ink: #221c12;
+  --ink-secondary: #4c4433;
+  --ink-light: #6b6250;
+  --ink-muted: #746b57;
+  --ink-faint: #93886e;
+
+  --paper: #f4efe4;
+  --paper-alt: #ece5d6;
+
+  /* the panel system — one shade off the ground, borderless */
+  --panel: #ece7d9;
+  --panel-lift: #fbf8f0;
+  --border: #ddd4c0;
+
+  --accent: #26604e;
+  --accent-text: #1f5747;
+  --accent-soft: rgba(38, 96, 78, 0.13);
+  --accent-muted: rgba(38, 96, 78, 0.055);
+
+  --urgent: #a4321f;
+  --urgent-soft: rgba(164, 50, 31, 0.09);
+  --health-active: #2c8a4f;
+  --health-active-soft: rgba(44, 138, 79, 0.16);
+  --health-cooling: #c07f10;
+  --health-cooling-soft: rgba(192, 127, 16, 0.15);
+  --health-cold: #948b7c;
+  --health-cold-soft: rgba(148, 139, 124, 0.18);
+
+  --radius-sm: 6px;
+  --radius-panel: 12px;
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 20px; --space-6: 24px; --space-8: 32px;
+  --space-10: 40px; --space-12: 48px; --space-16: 64px;
+
+  --font-serif: Besley, Georgia, serif;
+  --font-mono: "Martian Mono", ui-monospace, "SF Mono", monospace;
+  /* The same five type tokens the dashboard's app.css documents. */
+  --mono-meta: 0.6875rem;     /* 11px — folios, counts, chips, buttons */
+  --text-eyebrow: 0.6875rem;  /* 11px — eyebrows + section caps */
+  --text-body: 1.0625rem;     /* 17px — every serif reading size */
+  --text-title: 1.3125rem;    /* 21px — row titles / panel headings */
+  --text-display: clamp(2rem, 7.6vw, 2.6rem);
+  --ls-tight: 0.01em;
+  --ls-wide: 0.035em;
+  --ls-eyebrow: 0.1em;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --dur-press: 120ms;
+  --dur-hover: 150ms;
+  --dur-enter: 200ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #eae3d3;
+    --ink-secondary: #cbc2ad;
+    --ink-light: #a89d86;
+    --ink-muted: #998e75;
+    --ink-faint: #6e6450;
+
+    --paper: #191510;
+    --paper-alt: #201b14;
+
+    --panel: #211c15;
+    --panel-lift: #2a241b;
+    --border: #362e20;
+
+    --accent: #64887a;
+    --accent-text: #95b2a4;
+    --accent-soft: rgba(149, 178, 164, 0.2);
+    --accent-muted: rgba(149, 178, 164, 0.07);
+
+    --urgent: #e2705a;
+    --urgent-soft: rgba(226, 112, 90, 0.13);
+    --health-active: #63a487;
+    --health-active-soft: rgba(99, 164, 135, 0.16);
+    --health-cooling: #d9a83e;
+    --health-cooling-soft: rgba(217, 168, 62, 0.15);
+    --health-cold: #8d8270;
+    --health-cold-soft: rgba(141, 130, 112, 0.18);
+
+  }
+}
+
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.62;
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100dvh;
+}
+
+/* ---------- The mono label layer — one size, one voice ---------- */
+.mono, .eyebrow, .ledger-cap, .masthead-folio, .chip, .rail a, .btn, .folio {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--mono-meta);
+}
+
+/* The panel — the one grouped-content surface. Borderless, shadowless. */
+.ledger, .card, .node, .stage, .verdict, .circuit, .score, .scoreboard-panel {
+  background: var(--panel);
+  border: none;
+  box-shadow: none;
+  border-radius: var(--radius-panel);
+}
+
+/* ---------- Shell ---------- */
+.site { min-height: 100dvh; }
+.content {
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-5) var(--space-16);
+}
+
+.rail { display: none; }
+@media (min-width: 1040px) {
+  .site { display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+  .rail {
+    display: block;
+    position: sticky;
+    top: 0;
+    align-self: start;
+    max-height: 100dvh;
+    overflow-y: auto;
+    padding: var(--space-6) var(--space-4);
+    border-right: 1px solid var(--border);
+  }
+  .content { margin: 0; padding-left: var(--space-6); }
+}
+.rail .brand {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-transform: none;
+  display: block;
+  margin-bottom: var(--space-1);
+}
+.rail .brand span { color: var(--accent-text); font-style: normal; }
+.rail .brand-sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-light);
+  margin-bottom: var(--space-5);
+}
+.rail nav { display: flex; flex-direction: column; gap: 2px; }
+.rail a {
+  color: var(--ink-muted);
+  text-decoration: none;
+  padding: 6px 0 6px 14px;
+  border-left: 1px solid transparent;
+  transition: color var(--dur-hover) ease;
+}
+.rail a:hover { color: var(--accent-text); }
+.rail a.on { color: var(--ink); border-left-color: var(--accent); }
+.rail .rail-foot {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-faint);
+  margin-top: var(--space-6);
+  text-transform: none;
+}
+
+/* ---------- Masthead ---------- */
+.masthead-folio {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--space-3);
+  font-weight: 600; letter-spacing: var(--ls-eyebrow);
+  font-size: var(--text-eyebrow);
+  color: var(--accent-text);
+  margin: 0 0 var(--space-3);
+}
+.masthead-folio .folio-no { color: var(--ink-faint); font-weight: 500; }
+.masthead-date {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 700; letter-spacing: -0.024em; line-height: 1.05;
+  margin: 0 0 var(--space-5);
+  text-wrap: balance;
+}
+.thesis { color: var(--ink-secondary); max-width: 62ch; }
+.thesis em { color: var(--ink); font-style: italic; }
+
+.head-rule {
+  border: none; height: 5px;
+  border-top: 2.5px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+  background: transparent;
+  margin: var(--space-6) 0 var(--space-10);
+}
+
+/* ---------- Section caps + the ledger ---------- */
+.eyebrow {
+  font-weight: 600; letter-spacing: var(--ls-eyebrow);
+  font-size: var(--text-eyebrow);
+  color: var(--accent-text);
+  margin: 0 0 var(--space-3);
+}
+section { margin-bottom: var(--space-16); scroll-margin-top: var(--space-4); }
+.ledger-cap {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--space-3);
+  font-weight: 600; letter-spacing: var(--ls-eyebrow);
+  font-size: var(--text-eyebrow);
+  color: var(--ink-muted);
+  margin: 0 0 var(--space-3);
+}
+.ledger-cap .cap-count { color: var(--ink-faint); font-weight: 500; }
+.ledger { padding: var(--space-2) var(--space-4); margin-bottom: var(--space-10); }
+.cap-sub {
+  font-style: italic; color: var(--ink-light); line-height: 1.55;
+  margin: 0 0 var(--space-4); max-width: 56ch;
+}
+h2.act {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 600; letter-spacing: -0.022em; line-height: 1.08;
+  margin: 0 0 var(--space-3);
+  text-wrap: balance;
+}
+
+/* ---------- Rows ---------- */
+.row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  column-gap: var(--space-4);
+  align-items: baseline;
+  padding: var(--space-4) 0;
+  position: relative;
+  width: 100%;
+  text-align: left;
+  background: none; border: none; color: inherit;
+  font: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background-color var(--dur-hover) ease;
+}
+.row.static { cursor: default; }
+.row:hover:not(.static) { background: var(--panel-lift); }
+.row.sel { background: var(--accent-muted); }
+.row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  align-self: start; margin-top: 9px; justify-self: start;
+  background: var(--health-cold);
+  box-shadow: 0 0 0 3px var(--health-cold-soft);
+  transition: background-color var(--dur-enter) ease, box-shadow var(--dur-enter) ease;
+}
+.dot.on   { background: var(--health-active); box-shadow: 0 0 0 3px var(--health-active-soft); }
+.dot.warn { background: var(--health-cooling); box-shadow: 0 0 0 3px var(--health-cooling-soft); }
+.dot.bad  { background: var(--urgent); box-shadow: 0 0 0 3px var(--urgent-soft); }
+.dot.live { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.row-main { min-width: 0; }
+/* The row's parts are SPANS in the markup below; without this they run
+   together ("1. KnowledgeBriefs extract facts…"). Blockify in CSS — the
+   markup and its data island stay exactly as they are. */
+.row-main, .row-title, .row-sub, .row-detail { display: block; }
+.row-title {
+  font-weight: 600; font-size: var(--text-title);
+  letter-spacing: -0.012em; line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.row-sub { font-size: var(--text-body); line-height: 1.5; color: var(--ink-secondary); margin-top: 2px; }
+.row-detail { font-style: italic; color: var(--ink-light); margin-top: 1px; }
+.folio {
+  color: var(--ink-muted); text-align: right;
+  white-space: normal; overflow-wrap: anywhere; max-width: 7.5rem;
+  line-height: 1.5;
+  align-self: start; padding-top: 6px;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
+}
+@media (min-width: 640px) { .folio { max-width: 15rem; } }
+
+/* ---------- Chips ---------- */
+.chip {
+  display: inline-block;
+  padding: 3px 8px; border-radius: var(--radius-sm);
+  background: var(--panel-lift); color: var(--ink-muted);
+  white-space: nowrap;
+}
+.chip.accent { background: var(--accent-muted); }
+.chip.warn { background: var(--health-cooling-soft); }
+.chip.bad  { background: var(--urgent-soft); color: var(--urgent); }
+.chips { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
+
+/* ---------- Cards / dossier ---------- */
+.card { padding: var(--space-5) var(--space-6); }
+.card + .card { margin-top: var(--space-3); }
+.card h3 {
+  font-family: var(--font-serif);
+  font-size: var(--text-title); font-weight: 600;
+  letter-spacing: -0.012em; line-height: 1.25; margin: 0 0 var(--space-2);
+  text-wrap: balance;
+}
+.card p { color: var(--ink-secondary); }
+.card p + p { margin-top: var(--space-2); }
+.card .file {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-faint); letter-spacing: var(--ls-tight);
+  overflow-wrap: anywhere; margin-bottom: var(--space-2);
+  text-transform: none;
+}
+.dossier { margin-top: var(--space-4); }
+.dossier .empty { font-style: italic; color: var(--ink-light); }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+  padding: 0.5rem 0.9rem; letter-spacing: var(--ls-eyebrow);
+  background: var(--panel-lift); color: var(--ink);
+  border: none; box-shadow: none;
+  border-radius: var(--radius-sm); cursor: pointer;
+  transition: background-color var(--dur-hover) ease,
+              box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.btn:hover { background: var(--accent-muted); color: var(--accent-text); }
+.btn:active { transform: scale(0.97); }
+.btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+.btn.on { box-shadow: inset 0 0 0 1px var(--accent); color: var(--ink); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btnbar { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); }
+
+/* ---------- The map (Act I) ---------- */
+.map { display: grid; gap: var(--space-3); margin-bottom: var(--space-2); }
+@media (min-width: 720px) { .map.three { grid-template-columns: 1fr 1fr 1fr; align-items: stretch; } }
+.node {
+  padding: var(--space-4) var(--space-5);
+  text-align: left; font: inherit; color: inherit;
+  border: none; cursor: pointer; width: 100%;
+  transition: background-color var(--dur-hover) ease, box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.node:hover { background: var(--panel-lift); }
+.node:active { transform: scale(0.99); }
+.node.sel { box-shadow: inset 0 0 0 1px var(--accent); }
+.node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.node .nlabel {
+  font-family: var(--font-mono); font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase; letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted); display: block; margin-bottom: var(--space-1);
+}
+.node .ntitle { font-size: var(--text-title); font-weight: 600; letter-spacing: -0.008em; }
+.node .nsub { color: var(--ink-secondary); font-size: var(--text-body); }
+.flow {
+  display: flex; align-items: center; justify-content: center; gap: var(--space-2);
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  text-transform: uppercase; letter-spacing: var(--ls-wide);
+  color: var(--ink-faint); margin: var(--space-2) 0;
+}
+.flow .arrow { color: var(--accent-text); }
+
+/* ---------- The spine (Act III) ---------- */
+.spine { display: grid; gap: var(--space-2); }
+@media (min-width: 860px) { .spine { grid-template-columns: repeat(5, 1fr); } }
+.stage {
+  padding: var(--space-4);
+  text-align: left; font: inherit; color: inherit; border: none; cursor: pointer;
+  transition: background-color var(--dur-hover) ease, box-shadow var(--dur-hover) ease;
+}
+.stage:hover { background: var(--panel-lift); }
+.stage.sel { box-shadow: inset 0 0 0 1px var(--accent); }
+.stage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.stage .sno {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-faint); letter-spacing: var(--ls-wide); display: block;
+}
+.stage .sname { font-size: var(--text-title); font-weight: 600; letter-spacing: -0.008em; }
+.stage .sverb { font-style: italic; color: var(--ink-light); }
+
+/* ---------- Tables (shared files) ---------- */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 460px; }
+th, td { text-align: left; padding: var(--space-2) var(--space-3) var(--space-2) 0; vertical-align: top; }
+th {
+  font-family: var(--font-mono); font-size: var(--text-eyebrow);
+  text-transform: uppercase; letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted); font-weight: 600;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);   /* a table head IS a rule */
+}
+td { color: var(--ink-secondary); }
+td .path {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink); text-transform: none; letter-spacing: var(--ls-tight);
+  overflow-wrap: anywhere;
+}
+tr.shared td { background: var(--accent-muted); }
+
+/* ---------- The funnel ---------- */
+.gate {
+  display: grid;
+  grid-template-columns: 30px 14px minmax(0, 1fr) minmax(0, auto);
+  column-gap: var(--space-3);
+  align-items: baseline;
+  width: 100%; text-align: left; font: inherit; color: inherit;
+  background: none; border: none; cursor: pointer;
+  padding: var(--space-3) 0;
+  border-radius: var(--radius-sm);
+  transition: background-color var(--dur-hover) ease, opacity var(--dur-enter) ease;
+}
+.gate:hover { background: var(--panel-lift); }
+.gate.sel { background: var(--panel-lift); }
+.gate:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.gate .gno { font-family: var(--font-mono); font-size: var(--mono-meta); color: var(--ink-faint); }
+.gate > span { min-width: 0; }
+.gate .gname { font-weight: 600; letter-spacing: -0.012em; }
+.gate .grule { color: var(--ink-secondary); font-size: var(--text-body); overflow-wrap: anywhere; }
+.gate .gclass {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-muted); text-align: right;
+  white-space: normal; overflow-wrap: anywhere; max-width: 5.5rem; line-height: 1.5;
+  text-transform: none; letter-spacing: var(--ls-tight);
+}
+@media (min-width: 640px) { .gate .gclass { max-width: 12rem; } }
+.gate.dim { opacity: 0.38; }
+.gate.walk { background: var(--accent-muted); }
+.gate.stop { background: var(--urgent-soft); }
+.tier-cap {
+  font-family: var(--font-mono); font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase; letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin: var(--space-6) 0 var(--space-2);
+}
+.tier-cap:first-child { margin-top: 0; }
+.verdict { margin-top: var(--space-5); padding: var(--space-5) var(--space-6); }
+.verdict .vlabel {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  text-transform: uppercase; letter-spacing: var(--ls-wide);
+  color: var(--ink-muted); display: block; margin-bottom: var(--space-1);
+}
+.verdict .vhead { font-size: var(--text-title); font-weight: 600; letter-spacing: -0.01em; }
+.verdict .vhead.nudge { color: var(--accent-text); }
+.verdict .vhead.queued { color: var(--ink); }
+.verdict .vhead.dropped { color: var(--urgent); }
+.verdict .vwhy { color: var(--ink-secondary); margin-top: var(--space-1); }
+.verdict .vnext { font-style: italic; color: var(--ink-light); margin-top: var(--space-2); }
+.trace { margin-top: var(--space-3); }
+.trace li {
+  list-style: none;
+  font-size: var(--text-body); color: var(--ink-secondary);
+  padding: 3px 0 3px 0;
+}
+.trace li .tno {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-faint); margin-right: 0.6em;
+}
+
+/* ---------- Misc ---------- */
+.foot {
+  margin-top: var(--space-8);
+  font-style: italic; color: var(--ink-faint);
+  max-width: 62ch;
+}
+.foot a, .content a { color: inherit; text-decoration-color: var(--ink-faint); }
+.content a:hover { color: var(--accent-text); }
+.skip {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="site">
+
+  <header class="rail">
+    <span class="brand">Sotto<span>.</span></span>
+    <div class="brand-sub">The machine, explorable.</div>
+    <nav id="rail">
+      <a href="#act1" class="on">I · Two pieces</a>
+      <a href="#act2">II · The runtime</a>
+      <a href="#act3">III · The spine</a>
+      <a href="#act4">IV · The funnel</a>
+      <a href="#act5">V · See it live</a>
+    </nav>
+    <p class="rail-foot">Everything on this page is a rule that exists in code. Click anything.</p>
+  </header>
+
+  <main class="content">
+
+    <div class="masthead-folio">
+      <span>Sotto · playground</span>
+      <span class="folio-no">Folio № 01 — architecture</span>
+    </div>
+    <h1 class="masthead-date">The machine, explorable</h1>
+    <p class="thesis">
+      Two processes, five modules, four daemon threads, sixteen skills, and one funnel that
+      decides whether your phone buzzes. <em>Click a piece to open its dossier</em>; the funnel at
+      the bottom will walk a real event through its gates and tell you what happened, and why.
+    </p>
+    <hr class="head-rule">
+
+    <!-- ════════════════════════ ACT I ════════════════════════ -->
+    <section id="act1">
+      <p class="eyebrow">Act I</p>
+      <h2 class="act">Two pieces and a volume</h2>
+      <p class="cap-sub">
+        A Mac that can read your messages, and a container that can think. They never share a
+        network — the Mac pushes out and long-polls back, so nothing at home needs an open port.
+      </p>
+
+      <div class="map three">
+        <button class="node" data-node="bridge">
+          <span class="nlabel">On your Mac</span>
+          <span class="ntitle">Sotto Bridge</span>
+          <span class="nsub">Menu-bar app over a read-only Rust engine. Watches, pushes, answers.</span>
+        </button>
+        <button class="node" data-node="receiver">
+          <span class="nlabel">In the container</span>
+          <span class="ntitle">Trigger receiver</span>
+          <span class="nsub">Stdlib HTTP on <code>$PORT</code>. The front door and the funnel's dispatch half.</span>
+        </button>
+        <button class="node" data-node="hermes">
+          <span class="nlabel">Beside it</span>
+          <span class="ntitle">Hermes</span>
+          <span class="nsub">The agent loop, the chat gateway, the cron scheduler.</span>
+        </button>
+      </div>
+
+      <div class="flow">
+        <span>Bridge</span><span class="arrow">→</span><span>receiver</span>
+        <span class="arrow">←</span><span>Hermes</span>
+        <span class="arrow">·</span><span>shared: <code>$SOTTO_DATA</code></span>
+      </div>
+
+      <div class="map">
+        <button class="node" data-node="surfaces">
+          <span class="nlabel">Two surfaces, one product</span>
+          <span class="ntitle">Chat &amp; The Window</span>
+          <span class="nsub">Text is primary; the dashboard visualizes — and every lever it offers
+            shells out to the same CLI a texted instruction would.</span>
+        </button>
+        <button class="node" data-node="volume">
+          <span class="nlabel">The one shared thing</span>
+          <span class="ntitle">The <code>$SOTTO_DATA</code> volume</span>
+          <span class="nsub">Everything that crosses a process boundary crosses as a file.</span>
+        </button>
+      </div>
+
+      <div class="dossier" id="dossier1"><div class="card"><p class="empty">Pick a piece above.</p></div></div>
+    </section>
+
+    <!-- ════════════════════════ ACT II ════════════════════════ -->
+    <section id="act2">
+      <p class="eyebrow">Act II</p>
+      <h2 class="act">The runtime, module by module</h2>
+      <p class="cap-sub">
+        All stdlib, no framework. <code>receiver.py</code> loads the other four with
+        <code>importlib</code> and injects <code>HOOKS</code> — late-bound lambdas over its own
+        globals — so no module ever imports the receiver back.
+      </p>
+
+      <div class="ledger-cap"><span>The five modules</span><span class="cap-count">runtime/trigger-receiver</span></div>
+      <div class="ledger" id="modules"></div>
+
+      <div class="ledger-cap" style="margin-top:var(--space-6)"><span>The four daemon threads</span><span class="cap-count">daemon=True · swallow their own exceptions</span></div>
+      <div class="ledger" id="threads"></div>
+
+      <div class="ledger-cap" style="margin-top:var(--space-6)"><span>The five subprocess boundaries</span><span class="cap-count">the receiver image cannot import the skills tree</span></div>
+      <div class="ledger" id="forks"></div>
+
+      <div class="dossier" id="dossier2"><div class="card"><p class="empty">Pick a module, a thread, or a fork.</p></div></div>
+
+      <div class="ledger-cap" style="margin-top:var(--space-6)"><span>The shared files</span><span class="cap-count">writer → reader</span></div>
+      <div class="ledger" style="padding-top:var(--space-3)">
+        <p class="cap-sub">
+          Every JSON write goes through <code>connectors.write_json</code> (tmp at 0600 →
+          <code>os.replace</code>), so a crash mid-write can never leave a torn file. Every row but
+          the last is <strong>one-way</strong>: exactly one writer, readers that never write. That
+          is the property that keeps the two processes from needing a lock.
+        </p>
+        <div class="btnbar">
+          <button class="btn" id="oneWayBtn" aria-pressed="false">Show the one shared-write file</button>
+        </div>
+        <div class="tablewrap">
+          <table id="filesTable">
+            <thead><tr><th>File</th><th>Writer</th><th>Reader</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="dossier" id="sharedNote"></div>
+      </div>
+    </section>
+
+    <!-- ════════════════════════ ACT III ════════════════════════ -->
+    <section id="act3">
+      <p class="eyebrow">Act III</p>
+      <h2 class="act">The skills spine</h2>
+      <p class="cap-sub">
+        The container half is the plumbing. The product is the skills tree — and every Sotto
+        behaviour is the same five-step spine. Deterministic Python does the gathering and the
+        learning; one Gemini call composes; a validator rejects a malformed or hallucinated brief
+        before it reaches you. <strong>The LLM writes prose — it never decides whether to interrupt
+        you.</strong>
+      </p>
+
+      <div class="spine" id="spine"></div>
+      <div class="dossier" id="dossier3"><div class="card"><p class="empty">Pick a step of the spine.</p></div></div>
+
+      <div class="ledger-cap" style="margin-top:var(--space-6)"><span>The sixteen skills</span><span class="cap-count" id="skillCount"></span></div>
+      <div class="ledger" id="skills"></div>
+      <p class="cap-sub" style="margin-top:var(--space-3)">
+        Where the schedule lives: <code>adapters/hermes/crons.json</code> is the ONE source for the
+        cron jobs — morning brief {cron.morning}, midday digest {cron.midday}, evening brief
+        {cron.evening}, relationship pulse {cron.pulse_day} {cron.pulse_time}, proactive check every
+        {cron.proactive_min} minutes. Four registrars read that file; none of them
+        keeps its own copy.
+      </p>
+    </section>
+
+    <!-- ════════════════════════ ACT IV ════════════════════════ -->
+    <section id="act4">
+      <p class="eyebrow">Act IV — the interactive one</p>
+      <h2 class="act">The funnel</h2>
+      <p class="cap-sub">
+        Every event — a text, a WhatsApp message, a call, an email the container polled itself, a
+        meeting that just ended — is deduped by <code>(source, rowid)</code> and runs through
+        <strong>one</strong> funnel, synchronously. Tier 0 is deterministic and free. Tier 1 is one
+        cheap LLM call on whatever survives. <em>Any Tier-1 error queues</em> — the funnel fails
+        toward silence, never toward noise.
+      </p>
+
+      <div class="ledger-cap"><span>Pick a scenario</span><span class="cap-count">then watch it walk</span></div>
+      <div class="ledger" style="padding-top:var(--space-3)">
+        <div class="btnbar" id="scenarios"></div>
+        <div class="btnbar">
+          <button class="btn" id="runBtn" disabled>Run the event</button>
+          <button class="btn" id="resetBtn">Reset</button>
+        </div>
+        <p class="cap-sub" id="scenarioNote" style="margin-bottom:var(--space-2)">
+          Nothing loaded. Pick one of the six above — each is a real path through the code, not an
+          illustration.
+        </p>
+      </div>
+
+      <p class="tier-cap">Tier 0 — deterministic, free, in this order</p>
+      <div class="ledger" id="tier0" style="padding-top:var(--space-2)"></div>
+
+      <p class="tier-cap">Tier 1 — one cheap model call on the survivors</p>
+      <div class="ledger" id="tier1" style="padding-top:var(--space-2)"></div>
+
+      <p class="tier-cap">Then, before dispatch — the volume controls</p>
+      <div class="ledger" id="post" style="padding-top:var(--space-2)"></div>
+
+      <div class="verdict" id="verdict" hidden>
+        <span class="vlabel">Verdict</span>
+        <div class="vhead" id="vhead"></div>
+        <div class="vwhy" id="vwhy"></div>
+        <div class="vnext" id="vnext"></div>
+        <ol class="trace" id="vtrace"></ol>
+      </div>
+
+      <div class="dossier" id="dossier4"><div class="card"><p class="empty">Or click any gate to read its rule.</p></div></div>
+    </section>
+
+    <!-- ════════════════════════ ACT V ════════════════════════ -->
+    <section id="act5">
+      <p class="eyebrow">Act V</p>
+      <h2 class="act">Where to see it live</h2>
+      <p class="cap-sub">
+        Nothing above is a diagram of an intention. Every number has a state file, and the dashboard
+        renders those files without recomputing them.
+      </p>
+      <div class="ledger-cap"><span>The Window</span><span class="cap-count">your deploy URL → /app</span></div>
+      <div class="ledger" id="live"></div>
+    </section>
+
+    <p class="foot">
+      Sources of truth for this page: <code>docs/ARCHITECTURE.md</code>,
+      <code>docs/HOW-SOTTO-DECIDES.md</code>, and the module docstrings of
+      <code>triage_event.py</code>, <code>receiver.py</code> and <code>calcache.py</code>. Defaults
+      shown are the shipped defaults; every one of them is an environment variable, documented in
+      <code>RAILWAY.md</code>. If this page and the code disagree, the code is right.
+    </p>
+
+  </main>
+</div>
+
+<!-- ═══════════════════ THE RULES ISLAND ═══════════════════
+     The ONE source for every numeric rule this page states. The prose, the labels and the
+     simulator all read from here — nothing below hardcodes a knob. Identical in both
+     playgrounds, and compared field-by-field against the code constants by
+     sotto-chief-of-staff/tests/test_docs_drift.py. CLAUDE.md's docs-stay-true rule: a behaviour
+     change updates the playground's rules island in the same commit. -->
+<script type="application/json" id="sotto-rules">
+{
+  "cron":       { "morning": "6:30", "midday": "12:30", "evening": "17:30",
+                  "pulse_day": "Mondays", "pulse_time": "9:00", "proactive_min": 15 },
+  "intervals":  { "events_tick_secs": 3, "email_poll_secs": 90, "valve_interval_secs": 900,
+                  "calendar_refresh_secs": 900, "triage_fork_secs": 30, "gmail_fork_secs": 180,
+                  "calendar_gather_fork_secs": 60, "dashboard_cli_fork_secs": 30 },
+  "calendar":   { "ttl_secs": 600, "stale_intervals": 2 },
+  "tap":        { "grace_min": 5, "max_per_day": 3 },
+  "quiet":      { "start_hour": 21, "end_hour": 7 },
+  "vip":        { "min_priority": 10 },
+  "tier1":      { "text_max_chars": 1500 },
+  "escalation": { "window_min": 45 },
+  "freshness":  { "event_max_age_min": 30 },
+  "cooldown":   { "min": 20 },
+  "budget":     { "nudge_per_day": 4 },
+  "valve":      { "max_per_tick": 2, "max_per_hour": 2, "max_age_min": 240 },
+  "digest":     { "min_signals": 8 },
+  "ledger":     { "max_mb": 4, "keep_lines": 4000 },
+  "style":      { "confirmed_floor": 0.95,
+                  "ttl_days": { "work_email": 90, "work_message": 60, "personal_message": 30 } },
+  "approval":   { "min_accepted": 3, "min_accept_rate": 0.8 },
+  "continuity": { "deadline_grace_days": 2, "terminal_retention_days": 30 },
+  "chase":      { "after_days": 3, "max": 2 },
+  "birthday":   { "lead_days": 3 },
+  "classes":    {
+    "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
+    "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
+    "budget_exempt":       ["missed_call", "escalation", "post_meeting"],
+    "meeting_hold_exempt": ["missed_call", "escalation"],
+    "cooldown_exempt":     ["escalation"],
+    "digest_count":        ["ambient", "quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"],
+    "digest_actionable":   ["quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"]
+  }
+}
+</script>
+
+<script>
+"use strict";
+/* ═══════════════════ THE RULES ISLAND ═══════════════════
+   Every numeric rule on this page comes from the <script id="sotto-rules"> block above — one
+   source, read once. Prose and labels carry {dotted.path} tokens with an optional :formatter;
+   `fill` resolves them at render time and `fillStatic` resolves the ones written into the static
+   markup. An unknown path throws loudly rather than rendering a hole.
+   Derived units are computed here, never stored twice: :min is seconds→minutes, :hours is
+   minutes→hours, :hhmm is an hour→"HH:00", :pct is a rate→percent, :word spells a small integer,
+   and :codes/:dots/:slash render a set the way the sentence around it needs it. */
+
+const RULES = JSON.parse(document.getElementById("sotto-rules").textContent);
+
+const NUM_WORDS = { 0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+                    7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+                    15: "fifteen", 20: "twenty", 30: "thirty", 45: "forty-five", 60: "sixty",
+                    90: "ninety", 240: "two hundred and forty" };
+
+const _vals = v => (Array.isArray(v) ? v : Object.keys(v).map(k => v[k]));
+
+const FMT = {
+  raw:   v => String(v),
+  min:   v => String(Math.round(v / 60)),
+  hours: v => String(Math.round(v / 60)),
+  hhmm:  v => (String(v).length < 2 ? "0" + v : String(v)) + ":00",
+  pct:   v => String(Math.round(v * 100)),
+  word:  v => (NUM_WORDS[v] !== undefined ? NUM_WORDS[v] : String(v)),
+  codes: v => _vals(v).map(x => "<code>" + x + "</code>").join(", "),
+  dots:  v => _vals(v).join(" · "),
+  slash: v => _vals(v).join("/")
+};
+
+function ruleAt(path) {
+  let v = RULES;
+  const keys = path.split(".");
+  for (let i = 0; i < keys.length; i++) {
+    if (v === null || typeof v !== "object" || !(keys[i] in v)) {
+      throw new Error("sotto-rules: unknown rule path " + path);
+    }
+    v = v[keys[i]];
+  }
+  return v;
+}
+
+const TOKEN_RE = /\{([a-z0-9_]+(?:\.[a-z0-9_]+)*)(?::([a-z]+))?\}/g;
+
+function fill(s) {
+  return String(s).replace(TOKEN_RE, function (m, path, fmt) {
+    const f = FMT[fmt || "raw"];
+    if (!f) throw new Error("sotto-rules: unknown formatter :" + fmt);
+    return f(ruleAt(path));
+  });
+}
+
+// Static markup carries tokens too (the cron line, for one). Rewriting text nodes in place keeps
+// every element identity — the rail's IntersectionObserver targets survive it.
+function fillStatic(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const hits = [];
+  while (walker.nextNode()) {
+    const n = walker.currentNode;
+    const parent = n.parentNode ? n.parentNode.nodeName : "";
+    if (parent === "SCRIPT" || parent === "STYLE") continue;
+    if (n.nodeValue.indexOf("{") >= 0) hits.push(n);
+  }
+  hits.forEach(n => { n.nodeValue = fill(n.nodeValue); });
+}
+
+
+/* ═══════════════════ DOSSIERS ═══════════════════
+   Every entry is prose written against the code at HEAD. `file` names where to
+   go read it. Nothing here is generated. */
+
+const DOSSIER = {
+  bridge: {
+    title: "Sotto Bridge — the Mac half",
+    file: "the Bridge's Rust core: watcher · readers · relay",
+    body: [
+      "A menu-bar app wrapping a read-only engine. It watches iMessage, WhatsApp and the call log, and POSTs new rows to <code>/bridge/events</code> within seconds — <code>SOTTO_EVENTS_TICK_SECS</code>, default {intervals.events_tick_secs}.",
+      "It also long-polls <code>/bridge/poll</code>. That is the reverse-MCP relay: Hermes calls <code>/mcp</code> locally, the receiver parks the request, the Mac picks it up on its next poll and answers. No tunnel, no inbound port, no dynamic DNS.",
+      "When the Mac has been asleep the backlog arrives as a <em>catchup</em> batch — and a catchup batch never nudges in real time (Tier 0's reconnect grace, gate 11 below)."
+    ],
+    chips: ["iMessage", "WhatsApp", "calls", "read-only", "outbound-only"]
+  },
+  receiver: {
+    title: "The trigger receiver — the front door",
+    file: "runtime/trigger-receiver/receiver.py",
+    body: [
+      "A stdlib HTTP server on <code>$PORT</code>. <code>start.sh</code> boots it <em>first</em>, so the platform's <code>/health</code> answers within seconds, and only then boots Hermes.",
+      "It owns <code>/health</code>, <code>/trigger</code>, <code>/bridge/*</code>, <code>/mcp</code>, <code>/setup*</code>, <code>/google/*</code>, <code>/connect/*</code> and <code>/debug/*</code> — plus brief-trigger dedup, the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks.",
+      "It carries no PyYAML and cannot import the skills tree. Everything that needs the tree is a fork on <code>sys.executable</code> with <code>SOTTO_DATA</code> passed explicitly — one policy, because interpreter ambiguity has bitten before."
+    ],
+    chips: ["stdlib only", "$PORT", "forks the tree"]
+  },
+  hermes: {
+    title: "Hermes — the agent loop",
+    file: "adapters/hermes/start.sh · crons.json · sotto-persona.md",
+    body: [
+      "The agent runtime, the chat gateway (WhatsApp / Telegram / iMessage) and the cron scheduler, running side by side with the receiver in one container.",
+      "The two processes share exactly one thing: the <code>$SOTTO_DATA</code> volume. No sockets, no queues, no RPC between them.",
+      "Skills run here. When the funnel decides an event deserves a nudge, the receiver fires <code>$SOTTO_RUN_SKILL</code> fire-and-forget — the skill delivers through the gateway, not back through the receiver."
+    ],
+    chips: ["agent loop", "gateway", "cron"]
+  },
+  surfaces: {
+    title: "Chat and The Window",
+    file: "runtime/trigger-receiver/dashboard.py · static/app.html",
+    body: [
+      "Chat is primary. The dashboard — <code>/app</code>, seven views: Today, Cadence, Loops, Briefs, People, Learned, Record — visualizes the same state and offers every lever.",
+      "The design rule that makes it safe: <strong>every write shells out to the CLI chat uses</strong>. Muting a sender from her dashboard page forks <code>preferences.py</code>; correcting a fact forks <code>knowledge_edit.py</code>, which builds the exact extraction payload a texted correction produces. Byte-for-byte the same path.",
+      "There is one deliberate exception — deleting a <em>learned</em> rule, which has no CLI verb. It writes directly, and records a tombstone so the learner can't resurrect it."
+    ],
+    chips: ["/app", "7 views", "one write path"]
+  },
+  volume: {
+    title: "$SOTTO_DATA — the only shared surface",
+    file: "runtime/trigger-receiver/connectors.py:write_json",
+    body: [
+      "Briefs, events, knowledge, preferences, style, caches, sessions, logs. Every JSON write is atomic: a temp file at mode 0600, then <code>os.replace</code>.",
+      "Read the table below for who writes what. The discipline it encodes: one writer per file. Two writers means a lock, and a lock across a process boundary is a bug waiting for a bad night."
+    ],
+    chips: ["atomic writes", "0600", "one writer per file"]
+  }
+};
+
+const MODULES = [
+  { id: "m-receiver", name: "receiver.py", sub: "The HTTP surface, brief-trigger dedup, the funnel's dispatch half, the setup wizard, every fork.",
+    folio: "front door", dot: "on",
+    file: "runtime/trigger-receiver/receiver.py",
+    body: ["Loads the other four with <code>importlib</code> and injects <code>HOOKS</code> — late-bound lambdas over its own globals — so no module ever imports the receiver back. That one trick is why five files can share state without a cycle.",
+           "Locates the skills tree with <code>_find_sotto_script</code>: <code>SOTTO_SKILLS_ROOT</code> → the Hermes layout → the repo-relative source tree, resolved once per script name."] },
+  { id: "m-dashboard", name: "dashboard.py", sub: "The Window: /app, /app/login, /static/*, /api/* — sessions, CSRF, CSP, lockout, and every write lever.",
+    folio: "the window", dot: "on",
+    file: "runtime/trigger-receiver/dashboard.py",
+    body: ["Sessions replace the code-as-cookie model; every POST is session-gated and CSRF-enforced; static serving is whitelist-only, so a request name that isn't exactly a key never touches a path join.",
+           "Every write lever shells out to the CLI chat uses — one subprocess policy for the whole write surface, {intervals.dashboard_cli_fork_secs}-second budget."] },
+  { id: "m-calcache", name: "calcache.py", sub: "The ONE calendar cache: the gather fork, a {calendar.ttl_secs:min}-minute TTL, the refresh thread, and the post-meeting tap detector.",
+    folio: "one cache", dot: "on",
+    file: "runtime/trigger-receiver/calcache.py",
+    body: ["Two competing calendar caches is how drift starts. The dashboard's <code>/api/calendar</code> and the funnel's in-meeting hold read the same snapshot, written to <code>cache/calendar_today.json</code>.",
+           "It also detects meetings that ended since the last tick and pushes each one through the funnel exactly once — the post-meeting tap."] },
+  { id: "m-connectors", name: "connectors.py", sub: "Remote-MCP OAuth 2.1 for the Connect tiles — and write_json, the one atomic-write helper the whole image uses.",
+    folio: "oauth + write", dot: "on",
+    file: "runtime/trigger-receiver/connectors.py",
+    body: ["Discovery → dynamic client registration → PKCE → a per-service token file. The container registers itself; <code>/setup</code> is the redirect URI.",
+           "The second job is the small one that matters everywhere: <code>write_json</code>, tmp-at-0600 then <code>os.replace</code>."] },
+  { id: "m-relay", name: "relay.py", sub: "The reverse-MCP relay: the Mac long-polls /bridge/poll, Hermes calls /mcp locally, no tunnel.",
+    folio: "no tunnel", dot: "on",
+    file: "runtime/trigger-receiver/relay.py",
+    body: ["The mechanism that lets a cloud agent read a laptop's iMessage database without the laptop accepting a single inbound connection."] }
+];
+
+const THREADS = [
+  { id: "t-gmail", name: "Gmail poll", sub: "Forks poll_gmail.py and feeds new mail through the same funnel as Bridge events. No Mac needed for email.",
+    folio: "SOTTO_EMAIL_POLL_SECS · {intervals.email_poll_secs}s", dot: "live",
+    file: "receiver.start_gmail_poll_thread → event-triage/scripts/poll_gmail.py",
+    body: ["Email does not depend on the Mac being awake: the container polls Gmail itself and hands the results to the identical funnel.", "The fork gets a {intervals.gmail_fork_secs}-second budget."] },
+  { id: "t-valve", name: "Release valve", sub: "Forks triage_event.py --valve so a nudge held during cooldown, quiet hours, catch-up or a meeting can still get out.",
+    folio: "valve heartbeat · {intervals.valve_interval_secs}s", dot: "live",
+    file: "receiver.start_valve_thread → triage_event.py --valve",
+    body: ["This is the fix for the audit's worst discovered failure: an actionable event arriving during a hold used to be silently deferred until the digest or the evening brief.", "Up to {valve.max_per_tick} promotions per tick, ≤{valve.max_per_hour} per hour, and it honours the same daily interrupt budget — a promotion is a nudge."] },
+  { id: "t-update", name: "Update check", sub: "One fetch a day → cache/update.json. Silent on an unstamped dev build.",
+    folio: "daily", dot: "warn",
+    file: "receiver.start_update_check_thread",
+    body: ["Compares the running build stamp against the published one and drops a single quiet line on the setup page. It never updates anything itself."] },
+  { id: "t-cal", name: "Calendar refresh", sub: "Rewrites cache/calendar_today.json, then asks tap_tick() which meetings just ended.",
+    folio: "SOTTO_CALENDAR_REFRESH_SECS · {intervals.calendar_refresh_secs}s", dot: "live",
+    file: "calcache.start_refresh_thread",
+    body: ["Powers two features at once: the in-meeting hold (a would-be nudge queues while you are in a peopled, timed event) and the post-meeting tap.",
+           "The funnel refuses to hold on a snapshot older than <strong>{calendar.stale_intervals:word}</strong> refresh intervals, or one stamped with any day but the local today. Never act on a stale belief about where you are."] }
+];
+
+const FORKS = [
+  { id: "f-triage", name: "run_triage", sub: "events JSON on stdin → verdict JSON on stdout. Synchronous.",
+    folio: "triage_event.py · {intervals.triage_fork_secs}s", dot: "on",
+    file: "receiver.run_triage → event-triage/scripts/triage_event.py",
+    body: ["The whole funnel for one batch, in one blocking call. Tier 0 is sub-second; Tier 1 is one small model call."] },
+  { id: "f-valve", name: "run_valve", sub: "verdict JSON on stdout — the heartbeat's promotion pass.",
+    folio: "--valve · {intervals.triage_fork_secs}s", dot: "on",
+    file: "receiver.run_valve → triage_event.py --valve",
+    body: ["Returns the same <code>{verdict, reason, bundle}</code> shape triage does, so the receiver stages and spawns identically. There is no second nudge path."] },
+  { id: "f-poll", name: "_poll_gmail_once", sub: "event list on stdout.",
+    folio: "poll_gmail.py · {intervals.gmail_fork_secs}s", dot: "on",
+    file: "receiver._poll_gmail_once",
+    body: ["New mail becomes ordinary funnel events, deduped by <code>(source, rowid)</code> like everything else."] },
+  { id: "f-cli", name: "_run_skill_cli", sub: "Every dashboard write: knowledge_edit.py · preferences.py · style_extract.py --confirm · triage_event.py --promote.",
+    folio: "one policy · {intervals.dashboard_cli_fork_secs}s", dot: "on",
+    file: "dashboard._run_skill_cli",
+    body: ["ONE subprocess policy for the whole write surface, so every dashboard edit rides the identical code path the same instruction typed in chat would.",
+           "This is the reason the dashboard can be a complete alternative to chat without becoming a second implementation of the product."] },
+  { id: "f-cal", name: "_run_calendar_gather", sub: "Writes a temp JSON file the cache then adopts.",
+    folio: "gather_google.py --skip-gmail · {intervals.calendar_gather_fork_secs}s", dot: "on",
+    file: "calcache._run_calendar_gather",
+    body: ["The calendar half of the daily gather, reused as a cache refresh — the same script the morning brief runs, with Gmail skipped."] },
+  { id: "f-sixth", name: "The sixth boundary, different in kind", sub: "run_skill / _spawn_event_agent fire $SOTTO_RUN_SKILL fire-and-forget.",
+    folio: "no return path", dot: "warn",
+    file: "receiver.run_skill · receiver._spawn_event_agent",
+    body: ["Nothing comes back here: the skill delivers through the gateway. A seventh exists for Google auth only — the workspace skill's own setup script."] }
+];
+
+const SHARED_FILES = [
+  ["setup_code", "receiver (boot)", "receiver, start.sh"],
+  ["config/settings.json", "receiver (/setup/timezone)", "receiver, dashboard, start.sh, skills"],
+  ["briefs/&lt;date&gt;.&lt;kind&gt;.claim / .delivered", "receiver", "receiver (trigger dedup)"],
+  ["briefs/&lt;date&gt;.&lt;kind&gt;.payload.json", "receiver", "skills (compose_brief.py)"],
+  ["briefs/&lt;date&gt;_&lt;kind&gt;.json", "skills", "dashboard"],
+  ["events/seen.json", "receiver", "receiver (idempotency ring)"],
+  ["events/last.stamp", "receiver", "receiver (/setup liveness line)"],
+  ["events/bundle-&lt;ms&gt;.json", "receiver", "skills (the event one-shot)"],
+  ["cache/calendar_today.json", "calcache", "skills (the in-meeting hold)"],
+  ["cache/meeting_taps.json", "calcache", "calcache (exactly-once tap record)"],
+  ["cache/hermes-version.json", "start.sh", "receiver (Integrations page)"],
+  ["cache/update.json", "receiver", "receiver"],
+  ["connectors/&lt;service&gt;.json", "connectors", "skills, receiver (presence only)"],
+  ["connectors/&lt;service&gt;.error", "skills (the gather)", "receiver (reconnect hint)"],
+  ["dashboard_sessions.json · dashboard_audit.jsonl", "dashboard", "dashboard"],
+  ["knowledge/** · style.json · outcomes.jsonl", "skills", "dashboard (read), skills"],
+  ["logs/compose_brief.log", "skills", "receiver (/debug/brief-log)"],
+  ["whatsapp-pairing.txt · google-auth-url.txt", "pairing / start.sh", "receiver"]
+];
+
+const SHARED_WRITE_ROW = ["preferences.json", "skills <em>and</em> dashboard", "skills, dashboard"];
+
+const SHARED_NOTE = "<div class=\"card\"><h3>The one shared-write file</h3>" +
+  "<div class=\"file\">$SOTTO_DATA/preferences.json</div>" +
+  "<p>Two writers: <code>learn_preferences.py</code> rebuilds the behavioral lists from " +
+  "<code>outcomes.jsonl</code> after every brief, and <code>preferences.py</code> owns the user's " +
+  "stated <code>explicit</code> block — mutes, VIPs, tone notes, the nudge snooze.</p>" +
+  "<p>The dashboard is not a third writer: an <code>explicit</code> change from <code>POST " +
+  "/api/prefs</code> or <code>POST /api/cadence</code> forks <code>preferences.py</code>. The one " +
+  "direct write it keeps is deleting a <em>learned</em> rule, which has no CLI verb — and that " +
+  "carries the rule for the overlap: <strong>a rule you delete stays deleted</strong>, because the " +
+  "delete also records <code>{list, value}</code> in the top-level <code>suppressed</code> array, " +
+  "which the learner filters out when it rebuilds.</p></div>";
+
+const SPINE = [
+  { id: "s-gather", no: "01", name: "gather", verb: "deterministic Python, never the agent",
+    file: "gather_google.py · gather_granola.py · the Bridge's local read · research_attendees.py · web_research.py",
+    body: ["Agent-driven fetching is the number-one historical failure mode, so gathering is scripts: Gmail and Calendar through the workspace CLI, Granola over MCP with a REST fallback, the Mac's messages and calls through the Bridge.",
+           "The gather also runs a small <code>in:sent</code> lane — that is what teaches the style fingerprint your email voice."] },
+  { id: "s-compose", no: "02", name: "compose", verb: "one Gemini call",
+    file: "_shared/scripts/compose_brief.py",
+    body: ["One model call turns the packed context into the brief. It receives prior knowledge, the open-loop ledger, today's research, and — for the evening brief — the nudges you already got today, so it cannot re-tell them as news."] },
+  { id: "s-validate", no: "03", name: "validate", verb: "reject before it reaches you",
+    file: "_shared/lib/brief_validate.py + the pack's critic",
+    body: ["A malformed or hallucinated brief is rejected before delivery. The critic judges against the extraction prompt's own triage bar, and there is exactly one banned-phrase list, in code."] },
+  { id: "s-deliver", no: "04", name: "deliver", verb: "the host's gateway — as a draft",
+    file: "chatfmt.to_chat · action_links.py · brief_marker.py",
+    body: ["Delivery is the gateway; formatting goes through <code>chatfmt</code>; a tappable deep link carries the draft to your phone with the recipient and body prefilled.",
+           "<code>brief_marker.py</code> holds the deliver-once claim — and the claim that <em>wins</em> is what advances the midday digest's window."] },
+  { id: "s-learn", no: "05", name: "learn", verb: "four scripts, every brief",
+    file: "knowledge_update.py · continuity_resolve.py · learn_preferences.py · style_extract.py",
+    body: ["The Learn step is where the flywheel actually turns: the extraction's facts go into the people/company graph, open loops are resolved deterministically, behavioral rules are rebuilt from outcomes, and the style fingerprint accumulates.",
+           "Each of those is a closed loop; the companion playground draws all seven."] }
+];
+
+const SKILLS = [
+  { g: "Briefs — compose and deliver", items: ["morning-brief", "evening-brief", "meeting-prep", "followup"],
+    note: "The scheduled surfaces. Each is gather → compose → validate → deliver → learn with a different window." },
+  { g: "Interrupt — decide whether to speak", items: ["event-triage", "proactive", "triage"],
+    note: "event-triage owns the funnel and the midday digest; proactive is the {cron.proactive_min}-minute watcher — a meeting you haven't prepped, a commitment due today, one chase for something you're owed, a birthday {birthday.lead_days} days out and again on the day, the plain question after an ask nobody answered {chase.max} times, and an offer to tidy a heavy pile. It decides only WHAT is due and hands the tick to <code>triage()</code> in process, so it passes the same gates because it is the same code, spending ONE budget unit for the whole push; triage is the user-driven inbox pass." },
+  { g: "Act — draft, never send", items: ["draft-reply", "schedule"],
+    note: "Both answer to the same always-on autonomy policy (<code>_shared/references/approval-tiers.md</code>): what may run automatically, what needs confirmation, what is forbidden." },
+  { g: "Ask and remember", items: ["ask", "people", "loops", "relationship-pulse"],
+    note: "Read paths over the same knowledge graph and continuity ledger the briefs write. loops carries the cleanup verb too — it surfaces stale loops to dismiss, snooze or keep, and suggests mutes from what you keep dismissing." },
+  { g: "Tune", items: ["feedback"],
+    note: "Records corrections and cadence asks: mute a sender, fix a fact, go quiet until 3." },
+  { g: "Your routines", items: ["routines"],
+    note: "Say a recurring job in plain language — 'every Friday at 4, summarize my open loops by person' — and Sotto runs it on your clock: user- crons fenced off from the system jobs, capped at 10." },
+  { g: "First run", items: ["setup"],
+    note: "The guided first hour: check connections, seed memory, schedule briefs, offer the first one." }
+];
+
+/* ═══════════════════ THE FUNNEL ═══════════════════
+   Gate order mirrors triage_event.classify_event() and then triage()'s
+   post-classification chain, in code order. */
+
+const TIER0 = [
+  { id: "g1", no: "0", name: "A meeting that just ended", cls: "post_meeting",
+    rule: "A synthetic meeting_end event goes straight to the tap — none of the sender machinery below applies to it.",
+    body: ["The calendar refresh thread detects meetings that ended at least {tap.grace_min} minutes ago with at least one other human, and pushes each one through this funnel exactly once.",
+           "There is no Tier-1 call: the calendar already told us it was a real meeting with real people, which is the whole judgment. Only two gates are applied here explicitly, in this order — an active snooze, then quiet hours."] },
+  { id: "g2", no: "1", name: "Your own outbound", cls: "queue · signal",
+    rule: "A message you sent is ledger fodder — never a nudge.",
+    body: ["Queued with class <code>signal</code>. It is the loop-closing evidence deterministic resolution needs, and the right-hand side the draft matcher will eventually join against."] },
+  { id: "g3", no: "2", name: "Calls", cls: "drop / nudge / queue",
+    rule: "Answered or outgoing → dropped. Missed from someone you know → nudge. Missed from an unknown number → queued.",
+    body: ["Calls carry no text, so the decision is direction plus who. A missed call from a known person is the one Tier-0 class that nudges outright.",
+           "An explicit snooze outranks it. Quiet hours do not — but only for a <strong>VIP</strong>; a non-VIP missed call in quiet hours queues.",
+           "A missed call is exempt from the daily interrupt budget and from the in-meeting hold. It still respects its thread's cooldown: three calls in ten minutes is one nudge."] },
+  { id: "g4", no: "3", name: "Automated noise", cls: "drop · automated / system",
+    rule: "An OTP, a shortcode, a system message, an automated sender — dropped silently.",
+    body: ["The same filters the brief applies before the LLM ever sees a thread. An OTP needs both the canonical phrasing and an actual 4–8 digit code; a shortcode is a 3–6 digit 'number' that was never a person."] },
+  { id: "g5", no: "4", name: "Mutes", cls: "drop · muted",
+    rule: "A muted sender or a muted person is dropped — 'stop surfacing X' sticks here too.",
+    body: ["Written by the feedback skill or the dashboard's mute toggle; both fork the same <code>preferences.py</code> CLI."] },
+  { id: "g6", no: "5", name: "Snooze, then quiet hours", cls: "queue · snoozed / quiet",
+    rule: "An explicit snooze queues everything that survived the drops; then quiet hours queue the rest.",
+    body: ["Order matters and is deliberate. The snooze is an explicit request, so it outranks the VIP carve-out quiet hours grants — <em>everything</em> holds, missed calls included.",
+           "Quiet hours are <code>SOTTO_QUIET_START</code>–<code>SOTTO_QUIET_END</code>, default {quiet.start_hour:hhmm}–{quiet.end_hour:hhmm}, wrap-midnight aware.",
+           "Both are checked <em>before</em> Tier 1, so a snoozed hour costs nothing in model calls. And <code>snoozed</code> is deliberately not promotable: when a snooze lifts, held events must not come back as a burst of late nudges — they ride the digest or the brief."] },
+  { id: "g7", no: "6", name: "Groups without a name-mention", cls: "queue · group",
+    rule: "A group message only clears the bar when you are called out by name.",
+    body: ["Detection is your first name, bare or @-prefixed, from <code>SOTTO_USER_NAME</code>. Unset means never a mention — so groups always queue. The conservative default."] },
+  { id: "g8", no: "7", name: "Unknown non-VIP 1:1", cls: "queue · unknown",
+    rule: "A stranger writing to you one-to-one never reaches the agent.",
+    body: ["Known means Contacts (or a WhatsApp push name) resolved a real human name — the same standard the brief applies to a 1:1 thread. For email it also counts a knowledge-graph person file.",
+           "VIP requires being known, by construction. VIP is, in order: the list you stated, then a top-of-queue relationship-pulse priority (≥ {vip.min_priority}), then a 'family' mention in their file. Your own word outranks any heuristic."] },
+  { id: "g9", no: "8", name: "Nothing to judge", cls: "queue · ambient",
+    rule: "An attachment with no text doesn't get to burn a model call.",
+    body: [] }
+];
+
+const TIER1 = [
+  { id: "g10", no: "9", name: "One small model call", cls: "agent / queue / drop",
+    rule: "{classes.tier1_nudge:dots} → nudge. ambient → queue. ignore → drop. Any error → queue.",
+    body: ["The prompt is the event text (capped at {tier1.text_max_chars} characters) plus a one-line 'who is this' assembled from the relationship pulse and the knowledge graph — under 2k tokens, on <code>SOTTO_TRIAGE_MODEL</code>.",
+           "<code>scheduling_ask</code> additionally tells the agent to gather the calendar and propose real slots.",
+           "<strong>Any</strong> failure — no key, bad JSON, an unexpected class — queues. Failing toward silence is the whole posture."] }
+];
+
+const POST = [
+  { id: "g11", no: "10", name: "Escalation join", cls: "agent · escalation",
+    rule: "The same known person, on a second channel, inside {escalation.window_min} minutes — where at least one side is a call or a real ask.",
+    body: ["Checked after classification and before every downstream gate, so the escalation class carries its exemptions into the hold, the cooldown and the budget. It is exempt from the daily budget <em>and</em> from the per-thread cooldown — which is the point, because the cooldown stamped by the first of the two messages is exactly what would swallow the second.",
+           "Identity matching is deliberately literal: an exact resolved-name match or an exact normalized-identifier match (last ten digits for a phone, lowercased for an email). Nothing fuzzy, ever — a fuzzy match here would manufacture the loudest nudge Sotto can send, about the wrong person.",
+           "It fires <strong>once</strong> per window: if a prior row in the window already carries the escalation class, the join returns nothing. The next three emails after 'Sarah called AND emailed' are the same event.",
+           "A meeting-end row is never evidence. A meeting ending is not someone reaching you. And a catchup batch or a message past the freshness bar never escalates — the loudest nudge must never fire on replayed history."] },
+  { id: "g12", no: "11", name: "Reconnect grace", cls: "queue · stale",
+    rule: "A message older than {freshness.event_max_age_min} minutes, or anything in a catch-up batch, never nudges in real time. Missed calls exempt.",
+    body: ["After the Mac has been asleep the backlog arrives in bursts. A real-time nudge only makes sense for a real-time event; a stale message was probably already handled on another device.",
+           "The held class is preserved, so the digest and the release valve can still tell 'was interrupt-worthy, deterministically held' from born-ambient."] },
+  { id: "g13", no: "12", name: "In-meeting hold", cls: "queue · meeting_hold",
+    rule: "Inside a timed calendar event with at least one other human, would-be nudges queue. Solo blocks and all-day events never hold.",
+    body: ["First in the chain on purpose: a held ask must burn neither its thread's cooldown nor a unit of the day's budget, so when the meeting ends the valve can promote it intact and spend the allowance then.",
+           "Exempt: a missed call and an escalation — those are exactly what should reach you mid-meeting. The post-meeting tap is <em>not</em> exempt here even though it is budget-exempt: a tap firing while you are already in the next meeting must still hold, and the valve's next tick after that meeting ends is its release path.",
+           "Two staleness checks, one posture: a snapshot older than {calendar.stale_intervals:word} refresh intervals does not hold, and neither does one stamped with any day but the local today. A missing or unparseable file holds nothing, silently."] },
+  { id: "g14", no: "13", name: "Per-thread cooldown", cls: "queue · cooldown",
+    rule: "At most one nudge per conversation thread per SOTTO_EVENT_COOLDOWN_MIN (default {cooldown.min}). Only escalations are exempt.",
+    body: ["Stamped per thread key — the group id when there is one, else the 1:1 identifier. Checked before the budget, so a suppressed event never spends budget."] },
+  { id: "g15", no: "14", name: "Daily interrupt budget", cls: "queue · budget",
+    rule: "At most SOTTO_NUDGE_BUDGET (default {budget.nudge_per_day}) nudges per LOCAL day, the proactive watcher's included.",
+    body: ["The cross-thread volume control per-thread cooldowns cannot be: ten different senders in one hour is exactly the case a cooldown can't stop.",
+           "Keyed by the local date, so it rolls over at local midnight with no cleanup job. The read-modify-write happens under a file lock — four producers can run this script at once, and two concurrent spends each reading 3 and writing 4 handed out a free nudge.",
+           "Exempt and never counted: a Tier-0 missed call, an escalation, and the post-meeting tap — which has its own named cap, <code>SOTTO_TAP_MAX_PER_DAY</code> (default {tap.max_per_day}), enforced exactly-once at dispatch. In one sentence: <strong>interrupts spend the daily budget ({budget.nudge_per_day}/day), post-meeting taps have their own cap ({tap.max_per_day}/day), and neither eats the other.</strong>"] },
+  { id: "g16", no: "15", name: "The release valve", cls: "promoted",
+    rule: "Every {intervals.valve_interval_secs:min} min, when nothing is holding: up to {valve.max_per_tick} queued events per tick, ≤{valve.max_per_hour}/hour, younger than {valve.max_age_min} minutes, back into a nudge.",
+    body: ["Promotable classes are the deterministically-deferred ones: {classes.promotable:codes}. Born-ambient never promotes, and <code>snoozed</code> deliberately never promotes.",
+           "A <code>meeting_hold</code> entry skips the age limit — an ask Sotto itself held is never too old to deliver, and a three-hour meeting would otherwise expire something that arrived before it started. The ≤{valve.max_per_hour}/hour cap still bounds the volume.",
+           "The valve honours the same daily budget: a promotion <em>is</em> a nudge, so it can never push the day past its cap. Quiet hours, an active snooze, or being in a meeting stop it entirely.",
+           "You can release one yourself: the dashboard's Cadence page lists what is being held and offers <em>nudge me now</em>. Same eligibility, same budget spend, same ledger row. The two gates it skips are the clock ones — quiet hours and the snooze exist to stop <em>unprompted</em> interruptions, and you asked for this one. The room you are in and the day's budget still apply.",
+           "Undeliverable nudges are never spent: on the default WhatsApp delivery channel the valve and the tap wait for a positive link probe before dispatching."] },
+  { id: "g17", no: "16", name: "Every verdict is recorded", cls: "surfaced.jsonl",
+    rule: "Nudged, queued, dropped or promoted — one line, with its reason, at verdict time.",
+    body: ["<code>{ts, sender, channel, verdict, reason, class}</code>, bounded like the queue. This is the substrate for 'why didn't I get nudged about that?', and the dashboard's Record view renders it as-is.",
+           "It is also read by three other places: the escalation join (the only ledger that retains agent verdicts), the evening brief (so a nudge you already got isn't re-told as news), and the learning loop's outcome join."] }
+];
+
+const LIVE = [
+  { name: "Cadence — the waiting room", sub: "Today's interrupt spend, the tap cap, the valve's hour, the snooze, quiet hours, whether you are in a meeting — and every event being held, with why.",
+    folio: "/app#cadence", dot: "live",
+    file: "dashboard.api_cadence → events/budget.json · valve_state.json · queue.jsonl",
+    body: ["Every field is a read of the funnel's own state file; nothing is recomputed. The <em>nudge me now</em> control on a held item is the release valve with one entry."] },
+  { name: "Record — every verdict", sub: "The merged ledger: outcomes, dashboard audit rows, and every triage verdict with its reason.",
+    folio: "/app#record", dot: "live",
+    file: "dashboard.api_ledger → outcomes.jsonl + events/surfaced.jsonl",
+    body: ["If you are asking why a message never reached you, the answer is a row here: <em>muted sender</em>, <em>quiet hours</em>, <em>daily interrupt budget spent ({budget.nudge_per_day} nudges today)</em>, <em>in a meeting until 2:30 PM — Sarah Chen</em>. Nothing is silently discarded without a reason you can read."] },
+  { name: "Learned — the rules you can delete", sub: "What the learner derived from your behaviour, and the stated rules you wrote yourself.",
+    folio: "/app#learned", dot: "live",
+    file: "dashboard.api_learned → preferences.json",
+    body: ["A rule you delete stays deleted: the delete records a tombstone the nightly rebuild filters out."] },
+  { name: "Today, Loops, Briefs, People", sub: "The reading surfaces — the thesis sentence, the continuity ledger, the brief archive, and per-person files with provenance.",
+    folio: "/app", dot: "on",
+    file: "dashboard.api_overview · api_loops · _api_briefs · api_people",
+    body: ["Text stays primary; the web visualizes. Every edit offered on these pages forks the same CLI a texted instruction would."] }
+];
+
+/* ═══════════════════ SCENARIOS ═══════════════════
+   Each trace is written against classify_event() + triage(). `stop` marks the
+   gate that decided; `walk` marks a gate the event passed through. */
+
+const SCENARIOS = [
+  {
+    id: "sc-ask", label: "A friend's real ask",
+    setup: "A known contact texts you at 2:14pm: “can you look at the deck before Thursday?” You are not in a meeting, one nudge spent today, no prior contact from her in the window.",
+    walk: ["g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g14","g15","g17"],
+    stop: null,
+    verdict: "nudge", head: "Nudge — one short message, with a reply already drafted",
+    why: "Tier 1 returned <code>actionable</code>; nothing downstream held it. The thread's cooldown is stamped and the day's budget goes to 2 of {budget.nudge_per_day}.",
+    next: "You get a tap-link with the draft prefilled. Sotto never sends for you.",
+    trace: [
+      "Not a meeting-end event, not your own outbound, not a call.",
+      "Not automated, not muted, not snoozed, outside quiet hours.",
+      "1:1, sender resolved from Contacts, real text to judge → survives Tier 0.",
+      "Tier 1 → <code>actionable</code> (a real ask that can wait for a nudge).",
+      "No prior row from her on another channel inside {escalation.window_min} min → no escalation upgrade.",
+      "Fresh (well under {freshness.event_max_age_min} min) and not a catch-up batch → no stale demotion.",
+      "Calendar cache says no peopled event spans now → no hold.",
+      "Thread cooldown clear (nothing nudged on this thread in {cooldown.min} min).",
+      "Budget: 1 of {budget.nudge_per_day} spent → room. Cooldown stamped, budget spent.",
+      "surfaced.jsonl: verdict <code>agent</code>, class <code>actionable</code>."
+    ]
+  },
+  {
+    id: "sc-auto", label: "An automated email",
+    setup: "A “Your receipt from …” email lands from a noreply address at 10:02am.",
+    walk: ["g1","g2","g3","g4","g17"], stop: "g4",
+    verdict: "drop", head: "Dropped — silently",
+    why: "The sender matched the automated-sender filter, the same one the brief applies before the model ever sees a thread.",
+    next: "It still gets a surfaced.jsonl row with class <code>automated</code>, so the Record can answer for it. It is not queued, so it can never trip the digest and it is never escalation evidence.",
+    trace: [
+      "Not a meeting-end event, not your own outbound, not a call.",
+      "Automated sender → <strong>drop</strong>, class <code>automated</code>.",
+      "No Tier-1 call is made — nothing was spent on it.",
+      "surfaced.jsonl: verdict <code>drop</code>. Dropped rows are excluded from the escalation join by design."
+    ]
+  },
+  {
+    id: "sc-esc", label: "A second channel within {escalation.window_min} min",
+    setup: "Sarah emailed at 1:40pm — Tier 1 called it actionable and you were nudged. At 1:58pm she texts “did you see my mail?”. Tier 1 would call the text ambient.",
+    walk: ["g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g14","g15","g17"],
+    stop: null,
+    verdict: "nudge", head: "Nudge — “Sarah emailed AND texted within 18 min”",
+    why: "The escalation join found the same person on a different channel inside the {escalation.window_min}-minute window with an ask-like class on one side, and upgraded the verdict. It is exempt from the per-thread cooldown <em>and</em> from the daily budget.",
+    next: "The reason string carries her name and the fact, so the nudge and the Record can both lead with it. It fires once per window — her next three messages are the same event.",
+    trace: [
+      "Tier 0 clears (known 1:1, no mute, no snooze, no quiet hours).",
+      "Tier 1 → <code>ambient</code>. On its own this would queue.",
+      "Escalation join scans the tails of queue.jsonl and surfaced.jsonl for rows inside {escalation.window_min} min.",
+      "Match: exact resolved name, channel <code>email</code> ≠ <code>imessage</code>, class <code>actionable</code> is ask-like.",
+      "Verdict upgraded to <code>agent</code>, class <code>escalation</code>.",
+      "Cooldown exempt — the first message's stamp is exactly what would have swallowed this one.",
+      "Budget exempt, and the in-meeting hold would not have stopped it either.",
+      "surfaced.jsonl: verdict <code>agent</code>, class <code>escalation</code> — which also blocks a second escalation in this window."
+    ]
+  },
+  {
+    id: "sc-meeting", label: "A message during a meeting",
+    setup: "The same real ask arrives at 2:14pm, but the calendar snapshot says you are in a timed event with two other humans until 2:30pm.",
+    walk: ["g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g17"], stop: "g13",
+    verdict: "queue", head: "Held — “in a meeting until 2:30 PM — Sarah Chen”",
+    why: "The in-meeting hold is first in the downstream chain on purpose: the ask burns neither its thread's cooldown nor a unit of the day's budget.",
+    next: "The release valve's next tick after 2:30 promotes it intact — the held class is preserved, so a deferred scheduling ask still gets the scheduling treatment. <code>meeting_hold</code> skips the {valve.max_age_min:hours}-hour age limit; a long meeting must not silently expire something Sotto itself held.",
+    trace: [
+      "Tier 0 clears; Tier 1 → <code>actionable</code>.",
+      "No escalation evidence; fresh, not a catch-up batch.",
+      "Calendar snapshot: fresh (under {calendar.stale_intervals:word} refresh intervals) and stamped with today.",
+      "A timed event with ≥1 other human spans now → <strong>hold</strong>, class <code>meeting_hold</code>, held_class <code>actionable</code>.",
+      "No cooldown stamp. No budget spend.",
+      "queue.jsonl gets the entry; surfaced.jsonl gets verdict <code>queue</code> with the sentence-shaped reason.",
+      "It also appears in the dashboard's Cadence waiting room, with a “nudge me now” control."
+    ]
+  },
+  {
+    id: "sc-budget", label: "The fifth nudge of the day",
+    setup: "Four nudges have already gone out today. At 4:05pm another known contact sends a real ask.",
+    walk: ["g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g14","g15","g17"], stop: "g15",
+    verdict: "queue", head: "Held — “daily interrupt budget spent ({budget.nudge_per_day} nudges today)”",
+    why: "The cross-thread cap that per-thread cooldowns cannot be. Checked after the cooldown, so a suppressed event never spends budget, and before the cooldown stamp, so a budget-held event doesn't burn its thread either.",
+    next: "It rides the {cron.midday} digest tomorrow, or the evening brief tonight. The valve <em>can</em> promote a <code>budget</code> entry, but the valve honours the same daily cap — so in practice these wait for the day to roll over at local midnight.",
+    trace: [
+      "Tier 0 clears; Tier 1 → <code>actionable</code>.",
+      "No escalation; fresh; not in a meeting; thread cooldown clear.",
+      "Budget: {budget.nudge_per_day} of {budget.nudge_per_day} spent, and <code>actionable</code> is not an exempt class.",
+      "→ <strong>queue</strong>, class <code>budget</code>, held_class <code>actionable</code>.",
+      "No cooldown stamp, no spend — nothing was consumed by holding it.",
+      "The digest counts it as deferred-actionable; the evening brief can compress it."
+    ]
+  },
+  {
+    id: "sc-tap", label: "A post-meeting tap",
+    setup: "Your 2:00pm with Sarah Chen ended at 2:30. The calendar refresh thread notices at 2:37, six minutes past the grace period.",
+    walk: ["g1","g12","g13","g14","g15","g17"], stop: null,
+    verdict: "nudge", head: "Tap — “Your 2:00 PM with Sarah Chen just wrapped. Want me to send the follow-up?”",
+    why: "Tier 0 classes a <code>meeting_end</code> event as <code>post_meeting</code> and sends it straight to the agent, which runs the battle-tested follow-up composition for that meeting. No Tier-1 call: the calendar already made the judgment.",
+    next: "Routed through the funnel as an event rather than nudged from the receiver, so every existing gate applies with no second implementation.",
+    trace: [
+      "calcache detects a meeting that ended ≥{tap.grace_min} min ago with ≥1 other human.",
+      "Not snoozed, not in quiet hours → verdict <code>agent</code>, class <code>post_meeting</code>.",
+      "Budget-exempt — but capped by <code>SOTTO_TAP_MAX_PER_DAY</code> ({tap.max_per_day}/day), enforced exactly-once at dispatch.",
+      "<strong>Not</strong> hold-exempt: if you are already in the next meeting it queues as <code>meeting_hold</code> and the valve promotes it when that one ends.",
+      "Burns a per-meeting cooldown key; demotes when stale; lands in surfaced.jsonl like every other verdict.",
+      "On the default WhatsApp channel, dispatch waits for a positive link probe — an undeliverable tap is never spent."
+    ]
+  }
+];
+
+/* ═══════════════════ RENDER ═══════════════════ */
+
+const $ = (sel, root) => (root || document).querySelector(sel);
+const el = (tag, cls, html) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (html !== undefined) n.innerHTML = html;
+  return n;
+};
+
+function dossierCard(title, file, body, chips) {
+  const parts = ['<div class="card"><h3>' + title + "</h3>"];
+  if (file) parts.push('<div class="file">' + file + "</div>");
+  (body || []).forEach(p => parts.push("<p>" + p + "</p>"));
+  if (chips && chips.length) {
+    parts.push('<div class="chips">' + chips.map(c => '<span class="chip">' + c + "</span>").join("") + "</div>");
+  }
+  parts.push("</div>");
+  return fill(parts.join(""));
+}
+
+/* --- Act I --- */
+function wireMap() {
+  const target = $("#dossier1");
+  document.querySelectorAll("[data-node]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("[data-node]").forEach(b => b.classList.remove("sel"));
+      btn.classList.add("sel");
+      const d = DOSSIER[btn.dataset.node];
+      target.innerHTML = dossierCard(d.title, d.file, d.body, d.chips);
+    });
+  });
+}
+
+/* --- generic clickable ledger --- */
+function renderLedger(mountId, items, dossierId) {
+  const mount = $("#" + mountId);
+  const target = $("#" + dossierId);
+  items.forEach(it => {
+    const row = el("button", "row");
+    row.type = "button";
+    row.innerHTML = fill(
+      '<span class="dot ' + (it.dot || "") + '"></span>' +
+      '<span class="row-main"><span class="row-title">' + it.name + "</span>" +
+      '<span class="row-sub">' + it.sub + "</span></span>" +
+      '<span class="folio">' + it.folio + "</span>");
+    row.addEventListener("click", () => {
+      mount.parentNode.querySelectorAll(".row").forEach(r => r.classList.remove("sel"));
+      document.querySelectorAll("#modules .row, #threads .row, #forks .row").forEach(r => r.classList.remove("sel"));
+      row.classList.add("sel");
+      target.innerHTML = dossierCard(it.name, it.file, it.body);
+      target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+    mount.appendChild(row);
+  });
+}
+
+/* --- shared files table --- */
+function renderFiles() {
+  const tbody = $("#filesTable tbody");
+  SHARED_FILES.forEach(r => {
+    const tr = el("tr");
+    tr.innerHTML = fill('<td><span class="path">' + r[0] + "</span></td><td>" + r[1] + "</td><td>" + r[2] + "</td>");
+    tbody.appendChild(tr);
+  });
+  const tr = el("tr", "shared");
+  tr.innerHTML = fill('<td><span class="path"><strong>' + SHARED_WRITE_ROW[0] + "</strong></span></td><td><strong>" +
+                      SHARED_WRITE_ROW[1] + "</strong></td><td>" + SHARED_WRITE_ROW[2] + "</td>");
+  tbody.appendChild(tr);
+
+  const btn = $("#oneWayBtn");
+  const note = $("#sharedNote");
+  btn.addEventListener("click", () => {
+    const on = btn.getAttribute("aria-pressed") === "true";
+    btn.setAttribute("aria-pressed", String(!on));
+    btn.classList.toggle("on", !on);
+    btn.textContent = on ? "Show the one shared-write file" : "Hide";
+    note.innerHTML = on ? "" : fill(SHARED_NOTE);
+    tbody.querySelectorAll("tr").forEach(r => {
+      r.style.opacity = (!on && !r.classList.contains("shared")) ? "0.4" : "";
+    });
+  });
+}
+
+/* --- Act III --- */
+function renderSpine() {
+  const mount = $("#spine");
+  const target = $("#dossier3");
+  SPINE.forEach((s, i) => {
+    const b = el("button", "stage");
+    b.type = "button";
+    b.innerHTML = fill('<span class="sno">' + s.no + (i < SPINE.length - 1 ? " →" : "") + "</span>" +
+                       '<span class="sname">' + s.name + "</span><br>" +
+                       '<span class="sverb">' + s.verb + "</span>");
+    b.addEventListener("click", () => {
+      mount.querySelectorAll(".stage").forEach(x => x.classList.remove("sel"));
+      b.classList.add("sel");
+      target.innerHTML = dossierCard(s.name, s.file, s.body);
+    });
+    mount.appendChild(b);
+  });
+
+  const skills = $("#skills");
+  let n = 0;
+  SKILLS.forEach(group => {
+    n += group.items.length;
+    const row = el("div", "row static");
+    row.innerHTML = fill(
+      '<span class="dot on"></span>' +
+      '<span class="row-main"><span class="row-title">' + group.g + "</span>" +
+      '<span class="row-sub">' + group.note + "</span>" +
+      '<span class="chips">' + group.items.map(s => '<span class="chip">' + s + "</span>").join("") + "</span></span>" +
+      '<span class="folio">' + group.items.length + "</span>");
+    skills.appendChild(row);
+  });
+  $("#skillCount").textContent = n + " in the pack";
+}
+
+/* --- Act V --- */
+function renderLive() {
+  const mount = $("#live");
+  const target = el("div", "dossier");
+  mount.parentNode.appendChild(target);
+  target.innerHTML = '<div class="card"><p class="empty">Pick a view.</p></div>';
+  LIVE.forEach(it => {
+    const row = el("button", "row");
+    row.type = "button";
+    row.innerHTML = fill(
+      '<span class="dot ' + it.dot + '"></span>' +
+      '<span class="row-main"><span class="row-title">' + it.name + "</span>" +
+      '<span class="row-sub">' + it.sub + "</span></span>" +
+      '<span class="folio">' + it.folio + "</span>");
+    row.addEventListener("click", () => {
+      mount.querySelectorAll(".row").forEach(r => r.classList.remove("sel"));
+      row.classList.add("sel");
+      target.innerHTML = dossierCard(it.name, it.file, it.body);
+    });
+    mount.appendChild(row);
+  });
+}
+
+/* --- Act IV: the funnel --- */
+const GATE_BY_ID = {};
+[TIER0, TIER1, POST].forEach(list => list.forEach(g => { GATE_BY_ID[g.id] = g; }));
+
+function renderGates(mountId, list) {
+  const mount = $("#" + mountId);
+  const target = $("#dossier4");
+  list.forEach(g => {
+    const b = el("button", "gate");
+    b.type = "button";
+    b.id = "gate-" + g.id;
+    b.innerHTML = fill(
+      '<span class="gno">' + g.no + "</span>" +
+      '<span class="dot"></span>' +
+      '<span><span class="gname">' + g.name + "</span><br>" +
+      '<span class="grule">' + g.rule + "</span></span>" +
+      '<span class="gclass">' + g.cls + "</span>");
+    b.addEventListener("click", () => {
+      document.querySelectorAll(".gate").forEach(x => x.classList.remove("sel"));
+      b.classList.add("sel");
+      target.innerHTML = dossierCard(g.name, "triage_event.py — " + g.cls,
+        [ "<strong>" + g.rule + "</strong>" ].concat(g.body || []));
+      target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+    mount.appendChild(b);
+  });
+}
+
+let CURRENT = null;
+let TIMERS = [];
+
+function clearRun() {
+  TIMERS.forEach(t => clearTimeout(t));
+  TIMERS = [];
+  document.querySelectorAll(".gate").forEach(g => {
+    g.classList.remove("walk", "stop", "dim");
+    const d = g.querySelector(".dot");
+    d.className = "dot";
+  });
+  $("#verdict").hidden = true;
+}
+
+function selectScenario(sc) {
+  clearRun();
+  CURRENT = sc;
+  document.querySelectorAll("#scenarios .btn").forEach(b => b.classList.toggle("on", b.dataset.sc === sc.id));
+  $("#scenarioNote").innerHTML = fill("<strong>" + sc.label + ".</strong> " + sc.setup);
+  $("#runBtn").disabled = false;
+}
+
+function runScenario() {
+  if (!CURRENT) return;
+  clearRun();
+  const sc = CURRENT;
+  // `walk` is the ordered list of gates this event actually reaches, in code order; `stop` names
+  // the one that decided. Gates it never reaches are dimmed rather than hidden — the chain the
+  // event skipped is part of what the chain means.
+  const seq = sc.walk.slice();
+  const touched = {};
+  seq.forEach(id => { touched[id] = true; });
+
+  document.querySelectorAll(".gate").forEach(g => {
+    const id = g.id.replace("gate-", "");
+    if (!touched[id]) g.classList.add("dim");
+  });
+
+  const step = 190;
+  seq.forEach((id, i) => {
+    TIMERS.push(setTimeout(() => {
+      const node = document.getElementById("gate-" + id);
+      if (!node) return;
+      const isStop = sc.stop === id;
+      node.classList.add(isStop ? "stop" : "walk");
+      node.querySelector(".dot").className = "dot " + (isStop ? "bad" : "live");
+    }, i * step));
+  });
+
+  TIMERS.push(setTimeout(() => {
+    const v = $("#verdict");
+    v.hidden = false;
+    $("#vhead").className = "vhead " + (sc.verdict === "nudge" ? "nudge" : sc.verdict === "drop" ? "dropped" : "queued");
+    $("#vhead").innerHTML = fill(sc.head);
+    $("#vwhy").innerHTML = fill(sc.why);
+    $("#vnext").innerHTML = fill(sc.next);
+    const ol = $("#vtrace");
+    ol.innerHTML = "";
+    sc.trace.forEach((t, i) => {
+      ol.appendChild(el("li", "", fill('<span class="tno">' + String(i + 1).padStart(2, "0") + "</span>" + t)));
+    });
+    v.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, seq.length * step + 120));
+}
+
+function renderScenarios() {
+  const bar = $("#scenarios");
+  SCENARIOS.forEach(sc => {
+    const b = el("button", "btn", fill(sc.label));
+    b.type = "button";
+    b.dataset.sc = sc.id;
+    b.addEventListener("click", () => selectScenario(sc));
+    bar.appendChild(b);
+  });
+  $("#runBtn").addEventListener("click", runScenario);
+  $("#resetBtn").addEventListener("click", () => {
+    clearRun();
+    CURRENT = null;
+    $("#runBtn").disabled = true;
+    document.querySelectorAll("#scenarios .btn").forEach(b => b.classList.remove("on"));
+    $("#scenarioNote").innerHTML = "Nothing loaded. Pick one of the six above — each is a real path through the code, not an illustration.";
+  });
+}
+
+/* --- rail scroll spy --- */
+function wireRail() {
+  const links = Array.prototype.slice.call(document.querySelectorAll("#rail a"));
+  const sections = links.map(a => document.querySelector(a.getAttribute("href")));
+  if (!("IntersectionObserver" in window)) return;
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const i = sections.indexOf(e.target);
+      if (i < 0) return;
+      links.forEach(a => a.classList.remove("on"));
+      links[i].classList.add("on");
+    });
+  }, { rootMargin: "-20% 0px -70% 0px" });
+  sections.forEach(s => s && obs.observe(s));
+}
+
+/* --- boot --- */
+fillStatic(document.body);
+wireMap();
+renderLedger("modules", MODULES, "dossier2");
+renderLedger("threads", THREADS, "dossier2");
+renderLedger("forks", FORKS, "dossier2");
+renderFiles();
+renderSpine();
+renderGates("tier0", TIER0);
+renderGates("tier1", TIER1);
+renderGates("post", POST);
+renderScenarios();
+renderLive();
+wireRail();
+</script>
+
+</body>
+</html>
