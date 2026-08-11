@@ -1,0 +1,998 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sotto — the flywheel, honestly</title>
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   Sotto's ledger design system, self-contained.
+   Besley + Martian Mono by NAME ONLY (no @font-face, no network) so this file
+   reads the same opened from disk as it does served from the dashboard.
+   Surfaces: grouped content sits on a soft, BORDERLESS panel one shade off
+   the ground (--panel, --radius-panel). The masthead double rule is the ONE
+   rule left; everything else separates by surface and air. The verdigris
+   accent is punctuation, never paint.
+   ───────────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  color-scheme: light dark;
+
+  --ink: #221c12;
+  --ink-secondary: #4c4433;
+  --ink-light: #6b6250;
+  --ink-muted: #746b57;
+  --ink-faint: #93886e;
+
+  --paper: #f4efe4;
+  --paper-alt: #ece5d6;
+  --paper-white: #fbf8f0;
+
+  /* the panel system — one shade off the ground, borderless */
+  --panel: #ece7d9;
+  --panel-lift: #fbf8f0;
+  --border: #ddd4c0;
+
+  --accent: #26604e;
+  --accent-text: #1f5747;
+  --accent-soft: rgba(38, 96, 78, 0.13);
+  --accent-muted: rgba(38, 96, 78, 0.055);
+
+  --urgent: #a4321f;
+  --urgent-soft: rgba(164, 50, 31, 0.09);
+  --health-active: #2c8a4f;
+  --health-active-soft: rgba(44, 138, 79, 0.16);
+  --health-cooling: #c07f10;
+  --health-cooling-soft: rgba(192, 127, 16, 0.15);
+  --health-cold: #948b7c;
+  --health-cold-soft: rgba(148, 139, 124, 0.18);
+
+  --radius-xs: 3px; --radius-sm: 6px; --radius-md: 10px;
+  --radius-panel: 12px;
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 20px; --space-6: 24px; --space-8: 32px;
+  --space-10: 40px; --space-12: 48px; --space-16: 64px;
+
+  --font-serif: Besley, Georgia, serif;
+  --font-mono: "Martian Mono", ui-monospace, "SF Mono", monospace;
+  /* The same five type tokens the dashboard's app.css documents. */
+  --mono-meta: 0.6875rem;     /* 11px — folios, counts, chips, buttons */
+  --text-eyebrow: 0.6875rem;  /* 11px — eyebrows + section caps */
+  --text-body: 1.0625rem;     /* 17px — every serif reading size */
+  --text-title: 1.3125rem;    /* 21px — row titles / panel headings */
+  --text-display: clamp(2rem, 7.6vw, 2.6rem);
+  --ls-tight: 0.01em;
+  --ls-wide: 0.035em;
+  --ls-eyebrow: 0.1em;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --dur-press: 120ms;
+  --dur-hover: 150ms;
+  --dur-enter: 200ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #eae3d3;
+    --ink-secondary: #cbc2ad;
+    --ink-light: #a89d86;
+    --ink-muted: #998e75;
+    --ink-faint: #6e6450;
+
+    --paper: #191510;
+    --paper-alt: #201b14;
+    --paper-white: #251f17;
+
+    --panel: #211c15;
+    --panel-lift: #2a241b;
+    --border: #362e20;
+
+    --accent: #64887a;
+    --accent-text: #95b2a4;
+    --accent-soft: rgba(149, 178, 164, 0.2);
+    --accent-muted: rgba(149, 178, 164, 0.07);
+
+    --urgent: #e2705a;
+    --urgent-soft: rgba(226, 112, 90, 0.13);
+    --health-active: #63a487;
+    --health-active-soft: rgba(99, 164, 135, 0.16);
+    --health-cooling: #d9a83e;
+    --health-cooling-soft: rgba(217, 168, 62, 0.15);
+    --health-cold: #8d8270;
+    --health-cold-soft: rgba(141, 130, 112, 0.18);
+
+  }
+}
+
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.62;
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100dvh;
+}
+
+.mono, .eyebrow, .ledger-cap, .masthead-folio, .chip, .rail a, .btn, .folio, .scoreboard .label {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--mono-meta);
+}
+
+/* The panel — the one grouped-content surface. Borderless, shadowless. */
+.ledger, .card, .score, .circuit, .verdict {
+  background: var(--panel);
+  border: none;
+  box-shadow: none;
+  border-radius: var(--radius-panel);
+}
+
+/* ---------- Shell ---------- */
+.site { min-height: 100dvh; }
+.content {
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-5) var(--space-16);
+}
+.rail { display: none; }
+@media (min-width: 1040px) {
+  .site { display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+  .rail {
+    display: block; position: sticky; top: 0; align-self: start;
+    max-height: 100dvh; overflow-y: auto;
+    padding: var(--space-6) var(--space-4);
+    border-right: 1px solid var(--border);
+  }
+  .content { margin: 0; padding-left: var(--space-6); }
+}
+.rail .brand {
+  font-family: var(--font-serif); font-size: var(--text-title);
+  font-style: italic; font-weight: 700; letter-spacing: -0.02em;
+  text-transform: none; display: block; margin-bottom: var(--space-1);
+}
+.rail .brand span { color: var(--accent-text); font-style: normal; }
+.rail .brand-sub {
+  font-family: var(--font-serif); font-style: italic;
+  font-size: var(--text-body); color: var(--ink-light);
+  margin-bottom: var(--space-5);
+}
+.rail nav { display: flex; flex-direction: column; gap: 2px; }
+.rail a {
+  color: var(--ink-muted); text-decoration: none;
+  padding: 6px 0 6px 14px; border-left: 1px solid transparent;
+  transition: color var(--dur-hover) ease;
+  text-transform: none; letter-spacing: var(--ls-tight);
+}
+.rail a:hover { color: var(--accent-text); }
+.rail a.on { color: var(--ink); border-left-color: var(--accent); }
+.rail .rail-foot {
+  font-family: var(--font-serif); font-style: italic;
+  font-size: var(--text-body); color: var(--ink-faint);
+  margin-top: var(--space-6); text-transform: none;
+}
+
+/* ---------- Masthead ---------- */
+.masthead-folio {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--space-3); font-weight: 600; letter-spacing: var(--ls-eyebrow);
+  font-size: var(--text-eyebrow);
+  color: var(--accent-text); margin: 0 0 var(--space-3);
+}
+.masthead-folio .folio-no { color: var(--ink-faint); font-weight: 500; }
+.masthead-date {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 700; letter-spacing: -0.024em; line-height: 1.05;
+  margin: 0 0 var(--space-5); text-wrap: balance;
+}
+.thesis { color: var(--ink-secondary); max-width: 62ch; }
+.thesis em { color: var(--ink); font-style: italic; }
+.head-rule {
+  border: none; height: 5px;
+  border-top: 2.5px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+  background: transparent;
+  margin: var(--space-6) 0 var(--space-10);
+}
+
+/* ---------- Scoreboard ---------- */
+.scoreboard {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3); margin-bottom: var(--space-6);
+}
+.score {
+  padding: var(--space-5);
+  text-align: left; font: inherit; color: inherit; border: none; cursor: pointer;
+  transition: box-shadow var(--dur-hover) ease, background-color var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.score:hover { background: var(--panel-lift); }
+.score:active { transform: scale(0.99); }
+.score.on { box-shadow: inset 0 0 0 1px var(--accent); }
+.score:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.score .n {
+  font-family: var(--font-serif); font-size: var(--text-display);
+  font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; display: block;
+}
+.score .label {
+  color: var(--ink-muted); letter-spacing: var(--ls-eyebrow); font-weight: 600;
+  font-size: var(--text-eyebrow); display: block; margin-top: var(--space-2);
+}
+.score.closed .n { color: var(--accent-text); }
+.score.recording .n { color: var(--health-cooling); }
+.score.planned .n { color: var(--ink-faint); }
+
+/* ---------- Section caps + ledger ---------- */
+.eyebrow {
+  font-weight: 600; letter-spacing: var(--ls-eyebrow); font-size: var(--text-eyebrow);
+  color: var(--accent-text); margin: 0 0 var(--space-3);
+}
+section { margin-bottom: var(--space-16); scroll-margin-top: var(--space-4); }
+.ledger-cap {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--space-3); font-weight: 600; letter-spacing: var(--ls-eyebrow);
+  font-size: var(--text-eyebrow);
+  color: var(--ink-muted); margin: 0 0 var(--space-3);
+}
+.ledger-cap .cap-count { color: var(--ink-faint); font-weight: 500; }
+.ledger { padding: var(--space-2) var(--space-4); margin-bottom: var(--space-10); }
+.cap-sub { font-style: italic; color: var(--ink-light); line-height: 1.55; margin: 0 0 var(--space-4); max-width: 56ch; }
+h2.act {
+  font-family: var(--font-serif); font-size: var(--text-display);
+  font-weight: 600; letter-spacing: -0.022em; line-height: 1.08;
+  margin: 0 0 var(--space-3); text-wrap: balance;
+}
+
+/* ---------- Loop rows ---------- */
+.row {
+  display: grid; grid-template-columns: 14px minmax(0, 1fr) auto;
+  column-gap: var(--space-4); align-items: baseline;
+  padding: var(--space-4) 0;
+  width: 100%; text-align: left;
+  background: none; border: none; color: inherit; font: inherit;
+  cursor: pointer; border-radius: var(--radius-sm);
+  transition: background-color var(--dur-hover) ease, opacity var(--dur-enter) ease;
+}
+.row:hover { background: var(--panel-lift); }
+.row.sel { background: var(--accent-muted); }
+.row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row.hidden { display: none; }
+.dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  align-self: start; margin-top: 9px; justify-self: start;
+  background: var(--health-cold); box-shadow: 0 0 0 3px var(--health-cold-soft);
+}
+.dot.closed { background: var(--health-active); box-shadow: 0 0 0 3px var(--health-active-soft); }
+.dot.recording { background: var(--health-cooling); box-shadow: 0 0 0 3px var(--health-cooling-soft); }
+.dot.planned { background: var(--health-cold); box-shadow: 0 0 0 3px var(--health-cold-soft); }
+.row-main { min-width: 0; }
+/* The row's parts are SPANS in the markup below; without this they run
+   together ("1. KnowledgeBriefs extract facts…"). Blockify in CSS — the
+   markup and its data island stay exactly as they are. */
+.row-main, .row-title, .row-sub, .row-detail { display: block; }
+.row-title { font-weight: 600; font-size: var(--text-title); letter-spacing: -0.012em; line-height: 1.25; }
+.row-sub { color: var(--ink-secondary); margin-top: 2px; }
+.folio {
+  color: var(--ink-muted); text-align: right;
+  white-space: normal; overflow-wrap: anywhere; max-width: 7.5rem;
+  line-height: 1.5; align-self: start; padding-top: 6px;
+}
+@media (min-width: 640px) { .folio { max-width: 15rem; } }
+
+/* ---------- Chips / badges ---------- */
+.chip {
+  display: inline-block; padding: 3px 8px; border-radius: var(--radius-sm);
+  background: var(--panel-lift); color: var(--ink-muted); white-space: nowrap;
+}
+.chip.closed { background: var(--accent-muted); color: var(--accent-text); }
+.chip.recording { background: var(--health-cooling-soft); }
+.chip.planned { background: var(--health-cold-soft); color: var(--ink-muted); }
+.chips { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
+
+/* ---------- Stage ---------- */
+.stagewrap { margin-top: var(--space-5); }
+.circuit { padding: var(--space-5) var(--space-3); }
+.circuit svg { display: block; width: 100%; height: auto; }
+.arc { fill: none; stroke: var(--border); stroke-width: 1.4; transition: stroke var(--dur-enter) ease; }
+.arc.lit { stroke: var(--accent); }
+.arc.pending { stroke-dasharray: 5 6; stroke: var(--health-cold); }
+.st-ring { fill: var(--panel-lift); stroke: var(--ink-faint); stroke-width: 1.2; transition: stroke var(--dur-enter) ease, fill var(--dur-enter) ease; }
+.st-ring.lit { stroke: var(--accent); fill: var(--accent-soft); }
+.st-ring.pending { stroke: var(--health-cold); stroke-dasharray: 3 3; }
+.st-no {
+  font-family: var(--font-mono); font-size: 10px; fill: var(--ink-muted);
+  text-anchor: middle; dominant-baseline: central;
+}
+.st-no.lit { fill: var(--accent-text); }
+.st-label {
+  font-family: var(--font-mono); font-size: 11.5px; fill: var(--ink-secondary);
+  letter-spacing: 0.01em; text-transform: uppercase;
+}
+.st-label.pending { fill: var(--ink-faint); }
+.hub-title { font-family: var(--font-serif); font-size: 17px; font-weight: 600; fill: var(--ink); text-anchor: middle; }
+.hub-sub { font-family: var(--font-serif); font-size: 12.5px; font-style: italic; fill: var(--ink-light); text-anchor: middle; }
+.gap-note {
+  font-family: var(--font-mono); font-size: 10px; fill: var(--ink-faint);
+  text-anchor: middle; text-transform: uppercase; letter-spacing: 0.03em;
+}
+
+/* ---------- Cards ---------- */
+.card { padding: var(--space-5) var(--space-6); }
+.card + .card { margin-top: var(--space-3); }
+.card h3 {
+  font-family: var(--font-serif); font-size: var(--text-title);
+  font-weight: 600; letter-spacing: -0.01em; margin: 0 0 var(--space-1); text-wrap: balance;
+}
+.card p { color: var(--ink-secondary); }
+.card p + p { margin-top: var(--space-2); }
+.card .file {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-faint); letter-spacing: var(--ls-tight);
+  overflow-wrap: anywhere; margin-bottom: var(--space-2); text-transform: none;
+}
+.card .empty { font-style: italic; color: var(--ink-light); }
+
+/* station list under the circuit */
+.stations { margin-top: var(--space-3); }
+.station {
+  display: grid; grid-template-columns: 26px minmax(0, 1fr);
+  column-gap: var(--space-3); align-items: baseline;
+  padding: var(--space-2) 0;
+  transition: opacity var(--dur-enter) ease;
+}
+.station .sno { font-family: var(--font-mono); font-size: var(--mono-meta); color: var(--ink-faint); }
+.station.lit .sno { color: var(--accent-text); }
+.station .sname { font-weight: 600; letter-spacing: -0.008em; }
+.station .sfile {
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  color: var(--ink-faint); text-transform: none; letter-spacing: var(--ls-tight);
+  overflow-wrap: anywhere; display: block; margin-top: 1px;
+}
+.station .snote { color: var(--ink-secondary); margin-top: 2px; }
+.station.pending { opacity: 0.55; }
+.station.pending .sname::after {
+  content: " — pending";
+  font-family: var(--font-mono); font-size: var(--mono-meta);
+  text-transform: uppercase; color: var(--health-cooling); letter-spacing: var(--ls-wide);
+}
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+  padding: 0.5rem 0.9rem; letter-spacing: var(--ls-eyebrow);
+  background: var(--panel-lift); color: var(--ink);
+  border: none; box-shadow: none; border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-hover) ease, box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+.btn:hover { background: var(--accent-muted); color: var(--accent-text); }
+.btn:active { transform: scale(0.97); }
+.btn.on { box-shadow: inset 0 0 0 1px var(--accent); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btnbar { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: var(--space-3) 0; }
+
+/* ---------- Misc ---------- */
+.foot { margin-top: var(--space-8); font-style: italic; color: var(--ink-faint); max-width: 62ch; }
+.content a { color: inherit; text-decoration-color: var(--ink-faint); }
+.content a:hover { color: var(--accent-text); }
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="site">
+
+  <header class="rail">
+    <span class="brand">Sotto<span>.</span></span>
+    <div class="brand-sub">The flywheel, honestly.</div>
+    <nav id="rail">
+      <a href="#scoreboard" class="on">The scoreboard</a>
+      <a href="#loops">The six loops</a>
+      <a href="#stage">The circuit</a>
+      <a href="#rules">What a badge means</a>
+    </nav>
+    <p class="rail-foot">Every CLOSED badge on this page names the file that closes it. If it doesn't, it isn't closed.</p>
+  </header>
+
+  <main class="content">
+
+    <div class="masthead-folio">
+      <span>Sotto · playground</span>
+      <span class="folio-no">Folio № 02 — feedback loops</span>
+    </div>
+    <h1 class="masthead-date">The flywheel, honestly</h1>
+    <p class="thesis">
+      A self-improving system is a set of circuits. Some are closed — the output really does re-enter
+      as input, and you can name the file where it happens. Some are plans. None today is merely
+      <em>recording</em> — a ledger written for a consumer that hasn't shipped was deleted rather
+      than badged, because data with no reader is a promise, not a kept promise.
+      <em>Click a loop to watch its stations light in order.</em> Nothing here is badged better than it is.
+    </p>
+    <hr class="head-rule">
+
+    <!-- ═══════ SCOREBOARD ═══════ -->
+    <section id="scoreboard">
+      <p class="eyebrow">The honest scoreboard</p>
+      <div class="scoreboard">
+        <button class="score closed" data-filter="closed">
+          <span class="n" id="nClosed">0</span><span class="label">Closed</span>
+        </button>
+        <button class="score recording" data-filter="recording">
+          <span class="n" id="nRecording">0</span><span class="label">Recording</span>
+        </button>
+        <button class="score planned" data-filter="planned">
+          <span class="n" id="nPlanned">0</span><span class="label">Planned</span>
+        </button>
+      </div>
+      <p class="cap-sub" id="filterNote">
+        Tap a tile to filter the list below. <strong>Closed</strong> means the output re-enters as
+        input today, in shipped code. <strong>Recording</strong> means the write side is live and
+        the consumer is not. <strong>Planned</strong> means neither.
+      </p>
+    </section>
+
+    <!-- ═══════ THE LOOPS ═══════ -->
+    <section id="loops">
+      <div class="ledger-cap"><span>The six loops</span><span class="cap-count" id="loopCount"></span></div>
+      <div class="ledger" id="loopList"></div>
+    </section>
+
+    <!-- ═══════ THE STAGE ═══════ -->
+    <section id="stage">
+      <div class="ledger-cap"><span>The circuit</span><span class="cap-count" id="stageCap">nothing selected</span></div>
+      <div class="ledger" style="padding-top:var(--space-3)">
+        <div class="stagewrap">
+          <div class="circuit"><svg id="svg" viewBox="0 0 560 360" role="img" aria-labelledby="svgTitle"><title id="svgTitle">Loop circuit diagram</title></svg></div>
+          <div class="btnbar">
+            <button class="btn" id="replayBtn" disabled>Replay the circuit</button>
+          </div>
+          <div id="verdictCard"><div class="card"><p class="empty">Pick a loop above.</p></div></div>
+          <div class="stations" id="stations"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ RULES ═══════ -->
+    <section id="rules">
+      <p class="eyebrow">Method</p>
+      <h2 class="act">What a badge means</h2>
+      <p class="cap-sub">
+        The temptation with a flywheel diagram is to draw every arrow solid. These three badges exist
+        so the drawing can't lie.
+      </p>
+      <div class="ledger-cap"><span>The three badges</span><span class="cap-count">and their evidence bar</span></div>
+      <div class="ledger">
+        <div class="row" style="cursor:default">
+          <span class="dot closed"></span>
+          <span class="row-main">
+            <span class="row-title">CLOSED</span>
+            <span class="row-sub">Every station is shipped code, and the last one feeds the first. To earn
+              this badge a loop must name the writer, the store, the reader, and the surface where the
+              effect shows up — all four, all at HEAD.</span>
+          </span>
+          <span class="folio">4 named files</span>
+        </div>
+        <div class="row" style="cursor:default">
+          <span class="dot recording"></span>
+          <span class="row-main">
+            <span class="row-title">RECORDING</span>
+            <span class="row-sub">The write side is live and accruing ahead of its consumer, with the arc
+              back drawn dashed and dark because nothing reads it yet. <strong>No loop carries it
+              today:</strong> the one that did — an offered-drafts ledger — was deleted rather than kept
+              warm for a matcher that hasn't shipped.</span>
+          </span>
+          <span class="folio">none at HEAD</span>
+        </div>
+        <div class="row" style="cursor:default">
+          <span class="dot planned"></span>
+          <span class="row-main">
+            <span class="row-title">PLANNED</span>
+            <span class="row-sub">Designed, sequenced, not built. Shown because leaving it off the map would
+              make the map look better than the machine.</span>
+          </span>
+          <span class="folio">not built</span>
+        </div>
+      </div>
+    </section>
+
+    <p class="foot">
+      Sources of truth for this page: the module docstrings of <code>knowledge_update.py</code>,
+      <code>learn_preferences.py</code>, <code>triage_event.py</code>, <code>style_extract.py</code>,
+      <code>action_links.py</code> and <code>continuity_resolve.py</code>, the roadmap's Step 2.5 and
+      Step 3 entries, and <code>evals/run_evals.py</code>. Where a docstring and the code disagreed,
+      the code won.
+    </p>
+
+  </main>
+</div>
+
+<!-- ═══════════════════ THE RULES ISLAND ═══════════════════
+     The ONE source for every numeric rule this page states. The prose, the labels and the
+     simulator all read from here — nothing below hardcodes a knob. Identical in both
+     playgrounds, and compared field-by-field against the code constants by
+     sotto-chief-of-staff/tests/test_docs_drift.py. CLAUDE.md's docs-stay-true rule: a behaviour
+     change updates the playground's rules island in the same commit. -->
+<script type="application/json" id="sotto-rules">
+{
+  "cron":       { "morning": "6:30", "midday": "12:30", "evening": "17:30",
+                  "pulse_day": "Mondays", "pulse_time": "9:00", "proactive_min": 15 },
+  "intervals":  { "events_tick_secs": 3, "email_poll_secs": 90, "valve_interval_secs": 900,
+                  "calendar_refresh_secs": 900, "triage_fork_secs": 30, "gmail_fork_secs": 180,
+                  "calendar_gather_fork_secs": 60, "dashboard_cli_fork_secs": 30 },
+  "calendar":   { "ttl_secs": 600, "stale_intervals": 2 },
+  "tap":        { "grace_min": 5, "max_per_day": 3 },
+  "quiet":      { "start_hour": 21, "end_hour": 7 },
+  "vip":        { "min_priority": 10 },
+  "tier1":      { "text_max_chars": 1500 },
+  "escalation": { "window_min": 45 },
+  "freshness":  { "event_max_age_min": 30 },
+  "cooldown":   { "min": 20 },
+  "budget":     { "nudge_per_day": 4 },
+  "valve":      { "max_per_tick": 2, "max_per_hour": 2, "max_age_min": 240 },
+  "digest":     { "min_signals": 8 },
+  "ledger":     { "max_mb": 4, "keep_lines": 4000 },
+  "style":      { "confirmed_floor": 0.95,
+                  "ttl_days": { "work_email": 90, "work_message": 60, "personal_message": 30 } },
+  "approval":   { "min_accepted": 3, "min_accept_rate": 0.8 },
+  "continuity": { "deadline_grace_days": 2, "terminal_retention_days": 30 },
+  "chase":      { "after_days": 3, "max": 2 },
+  "birthday":   { "lead_days": 3 },
+  "classes":    {
+    "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
+    "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
+    "budget_exempt":       ["missed_call", "escalation", "post_meeting"],
+    "meeting_hold_exempt": ["missed_call", "escalation"],
+    "cooldown_exempt":     ["escalation"],
+    "digest_count":        ["ambient", "quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"],
+    "digest_actionable":   ["quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"]
+  }
+}
+</script>
+
+<script>
+"use strict";
+/* ═══════════════════ THE RULES ISLAND ═══════════════════
+   Every numeric rule on this page comes from the <script id="sotto-rules"> block above — one
+   source, read once. Prose and labels carry {dotted.path} tokens with an optional :formatter;
+   `fill` resolves them at render time and `fillStatic` resolves the ones written into the static
+   markup. An unknown path throws loudly rather than rendering a hole.
+   Derived units are computed here, never stored twice: :min is seconds→minutes, :hours is
+   minutes→hours, :hhmm is an hour→"HH:00", :pct is a rate→percent, :word spells a small integer,
+   and :codes/:dots/:slash render a set the way the sentence around it needs it. */
+
+const RULES = JSON.parse(document.getElementById("sotto-rules").textContent);
+
+const NUM_WORDS = { 0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+                    7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+                    15: "fifteen", 20: "twenty", 30: "thirty", 45: "forty-five", 60: "sixty",
+                    90: "ninety", 240: "two hundred and forty" };
+
+const _vals = v => (Array.isArray(v) ? v : Object.keys(v).map(k => v[k]));
+
+const FMT = {
+  raw:   v => String(v),
+  min:   v => String(Math.round(v / 60)),
+  hours: v => String(Math.round(v / 60)),
+  hhmm:  v => (String(v).length < 2 ? "0" + v : String(v)) + ":00",
+  pct:   v => String(Math.round(v * 100)),
+  word:  v => (NUM_WORDS[v] !== undefined ? NUM_WORDS[v] : String(v)),
+  codes: v => _vals(v).map(x => "<code>" + x + "</code>").join(", "),
+  dots:  v => _vals(v).join(" · "),
+  slash: v => _vals(v).join("/")
+};
+
+function ruleAt(path) {
+  let v = RULES;
+  const keys = path.split(".");
+  for (let i = 0; i < keys.length; i++) {
+    if (v === null || typeof v !== "object" || !(keys[i] in v)) {
+      throw new Error("sotto-rules: unknown rule path " + path);
+    }
+    v = v[keys[i]];
+  }
+  return v;
+}
+
+const TOKEN_RE = /\{([a-z0-9_]+(?:\.[a-z0-9_]+)*)(?::([a-z]+))?\}/g;
+
+function fill(s) {
+  return String(s).replace(TOKEN_RE, function (m, path, fmt) {
+    const f = FMT[fmt || "raw"];
+    if (!f) throw new Error("sotto-rules: unknown formatter :" + fmt);
+    return f(ruleAt(path));
+  });
+}
+
+// Static markup carries tokens too (the cron line, for one). Rewriting text nodes in place keeps
+// every element identity — the rail's IntersectionObserver targets survive it.
+function fillStatic(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const hits = [];
+  while (walker.nextNode()) {
+    const n = walker.currentNode;
+    const parent = n.parentNode ? n.parentNode.nodeName : "";
+    if (parent === "SCRIPT" || parent === "STYLE") continue;
+    if (n.nodeValue.indexOf("{") >= 0) hits.push(n);
+  }
+  hits.forEach(n => { n.nodeValue = fill(n.nodeValue); });
+}
+
+// This page's static markup carries no tokens today — every number it states lives in the loop
+// data below. The pass runs anyway, so a sentence in the markup can adopt one without wiring.
+fillStatic(document.body);
+
+
+/* ═══════════════════ THE LOOPS ═══════════════════
+   status: "closed" | "recording" | "planned"
+   live:   how many stations are shipped today (the rest render dashed)
+   Every `file` is a real path at HEAD. */
+
+const LOOPS = [
+  {
+    id: "knowledge",
+    title: "Knowledge",
+    status: "closed",
+    one: "Briefs extract facts → the graph → the next brief, the next prep and the next nudge name people better.",
+    hub: ["Knowledge", "the people & company graph"],
+    closes: "The correction re-enters at station 2. A dashboard fact edit builds the exact extraction payload a texted correction produces and runs it through the same <code>apply()</code> — SUPERSEDE semantics, archived text, dedup, migration, all identical. One apply path, whichever surface you used.",
+    detail: [
+      "Entity-dedup rides the same Learn step, in three deliberately asymmetric pieces: two files sharing a normalized identifier auto-merge (an identifier is not a coincidence); name-similarity is <strong>suggest-only, forever</strong> (name-slug keying is the original identity bug — two different John Smiths in one file); and companies get prevention rather than repair, with alias and domain consulted before a new file is minted and known names fed back into the extraction prompt.",
+      "Retrieval always includes today's attendees regardless of file staleness — otherwise the person you meet after a three-week gap is packed with zero context."
+    ],
+    live: 6,
+    stations: [
+      { s: "Extract", name: "The brief extracts", file: "_shared/scripts/compose_brief.py → extracted_knowledge", note: "One Gemini call returns <code>{person_updates, company_updates}</code> alongside the prose." },
+      { s: "Apply", name: "Apply to the graph", file: "_shared/knowledge/knowledge_update.py", note: "SUPERSEDE semantics, similarity dedup, provenance, exact-identifier auto-merge, merge suggestions for the rest." },
+      { s: "Store", name: "The files", file: "$SOTTO_DATA/knowledge/people/*.md · knowledge/companies/*.md", note: "Markdown with a facts map and per-fact provenance. Nothing is deleted; superseded facts are archived." },
+      { s: "Retrieve", name: "Pack for the model", file: "_shared/knowledge/knowledge_query.py --calendar", note: "Recently-updated people, plus everyone on today's calendar regardless of staleness, plus the contact_index identity map that bridges a phone to an email." },
+      { s: "Spend", name: "Named better", file: "the next brief · compose_meeting_prep.py · the funnel's Tier-1 one-liner", note: "The same packed knowledge becomes the “who is this” line the triage model sees — so the graph improves interrupt decisions, not just prose." },
+      { s: "Correct", name: "You correct it", file: "feedback skill → knowledge_update.py · dashboard → knowledge_edit.py", note: "“That's wrong about Peyton” in chat, or a tap on her page. Both land at station 2." }
+    ]
+  },
+  {
+    id: "preferences",
+    title: "Preferences",
+    status: "closed",
+    one: "Feedback verbs and dashboard levers → preferences.json → the funnel and the brief obey; learned lists are rebuilt from scratch every brief, with tombstones.",
+    hub: ["Preferences", "stated rules + learned rules"],
+    closes: "<code>learn_preferences.py</code> runs in every brief's Learn step and rebuilds the three learned lists <em>from scratch</em> — which is exactly why the tombstones matter. The dashboard records each delete of a learned rule in the top-level <code>suppressed</code> array, and the learner filters those values back out. <strong>A rule you delete stays deleted.</strong>",
+    detail: [
+      "The stated half never goes near the learner: an <code>explicit</code> change from the dashboard forks <code>preferences.py</code>, so muting a sender from the web is byte-for-byte what saying it in chat does.",
+      "A learned approval default is emitted only with real signal — at least {approval.min_accepted} accepted outcomes at ≥{approval.min_accept_rate:pct}% acceptance — and it is clamped: behaviour alone may relax <em>review</em> to <em>one_tap</em>, but it can never grant <code>auto</code> and never emits <code>forbidden</code>.",
+      "<code>preferences.json</code> is the system's ONE shared-write file. Two writers, one for each half, and a documented rule for the overlap."
+    ],
+    live: 6,
+    stations: [
+      { s: "Say it", name: "You state a rule", file: "feedback skill · dashboard mute / VIP / snooze / add-a-rule", note: "“Mute Bob”, “make Sarah a VIP”, “be quiet until 3”, “keep my briefs terse”." },
+      { s: "One CLI", name: "One write path", file: "_shared/scripts/preferences.py (the explicit block)", note: "Chat and dashboard both fork it. No second implementation." },
+      { s: "Behave", name: "You act on drafts", file: "_shared/scripts/log_outcome.py → outcomes.jsonl", note: "draft_created · opened · copied · dismissed · executed · viewed · edited_and_sent." },
+      { s: "Learn", name: "Derive the rules", file: "approval-tiers/scripts/learn_preferences.py", note: "Runs in every brief's Learn step. Deprioritization, approval defaults, style feedback, completion analytics." },
+      { s: "Store", name: "preferences.json", file: "$SOTTO_DATA/preferences.json", note: "explicit · learned lists · the <code>suppressed</code> tombstones." },
+      { s: "Obey", name: "The funnel obeys", file: "triage_event.py (mutes, VIP, snooze) · compose_brief.py (tone, muted sections)", note: "The mutes and the VIP list are read in Tier 0 — before any model call is made." }
+    ]
+  },
+  {
+    id: "surfacing",
+    title: "Surfacing",
+    status: "closed",
+    one: "Every verdict → surfaced.jsonl → the digest window, the escalation join, the evening brief, and the Record. The “never tell you twice” loop.",
+    hub: ["Surfacing", "one line per verdict"],
+    closes: "Four independent readers, all live at HEAD. The one that closes the felt loop is the evening brief: it reads today's delivered nudges and compresses each still-open one to a single line, so a 3pm ask that tapped you at 3:05 is never re-derived and re-told at 5:30 as if it were news.",
+    detail: [
+      "The window is anchored to the brief that actually <em>delivered</em>: <code>brief_marker.claim()</code> advances the digest stamp when it wins the deliver-once claim, so the {cron.midday} digest can never repeat what the morning brief just covered.",
+      "The escalation join reads this ledger because it is the only place an <em>agent</em> verdict is retained — a live missed call exists nowhere else. Dropped rows are excluded on purpose: an automated or muted event is not someone reaching you.",
+      "Bounded like the queue: {ledger.max_mb} MB, {ledger.keep_lines} lines, rotate-keeping-tail. The readers take bounded tails of it, so the join stays cheap per event."
+    ],
+    live: 6,
+    stations: [
+      { s: "Verdict", name: "Every verdict, recorded", file: "triage_event._record_surfaced", note: "<code>{ts, sender, channel, verdict, reason, class}</code> — nudged, queued, dropped or promoted." },
+      { s: "Ledger", name: "surfaced.jsonl", file: "$SOTTO_DATA/events/surfaced.jsonl", note: "The diagnostic substrate for “why didn't I get nudged about that?”." },
+      { s: "Digest", name: "The digest window", file: "brief_marker.claim() → digest_check.advance_stamp", note: "The {cron.midday} digest only considers what was queued since the last DELIVERED brief — and needs at least {digest.min_signals} real signals from people you know, or it stays silent." },
+      { s: "Escalate", name: "The escalation join", file: "triage_event._ledger_rows", note: "Bounded tails of queue.jsonl and surfaced.jsonl answer one question: has this exact person already reached you on a different channel in the last {escalation.window_min} minutes?" },
+      { s: "Compress", name: "The evening brief", file: "compose_brief._load_surfaced_nudges → “Already Nudged Today”", note: "Today's delivered nudges, in your local day, compressed to one line each. An item not listed was never nudged — treat it normally." },
+      { s: "Record", name: "The Record view", file: "dashboard.api_ledger → /app#record", note: "Rendered as-is: <em>muted sender</em>, <em>quiet hours</em>, <em>daily interrupt budget spent ({budget.nudge_per_day} nudges today)</em>." }
+    ]
+  },
+  {
+    id: "style",
+    title: "Style",
+    status: "closed",
+    one: "Sent mail and sent messages → style.json → drafts in your voice; the confirmed bucket is seeded from the dashboard.",
+    hub: ["Style", "the writing fingerprint"],
+    closes: "The seed-to-draft circuit is closed today: the gather's <code>in:sent</code> lane and the Mac's own outbound rows feed the extractor every brief, and <code>style_apply.py</code> quotes verbatim samples into the drafter prompt — per-person first, then the context bucket.",
+    detail: [
+      "Confirming a sample on the dashboard's Voice card forks <code>style_extract.py --confirm &lt;hash&gt;</code>, copying it into the <code>confirmed</code> bucket. That bucket is weighted hardest — it is floored at {style.confirmed_floor} quality, immune to TTL eviction, and quoted first as “drafts the user has shipped before (highest signal)”. <strong>That consumer weighting is live.</strong>",
+      "The arc this loop does <em>not</em> close is “what did he change about what I wrote”. That is loop 5, and it lands with the Step 3 learning loop.",
+      "Accumulation is real, not a sketch: three context buckets, quality scoring, promotion after a week above the quality bar, and per-bucket TTL eviction ({style.ttl_days:slash} days) so a voice from last spring doesn't outvote this week's."
+    ],
+    live: 6,
+    stations: [
+      { s: "Sent", name: "What you actually sent", file: "gather_google.py's in:sent lane · the Bridge's is_from_me rows", note: "A small sent-mail lane merged into the same gather file and flagged <code>isSent</code>. Skip it and the email voice never learns." },
+      { s: "Extract", name: "Fingerprint it", file: "_shared/scripts/style_extract.py", note: "Buckets by context — work_email, work_message, personal_message — with quality scoring and back-channel filtering." },
+      { s: "Store", name: "style.json", file: "$SOTTO_DATA/style.json (schema v2)", note: "Canonical, recent, per-person and confirmed samples, each with an age and a score." },
+      { s: "Apply", name: "Into the prompt", file: "_shared/scripts/style_apply.py", note: "Verbatim samples, per-person first, then the bucket, plus master guardrails: capitalization, exclamation habit, openers and closings." },
+      { s: "Draft", name: "The draft sounds like you", file: "draft-reply skill · the nudge's ready-to-send reply", note: "Never sent — always a draft behind a tap." },
+      { s: "Confirm", name: "You confirm a sample", file: "dashboard Voice card → style_extract.py --confirm", note: "Floored at {style.confirmed_floor}, TTL-immune, quoted first. The one place a human vote outranks the extractor." }
+    ]
+  },
+  {
+    id: "corpus",
+    title: "Corpus & evals",
+    status: "planned",
+    one: "Real history → a scrubbed corpus → replayable evals, so every judgment change ships with evidence instead of vibes.",
+    hub: ["Corpus", "evidence, not vibes"],
+    closes: "",
+    gap: "There <em>is</em> an eval harness today, and it is genuinely useful — but its inputs are three synthetic golden days. Until the corpus exists, a change to the funnel's judgment ships with invariants, not with evidence about your actual history.",
+    detail: [
+      "Live today: <code>evals/run_evals.py --deterministic</code> loads three golden day fixtures, runs the real pipeline pieces — normalize, continuity resolve, prompt build, compose against a stub model, tap-link post-processing — into a throwaway sandbox and asserts named invariants. It is offline, under five seconds, and guarded by the test suite. A <code>--live</code> mode scores real extractions with the pack's own critic against a stored baseline; it is deliberately never automatic.",
+      "Planned (roadmap Step 2.5): the owner's real history, PII-scrubbed with referential integrity, versioned, and confidential regardless — it never ships and is excluded from the publish generator.",
+      "It unlocks four things in order: regression evals, funnel replay with labeled nudge decisions (which is what would tune the budget and the valve on evidence), a six-week flywheel time-travel test, and the voice ground truth the learning loop needs.",
+      "Sequencing note from the roadmap: labeling which events deserved a nudge and labeling the corpus are the same hour of owner judgment — they happen together."
+    ],
+    live: 2,
+    stations: [
+      { s: "Fixtures", name: "Three golden days", file: "evals/fixtures + evals/run_evals.py --deterministic", note: "Real pipeline pieces, stub model, named invariants, offline, in CI." },
+      { s: "Baseline", name: "A scored live run", file: "evals/run_evals.py --live → baselines/scores.json", note: "Human-invoked only. Fails on a regression past the threshold." },
+      { s: "Scrub", name: "Scrub real history", file: "Step 2.5 — PII scrub with referential integrity", note: "Not built. Confidential regardless; generator-excluded by design." },
+      { s: "Replay", name: "Funnel replay", file: "Step 2.5 — labeled nudge decisions", note: "Not built. This is what turns budget and valve tuning into an evidence question." },
+      { s: "Judge", name: "An independent judge", file: "Step 7 — not the pack's own critic", note: "Not built. Named as a prerequisite there, built here, consumed there." }
+    ]
+  },
+  {
+    id: "continuity",
+    title: "Continuity",
+    status: "closed",
+    one: "Commitments → the ledger → every brief until resolved → deterministic resolution before the model ever runs; what you're owed is chased instead of forgotten.",
+    hub: ["Continuity", "the open-loop ledger"],
+    closes: "Resolution is deterministic and runs <em>before</em> the LLM: replied threads close, passed meetings close, a deadline {continuity.deadline_grace_days:word} days gone expires something YOU owe, terminal items are pruned after {continuity.terminal_retention_days:word} days. Closure never depends on the model noticing.",
+    detail: [
+      "Dedup is by <code>anchor_key</code>, so the same ask re-extracted tomorrow lands on the same file and bumps <code>times_surfaced</code> instead of breeding a second one. That counter is what lets the brief say “still open, third day”.",
+      "The anchor is an identity, never a label: a group ask is keyed by the group's own platform ID (iMessage's <code>chat_guid</code>, WhatsApp's <code>…@g.us</code> JID, verified against the snapshot the model was shown), a person's ask by the person. Rename the group and it is still the one debt — and a row minted under an invented name re-anchors on the next sweep, its duplicate folding into the older row's age with the newer row's words.",
+      "Owning a loop by hand goes through the resolver's own machinery — normalize, compute the anchor, persist — so a hand-added loop is byte-shaped like every other entry and the sweep reads it natively. A hand-added loop carries <code>channel: manual</code> and nothing auto-closes it, because nothing in your inbox corresponds to it.",
+      "Direction decides the ending. Something you OWE has no snooze state — moving the deadline forward is its only “later”, because the resolver expires it {continuity.deadline_grace_days:word} days past that date. Something you're OWED is never expired by a date at all: after {chase.after_days} silent days it is marked chase-due, the watcher delivers one short warm chase, and only a DELIVERED chase is counted — so one that quiet hours swallowed is not one of the {chase.max} this item gets.",
+      "After the {chase.max}nd, Sotto stops guessing and asks in plain words — “I've nudged Maya twice about the contract — nudge her again, or let it go?” — which is the one place the loop hands itself back to you by name. It asks <em>once</em>: the delivery is stamped on the row, so the question is never repeated and the loop stops taking a line in every brief — it waits in the count line until you answer."
+    ],
+    live: 6,
+    stations: [
+      { s: "Commit", name: "A commitment appears", file: "the brief's actions[] · followup/scripts/apply_commitments.py", note: "“I'll send the deck Thursday” from a meeting transcript, or an action the brief extracted." },
+      { s: "Anchor", name: "Anchor and dedupe", file: "continuity_resolve.compute_anchor_key", note: "A group ask keys on the group's own ID, a person's on the person; re-adding the same ask bumps times_surfaced rather than making a second file." },
+      { s: "Store", name: "The ledger", file: "$SOTTO_DATA/knowledge/continuity/*.md (YAML frontmatter)", note: "One markdown file per loop, with status, resolution, deadline and provenance." },
+      { s: "Resolve", name: "Deterministic sweep", file: "morning-brief/scripts/continuity_resolve.py", note: "Replied threads · passed meetings · a deadline {continuity.deadline_grace_days} days past expires what you OWE · what you're OWED is marked chase-due after {chase.after_days} days instead · terminal items pruned after {continuity.terminal_retention_days} days. Runs before the model." },
+      { s: "Surface", name: "Until it's done", file: "compose_brief via ledger_io · loops_query.py · proactive_scan.py · /app#loops", note: "Every open loop rides every brief — urgent ones by name, the rest as one count line, and one you snoozed not at all; the watcher delivers the one chase that is due and finalizes the count on delivery; the read surfaces never write." },
+      { s: "Own it", name: "You close it by hand", file: "knowledge_edit.py --op loop / loop-add / loop-deadline", note: "Resolver-shaped bytes, written with the resolver's own calls — from chat or from the dashboard." }
+    ]
+  }
+];
+
+/* ═══════════════════ RENDER ═══════════════════ */
+
+const $ = (s, r) => (r || document).querySelector(s);
+const el = (t, c, h) => { const n = document.createElement(t); if (c) n.className = c; if (h !== undefined) n.innerHTML = h; return n; };
+// The SVG namespace, read off the inline <svg> element rather than written as a literal — this
+// file makes zero network references of any kind, and that includes ones that only look like URLs.
+const SVGNS = document.getElementById("svg").namespaceURI;
+const svgEl = (t, a) => {
+  const n = document.createElementNS(SVGNS, t);
+  if (a) Object.keys(a).forEach(k => n.setAttribute(k, a[k]));
+  return n;
+};
+
+const BADGE = { closed: "CLOSED", recording: "RECORDING · consumer pending", planned: "PLANNED" };
+
+/* --- scoreboard --- */
+const counts = { closed: 0, recording: 0, planned: 0 };
+LOOPS.forEach(l => { counts[l.status] += 1; });
+$("#nClosed").textContent = counts.closed;
+$("#nRecording").textContent = counts.recording;
+$("#nPlanned").textContent = counts.planned;
+$("#loopCount").textContent = LOOPS.length + " circuits";
+
+let FILTER = null;
+document.querySelectorAll(".score").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const f = btn.dataset.filter;
+    FILTER = (FILTER === f) ? null : f;
+    document.querySelectorAll(".score").forEach(b => b.classList.toggle("on", b.dataset.filter === FILTER));
+    document.querySelectorAll("#loopList .row").forEach(r => {
+      r.classList.toggle("hidden", !!FILTER && r.dataset.status !== FILTER);
+    });
+    $("#filterNote").innerHTML = FILTER
+      ? "Showing <strong>" + BADGE[FILTER] + "</strong> loops only. Tap the tile again to show all six."
+      : "Tap a tile to filter the list below. <strong>Closed</strong> means the output re-enters as input today, in shipped code. <strong>Recording</strong> means the write side is live and the consumer is not. <strong>Planned</strong> means neither.";
+  });
+});
+
+/* --- the loop list --- */
+const list = $("#loopList");
+LOOPS.forEach((loop, i) => {
+  const row = el("button", "row");
+  row.type = "button";
+  row.dataset.status = loop.status;
+  row.dataset.id = loop.id;
+  row.innerHTML = fill(
+    '<span class="dot ' + loop.status + '"></span>' +
+    '<span class="row-main"><span class="row-title">' + (i + 1) + ". " + loop.title + "</span>" +
+    '<span class="row-sub">' + loop.one + "</span>" +
+    '<span class="chips"><span class="chip ' + loop.status + '">' + BADGE[loop.status] + "</span>" +
+    '<span class="chip">' + loop.stations.length + " stations</span>" +
+    (loop.live < loop.stations.length ? '<span class="chip planned">' + (loop.stations.length - loop.live) + " not built</span>" : "") +
+    "</span></span>" +
+    '<span class="folio">№ ' + String(i + 1).padStart(2, "0") + "</span>");
+  row.addEventListener("click", () => select(loop));
+  list.appendChild(row);
+});
+
+/* --- the circuit --- */
+let TIMERS = [];
+let CURRENT = null;
+
+function clearTimers() { TIMERS.forEach(t => clearTimeout(t)); TIMERS = []; }
+
+const CX = 280, CY = 178, RX = 196, RY = 118;
+
+function pointAt(angleDeg) {
+  const a = (angleDeg - 90) * Math.PI / 180;
+  return { x: CX + RX * Math.cos(a), y: CY + RY * Math.sin(a) };
+}
+
+function drawCircuit(loop) {
+  const svg = $("#svg");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const title = svgEl("title", { id: "svgTitle" });
+  title.textContent = loop.title + " loop — " + BADGE[loop.status];
+  svg.appendChild(title);
+
+  const n = loop.stations.length;
+  const pts = [];
+  for (let i = 0; i < n; i++) pts.push(pointAt((360 / n) * i));
+
+  // arcs first (behind the stations)
+  const arcs = [];
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    // an arc is "pending" when either endpoint is a station that isn't built yet
+    const pending = !(i < loop.live) || !(((i + 1) % n) < loop.live);
+    const p = svgEl("path", {
+      d: "M" + a.x.toFixed(1) + "," + a.y.toFixed(1) +
+         " A" + RX + "," + RY + " 0 0,1 " + b.x.toFixed(1) + "," + b.y.toFixed(1),
+      class: "arc" + (pending ? " pending" : "")
+    });
+    svg.appendChild(p);
+    arcs.push({ node: p, pending: pending });
+  }
+
+  // hub text
+  const t1 = svgEl("text", { x: CX, y: CY - 4, class: "hub-title" });
+  t1.textContent = loop.hub[0];
+  svg.appendChild(t1);
+  const t2 = svgEl("text", { x: CX, y: CY + 16, class: "hub-sub" });
+  t2.textContent = loop.hub[1];
+  svg.appendChild(t2);
+  if (loop.status !== "closed") {
+    const t3 = svgEl("text", { x: CX, y: CY + 40, class: "gap-note" });
+    t3.textContent = loop.status === "recording" ? "arc back not yet read" : "not built";
+    svg.appendChild(t3);
+  }
+
+  // stations
+  const rings = [];
+  pts.forEach((p, i) => {
+    const pending = (i + 1) > loop.live;
+    const g = svgEl("g");
+    const c = svgEl("circle", { cx: p.x.toFixed(1), cy: p.y.toFixed(1), r: 13,
+                                class: "st-ring" + (pending ? " pending" : "") });
+    g.appendChild(c);
+    const no = svgEl("text", { x: p.x.toFixed(1), y: p.y.toFixed(1), class: "st-no" });
+    no.textContent = String(i + 1);
+    g.appendChild(no);
+
+    // Label placed outward from the centre. Stations near the vertical axis get the label above
+    // or below (centred); the rest get it to the left or right, anchored away from the ellipse —
+    // which is what keeps a six-station ring from colliding with itself inside the viewBox.
+    const dx = p.x - CX, dy = p.y - CY;
+    const side = Math.abs(dx) >= 30;
+    const lab = svgEl("text", {
+      x: (side ? p.x + (dx > 0 ? 18 : -18) : p.x).toFixed(1),
+      y: (side ? p.y + 4 : p.y + (dy < 0 ? -22 : 27)).toFixed(1),
+      class: "st-label" + (pending ? " pending" : ""),
+      "text-anchor": side ? (dx > 0 ? "start" : "end") : "middle"
+    });
+    lab.textContent = loop.stations[i].s;
+    g.appendChild(lab);
+    svg.appendChild(g);
+    rings.push({ ring: c, no: no, pending: pending });
+  });
+
+  return { arcs: arcs, rings: rings, n: n };
+}
+
+function renderStations(loop) {
+  const mount = $("#stations");
+  mount.innerHTML = "";
+  loop.stations.forEach((st, i) => {
+    const pending = (i + 1) > loop.live;
+    const d = el("div", "station" + (pending ? " pending" : ""));
+    d.dataset.i = String(i);
+    d.innerHTML = fill(
+      '<span class="sno">' + String(i + 1).padStart(2, "0") + "</span>" +
+      '<span><span class="sname">' + st.name + "</span>" +
+      '<span class="sfile">' + st.file + "</span>" +
+      '<span class="snote">' + st.note + "</span></span>");
+    mount.appendChild(d);
+  });
+}
+
+function renderVerdict(loop) {
+  const parts = ['<div class="card">'];
+  parts.push("<h3>" + loop.title + '&nbsp;<span class="chip ' + loop.status + '">' + BADGE[loop.status] + "</span></h3>");
+  parts.push('<div class="file">' + loop.stations.length + " stations · " + loop.live + " shipped · " +
+             (loop.stations.length - loop.live) + " pending</div>");
+  if (loop.closes) parts.push("<p><strong>What closes it:</strong> " + loop.closes + "</p>");
+  if (loop.gap) parts.push("<p><strong>What's open:</strong> " + loop.gap + "</p>");
+  (loop.detail || []).forEach(p => parts.push("<p>" + p + "</p>"));
+  parts.push("</div>");
+  $("#verdictCard").innerHTML = fill(parts.join(""));
+}
+
+function play(loop, parts) {
+  clearTimers();
+  parts.arcs.forEach(a => a.node.classList.remove("lit"));
+  parts.rings.forEach(r => { r.ring.classList.remove("lit"); r.no.classList.remove("lit"); });
+  document.querySelectorAll("#stations .station").forEach(s => s.classList.remove("lit"));
+
+  const step = 240;
+  for (let i = 0; i < parts.n; i++) {
+    TIMERS.push(setTimeout(() => {
+      if (i + 1 > loop.live) return;               // a station that isn't built never lights
+      parts.rings[i].ring.classList.add("lit");
+      parts.rings[i].no.classList.add("lit");
+      const st = document.querySelector('#stations .station[data-i="' + i + '"]');
+      if (st) st.classList.add("lit");
+      const arc = parts.arcs[i];
+      if (arc && !arc.pending) arc.node.classList.add("lit");
+    }, i * step));
+  }
+}
+
+function select(loop) {
+  CURRENT = loop;
+  document.querySelectorAll("#loopList .row").forEach(r => r.classList.toggle("sel", r.dataset.id === loop.id));
+  $("#stageCap").textContent = loop.title + " · " + BADGE[loop.status];
+  const parts = drawCircuit(loop);
+  renderStations(loop);
+  renderVerdict(loop);
+  $("#replayBtn").disabled = false;
+  $("#replayBtn").onclick = () => play(loop, parts);
+  play(loop, parts);
+  $("#stage").scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+/* --- rail scroll spy --- */
+(function wireRail() {
+  const links = Array.prototype.slice.call(document.querySelectorAll("#rail a"));
+  const sections = links.map(a => document.querySelector(a.getAttribute("href")));
+  if (!("IntersectionObserver" in window)) return;
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const i = sections.indexOf(e.target);
+      if (i < 0) return;
+      links.forEach(a => a.classList.remove("on"));
+      links[i].classList.add("on");
+    });
+  }, { rootMargin: "-20% 0px -70% 0px" });
+  sections.forEach(s => s && obs.observe(s));
+})();
+</script>
+
+</body>
+</html>
