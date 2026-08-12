@@ -210,3 +210,70 @@ def test_brief_audio_is_a_validated_scalar(tmp_path, monkeypatch, capsys):
         raised = e.code == 2
     assert raised and "off|morning|evening|both" in capsys.readouterr().out
     assert "brief_audio" in pr.SCALARS   # the learner carries scalars forward untouched
+
+
+# ── concurrency: the write that used to vanish ───────────────────────────────────────────────────
+
+def _spawn(script, args, data_dir):
+    import subprocess, sys as _s
+    return subprocess.run([_s.executable, script, *args],
+                          env={**os.environ, "SOTTO_DATA": str(data_dir)},
+                          capture_output=True, text=True)
+
+
+PREFS_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                         "_shared", "scripts", "preferences.py")
+LEARN_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                         "approval-tiers", "scripts", "learn_preferences.py")
+
+
+def test_two_concurrent_preference_writes_both_survive(tmp_path):
+    """The reproduction, as a test. Before the lock this lost a mute 7% of the time, crashed a
+    writer 7%, and left preferences.json unreadable 2% — and a half-fix that locked only the WRITE
+    made the loss worse (23%), because the loser faithfully wrote back a block it read before the
+    winner's change existed. The mutation has to happen inside the lock."""
+    from concurrent.futures import ThreadPoolExecutor
+    _spawn(PREFS_CLI, ["mute-sender", "seed@x.test"], tmp_path)
+    with ThreadPoolExecutor(2) as ex:
+        rs = list(ex.map(lambda w: _spawn(PREFS_CLI, ["mute-sender", f"{w}@x.test"], tmp_path),
+                         ["alice", "bob"]))
+    assert all(r.returncode == 0 for r in rs), [r.stderr for r in rs]
+    got = json.loads(open(os.path.join(str(tmp_path), "preferences.json")).read())
+    mutes = got["explicit"]["mute_senders"]
+    assert {"seed@x.test", "alice@x.test", "bob@x.test"} <= set(mutes)
+
+
+def test_a_preference_set_during_the_learn_rebuild_is_not_clobbered(tmp_path):
+    """The collision that actually happens every morning: the Learn step rewrites preferences.json
+    wholesale from behaviour while you mute someone. Both must survive."""
+    from concurrent.futures import ThreadPoolExecutor
+    with open(os.path.join(str(tmp_path), "outcomes.jsonl"), "w") as f:
+        for i in range(200):
+            f.write(json.dumps({"ts": "2026-08-01", "action_id": f"a{i}", "outcome": "executed",
+                                "channel": "email", "contact": f"p{i % 5}@y.test",
+                                "action_type": "reply", "tier": "one_tap"}) + "\n")
+    with ThreadPoolExecutor(2) as ex:
+        rs = list(ex.map(lambda w: _spawn(LEARN_CLI, [], tmp_path) if w == "learn"
+                         else _spawn(PREFS_CLI, ["vip", "Ada Lovelace"], tmp_path),
+                         ["learn", "vip"]))
+    assert all(r.returncode == 0 for r in rs), [r.stderr for r in rs]
+    got = json.loads(open(os.path.join(str(tmp_path), "preferences.json")).read())
+    assert "Ada Lovelace" in got["explicit"]["vip_people"]   # the user's write survived
+    assert "analytics" in got                                # …and so did the learner's
+
+
+def test_a_corrupt_preferences_file_is_never_papered_over(tmp_path):
+    """A learner that mints a fresh file over an unreadable one drops the explicit block and every
+    tombstone with it. It must refuse instead."""
+    p = os.path.join(str(tmp_path), "preferences.json")
+    with open(p, "w") as f:
+        f.write("{not json")
+    # outcomes must exist, or the learner returns before it ever reaches the write it must refuse
+    with open(os.path.join(str(tmp_path), "outcomes.jsonl"), "w") as f:
+        for i in range(10):
+            f.write(json.dumps({"ts": "2026-08-01", "action_id": f"a{i}", "outcome": "executed",
+                                "channel": "email", "contact": "p@y.test",
+                                "action_type": "reply", "tier": "one_tap"}) + "\n")
+    r = _spawn(LEARN_CLI, [], tmp_path)
+    assert "unreadable" in (r.stderr or "")
+    assert open(p).read() == "{not json"      # untouched, awaiting repair

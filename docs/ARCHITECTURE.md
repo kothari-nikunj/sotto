@@ -98,10 +98,12 @@ The Hermes `google-workspace` skill's `setup.py` is a seventh, forked for Google
 
 **Adapter/plumbing variables** (script-to-script, never a user setting — they are deliberately
 absent from RAILWAY.md's table): `SOTTO_DATA` (the volume path, `/data` in the image),
-`SOTTO_RUN_SKILL` and `SOTTO_SKILLS_ROOT` (above), `SOTTO_MCP_TOKEN` (the reverse-MCP relay bearer,
-which `start.sh` sets from `BRIDGE_TOKEN`), and `SOTTO_TRIGGER_PORT` / `SOTTO_TRIGGER_BIND` (the
+`SOTTO_RUN_SKILL` and `SOTTO_SKILLS_ROOT` (above), `SOTTO_UNATTENDED` (set to `1` on every skill run the receiver spawns — the seam `google_action.py`'s send gate reads; the interactive gateway never carries it), `SOTTO_MCP_TOKEN` (the reverse-MCP relay bearer,
+which `start.sh` sets from `BRIDGE_TOKEN`), `SOTTO_TRIGGER_PORT` / `SOTTO_TRIGGER_BIND` (the
 receiver's port and bind address, used only when Railway's `PORT` is absent — local runs get `8787`
-on `127.0.0.1`).
+on `127.0.0.1`), and `SOTTO_BRIDGE_BIN` (read once by `adapters/hermes/install.sh`: an explicit path
+to a `sotto-bridged` engine, overriding both locations it probes for local mode — the built binary
+and the one bundled in `/Applications/Sotto Bridge.app`).
 
 ## The shared `$SOTTO_DATA` files
 
@@ -114,14 +116,18 @@ process.**
 |---|---|---|
 | `setup_code` | receiver (boot) | receiver, `start.sh` |
 | `config/settings.json` | receiver (`/setup/timezone`) | receiver, dashboard, `start.sh`, skills (`timeutil`) |
-| `briefs/<date>.<kind>.claim` / `.delivered` | receiver | receiver (trigger dedup) |
+| `briefs/<date>.<kind>.claim` · `briefs/<date>.<kind>.delivered` | receiver | receiver (trigger dedup) |
 | `briefs/<date>.<kind>.payload.json` | receiver | skills (`compose_brief.py`) |
 | `briefs/<date>_<kind>.json` | skills | dashboard |
 | `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
-| `events/seen.json` | receiver | receiver (idempotency ring) |
+| `events/seen.json` | receiver | receiver (idempotency ring — Bridge events, keyed `(source,rowid)`) |
+| `events/gmail_seen.json` | skills (`poll_gmail.py`) | skills (`poll_gmail.py`) — the same ring for polled Gmail; a *separate* file because a different process owns it |
 | `events/last.stamp` | receiver | receiver (`/setup` liveness line) |
 | `events/bundle-<ms>.json` | receiver | skills (the `sotto-event` one-shot) |
-| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`) |
+| `events/last_digest.txt` | skills (`digest_check.py --stamp`, and the brief that wins the deliver-once claim) | skills (`digest_check.py` window), dashboard (`/api/cadence` context line) |
+| `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads `surfaced`) |
+| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`) — rows that close a run also carry a `usage` object (`{model, cost, input_tokens, output_tokens}`) |
+| `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per send/reply **attempt**, allowed or refused, so "what did Sotto send?" isn't answered by a prompt's promise |
 | `cache/calendar_today.json` | calcache | skills (`triage_event.py` in-meeting hold) |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
 | `cache/research_<date>.json` | skills (`research_attendees.py`) | dashboard (`/api/research` cards), skills (`compose_brief.py` joins it) |
@@ -131,8 +137,15 @@ process.**
 | `connectors/<service>.json` | connectors | skills (`connector_tokens.py`), receiver (presence only) |
 | `connectors/<service>.error` | skills (the gather) | receiver (`/setup` reconnect hint) |
 | `dashboard_sessions.json` · `dashboard_audit.jsonl` | dashboard | dashboard |
-| `knowledge/**` · `style.json` · `outcomes.jsonl` | skills | dashboard (read), skills |
+| `knowledge/last_local_snapshot.json` | skills (`compose_brief.py`) | skills — the RAW Bridge payload, overwritten each brief and never deleted; its 24h TTL stops reuse, not storage ([DATA-FLOW.md](DATA-FLOW.md)) |
+| `knowledge/relationship_state.json` | skills (`relationship_pulse.py`) | skills (`compose_brief.py`, `triage_event.py`'s VIP floor), dashboard (the attention queue) |
+| `knowledge/<kind>/*.md` · `style.json` · `outcomes.jsonl` | skills | dashboard (read), skills |
 | `logs/compose_brief.log` | skills | receiver (`/debug/brief-log`) |
+| `proactive/<date>.json` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the once-per-day nudge dedup; a read-modify-write, so both producers take `triage_event._locked` on it |
+| `proactive/wake_run.last` | receiver (`handle_proactive_wake`) | receiver — its *mtime* is the sleep→wake throttle, nothing is read from inside it |
+| `proactive/retune_offer.last` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the retune-offer cooldown stamp |
+| `proactive/pending_offer.json` | skills (`pending_offer.py set` — the ONE writer, called by the proactive lane right after it delivers a push that ENDED in a question) | the gateway (`pending_offer.py get`, then `clear`) — a nudge is delivered by a detached run, so the user's bare "sure" lands in a session that never saw the question; this file is where it is written down. One offer at a time, newest wins, expires after 180 min at read |
+| `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
 | **`preferences.json`** | **skills *and* dashboard** | skills, dashboard |
 
@@ -178,7 +191,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 | Learned preferences | `preferences.json` (behavioral lists) | `approval-tiers/scripts/learn_preferences.py` |
 | Stated preferences | `preferences.json` (`explicit` block) | `_shared/scripts/preferences.py` |
 | Writing style | `style.json` | `_shared/scripts/style_extract.py` |
-| Relationship analytics | `relationship_state.json` | `relationship-pulse/scripts/relationship_pulse.py` |
+| Relationship analytics | `knowledge/relationship_state.json` | `relationship-pulse/scripts/relationship_pulse.py` |
 | The Record (every verdict) | `events/surfaced.jsonl` · `events/queue.jsonl` | `event-triage/scripts/triage_event.py` |
 | Outcomes | `outcomes.jsonl` | `_shared/scripts/log_outcome.py` |
 

@@ -1,6 +1,12 @@
 **/.pytest_cache/
 **/__pycache__/
 *.pyc
+# A deployer's own local env file. `adapters/hermes/.env.template` IS committed and shipped; the
+# `.env` beside it is that template filled in with their tokens and must never be committed. The
+# monorepo root ignores `.env` globally, but THIS file is the one that ships (the generator copies it
+# as the public repo's .gitignore), so without this line a user who follows LOCAL-SETUP.md sees their
+# own credentials file sitting untracked in `git status`. Belt to the publish-time IGNORED guard.
+adapters/hermes/.env
 sotto-bridge/core/target/
 .DS_Store
 # Bridge build/release artifacts (build-app.sh + release.sh outputs — never committed;

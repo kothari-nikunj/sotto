@@ -40,6 +40,17 @@ or scheduled run may create one silently, and no learned default relaxes it belo
 drafts folder filling itself up while the user sleeps is exactly the busywork theater a chief of
 staff doesn't do.
 
+**The tiers are policy; outbound email has an enforcement seam.** Everything above is a rule an
+agent honors — and an agent running with approvals auto-bypassed (`hermes -z`, which is how every
+cron, proactive and event-triage run executes) honors nothing by construction. So the one
+irreversible act, outbound email, is gated in code rather than in prose: the receiver sets
+`SOTTO_UNATTENDED` in the environment of every skill it spawns, and `google_action.py` refuses
+`gmail-send` and `gmail-reply` when it is set, before any network call, returning
+`fallback: "gmail-draft"` and exiting non-zero. **That refusal is the policy working, not an error
+to route around** — never retry it, never reach for another send path; offer the Gmail draft, or
+queue the item for the next conversation. `gmail-draft` and the calendar verbs stay available
+unattended because they are not outbound email; they still need their tier's approval.
+
 **Unattended runs.** A scheduled or unattended send may only use `auto` — plus `one_tap` for a
 recipient the user has pre-approved, and that allowance covers **message drafts**
 (iMessage/SMS/WhatsApp) only. It does not cover the `one_tap` calendar write: an RSVP runs on the

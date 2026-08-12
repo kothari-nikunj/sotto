@@ -48,10 +48,14 @@ from datetime import datetime, timezone, timedelta
 # textutil / timeutil themselves, so nothing loads the brief engine to reach a string helper.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from textutil import (  # noqa: E402
-    _arr, _obj, _s, _names_match, _is_excluded_domain,
+    _arr, _obj, _s, _names_match, _is_excluded_domain, _normalize_identifier,
     _base_domain, _sender_addr, _extract_sender_name, unwrap_tool_result,
     normalize_attendee_research as _normalize_attendee_research,
 )
+# The deterministic brief rules — and, with them, THE fabricated-identifier test the tap-link
+# builder enforces (identifier_allowed / TAP_IDENTIFIER_FIELDS). Imported at the top like every
+# other lib: the guard that decides whether a link may be minted cannot be an optional import.
+import brief_validate  # noqa: E402
 from timeutil import (  # noqa: E402
     _date_only, _parse_ts, _tz_offset_minutes,
     configured_tz, configured_user_email, _resolve_tz, _user_tz_offset,
@@ -88,6 +92,12 @@ PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "morning-brief
 # path — a live read_local always wins. Past this, we'd rather brief with no local than re-surface
 # day(s)-old "needs reply" threads as if they're fresh, so an expired snapshot is dropped.
 LOCAL_SNAPSHOT_TTL_HOURS = 24
+
+# The `source_status` value that means the user switched a source OFF (Bridge config.rs: a source in
+# `disabled_sources` is never read and reports "disabled"). Distinct from every other status —
+# "needs_fda"/"unavailable"/"degraded" are a source that BROKE, and a broken source's last good data
+# is still worth carrying; a switched-off one is not.
+_DISABLED_SOURCE = "disabled"
 
 # Ledger entries the brief never renders: a meeting-prep/meeting-info loop is a calendar shadow, not
 # an ask, and the docket already covers it. Same rule (and same two names) the dashboard's
@@ -713,7 +723,14 @@ def _save_local_snapshot(local: dict):
         # pull can come back thin. If THIS pull has no contacts but the prior snapshot did, keep the
         # old ones so a contacts-less refresh doesn't wipe name resolution (the "raw phone numbers in
         # the brief" symptom). Everything else is plain last-write-wins.
-        if not _arr(local, "contacts"):
+        #
+        # UNLESS the user turned Contacts OFF. `source_status: {"contacts": "disabled"}` is the
+        # Bridge reporting a CHOICE (bridge-config.json's disabled_sources), not a thin read, and
+        # carrying yesterday's address book forward past that choice keeps a disabled source alive
+        # in every later brief. A disabled source is dropped from the snapshot, not remembered.
+        if _s(_obj(local, "source_status").get("contacts")) == _DISABLED_SOURCE:
+            local.pop("contacts", None)
+        elif not _arr(local, "contacts"):
             try:
                 with open(path, encoding="utf-8") as f:
                     prev = (json.load(f).get("local") or {})
@@ -1512,13 +1529,89 @@ def _event_link_map(inputs: dict) -> dict:
 
 
 
-def _action_tap_link(action: dict, event_links: dict | None = None) -> str:
-    """Pick the CHANNEL and IDENTIFIER for a brief action, then hand the URL to the one link builder
-    (action_links.link_for). What lives here is the
-    routing the raw builder can't do: JID stripping, the routable-phone guard, resolving a calendar
-    event id against the gathered events, and inferring a channel the model omitted. Chat-tappable
-    schemes throughout (wa.me/mailto:/tel:/sms:, not the Mac app's imessage://) because the brief is
-    delivered in chat. Returns '' when there's no routable identifier."""
+# ── The tap-target allowlist (a tap link may only point at someone the DATA contained) ────────────
+# One sentence: a link is minted only for an identifier the gathered sources actually carried, so an
+# invented recipient gets prose and no tap target. The model picks WHICH identifier an action
+# carries; this decides whether that identifier EXISTS. Built from the inputs dict alone — never
+# from model output — and normalized through textutil's one identifier normalizer, so
+# "+1 (555) 123-4567", "15551234567" and "15551234567@s.whatsapp.net" are a single entry.
+
+_EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def _allow(allow: set, *values) -> None:
+    for v in values:
+        n = _normalize_identifier(_s(v))
+        if n:
+            allow.add(n)
+
+
+def build_tap_target_allowlist(inputs: dict, event_links: dict | None = None) -> set:
+    """Every identifier the SOURCE DATA carried, normalized — the set a tap target must belong to.
+
+    The sources, one per line below: Apple Contacts' phones and emails; iMessage handles; WhatsApp
+    JIDs, group senders and participants; the stable group ids (`chat_guid`) a group loop is keyed
+    by; call numbers; email senders, recipients and thread ids; calendar attendees, organizers, and
+    each event's id and link; the knowledge graph's contact_index identifiers and person-knowledge
+    emails; and the open ledger's counterparts. Canonical ids ride along wherever the source carried
+    one — a `<!--id:c_ab12…-->` marker is how the open-items contract proves a loop was already
+    told, and it is not a way to message anyone. An identifier absent from all of them was invented
+    somewhere between the data and the brief.
+
+    A failure while reading a malformed payload returns what was collected so far, which can only
+    ever refuse MORE links — never fewer, and never the brief."""
+    allow: set = set()
+    try:
+        _collect_tap_targets(inputs, event_links, allow)
+    except Exception as e:  # noqa: BLE001
+        _diag(f"[compose_brief] tap-target allowlist incomplete ({type(e).__name__}: {str(e)[:120]}) "
+              f"— unverifiable identifiers get no link this run")
+    return allow
+
+
+def _collect_tap_targets(inputs: dict, event_links: dict | None, allow: set) -> None:
+    local = _normalize_local(inputs)
+    google = _obj(inputs, "google")
+    for c in _arr(local, "contacts"):
+        _allow(allow, *_arr(c, "phones"), *_arr(c, "emails"))
+    for m in _arr(local, "imessage") + _arr(local, "deferred_unread_imessage"):
+        _allow(allow, m.get("handle"), m.get("chat_guid"), m.get("canonical_id"),
+               *_arr(m, "group_participants"))
+    for m in _arr(local, "whatsapp") + _arr(local, "deferred_unread_whatsapp"):
+        _allow(allow, m.get("contact_jid"), m.get("sender_jid"), m.get("chat_guid"),
+               m.get("canonical_id"), *_arr(m, "group_participants"))
+    for c in (_arr(local, "calls") + _arr(local, "whatsapp_calls")
+              + _arr(local, "missed_calls") + _arr(local, "recent_calls")):
+        _allow(allow, c.get("phone"), c.get("jid"))
+    for e in _arr(local, "contact_index"):
+        _allow(allow, e.get("canonical_id"), *_arr(e, "identifiers"))
+    for a in _arr(local, "action_ledger"):
+        _allow(allow, a.get("contact_identifier"), a.get("canonical_id"), a.get("group_id"))
+    _allow(allow, *_known_identities(local)[0])       # contacts + person-knowledge graph emails
+    for e in _arr(google, "emails") + _arr(local, "deferred_unread_emails"):
+        headers = _obj(e, "headers")
+        _allow(allow, e.get("senderEmail"), e.get("threadId"))
+        for field in (e.get("from"), e.get("to"), e.get("cc"),
+                      headers.get("from"), headers.get("to"), headers.get("cc")):
+            _allow(allow, *_EMAIL_IN_TEXT_RE.findall(_s(field)))
+    for t in _arr(local, "stale_threads"):
+        _allow(allow, t.get("threadId"), *_EMAIL_IN_TEXT_RE.findall(_s(t.get("to"))))
+    for e in _arr(google, "events"):
+        _allow(allow, e.get("id"), e.get("meetingLink"), e.get("htmlLink"), e.get("hangoutLink"))
+        _allow(allow, *[a.get("email") for a in _arr(e, "attendees")])
+        _allow(allow, _obj(e, "organizer").get("email"), _obj(e, "creator").get("email"))
+    _allow(allow, *(event_links or {}).values())      # the resolved event links, same source one hop on
+    _allow(allow, google.get("userEmail"), configured_user_email())
+
+
+
+
+def _tap_target(action: dict, event_links: dict | None = None) -> tuple:
+    """Pick the CHANNEL and IDENTIFIER a brief action would link to — ('', '') when nothing about it
+    is routable. THE routing decision, in one place: JID stripping, the routable-phone guard,
+    resolving a calendar event id against the gathered events, and inferring a channel the model
+    omitted. Chat-tappable channels throughout (wa.me/mailto:/tel:/sms:, not the Mac app's
+    imessage://) because the brief is delivered in chat."""
     ch = _s(action.get("channel")).lower()
     a_type = _s(action.get("type") or action.get("action_type")).lower()
     ident = _s(action.get("contactIdentifier") or action.get("contact_identifier"))
@@ -1528,11 +1621,6 @@ def _action_tap_link(action: dict, event_links: dict | None = None) -> str:
     is_jid = any(ident.endswith(s) for s in ("@s.whatsapp.net", "@g.us", "@lid", "@c.us"))
     phone_digits = re.sub(r"\D", "", ident.split("@")[0] if is_jid else ident)
     email = _s(action.get("emailReplyTo")) or (ident if ("@" in ident and not is_jid) else "")
-    subject = _s(action.get("emailSubject"))
-
-    def _link(channel: str, identifier: str) -> str:
-        # No message: a brief's tap link opens the thread, it never prefills a draft.
-        return link_for(channel, identifier, "", ("Re: " + subject) if subject else "") if identifier else ""
 
     # Routable guard (port of actionSchemas isRoutableIdentifier): only a real phone (>=7 digits) gets
     # a phone-shaped link. NEVER fall back to sms:<ident> — that's how name slugs ("arnav_sahu") and
@@ -1541,38 +1629,110 @@ def _action_tap_link(action: dict, event_links: dict | None = None) -> str:
 
     # Channel is AUTHORITATIVE — a message action never routes to mailto just because its id has '@'.
     if ch in ("email", "gmail", "apple_mail"):
-        return _link("email", email) if email else _link("gmail_thread", _s(action.get("emailThreadId")))
+        return ("email", email) if email else ("gmail_thread", _s(action.get("emailThreadId")))
     if ch in ("whatsapp", "whatsapp_call"):
-        return _link("whatsapp", phone_digits) if phone else ""   # wa.me carries no '+'
+        return ("whatsapp", phone_digits) if phone else ("", "")   # wa.me carries no '+'
     if ch in ("phone",) or a_type == "call_back":
-        return _link("phone", phone)
+        return ("phone", phone)
     if ch in ("imessage", "sms"):
-        return _link("sms", phone)
+        return ("sms", phone)
     if ch in ("calendar",) or a_type in ("meeting_prep", "meeting_info"):
         # Prefer a link on the action; else resolve the event id (carried in contactIdentifier or
         # eventId) back to the gathered event's meeting/html link. This is what makes calendar actions
         # one-tap — the LLM usually emits the event id but not the link.
-        link = _s(action.get("meetingLink")) or _s((event_links or {}).get(
-            _s(action.get("eventId") or action.get("event_id")) or ident))
-        return _link("calendar", link)
+        return ("calendar", _s(action.get("meetingLink")) or _s((event_links or {}).get(
+            _s(action.get("eventId") or action.get("event_id")) or ident)))
     # No explicit channel → infer from the identifier shape (a real email, else a phone).
-    return _link("email", email) if email else _link("sms", phone)
+    return ("email", email) if email else ("sms", phone)
 
 
 
 
-def _attach_tap_links(out: dict, event_links: dict | None = None) -> dict:
+def _action_tap_link(action: dict, event_links: dict | None = None, allowlist=None) -> str:
+    """The tappable URL for a brief action, or '' when there is none: route it (_tap_target), refuse
+    a target the source data never carried (brief_validate.identifier_allowed — `allowlist=None`
+    means no source was supplied to check against), then hand the channel + identifier to the one
+    link builder (action_links.link_for)."""
+    channel, target = _tap_target(action, event_links)
+    if not (channel and target):
+        return ""
+    if not brief_validate.identifier_allowed(target, allowlist):
+        return ""
+    subject = _s(action.get("emailSubject"))
+    # No message: a brief's tap link opens the thread, it never prefills a draft.
+    return link_for(channel, target, "", ("Re: " + subject) if subject else "")
+
+
+
+
+def _refuse_tap_target(action: dict, target: str) -> str:
+    """Strip every routing field off an action whose target the data never contained, and say which
+    one was refused. The action keeps its TEXT — prose the user can act on by hand — and loses the
+    identifier entirely, so nothing downstream (a draft, a nudge, a re-link) can reach the invented
+    recipient. Fail toward silence for the ACTION; the brief itself is never withheld."""
+    for field in brief_validate.TAP_IDENTIFIER_FIELDS:
+        action.pop(field, None)
+    action["tap_link"] = ""
+    return (f"refused-tap-target: action '{_s(action.get('id')) or _s(action.get('contactName')) or '?'}' "
+            f"({_s(action.get('channel')) or 'no channel'}) pointed at '{target}', which appears in no "
+            f"gathered source — no link minted and the identifier dropped")
+
+
+# A tap marker in the markdown, whole: `<!--id:VALUE|ch:x-->`, `<!--id:VALUE-->` and
+# `<!--meeting:event_id:VALUE|…-->`. The app turns these into deep links exactly like an action's
+# identifier, so they are the SECOND place an identifier becomes a link — and they answer to the
+# same allowlist. (Chat delivery strips every marker anyway; the archived markdown does not.)
+_TAP_MARKER_RE = re.compile(r"<!--(id|meeting:event_id):([^|>]+?)(\|[^>]*)?-->")
+
+
+def _strip_fabricated_markers(out: dict, allowlist=None) -> list:
+    """Delete every tap marker whose identifier the source data never carried, keeping the bold name
+    it followed — the brief still names the person, it just no longer claims to know how to reach
+    them. Returns one refusal line per deleted marker."""
+    markdown = _s(out.get("brief_markdown"))
+    if not markdown or allowlist is None:
+        return []
+    refused = []
+
+    def _keep(m):
+        ident = _s(m.group(2)).strip()
+        if not ident or brief_validate.identifier_allowed(ident, allowlist):
+            return m.group(0)
+        refused.append(f"refused-tap-marker: <!--{m.group(1)}:{ident}--> appears in no gathered "
+                       f"source — the marker is dropped and the name stays unlinked")
+        return ""
+
+    stripped = _TAP_MARKER_RE.sub(_keep, markdown)
+    if refused:
+        out["brief_markdown"] = stripped
+    return refused
+
+
+def _attach_tap_links(out: dict, event_links: dict | None = None, allowlist=None) -> dict:
+    """Mint each action's tap link — and refuse the ones the source data cannot vouch for.
+
+    `allowlist` is compose-time truth (build_tap_target_allowlist); pass None and the refusal is
+    skipped, which only a caller with no inputs to check against may do."""
     actions = out.get("actions") or []
+    refused = _strip_fabricated_markers(out, allowlist)
     for a in actions:
-        if isinstance(a, dict) and not a.get("tap_link"):
-            link = _action_tap_link(a, event_links)
-            if link:
-                a["tap_link"] = link
+        if not isinstance(a, dict) or a.get("tap_link"):
+            continue
+        _channel, target = _tap_target(a, event_links)
+        if target and not brief_validate.identifier_allowed(target, allowlist):
+            refused.append(_refuse_tap_target(a, target))
+            continue
+        link = _action_tap_link(a, event_links, allowlist)
+        if link:
+            a["tap_link"] = link
     linked = sum(1 for a in actions if isinstance(a, dict) and a.get("tap_link"))
     dropped = [f"{_s(a.get('channel'))}:{_s(a.get('contactIdentifier') or a.get('contact_identifier'))}"
                for a in actions if isinstance(a, dict) and not a.get("tap_link")]
     _diag(f"[compose_brief] tap_links: {linked}/{len(actions)} actions linked"
           + (f"; no link for {dropped}" if dropped else ""))
+    if refused:
+        out["_refused_tap_targets"] = refused
+        _diag(f"[brief-validate] REFUSED {len(refused)} fabricated tap target(s): " + " | ".join(refused))
     return out
 
 
@@ -2252,20 +2412,25 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
     out = _normalize_output(json.loads(raw))
 
-    # Deterministic post-hoc validator (Sprint 1 #6): log-only, never blocks delivery; the violation
-    # list is handed to the critic so the revise pass fixes what code could measure.
+    # Deterministic post-hoc validator (Sprint 1 #6). Two halves, deliberately different: the prose
+    # rules are advisory (the violation list is handed to the critic so the revise pass fixes what
+    # code could measure), while the fabricated-identifier verdict is ENFORCED below — a tap target
+    # the data never carried is refused outright, because no amount of revision makes an invented
+    # recipient safe to link.
     open_ledger = _open_ledger_entries(inputs)
     # The brief's own user-local day — what makes a deadline overdue/due-today rather than distant.
     brief_day = _brief_day(_brief_tz(inputs), _brief_now(inputs))
+    event_links = _event_link_map(inputs)
+    allowlist = build_tap_target_allowlist(inputs, event_links)
     violations = []
     try:
-        import brief_validate  # noqa: PLC0415  (_shared/lib is on sys.path)
         # first_run: the one-time onboarding note MANDATES a trailing offer line after the brief —
         # the validator must not count it as Coming Up overflow (which would make the critic delete
         # a schedule line or the offer on the single most-judged brief).
         violations = brief_validate.validate(out.get("brief_markdown", ""), out.get("actions") or [], prompt,
                                              first_run=_is_first_run(inputs, {}),
-                                             action_ledger=open_ledger, today=brief_day)
+                                             action_ledger=open_ledger, today=brief_day,
+                                             allowed_identifiers=allowlist)
         if violations:
             _diag(f"[brief-validate] {len(violations)} violation(s): " + " | ".join(violations[:12]))
     except Exception:  # noqa: BLE001
@@ -2289,8 +2454,9 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     out = _append_receipts(out, inputs, _brief_now(inputs))
     # …and last, the one-line "a newer Sotto is published" notice — housekeeping, once per version.
     out = _append_update_notice(out)
-    # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event map
-    result = _attach_tap_links(out, _event_link_map(inputs))
+    # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event
+    # map. LAST, so the critic's own rewrites are held to the same allowlist as the first draft.
+    result = _attach_tap_links(out, event_links, allowlist)
     # The chat-deliverable text: markers stripped, WhatsApp-safe formatting (chatfmt.to_chat is the
     # ONE such transformation). Deterministic here so delivery never depends on the agent
     # remembering to sed the markers out. brief_markdown stays untouched for records/critic/actions.

@@ -81,6 +81,10 @@ fi
 # Refresh the Sotto persona block in the persisted SOUL.md too — otherwise persona/guardrail changes
 # never take effect on a redeploy (the volume copy is seeded once and goes stale). Strip the old Sotto
 # block (everything from its marker to EOF, since it's appended last) and re-append the current one.
+# This is ALSO the only way a standing instruction reaches gateway sessions — they load SOUL.md (see
+# the reply-prefix note further down), and nothing else in this file talks to them. So a rule the
+# gateway must always carry (e.g. "a bare 'sure' with no referent → pending_offer.py get") belongs in
+# sotto-persona.md, which the Dockerfile and both install.sh's append the same way. One source.
 if [ -f "$HSTATE/SOUL.md" ] && [ -f /app/adapters/hermes/sotto-persona.md ]; then
   sed -i '/chief-of-staff persona/,$d' "$HSTATE/SOUL.md" 2>/dev/null || true
   printf '\n' >> "$HSTATE/SOUL.md"

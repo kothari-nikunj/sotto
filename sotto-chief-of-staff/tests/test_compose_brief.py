@@ -304,8 +304,17 @@ def test_compose_attaches_tap_links():
         return json.dumps({"brief_markdown": "# B", "actions": [
             {"id": "a1", "type": "reply", "channel": "whatsapp", "contactName": "Dhruv",
              "contactIdentifier": "+15551234567"}]})
-    out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm)
+    # The recipient must be one the SOURCE carried — a link is minted for a real WhatsApp
+    # counterpart, never for a number that appears only in the model's answer (see
+    # tests/test_tap_link_allowlist.py for the fabricated-recipient half of this rule).
+    local = {"whatsapp": [{"contact_jid": "15551234567@s.whatsapp.net", "partner_name": "Dhruv",
+                           "is_from_me": False, "text": "hi"}]}
+    out = cb.compose({"type": "morning", "google": {}, "local": local}, llm=fake_llm)
     assert out["actions"][0]["tap_link"] == "https://wa.me/15551234567"
+    # …and with no source data at all, the same answer gets no link and no identifier.
+    bare = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm)
+    assert not bare["actions"][0].get("tap_link")
+    assert not bare["actions"][0].get("contactIdentifier")
 
 
 def _recent_stamp(hours_ago=1):
@@ -362,6 +371,39 @@ def test_contacts_carry_forward_on_thin_pull(tmp_path):
     snap = json.load(open(cb._snapshot_path()))
     assert any(c.get("name") == "Sarah" for c in snap["local"]["contacts"])   # contacts preserved
     assert snap["local"]["imessage"][0]["text"] == "new msg"                  # messages updated
+    del os.environ["SOTTO_DATA"]
+
+
+def test_contacts_are_not_carried_forward_when_the_source_is_disabled(tmp_path):
+    # A thin pull and a SWITCHED-OFF source look identical in the payload (no contacts) and must not
+    # be treated alike: `source_status.contacts == "disabled"` is the user's choice, and carrying
+    # yesterday's address book past it keeps a disabled source alive in every later brief.
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    cb._save_local_snapshot({"contacts": [{"name": "Sarah", "phones": ["+15551234567"]}],
+                             "imessage": [{"text": "hi", "is_from_me": False, "timestamp": _recent_stamp(2)}],
+                             "generated_at": _recent_stamp(2), "source_status": {"contacts": "ok"}})
+    cb._save_local_snapshot({"imessage": [{"text": "new msg", "is_from_me": False, "timestamp": _recent_stamp(1)}],
+                             "generated_at": _recent_stamp(1),
+                             "source_status": {"imessage": "ok", "contacts": "disabled"}})
+    import json
+    snap = json.load(open(cb._snapshot_path()))
+    assert not snap["local"].get("contacts")                                 # dropped, not remembered
+    assert snap["local"]["imessage"][0]["text"] == "new msg"                 # everything else unchanged
+    del os.environ["SOTTO_DATA"]
+
+
+def test_a_broken_contacts_source_still_carries_forward(tmp_path):
+    # Only "disabled" is a choice. needs_fda / unavailable / degraded are a source that BROKE, and a
+    # broken source's last good data is still the best name resolution available.
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    cb._save_local_snapshot({"contacts": [{"name": "Sarah", "phones": ["+15551234567"]}],
+                             "generated_at": _recent_stamp(2), "source_status": {"contacts": "ok"}})
+    cb._save_local_snapshot({"imessage": [{"text": "new msg", "is_from_me": False, "timestamp": _recent_stamp(1)}],
+                             "generated_at": _recent_stamp(1),
+                             "source_status": {"contacts": "needs_fda"}})
+    import json
+    snap = json.load(open(cb._snapshot_path()))
+    assert any(c.get("name") == "Sarah" for c in snap["local"]["contacts"])
     del os.environ["SOTTO_DATA"]
 
 
@@ -1235,7 +1277,10 @@ def test_validator_violations_feed_critic_and_force_revise(monkeypatch):
             return json.dumps({"brief_markdown": fixed_brief, "actions": []})
         return json.dumps({"brief_markdown": bad_brief, "actions": []})
 
-    out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
+    # Sarah is a real correspondent, so the revised brief's marker survives (a marker for someone
+    # the data never contained is refused — tests/test_tap_link_allowlist.py).
+    google = {"emails": [{"threadId": "t1", "from": "Sarah Chen <sarah@x.com>", "subject": "deal"}]}
+    out = cb.compose({"type": "morning", "google": google, "local": {}}, llm=fake_llm, critic=True)
     # violations were appended to the critic's user content …
     assert "AUTOMATED VALIDATOR VIOLATIONS" in seen["critic_prompt"]
     assert "banned-phrase: 'reached out'" in seen["critic_prompt"]
@@ -1393,7 +1438,9 @@ def test_dropped_loop_goes_to_the_critic_first(monkeypatch):
             return json.dumps({"brief_markdown": fixed, "actions": []})
         return json.dumps({"brief_markdown": "## Filtered\n\n12 promotional emails\n", "actions": []})
 
-    out = cb.compose(_open_ledger_inputs(), llm=fake_llm, critic=True)
+    # The ledger row carries Priya's identifier — which is what lets the revision's tap marker for
+    # her stand (an identifier no source carried is refused, allowlist rule).
+    out = cb.compose(_open_ledger_inputs(contact_identifier="p@x.com"), llm=fake_llm, critic=True)
     assert "dropped-open-loop" in seen["critic_prompt"] and "Priya Raman" in seen["critic_prompt"]
     assert out["brief_markdown"] == fixed
     assert "Still open" not in out["brief_markdown"]

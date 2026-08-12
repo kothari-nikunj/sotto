@@ -17,9 +17,17 @@ meeting notes — and turns it into a few moments a day that actually matter:
 
 Two principles, everywhere: **Sotto drafts, you send** — it never sends a message on its own. And
 **it runs on YOUR infrastructure** — your Railway container, your API key, your Mac. There is no
-Sotto server, no account, and nobody else in the loop. And the memory it builds — the people, the
-open loops, your voice — is markdown and JSON on a volume you own: readable, movable, deletable,
-never trapped in someone's cloud.
+Sotto server and no Sotto account: nothing phones home to us, because there is no us to phone.
+And the memory it builds — the people, the open loops, your voice — is markdown and JSON on a
+volume you own: readable, movable, deletable, never trapped in someone's cloud.
+
+**What that does *not* mean.** Your data still passes through the infrastructure and the model
+provider *you* configure. To write a brief, Sotto sends the gathered material — including the text
+of your messages, emails, notes and calendar events — to your chosen LLM provider, and it is
+processed on that provider's servers under their terms. Self-hosted means **no third party of
+ours** in the path; it does not mean the data stays on your machine. If that distinction matters to
+you, read [docs/DATA-FLOW.md](docs/DATA-FLOW.md) before installing — it names every place your data
+goes, what is written to disk, and how long it stays.
 
 ## How it works
 
@@ -123,6 +131,8 @@ local material, and the escape hatch) plus how to add a service:
 |---|---|
 | **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
 | [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
+| [docs/DATA-FLOW.md](docs/DATA-FLOW.md) | **Where your data goes** — every destination, every file written, how long each stays, and the gaps stated plainly. Read this before installing |
+| [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the five modules, four daemon threads, five subprocess boundaries, and every shared file on the volume |
@@ -145,6 +155,19 @@ MCP, agentskills) with thin per-runtime adapters. It runs today on
 | `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, wake triggers, real-time event ingestion + triage funnel |
 | `adapters/` | Per-host wiring (Hermes, OpenClaw) — see [adapters/README.md](adapters/README.md) |
 | `contracts/` | LocalData JSON Schema + the on-disk data layout |
+
+**Running the tests.** Python 3.11+ and three pinned dev dependencies; no services, no keys, no
+network — every test is hermetic:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+cd sotto-chief-of-staff && python3 -m pytest tests -q && python3 tools/validate_skills.py
+cd .. && python3 -m pytest runtime/trigger-receiver -q
+```
+
+CI runs exactly these three, in this order, on every push and pull request — so green locally means
+green there. A handful of tests exercise release tooling that lives outside this repo; they skip
+themselves rather than fail, which is why a clean clone goes green with nothing pending.
 
 The Bridge app ships signed [on Releases](https://github.com/kothari-nikunj/sotto/releases/latest);
 its macOS data readers are not part of this source tree. It updates itself: a daily check against

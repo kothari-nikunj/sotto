@@ -1,0 +1,14 @@
+# Everything the test gauntlet needs, and nothing else. Three packages:
+#
+#   pytest                     — the two suites (sotto-chief-of-staff/tests, runtime/trigger-receiver)
+#   pyyaml                     — skills front-matter; tools/validate_skills.py parses it
+#   google-api-python-client   — imported by the google-workspace skill's google_api.py, which a
+#                                handful of tests import rather than mock
+#
+# Pinned to the versions the gauntlet is actually validated against (`pip show`, 2026-08-12), so a
+# red CI run means a real regression and never "PyPI shipped something this morning". pyyaml and
+# google-api-python-client are held at the SAME versions as requirements.txt (the image), so the
+# suites test the libraries the container will run.
+pytest==9.1.1
+pyyaml==6.0.1
+google-api-python-client==2.198.0

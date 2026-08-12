@@ -1,0 +1,47 @@
+# Continuous integration for Sotto.
+#
+# GENERATED FILE — written by the release tooling in the source repository on every publish, so a
+# hand-edit here survives exactly until the next one. Change it there.
+#
+# It runs the same checks the source repository runs, on the same Python the container ships:
+# the pipeline suite, the skills validator, and the trigger-receiver suite. Tests that exercise
+# release tooling which is not part of this repository skip themselves — a clean clone is green.
+#
+# This workflow holds no credentials and needs none: it reads the code and runs the tests. It cannot
+# deploy, publish, or reach any service.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile's base image, so a green run says something about the container.
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        # Pinned in requirements-dev.txt — a red run means a real regression, never "PyPI shipped
+        # something this morning".
+        run: python3 -m pip install --no-cache-dir -r requirements-dev.txt
+
+      - name: Pipeline + skills suite
+        working-directory: sotto-chief-of-staff
+        run: python3 -m pytest tests -q
+
+      - name: Skills validator
+        working-directory: sotto-chief-of-staff
+        run: python3 tools/validate_skills.py
+
+      - name: Trigger receiver suite
+        run: python3 -m pytest runtime/trigger-receiver -q

@@ -1,0 +1,19 @@
+# Runtime Python dependencies baked into the container image (Dockerfile COPYs this file and pip
+# installs from it). EXACT pins, on purpose: an image rebuilt six months from now must contain the
+# same libraries as the one that was tested, not whatever PyPI published that morning.
+#
+#   pyyaml                     — skills front-matter (validate_skills.py, every skill loader)
+#   google-api-python-client   — the bundled google-workspace skill's google_api.py (Gmail/Calendar);
+#   google-auth*               — its OAuth/transport half. WITHOUT these, google_api.py dies with
+#                                ModuleNotFoundError even though the token is valid, and briefs
+#                                silently fall back to local-only.
+#
+# Versions verified against PyPI on 2026-08-12 (each is the version this repo is developed against;
+# every one has cp312 wheels for linux amd64 + arm64, so the image needs no compiler for them).
+# requirements-dev.txt pins the SAME pyyaml + google-api-python-client for the test lanes — one
+# version of a library across CI and the image, or a green suite proves nothing about the container.
+pyyaml==6.0.1
+google-api-python-client==2.198.0
+google-auth==2.56.3
+google-auth-oauthlib==1.4.0
+google-auth-httplib2==0.4.1

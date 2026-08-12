@@ -662,6 +662,77 @@ def test_setup_surface_gating_over_http(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_the_setup_surface_is_defended_like_the_dashboard(tmp_path, monkeypatch):
+    """The wizard cookie holds the setup code — the SAME secret that opens the dashboard — so it
+    carries the dashboard's exact attributes (it was missing `Secure`, i.e. it could ride a
+    plaintext hop), and every setup response carries the dashboard's header set — including
+    `Cache-Control: no-store`, because this surface serves pairing links, OAuth state, the live QR
+    and brief diagnostics, and none of that may rest in a browser or proxy cache. The CSP is scoped
+    to what the wizard actually does: its two inline scripts (timezone detector, copy button) must
+    keep working, so script-src allows inline while styles and images stay strict."""
+    import importlib.util as _il
+    import threading
+    import urllib.error as _ue
+    import urllib.request as _u
+    from http.server import ThreadingHTTPServer
+
+    spec2 = _il.spec_from_file_location("receiver3", os.path.join(HERE, "receiver.py"))
+    r2 = _il.module_from_spec(spec2)
+    spec2.loader.exec_module(r2)
+    r2.DATA = str(tmp_path)
+    r2.SETTINGS_FILE = os.path.join(str(tmp_path), "config", "settings.json")
+    r2.SETUP_CODE = "sekrit-code-123"
+    r2.MCP_TOKEN = r2.TOKEN = "bearer-tok"
+    r2.RAILWAY_DOMAIN = "myapp.up.railway.app"
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), r2.Handler)
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    class _NoRedirect(_u.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = _u.build_opener(_NoRedirect)
+
+    def get(path, headers=None):
+        try:
+            with opener.open(_u.Request(base + path, headers=headers or {}), timeout=10) as resp:
+                return resp.status, resp.read().decode(), dict(resp.headers)
+        except _ue.HTTPError as e:
+            return e.code, e.read().decode(), dict(e.headers)
+
+    try:
+        code, body, hdrs = get("/setup?code=sekrit-code-123")
+        assert code == 200
+        # 1 · the cookie now matches dashboard._login_redirect attribute for attribute
+        sc = hdrs["Set-Cookie"]
+        assert "sotto_setup=sekrit-code-123" in sc
+        for attr in ("Path=/", "HttpOnly", "Secure", "SameSite=Lax"):
+            assert attr in sc, sc
+        # 2 · the dashboard's header set, on the page, on the redirect that grants the cookie, and
+        #     on the bearer-gated diagnostics tail (its lines carry contact identifiers)
+        for path in ("/setup?code=sekrit-code-123", "/pair?code=sekrit-code-123", "/", "/health",
+                     "/debug/brief-log"):
+            _, _, h = get(path, {"Authorization": "Bearer bearer-tok"})
+            assert h["X-Content-Type-Options"] == "nosniff", path
+            assert h["Referrer-Policy"] == "no-referrer", path
+            assert h["X-Frame-Options"] == "DENY", path
+            # no-store everywhere: nothing this server serves is cacheable content
+            assert h["Cache-Control"] == "no-store", path
+        assert get("/pair?code=sekrit-code-123")[0] == 302
+        assert get("/debug/brief-log", {"Authorization": "Bearer bearer-tok"})[0] == 200
+        # 3 · the CSP rides HTML only, and does not kill the wizard's own inline scripts
+        csp = hdrs["Content-Security-Policy"]
+        assert "script-src 'self' 'unsafe-inline'" in csp
+        assert "style-src 'self'" in csp and "frame-ancestors 'none'" in csp
+        assert "<script>" in body and "Intl.DateTimeFormat" in body   # the timezone detector
+        assert "onclick=" in body                                     # the copy button
+        assert "Content-Security-Policy" not in get("/health")[2]     # JSON needs no policy
+    finally:
+        srv.shutdown()
+
+
 def test_enqueue_then_dedupe(tmp_path, monkeypatch):
     rec.DATA = str(tmp_path)
     calls = []
@@ -2063,3 +2134,106 @@ def test_the_record_can_tell_decided_from_delivered(tmp_path, monkeypatch):
     sources = {e["source"] for e in led["entries"]}
     assert sources == {"triage", "delivery"}
     assert next(e for e in led["entries"] if e["source"] == "delivery")["status"] == "failed"
+
+
+# ── the spawned lane: marked unattended, optionally scoped, and honest about what it cost ────────
+
+def _capture_oneshot(monkeypatch, rec_mod, usage=None, rc=0, out="a nudge"):
+    """Stub the one-shot + `hermes send`, recording the argv and env of every call. When `usage` is
+    given, the stub writes it to the path the runner was handed — standing in for what hermes does."""
+    runs = []
+
+    def fake_run(argv, **kw):
+        runs.append({"argv": argv, "env": kw.get("env")})
+        if argv[:2] == ["hermes", "send"]:
+            return _FakeRun(0, "", "")
+        if usage is not None and "--usage-file" in argv:
+            with open(argv[argv.index("--usage-file") + 1], "w", encoding="utf-8") as f:
+                f.write(usage)
+        return _FakeRun(rc, out, "" if rc == 0 else "boom")
+
+    monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(rec_mod.shutil, "which", lambda b: "/usr/bin/" + b)
+    return runs
+
+
+def _run_oneshot(rec_mod, runner, label="event"):
+    rec_mod._spawn_and_deliver(runner, "run it", label)
+    for th in threading.enumerate():
+        if th.name == f"deliver-{label}":
+            th.join(timeout=5)
+
+
+def test_a_spawned_run_is_marked_unattended(tmp_path, monkeypatch):
+    """SOTTO_UNATTENDED=1 is the contract with the send-gate: this lane has nobody at the keyboard.
+    The interactive gateway isn't spawned here, so it never carries the flag — that IS the design."""
+    rec.DATA = str(tmp_path)
+    runs = _capture_oneshot(monkeypatch, rec)
+    _run_oneshot(rec, ["hermes", "-z"])
+    assert runs[0]["env"]["SOTTO_UNATTENDED"] == "1"
+    assert runs[0]["env"]["PATH"] == os.environ["PATH"]     # the rest of the env is inherited
+    assert "SOTTO_UNATTENDED" not in os.environ            # and never leaks into this process
+
+
+def test_toolsets_are_scoped_only_when_asked_and_only_for_hermes(tmp_path, monkeypatch):
+    """Toolset ids vary per install, so a guess would break every brief: unset = today's behavior.
+    And a foreign runner (SOTTO_RUN_SKILL can be an OpenClaw command) never sees hermes' flags."""
+    rec.DATA = str(tmp_path)
+    runs = _capture_oneshot(monkeypatch, rec)
+    _run_oneshot(rec, ["hermes", "-z"])
+    assert "-t" not in runs[0]["argv"]                                  # unset → unchanged argv
+    monkeypatch.setenv("SOTTO_SPAWN_TOOLSETS", "sotto-local,google-workspace")
+    _run_oneshot(rec, ["hermes", "-z"])
+    argv = runs[2]["argv"]
+    assert argv[argv.index("-t") + 1] == "sotto-local,google-workspace"
+    assert argv[-1] == "run it"                                         # the prompt stays last
+    _run_oneshot(rec, ["openclaw", "run"])
+    assert "-t" not in runs[4]["argv"] and "--usage-file" not in runs[4]["argv"]
+
+
+def test_what_a_run_cost_lands_on_its_receipt(tmp_path, monkeypatch):
+    """Cost is ground truth, not an estimate: hermes writes the usage report, we copy the four
+    fields onto the row that closes the run."""
+    rec.DATA = str(tmp_path)
+    report = json.dumps({"model": "claude-sonnet-4-6", "cost": 0.0412,
+                         "input_tokens": 118000, "output_tokens": 900, "turns": 4})
+    _capture_oneshot(monkeypatch, rec, usage=report)
+    _run_oneshot(rec, ["hermes", "-z"])
+    rows = _delivery_rows(tmp_path)
+    assert [r["status"] for r in rows] == ["spawned", "delivered"]
+    assert rows[1]["usage"] == {"model": "claude-sonnet-4-6", "cost": 0.0412,
+                                "input_tokens": 118000, "output_tokens": 900}
+    assert "usage" not in rows[0]          # the spawn row predates the run; it can't know
+
+
+def test_a_failed_run_still_reports_what_it_burned(tmp_path, monkeypatch):
+    """hermes writes the report even when the run fails — a brief that died at 90% still cost that."""
+    rec.DATA = str(tmp_path)
+    _capture_oneshot(monkeypatch, rec, rc=2,
+                     usage=json.dumps({"usage": {"model": "gemini-3-flash-preview",
+                                                 "prompt_tokens": 5, "cost": 0.001}}))
+    _run_oneshot(rec, ["hermes", "-z"])
+    row = _delivery_rows(tmp_path)[-1]
+    assert row["status"] == "failed"
+    assert row["usage"] == {"model": "gemini-3-flash-preview", "cost": 0.001, "input_tokens": 5}
+
+
+def test_a_missing_or_garbled_usage_file_is_never_an_error(tmp_path, monkeypatch):
+    """The receipt is a nice-to-have; the delivery is not. No file, or junk in it → no usage key."""
+    rec.DATA = str(tmp_path)
+    _capture_oneshot(monkeypatch, rec)                       # writes nothing to the usage path
+    _run_oneshot(rec, ["hermes", "-z"])
+    assert "usage" not in _delivery_rows(tmp_path)[-1]
+    _capture_oneshot(monkeypatch, rec, usage="{not json at all")
+    _run_oneshot(rec, ["hermes", "-z"])
+    assert "usage" not in _delivery_rows(tmp_path)[-1]
+    assert rec._read_usage(None) is None
+
+
+def test_the_usage_tempfile_does_not_pile_up(tmp_path, monkeypatch):
+    """One temp file per brief, forever, would fill the container's disk — it is cleaned either way."""
+    rec.DATA = str(tmp_path)
+    runs = _capture_oneshot(monkeypatch, rec, usage=json.dumps({"cost": 0.01}))
+    _run_oneshot(rec, ["hermes", "-z"])
+    path = runs[0]["argv"][runs[0]["argv"].index("--usage-file") + 1]
+    assert not os.path.exists(path)

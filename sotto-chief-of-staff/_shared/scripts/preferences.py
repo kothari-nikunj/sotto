@@ -44,6 +44,11 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+# _shared/lib holds the shared primitives; this module is invoked as a bare script from chat, the
+# dashboard and the learner, so the path is set up here rather than assumed.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import jsonstore  # noqa: E402 — THE read-modify-write lock for the volume
+
 LISTS = ("mute_senders", "mute_people", "mute_sections", "tone_notes", "vip_people")
 # Scalar (single-value) explicit preferences. Same block, same writer, same learner protection.
 SCALARS = ("nudge_snooze_until", "brief_audio")
@@ -101,47 +106,64 @@ def _norm(kind: str, value: str) -> str:
     return value
 
 
+def _mutate(apply) -> dict:
+    """THE way the explicit block changes: read, mutate and write inside ONE lock.
+
+    The mutation has to happen in here. An earlier fix moved only the FILE read inside the lock and
+    left callers computing their new block from `load_explicit()` outside it — which made things
+    worse, not better: serialising the writes turned a 7% racy overwrite into a 23% deterministic
+    one, because the losing writer faithfully wrote back a block it had read before the winner's
+    change existed. Measured both times; that is the only reason it was caught.
+
+    `apply` receives the current explicit block and mutates it in place."""
+    with jsonstore.transaction(_path(), default={}, mode=0o600, indent=2) as data:
+        if not isinstance(data, dict):
+            data.clear()
+        ex = data.get("explicit")
+        if not isinstance(ex, dict):
+            ex = empty_explicit()
+        for k in LISTS:
+            if not isinstance(ex.get(k), list):
+                ex[k] = []
+        for k in SCALARS:
+            if not isinstance(ex.get(k), str):
+                ex[k] = ""
+        apply(ex)
+        ex["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data["explicit"] = ex
+        return dict(ex)
+
+
 def _save(explicit: dict) -> None:
-    data = _load_all()
-    explicit["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    data["explicit"] = explicit
-    os.makedirs(_root(), exist_ok=True)
-    tmp = _path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)   # user data, same posture as every other writer on the volume
-    os.replace(tmp, _path())
+    """Replace the whole explicit block. Kept for callers that legitimately own the entire block
+    (clear-tone); everything incremental goes through _mutate so it can't clobber a concurrent
+    change it never saw."""
+    _mutate(lambda ex: (ex.clear(), ex.update(explicit)))
 
 
 def add(kind: str, value: str) -> dict:
     if kind not in LISTS:
         raise ValueError(f"unknown preference list: {kind}")
     value = _norm(kind, value)
-    ex = load_explicit()
-    if value and value not in ex[kind]:
-        ex[kind].append(value)
-    _save(ex)
-    return ex
+
+    def _apply(ex):
+        if value and value not in ex[kind]:
+            ex[kind].append(value)
+    return _mutate(_apply)
 
 
 def remove(kind: str, value: str) -> dict:
     if kind not in LISTS:
         raise ValueError(f"unknown preference list: {kind}")
     value = _norm(kind, value)
-    ex = load_explicit()
-    ex[kind] = [x for x in ex[kind] if x != value]
-    _save(ex)
-    return ex
+    return _mutate(lambda ex: ex.__setitem__(kind, [x for x in ex[kind] if x != value]))
 
 
 def set_scalar(kind: str, value: str) -> dict:
     """Write one scalar explicit preference (`nudge_snooze_until`, `brief_audio`). "" clears it."""
     if kind not in SCALARS:
         raise ValueError(f"unknown preference scalar: {kind}")
-    ex = load_explicit()
-    ex[kind] = (value or "").strip()
-    _save(ex)
-    return ex
+    return _mutate(lambda ex: ex.__setitem__(kind, (value or "").strip()))
 
 
 # ── Cadence: the nudge snooze ("quieter today" / "quiet until 3" / "back to normal") ───────────────
@@ -292,8 +314,7 @@ def main():
     if cmd == "show":
         print(json.dumps(load_explicit())); return
     if cmd == "clear-tone":
-        ex = load_explicit(); ex["tone_notes"] = []; _save(ex)
-        print(json.dumps(ex)); return
+        print(json.dumps(_mutate(lambda ex: ex.__setitem__("tone_notes", [])))); return
     if cmd == "unsnooze-nudges":
         print(json.dumps(set_scalar("nudge_snooze_until", ""))); return
     if cmd == "brief-audio":

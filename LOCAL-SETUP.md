@@ -2,8 +2,15 @@
 
 Run the whole thing on your Mac. The Bridge talks to Hermes over **stdio** (a child process), so there's
 **no tunnel, no Railway, no HTTP bearer** — Hermes just spawns the Bridge binary and reads local data
-directly. Pick this if you want privacy (messages never leave the Mac) or "works offline". Trade-off:
-briefs only run while your Mac is awake. The cloud path is [ONBOARDING.md](ONBOARDING.md) (friendly) / [RAILWAY.md](RAILWAY.md) (reference).
+directly. Pick this if you want **no cloud host in the path** — no Railway, no container, no volume
+off your machine. Trade-off: briefs only run while your Mac is awake. The cloud path is
+[ONBOARDING.md](ONBOARDING.md) (friendly) / [RAILWAY.md](RAILWAY.md) (reference).
+
+> **This is not "your messages never leave the Mac."** It removes the *host*, not the *model*. A
+> brief is one call to your LLM provider, and the prompt for that call contains the material the
+> brief is about — message text, email bodies, notes, calendar events. That leaves your Mac and is
+> processed on your provider's servers under their terms. The only way to keep everything local is a
+> local model, which Sotto does not ship today (`docs/DATA-FLOW.md` § What fully local would take).
 
 Same backend either way — identical skills, scripts, knowledge graph, continuity, style. Only the
 transport differs (stdio here vs the tunnel-free reverse dial-out relay in the cloud).
@@ -18,18 +25,31 @@ transport differs (stdio here vs the tunnel-free reverse dial-out relay in the c
 
 All commands run from the repo root.
 
-**1. Download the Bridge + grant Full Disk Access** (the only manual permission):
-```bash
-# Download "Sotto Bridge.app" from the Releases page, drag it to /Applications.
-# The signed app bundles the read-only engine at:
-#   /Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged
+**1. Get the Bridge + grant Full Disk Access** (the only manual permission).
+
+Get a `sotto-bridged` engine onto this Mac. Step 4's installer
+finds it on its own and registers it — you never type a path.
+
+*Install the app (no toolchain needed).* Download **"Sotto Bridge.app"**
+from the Releases page and drag it to **/Applications**. The signed app bundles the engine inside
+itself at:
 ```
+/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged
+```
+That is the path `install.sh` probes second, so nothing else is needed.
+
+
+*(Engine kept somewhere else? Export `SOTTO_BRIDGE_BIN=/path/to/sotto-bridged` before step 4 — an
+explicit override beats both probes. If none of the three exists, the installer refuses to say
+"Done": it names every path it looked in and exits non-zero.)*
+
 Grant **Full Disk Access to your terminal app** (Terminal/iTerm — System Settings ▸ Privacy & Security ▸
 **Full Disk Access**), then fully quit and reopen it. Why the terminal: in stdio mode macOS attributes
 the `chat.db` read to the process that *spawns* the Bridge — and both the verify command below and
 Hermes-launched runs are children of your terminal, so the terminal is the TCC principal. Adding
 `/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged` itself is belt-and-braces only. Verify:
 ```bash
+# the installed app:
 "/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged" --doctor
 ```
 One line per source: `ok (N rows readable)` means that source works; `needs Full Disk Access` means
@@ -62,7 +82,7 @@ from the setup wizard; **local does not** — leave it unset and the 6:30/17:30 
 Sotto-dedicated local Hermes. The installer also copies the repo's local skills to
 `~/.hermes/skills/sotto` (no hub tap needed; `SOTTO_TAP` overrides the fallback), maps your Gemini key
 to all three names Hermes/Sotto read (`GOOGLE_AI_API_KEY` + `GEMINI_API_KEY` + `GOOGLE_API_KEY`),
-registers the Bridge as a stdio MCP (no `BRIDGE_TOKEN` set → local mode), and
+registers the Bridge from step 1 as a stdio MCP (no `BRIDGE_TOKEN` set → local mode), and
 creates five crons: `sotto-morning-brief` (6:30), `sotto-evening-brief` (17:30 — its end-of-day
 report includes post-meeting follow-up drafts; no standalone follow-up cron exists anymore),
 `sotto-relationship-pulse` (Mon 9:00), `sotto-proactive` (`*/15`, mostly-silent nudges — set
@@ -78,6 +98,8 @@ model/key is already configured.
 ```bash
 hermes mcp list        # → sotto-local
 ```
+If step 4 ended with **"NOT done"** instead of "Done", it found no engine at any of the three paths
+it names — do step 1 (option A is the quick one) and re-run the installer.
 
 **6. Connect Google + a channel, then run:**
 ```bash

@@ -75,6 +75,7 @@ _shared/
   scripts/log_outcome.py             # outcomes + analytics (parity C2)
   scripts/action_links.py            # deep-link / tap-to-send URL builder
   scripts/brief_marker.py            # delivered-once gate (cloud cron ↔ Bridge wake-push)
+  scripts/pending_offer.py       # the one question Sotto is waiting on an answer to (proactive writes, gateway reads+clears)
   scripts/ledger_io.py               # shared READ helpers for the continuity ledger
   scripts/loops_query.py             # open-loops/action-ledger read view (sotto-loops, proactive)
   scripts/retune_scan.py             # read-only stale-loop scan behind sotto-loops §B
@@ -91,6 +92,7 @@ evals/                               # brief-quality eval harness (run_evals.py 
   corpus/                            # NEVER committed, NEVER shipped — real user data, built locally
 tests/                               # pytest: parity fixtures in → expected exhaust out (conftest sets sys.path)
 tools/                               # dry_run.py (offline full-loop) + validate_skills.py (SKILL.md lint)
+  forget.py                          # delete the exhaust (snapshot, caches, logs, receipts) — never the memory
   build_golden_corpus.py             # builds the Golden Corpus from $SOTTO_DATA (runs where the data lives)
 ```
 

@@ -37,6 +37,8 @@ import hashlib
 import json
 import os
 import re
+import contextlib
+import fcntl
 import secrets
 import time
 import urllib.error
@@ -145,11 +147,58 @@ def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> 
     a crash mid-write can't corrupt the destination, and the default 0600 means the volume never
     holds a world-readable file. Callers that want a human-diffable file pass indent=2."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    # PROCESS-UNIQUE temp. `path + ".tmp"` was itself a shared mutable resource: two writers opened
+    # the same scratch file, and whoever renamed first pulled it out from under the other — one of
+    # the three ways concurrent preference writes corrupted or lost data (Aug 2026).
+    tmp = f"{path}.tmp.{os.getpid()}"
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=indent)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+LOCK_SUFFIX = ".lock"   # MUST match _shared/lib/jsonstore.LOCK_SUFFIX — asserted by test_docs_drift
+LOCK_TIMEOUT_SECS = 10
+
+
+@contextlib.contextmanager
+def json_transaction(path: str, default=None, mode: int = 0o600, indent: int | None = None):
+    """The receiver's half of the read-modify-write lock. The skills tree owns the canonical
+    implementation (`_shared/lib/jsonstore.py`); this image cannot import it, so the protocol —
+    an advisory flock on `<path>.lock` — is what the two share. flock is an OS primitive, so two
+    implementations interoperate as long as they name the same file, and a drift test asserts they
+    do. Same copy-plus-guard posture as keys.py.
+
+    Used for `preferences.json`, the one file two processes both write."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lf = os.open(path + LOCK_SUFFIX, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECS
+        while True:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"could not lock {path} within {LOCK_TIMEOUT_SECS}s")
+                time.sleep(0.02)
+        data = _read_json(path)
+        if data is None:
+            data = default if default is not None else {}
+        yield data
+        write_json(path, data, mode, indent)
+    finally:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            os.close(lf)
 
 
 def _read_json(path: str) -> dict | None:

@@ -45,7 +45,7 @@ cron already sent.
    It has already recorded what it returns, so it won't repeat a nudge later today.
    **`held` is not yours to deliver** — the funnel did not hand those back: it queued them for the midday digest / next brief (the day's shared interrupt budget, the room you're in, the hour) or dropped them (a muted person). Say nothing about them, and never mention the budget.
 3. **For each nudge, draft (never send) and deliver ONE concise message:**
-   - `meeting_prep` → optionally run `sotto-meeting-prep` for that meeting (or a 2-line who/what), and offer prep **naming the person**: "You're meeting Spencer Kim in ~40 min — want me to pull full prep on him?" (the names are in the nudge's `detail`; use the first external attendee, or the meeting title when there are several). Naming them is what makes a bare "yes" answerable: a yes runs `sotto-meeting-prep` focused on that person — one deep dive on that meeting, no list of the user's other meetings. Include the calendar tap-link if handy.
+   - `meeting_prep` → optionally run `sotto-meeting-prep` for that meeting (or a 2-line who/what), and offer prep **naming the person**: "You're meeting Spencer Kim in ~40 min — want me to pull full prep on him?" (the names are in the nudge's `detail`; use the first external attendee, or the meeting title when there are several). Naming them is what makes a bare "yes" answerable: a yes runs `sotto-meeting-prep` focused on that person — one deep dive on that meeting, no list of the user's other meetings.
    - `commitment` → draft the reply/message for that open loop (use `sotto-draft-reply` style) and present it, then **ask** — never act unasked.
      - **Email → ask, don't paste a link.** Show the draft text and one plain question: *"Want this in your Gmail drafts?"* On yes, `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/google_action.py" gmail-draft --to <identifier> --body "<draft>" --thread-id <the nudge's `thread_id`>` and confirm in one line ("Drafted in Gmail — it's in your drafts, ready to send."). The nudge carries `thread_id` when the loop came from an email thread; pass it so the reply lands IN that thread. On `{status:"error", fallback:"deep_link"}` fall back to the `mailto:` link and say Gmail isn't connected.
      - **Every other channel** (iMessage/SMS/WhatsApp/call) → the one-tap link as before; ask before sending.
@@ -84,7 +84,30 @@ cron already sent.
    - **Plain words only.** Never say "proactive", "chase", "retune", "ledger", "loop anchor" or any
      other word from Sotto's own machinery. Say what happened to a person: *"you're still owed the
      contract"*, *"open items"*, *"want me to tidy these up?"*
+   - **It must read like a text from a person, not a notification.** A nudge is one or two plain
+     sentences and nothing else. Concretely, none of these:
+     - **No labelled field lines.** Not `📍 Backhaus (261 California Dr, Burlingame)` on its own
+       row — if the place matters, it belongs in the sentence: *"…at Backhaus in ~13 min"*.
+     - **No URLs.** Never paste a calendar link, and never a bare `https://…` of any kind. The
+       event is already on their calendar; a 200-character Google URL in a text message is noise
+       they have to scroll past. The ONE exception is an action link they asked for — a draft's
+       `mailto:`/`imessage:` tap-link, which exists to be tapped.
+     - **No headers, footers, subject lines or sign-offs.** No "Update:", no "Reminder:", no
+       bullet list for a single item.
+     Good: *"You're meeting Vignesh Ravikumar and Shomik (Sierra Ventures) at Backhaus in ~13 min
+     — want me to pull full prep on them?"* That is the whole message.
    - **Honor the approval tiers (`_shared/references/approval-tiers.md`): present drafts, never auto-send.** Deliver as **Sotto**.
+4. **If the push ENDED in a question, write it down — same turn, right after sending:**
+   The user's "sure" arrives in the gateway's own session, which never saw your question; unless
+   the question is on the volume, that session has nothing to resolve the "sure" against.
+   ```bash
+   python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" set \
+     --kind meeting_prep --person "Shivani" \
+     --question "You're meeting Shivani in ~44 min at Sightglass — want me to pull full prep on her?"
+   ```
+   Same for the other kinds (`--kind commitment|chase|handoff|retune_offer`), with the question
+   exactly as you sent it. It overwrites — one pending question at a time, newest wins.
+   **If the tick delivered nothing, or the push asked nothing, record nothing.**
 
 ## Notes
 - The meeting lead window (default 45 min) and the once-per-day dedup are in `proactive_scan.py`;

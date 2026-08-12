@@ -156,6 +156,9 @@ control surfaces that matter:
 
 ## Still unverified
 
+This section and the next one are the two lists [../README.md](../README.md) points at when it says
+Hermes is the reference adapter and this one is not equally finished. They are the difference.
+
 Everything above was executed live. These four could not be, and why:
 
 1. **Cron delivery actually reaching a chat** (`--announce --channel whatsapp --to …`) — needs a

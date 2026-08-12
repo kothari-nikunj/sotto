@@ -18,11 +18,15 @@ Security model (M1 is read-only; the CSRF token is minted now for M2's writes):
     every JSON write in this image goes through it). Cookie: HttpOnly, Secure, SameSite=Lax.
   * 30-day idle expiry, checked on every authed request; last_seen bumped at most once/hour so a
     busy dashboard doesn't hammer the volume.
-  * Brute-force damping: global in-memory counter, 5 failures → 60s lockout (single-user box).
-    The setup surface itself has no counter today, so this covers only the dashboard login.
+  * Brute-force damping is PER CALLER: 5 failures from one client key (the first X-Forwarded-For
+    entry Railway's edge sets, else the socket address) lock THAT key for 60s, doubling per repeat
+    offense to a 15-minute ceiling. A much higher global backstop (100 failures in 5 min → 60s for
+    everyone) still catches a distributed spray. It used to be one global counter, which meant one
+    stranger with the URL could hold the door shut on the owner indefinitely.
   * CSP (default-src 'self' + nosniff + no-referrer) on every dashboard response; the login page
     is the ONE page allowed inline styles ('unsafe-inline' in style-src only there — it renders
-    before any static asset exists). /api/* additionally sends Cache-Control: no-store.
+    before any static asset exists). Cache-Control: no-store on every response too — /static/* is
+    the ONE exception (those files exist to be cached and carry no user data).
   * Kill switch: SOTTO_DASHBOARD=0 → every dashboard path answers 404.
   * Audit: login_ok / login_fail / lockout appended to $SOTTO_DATA/dashboard_audit.jsonl.
   * Reads ONLY knowledge/, briefs/, style.json, preferences.json. Never connectors/*.json token
@@ -47,6 +51,7 @@ Write model (M2 — "edits feed the flywheel, not a side channel"):
 from __future__ import annotations
 
 import calendar
+import collections
 import hashlib
 import hmac
 import html as _htmlmod
@@ -74,8 +79,13 @@ def _unwired_write_json(*_a, **_k):
     raise RuntimeError("dashboard.HOOKS['write_json'] is unwired — load this module from receiver.py")
 
 
+def _unwired_transaction(*_a, **_k):
+    raise RuntimeError("dashboard.HOOKS['json_transaction'] is unwired — load this from receiver.py")
+
+
 HOOKS = {
     "data_root": lambda: os.environ.get("SOTTO_DATA", "/data"),
+    "json_transaction": _unwired_transaction,
     "setup_code": lambda: "",
     "bridge_connected": lambda: False,
     "last_event_at": lambda: None,
@@ -146,8 +156,15 @@ STATIC_FILES = {
 
 SESSION_IDLE_SECS = 30 * 24 * 3600     # 30-day idle expiry
 LAST_SEEN_BUMP_SECS = 3600             # bump last_seen at most hourly (limits volume writes)
-LOCKOUT_AFTER = 5                      # failed codes before the lockout engages
-LOCKOUT_SECS = 60
+LOCKOUT_AFTER = 5                      # failed codes from ONE client before that client is locked
+LOCKOUT_SECS = 60                      # first lockout, doubling per repeat offense by the same key…
+LOCKOUT_MAX_SECS = 15 * 60             # …up to this ceiling
+LOCKOUT_KEYS_MAX = 512                 # bucket-table cap: a spray of fresh keys can't eat memory
+# The distributed backstop — the OLD global behavior, demoted to last resort. It only fires when a
+# spray is coming from so many client keys that the per-key buckets can't hold it.
+GLOBAL_LOCKOUT_AFTER = 100             # failures across ALL keys…
+GLOBAL_LOCKOUT_WINDOW_SECS = 300       # …inside this rolling window…
+GLOBAL_LOCKOUT_SECS = 60               # …locks everyone for this long
 LOGIN_BODY_MAX = 8192                  # a form with one short code; anything bigger is garbage
 API_BODY_MAX = 16384                   # write bodies: an op + <=500 chars of text
 TEXT_MAX = 500                         # fact/preference text cap (the plan's input cap)
@@ -462,28 +479,72 @@ def _session_record(h):
 # ── Brute-force damping + audit ──────────────────────────────────────────────────────────────────
 
 _LOGIN_LOCK = threading.Lock()
-_LOGIN_STATE = {"fails": 0, "locked_until": 0.0}
+# key → {"fails", "locked_until", "strikes"}. Insertion-ordered, so eviction is popitem(last=False).
+_LOGIN_BUCKETS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+_LOGIN_GLOBAL = {"fails": 0, "window_start": 0.0, "locked_until": 0.0}
 
 
-def _lockout_remaining() -> float:
+def _client_key(h) -> str:
+    """Who is knocking. Railway's edge sets X-Forwarded-For, so its first entry is the real caller;
+    direct/local runs fall back to the socket address. A forged header only splits the attacker's
+    OWN bucket — which is exactly what the global backstop below is for."""
+    xff = (h.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    if xff:
+        return xff[:64]
+    addr = getattr(h, "client_address", None)
+    return str(addr[0]) if isinstance(addr, (tuple, list)) and addr else "unknown"
+
+
+def _prune_buckets(now: float) -> None:
+    """Drop finished buckets, then evict oldest until the table fits. Caller holds _LOGIN_LOCK."""
+    for k in [k for k, v in _LOGIN_BUCKETS.items() if v["locked_until"] <= now and not v["fails"]]:
+        _LOGIN_BUCKETS.pop(k, None)
+    while len(_LOGIN_BUCKETS) > LOCKOUT_KEYS_MAX:
+        _LOGIN_BUCKETS.popitem(last=False)
+
+
+def _lockout_remaining(h) -> float:
+    """Seconds this caller must wait — the longer of its own lockout and the global backstop."""
+    key = _client_key(h)
+    now = time.time()
     with _LOGIN_LOCK:
-        return max(0.0, _LOGIN_STATE["locked_until"] - time.time())
+        mine = (_LOGIN_BUCKETS.get(key) or {}).get("locked_until", 0.0)
+        return max(0.0, mine - now, _LOGIN_GLOBAL["locked_until"] - now)
 
 
-def _note_login_failure() -> bool:
-    """Count a failed code presentation. True when THIS failure engaged the lockout."""
+def _note_login_failure(h) -> str:
+    """Count a failed code presentation against this caller. Returns "client" or "global" when THIS
+    failure engaged a lockout, else "" — the caller audits it."""
+    key = _client_key(h)
+    now = time.time()
+    engaged = ""
     with _LOGIN_LOCK:
-        _LOGIN_STATE["fails"] += 1
-        if _LOGIN_STATE["fails"] >= LOCKOUT_AFTER:
-            _LOGIN_STATE["locked_until"] = time.time() + LOCKOUT_SECS
-            _LOGIN_STATE["fails"] = 0
-            return True
-    return False
+        b = _LOGIN_BUCKETS.get(key)
+        if b is None:
+            b = _LOGIN_BUCKETS[key] = {"fails": 0, "locked_until": 0.0, "strikes": 0}
+        b["fails"] += 1
+        if b["fails"] >= LOCKOUT_AFTER:
+            b["strikes"] += 1
+            b["fails"] = 0
+            # Doubling per repeat offense: 60s, 2m, 4m, 8m, then the 15-minute ceiling.
+            b["locked_until"] = now + min(LOCKOUT_SECS * (2 ** (b["strikes"] - 1)), LOCKOUT_MAX_SECS)
+            engaged = "client"
+        _LOGIN_BUCKETS.move_to_end(key)
+        if now - _LOGIN_GLOBAL["window_start"] > GLOBAL_LOCKOUT_WINDOW_SECS:
+            _LOGIN_GLOBAL["window_start"], _LOGIN_GLOBAL["fails"] = now, 0
+        _LOGIN_GLOBAL["fails"] += 1
+        if _LOGIN_GLOBAL["fails"] >= GLOBAL_LOCKOUT_AFTER:
+            _LOGIN_GLOBAL["locked_until"] = now + GLOBAL_LOCKOUT_SECS
+            _LOGIN_GLOBAL["fails"], _LOGIN_GLOBAL["window_start"] = 0, now
+            engaged = "global"
+        _prune_buckets(now)
+    return engaged
 
 
-def _note_login_success() -> None:
+def _note_login_success(h) -> None:
+    """A caller that proved the code owes nothing: its bucket (fails AND strikes) is dropped."""
     with _LOGIN_LOCK:
-        _LOGIN_STATE["fails"] = 0
+        _LOGIN_BUCKETS.pop(_client_key(h), None)
 
 
 def _audit(event: str, **fields) -> None:
@@ -500,12 +561,16 @@ def _audit(event: str, **fields) -> None:
 
 # ── Response plumbing (every dashboard byte leaves through these — headers are non-optional) ─────
 
-def _headers(api: bool = False, login: bool = False, doc: bool = False) -> list:
+def _headers(login: bool = False, doc: bool = False, cache: str = "no-store") -> list:
+    """`no-store` is the DEFAULT, not an /api/* special case: the app shell, the login form and the
+    redirects that carry a session cookie are as unfit for a browser's disk cache or a shared proxy
+    as the JSON is. /static/* is the one exception — those files exist to be cached — and it passes
+    its own value rather than being a hole in the rule."""
     hs = [("Content-Security-Policy", _CSP_DOC if doc else (_CSP_LOGIN if login else _CSP)),
           ("X-Content-Type-Options", "nosniff"),
           ("Referrer-Policy", "no-referrer")]
-    if api:
-        hs.append(("Cache-Control", "no-store"))
+    if cache:
+        hs.append(("Cache-Control", cache))
     return hs
 
 
@@ -525,7 +590,7 @@ def _respond(h, code: int, ctype, data, headers=()):
 
 
 def _json(h, code: int, obj: dict):
-    _respond(h, code, "application/json", json.dumps(obj).encode(), _headers(api=True))
+    _respond(h, code, "application/json", json.dumps(obj).encode(), _headers())
 
 
 def _page(h, code: int, markup: str, login: bool = False):
@@ -642,17 +707,18 @@ def _handle_app(h):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(h.path).query)
     supplied = _s((q.get("code") or [""])[0])
     want = (HOOKS["setup_code"]() or "").encode()
-    if want and _lockout_remaining() <= 0:
+    if want and _lockout_remaining(h) <= 0:
         wizard = _s(_cookie(h, "sotto_setup") or "")
         for cand in (supplied, wizard):
             if cand and hmac.compare_digest(cand.encode(), want):
-                _note_login_success()
+                _note_login_success(h)
                 _audit("login_ok")
                 return _login_redirect(h, mint_session())
         if supplied:  # an explicit wrong ?code= is a brute-force attempt — it counts
             _audit("login_fail")
-            if _note_login_failure():
-                _audit("lockout")
+            engaged = _note_login_failure(h)
+            if engaged:
+                _audit("lockout", scope=engaged)
     return _page(h, 200, _login_page(), login=True)
 
 
@@ -667,17 +733,18 @@ def _read_form(h) -> dict:
 
 
 def _handle_login(h):
-    if _lockout_remaining() > 0:
+    if _lockout_remaining(h) > 0:
         return _page(h, 429, _login_page("Too many attempts — try again in a minute."), login=True)
     supplied = _s((_read_form(h).get("code") or [""])[0])
     want = (HOOKS["setup_code"]() or "").encode()
     if want and supplied and hmac.compare_digest(supplied.encode(), want):
-        _note_login_success()
+        _note_login_success(h)
         _audit("login_ok")
         return _login_redirect(h, mint_session())
     _audit("login_fail")
-    if _note_login_failure():
-        _audit("lockout")
+    engaged = _note_login_failure(h)
+    if engaged:
+        _audit("lockout", scope=engaged)
         return _page(h, 429, _login_page("Too many attempts — try again in a minute."), login=True)
     return _page(h, 403, _login_page("That code didn't match."), login=True)
 
@@ -705,12 +772,12 @@ def _handle_static(h, path: str):
         return _respond(h, 200, "text/plain; charset=utf-8", b"dashboard assets missing", _headers())
     # The two doc playgrounds are single self-contained files, so they take the doc CSP (inline
     # CSS/JS allowed, the network forbidden outright). Everything else keeps the app policy.
-    hdrs = _headers(doc=ctype.startswith("text/html"))
-    if name.startswith("fonts/"):   # immutable vendored files — spare the phone a re-download
-        hdrs.append(("Cache-Control", "public, max-age=604800, immutable"))
-    else:                           # js/css must revalidate, or a redeploy ships a stale UI
-        hdrs.append(("Cache-Control", "no-cache"))
-    return _respond(h, 200, ctype, data, hdrs)
+    # These are the ONLY cacheable bytes the dashboard serves, so they override the no-store
+    # default: fonts are immutable vendored files (spare the phone a re-download), while js/css
+    # must revalidate or a redeploy ships a stale UI. None of them carry user data.
+    cache = "public, max-age=604800, immutable" if name.startswith("fonts/") else "no-cache"
+    return _respond(h, 200, ctype, data,
+                    _headers(doc=ctype.startswith("text/html"), cache=cache))
 
 
 # ── Read-only JSON API (all session-gated; tolerant readers — missing data is empty, never 500) ──
@@ -2107,35 +2174,39 @@ def _post_prefs(h, body: dict):
         return _json(h, 200, prefs)
     if op == "add":                     # no verb for this list → nothing safe to invent
         return _json(h, 400, {"error": "bad list"})
-    prefs = _read_json_file("preferences.json", default=None)
-    if not isinstance(prefs, dict):
-        prefs = {}
+    # The delete of a LEARNED rule is the one direct write this surface keeps (it has no CLI verb),
+    # and it is a read-modify-write on the file the learner also rewrites every brief. It therefore
+    # runs inside the shared lock — same sidecar the skills tree takes — so a tombstone can't be
+    # lost to a rebuild that started a moment earlier.
     removed = False
-    if lst in PREF_DICTS:
-        d = prefs.get(lst)
-        if isinstance(d, dict) and value in d:
-            d.pop(value)
-            removed = True
-    elif lst in PREF_TOP_LISTS:
-        v = prefs.get(lst)
-        if isinstance(v, list) and value in v:
-            prefs[lst] = [x for x in v if x != value]
-            removed = True
-    else:  # explicit block lists (preferences.py's reserved user-stated block)
-        ex = prefs.get("explicit")
-        if isinstance(ex, dict) and isinstance(ex.get(lst), list) and value in ex[lst]:
-            ex[lst] = [x for x in ex[lst] if x != value]
-            removed = True
+    with HOOKS["json_transaction"](os.path.join(_root(), "preferences.json"),
+                                   default={}, mode=0o600, indent=2) as prefs:
+        if lst in PREF_DICTS:
+            d = prefs.get(lst)
+            if isinstance(d, dict) and value in d:
+                d.pop(value)
+                removed = True
+        elif lst in PREF_TOP_LISTS:
+            v = prefs.get(lst)
+            if isinstance(v, list) and value in v:
+                prefs[lst] = [x for x in v if x != value]
+                removed = True
+        else:  # explicit block lists (preferences.py's reserved user-stated block)
+            ex = prefs.get("explicit")
+            if isinstance(ex, dict) and isinstance(ex.get(lst), list) and value in ex[lst]:
+                ex[lst] = [x for x in ex[lst] if x != value]
+                removed = True
+        if removed and (lst in PREF_TOP_LISTS | PREF_DICTS):
+            # recomputed every Learn run → leave a tombstone so it can't be resurrected
+            sup = prefs.get("suppressed")
+            if not isinstance(sup, list):
+                sup = []
+            tomb = {"list": lst, "value": value}
+            if tomb not in sup:
+                sup.append(tomb)
+            prefs["suppressed"] = sup
+        snapshot = dict(prefs)
     if not removed:
         return _json(h, 404, {"error": "not found"})
-    if lst in PREF_TOP_LISTS | PREF_DICTS:      # recomputed every Learn run → leave a tombstone
-        sup = prefs.get("suppressed")
-        if not isinstance(sup, list):
-            sup = []
-        tomb = {"list": lst, "value": value}
-        if tomb not in sup:
-            sup.append(tomb)
-        prefs["suppressed"] = sup
-    _write_prefs(prefs)
     _audit("write", endpoint="/api/prefs", target=f"{lst}:{value}"[:200], op="delete")
-    return _json(h, 200, prefs)
+    return _json(h, 200, snapshot)

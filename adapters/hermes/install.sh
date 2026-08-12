@@ -2,9 +2,14 @@
 # Hermes adapter installer (SPEC §5.2/§5.3). Idempotent. Supports --dry-run.
 # Wires the PORTABLE Sotto backend (../../sotto-chief-of-staff skills + scripts, ../../sotto-bridge,
 # ../../runtime/trigger-receiver) into a Hermes host. OpenClaw has its own adapter (../openclaw).
+#
+# Env: BRIDGE_TOKEN     set → CLOUD mode (reverse relay); unset → LOCAL mode (stdio Bridge)
+#      SOTTO_BRIDGE_BIN LOCAL mode only — an explicit path to a `sotto-bridged` engine, which wins
+#                       over both auto-probed locations (§5). Unset is the normal case.
 set -euo pipefail
 
 DRY_RUN=0
+BRIDGE_MISSING=0                                          # set by §5 when LOCAL mode finds no engine
 BRIDGE_TOKEN="${BRIDGE_TOKEN:-${SOTTO_BRIDGE_TOKEN:-}}"   # the shared bearer (reverse relay)
 RELAY_PORT="${SOTTO_TRIGGER_PORT:-8787}"
 TAP="${SOTTO_TAP:-sotto-ai/chief-of-staff}"             # hub fallback, used only if the local skills copy is absent
@@ -127,17 +132,37 @@ if [ -n "$BRIDGE_TOKEN" ]; then
     echo "+ python3 adapters/hermes/configure_mcp.py --url http://127.0.0.1:$RELAY_PORT/mcp --token *** --config $HERMES_HOME/config.yaml"
   fi
 else
-  BRIDGE_BIN="$ROOT/sotto-bridge/core/target/release/sotto-bridged"
-  if [ -x "$BRIDGE_BIN" ]; then
+  # LOCAL mode: Hermes spawns the engine as a stdio child, so the installer has to hand it an
+  # ABSOLUTE path to a `sotto-bridged` binary. Three places one can be, probed in this order:
+  #   1. $SOTTO_BRIDGE_BIN — explicit override, for an engine kept anywhere else. It wins.
+  #   2. built from source — monorepo checkouts only. The PUBLIC repo ships no Bridge source
+  #      (sotto-bridge/ is stripped by the publish generator), so this path simply doesn't exist
+  #      there — probing only this one is what made a public-repo install print "Done" with no
+  #      Bridge registered.
+  #   3. bundled inside the installed app — "Sotto Bridge.app" from the Releases page. The layout
+  #      is build-app.sh's: it copies the engine to "$APP/Contents/Resources/$BIN_NAME"
+  #      (BIN_NAME=sotto-bridged), and install-local.sh ditto's the bundle to the stable
+  #      /Applications path. That makes this the one engine a Releases user has.
+  BRIDGE_SRC="$ROOT/sotto-bridge/core/target/release/sotto-bridged"
+  BRIDGE_APP="/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged"
+  BRIDGE_BIN=""
+  for cand in ${SOTTO_BRIDGE_BIN:+"$SOTTO_BRIDGE_BIN"} "$BRIDGE_SRC" "$BRIDGE_APP"; do
+    [ -x "$cand" ] || continue
+    BRIDGE_BIN="$cand"
+    break
+  done
+  if [ -n "$BRIDGE_BIN" ]; then
     note "register sotto-local MCP (stdio: $BRIDGE_BIN) in $HERMES_HOME/config.yaml"
     if [ "$DRY_RUN" -eq 0 ]; then
       python3 "$HERE/configure_mcp.py" --name sotto-local --command "$BRIDGE_BIN" \
         --env "SOTTO_CHAT_DB=$HOME/Library/Messages/chat.db" --config "$HERMES_HOME/config.yaml"
     fi
   else
-    echo "! sotto-local not registered. For LOCAL mode, build the Bridge first:"
-    echo "    (cd \"$ROOT/sotto-bridge/core\" && cargo build --release)   # → $BRIDGE_BIN"
-    echo "  then re-run this installer. For CLOUD mode, set BRIDGE_TOKEN (the bearer you enter in the Mac app)."
+    # Do NOT abort here: everything after this point (Google guidance, crons) still installs
+    # cleanly, and re-running the installer is idempotent. Record the failure and let the run
+    # finish — then exit non-zero with the full report instead of printing "Done".
+    BRIDGE_MISSING=1
+    echo "! sotto-local NOT registered — no Bridge engine found. Full report at the end of this run."
   fi
 fi
 
@@ -186,5 +211,39 @@ echo "NOTE: scheduled briefs deliver via '--deliver $SOTTO_CRON_DELIVER' — the
 echo "      Hermes gateway runs with that channel connected ('hermes gateway'; WhatsApp = scan the QR,"
 echo "      Telegram = bot token — 'hermes gateway setup'). Interactive chat ('hermes') needs no channel."
 echo "      Set SOTTO_CRON_DELIVER=local (and re-run) only if you deliberately want cron briefs kept in the CLI."
+
+# "Done" is a claim, and it may only be made when everything this script set out to do happened.
+# A LOCAL-mode run with no Bridge registered is a HALF install — Hermes has the skills and the crons
+# but cannot read a single message off this Mac — so it reports that, names every path it looked in,
+# and exits non-zero. Same in --dry-run: the probe reads the real filesystem, so a dry run that
+# would have failed says so.
+if [ "$BRIDGE_MISSING" -eq 1 ]; then
+  cat >&2 <<EOF
+
+== NOT done. sotto-local (the Mac Bridge) was NOT registered. ==
+
+Everything else installed (skills, bundle, persona, crons), but LOCAL mode needs a 'sotto-bridged'
+engine to spawn over stdio, and there is no executable at any of the paths probed:
+
+  \$SOTTO_BRIDGE_BIN   ${SOTTO_BRIDGE_BIN:-(unset)}
+  built from source   $BRIDGE_SRC
+  installed app       $BRIDGE_APP
+
+Two ways to fix it, then re-run this installer (it is idempotent):
+
+  A. Download "Sotto Bridge.app" from the Releases page and drag it to /Applications.
+     The signed app bundles the engine at the "installed app" path above. This is the option that
+     works from the public repo, which ships no Bridge source.
+
+  B. Build it from source — monorepo checkouts only, where sotto-bridge/core/ exists:
+       (cd "$ROOT/sotto-bridge/core" && cargo build --release)
+
+  (Engine somewhere else entirely? Point SOTTO_BRIDGE_BIN at it and re-run.)
+
+For CLOUD mode you don't need a local engine at all: set BRIDGE_TOKEN (the bearer you enter in the
+Mac app) and re-run — the Bridge dials out to the reverse relay instead.
+EOF
+  exit 1
+fi
 
 echo "== Done. In chat: '/sotto setup' (or 'Sotto, set up') — it verifies health(), seeds your memory + writing voice, and offers your first brief. =="

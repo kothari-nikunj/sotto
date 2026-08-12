@@ -4,11 +4,28 @@
 # BUILD CONTEXT = the folder holding this Dockerfile (its COPY paths are relative to it). In a
 # standalone Sotto repo this folder IS the repo root → Railway needs no Root Directory / Dockerfile
 # Path at all (auto-detected). In the dailybrief monorepo, set Railway Root Directory = sotto-hermes.
-FROM python:3.12-slim
+
+# Base image: pinned to an EXACT patch tag *and* its multi-arch manifest digest. The tag says which
+# Python this is for a human; the digest is what actually gets pulled, so a rebuilt image is the same
+# bytes even after upstream re-tags `3.12-slim-bookworm` at the next patch. Both were resolved from
+# Docker Hub on 2026-08-12 (`docker-content-digest` for python:3.12.13-slim-bookworm, which was also
+# what the floating 3.12-slim-bookworm tag pointed at that day).
+# To move to a newer Python: change BOTH halves together — a tag without its matching digest is a lie
+# in the file, and the digest is what wins.
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
+
+# ROOT, deliberately, and this is a KNOWN GAP rather than an oversight: the Hermes installer below
+# writes to /root/.hermes, and the skills, the bundle, SOUL.md, start.sh and the volume's first-boot
+# copy all address that path. Running as a non-root user means relocating the agent's entire home,
+# which is upstream's layout, not ours to redefine — so the container runs as root and the mitigation
+# lives elsewhere (the process holds no host mounts beyond /data, and the platform isolates it).
+# Whoever revisits this: it is one migration — a `USER sotto` with $HOME=/home/sotto — and it must be
+# done for the installer, the skills tree, and start.sh in the SAME change, or it half-works.
 
 # Prereqs for Hermes' installer (per Nous docs: git, curl, xz-utils; build tools; ripgrep/ffmpeg the
 # agent uses) + tini as a proper init (reaps the receiver/pairing/bridge child processes and forwards
 # signals). Without these the install.sh below fails — so we do NOT mask its exit code.
+# `--no-install-recommends` keeps the list to exactly what is named here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates xz-utils build-essential ripgrep ffmpeg tini \
  && rm -rf /var/lib/apt/lists/*
@@ -20,10 +37,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # as the RUN line is byte-identical, so a routine code push does NOT upgrade Hermes. To pull the
 # latest Hermes, bump the value to any new string (e.g. today's date) and redeploy — that invalidates
 # the layer and re-runs the installer. See RAILWAY.md § Staying updated.
+# BUMPING IT MEANS RE-CHECKING THE HASH: a refresh fetches whatever install.sh upstream serves that
+# day, so recompute HERMES_INSTALL_SHA256 in the same edit (or clear it and accept the warning) —
+# a stale hash is a build that fails loudly, which is the correct failure but a confusing one if you
+# forgot why.
 ARG HERMES_REFRESH=2026-07-09
+# Integrity pin for the installer script. The script is fetched to a FILE, checked, and only then
+# executed — never `curl | bash`, so a MITM or a compromised host cannot stream a different script
+# into a shell that is already running it.
+#
+# Empty by default, and that is a documented FAIL-OPEN: upstream publishes install.sh from a URL with
+# no version in it and no signature beside it, so the owner (who bumps HERMES_REFRESH regularly)
+# cannot precompute a hash for a script that may change between his edit and the build. An empty ARG
+# therefore prints a loud warning and proceeds. The mechanism is here for anyone who wants the
+# guarantee: compute it once —
+#     curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sha256sum
+# — then either paste it as the default below, or pass it per build:
+#     docker build --build-arg HERMES_INSTALL_SHA256=<hex> .
+# NOT filled in here because this repo's build sandbox cannot reach hermes-agent.nousresearch.com
+# (egress policy blocks the host), and a hash nobody actually computed is worse than none: it would
+# fail every build and teach the next person to delete the check.
+ARG HERMES_INSTALL_SHA256=""
 RUN echo "hermes refresh: ${HERMES_REFRESH}" \
- && pip install --no-cache-dir pyyaml \
- && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+ && curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh \
+ && if [ -n "${HERMES_INSTALL_SHA256}" ]; then \
+      echo "verifying installer against HERMES_INSTALL_SHA256" \
+      && echo "${HERMES_INSTALL_SHA256}  /tmp/hermes-install.sh" | sha256sum -c - ; \
+    else \
+      echo "############################################################" >&2 ; \
+      echo "WARNING: HERMES_INSTALL_SHA256 is empty — the Hermes installer" >&2 ; \
+      echo "         is being executed UNVERIFIED. Whatever that URL serves" >&2 ; \
+      echo "         right now runs as root in this image." >&2 ; \
+      echo "         Pin it: --build-arg HERMES_INSTALL_SHA256=<sha256>" >&2 ; \
+      echo "############################################################" >&2 ; \
+    fi \
+ && bash /tmp/hermes-install.sh \
+ && rm -f /tmp/hermes-install.sh
 # The installer puts `hermes` on PATH for the install user; make common locations explicit for start.sh.
 ENV PATH="/root/.local/bin:/root/.hermes/bin:${PATH}"
 # Snapshot what the INSTALLER owns inside ~/.hermes (captured BEFORE any Sotto skills are copied) and
@@ -35,17 +84,20 @@ RUN mkdir -p /app \
  && (ls -A /root/.hermes 2>/dev/null || true) > /app/hermes-image-manifest.txt \
  && { hermes --version 2>/dev/null || hermes version 2>/dev/null || echo unknown; } | head -1 > /app/hermes-image-version.txt
 
-# Google Workspace client libs for the bundled google-workspace skill's google_api.py. WITHOUT these,
-# `google_api.py gmail/calendar` dies with `ModuleNotFoundError: No module named 'googleapiclient'` even
-# though the OAuth token is valid (setup.py --check only validates the token, not the client lib) — so
-# briefs silently fall to local-only and the agent improvises `pip install` mid-run. Installed with
-# `python3 -m pip` against the PATH python (the same interpreter execute_code/gather_google use) so the
-# dep is actually importable where google_api.py runs. Baked into the image → always present, no
-# per-run install, no improvisation.
-RUN python3 -m pip install --no-cache-dir \
-      google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 \
- || pip install --no-cache-dir \
-      google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+# Python runtime deps, EXACTLY pinned in requirements.txt (pyyaml for skills front-matter; the Google
+# Workspace client libs for the bundled google-workspace skill's google_api.py). WITHOUT the Google
+# libs, `google_api.py gmail/calendar` dies with `ModuleNotFoundError: No module named 'googleapiclient'`
+# even though the OAuth token is valid (setup.py --check only validates the token, not the client lib) —
+# so briefs silently fall to local-only and the agent improvises `pip install` mid-run. Baked into the
+# image → always present, no per-run install, no improvisation.
+#
+# Installed with `python3 -m pip` against the PATH python (the same interpreter execute_code/gather_google
+# use — the Hermes install above may have put a different one first), falling back to plain `pip`.
+# Deliberately AFTER the Hermes layer: editing a pin then costs one pip layer, not a re-download and
+# re-run of the installer.
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
+ || pip install --no-cache-dir -r /tmp/requirements.txt
 
 ENV SOTTO_DATA=/data
 RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles

@@ -8,8 +8,9 @@
 | **Local Hermes (Mac)** | `install.sh`, ~5 min | $0 | only while the Mac is awake | [LOCAL-SETUP.md](../LOCAL-SETUP.md) |
 | **OpenClaw** | `adapters/openclaw/install.sh` + wire 3 CLI lines | depends | depends | [openclaw/README.md](openclaw/README.md) |
 
-The **Sotto backend is host-agnostic.** The portable core has zero dependency on any specific
-agent runtime — it's all open standards:
+**The skills tree is host-agnostic. The adapters are not equally finished.** Nothing under
+`sotto-chief-of-staff/` imports an agent runtime: it is `SKILL.md` + `execute_code` over
+`$SOTTO_DATA`, MCP for the Mac, plain HTTP for the receiver.
 
 | Portable core (no host coupling) | Built on |
 |---|---|
@@ -18,8 +19,19 @@ agent runtime — it's all open standards:
 | `runtime/trigger-receiver/` | plain HTTP; host-neutral for briefs (`$SOTTO_RUN_SKILL`). The setup wizard, dashboard writes, and the event funnel additionally locate the skills tree via `$SOTTO_SKILLS_ROOT` or the Hermes layout |
 | `contracts/` | JSON Schema + the exhaust file layout |
 
-A **host adapter** is the thin, swappable glue that wires the core into one runtime. Nothing in the
-core imports or assumes a host; everything host-specific lives here:
+That is a claim about the tree, not a claim that every host works the same. The two adapters are at
+different stages:
+
+| Adapter | Where it stands |
+|---|---|
+| **Hermes** | The reference. Cloud boot, local install, crons, delivery, the setup wizard and the dashboard are all exercised against it, and it is the host the rest of these docs assume. |
+| **OpenClaw** | Installs and runs, with two lists attached. Four lanes could not be executed in the lab (no linked channel, no model key, no Google account, Linux). Three host couplings also remain **in the core**: three `SKILL.md` files print `hermes cron create …`, and the receiver's timezone re-registration shells out to `hermes` — so the setup flow's scheduling step, the personal-routines skill, and the first-night re-registration do not work there yet. |
+
+Both lists are in [openclaw/README.md](openclaw/README.md#still-unverified). Read them before
+treating OpenClaw as a drop-in for Hermes.
+
+A **host adapter** is the thin, swappable glue that wires the core into one runtime. Everything
+host-specific lives here:
 
 | Adapter file | What it covers | Hermes | OpenClaw |
 |---|---|---|---|

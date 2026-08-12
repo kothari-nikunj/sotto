@@ -62,6 +62,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import knowledge as kg  # noqa: E402
+import jsonstore  # noqa: E402 — THE lock for the volume (see apply)
 
 # Dedup-lite tuning. Kept small and boring: the suggestion list is a human's to-do list, not a
 # report, and the pairwise scan must never become the Learn step's cost centre.
@@ -167,7 +168,7 @@ def identifiers_conflict(a: "kg.PersonFile", b: "kg.PersonFile") -> bool:
     return False
 
 
-def merge_person_files(dst_path: str, src_path: str, now: datetime | None = None) -> bool:
+def _merge_person_files_unlocked(dst_path: str, src_path: str, now: datetime | None = None) -> bool:
     """Union src INTO dst and delete src — kg.absorb_person_file, which is migrate_people_dir's
     exact mechanics (nothing is dropped; dst wins ties) plus the two steps relations owe a merge:
     the survivor drops any edge that now points at itself, and every OTHER file's back-reference to
@@ -260,7 +261,7 @@ def _put_edge(p: "kg.PersonFile", rel: "kg.Relation") -> bool:
     return True
 
 
-def link_relation(slug_a: str, slug_b: str, rel_type: str, name_a: str = "", name_b: str = "",
+def _link_relation_unlocked(slug_a: str, slug_b: str, rel_type: str, name_a: str = "", name_b: str = "",
                   date: str = "", source: str = "brief_extraction", confidence: float = 0.9,
                   now: datetime | None = None) -> bool:
     """Write ONE typed edge on BOTH person files: `rel_type` from A to B, and its inverse from B to
@@ -289,7 +290,7 @@ def link_relation(slug_a: str, slug_b: str, rel_type: str, name_a: str = "", nam
     return True
 
 
-def unlink_relation(slug_a: str, slug_b: str, rel_type: str = "",
+def _unlink_relation_unlocked(slug_a: str, slug_b: str, rel_type: str = "",
                     now: datetime | None = None) -> int:
     """Remove the edge(s) between two people from BOTH files — the exact undo of link_relation. An
     empty rel_type removes every edge between them. Returns how many edges were dropped."""
@@ -645,7 +646,28 @@ def _apply_relations(pending: list, index: dict, counts: dict, dropped: list,
             f.write(kg.serialize_person_file(p, now))
 
 
+def apply_lock_target() -> str:
+    """What `apply()` locks: `$SOTTO_DATA/knowledge/.apply` → the sidecar `.apply.lock`. Named once
+    so a second caller can take THE graph lock rather than invent a second one."""
+    return os.path.join(kg.data_root(), "knowledge", ".apply")
+
+
 def apply(extracted: dict, now: datetime | None = None) -> dict:
+    """Apply an extraction to the graph under ONE lock — the graph's single writer, serialized.
+
+    Four processes call this concurrently (the brief's Learn step, meeting-prep research, the
+    prewarm sweep, and a dashboard/chat edit), each doing read → modify → write over the same
+    person and company markdown. That is the preferences.json race one level up: two applies that
+    overlap can drop one's facts entirely, because the second parsed the file before the first wrote
+    it. The lock is held across the WHOLE body — the migration, the auto-merge, every file write and
+    the suggestion refresh — because those steps read each other's output.
+
+    jsonstore.lock is reentrant within a process, so the locked merge/relation entry points nest here for free."""
+    with jsonstore.lock(apply_lock_target()):
+        return _apply(extracted, now)
+
+
+def _apply(extracted: dict, now: datetime | None = None) -> dict:
     # UTC, not server-local: now_iso labels the timestamp with a 'Z' suffix, so feeding it local
     # time would write a lie into every updated_at in the graph.
     now = now or datetime.now(timezone.utc)
@@ -928,3 +950,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def merge_person_files(dst_path: str, src_path: str, now: datetime | None = None) -> bool:
+    """The locked entry point — a human-confirmed merge (knowledge_edit --op merge) must not race a
+    brief's apply() over the same person files. jsonstore.lock is reentrant within a process, so
+    apply()'s own auto_merge path, which arrives here already holding the lock, nests for free."""
+    with jsonstore.lock(apply_lock_target()):
+        return _merge_person_files_unlocked(dst_path, src_path, now)
+
+
+def link_relation(*a, **k):
+    """Locked for the same reason as merge_person_files — relations write BOTH people's files."""
+    with jsonstore.lock(apply_lock_target()):
+        return _link_relation_unlocked(*a, **k)
+
+
+def unlink_relation(*a, **k):
+    with jsonstore.lock(apply_lock_target()):
+        return _unlink_relation_unlocked(*a, **k)

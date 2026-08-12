@@ -10,7 +10,10 @@ Security: binds 0.0.0.0 on Railway behind its TLS proxy (127.0.0.1 locally), cap
 validates `date` before using it in any path, and only writes the delivered flag AFTER the skill
 is successfully enqueued. /mcp and /bridge/* take the MCP bearer; /sotto/trigger takes the trigger
 token; the setup/pairing/debug-status pages (which surface the pairing link = the bearer, and the
-WhatsApp QR) take a per-deploy setup code printed to the boot log. /health is open. Stdlib only.
+WhatsApp QR) take a per-deploy setup code printed to the boot log. /health is open. Every response
+leaves through _write/_redirect, which stamp the dashboard's security headers (nosniff, no-referrer,
+frame-deny, no-store, plus SETUP_CSP on HTML) and set the wizard cookie with the dashboard's exact
+attributes (Secure; HttpOnly; SameSite=Lax). Stdlib only.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -117,6 +121,7 @@ DASHBOARD.HOOKS.update({
     # THE atomic JSON write (connectors.write_json). dashboard.py/calcache.py don't import
     # connectors, so it arrives the way every other cross-module call here does — a HOOKS lambda.
     "write_json": lambda p, o, mode=0o600, indent=None: CONNECTORS.write_json(p, o, mode, indent),
+    "json_transaction": lambda p, **kw: CONNECTORS.json_transaction(p, **kw),
     # The Cadence panel's write half: "nudge me now" on a held item runs the funnel's OWN
     # promotion (triage_event.py --promote) and then takes the identical stage → spawn path the
     # release valve and a fresh agent verdict take. The dashboard never spawns anything itself.
@@ -147,6 +152,7 @@ CALCACHE.HOOKS.update({
     "data_root": lambda: DATA,
     "find_script": lambda *rel: _find_sotto_script(*rel),
     "write_json": lambda p, o, mode=0o600, indent=None: CONNECTORS.write_json(p, o, mode, indent),
+    "json_transaction": lambda p, **kw: CONNECTORS.json_transaction(p, **kw),
     "local_today": lambda: DASHBOARD._local_today(),
     # The post-meeting tap (Step 2 item 3): calcache detects the event-END on the refresh tick, the
     # receiver relays it into the ordinary triage funnel. Late-bound like the rest.
@@ -187,30 +193,33 @@ def _deliver_target() -> str:
     return (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip()
 
 
-def _record_delivery(label: str, status: str, detail: str = "") -> None:
+def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None) -> None:
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
-    spawned / delivered / empty / failed. Best-effort: a receipt that can't be written must never
-    cost the delivery it is describing."""
+    spawned / delivered / empty / failed; `usage` is the run's ground-truth spend (see _read_usage),
+    present only on the row that closes a run. Best-effort: a receipt that can't be written must
+    never cost the delivery it is describing."""
     try:
         os.makedirs(_events_dir(), exist_ok=True)
         row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "label": label, "status": status, "target": _deliver_target()}
         if detail:
             row["detail"] = detail[:300]
+        if usage:
+            row["usage"] = usage
         with open(os.path.join(_events_dir(), "delivery.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:  # noqa: BLE001
         pass
 
 
-def _deliver_text(text: str, label: str) -> None:
+def _deliver_text(text: str, label: str, usage: dict | None = None) -> None:
     """Hand one skill's final text to `hermes send`. Silence is a legitimate outcome for every one
     of these skills ("if there's nothing, say nothing"), so an empty run is recorded and NOT sent —
     an empty message would be the busywork theater the standing bars forbid."""
     body = (text or "").strip()
     if not body:
-        _record_delivery(label, "empty")
+        _record_delivery(label, "empty", usage=usage)
         return
     target = _deliver_target()
     try:
@@ -218,15 +227,63 @@ def _deliver_text(text: str, label: str) -> None:
                            input=body, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS)
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] {label}: delivery FAILED ({type(e).__name__}: {e})", flush=True)
-        _record_delivery(label, "failed", f"{type(e).__name__}: {e}")
+        _record_delivery(label, "failed", f"{type(e).__name__}: {e}", usage=usage)
         return
     if r.returncode == 0:
-        _record_delivery(label, "delivered")
+        _record_delivery(label, "delivered", usage=usage)
         return
     detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
     # LOUD: a nudge that was decided and then lost is the failure this whole seam exists to end.
     print(f"[sotto] {label}: delivery FAILED to {target} — {detail[:300]}", flush=True)
-    _record_delivery(label, "failed", detail)
+    _record_delivery(label, "failed", detail, usage=usage)
+
+
+# Which of the four numbers a usage report may spell differently. We do not own hermes' schema, so
+# each field is looked up under its known aliases and anything unrecognized is simply not recorded.
+_USAGE_FIELDS = {"model": ("model",),
+                 "cost": ("cost", "cost_usd", "total_cost"),
+                 "input_tokens": ("input_tokens", "prompt_tokens"),
+                 "output_tokens": ("output_tokens", "completion_tokens")}
+
+
+def _read_usage(path: str | None) -> dict | None:
+    """Best-effort read of the runner's `--usage-file` JSON → {model, cost, input_tokens,
+    output_tokens}. A missing, empty, or unparseable file yields None (no `usage` key on the
+    receipt) and NEVER an error: cost is a nice-to-have on a receipt, the delivery is not."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    # Totals may sit at the top level or under a `usage`/`totals` envelope; top level wins.
+    src = {}
+    for envelope in ("totals", "usage"):
+        if isinstance(doc.get(envelope), dict):
+            src.update(doc[envelope])
+    src.update({k: v for k, v in doc.items() if not isinstance(v, dict)})
+    out = {}
+    for field, aliases in _USAGE_FIELDS.items():
+        for alias in aliases:
+            v = src.get(alias)
+            if field == "model" and isinstance(v, str) and v.strip():
+                out[field] = v.strip()[:80]
+                break
+            if field != "model" and isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[field] = v
+                break
+    return out or None
+
+
+def _spawn_env() -> dict:
+    """The environment a spawned one-shot inherits. SOTTO_UNATTENDED=1 is the contract that marks
+    an UNATTENDED lane: nobody is at the keyboard, so the send-gate downstream must hold anything
+    that would reach a human. The interactive gateway is not spawned by us and therefore never
+    carries it — that asymmetry IS the design, not an omission."""
+    return {**os.environ, "SOTTO_UNATTENDED": "1"}
 
 
 def _spawn_and_deliver(runner: list, prompt: str, label: str) -> None:
@@ -244,20 +301,50 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str) -> None:
     if not shutil.which(runner[0]):
         raise FileNotFoundError(f"{runner[0]}: not found on PATH (SOTTO_RUN_SKILL)")
 
+    # CAREFUL: `hermes -z` is only the DEFAULT runner — SOTTO_RUN_SKILL can name anything (an
+    # OpenClaw command, a wrapper script), and a foreign binary handed a flag it has never heard of
+    # would fail every brief. So the two flags below are added ONLY when the runner's argv[0]
+    # basename is `hermes`; every other runner gets today's argv, byte for byte.
+    argv = list(runner)
+    usage_path = None
+    if os.path.basename(argv[0]) == "hermes":
+        # Toolset ids vary per install, so there is no safe default to guess — unset means today's
+        # behavior (whatever toolsets the runner picks itself). `hermes tools --summary` lists them.
+        toolsets = (os.environ.get("SOTTO_SPAWN_TOOLSETS") or "").strip()
+        if toolsets:
+            argv += ["-t", toolsets]
+        # Ground truth for what the run cost — hermes writes this report even when the run fails.
+        # If tmp is unwritable we simply go without: a receipt is never worth losing a brief over.
+        try:
+            fd, usage_path = tempfile.mkstemp(prefix="sotto-usage-", suffix=".json")
+            os.close(fd)
+            argv += ["--usage-file", usage_path]
+        except OSError:
+            usage_path = None
+
     def _work():
         try:
-            r = subprocess.run([*runner, prompt], capture_output=True, text=True,
-                               timeout=ONESHOT_TIMEOUT_SECS)
-        except Exception as e:  # noqa: BLE001
-            print(f"[sotto] {label}: skill run failed ({type(e).__name__}: {e})", flush=True)
-            _record_delivery(label, "failed", f"run: {type(e).__name__}: {e}")
-            return
-        if r.returncode != 0:
-            detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
-            print(f"[sotto] {label}: skill exited {r.returncode} — {detail[:300]}", flush=True)
-            _record_delivery(label, "failed", f"exit {r.returncode}: {detail}")
-            return
-        _deliver_text(r.stdout, label)
+            try:
+                r = subprocess.run([*argv, prompt], capture_output=True, text=True,
+                                   timeout=ONESHOT_TIMEOUT_SECS, env=_spawn_env())
+            except Exception as e:  # noqa: BLE001
+                print(f"[sotto] {label}: skill run failed ({type(e).__name__}: {e})", flush=True)
+                _record_delivery(label, "failed", f"run: {type(e).__name__}: {e}",
+                                 usage=_read_usage(usage_path))
+                return
+            usage = _read_usage(usage_path)
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+                print(f"[sotto] {label}: skill exited {r.returncode} — {detail[:300]}", flush=True)
+                _record_delivery(label, "failed", f"exit {r.returncode}: {detail}", usage=usage)
+                return
+            _deliver_text(r.stdout, label, usage=usage)
+        finally:
+            if usage_path:
+                try:
+                    os.unlink(usage_path)
+                except OSError:
+                    pass
 
     _record_delivery(label, "spawned")
     threading.Thread(target=_work, name=f"deliver-{label}", daemon=True).start()
@@ -1889,6 +1976,21 @@ SETUP_GET_PATHS = frozenset({"/setup", "/pair", "/google/auth", "/google/submit-
                              "/whatsapp/qr", "/debug/google"})
 SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client"})
 
+# The wizard cookie carries the SAME attribute set as the dashboard's session cookie
+# (dashboard._login_redirect): Secure so it never rides a plaintext hop, HttpOnly so no script can
+# read it, SameSite=Lax so a foreign page can't ride it. It holds the setup code — the same secret
+# that opens the dashboard — so it gets the dashboard's protection, not less. (`Secure` is fine on
+# http://localhost: browsers treat localhost as a secure context.)
+SETUP_COOKIE_ATTRS = "Path=/; HttpOnly; Secure; SameSite=Lax"
+
+# The setup surface's CSP, scoped to what the wizard ACTUALLY does. Two inline scripts are load-
+# bearing here — the timezone detector and the pairing-link copy button — so script-src must allow
+# inline; the dashboard's `script-src 'self'` would silently kill timezone auto-detection. Styles
+# are external (/static/app.css + setup.css) and the only image is the favicon's data: URI, so
+# those two stay strict. base-uri/form-action/frame-ancestors don't inherit default-src — pinned.
+SETUP_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; "
+             "img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
 
 class Handler(BaseHTTPRequestHandler):
     def _authed(self, token: str) -> bool:
@@ -1923,16 +2025,36 @@ class Handler(BaseHTTPRequestHandler):
         self._write(403, "text/plain; charset=utf-8",
                     b"Forbidden. Open the setup link (with ?code=...) from your deploy logs.\n")
 
+    def _security_headers(self, ctype=None):
+        """The header set every response out of this handler carries — the same three the dashboard
+        sends on its own responses, plus the setup CSP on HTML (see SETUP_CSP). One place, so a new
+        page cannot be born unprotected."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        # Unconditional: this server has NO cacheable route. Every path is the pairing link (= the
+        # bearer), an OAuth code exchange, the live WhatsApp QR, brief diagnostics, or health —
+        # none of it may sit in a browser's disk cache or a shared proxy. (/static/* is the one
+        # cacheable surface in the image and it belongs to dashboard.py, which sets its own.)
+        self.send_header("Cache-Control", "no-store")
+        if ctype and ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", SETUP_CSP)
+
+    def _grant_header(self):
+        """Emit the authenticate-once wizard cookie if this request just presented a valid ?code=."""
+        granted = getattr(self, "_grant_cookie", None)
+        if granted:
+            self.send_header("Set-Cookie", f"sotto_setup={granted}; {SETUP_COOKIE_ATTRS}")
+            self._grant_cookie = None
+
     def _redirect(self, url: str):
         """302, carrying the authenticate-once wizard cookie when the request just presented a valid
         ?code= (the Connect tile links carry it) — so the post-OAuth success page's bare /setup link
         works without re-entering the code."""
         try:
             self.send_response(302)
-            granted = getattr(self, "_grant_cookie", None)
-            if granted:
-                self.send_header("Set-Cookie", f"sotto_setup={granted}; Path=/; HttpOnly; SameSite=Lax")
-                self._grant_cookie = None
+            self._security_headers()
+            self._grant_header()
             self.send_header("Location", url)
             self.end_headers()
         except (BrokenPipeError, ConnectionResetError):
@@ -2033,16 +2155,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = ("(no compose_brief.log yet — the composer hasn't run on this volume. If you've "
                         "since run a brief and still see this, the agent likely improvised instead of "
                         "running compose_brief.py.)\n")
-            data = body.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            try:
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
+            return self._write(200, "text/plain; charset=utf-8", body.encode())
         # Connector OAuth callback — the IdP's browser redirect lands here, so it is NOT setup-code
         # gated: the single-use `state` minted by the gated /connect/<service>/start is the auth.
         if path == "/connect/oauth/callback":
@@ -2071,10 +2184,7 @@ class Handler(BaseHTTPRequestHandler):
         # stays — it is what _setup_page renders from.)
         # Legacy /pair → the wizard (keeps old links/QRs working; the deep link itself is in the page).
         if path == "/pair":
-            self.send_response(302)
-            self.send_header("Location", f"/setup{qs}")
-            self.end_headers()
-            return
+            return self._redirect(f"/setup{qs}")
         # Live Google code exchange (no Railway redeploy). The /google/auth form posts the code here.
         if path == "/google/submit-code":
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -2249,11 +2359,9 @@ class Handler(BaseHTTPRequestHandler):
         # an error: swallow it so it doesn't dump a traceback per disconnect into the logs.
         try:
             self.send_response(code)
+            self._security_headers(ctype)
             # First valid ?code= on the setup surface → set the authenticate-once wizard cookie.
-            granted = getattr(self, "_grant_cookie", None)
-            if granted:
-                self.send_header("Set-Cookie", f"sotto_setup={granted}; Path=/; HttpOnly; SameSite=Lax")
-                self._grant_cookie = None
+            self._grant_header()
             if ctype is not None and data is not None:
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))

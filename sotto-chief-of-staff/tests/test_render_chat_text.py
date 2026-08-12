@@ -83,6 +83,12 @@ def test_compose_output_carries_brief_text(tmp_path, monkeypatch):
         "actionItems": [], "extractedKnowledge": {"person_updates": [], "company_updates": []},
     }))
     monkeypatch.setenv("SOTTO_LLM_STUB", str(stub))
-    out = cb.compose({"type": "morning", "google": {"emails": [], "events": []}, "local": {}})
+    # Sarah is a REAL correspondent here: a marker whose identifier the data never carried is
+    # deleted as a fabricated tap target (see tests/test_tap_link_allowlist.py), which would make
+    # this a test of the wrong thing.
+    out = cb.compose({"type": "morning",
+                      "google": {"emails": [{"threadId": "t1", "from": "Sarah Chen <sarah@acme.com>",
+                                             "subject": "ping", "body": "ping"}], "events": []},
+                      "local": {}})
     assert out["brief_text"] == "*Needs Attention Now*\n\n*Sarah Chen* - ping."
     assert "<!--id:" in out["brief_markdown"]                  # markdown keeps the markers for records

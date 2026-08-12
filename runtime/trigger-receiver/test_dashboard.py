@@ -298,10 +298,104 @@ def test_bad_code_counts_then_lockout_blocks_even_the_right_code(tmp_path):
         assert code == 200 and "sotto_session=" not in hdrs.get("Set-Cookie", "")
         audit = open(os.path.join(str(tmp_path), "dashboard_audit.jsonl")).read()
         assert audit.count('"login_fail"') == 5 and '"lockout"' in audit
+        assert '"scope": "client"' in audit          # the per-caller lockout, not the global one
         # lockout expires → login works again
-        m.DASHBOARD._LOGIN_STATE["locked_until"] = time.time() - 1
+        _expire_lockouts(m)
         code, _, hdrs = _post(base, "/app/login", _login_form(SETUP_CODE))
         assert code == 302 and "sotto_session=" in hdrs.get("Set-Cookie", "")
+    finally:
+        srv.shutdown()
+
+
+def _expire_lockouts(m):
+    """Rewind every per-key lockout into the past (the clock is the only thing we can't wait on)."""
+    for b in m.DASHBOARD._LOGIN_BUCKETS.values():
+        b["locked_until"] = time.time() - 1
+
+
+def _fail_from(base, key, n=1):
+    """n wrong-password attempts carrying `key` as the client IP Railway's edge would forward."""
+    out = []
+    for _ in range(n):
+        out.append(_post(base, "/app/login", _login_form("wrong"),
+                         {"X-Forwarded-For": f"{key}, 10.0.0.1"})[0])
+    return out
+
+
+def test_one_stranger_cannot_lock_the_owner_out(tmp_path):
+    """The finding: a global counter meant anyone with the URL could hold the door shut on the
+    owner forever. Lockouts are per caller now — A's spam locks A and nobody else."""
+    m, srv, base = _server(tmp_path)
+    try:
+        assert _fail_from(base, "203.0.113.9", 5)[-1] == 429      # the stranger locked himself out
+        assert _fail_from(base, "203.0.113.9", 1)[0] == 429
+        # the owner, on a different address, logs in normally throughout
+        code, _, hdrs = _post(base, "/app/login", _login_form(SETUP_CODE),
+                              {"X-Forwarded-For": "198.51.100.4"})
+        assert code == 302 and "sotto_session=" in hdrs.get("Set-Cookie", "")
+        # and a second innocent caller still gets the ordinary 403, not the stranger's 429
+        assert _fail_from(base, "198.51.100.5", 1)[0] == 403
+    finally:
+        srv.shutdown()
+
+
+def test_a_repeat_offender_is_locked_out_for_longer_each_time(tmp_path):
+    """Doubling per repeat offense, capped — so a patient attacker gets slower, not free retries."""
+    m, srv, base = _server(tmp_path)
+    D = m.DASHBOARD
+    try:
+        for expected in (D.LOCKOUT_SECS, D.LOCKOUT_SECS * 2, D.LOCKOUT_SECS * 4):
+            _fail_from(base, "203.0.113.9", 5)
+            b = D._LOGIN_BUCKETS["203.0.113.9"]
+            assert expected - 5 <= b["locked_until"] - time.time() <= expected
+            b["locked_until"] = time.time() - 1     # serve the sentence, come back for more
+        assert D.LOCKOUT_SECS * 2 ** 8 > D.LOCKOUT_MAX_SECS     # the ceiling is reachable and real
+    finally:
+        srv.shutdown()
+
+
+def test_a_successful_login_clears_that_callers_record(tmp_path):
+    """Proving the code settles the account: fails AND accumulated strikes go with the bucket."""
+    m, srv, base = _server(tmp_path)
+    try:
+        _fail_from(base, "198.51.100.4", 4)                       # one short of the lockout
+        code, _, _ = _post(base, "/app/login", _login_form(SETUP_CODE),
+                           {"X-Forwarded-For": "198.51.100.4"})
+        assert code == 302 and "198.51.100.4" not in m.DASHBOARD._LOGIN_BUCKETS
+        assert _fail_from(base, "198.51.100.4", 4)[-1] == 403     # the count restarted at zero
+    finally:
+        srv.shutdown()
+
+
+def test_a_distributed_spray_still_hits_the_global_backstop(tmp_path):
+    """Per-key buckets don't help against a botnet with a fresh IP per try — the old global rule
+    survives as the last resort, at a threshold no single honest user can trip."""
+    m, srv, base = _server(tmp_path)
+    D = m.DASHBOARD
+    try:
+        D.GLOBAL_LOCKOUT_AFTER = 12                       # 100 real requests is a slow test
+        for i in range(D.GLOBAL_LOCKOUT_AFTER):
+            _fail_from(base, f"203.0.113.{i}", 1)
+        assert D._LOGIN_GLOBAL["locked_until"] > time.time()
+        # everyone is now held, including a caller who has never failed once
+        code, _, _ = _post(base, "/app/login", _login_form(SETUP_CODE),
+                           {"X-Forwarded-For": "198.51.100.4"})
+        assert code == 429
+        audit = open(os.path.join(str(tmp_path), "dashboard_audit.jsonl")).read()
+        assert '"scope": "global"' in audit
+    finally:
+        srv.shutdown()
+
+
+def test_the_bucket_table_cannot_grow_without_bound(tmp_path):
+    """A spray of unique keys must cost memory that is bounded by a constant, not by the spray."""
+    m, srv, base = _server(tmp_path)
+    D = m.DASHBOARD
+    try:
+        D.LOCKOUT_KEYS_MAX = 4
+        for i in range(20):
+            _fail_from(base, f"203.0.113.{i}", 1)
+        assert len(D._LOGIN_BUCKETS) <= D.LOCKOUT_KEYS_MAX
     finally:
         srv.shutdown()
 
@@ -406,10 +500,17 @@ def test_security_headers_on_every_dashboard_surface(tmp_path):
             assert hdrs.get("Content-Security-Policy") == strict, path
             assert hdrs.get("X-Content-Type-Options") == "nosniff", path
             assert hdrs.get("Referrer-Policy") == "no-referrer", path
-        # /api/* additionally never caches
-        for path in ("/api/session", "/api/loops"):
-            _, _, hdrs = _get(base, path, headers=cookie)
+        # no-store is the DEFAULT, not an /api/* special case: the app shell and the login page
+        # are as unfit for a disk cache or a shared proxy as the JSON about your people is.
+        for path, hdr in (("/api/session", cookie), ("/api/loops", cookie), ("/app", cookie),
+                          ("/app", None)):                       # authed shell AND the login page
+            _, _, hdrs = _get(base, path, headers=hdr)
             assert hdrs.get("Cache-Control") == "no-store", path
+        # …and the redirect that hands out a session cookie
+        _, _, hdrs = _post(base, "/app/login", _login_form(SETUP_CODE))
+        assert hdrs.get("Cache-Control") == "no-store"
+        # /static/* is the ONE exception — those files exist to be cached, and carry no user data
+        assert _get(base, "/static/app.js")[2].get("Cache-Control") == "no-cache"
         # the login page keeps script-src 'self' (no JS) and is the ONE inline-style exception
         _, _, hdrs = _get(base, "/app")
         csp = hdrs.get("Content-Security-Policy", "")

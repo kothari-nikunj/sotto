@@ -31,6 +31,11 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+# This runs as a BARE SCRIPT from the brief's Learn step, so _shared/lib is not on the path unless
+# we put it there. (A test harness supplies it; production does not — which is exactly how an
+# import error here passed 1078 green tests and still crashed on the first real run.)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
+
 # approval_defaults thresholds: enough accepted signal, and the user almost always accepts.
 MIN_ACCEPTED_FOR_DEFAULT = 3
 MIN_ACCEPT_RATE = 0.8
@@ -138,49 +143,62 @@ def learn() -> dict:
         if tier in LEARNABLE_TIERS:
             approval_defaults[key] = tier
 
-    # Read the existing file BEFORE building the new one: it carries both the user's EXPLICIT block
-    # and the `suppressed` tombstones the rebuilt lists must respect. If it's present but unreadable
-    # (truncated/corrupt), ABORT without writing — minting a fresh file here would silently drop the
-    # user's explicit block. A corrupt file must be repaired (or explicitly rewritten via
-    # sotto-feedback), never papered over by this writer.
-    existing = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                existing = json.load(f) or {}
-        except (OSError, json.JSONDecodeError, ValueError):
-            print("[learn_preferences] preferences.json exists but is unreadable — "
-                  "aborting without writing (the explicit block would be lost)", file=sys.stderr)
-            return {}
-
-    # A rule you delete stays deleted: drop every value the dashboard tombstoned, per list.
-    sup = _suppressed(existing)
-    prefs = {
-        "deprioritization_hints": [k for k in deprioritize
-                                   if k not in sup.get("deprioritization_hints", ())],
-        "approval_defaults": {k: v for k, v in approval_defaults.items()
-                              if k not in sup.get("approval_defaults", ())},
-        "edit_heavy": [k for k, c in edits.items()
-                       if c >= 3 and k not in sup.get("edit_heavy", ())],
+    # Build the CANDIDATE lists from behaviour, unfiltered. Suppression and the carry-forward both
+    # depend on what is on disk, and that has to be read under the same lock as the write — a mute
+    # added while this rebuild ran must not be lost, and a rule tombstoned meanwhile must not come
+    # back. So the merge happens in _persist, inside the transaction, not here.
+    candidates = {
+        "deprioritization_hints": list(deprioritize),
+        "approval_defaults": dict(approval_defaults),
+        "edit_heavy": [k for k, c in edits.items() if c >= 3],
         "analytics": {
             "total_outcomes": total,
             "completion_rate": round(completed / total, 3) if total else 0.0,
         },
         "version": 1,
     }
-    # Carry forward the EXPLICIT preferences (mutes / tone the user stated via sotto-feedback) and
-    # the tombstones themselves. This learner rewrites preferences.json wholesale from behavior;
-    # neither may be wiped.
-    if isinstance(existing.get("explicit"), dict):
-        prefs["explicit"] = existing["explicit"]
-    if isinstance(existing.get("suppressed"), list):
-        prefs["suppressed"] = existing["suppressed"]
-    os.makedirs(_root(), exist_ok=True)
-    tmp = path + ".tmp"   # tmp + atomic rename (preferences.py _save pattern): a crash mid-write
-    with open(tmp, "w", encoding="utf-8") as f:   # must never leave a truncated preferences.json
-        json.dump(prefs, f, indent=2)
-    os.replace(tmp, path)
-    return prefs
+    return _persist(path, candidates)
+
+
+def _persist(path: str, candidates: dict) -> dict:
+    """Filter, merge and write — all inside ONE lock.
+
+    Everything that depends on the file's current contents happens here: `suppressed` decides which
+    learned rules survive ("a rule you delete stays deleted"), and the user's `explicit` block is
+    carried forward untouched. Reading those under the write lock is what stops a preference set
+    during this rebuild from being clobbered by it.
+
+    A present-but-unreadable file ABORTS without writing. Minting a fresh one would drop the
+    explicit block and every tombstone with it, so a corrupt file must be repaired, never papered
+    over by this writer."""
+    import jsonstore  # noqa: PLC0415 — path set up in the header above
+
+    try:
+        with jsonstore.transaction(path, default={}, mode=0o600, indent=2, strict=True) as cur:
+            if not isinstance(cur, dict):
+                cur = {}
+            sup = _suppressed(cur)
+            prefs = {
+                "deprioritization_hints": [k for k in candidates["deprioritization_hints"]
+                                           if k not in sup.get("deprioritization_hints", ())],
+                "approval_defaults": {k: v for k, v in candidates["approval_defaults"].items()
+                                      if k not in sup.get("approval_defaults", ())},
+                "edit_heavy": [k for k in candidates["edit_heavy"]
+                               if k not in sup.get("edit_heavy", ())],
+                "analytics": candidates["analytics"],
+                "version": candidates["version"],
+            }
+            if isinstance(cur.get("explicit"), dict):
+                prefs["explicit"] = cur["explicit"]
+            if isinstance(cur.get("suppressed"), list):
+                prefs["suppressed"] = cur["suppressed"]
+            cur.clear()
+            cur.update(prefs)
+            return dict(prefs)
+    except jsonstore.Unreadable:
+        print("[learn_preferences] preferences.json exists but is unreadable — "
+              "aborting without writing (the explicit block would be lost)", file=sys.stderr)
+        return {}
 
 
 if __name__ == "__main__":

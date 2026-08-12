@@ -19,6 +19,15 @@ Gmail drafts, where they review and press send. That is why the offer surfaces p
 percent-encoded `mailto:` — but it still runs only after the user says yes (approval-tiers.md →
 `review`), never from a cron.
 
+⚠️ THE SEND GATE — "Sotto drafts, you send" is enforced here, not asked for. The attended chat lane
+gates a send on the user's yes in the conversation. The unattended lanes (cron briefs, the proactive
+watcher, event triage) run with approvals auto-bypassed, so prompt text is not a gate: the receiver
+sets `SOTTO_UNATTENDED=1` in the environment of every skill it spawns, and with it set `gmail-send`
+and `gmail-reply` are REFUSED here before any network call (`fallback: "gmail-draft"`, exit 2).
+`gmail-draft`, the calendar verbs and every read verb are unaffected — a draft never leaves the
+house, and a calendar write is the user's own in-chat instruction. Every send/reply attempt, allowed
+or refused, leaves one metadata-only line in `$SOTTO_DATA/events/sends.jsonl`.
+
 WHY IT DOESN'T GO THROUGH THE HOST CLI: the Hermes `google-workspace` `google_api.py` has no
 `gmail draft` verb (its gmail actions are search/get/send/reply/labels/modify), and that CLI is
 installed from upstream, not from this repo. The granted token already carries `gmail.modify`, which
@@ -30,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import os
 import subprocess
@@ -38,6 +48,70 @@ from email.mime.text import MIMEText
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gather_google import _find_google_api  # noqa: E402  (reuse the CLI locator)
+
+
+# ── The send gate ────────────────────────────────────────────────────────────────────────────────
+# It covers the two verbs that put mail in someone else's inbox — `gmail-send` and `gmail-reply`
+# (see main()). Everything else here either stays in the user's own account (gmail-draft) or is a
+# calendar write they asked for in chat.
+#
+# Set by the trigger receiver in the environment of every skill it spawns for a cron / proactive /
+# event-triage run — the lanes where `hermes -z` auto-bypasses approvals. Any non-empty value counts
+# (fail closed: an unparseable value means unattended, never attended).
+UNATTENDED_ENV = "SOTTO_UNATTENDED"
+
+REFUSAL = {"status": "error",
+           "error": "refused: unattended run — Sotto drafts, you send. Use gmail-draft instead.",
+           "fallback": "gmail-draft"}
+
+SENDS_MAX_BYTES = 4 * 1024 * 1024   # same bound as the other $SOTTO_DATA/events ledgers
+SENDS_KEEP_LINES = 4000
+
+
+def _unattended() -> bool:
+    """True when this process was spawned by a scheduled / proactive / triage run."""
+    return bool(os.environ.get(UNATTENDED_ENV))
+
+
+def _sends_path() -> str:
+    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "sends.jsonl")
+
+
+def _record_send(verb: str, ident: dict, unattended: bool, result: str) -> None:
+    """One JSONL line per send/reply ATTEMPT — allowed or refused — so "what did Sotto send?" has an
+    answer that isn't a prompt's promise: {ts, verb, to|message_id, unattended, result}.
+
+    METADATA ONLY. The subject and the body are never written here: the receipt proves an outbound
+    act happened, it is not a copy of the mail. Best-effort and bounded — an unwritable /data volume
+    must never change what the verb itself returns."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+        from sotto_log import bounded_append  # noqa: PLC0415
+        line = json.dumps({
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "verb": verb,
+            **ident,
+            "unattended": unattended,
+            "result": result,
+        })
+        bounded_append(_sends_path(), line, SENDS_MAX_BYTES, SENDS_KEEP_LINES)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gated_send(verb: str, ident: dict, cli_args: list) -> tuple[dict, bool]:
+    """Run one of the two outbound verbs, or refuse it. Returns (result, refused).
+
+    Unattended → refuse BEFORE `_run` (i.e. before the CLI, before the network); the caller exits 2
+    so a bypassed-approval agent sees a hard failure, and `fallback: "gmail-draft"` tells it the one
+    thing it may do instead. `ident` is the recipient (send) or the message id (reply)."""
+    if _unattended():
+        _record_send(verb, ident, True, "refused")
+        return dict(REFUSAL), True
+    out = _run(cli_args)
+    ok = isinstance(out, dict) and out.get("status") != "error"
+    _record_send(verb, ident, False, "sent" if ok else "error")
+    return out, False
 
 
 def _run(args) -> dict:
@@ -265,15 +339,17 @@ def main():
     rv.add_argument("--calendar", default="primary"); rv.add_argument("--comment", default="")
     a = ap.parse_args()
 
+    refused = False
     if a.cmd == "gmail-draft":
         out = _gmail_draft(a.to, a.body, a.subject, a.thread_id)
     elif a.cmd == "gmail-reply":
-        out = _run(["gmail", "reply", a.message_id, "--body", a.body])
+        out, refused = _gated_send("gmail-reply", {"message_id": a.message_id},
+                                   ["gmail", "reply", a.message_id, "--body", a.body])
     elif a.cmd == "gmail-send":
         args = ["gmail", "send", "--to", a.to, "--body", a.body]
         if a.subject:
             args += ["--subject", a.subject]
-        out = _run(args)
+        out, refused = _gated_send("gmail-send", {"to": a.to}, args)
     elif a.cmd == "calendar-create":
         base = ["calendar", "create", "--summary", a.summary, "--start", a.start, "--end", a.end]
         if a.attendees:
@@ -340,6 +416,10 @@ def main():
     except Exception:
         pass
     print(json.dumps(out))
+    if refused:
+        # Exit 2, not 0-with-an-error: an agent running with approvals bypassed must hit a wall it
+        # cannot read past. The JSON on stdout tells it what to do instead (gmail-draft).
+        sys.exit(2)
 
 
 if __name__ == "__main__":

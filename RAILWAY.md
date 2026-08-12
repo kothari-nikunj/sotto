@@ -270,7 +270,7 @@ Your deploy URL doubles as a private web dashboard: **`https://<your-domain>/app
 glance, open loops with one-tap resolve, the archive of every delivered brief, everyone Sotto knows
 (editable, with per-fact confidence), and its learned voice + preferences. Sign in once with your
 **setup code** — the same code in the `[sotto] Setup link` line of your boot logs (also on the volume
-at `/data/setup_code`) — and the session lasts **30 days**. Five wrong codes lock the login for **60
+at `/data/setup_code`) — and the session lasts **30 days**. Five wrong codes lock that visitor's login for **60
 seconds**: wait a minute and retry with the code from your boot log. `SOTTO_DASHBOARD=0` turns the
 whole surface off (`/app` and `/api/*` answer 404).
 
@@ -309,6 +309,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_FALLBACK_MODEL` | backup **1M-context** Gemini model id the brief falls back to on a 429/5xx/timeout. Defaults to `gemini-3-flash-preview` (cheaper than the primary, and a separate per-model rate-limit bucket — works with your existing key, no second key needed); set it to override (e.g. `gemini-2.5-pro`). The brief prompt is 100K–140K chars, so the backup MUST be 1M-context. | optional (resilience) |
 | `SOTTO_FALLBACK_API_KEY` | optional second Gemini key (different project) used for the fallback — dodges per-project quota (the 429 storm). Can be set alone (same model, backup key) or with `SOTTO_FALLBACK_MODEL`. | optional (resilience) |
 | `SOTTO_ALLOW_SELF_IMPROVE` | `1` to allow Hermes' skill self-writes + Curator on this instance. Default (unset) **protects** Sotto's skills: gates `skills.write_approval`, disables curator pruning. Set `1` only on a shared general-purpose Hermes. | optional |
+| `SOTTO_SPAWN_TOOLSETS` | comma-separated **Hermes toolset ids** the spawned one-shot runs (briefs, nudges, event agents) are scoped to — e.g. `sotto-local,google-workspace`. **Unset by design, and usually should stay unset:** toolset ids vary by install, so a wrong guess would break *every* brief and no default can be safely picked for you. Run `hermes tools --summary` to see the ids this deploy actually has before setting it. Ignored unless the runner is `hermes` (`SOTTO_RUN_SKILL` may name another agent, which would choke on the flag). | optional |
 | `SOTTO_REFRESH_HERMES` | `1` for **one boot** adopts the image's Hermes runtime onto the `/data` volume (see *Staying updated*). A denylist protects WhatsApp login, sessions, config, SOUL, and the knowledge graph. Unset after the version line confirms the upgrade. | optional (upgrade) |
 | `SOTTO_RESEARCH_DEEP` | `1` (default) runs the second, recency-focused attendee-research pass (recent posts/news, not just a bio); `0` keeps only the cheap first pass. | optional |
 | `SOTTO_PREWARM_RESEARCH` | first-run seed: background-researches your most-frequent contacts while pre-warming the knowledge graph (stored as clearly-labeled low-confidence notes). Default **on**; `=0` skips the research and seeds plain identity stubs only. | optional |
@@ -430,6 +431,8 @@ DMG and dragging it over the old app still works exactly the same way.
 **access code** once and pauses streaming to your cloud until you enter one — pairing, Full Disk
 Access and settings all survive, so entering it resumes streaming with nothing to re-pair. No code
 yet? Ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
+
+Builds verify the Hermes installer against the `HERMES_INSTALL_SHA256` build ARG when it is set; unset, the build warns and proceeds (the ARG exists for deployments that want a pinned installer — compute it with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sha256sum` and set it alongside a `HERMES_REFRESH` bump).
 
 ## Troubleshooting
 | Symptom | Fix |

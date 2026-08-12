@@ -461,6 +461,147 @@ def test_the_shared_file_map_is_the_same_set_in_the_doc_and_the_page():
     assert _norm_shared_file(write_row.group(1)) == "preferences.json"
 
 
+# ── …and the map must be COMPLETE, not merely self-consistent ───────────────────────────────────
+#
+# The guard above proves the two RENDERINGS agree. Agreement is not completeness: a file the code
+# writes and neither rendering names passes it happily, and seven did — events/gmail_seen.json,
+# events/last_digest.txt, events/{queue,surfaced,sends}.jsonl, the whole proactive/ directory, the
+# WhatsApp session creds, knowledge/relationship_state.json. This is the guard that closes the
+# class: it reads the CODE, not the docs, and asks the docs to account for what it finds.
+
+# One literal path built off the volume root. Three spellings cover the tree: the inline
+# `os.environ.get("SOTTO_DATA", …)` the skills scripts use, the module-level `DATA` constant in
+# receiver.py, and the dashboard's `_root()`.
+_DATA_JOIN_RE = re.compile(
+    r'os\.path\.join\(\s*(?:os\.environ\.get\(\s*["\']SOTTO_DATA["\'][^)]*\)|DATA|_root\(\))'
+    r'\s*,\s*([^)]{0,160}?)\)')
+
+# A quoted string, with any prefix (f/r/b) — the only kind of path component this guard can read.
+_STR_LITERAL_RE = re.compile(r'''[fFrRbB]{0,2}("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')''')
+
+# THE ALLOWLIST — kept small and named on purpose; an allowlist that grows is this guard failing
+# quietly. Artifacts that are internal to one writer and cross no boundary:
+_INTERNAL_SUFFIXES = (".lock", ".tmp")      # jsonstore's flock sidecar · atomic-write temporaries
+# Directories are not on it and need no names: `os.path.join(DATA, "events")` is a mkdir/listdir
+# target, and it is allowed exactly when some documented row LIVES in that directory — derived
+# from the map itself below, so a new directory can never be allowed by accident.
+
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", "target", ".pytest_cache", "venv", ".venv"}
+
+
+def _literal_parts(capture: str):
+    """The join's arguments as literal path components, or None if ANY component is a variable.
+
+    `os.path.join(DATA, "cache", name)` names no file — the guard can't know what `name` is, and
+    guessing would be worse than skipping. Every component must be a string literal for the hit to
+    count."""
+    parts, pos = [], 0
+    for m in _STR_LITERAL_RE.finditer(capture):
+        if capture[pos:m.start()].strip() not in ("", ","):
+            return None                      # something that isn't a literal sits between them
+        parts.append(m.group(1)[1:-1])
+        pos = m.end()
+    if not parts or capture[pos:].strip() not in ("", ","):
+        return None
+    return parts
+
+
+def _code_path(parts) -> str:
+    """The components as one `$SOTTO_DATA`-relative path, with f-string placeholders normalized to
+    `*` — `f"{date}.{kind}.claim"` and the doc's `<date>.<kind>.claim` are the same claim."""
+    return re.sub(r"\{[^{}]*\}", "*", "/".join(parts))
+
+
+def _matcher(name: str):
+    """A documented file NAME as a regex. `<date>` and `*` both mean "one path segment's worth of
+    anything" — so `knowledge/<kind>/*.md` cannot quietly cover `knowledge/anything.json`."""
+    name = re.sub(r"<[^>]*>", "*", name)
+    return re.compile("^" + "".join("[^/]*" if ch == "*" else re.escape(ch) for ch in name) + "$")
+
+
+def _documented_matchers():
+    """Every file the ARCHITECTURE.md map names, plus the directory each one lives in.
+
+    Only that table is read: the guard above already forces the playground to carry the same set,
+    so asking both would be asking one question twice."""
+    with open(os.path.join(DOCS, "ARCHITECTURE.md"), encoding="utf-8") as f:
+        section = _ARCH_TABLE_RE.search(f.read())
+    assert section, "ARCHITECTURE.md no longer has a '## The shared `$SOTTO_DATA` files' section"
+    files, dirs = [], []
+    for line in section.group(1).splitlines():
+        if not line.startswith("|") or line.startswith("|---") or line.startswith("| File "):
+            continue
+        for name in line.split("|")[1].split("·"):
+            name = _norm_shared_file(name)
+            if not name:
+                continue
+            files.append(name)
+            while "/" in name:                        # every parent directory of a documented row
+                name = name.rsplit("/", 1)[0]
+                dirs.append(name)
+    return [_matcher(n) for n in files], [_matcher(n) for n in dirs]
+
+
+def _scan_data_paths():
+    """{normalized path: {source files}} for every literal `$SOTTO_DATA/…` path in the tree.
+
+    `test_*.py` is skipped: a test builds paths under its own tmp_path, and a fixture tree is not
+    the volume."""
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(HERMES):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for filename in filenames:
+            if not filename.endswith(".py") or filename.startswith("test_"):
+                continue
+            path = os.path.join(dirpath, filename)
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            for m in _DATA_JOIN_RE.finditer(src):
+                parts = _literal_parts(m.group(1))
+                if parts:
+                    found.setdefault(_code_path(parts), set()).add(
+                        os.path.relpath(path, HERMES))
+    return found
+
+
+def test_the_shared_file_map_covers_every_path_the_code_writes():
+    """Every literal `$SOTTO_DATA` path in the tree is accounted for by a row in the map.
+
+    The map is the thing a reader checks before adding a writer, and the thing a user checks to
+    learn what Sotto keeps about them. A file the code writes and the map doesn't list is invisible
+    to both — and it is invisible in the way that matters most, because the undocumented ones were
+    exactly the message-derived ones (the Gmail dedup ring, the send receipts, the WhatsApp session
+    creds). Add the row in the same commit as the writer; both renderings, per the guard above."""
+    file_matchers, dir_matchers = _documented_matchers()
+    undocumented = {}
+    for rel_path, sources in sorted(_scan_data_paths().items()):
+        if rel_path.endswith(_INTERNAL_SUFFIXES) or ".tmp." in rel_path:
+            continue
+        if any(m.match(rel_path) for m in file_matchers):
+            continue
+        if any(m.match(rel_path) for m in dir_matchers):
+            continue                                  # a directory some documented row lives in
+        undocumented[rel_path] = sorted(sources)
+
+    assert not undocumented, (
+        "docs drift — the code writes $SOTTO_DATA paths that the shared-file map in "
+        "docs/ARCHITECTURE.md does not name:\n"
+        + "\n".join(f"  {p}   ← {', '.join(s)}" for p, s in sorted(undocumented.items()))
+        + "\nAdd a row to BOTH renderings (the table and the playground's SHARED_FILES), or, if it "
+        f"is genuinely internal, to _INTERNAL_SUFFIXES with a reason.\n{RULE}")
+
+
+def test_the_completeness_scan_actually_finds_paths():
+    """A scan that silently matches nothing would make the guard above pass forever. Pin the floor:
+    it must find the map's own landmark rows in the real tree."""
+    found = _scan_data_paths()
+    for expected in ("events/gmail_seen.json", "events/sends.jsonl", "proactive/wake_run.last",
+                     "knowledge/relationship_state.json", "config/settings.json"):
+        assert expected in found, (
+            f"the $SOTTO_DATA path scan no longer finds {expected!r} — the scan regex has drifted "
+            f"from how the tree builds paths, and the completeness guard is now vacuous.\n{RULE}")
+
+
 # ── the provider ladder, which exists in two processes ──────────────────────────────────────────
 
 def test_the_search_providers_are_the_same_ladder_in_both_processes():
@@ -486,3 +627,20 @@ def test_the_search_providers_are_the_same_ladder_in_both_processes():
     assert conn.CAPABILITIES == dict(wr.CAPABILITIES), (
         f"docs drift — capability precedence differs: receiver {conn.CAPABILITIES} vs "
         f"web_research {dict(wr.CAPABILITIES)}.\n{RULE}")
+
+
+# ── the read-modify-write lock, which exists in two processes ───────────────────────────────────
+
+def test_both_runtimes_lock_preferences_on_the_same_sidecar():
+    """`preferences.json` is the one file two RUNTIMES both write: the skills tree (preferences.py,
+    learn_preferences.py) and the receiver image (the dashboard's learned-rule delete). flock is an
+    OS primitive, so they serialise correctly ONLY if they name the same lock file. The receiver
+    cannot import the skills tree, so the protocol is duplicated exactly once — and this is the
+    guard that keeps the two names identical. Change one, change the other, same commit."""
+    js = _load("dd_jsonstore", PACK, "_shared", "lib", "jsonstore.py")
+    import connectors as conn  # noqa: PLC0415
+    assert js.LOCK_SUFFIX == conn.LOCK_SUFFIX, (
+        f"docs drift — lock suffix differs: skills {js.LOCK_SUFFIX!r} vs receiver "
+        f"{conn.LOCK_SUFFIX!r}. Two writers taking DIFFERENT locks is the same as no lock.\n{RULE}")
+    probe = "/tmp/x/preferences.json"
+    assert js.lock_path(probe) == probe + conn.LOCK_SUFFIX

@@ -20,6 +20,12 @@ Rules implemented (each returns a one-line violation string):
   e. every marker identifier (`<!--id:VALUE|ch:...-->`, `<!--meeting:event_id:VALUE|...-->`) appears
      VERBATIM somewhere in the rendered source text — an identifier the data never contained is a
      fabricated tap target.
+  e2. every identifier on an ACTION OBJECT is one the source data carried (`allowed_identifiers`,
+     the compose-time allowlist). Rule (e) reads the markdown only, so the identifiers the LINK
+     BUILDER consumes — `contactIdentifier`, `emailReplyTo`, an event id — went unchecked: an
+     external reviewer minted `sms:+19999999999` from a payload whose only recipient was
+     `+15551234567`, with zero violations. This rule is normalized (a formatting variant of a real
+     identifier is the same identity), and the composer ENFORCES it rather than logging it.
   f. per action item, contextSummary / contextAsk / prose are pairwise DISTINCT (normalized
      token-overlap ratio > 0.8 fails — "one fact stated three ways").
   g. every URGENT open/waiting action_ledger entry is NAMED somewhere in the brief, and the brief
@@ -187,6 +193,49 @@ def _check_marker_identifiers(markdown: str, rendered_source_text: str) -> list:
             if ident and ident not in src:
                 violations.append(
                     f"fabricated-identifier: {kind} '{ident}' does not appear verbatim in the source data")
+    return violations
+
+
+# ── THE fabricated-identifier test (one sentence, one implementation) ─────────────────────────────
+# A tap target may only be an identifier the SOURCE DATA carried. compose_brief builds the allowlist
+# from the gathered payload (build_tap_target_allowlist) and both callers — this validator and the
+# link builder that refuses to mint a link — ask the question HERE, so "did the data contain this
+# recipient?" can never come to mean two things.
+
+# The action fields that can become a tap target. compose_brief strips exactly these from a refused
+# action, so the list lives once, here, next to the check that reads it.
+TAP_IDENTIFIER_FIELDS = ("contactIdentifier", "contact_identifier", "emailReplyTo", "emailThreadId",
+                         "eventId", "event_id", "meetingLink")
+
+
+def identifier_allowed(value: str, allowlist) -> bool:
+    """Is `value` an identifier the source data carried? Normalized on BOTH sides through the
+    pipeline's one identifier normalizer, so `+1 (555) 123-4567`, `15551234567` and
+    `15551234567@s.whatsapp.net` are the same identity and `+19999999999` is not.
+
+    `allowlist=None` means the caller has no source data to check against — that is ignorance, not
+    evidence of fabrication, so everything is allowed (an empty SET, by contrast, is a payload that
+    carried no identifiers at all and allows nothing)."""
+    if allowlist is None:
+        return True
+    v = _normalize_identifier(str(value or ""))
+    return bool(v) and v in allowlist
+
+
+def _check_action_identifiers(action_items: list, allowlist) -> list:
+    if allowlist is None:
+        return []
+    violations = []
+    for a in action_items or []:
+        if not isinstance(a, dict):
+            continue
+        label = str(a.get("id") or a.get("contactName") or a.get("contact_name") or "?")
+        for field in TAP_IDENTIFIER_FIELDS:
+            value = str(a.get(field) or "").strip()
+            if value and not identifier_allowed(value, allowlist):
+                violations.append(
+                    f"fabricated-identifier: action '{label}' field {field} '{value}' is not in the "
+                    f"source data — it can never be a tap target")
     return violations
 
 
@@ -408,19 +457,21 @@ def _check_no_open_loop_inventory(markdown: str) -> list:
 
 def validate(brief_markdown: str, action_items: list, rendered_source_text: str,
              first_run: bool = False, action_ledger: list | None = None,
-             today: str = "") -> list:
+             today: str = "", allowed_identifiers=None) -> list:
     """Pure: run every machine-checkable brief rule; return a list of one-line violation strings
     (empty = clean). Never raises on malformed input — a validator crash must not cost a brief.
     `first_run` marks the one-time onboarding brief, whose mandated trailing offer line is allowed
     past the Coming Up cap (see _check_coming_up_length). `action_ledger` is the open-loop ledger the
     brief was built from (rule g); omit it and that rule simply doesn't run. `today` is the brief's
-    user-local date, which is what makes a deadline urgent or not."""
+    user-local date, which is what makes a deadline urgent or not. `allowed_identifiers` is the
+    compose-time tap-target allowlist (rule e2); omit it and that rule doesn't run either."""
     violations = []
     try:
         violations += _check_bold_markers_and_duplicates(brief_markdown, rendered_source_text)
         violations += _check_banned_phrases(brief_markdown)
         violations += _check_coming_up_length(brief_markdown, first_run)
         violations += _check_marker_identifiers(brief_markdown, rendered_source_text)
+        violations += _check_action_identifiers(action_items, allowed_identifiers)
         violations += _check_action_field_distinctness(action_items)
         violations += _check_open_ledger_coverage(brief_markdown, action_ledger, today)
         violations += _check_no_open_loop_inventory(brief_markdown)
