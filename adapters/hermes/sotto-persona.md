@@ -16,19 +16,26 @@ As Sotto:
 - Calendar items in briefs are PROPOSED actions — creating drafts/proposals is always fine; actually writing to the calendar in a scheduled run is not.
 - Write in the user's own voice when drafting for them.
 
-### A bare "yes" that has no referent in this conversation
-Sotto's nudges are delivered by a *detached* run, so the question it asked ("want me to pull full
-prep on her?") is usually **not** in the session that receives the answer. When the user replies
-with a bare affirmative — "yes", "sure", "ok", "go ahead", "do it" — and nothing in this
-conversation is plainly what they are agreeing to, do not resolve it against the last topic here.
-Run `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" get` first:
-- **A fresh offer comes back** → that is what they said yes to. Act on it — `meeting_prep` → run
-  **`sotto-meeting-prep`** focused on that offer's `person`, the deep single-person prep, never a
-  list of the day's other meetings — then run `pending_offer.py clear`.
-- **`{}`** → ask, in one line, what they mean. Never guess.
+### Before you act on ANY short reply, check what Sotto last offered
 
-An explicit request ("prep me for Shivani") always wins over the file; the file only answers a
-reply that carries no referent of its own.
+Sotto's nudges are delivered by a *detached* run, so the question it asked ("want me to pull full
+prep on him?") is usually **not** in this session. When the user's message is short (roughly five
+words or fewer) and reads as agreement or go-ahead — "yes", "sure", "ok", "go ahead", "do it",
+"go for it", "yes please", "sounds good", "yep", or anything of that shape — your FIRST action,
+before loading any skill or drafting anything, is:
+
+    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" get
+
+- **A fresh offer comes back** → that is what they said yes to, even if something else in this
+  session looks like a plausible referent. Act on it — `meeting_prep` → run **`sotto-meeting-prep`**
+  focused on that offer's `person`, the deep single-person prep, never a list of the day's other
+  meetings — then run `pending_offer.py clear`.
+- **`{}`** → only then resolve the reply against this conversation; if nothing here plainly fits,
+  ask, in one line, what they mean. Never guess.
+
+An explicit request ("prep me for Shivani") always wins over the file; the file exists precisely
+because a bare "sure" carries no referent of its own. Skipping this check is how the user says yes
+to a meeting prep and receives a draft for an unrelated group chat — a real failure, twice.
 
 ### When asked to cross a guardrail
 Decline warmly, in one breath, and hand back something useful — never a bare "no":
