@@ -1,0 +1,1460 @@
+/* Sotto — The Window.
+   An editorial instrument: oat-parchment ground, iron-dark ink, and a
+   patinated-verdigris accent that behaves like punctuation, never like paint.
+   Besley (a Clarendon revival — the bookkeeper's serif) carries all reading at
+   real display sizes; Martian Mono carries the small uppercase label layer
+   (eyebrows, folios, counts). Dark mode is a derivation — lamp-lit umber, the
+   same accent aged toward bronze. No build step.
+
+   THE SURFACE SYSTEM (Aug 2026 design pass — the reference brief was
+   party.pro/book, the Anthropic blog, and Amplify Partners):
+   grouped content sits on a soft, BORDERLESS panel one shade off the ground
+   (.panel / .ledger / .card / setup.css's .tile), radius --radius-panel, no
+   border, no shadow. The panel boundary is what used to be a hairline, so
+   sections now separate by SURFACE + AIR rather than by lines. Sectional
+   spacing is roughly double what a dense tool would use: essay-calm, never
+   cramped. Every page still carries its full content — the air comes from the
+   spacing scale, never from hiding rows.
+
+   Rule inventory (what is left after the panels took over):
+     1. .head-rule  — the masthead double rule. ONE per page, the signature.
+     2. .sidebar    — the chrome divider (right on desktop, bottom on the
+                      phone's translucent top bar)
+     3. form-control borders (.edit-textarea, .edit-select, .edit-input,
+                      setup.css .field) — inputs, not rules
+   Everything else that used to be a hairline (.ledger's section cap rule,
+   .head-rule.single) is now a panel edge. .head-rule.single is retained as a
+   no-op-safe spacer for the markup that still emits it.
+
+   TYPE TOKENS — the closed set (5 steps; nothing else may invent a size):
+     --text-display  clamp(2rem → 2.6rem)      page titles + the masthead
+                                               dateline (32px phone / ~42px wide)
+     --text-title    1.3125rem (21px)          row titles, thesis, panel headings
+     --text-body     1.0625rem (17px, 1.62)    every serif reading size
+     --text-eyebrow  0.6875rem (11px, .1em)    eyebrow / section caps — the
+                                               letterspaced uppercase register
+     --mono-meta     0.6875rem (11px)          folios, counts, chips, buttons */
+
+/* ---------- Vendored fonts (SIL OFL — see /static/fonts/LICENSE.txt) ---------- */
+
+@font-face {
+  font-family: 'Besley';
+  src: url('/static/fonts/Besley.woff2') format('woff2');
+  font-weight: 400 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Besley';
+  src: url('/static/fonts/Besley-italic.woff2') format('woff2');
+  font-weight: 400 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Martian Mono';
+  src: url('/static/fonts/MartianMono.woff2') format('woff2');
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------- Tokens ---------- */
+
+:root {
+  color-scheme: light dark;
+
+  /* Ink ramp — iron-gall, warm */
+  --ink: #221c12;
+  --ink-secondary: #4c4433;
+  --ink-light: #6b6250;
+  --ink-muted: #746b57;
+  /* decoration-only tone (№ folio, separators, placeholders, brand foot) —
+     3.1:1 on paper; anything that must be READ takes --ink-muted (4.6:1) */
+  --ink-faint: #93886e;
+
+  /* Paper — oat parchment */
+  --paper: #f4efe4;
+  --paper-alt: #ece5d6;
+  --paper-white: #fbf8f0;
+  --paper-nav: rgba(244, 239, 228, 0.85);
+  --border: #ddd4c0;
+  --border-light: #e7e0cf;
+
+  /* Surfaces — the panel system. ONE shade off the ground, borderless.
+     --panel      the grouped-content surface (.panel/.ledger/.card/.tile)
+     --panel-lift the raised chip ON a panel (a button, a chip, a hovered row) */
+  --panel: #ece7d9;
+  --panel-lift: #fbf8f0;
+
+  /* Accent — calm viridian, gray-leaning. Punctuation only: the wordmark
+     period, active-nav markers, tiny status dots, focus rings, and the
+     hero CTA's border. Links are ink; the accent appears on hover. */
+  --accent: #26604e;
+  --accent-light: #316b58;
+  --accent-text: #1f5747;             /* 7.3:1 on parchment — safe at label sizes */
+  --accent-soft: rgba(38, 96, 78, 0.13);
+  --accent-muted: rgba(38, 96, 78, 0.055);
+  --accent-hover: rgba(38, 96, 78, 0.17);
+  --accent-underline: rgba(38, 96, 78, 0.4);
+  --accent-glow: rgba(38, 96, 78, 0.1);
+  --accent-wash: rgba(38, 96, 78, 0.22);
+  --link-underline: rgba(34, 28, 18, 0.28);
+  --thesis-underline: rgba(34, 28, 18, 0.16);
+
+  /* Status — oxblood for trouble (the accent owns "alive") */
+  --urgent: #a4321f;
+  --urgent-soft: rgba(164, 50, 31, 0.09);
+  --success: #26604e;
+  --success-soft: rgba(38, 96, 78, 0.12);
+  --health-active: #2c8a4f;
+  --health-active-soft: rgba(44, 138, 79, 0.16);
+  --health-cooling: #c07f10;
+  --health-cooling-soft: rgba(192, 127, 16, 0.15);
+  --health-cold: #948b7c;
+  --health-cold-soft: rgba(148, 139, 124, 0.18);
+  --warn-text: #7a5a10;
+
+  /* Depth — the panel system is flat, so only the TOAST still lifts. */
+  --shadow-lg: 0 4px 20px rgba(56, 46, 28, 0.12), 0 0 1px rgba(56, 46, 28, 0.07);
+
+  /* Radii / spacing (4px base). --space-10/12/16 are the SECTIONAL steps the
+     design pass added — the air between one idea and the next. */
+  --radius-xs: 3px;
+  --radius-sm: 6px;
+  --radius-panel: 12px;      /* the ONE panel radius */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 20px; --space-6: 24px; --space-8: 32px;
+  --space-10: 40px; --space-12: 48px; --space-16: 64px;
+
+  /* Type — the five steps (see the header). Martian Mono runs wide, so the
+     label layer sits at 11px and buys its presence back with tracking. */
+  --font-serif: 'Besley', Georgia, serif;
+  --font-mono: 'Martian Mono', 'SF Mono', ui-monospace, monospace;
+  --mono-meta: 0.6875rem;    /* 11px — folios, counts, chips, buttons */
+  --text-eyebrow: 0.6875rem; /* 11px — eyebrows + section caps */
+  --text-body: 1.0625rem;    /* 17px — the ONE serif reading size */
+  --text-title: 1.3125rem;   /* 21px — row titles / thesis / panel headings */
+  --text-display: clamp(2rem, 7.6vw, 2.6rem);      /* 32px phone → ~42px wide */
+  --ls-tight: 0.01em;
+  --ls-eyebrow: 0.1em;       /* the eyebrow register's tracking */
+
+  /* Motion — the built-in curves are too weak; these are the only two we use.
+     Press 120ms · hover color 150ms · list entrance 200ms (+40ms stagger,
+     first visit only) · row exit 200ms · toast 220ms. Nothing over 300ms. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur-press: 120ms;
+  --dur-hover: 150ms;
+  --dur-enter: 200ms;
+  --dur-exit: 200ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Lamp-lit umber — warm dark ledger, not slate */
+    --ink: #eae3d3;
+    --ink-secondary: #cbc2ad;
+    --ink-light: #a89d86;
+    --ink-muted: #998e75;
+    --ink-faint: #6e6450;
+
+    --paper: #191510;
+    --paper-alt: #201b14;
+    --paper-white: #251f17;
+    --paper-nav: rgba(25, 21, 16, 0.85);
+    --border: #362e20;
+    --border-light: #2a2419;
+
+    /* Same relationships, inverted: the panel is one shade UP from the dark
+       ground, and the lift is one shade up from the panel. */
+    --panel: #211c15;
+    --panel-lift: #2a241b;
+
+    /* Aged bronze / verdigris — barely green, never minty */
+    --accent: #64887a;
+    --accent-light: #739684;
+    --accent-text: #95b2a4;            /* 7.9:1 on umber */
+    --accent-soft: rgba(149, 178, 164, 0.14);
+    --accent-muted: rgba(149, 178, 164, 0.07);
+    --accent-hover: rgba(149, 178, 164, 0.2);
+    --accent-underline: rgba(149, 178, 164, 0.5);
+    --accent-glow: rgba(149, 178, 164, 0.12);
+    --accent-wash: rgba(149, 178, 164, 0.28);
+    --link-underline: rgba(234, 227, 211, 0.3);
+    --thesis-underline: rgba(234, 227, 211, 0.18);
+
+    --urgent: #e2705a;
+    --urgent-soft: rgba(226, 112, 90, 0.13);
+    --success: #95b2a4;
+    --success-soft: rgba(149, 178, 164, 0.13);
+    --health-active: #63a487;
+    --health-active-soft: rgba(99, 164, 135, 0.16);
+    --health-cooling: #d9a83e;
+    --health-cooling-soft: rgba(217, 168, 62, 0.15);
+    --health-cold: #8d8270;
+    --health-cold-soft: rgba(141, 130, 112, 0.18);
+    --warn-text: #d9a83e;
+
+    --shadow-lg: 0 4px 20px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(234, 227, 211, 0.06);
+  }
+}
+
+/* ---------- Base ---------- */
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.62;
+  color: var(--ink);
+  background: var(--paper);
+  min-height: 100dvh;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Links read as ink with a quiet underline; the accent arrives on hover.
+   Component links (nav, ledger rows, chips, folios) opt out below. */
+a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--link-underline);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  transition: color var(--dur-hover) ease,
+              text-decoration-color var(--dur-hover) ease;
+}
+a:hover { color: var(--accent-text); text-decoration-color: var(--accent); }
+
+::selection { background: var(--accent-wash); color: var(--ink); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- The mono label layer — one size, one voice ---------- */
+
+.mono-label, .eyebrow, .meta, .row-folio, .ledger-cap, .masthead-folio {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- The panel — the one grouped-content surface ----------
+   Soft, borderless, one shade off the ground. This is what replaced the
+   hairline section rules: a panel edge IS the boundary. Nothing here casts a
+   shadow — the tint alone does the separating, in both themes. */
+
+.panel, .ledger, .card {
+  background: var(--panel);
+  border: none;
+  border-radius: var(--radius-panel);
+}
+
+/* ---------- Shell — one site, two chromes ----------
+   Shared contract with the server-rendered /setup pages, which link this
+   stylesheet first: .site wraps header.sidebar (wordmark + nav.nav) and
+   main.content. Phones get a sticky translucent top bar; ≥900px the sidebar
+   becomes a fixed left column and .content centers in the remaining track. */
+
+.site { min-height: 100dvh; }
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  background: var(--paper-nav);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Materials honesty: translucency and blur are a preference, not a requirement */
+@media (prefers-reduced-transparency: reduce) {
+  .sidebar {
+    background: var(--paper);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@media (prefers-contrast: more) {
+  .sidebar {
+    background: var(--paper);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    border-bottom-color: var(--ink-muted);
+  }
+  .chip { box-shadow: inset 0 0 0 1px var(--ink-muted); }
+  /* Borderless panels lean on a 1-shade tint. When the reader has asked for
+     more contrast, give every panel an explicit edge back. */
+  .panel, .ledger, .card, .company-prose, .company-empty, .voice-prose,
+  .search-input { box-shadow: inset 0 0 0 1px var(--ink-muted); }
+}
+
+.brand, .wordmark {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 700;
+  font-size: var(--text-title);
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  flex: none;
+  line-height: 1.2;
+  text-decoration: none;
+}
+.brand::after, .wordmark::after { content: "."; color: var(--accent); font-style: normal; }
+.brand:hover, .wordmark:hover { text-decoration: none; color: var(--ink); }
+
+.nav {
+  display: flex;
+  gap: var(--space-1);
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.nav::-webkit-scrollbar { display: none; }
+
+.nav a {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  text-decoration: none;
+  white-space: nowrap;
+  padding: 11px var(--space-2) 9px;
+  border-bottom: 2px solid transparent;   /* the active marker's rail, not a rule */
+  transition: color var(--dur-hover) ease,
+              border-color var(--dur-hover) ease,
+              background-color var(--dur-hover) ease;
+}
+.nav a:hover { text-decoration: none; color: var(--ink); }
+.nav a:active { color: var(--accent-text); }
+.nav a[aria-current="page"],
+.nav a.active {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+/* quiet mono footer — only visible when the sidebar is a column */
+.sidebar-foot {
+  display: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0;
+}
+
+@media (min-width: 900px) {
+  .site {
+    display: grid;
+    grid-template-columns: 216px minmax(0, 1fr);
+  }
+  .sidebar {
+    grid-column: 1;
+    grid-row: 1;
+    height: 100dvh;
+    overflow-y: auto;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-6);
+    padding: var(--space-8) var(--space-4) var(--space-6);
+    background: var(--paper);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    border-bottom: none;
+    border-right: 1px solid var(--border);  /* chrome divider — sidebar vs page */
+  }
+  .brand, .wordmark { padding-left: var(--space-3); }
+  .nav {
+    flex-direction: column;
+    gap: 2px;
+    overflow: visible;
+  }
+  .nav a {
+    padding: 7px var(--space-3);
+    border-bottom: none;
+    border-radius: var(--radius-sm);
+  }
+  .nav a:hover { background: var(--paper-alt); }
+  .nav a[aria-current="page"],
+  .nav a.active,
+  .nav a[aria-current="page"]:hover,
+  .nav a.active:hover {
+    color: var(--ink);
+    border-bottom-color: transparent;
+    background: var(--accent-muted);
+  }
+  .sidebar-foot {
+    display: block;
+    margin-top: auto;
+    padding: var(--space-6) var(--space-3) 0;
+  }
+  .content { grid-column: 2; grid-row: 1; }
+}
+
+/* ---------- Layout ---------- */
+
+.content {
+  width: 100%;
+  max-width: 700px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-5) calc(var(--space-16) + env(safe-area-inset-bottom));
+  outline: none;
+}
+
+/* The eyebrow register (party.pro's "WHY THIS BOOK"): small, uppercase, widely
+   letterspaced. The PAGE eyebrow is the one accent moment in the label layer —
+   section caps below stay ink-muted, so verdigris keeps its punctuation job. */
+.eyebrow {
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--accent-text);
+  margin: 0 0 var(--space-3);
+}
+
+.view-title {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 600;
+  letter-spacing: -0.022em;
+  line-height: 1.08;
+  margin: 0 0 var(--space-3);
+  text-wrap: balance;
+}
+
+.view-sub {
+  font-style: italic;
+  color: var(--ink-light);
+  font-size: var(--text-body);
+  line-height: 1.55;
+  margin: 0 0 var(--space-8);
+  max-width: 46ch;
+}
+
+.back-link {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  text-decoration: none;
+  margin-bottom: var(--space-6);
+}
+.back-link:hover { color: var(--accent-text); text-decoration: none; }
+.back-link:active { color: var(--accent-text); }
+
+/* ---------- Masthead — the Today page's dateline ---------- */
+
+.masthead { margin-bottom: var(--space-6); }
+
+.masthead-folio {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--accent-text);
+  margin: 0 0 var(--space-3);
+}
+.masthead-folio .folio-no { color: var(--ink-faint); font-weight: 500; }
+
+.masthead-date {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);   /* one display step, page titles and dateline alike */
+  font-weight: 700;
+  letter-spacing: -0.024em;
+  line-height: 1.05;
+  margin: 0 0 var(--space-5);
+  text-wrap: balance;
+}
+
+/* The thesis — one editorial status sentence composed from live data.
+   Each clause is a link to its page; the sentence IS the overview. */
+.thesis {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  line-height: 1.45;
+  color: var(--ink-secondary);
+  margin: 0;
+  text-wrap: pretty;
+}
+/* Every clause is a link, so six underlines in a row would read as noise. The
+   underline stays (colour alone is not an affordance) but drops to the faintest
+   tone that still shows, and firms up on hover. */
+.thesis a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--thesis-underline);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 5px;
+  transition: color var(--dur-hover) ease, text-decoration-color var(--dur-hover) ease;
+}
+.thesis a:hover { color: var(--accent-text); text-decoration-color: var(--accent); }
+.thesis a:active { color: var(--accent-text); }
+.thesis .sep { color: var(--ink-faint); padding: 0 0.35em; }
+.thesis .down { color: var(--warn-text); }
+
+/* The masthead's closing "total rule": bold over thin — the accountant's double
+   rule. The double form marks a PAGE's masthead only (one per page); section
+   caps take the .single hairline (or open a .ledger, which carries its own). */
+.head-rule {
+  border: none;
+  height: 5px;
+  border-top: 2.5px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+  background: transparent;
+  margin: var(--space-6) 0 var(--space-10);
+}
+/* The per-section hairline is gone — a panel edge does that work now. The class
+   survives as pure air so the markup that still emits it needs no change. */
+.head-rule.single {
+  height: 0;
+  border-top: none;
+  border-bottom: none;
+  margin: 0 0 var(--space-1);
+}
+
+/* ---------- "A newer Sotto is published" ----------
+   Housekeeping, so it reads as housekeeping: the mono label layer on the ONE
+   panel surface, in the muted ink every other meta line uses. Deliberately not
+   a warning colour and deliberately not a card — an update is news you'll get
+   to, not an alarm. It sits directly under the masthead rule (above the fold,
+   where a fact belongs) and pays its own bottom air, since the docket cap that
+   follows has no panel between them. */
+.update-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  background: var(--panel);
+  border-radius: var(--radius-panel);
+  padding: var(--space-3) var(--space-4);
+  margin: calc(-1 * var(--space-4)) 0 var(--space-10);
+  /* The mono label layer's family and tracking, but NOT its uppercase: this is
+     a sentence, and a shouted sentence is the alarm we're avoiding. */
+  font-family: var(--font-mono);
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--mono-meta);
+  line-height: 1.55;
+  color: var(--ink-muted);
+}
+.update-note a { color: var(--accent-text); text-decoration: none; white-space: nowrap; }
+.update-note a:hover { text-decoration: underline; }
+
+/* ---------- The ledger — the product's signature list form ----------
+   Serif entries ON a soft panel; rows separate by spacing alone — no
+   between-row lines, no hairline cap. The eyebrow-register section cap sits
+   ABOVE the panel (party.pro's label-over-card rhythm), and the panel's own
+   edge is the boundary the old rule used to draw. Mono folio meta sits right. */
+
+.ledger-cap {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin: 0 0 var(--space-3);
+}
+.ledger-cap .cap-count { color: var(--ink-faint); font-weight: 500; }
+.ledger-cap a { text-decoration: none; color: var(--ink-muted); }
+.ledger-cap a:hover { color: var(--accent-text); }
+/* An umbrella cap followed straight by its subsection cap (Learned's House
+   rules → Muted people) needs its own air — no panel sits between them. */
+.ledger-cap + .ledger-cap,
+.head-rule.single + .ledger-cap { margin-top: var(--space-6); }
+
+.ledger {
+  /* The sectional gap lives on the PANEL's bottom margin, not on the cap's top:
+     a cap is often the first child of a section wrapper, where a top margin
+     would collapse or miss. Panel-then-air is the page's whole rhythm. */
+  margin-bottom: var(--space-12);
+  padding: var(--space-2) var(--space-4);
+}
+
+.ledger-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: var(--space-4);
+  align-items: baseline;
+  padding: var(--space-4) 0;
+  border-radius: var(--radius-sm);
+  position: relative;
+}
+.ledger-row.has-dot { grid-template-columns: 14px minmax(0, 1fr) auto; }
+
+a.ledger-row { color: inherit; text-decoration: none; }
+a.ledger-row:hover { text-decoration: none; color: inherit; }
+/* On a panel the hover wash has to come from the OTHER direction — a lift, not
+   a tint, so it reads on parchment and on umber alike. */
+@media (hover: hover) and (pointer: fine) {
+  a.ledger-row, .ledger-row.pressable {
+    transition: background-color var(--dur-hover) ease;
+    margin: 0 calc(var(--space-3) * -1);
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+  a.ledger-row:hover, .ledger-row.pressable:hover { background: var(--panel-lift); }
+}
+a.ledger-row:active, .ledger-row.pressable:active { background: var(--accent-soft); }
+
+.row-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  align-self: start;
+  margin-top: 9px;    /* optically centers on the title's first line */
+  justify-self: start;
+  background: var(--health-cold);
+}
+.row-dot.on   { background: var(--health-active); box-shadow: 0 0 0 3px var(--health-active-soft); }
+.row-dot.off  { background: var(--health-cold); box-shadow: 0 0 0 3px var(--health-cold-soft); }
+.row-dot.warn { background: var(--health-cooling); box-shadow: 0 0 0 3px var(--health-cooling-soft); }
+.row-dot.bad  { background: var(--urgent); box-shadow: 0 0 0 3px var(--urgent-soft); }
+
+.row-main { min-width: 0; }
+.row-title {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: var(--text-title);
+  letter-spacing: -0.012em;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.row-sub {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.55;
+  color: var(--ink-secondary);
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.row-detail {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-light);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* The folio column is capped: an `auto` track takes its max-content width and
+   squeezes the title to nothing, which on a phone turned a long folio
+   ("3 days · surfaced 2 · chased ×1, Sat") into one letter per line. Capped +
+   wrappable, the folio breaks at its own separators instead. */
+.row-folio {
+  font-size: var(--mono-meta);
+  color: var(--ink-muted);
+  text-align: right;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  /* A LENGTH, not a percentage: a percentage max-width resolves against an
+     indefinite grid area during intrinsic sizing, so the auto track still took
+     its full max-content width and the title column collapsed to one letter. */
+  max-width: 7.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  align-self: start;
+  padding-top: 6px;
+  line-height: 1.5;
+}
+.row-folio .go { color: var(--ink); }
+
+/* A data moment: one panel, one idea, the figure given room (claude.com's chart
+   card). Cadence's counters and the levers use it — never a stat-tile grid.
+   The reading is its own line, so nothing has to fit a phone's folio column. */
+.ledger-row.meter { display: block; }
+.meter-reading {
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin-top: var(--space-2);
+}
+.meter-reading + .row-sub { margin-top: var(--space-2); color: var(--ink-light); }
+
+/* an italic aside tied to a ledger cap (section explanations on Learned) */
+.cap-sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  line-height: 1.55;
+  color: var(--ink-light);
+  margin: 0 0 var(--space-3);
+  max-width: 52ch;
+}
+
+/* Row actions — revealed on hover/focus on pointer devices; always on touch.
+   Space is reserved (opacity, not display) so reveal never shifts layout. */
+.row-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}
+@media (hover: hover) and (pointer: fine) {
+  .ledger-row .row-actions,
+  .ledger-row .reveal { opacity: 0; transition: opacity var(--dur-hover) ease; }
+  .ledger-row:hover .row-actions,
+  .ledger-row:focus-within .row-actions,
+  .ledger-row:hover .reveal,
+  .ledger-row:focus-within .reveal { opacity: 1; }
+}
+
+/* First-visit entrance (per view, per session): staggered rise, first paint only.
+   The Record stacks one PANEL per day, so a panel child rises like a row does. */
+.ledger-enter > .ledger-row,
+.record-days.ledger-enter > .ledger {
+  animation: row-in var(--dur-enter) var(--ease-out) backwards;
+}
+@keyframes row-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.ledger-enter > .ledger-row:nth-child(1) { animation-delay: 0ms; }
+.ledger-enter > .ledger-row:nth-child(2) { animation-delay: 40ms; }
+.ledger-enter > .ledger-row:nth-child(3) { animation-delay: 80ms; }
+.ledger-enter > .ledger-row:nth-child(4) { animation-delay: 120ms; }
+.ledger-enter > .ledger-row:nth-child(5) { animation-delay: 160ms; }
+.ledger-enter > .ledger-row:nth-child(n+6) { animation-delay: 200ms; }
+
+/* The Record's day stack: cap + panel per day, the page's sectional rhythm. */
+.record-days { margin-bottom: var(--space-12); }
+.record-days > .ledger { margin-bottom: var(--space-10); }
+.record-days > .ledger:last-child { margin-bottom: 0; }
+.record-days > .ledger-sub { padding: 0 0 var(--space-3); }
+
+/* Row exit (loop resolved/dismissed) — a clean close, then the list settles */
+@keyframes row-out {
+  to { opacity: 0; transform: translateY(-4px); }
+}
+.row-leaving {
+  animation: row-out var(--dur-exit) var(--ease-out) forwards;
+  pointer-events: none;
+}
+
+/* ---------- Cards — the same panel, for framed surfaces (dialogs, notices) ---------- */
+
+.card {
+  padding: var(--space-5) var(--space-6);
+  margin-bottom: var(--space-3);
+}
+
+.card h2 {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  line-height: 1.25;
+  color: var(--ink);
+  margin: 0 0 var(--space-2);
+  text-wrap: balance;
+}
+
+/* ---------- Chips — mono provenance layer ---------- */
+
+.chip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-lift);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.chip.accent, .chip.user-edit { background: var(--accent-muted); color: var(--ink-secondary); }
+a.chip { color: var(--ink-muted); text-decoration: none; }
+a.chip:hover { text-decoration: none; color: var(--accent-text); background: var(--accent-muted); }
+a.chip:active { background: var(--accent-soft); }
+
+/* ---------- Buttons — quiet paper, mono labels, press-down feedback ---------- */
+
+button.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  padding: 0.5rem 0.9rem;
+  background: var(--panel-lift);
+  color: var(--ink);
+  border: none;
+  box-shadow: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-hover) ease,
+              box-shadow var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+button.btn:hover { background: var(--accent-muted); color: var(--accent-text); }
+button.btn:active { transform: scale(0.97); }
+button.btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+
+/* Primary = the same lifted chip, a shade firmer — never a filled green block */
+button.btn-primary {
+  background: var(--panel-lift);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--accent-underline);
+}
+button.btn-primary:hover { background: var(--accent-muted); color: var(--ink); }
+
+button.btn-danger-quiet { color: var(--urgent); }
+
+/* quiet inline text actions (fact rows, add fact, pref delete) */
+/* Control labels keep TIGHT tracking — the eyebrow's 0.1em pushed "mark
+   resolved" onto two lines inside a phone-width row. */
+button.text-action {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  background: none;
+  border: none;
+  padding: 3px 6px;
+  border-radius: var(--radius-xs);
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: color var(--dur-hover) ease,
+              background-color var(--dur-hover) ease,
+              transform var(--dur-press) var(--ease-out);
+}
+button.text-action:hover { color: var(--accent-text); background: var(--accent-muted); }
+button.text-action:active { transform: scale(0.96); }
+button.text-action:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------- Segmented filter (People: All / People / Companies) ---------- */
+
+.seg {
+  display: flex;
+  gap: var(--space-1);
+  margin-bottom: var(--space-8);
+}
+.seg button {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;   /* the active marker's rail */
+  padding: 6px var(--space-2) 7px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: color var(--dur-hover) ease, border-color var(--dur-hover) ease;
+}
+.seg button:hover { color: var(--ink); }
+.seg button:active { color: var(--accent-text); }
+.seg button[aria-pressed="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.seg .seg-count { color: var(--ink-muted); }
+
+/* ---------- Briefs — the reading page (Read mode; the crown) ---------- */
+
+.reading {
+  max-width: 62ch;
+  margin: 0 auto;
+}
+.reading .head-rule { margin-top: var(--space-5); }
+
+.brief-body {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.78;
+  color: var(--ink);
+}
+.brief-body p { margin: 0 0 1.3em; text-wrap: pretty; }
+.brief-body p:last-child { margin-bottom: 0; }
+.brief-body strong { font-weight: 600; }
+.brief-body em { font-style: italic; }
+
+/* A line that was entirely *bold* in the chat rendering is a section header —
+   compose_brief emits them as section titles, so the structure is true. */
+.brief-section {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--accent-text);
+  margin: 2.6em 0 1em;
+}
+.brief-body .brief-section:first-child { margin-top: 0; }
+
+/* fallback data walk */
+.data-walk dl { margin: 0; }
+.data-walk dt {
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin-top: var(--space-5);
+}
+.data-walk dd { margin: 2px 0 0 0; font-size: var(--text-body); overflow-wrap: anywhere; }
+.data-walk ul { margin: var(--space-1) 0; padding-left: 18px; }
+.data-walk li { margin: 3px 0; font-size: var(--text-body); overflow-wrap: anywhere; }
+.data-walk .nested { padding-left: var(--space-3); margin-top: var(--space-1); }
+
+/* ---------- People ---------- */
+
+.search-wrap { margin-bottom: var(--space-4); }
+.search-input {
+  width: 100%;
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  padding: 13px 16px;
+  border-radius: var(--radius-panel);
+  border: none;
+  box-shadow: none;
+  background: var(--panel);
+  color: var(--ink);
+  transition: box-shadow var(--dur-hover) ease;
+}
+.search-input::placeholder { color: var(--ink-faint); font-style: italic; }
+.search-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* person page — the dossier */
+.dossier-head { margin-bottom: 0; }
+.dossier-head h1 {
+  font-family: var(--font-serif);
+  font-size: var(--text-display);
+  font-weight: 700;
+  letter-spacing: -0.024em;
+  line-height: 1.05;
+  margin: 0 0 var(--space-3);
+  text-wrap: balance;
+}
+.dossier-meta {
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.fact-text {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.6;
+  margin: 0 0 var(--space-2);
+  overflow-wrap: anywhere;
+}
+
+/* company dossier — About/News/Context prose on its own panel under the cap */
+.company-prose {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.7;
+  color: var(--ink);
+  background: var(--panel);
+  border-radius: var(--radius-panel);
+  padding: var(--space-5) var(--space-6);
+  margin: 0 0 var(--space-12);
+}
+.company-prose p { margin: 0 0 var(--space-3); overflow-wrap: anywhere; text-wrap: pretty; }
+.company-prose p:last-child { margin-bottom: 0; }
+.company-empty {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-light);
+  background: var(--panel);
+  border-radius: var(--radius-panel);
+  padding: var(--space-5) var(--space-6);
+  margin: 0 0 var(--space-12);
+}
+
+@keyframes fact-flash {
+  0% { background-color: var(--accent-soft); box-shadow: -8px 0 0 var(--accent-soft), 8px 0 0 var(--accent-soft); }
+  100% { background-color: transparent; box-shadow: none; }
+}
+.fact-flash { animation: fact-flash 1.2s var(--ease-out) 1; }
+
+/* Trust is carried by the provenance chips + seen/date meta below each fact —
+   no separate confidence bar (it read as an unexplained decoration). */
+.fact-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--mono-meta);
+  color: var(--ink-muted);
+}
+
+/* inline edit / confirm blocks */
+.edit-block { margin-top: var(--space-2); }
+.edit-textarea {
+  width: 100%;
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--paper-white);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 64px;
+}
+.edit-textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+.edit-select {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-tight);
+  padding: 6px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--paper-white);
+  color: var(--ink-secondary);
+  max-width: 100%;
+}
+.edit-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+/* Single-line form control — the loop's contact/deadline, the snooze date, the
+   rule value. Same border contract as .edit-select (rule inventory item 4), serif
+   for typed prose and mono for a date the browser renders as digits. */
+.edit-input {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  padding: 6px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--paper-white);
+  color: var(--ink);
+  min-width: 0;
+  max-width: 100%;
+}
+.edit-input[type="date"] {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  color: var(--ink-secondary);
+}
+.edit-input::placeholder { color: var(--ink-faint); font-style: italic; }
+.edit-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+/* A mono aside sitting beside a control — why a button is off, what just happened.
+   Never a status colour: the sentence carries the meaning. */
+.row-note {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-muted);
+}
+
+.edit-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}
+
+.confirm-text {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-light);
+  margin: var(--space-2) 0 0;
+}
+
+.inline-error {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  text-transform: uppercase;
+  color: var(--urgent);
+  margin: var(--space-2) 0 0;
+}
+
+.add-fact { padding: var(--space-2) 0; }
+
+details.archived-facts { margin-top: var(--space-3); }
+details.archived-facts summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  padding: var(--space-2) 0;
+  list-style-position: inside;
+}
+details.archived-facts summary:hover { color: var(--accent-text); }
+details.archived-facts .ledger-row { opacity: 0.55; }
+
+/* ---------- Learned ---------- */
+
+/* The voice card: the fingerprint's own summary given a panel of its own, the
+   way a chart panel frames a figure. */
+.voice-prose {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  line-height: 1.5;
+  color: var(--ink-secondary);
+  background: var(--panel);
+  border-radius: var(--radius-panel);
+  padding: var(--space-5) var(--space-6);
+  margin: 0 0 var(--space-3);
+  text-wrap: pretty;
+}
+.voice-prose strong { color: var(--ink); font-weight: 600; }
+.voice-chips { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-6); }
+/* A cap that follows loose (un-panelled) content pays the sectional gap itself —
+   the panel's own bottom margin is what covers every other case. */
+.voice-chips + .ledger-cap,
+.note + .ledger-cap,
+.add-fact + .ledger-cap { margin-top: var(--space-12); }
+
+/* a quiet italic aside — no border decoration, the voice carries it */
+.note {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  line-height: 1.55;
+  color: var(--ink-light);
+  padding: var(--space-1) 0;
+  margin: var(--space-3) 0 var(--space-6);
+  max-width: 52ch;
+}
+
+/* ---------- M3: the docket, research cards, the record ---------- */
+
+/* author display rules on .ledger-row would defeat the hidden attribute
+   (collapsed tomorrow rows, revealed by the "+N more" disclosure) */
+[hidden] { display: none !important; }
+
+/* a lighter sub-label inside a ledger — the TOMORROW break, the record's day
+   folios. A mono label with breathing room; spacing does the separating. */
+.ledger-sub {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  padding: var(--space-6) 0 var(--space-1);
+}
+.ledger-sub:first-child { padding-top: var(--space-2); }
+/* A day label used as a standalone cap ABOVE its own panel (the docket's
+   Tomorrow, the Record's days) carries the sectional gap instead. */
+.ledger + .ledger-sub { padding: 0 0 var(--space-3); }
+.ledger-sub .cap-count { color: var(--ink-faint); font-weight: 500; }
+
+/* attendee names — mono provenance under the meeting title, never uppercase */
+.attendee-line {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-muted);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* one-line docket states: Google absent / a clear day / didn't load */
+.docket-line {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: var(--text-body);
+  color: var(--ink-light);
+  margin: 0;
+  padding: var(--space-4) 0;
+}
+
+/* the "+N more" disclosure row under tomorrow's collapsed meetings */
+.ledger-more {
+  padding: var(--space-1) 0;
+}
+
+/* a folio span that may wrap (research title @ company) — the folio's nowrap
+   would otherwise push long titles off a phone screen */
+.row-folio .folio-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 180px;
+}
+
+/* research card lines: mono label, serif substance */
+.research-line {
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  color: var(--ink-secondary);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+.mini-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin-right: var(--space-2);
+}
+.research-when {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.research-who {   /* the who-they-are line under a meeting: quiet mono, like a folio */
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink-muted);
+}
+a.research-who { text-decoration: none; color: var(--ink-muted); }
+a.research-who:hover { color: var(--accent-text); }
+a.research-src {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  color: var(--ink-muted);
+  text-decoration: none;
+  padding: 0 3px;
+}
+a.research-src:hover { text-decoration: none; color: var(--accent-text); background: var(--accent-muted); border-radius: var(--radius-xs); }
+
+/* the record's window selector — mono links, the served window carries the mark */
+.range-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink-muted);
+  margin-bottom: var(--space-3);
+}
+.range-row .range-label { color: var(--ink-muted); }
+.range-row .sep { color: var(--ink-faint); }
+.range-row a {
+  color: var(--ink-muted);
+  text-decoration: none;
+  padding: 2px 4px;
+  border-bottom: 2px solid transparent;   /* the active marker's rail */
+  transition: color var(--dur-hover) ease, border-color var(--dur-hover) ease;
+}
+.range-row a:hover { color: var(--ink); text-decoration: none; }
+.range-row a:active { color: var(--accent-text); }
+.range-row a[aria-current="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+
+/* ---------- Empty / error / loading — editorial voice, no card chrome ---------- */
+
+.empty-state {
+  padding: var(--space-5) 0 var(--space-6);
+  font-family: var(--font-serif);
+  font-style: italic;
+  line-height: 1.55;
+  color: var(--ink-light);
+  font-size: var(--text-body);
+  max-width: 52ch;
+}
+.empty-state .empty-title {
+  font-style: normal;
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  color: var(--ink);
+  margin-bottom: var(--space-2);
+}
+
+.error-state { text-align: center; padding: var(--space-8) var(--space-5); }
+.error-state p {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--ink-light);
+  margin: 0 0 var(--space-4);
+}
+
+/* skeletons — quiet border-tone pulse */
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.6; }
+}
+.skeleton {
+  background: var(--border);
+  border-radius: var(--radius-sm);
+  animation: skeleton-pulse 1.2s ease-in-out infinite;
+  min-height: 13px;
+}
+.skeleton-card {
+  padding: var(--space-5) 0;
+}
+.skeleton-line { height: 12px; margin-bottom: 10px; }
+.skeleton-line:last-child { margin-bottom: 0; }
+.w-30 { width: 30%; }
+.w-50 { width: 50%; }
+.w-70 { width: 70%; }
+.w-90 { width: 90%; }
+
+/* ---------- Toast — small mono paper slip, bottom center, interruptible ---------- */
+
+.toast-root {
+  position: fixed;
+  left: 0; right: 0;
+  bottom: calc(var(--space-5) + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  z-index: 300;
+  pointer-events: none;
+  padding: 0 var(--space-4);
+}
+.toast {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--ink);
+  background: var(--paper-white);
+  box-shadow: var(--shadow-lg);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-5);
+  max-width: 100%;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 220ms var(--ease-out),
+              transform 220ms var(--ease-out);
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* ---------- Session expired ---------- */
+
+.session-expired {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  background: var(--paper);
+  animation: overlay-in var(--dur-hover) var(--ease-out);
+}
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.session-expired .card { max-width: 380px; text-align: center; padding: var(--space-8) var(--space-6); }
+.session-expired h2 {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin: 0 0 var(--space-2);
+}
+.session-expired p {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--ink-light);
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-body);
+}
+
+.noscript-card { margin-top: var(--space-6); text-align: center; }
+.noscript-card h2 {
+  font-family: var(--font-serif);
+  font-size: var(--text-title);
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.noscript-card p { font-style: italic; color: var(--ink-light); }
+
+/* ---------- Reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .skeleton { animation: none; }
+  .fact-flash { animation: none; }
+  /* row exits still communicate, opacity-only, near-instant via the clamp above */
+}
+
+/* ---------- Wider screens ---------- */
+
+@media (min-width: 640px) {
+  .content { padding: var(--space-12) var(--space-8) calc(var(--space-16) * 1.5); }
+  .row-folio { max-width: 15rem; }
+  .ledger { padding: var(--space-3) var(--space-6); }
+  .ledger-row { padding: var(--space-5) 0; }
+  @media (hover: hover) and (pointer: fine) {
+    a.ledger-row, .ledger-row.pressable {
+      margin: 0 calc(var(--space-4) * -1);
+      padding-left: var(--space-4);
+      padding-right: var(--space-4);
+    }
+  }
+}
+
+@media (min-width: 900px) {
+  .content { padding-top: var(--space-16); }
+}
