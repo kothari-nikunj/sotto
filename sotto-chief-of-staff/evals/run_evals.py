@@ -527,7 +527,7 @@ def _score_live(name: str) -> dict:
         manifest = cb.build_data_manifest(inputs)
         critic = cb.run_critic(out.get("brief_markdown", ""), out.get("actions", []), manifest, gemini_call)
         return {"score": float(critic.get("score", -1)),
-                "model": os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")}
+                "model": os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")}
     finally:
         for k, v in saved.items():
             if v is None:

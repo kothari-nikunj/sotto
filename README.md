@@ -105,7 +105,7 @@ Gemini is the **default**, and it is what the brief pipeline calls today. The ho
 
 - **Briefs, meeting prep, follow-ups, triage** — a `GOOGLE_AI_API_KEY`, full stop: this half is
   deterministic Python posting to Gemini's REST API. It needs a **1M-context model**; default
-  **Gemini 3.6 Flash**, with automatic fallback to `gemini-3-flash-preview` (cheaper, separate
+  **Gemini 3.7 Flash**, with automatic fallback to `gemini-3-flash-preview` (cheaper, separate
   rate-limit bucket, same key) on quota errors. `SOTTO_GEMINI_MODEL` / `SOTTO_FALLBACK_MODEL` pick
   which Gemini model — not which vendor.
 - **The chat layer** (Ask Sotto, nudge replies) — Hermes' model, so Anthropic, OpenAI, Kimi,

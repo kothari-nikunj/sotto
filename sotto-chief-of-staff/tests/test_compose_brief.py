@@ -721,7 +721,7 @@ def test_gemini_fallback_on_429_when_backup_configured(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     out = gemini.call_gemini("p", {})
     assert out == '{"markdown": "ok"}'
-    primary = cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
+    primary = cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
     assert calls[0][0] == primary
     assert calls[1][0] == primary and calls[1][2] == " [retry]"    # bounded primary retry first
     assert calls[2][:2] == ("gemini-2.5-pro", "backup") and calls[2][2] == " [fallback]"  # then backup
@@ -1047,7 +1047,7 @@ def test_default_model_is_gemini_36_flash(monkeypatch):
     for var in ("SOTTO_GEMINI_MODEL", "SOTTO_LLM_STUB", "SOTTO_FALLBACK_MODEL", "SOTTO_FALLBACK_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     gemini.call_gemini("p", {})
-    assert calls == ["gemini-3.6-flash"]
+    assert calls == ["gemini-3.7-flash"]
 
 
 # --- evening followup merge (Sprint 0 #4) --------------------------------------

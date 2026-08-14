@@ -136,7 +136,7 @@ Two layers, and only one of them is switchable without editing a file:
   OpenRouter.** On a **local or existing** Hermes, `model.provider` + that provider's key switches
   Ask Sotto and every nudge reply with zero Sotto changes (the installer leaves your global model
   alone unless you pass `--dedicated`). On the **cloud container**, note that `start.sh` runs
-  `hermes config set model gemini-3.6-flash` on **every** boot, so a config edit is reverted by the
+  `hermes config set model gemini-3.7-flash` on **every** boot, so a config edit is reverted by the
   next redeploy — switching there means editing that one line in your fork. Say so out loud rather
   than promising a knob that isn't there.
 - **Research is independent of both.** `EXA_API_KEY` (search) and `PARALLEL_API_KEY` (deep research)

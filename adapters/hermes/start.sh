@@ -115,8 +115,8 @@ printf '{"running":"%s","image":"%s"}\n' \
 # Brief resilience: default an AUTOMATIC fallback model for the brief's direct Gemini call.
 # compose_brief.py's call_gemini activates the fallback when SOTTO_FALLBACK_MODEL alone is set — it
 # reuses GOOGLE_AI_API_KEY unless SOTTO_FALLBACK_API_KEY is also set — so no second key is needed:
-# a 429/5xx/timeout on gemini-3.6-flash retries on gemini-3-flash-preview (cheaper: $0.50/$3.00 vs
-# $1.50/$7.50 per 1M tokens, and a separate per-model rate-limit bucket). Must be exported BEFORE the
+# a 429/5xx/timeout on gemini-3.7-flash retries on gemini-3-flash-preview (cheaper: $0.50/$3.00 vs
+# $0.75/$3.75 per 1M tokens, and a separate per-model rate-limit bucket). Must be exported BEFORE the
 # receiver starts below so every `hermes -z` brief run inherits it. Override with your own
 # SOTTO_FALLBACK_MODEL (keep it 1M-context — the brief prompt runs 100K–140K chars).
 export SOTTO_FALLBACK_MODEL="${SOTTO_FALLBACK_MODEL:-gemini-3-flash-preview}"
@@ -178,7 +178,7 @@ fi
 # 2) Model + scheduler (dedicated cloud instance → Gemini 1M as the driver too).
 #    Use the NATIVE Gemini model id (not the OpenRouter-style "google/…", which would route via
 #    OpenRouter and need OPENROUTER_API_KEY). The key is set as GEMINI_API_KEY/GOOGLE_API_KEY below.
-hermes config set model gemini-3.6-flash || true
+hermes config set model gemini-3.7-flash || true
 hermes_set_if_supported scheduler.enabled true
 # Timezone — Hermes cron + the system-prompt time injection default to UTC. Set the user's IANA zone so
 # the 6:30/17:30 briefs fire at their LOCAL morning/evening, AND so `hermes cron create` below doesn't
@@ -489,7 +489,7 @@ fi
 # configured model exists — a bad key/model otherwise only surfaces hours later as a silently failed
 # brief. Non-fatal by construction (`|| true` inside the substitution guards set -euo pipefail; 10s cap
 # so a network blip can't stall boot). Exactly one log line either way.
-GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.6-flash}"
+GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.7-flash}"
 if [ -n "$GKEY" ]; then
   GCHECK="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
     "https://generativelanguage.googleapis.com/v1beta/models/${GMODEL}?key=${GKEY}" 2>/dev/null || true)"

@@ -32,7 +32,7 @@ Input  (stdin or argv[1], JSON): { type, window_hours, google, granola, local, p
   local:  the LocalData payload (the 16 sources + intelligence context). Missing fields are treated as empty.
 Output (stdout, JSON): { brief_markdown, actions[], meetings_needing_prep[], extracted_knowledge }
 
-Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3.6-flash).
+Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3.7-flash).
 Test mode: set SOTTO_LLM_STUB=/path/to/response.json to bypass the network and return that file.
 """
 from __future__ import annotations

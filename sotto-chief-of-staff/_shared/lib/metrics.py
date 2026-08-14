@@ -35,14 +35,19 @@ if _HERE not in sys.path:
 
 # ── PRICE TABLE ──────────────────────────────────────────────────────────────────────────────────
 # Per-1,000,000-token USD rates: {model: {"in": <prompt $/1M>, "out": <output $/1M>}}.
-# gemini-3.6-flash (the default): launch rates from Google's July 21, 2026 announcement — $1.50 in /
-# $7.50 out ($0.15 cached input; caching isn't broken out here, so estimates are an upper bound).
+# gemini-3.7-flash (the default): INTRODUCTORY rates from Google's Aug 13, 2026 launch — $0.75 in /
+# $3.75 out through Dec 31, 2026; standard $1.50 / $7.50 applies from Jan 1, 2027. ⚠️ Re-check this
+# entry in Jan 2027 — the table states today's price, it does not schedule the change.
+# gemini-3.6-flash (previous default, kept for SOTTO_GEMINI_MODEL overrides): launch rates from
+# Google's July 21, 2026 announcement — $1.50 in / $7.50 out ($0.15 cached input; caching isn't
+# broken out here, so estimates are an upper bound).
 # gemini-3.5-flash-lite: $0.30 in / $2.50 out (same announcement's pricing page).
 # ⚠️  gemini-3-flash-preview (the brief's automatic fallback) is a preview model with no locked public
 # price yet — $0.50 in / $3.00 out verified 2026-07-06 against Google's Gemini 3 Flash announcement
 # and OpenRouter's listing. Re-check when the model leaves preview. A model NOT in this table yields
 # est=n/a (cost None) — metrics never guesses a price.
 PRICE_TABLE = {
+    "gemini-3.7-flash": {"in": 0.75, "out": 3.75},
     "gemini-3.6-flash": {"in": 1.50, "out": 7.50},
     "gemini-3-flash-preview": {"in": 0.50, "out": 3.00},
     "gemini-3.5-flash-lite": {"in": 0.30, "out": 2.50},

@@ -130,7 +130,7 @@ emails, **~198K** for the pathological ceiling.
 | **Max context vs our biggest call** | 1M — fits everything incl. the 198K ceiling ✅ | 1M — fits everything ✅ | 400K — fits heavy (77K) and the ceiling ✅ | 256K — fits heavy ✅, ceiling fits but tight | 163K — fits heavy (77K) ✅, **ceiling truncates** ⚠️ |
 | **Search story** | **Irrelevant to the model choice now:** sites 4–5 go through the search seam, which answers on `EXA_API_KEY` / `PARALLEL_API_KEY` / `GOOGLE_AI_API_KEY`, whichever is present | No native web search in the pipeline's call shape; Anthropic's server-side web-search tool exists but is not wired here | No native grounding in our call shape | None | None |
 | **Structured JSON for extraction** | `responseSchema` (OpenAPI subset) + `response_mime_type` — used today, strongest guarantee | ⚠️ Sonnet **4.6** is not on Anthropic's structured-outputs model list, and assistant prefill 400s on it — you'd fall back to strict tool use or prompt-only JSON. Sonnet 5 / Opus 4.8+ do support `output_config.format` | `response_format: json_schema` (strict) — equivalent guarantee | JSON mode (`json_object`); strict `json_schema` not guaranteed → validate client-side | JSON mode only, **no** `json_schema`; documented occasional empty-content responses → needs retry + validation |
-| **~$/day at our volumes** *(see §4)* | **$0.36** primary · **$0.13** on the cheaper fallback | **$0.72** | **$0.55** | **$0.21** | **$0.04** |
+| **~$/day at our volumes** *(see §4)* | **$0.18** primary (3.7 Flash intro rates through Dec 31, 2026; $0.36 at 2027 standard rates) · **$0.13** on the cheaper fallback | **$0.72** | **$0.55** | **$0.21** | **$0.04** |
 | **TTS impact** | none | none | none | none | none |
 | **THE GAP — pipeline (sites 1–3, 6–8)** | — (works) | Needs an `anthropic_messages` client beside `call_gemini`: different auth header, `system` as a top-level field, `content[].text` response shape, `usage.input_tokens`, and a schema story (see above) | Needs an OpenAI-compatible client: base URL + `Authorization: Bearer`, `messages[]`, `choices[0].message.content`, `usage.prompt_tokens` | same as GPT-5.2 | same as GPT-5.2 |
 | **THE GAP — research (sites 4–5)** | — (works) | **None, as of the search seam.** Set `EXA_API_KEY` (search) and/or `PARALLEL_API_KEY` (deep research) and sites 4–5 run with no Gemini key at all; unset, they fall back to Gemini grounding as before | same | same | same |
@@ -202,7 +202,7 @@ briefs** — those are `execute_code` Python calling Gemini's REST endpoint with
 and they neither know nor care what the chat model is.
 
 **One caveat, and it is a real one on the cloud container:** `adapters/hermes/start.sh` runs
-`hermes config set model gemini-3.6-flash` **on every boot** (and routes every auxiliary task to
+`hermes config set model gemini-3.7-flash` **on every boot** (and routes every auxiliary task to
 `main`), so one key covers everything out of the box — but it also means a `config.yaml` edit is
 reverted by the next redeploy. On Railway, switching the chat model is a one-line edit to that file
 in your fork, not a config change. On a **local or pre-existing** Hermes it genuinely is config only:

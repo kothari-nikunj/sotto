@@ -44,7 +44,7 @@ command -v hermes >/dev/null 2>&1 || {
 #    GEMINI_API_KEY/GOOGLE_API_KEY.
 DEDICATED=0
 for a in "$@"; do [ "$a" = "--dedicated" ] && DEDICATED=1; done
-[ "$DEDICATED" -eq 1 ] && run hermes config set model gemini-3.6-flash \
+[ "$DEDICATED" -eq 1 ] && run hermes config set model gemini-3.7-flash \
   || echo "! Leaving the global model untouched (brief uses Gemini via compose_brief.py + GOOGLE_AI_API_KEY)."
 # scheduler.enabled: Hermes v0.20 dropped the key and warns on it — probe with `config get` and set
 # only where supported. (hermes-missing is dry-run only — the guard above exits otherwise — so keep

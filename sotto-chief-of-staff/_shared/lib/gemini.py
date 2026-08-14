@@ -156,7 +156,7 @@ def call_gemini(prompt: str, inputs: dict, system: str | None = None, schema: di
     key = os.environ.get("GOOGLE_AI_API_KEY")
     if not key:
         raise RuntimeError("GOOGLE_AI_API_KEY not set (or use SOTTO_LLM_STUB for offline)")
-    model = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
+    model = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
     # SOTTO_FALLBACK_MODEL: unset → default to gemini-3-flash-preview (1M context, priced in
     # metrics.PRICE_TABLE as "the brief's automatic fallback"); set to "" → fallback DISABLED
     # (the explicit off switch); any other value overrides the default.

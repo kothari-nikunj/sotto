@@ -64,7 +64,7 @@ Output (--out file + stdout): {"attendees":[{email,title,company,relevance[],sum
 Degradation ladder per attendee: person profile → company profile (corporate domains always get a
 company_summary attempt) → truly nothing (freemail + unsearchable name only).
 Env: one of EXA_API_KEY / PARALLEL_API_KEY / GOOGLE_AI_API_KEY (no key at all = no research, said
-     out loud in the log, never invented), SOTTO_GEMINI_MODEL (default gemini-3.6-flash),
+     out loud in the log, never invented), SOTTO_GEMINI_MODEL (default gemini-3.7-flash),
      SOTTO_RESEARCH_DEEP=0 disables Pass B AND the focus pass; the recency window is the named
      constant DEFAULT_RECENCY_DAYS (90), not a knob.
 Test: SOTTO_LLM_STUB=/path/to/{"attendees":[...]}.json bypasses the network.
@@ -93,7 +93,7 @@ from timeutil import _now_local, _parse_ts, _user_local_date, configured_tz  # n
 from render_local import RESEARCH_HORIZON_HOURS  # noqa: E402
 import web_research as wr  # noqa: E402  (THE search seam: the provider ladder lives there)
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.6-flash")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
 MAX_ATTENDEES = 25
 BATCH_SIZE = 5
 PER_BATCH_TIMEOUT = 60
