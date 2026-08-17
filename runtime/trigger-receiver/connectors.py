@@ -506,6 +506,23 @@ def service_status() -> list[dict]:
     return out
 
 
+def disconnect(service: str) -> dict:
+    """Forget a connected service: delete its TOKEN file (the credential) and the gather-written
+    `.error` marker. The DCR client registration and discovery cache stay — they hold no user
+    credential and make a later reconnect one click. Nothing to delete is a success (the forget.py
+    posture): disconnecting twice is not an error."""
+    removed = []
+    for p in (token_path(service), os.path.join(_connectors_dir(), f"{service}.error")):
+        try:
+            os.unlink(p)
+            removed.append(os.path.basename(p))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return {"service": service, "removed": removed}
+
+
 def key_provider_status() -> list[dict]:
     """One row per key-based provider for the same Connections tile. Presence of the credential is
     the whole test — the identical rule `web_research.provider_chain` applies, so this page can

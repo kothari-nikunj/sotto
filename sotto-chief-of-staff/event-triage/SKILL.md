@@ -125,6 +125,24 @@ looking for more events, and do not re-triage.
    - The bundle's event is the LATEST channel; the earlier one is named in the `why` and is not
      re-fetched — don't go looking for it. Draft on the channel that just arrived, unless a missed
      call makes a callback the obvious move.
+3d. **Class `calendar_change` — the imminent calendar shifted; say the change, then be useful.**
+   The event is synthetic (`source: "calendar_change"`, carrying `change` (declined | invited |
+   moved | cancelled), `summary`, `start`, `old_start`, `who`, `attendees:[{name,email}]`, and a
+   ready `text` sentence) — the receiver's calendar watcher noticed the diff on its 15-min tick.
+   There is no inbound message: the nudge is the change plus ONE useful next thing, and it reads
+   like a text — no event IDs, no calendar URLs, plain chat.
+   - **declined** — lead with the `text` ("Ali Panju just declined your 11:00 AM"). Add ONE short
+     reschedule draft in the user's voice to the decliner ("Sorry to miss you this morning — want
+     to grab time later this week?") and hand it over per step 4 (email attendee → the Gmail-draft
+     ask; phone → tap link). Draft only — never touch the calendar.
+   - **invited** — "Last-minute: <title> at <time> with <name>." Read `cache/calendar_today.json`
+     and say the one thing they'd check: "conflicts with your 11:00" or "you're free." A conflict
+     earns the decline draft per the scheduling rules; no conflict earns nothing extra.
+   - **moved** — one line, old time → new time; name a collision if the new slot creates one.
+   - **cancelled** — one line. If `loops_query.py` shows an open loop with an attendee, add that
+     the freed slot is a chance to close it; otherwise just the fact.
+   - Ground ONLY in the bundle + the calendar cache + the graph — never invent WHY something
+     changed, and never speculate about the decliner's reasons.
 
 4. **Draft the reply in the user's voice** (this is what makes the nudge actionable, not just noisy):
    - `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/style_apply.py" '{"recipient":…,"channel":…,"canonical_id":…}'`

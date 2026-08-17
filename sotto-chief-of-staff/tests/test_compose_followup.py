@@ -26,9 +26,32 @@ def test_recent_ended_filters_window_and_requires_body():
     assert titles == {"Yesterday", "Notes only"}
 
 
+def test_context_layers_notes_summary_then_transcript():
+    # Structure over volume: the transcript used to REPLACE notes+summary, drowning the two most
+    # distilled signals (the user's own notes; Granola's summary, which already lists action items)
+    # exactly when a transcript existed. All three layers render, most-distilled first, under the
+    # exact markers the prompt's "distilled first, verified always" rule names.
+    meetings = [{"title": "Acme Sync", "date": _iso(2),
+                 "your_notes": "push on pricing",
+                 "ai_summary": "Action items: send deck to Sarah.",
+                 "transcript": "hello " * 10 + "I'll send the deck tomorrow"}]
+    ctx, ended = cf.build_context({"granola": meetings, "local": {}}, 36)
+    assert len(ended) == 1
+    ni, si, ti = ctx.index("[your notes]:"), ctx.index("[summary]:"), ctx.index("[transcript]:")
+    assert ni < si < ti                                   # distilled first
+    assert "push on pricing" in ctx and "send deck to Sarah" in ctx
+    assert "I'll send the deck tomorrow" in ctx           # transcript still present, last
+    # A long transcript keeps its TAIL — commitments cluster at the end.
+    meetings[0]["transcript"] = ("early filler. " * 20000) + "THE ENDING COMMITMENT"
+    ctx, _ = cf.build_context({"granola": meetings, "local": {}}, 36)
+    assert "THE ENDING COMMITMENT" in ctx
+    assert len(ctx) < cf.TRANSCRIPT_CHAR_CAP + 5000       # capped, not the whole 260K chars
+
+
 def test_compose_no_meetings_short_circuits():
     out = cf.compose({"granola": [], "local": {}, "google": {"events": []}}, since_hours=36)
     assert out["commitments"] == [] and out["drafts"] == []
+    assert cf._normalize({})["procedural_candidates"] == []   # the key always exists downstream
     assert "Nothing to follow up" in out["followup_markdown"]
 
 

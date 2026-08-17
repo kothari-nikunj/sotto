@@ -804,6 +804,8 @@ def _handle_api(h, path: str):
             return _json(h, 200, obj) if obj is not None else _json(h, 404, {"error": "not found"})
         if path == "/api/learned":
             return _json(h, 200, api_learned())
+        if path == "/api/master":
+            return _json(h, 200, api_master())
         if path == "/api/cadence":
             return _json(h, 200, api_cadence())
         if path == "/api/graph":
@@ -1196,6 +1198,51 @@ def api_person(slug: str):
                                "muted": _listed("mute_people"), "vip": _listed("vip_people")}
         return out
     return None
+
+
+# The master memory file's size cap — MUST equal master_file.MASTER_CHAR_CAP in the skills tree
+# (the receiver image can't import it; tests/test_master_file.py pins the agreement). The GET below
+# is a READ-ONLY window; the POST shells out to master_file.py, the one writer.
+MASTER_CHAR_CAP = 8000
+_MASTER_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+
+def api_master() -> dict:
+    """GET /api/master — knowledge/master.md as sections, for the Learned page's standing-file
+    card. Same read-only-window posture as the people index: parsing here, writing never."""
+    try:
+        with open(os.path.join(_root(), "knowledge", "master.md"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    parts = _MASTER_HEADING_RE.split(text)
+    sections = [{"name": parts[i], "text": parts[i + 1].strip("\n")}
+                for i in range(1, len(parts) - 1, 2)]
+    return {"present": bool(text.strip()), "preamble": (parts[0].strip("\n") if parts else ""),
+            "sections": sections, "chars": len(text), "cap": MASTER_CHAR_CAP}
+
+
+def _post_master(h, body: dict):
+    """POST /api/master {op: set|append|remove, section, text?} — through the skills tree's
+    master_file.py (the ONE writer: same lock, same cap, same file a chat capture writes), under
+    the single subprocess policy every dashboard write uses. Skills tree absent → 503."""
+    op = _s(body.get("op"))
+    section = _clean_text(body.get("section"), 80)
+    if op not in ("set", "append", "remove") or not section:
+        return _json(h, 400, {"error": "op must be set|append|remove, with a section"})
+    args = [op, "--section", section]
+    if op != "remove":
+        text = _clean_text(body.get("text"), MASTER_CHAR_CAP)
+        if not text:
+            return _json(h, 400, {"error": "text required (use op:remove to delete a section)"})
+        args += ["--text", text]
+    result = _run_skill_cli(("_shared", "knowledge", "master_file.py"), args, "master_file")
+    if result is None:
+        return _json(h, 503, {"error": "the skills tree isn't on this box — edit via chat instead"})
+    if not result.get("ok"):
+        return _edit_failure(h, result)
+    _audit("write", endpoint="/api/master", target=section[:200], op=op)
+    return _json(h, 200, api_master())
 
 
 def api_learned() -> dict:
@@ -1856,6 +1903,8 @@ def _handle_api_post(h, path: str):
             return _post_loops(h, body)
         if path == "/api/prefs":
             return _post_prefs(h, body)
+        if path == "/api/master":
+            return _post_master(h, body)
         if path == "/api/cadence":
             return _post_cadence(h, body)
         if path == "/api/graph":

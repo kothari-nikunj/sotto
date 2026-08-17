@@ -248,18 +248,26 @@ PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting
 # post-meeting tap has its OWN daily cap (SOTTO_TAP_MAX_PER_DAY, default 3, enforced exactly-once at
 # dispatch in calcache.tap_tick via meeting_taps.json). The rule in one sentence: interrupts spend
 # the daily budget (4/day), post-meeting taps have their own cap (3/day), neither eats the other.
-BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting"})
+# "calendar_change" (a decline, a last-minute invite, a move, a cancellation of an imminent
+# meeting) is exempt because it EXPIRES with the meeting: it is rare, per-change deduped at the
+# source (calcache's baseline + the receiver's seen-ring), and a spent budget must not silence
+# "Ali declined your 11am" at 10:40.
+BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change"})
 # The in-meeting hold exempts LESS than the budget does: a missed call or a multi-channel escalation
 # is precisely what should reach you mid-meeting, but a tap that fires while you're in your NEXT
 # meeting must still hold (that's the back-to-back case the valve promotes out of). So this is
 # deliberately its own set, not an alias of BUDGET_EXEMPT_CLASSES — taps are hold-able but
 # budget-free.
-MEETING_HOLD_EXEMPT_CLASSES = frozenset({"missed_call", "escalation"})
+# A calendar change is about the user's IMMINENT schedule — the meeting they're in is exactly when
+# "your next one just moved/was declined" is most worth knowing, so it joins the mid-meeting set.
+MEETING_HOLD_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "calendar_change"})
 # The per-thread cooldown exempts ONLY the escalation join — deliberately NOT aliased to the budget
 # set. A missed call still respects its thread's cooldown (three calls in ten minutes is one nudge),
 # but an escalation is defined by a SECOND channel arriving inside the window, which is precisely
 # when the first message's cooldown stamp would otherwise swallow it.
-COOLDOWN_EXEMPT_CLASSES = frozenset({"escalation"})
+# "calendar_change" carries no conversation thread — its rowid is unique per change, so a thread
+# cooldown could only ever misfire (two different changes sharing an empty key), never protect.
+COOLDOWN_EXEMPT_CLASSES = frozenset({"escalation", "calendar_change"})
 
 # ── Real-time escalation join (Editor Step 2 item 4) ───────────────────────────────────────────────
 ESCALATION_CLASS = "escalation"
@@ -285,6 +293,9 @@ ESCALATION_VERBS = {"calls": "called", "email": "emailed", "imessage": "texted",
 # The post-meeting tap's synthetic event: the `source` string IS the contract with calcache.py
 # (runtime/trigger-receiver/calcache.MEETING_END_SOURCE). Nothing else in the funnel emits it.
 MEETING_END_SOURCE = "meeting_end"
+# The calendar-diff nudge's synthetic event: the `source` string IS the contract with
+# runtime/trigger-receiver/calcache.CALENDAR_CHANGE_SOURCE. Nothing else in the funnel emits it.
+CALENDAR_CHANGE_SOURCE = "calendar_change"
 # The proactive watcher's synthetic event: the `source` string IS the contract with
 # proactive_scan._proactive_event, the one adapter between the watcher's nudge shape and this
 # funnel. A chase/birthday/commitment nudge is Sotto talking, not a person.
@@ -293,7 +304,7 @@ PROACTIVE_SOURCE = "proactive"
 # nudge) is never evidence that a person reached you; neither is the user's own outbound, whose
 # recorded sender is the person they wrote TO. Both would manufacture a cross-channel escalation
 # out of one real message — the loudest nudge Sotto can send, on the strength of its own voice.
-NON_EVIDENCE_SOURCES = frozenset({MEETING_END_SOURCE, PROACTIVE_SOURCE})
+NON_EVIDENCE_SOURCES = frozenset({MEETING_END_SOURCE, PROACTIVE_SOURCE, CALENDAR_CHANGE_SOURCE})
 NON_EVIDENCE_CLASSES = frozenset({"signal"})
 
 # ── The shared calendar cache (written by runtime/trigger-receiver/calcache.py) ────────────────────
@@ -605,6 +616,27 @@ def _graph_knows(name: str, ident: str) -> bool:
         return bool(knowledge.find_person_file(name=name or "", identifier=ident or ""))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _graph_display_name(ident: str) -> str:
+    """The graph's display name for an identifier the snapshot's contacts couldn't resolve, or "".
+    Prewarm seeds person files (keyed by handle/JID/email) for exactly the people the user messages
+    most — so this answers precisely when a thin snapshot has blinded contact resolution. Without
+    it, a starved snapshot made EVERY text an "unknown sender 1:1" and message nudges went to zero
+    (Aug 2026) while the graph knew the sender all along."""
+    if not _s(ident):
+        return ""
+    try:
+        import knowledge  # noqa: PLC0415  (_shared/knowledge, already on sys.path)
+        path = knowledge.find_person_file(identifier=ident)
+        if not path:
+            return ""
+        with open(path, encoding="utf-8") as f:
+            p = knowledge.parse_person_file(f.read())
+        name = _s(getattr(p, "name", ""))
+        return name if _is_known_name(name) else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -> bool:
@@ -1175,6 +1207,25 @@ def _classify_meeting_end(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     return "agent", "post_meeting", reason, who
 
 
+def _classify_calendar_change(e: dict, ctx: dict) -> tuple[str, str, str, str]:
+    """Tier 0 for a `calendar_change` event (a decline / last-minute invite / move / cancellation
+    of an imminent meeting — calcache's diff tick). No Tier-1 call: the calendar already told us
+    this is real and imminent, which is the whole judgment. Snooze and quiet hours still hold it
+    (the clock outranks everything the user didn't ask for); a muted person's decline is dropped
+    like their messages are. Downstream, the class is exempt from the budget, the in-meeting hold
+    and the cooldown — a change expires with the meeting it's about."""
+    who = _s(e.get("who"))
+    reason = _s(e.get("text")) or f"calendar change: {_s(e.get('summary'))}"
+    if who and any(_s(who).strip().lower() == _s(m).strip().lower()
+                   for m in ctx["prefs"]["mute_people"]):
+        return "drop", "muted", f"muted person {who}", who
+    if ctx["snoozed"]:
+        return "queue", "snoozed", f"nudges snoozed until {ctx['snooze_until']} — {reason}", who
+    if ctx["quiet"]:
+        return "queue", "quiet", f"quiet hours — {reason}", who
+    return "agent", "calendar_change", reason, who
+
+
 # ── The per-event decision ─────────────────────────────────────────────────────────────────────────
 
 def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
@@ -1194,6 +1245,9 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     #     Same reason it comes first: it is not a message from anyone.
     if src == PROACTIVE_SOURCE:
         return _classify_proactive(e, ctx)
+    # 0c) A change to the imminent calendar (calcache's diff tick) — same reason again.
+    if src == CALENDAR_CHANGE_SOURCE:
+        return _classify_calendar_change(e, ctx)
     name, ident = _resolve_sender(e, ctx["lookup"])
 
     # 1) The user's own outbound — a loop-closing signal for deterministic resolution, never a nudge.
@@ -1251,8 +1305,19 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
         return "queue", "group", "group message without a name-mention", name
 
     # 7) Unknown non-VIP 1:1 never reaches the agent (VIP requires being known, by construction).
-    known = (bool(ctx["lookup"].get(ident)) or _graph_knows(name, ident)) if src == "email" \
-        else _is_known_name(name)
+    #    The graph is the fallback identity source on EVERY channel, not just email: the snapshot's
+    #    contacts can come back thin (the recurring "raw phone numbers" failure), and when it does,
+    #    contacts-only knownness turns every text into "unknown sender 1:1" — zero message nudges
+    #    while the graph knew the sender all along (Aug 2026). A graph hit also SUPPLIES the name,
+    #    so the nudge says who it is instead of a formatted number.
+    if src == "email":
+        known = bool(ctx["lookup"].get(ident)) or _graph_knows(name, ident)
+    else:
+        known = _is_known_name(name)
+        if not known:
+            gname = _graph_display_name(ident)
+            if gname:
+                name, known = gname, True
     if not known and not group:
         return "queue", "unknown", "unknown sender 1:1", name
 
@@ -1296,6 +1361,18 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
     ctx["snoozed"] = _snoozed(ctx["prefs"], now_local)
     ctx["lookup"] = build_contact_lookup(ctx["snapshot"].get("contacts")
                                          if isinstance(ctx["snapshot"].get("contacts"), list) else [])
+    # A source that breaks must SAY so: an empty contact lookup with message events in the batch
+    # means name resolution is running blind (thin/absent snapshot) — the graph fallback in gate 7
+    # still resolves the people Sotto knows, but the log must name the degradation, because from
+    # the outside it looks identical to "everyone who texted today was a stranger".
+    if not ctx["lookup"] and any(_s(e.get("source")) in ("imessage", "whatsapp", "calls")
+                                 for e in events):
+        try:
+            from sotto_log import diag  # noqa: PLC0415
+            diag("[triage] WARNING: snapshot has 0 contacts — sender resolution degraded to the "
+                 "knowledge graph only. Check the Bridge pull / last_local_snapshot.json.")
+        except Exception:  # noqa: BLE001
+            pass
     now_ts = time.time()
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)

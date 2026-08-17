@@ -149,12 +149,22 @@ class McpClient:
         return tools if isinstance(tools, list) else []
 
     def call_tool(self, name: str, arguments: dict | None = None, timeout: int = 60):
-        """Call a tool; return its first text content item JSON-decoded when possible (else the
-        raw text, else the raw content list) — the same extraction the Mac's granola-mcp.ts does."""
+        """Call a tool; return `structuredContent` when the server provides one, else the first
+        text content item JSON-decoded when possible (else the raw text, else the raw content list —
+        the extraction the Mac's granola-mcp.ts does).
+
+        structuredContent (MCP spec 2025-06-18) is the machine-readable result for tools that
+        declare an outputSchema — and servers that adopt it tend to turn `content[].text` into
+        PROSE for LLM chat clients at the same time. That is exactly what silenced the Granola
+        gather (Aug 2026): list_meetings started answering prose, the text lane returned a str,
+        and every brief read 0 meetings. A deterministic client must prefer the structured lane."""
         result = self._request("tools/call", {"name": name, "arguments": arguments or {}},
                                timeout=timeout) or {}
         if result.get("isError"):
             raise McpError(f"tool {name} returned an error: {json.dumps(result.get('content'))[:300]}")
+        structured = result.get("structuredContent")
+        if isinstance(structured, (dict, list)):
+            return structured
         content = result.get("content")
         if isinstance(content, list):
             for item in content:

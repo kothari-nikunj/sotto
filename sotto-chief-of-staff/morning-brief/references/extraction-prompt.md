@@ -486,6 +486,7 @@ EVENING briefs only: anything in the **Already Nudged Today** section below was 
 
 {{source_availability}}
 
+{{master_context}}
 {{user_preferences}}
 {{first_run_note}}
 ## Context Signals (PRE-COMPUTED - use for priority decisions)

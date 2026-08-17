@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402
 
-KINDS = ("meeting_prep", "commitment", "chase", "handoff", "retune_offer")
+KINDS = ("meeting_prep", "commitment", "chase", "handoff", "retune_offer", "procedure")
 DEFAULT_TTL_MIN = 180   # a question goes stale in three hours; a named constant, not a knob
 
 

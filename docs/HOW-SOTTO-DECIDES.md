@@ -14,7 +14,9 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
 - **Email** — the container polls Gmail itself every `SOTTO_EMAIL_POLL_SECS` (default 90s) and feeds
   new mail through the same endpoint. No Mac needed.
 - **Calendar** — a background thread refreshes today's events every `SOTTO_CALENDAR_REFRESH_SECS`
-  (default 15 min). It powers the in-meeting hold and detects meetings that just ended.
+  (default 15 min). It powers the in-meeting hold, detects meetings that just ended, and **diffs
+  each refresh against the last** to catch what changed about the imminent calendar: a decline, a
+  last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables).
 
 Every event is deduped by `(source, rowid)` and then runs through **one** funnel, synchronously.
 There is no second nudge path, and that is now structural rather than a matter of discipline: the
@@ -36,6 +38,7 @@ is a table lookup, not a code search.
 | **Gmail poll** (inbound email) | `receiver._poll_gmail_once` — every `SOTTO_EMAIL_POLL_SECS` | the same `handle_events` → `triage_event.triage` path; email is not a separate lane |
 | **Release valve** (something held earlier, let out now) | `receiver._valve_tick` — every 15 min (`receiver.VALVE_INTERVAL_SECS_DEFAULT`) | `triage_event.release_valve` — re-checks class, sender, age and cooldown, then spends the budget like any nudge |
 | **Post-meeting tap** (a meeting just ended) | `calcache.tap_tick` → `receiver._dispatch_meeting_tap` | `triage_event.triage` as an ordinary event, classified `post_meeting` — its own daily cap, exempt from the interrupt budget |
+| **Calendar diff** (a decline · a last-minute invite · a move · a cancellation of an imminent meeting) | `calcache.change_tick` — the same refresh tick as the tap | `triage_event.triage` as a `calendar_change` event — snooze, quiet hours and mutes still hold it; exempt from the budget, the in-meeting hold and the cooldown, because a change expires with the meeting it's about (per-change deduped at the source) |
 | **Proactive watcher** (meeting prep · commitment · chase · birthday · handoff · retune offer) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
 | **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses, spending exactly one budget unit |
 
@@ -45,7 +48,9 @@ is a table lookup, not a code search.
 
 1. a meeting that just ended → the *post-meeting tap* (below); a nudge the watcher planned → its
    own kind (a birthday, something you're owed), held by the snooze then quiet hours then a mute,
-   and then through every gate the rest of this list ends in;
+   and then through every gate the rest of this list ends in; a *calendar change* (a decline, a
+   last-minute invite, a move, a cancellation of an imminent meeting) → **nudge**, held only by
+   the snooze, quiet hours, and a muted person;
 2. your own outbound → queued as a `signal` (ledger fodder, never a nudge);
 3. an answered or outgoing call → dropped; a missed call from someone you know → **nudge**; from an
    unknown number → queued;
@@ -53,7 +58,10 @@ is a table lookup, not a code search.
 5. from a muted sender or muted person → dropped;
 6. inside an active snooze → queued; inside quiet hours → queued;
 7. a group message that doesn't name you → queued;
-8. an unknown non-VIP 1:1 → queued (never a nudge);
+8. an unknown non-VIP 1:1 → queued (never a nudge). **Known, on every channel,** means your
+   Contacts resolved a real name **or the knowledge graph has a person file for the sender** — the
+   graph fallback exists because a thin contacts snapshot must not turn everyone who texts you
+   into a stranger, and a graph hit also supplies the name the nudge uses;
 9. anything with no text to judge → queued.
 
 **Tier 1 is one cheap LLM call** (`SOTTO_TRIAGE_MODEL`) on whatever survives: the event text plus a
@@ -67,12 +75,14 @@ queues** — the funnel fails toward silence, never toward noise.
   day, counting the proactive watcher's; beyond it, nudge-worthy events queue with class `budget`.
   The unit is a **message**, not an event: a batch of arrivals is one nudge and costs one unit, and
   so does the watcher's whole push.
-- **The honest version of that sentence** — the budget covers *everything except three exempt
+- **The honest version of that sentence** — the budget covers *everything except four exempt
   classes, which are uncapped*: missed calls (at most one per thread per
   `SOTTO_EVENT_COOLDOWN_MIN`) and cross-channel escalations (at most one per person per
-  escalation window) have no daily ceiling at all, and post-meeting taps have their own
-  (3/day). So a worst-case busy day is: 4 budgeted interrupts + 3 taps + however many missed calls
-  and escalations the day actually contains + the midday digest + your two briefs.
+  escalation window) have no daily ceiling at all, post-meeting taps have their own
+  (3/day), and calendar changes are bounded only by your calendar actually changing (each distinct
+  change nudges once, ever). So a worst-case busy day is: 4 budgeted interrupts + 3 taps + however
+  many missed calls, escalations and calendar changes the day actually contains + the midday digest
+  + your two briefs.
 - **Post-meeting taps have their own cap** — at most `SOTTO_TAP_MAX_PER_DAY` (default 3) per local
   day. Taps do not spend the interrupt budget and interrupts do not spend the tap cap: **neither
   eats the other.**
@@ -170,7 +180,7 @@ queues** — the funnel fails toward silence, never toward noise.
 | | When | What |
 |---|---|---|
 | Morning brief | 6:30 local (or the moment your Mac wakes past 7am) | your day across messages, email, calendar, plus open loops |
-| Evening brief | 17:30 local | accountability, tomorrow, post-meeting follow-up drafts, and a **What moved today** block — chases delivered, loops closed, interruptions held, people prepped, follow-ups offered, named where the record has a name. Outcomes only; nothing moved means no block, and it will never tell you how many emails it read |
+| Evening brief | 17:30 local | accountability, tomorrow, post-meeting follow-up drafts, and a **What moved today** block — chases delivered, loops closed, interruptions held, people prepped, follow-ups offered, named where the record has a name. Outcomes only; nothing moved means no block, and it will never tell you how many emails it read. Plus at most one *"make that a standing rule?"* confirmation when today's transcripts showed you stating one — your yes writes it to the master file; it is never written unconfirmed |
 | Midday digest | 12:30 local | everything queued **since the last delivered brief** — and only if there are at least `SOTTO_DIGEST_MIN` (default 8) real signals from people you know; otherwise silent. Nudges Sotto raised itself never count toward that 8 (they aren't people), though they may ride along in the message |
 | Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself), every other channel gets a one-tap link |
 | Proactive nudges | a meeting starting in ~45 min you haven't prepped, a commitment due today, one chase for something you're owed, a birthday (`SOTTO_BIRTHDAY_LEAD_DAYS`, default 3, days out and on the day — unless a brief already delivered today), a plain question about an ask nobody answered twice, an offer to tidy a heavy pile | the same thing — and the whole push spends **one** unit of the same daily budget, queues to the same digest when it's gone, waits out the same mutes and in-meeting hold, and lands in the same ledger |

@@ -374,6 +374,27 @@ def test_contacts_carry_forward_on_thin_pull(tmp_path):
     del os.environ["SOTTO_DATA"]
 
 
+def test_carry_forward_reaches_the_live_run_not_just_the_file(tmp_path):
+    # The symptom is LIVE: the brief being composed right now must see the carried contacts, or a
+    # thin pull still renders "+1 (973) 985-7448" group labels while the snapshot quietly heals —
+    # exactly the recurring report. _save_local_snapshot returns the healed copy; callers compose
+    # from it.
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    cb._save_local_snapshot({"contacts": [{"name": "Sarah", "phones": ["+15551234567"]}],
+                             "generated_at": _recent_stamp(2)})
+    healed = cb._save_local_snapshot({"imessage": [{"text": "new msg", "is_from_me": False,
+                                                    "timestamp": _recent_stamp(1)}],
+                                      "generated_at": _recent_stamp(1)})
+    assert any(c.get("name") == "Sarah" for c in healed["contacts"])          # live copy healed
+    # The disabled CHOICE is honored in the live copy too — no contacts revive in today's brief.
+    dropped = cb._save_local_snapshot({"imessage": [{"text": "x", "is_from_me": False,
+                                                     "timestamp": _recent_stamp(1)}],
+                                       "generated_at": _recent_stamp(1),
+                                       "source_status": {"contacts": "disabled"}})
+    assert not dropped.get("contacts")
+    del os.environ["SOTTO_DATA"]
+
+
 def test_contacts_are_not_carried_forward_when_the_source_is_disabled(tmp_path):
     # A thin pull and a SWITCHED-OFF source look identical in the payload (no contacts) and must not
     # be treated alike: `source_status.contacts == "disabled"` is the user's choice, and carrying

@@ -67,6 +67,8 @@ PROMPT_PATH = os.path.join(_HERE, "..", "references", "meeting-prep-prompt.md")
 MAX_THREAD_LINES = 3     # email exchanges from --attendee-comms
 MAX_TEXT_LINES = 2       # iMessage/WhatsApp messages mined from --local
 MAX_PRIVATE_LINES = 6    # hard cap on thread: + text: + loop: lines combined
+PAST_TRANSCRIPT_CHAR_CAP = 30_000   # per past meeting, tail kept — see _granola_for_emails
+PAST_NOTES_CHAR_CAP = 2_000
 
 
 # The prompt file carries BOTH output variants, each fenced by marker comments: the calendar-wide
@@ -124,13 +126,24 @@ def _granola_for_emails(granola_meetings: list, emails: set) -> list:
     for m in granola_meetings:
         ae = {_s(e).lower().strip() for e in (m.get("attendee_emails") or [])}
         if ae & emails:
-            # Prefer the full TRANSCRIPT (richer — carries what was decided/committed) when the skill
-            # fetched it; fall back to the AI summary / your notes. Larger cap for transcripts.
+            # Distilled first, same rule as the followup composer: the user's own notes, then
+            # Granola's summary (what was decided, usually with the action items already), then a
+            # transcript TAIL as the evidence record — decisions and next steps cluster at the end.
+            # The transcript used to replace the notes/summary entirely, which drowned the two most
+            # concentrated signals in raw speech. Up to 3 past meetings feed a prep, so the caps
+            # are per-meeting (30K chars ≈ 45 min of speech vs the old 3,500 ≈ 4 min).
+            segs = []
+            notes = _s(m.get("your_notes")).strip()
+            summary = _s(m.get("ai_summary")).strip()
             transcript = _s(m.get("transcript"))
-            body = transcript[:3500] if transcript else _s(m.get("ai_summary") or m.get("your_notes"))[:1200]
-            if body:
-                src = "transcript" if transcript else "notes"
-                hits.append(f"- {_s(m.get('title'))} ({_s(m.get('date'))}) [{src}]: {body}")
+            if notes:
+                segs.append(f"[your notes]: {notes[:PAST_NOTES_CHAR_CAP]}")
+            if summary:
+                segs.append(f"[summary]: {summary[:PAST_NOTES_CHAR_CAP]}")
+            if transcript:
+                segs.append(f"[transcript tail]: {transcript[-PAST_TRANSCRIPT_CHAR_CAP:]}")
+            if segs:
+                hits.append(f"- {_s(m.get('title'))} ({_s(m.get('date'))}) " + " ".join(segs))
     return hits[:3]
 
 
@@ -492,6 +505,19 @@ def build_context(inputs: dict) -> tuple[str, list]:
     return "\n\n".join(([focus_note] if focus_note else []) + blocks), meetings_out
 
 
+def _master_context() -> str:
+    """knowledge/master.md via its one owner module — the same always-in-context block the brief
+    gets, so prep resolves partners/priorities/procedures the same way. Absent file → ''."""
+    try:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "knowledge")
+        if base not in sys.path:
+            sys.path.insert(0, base)
+        import master_file  # noqa: PLC0415
+        return master_file.render_for_prompt()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def build_prompt(template: str, inputs: dict) -> tuple[str, list]:
     google = _obj(inputs, "google")
     events = _arr(google, "events")
@@ -499,6 +525,7 @@ def build_prompt(template: str, inputs: dict) -> tuple[str, list]:
     context, meetings = build_context(inputs)
     fields = {
         "meetings_context": context or "(no upcoming meetings with external attendees)",
+        "master_context": _master_context(),
         "user_timezone": tz or "(unknown)",
         "user_today": _user_local_date(tz),
     }

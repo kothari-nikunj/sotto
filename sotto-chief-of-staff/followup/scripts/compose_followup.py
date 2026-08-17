@@ -42,6 +42,14 @@ from chatfmt import to_chat  # noqa: E402
 
 PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "references", "followup-prompt.md")
 
+# A transcript is included WHOLE up to this cap — ~2.5 hours of speech, so virtually every real
+# meeting fits entire. The old cap was 6,000 chars (~7 minutes): it cut every meeting off before
+# the part where people say what they'll do, which is the one thing this extraction exists for.
+# Over the cap, the TAIL is kept — commitments cluster at the end. Budget: 150K chars ≈ 37K tokens,
+# and the pipeline requires a 1M-context model precisely so meetings never get skimmed.
+TRANSCRIPT_CHAR_CAP = 150_000
+NOTES_CHAR_CAP = 4_000
+
 
 def _load_prompt() -> str:
     with open(PROMPT_PATH, encoding="utf-8") as f:
@@ -81,13 +89,24 @@ def build_context(inputs: dict, since_hours: int) -> tuple[str, list]:
         title = _s(m.get("title")) or "Meeting"
         when = _s(m.get("date") or m.get("start"))
         emails = [_s(e) for e in (m.get("attendee_emails") or []) if _s(e)]
-        transcript = _s(m.get("transcript"))
-        body = transcript[:6000] if transcript else _s(m.get("ai_summary") or m.get("your_notes"))[:1500]
-        src = "transcript" if transcript else "notes"
         lines = [f"### {title} — {when}"]
         if emails:
             lines.append("attendees: " + ", ".join(emails))
-        lines.append(f"[{src}]: {body}")
+        # Distilled first — the transcript used to REPLACE the notes and summary, so the two most
+        # concentrated signals (what the user themselves typed; Granola's summary, which usually
+        # already lists the action items) vanished exactly when a transcript existed. All three
+        # layers now render, most-distilled first; the transcript is the evidence record, not the
+        # headline. The prompt's "distilled first, verified always" rule is written against these
+        # exact three markers.
+        notes = _s(m.get("your_notes")).strip()
+        summary = _s(m.get("ai_summary")).strip()
+        transcript = _s(m.get("transcript"))
+        if notes:
+            lines.append(f"[your notes]: {notes[:NOTES_CHAR_CAP]}")
+        if summary:
+            lines.append(f"[summary]: {summary[:NOTES_CHAR_CAP]}")
+        if transcript:
+            lines.append(f"[transcript]: {transcript[-TRANSCRIPT_CHAR_CAP:]}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks), ended
 
@@ -114,6 +133,7 @@ def _normalize(parsed: dict) -> dict:
     out.setdefault("followup_markdown", "")
     out.setdefault("commitments", [])
     out.setdefault("drafts", [])
+    out.setdefault("procedural_candidates", [])
     # The SKILL delivers followup_markdown VERBATIM on chat channels — route it through the shared
     # chat pipeline so **bold**/<!--…--> never reach WhatsApp literally. to_chat is idempotent, so
     # the evening merge (compose_brief embeds this in its prompt, then chat-formats its own output)

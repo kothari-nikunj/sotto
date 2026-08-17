@@ -148,9 +148,9 @@
   "classes":    {
     "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
     "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
-    "budget_exempt":       ["missed_call", "escalation", "post_meeting"],
-    "meeting_hold_exempt": ["missed_call", "escalation"],
-    "cooldown_exempt":     ["escalation"],
+    "budget_exempt":       ["missed_call", "escalation", "post_meeting", "calendar_change"],
+    "meeting_hold_exempt": ["missed_call", "escalation", "calendar_change"],
+    "cooldown_exempt":     ["escalation", "calendar_change"],
     "digest_count":        ["ambient", "quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"],
     "digest_actionable":   ["quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"]
   }
@@ -479,9 +479,10 @@ const SHARED_FILES = [
   ["cache/hermes-version.json", "start.sh", "receiver (Integrations page)"],
   ["cache/update_check.json", "receiver (the daily check — the ONE writer)", "receiver (/setup, /api/overview), skills (compose_brief.py)"],
   ["cache/update_notice.json", "skills (compose_brief.py)", "skills (the once-per-version marker)"],
-  ["connectors/&lt;service&gt;.json", "connectors", "skills, receiver (presence only)"],
-  ["connectors/&lt;service&gt;.error", "skills (the gather)", "receiver (reconnect hint)"],
+  ["connectors/&lt;service&gt;.json", "connectors (OAuth write; /setup Disconnect deletes)", "skills, receiver (presence only)"],
+  ["connectors/&lt;service&gt;.error", "skills (the gather; /setup Disconnect deletes)", "receiver (reconnect hint)"],
   ["dashboard_sessions.json · dashboard_audit.jsonl", "dashboard", "dashboard"],
+  ["knowledge/master.md", "master_file.py (the ONE writer — user-stated words; gateway confirms, dashboard edits shell out to it)", "compose_brief + compose_meeting_prep (always in the prompt), gateway chat, dashboard (Learned page)"],
   ["knowledge/last_local_snapshot.json", "skills (compose_brief.py)", "skills — the RAW Bridge payload, kept until deleted"],
   ["knowledge/relationship_state.json", "skills (relationship_pulse.py)", "skills (compose_brief.py, the VIP floor), dashboard (attention queue)"],
   ["knowledge/&lt;kind&gt;/*.md · style.json · outcomes.jsonl", "skills", "dashboard (read), skills"],

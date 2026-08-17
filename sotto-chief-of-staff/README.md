@@ -86,6 +86,7 @@ _shared/
     knowledge_update.py              # apply an extraction (dedup/decay/prune) + the ONE relations and company writer
     knowledge_query.py               # read + pack for the LLM (--calendar exempts today's cast)
     knowledge_edit.py                # user-initiated writes (facts, company About, loops, merges, relations) for chat + dashboard
+    master_file.py                   # the ONE writer/reader for knowledge/master.md (the always-in-context master memory file)
 evals/                               # brief-quality eval harness (run_evals.py + fixtures/baselines)
   run_golden.py                      # Golden Corpus replay: the owner's real history, scored vs his labels
   LABELING.md                        # the one-hour labeling runbook (evals/README.md § The Golden Corpus)

@@ -65,6 +65,30 @@ Do NOT explore the filesystem / packages / Hermes internals or run `hermes tools
    writing style and the people you talk to most." (If N = 0, say the seed was thin and the briefs
    will learn as they run — don't announce a learned style that doesn't exist.)
 
+**3b. The standing file — propose from the seed, confirm, then two questions (skippable).** The
+seed learned who they *talk to*; use it so they confirm instead of typing from scratch — but the
+file's authority comes from being THEIR stated words, so nothing is written unconfirmed. From what
+step 3 already gathered (their sent mail's signature and domain, the seed's most-messaged people),
+DRAFT the first two sections and ask all of it in ONE friendly message:
+> "Last thing — I want to get your standing file right. From what I've seen: **you're** <drafted
+> one-liner — name, role, company from their sent mail — or 'I couldn't tell what you do — one
+> sentence?'>. **Your inner circle** looks like <top 4–6 most-messaged names from the seed> — who
+> here actually belongs (partners, EA, family), and who's missing? Two I can't guess: **what are
+> you focused on right now**, and **any standing rules** for how you like things done ('intros are
+> always forwardable emails', 'never book Fridays')? Correct anything, skip anything — this is
+> editable later in chat or on your dashboard."
+Write ONLY what they confirmed or corrected — a proposal they ignored is not an answer; never
+write your own draft unconfirmed, and never invent content for a skipped section:
+```bash
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section About --text "<their answer>"
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section People --text "<their answer>"
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section Priorities --text "<their answer>"
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section Procedures --text "<their rules, one per line>"
+```
+This is `knowledge/master.md` — it rides along in every brief and meeting prep from the first one,
+and they can edit it anytime on the dashboard's **Learned** page or by telling you in chat. If they
+skip everything, say "no problem — tell me anytime" and move on; never block setup on it.
+
 **4. Schedule the briefs — dedup first, ALWAYS.** Run `hermes cron list` FIRST and check which of the five jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers all five at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
    The five jobs, their schedules and their skills live in **`adapters/hermes/crons.json`** — the one
    source `start.sh` and the installers read; if a schedule here ever disagrees with it, `crons.json`

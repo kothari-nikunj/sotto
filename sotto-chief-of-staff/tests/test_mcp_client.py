@@ -67,6 +67,17 @@ def test_call_tool_plain_json_text_content_is_json_decoded():
     assert t.requests[0][1]["params"] == {"name": "list_meetings", "arguments": {"limit": 50}}
 
 
+def test_call_tool_prefers_structured_content_over_prose_text():
+    # MCP 2025-06-18: servers with an outputSchema put the machine-readable result in
+    # structuredContent and often turn content[].text into prose. The prose lane silenced the
+    # Granola gather for five days (Aug 2026) — the structured lane must win.
+    t = FakeTransport([_json_resp(1, {
+        "structuredContent": {"meetings": [{"title": "Sync", "id": "m1"}]},
+        "content": [{"type": "text", "text": "Here are your meetings:\n- Sync"}]})])
+    out = mc.McpClient("u", "t", transport=t).call_tool("list_meetings")
+    assert out == {"meetings": [{"title": "Sync", "id": "m1"}]}
+
+
 def test_call_tool_non_json_text_stays_raw():
     t = FakeTransport([_json_resp(1, {"content": [{"type": "text", "text": "you said: ship it"}]})])
     out = mc.McpClient("u", "t", transport=t).call_tool("get_meeting_transcript", {"meeting_id": "m1"})

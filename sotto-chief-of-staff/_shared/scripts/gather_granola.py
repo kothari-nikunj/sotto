@@ -38,6 +38,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -180,6 +181,25 @@ def _has_content(m: dict) -> bool:
     return bool(m.get("ai_summary") or m.get("your_notes") or m.get("transcript"))
 
 
+def _salvage_json(text: str):
+    """Last-ditch parse for a tool result that came back as PROSE with JSON embedded in it — a
+    fenced ```json block, or the widest [...] / {...} span that parses. MCP servers built for LLM
+    chat clients (mcp.granola.ai) answer in prose; the data is often still in there. Returns the
+    decoded value or None — never guesses beyond an actual json.loads success."""
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    candidates = [fence.group(1)] if fence else []
+    for open_c, close_c in (("[", "]"), ("{", "}")):
+        i, j = text.find(open_c), text.rfind(close_c)
+        if 0 <= i < j:
+            candidates.append(text[i:j + 1])
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except ValueError:
+            continue
+    return None
+
+
 def _as_items(result) -> list:
     """Normalize any tool result into a list of dicts (bare list, single object, or an envelope)."""
     if isinstance(result, dict):
@@ -237,6 +257,8 @@ def _fetch_details(client, detail_tool: str, props: dict | None, ids: list, warn
     out: dict = {}
 
     def _absorb(result):
+        if isinstance(result, str):              # same prose-answer salvage as the list call
+            result = _salvage_json(result) or result
         for item in _as_items(result):
             mid = _meeting_id(item)
             if mid is not None:
@@ -300,13 +322,18 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
         detail_tool = None            # one tool doing both jobs already returned whatever it has
 
     raw = client.call_tool(list_tool, _list_args(_tool_props(tools, list_tool)), timeout=60)
+    if isinstance(raw, str):                      # prose answer (LLM-facing server) → salvage the data
+        raw = _salvage_json(raw) or raw
     if isinstance(raw, dict):
         for k in ("meetings", "notes", "items", "results", "data"):
             if isinstance(raw.get(k), list):
                 raw = raw[k]
                 break
     if not isinstance(raw, list):
-        warnings.append(f"{list_tool} returned non-list ({type(raw).__name__}); treating as empty")
+        # Carry a preview of what the server actually said — five days of "non-list (str)" with no
+        # content was undiagnosable from the log alone (Aug 2026).
+        warnings.append(f"{list_tool} returned non-list ({type(raw).__name__}); treating as empty. "
+                        f"Preview: {repr(raw)[:200]}")
         raw = []
 
     now = now or datetime.datetime.now(datetime.timezone.utc)

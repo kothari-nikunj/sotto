@@ -152,7 +152,10 @@ def test_cli_rejects_a_kind_no_lane_produces(tmp_path):
     p = subprocess.run([sys.executable, SCRIPT, "set", "--kind", "birthday",
                         "--question", "?"], env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode != 0
-    assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff", "retune_offer"}
+    # Every kind has a producing lane: the proactive watcher's five, plus the evening brief's
+    # "make that a standing rule?" confirmation (compose_brief._append_procedure_offer).
+    assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff", "retune_offer",
+                             "procedure"}
 
 
 # ── the two processes, at the same moment ───────────────────────────────────────────────────────

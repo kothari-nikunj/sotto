@@ -244,6 +244,44 @@ def test_meetings_envelope_dict_unwrapped():
     assert meetings[0]["title"] == "Acme Sync"
 
 
+def test_prose_list_answer_with_embedded_json_is_salvaged():
+    # mcp.granola.ai answers LLM chat clients in PROSE; the meetings are often still embedded as
+    # JSON. Five days of real briefs read 0 meetings off exactly this shape (Aug 2026).
+    prose = ("Here are your meetings from this week:\n```json\n"
+             + json.dumps(RAW_MEETINGS[:1]) + "\n```\nLet me know if you need details.")
+    client = FakeMcp([{"name": "list_meetings"}, {"name": "get_meeting_transcript"}], prose)
+    meetings, warnings = gg.gather_mcp(days=14, since_hours=0, client=client, now=NOW)
+    assert meetings[0]["title"] == "Acme Sync"
+    assert not any("non-list" in w for w in warnings)
+
+
+def test_prose_list_answer_without_data_warns_with_a_preview():
+    # Pure prose (or an error sentence) → empty, but the warning must SHOW what the server said —
+    # "non-list (str)" alone was undiagnosable from the log.
+    client = FakeMcp([{"name": "list_meetings"}], "Please reconnect your Granola account.")
+    meetings, warnings = gg.gather_mcp(days=14, since_hours=0, client=client, now=NOW)
+    assert meetings == []
+    assert any("Please reconnect your Granola account." in w for w in warnings)
+
+
+def test_prose_detail_answer_with_embedded_json_is_salvaged():
+    # Same salvage on the DETAIL tool: list carries titles only, detail answers in prose.
+    listed = [{"id": "m1", "title": "Acme Sync", "start_time": _iso_hours_ago(2)}]
+    detail_prose = ("Meeting details:\n```json\n"
+                    + json.dumps([{"id": "m1", "summary": "Discussed the pilot rollout."}]) + "\n```")
+
+    class ProseDetail(FakeMcp):
+        def call_tool(self, name, arguments=None, timeout=60):
+            self.calls.append((name, arguments))
+            if name == "get_meetings":
+                return detail_prose
+            return listed
+
+    client = ProseDetail([{"name": "list_meetings"}, {"name": "get_meetings"}], listed)
+    meetings, _ = gg.gather_mcp(days=14, since_hours=0, client=client, now=NOW)
+    assert meetings[0]["ai_summary"] == "Discussed the pilot rollout."
+
+
 def test_mcp_401_mid_session_refreshes_once_and_retries():
     from connector_tokens import ConnectorAuthError
 

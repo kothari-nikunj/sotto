@@ -713,12 +713,17 @@ def _snapshot_age_hours(captured_at: str):
 
 
 
-def _save_local_snapshot(local: dict):
+def _save_local_snapshot(local: dict) -> dict:
+    """Write the snapshot and RETURN the dict actually written, carry-forward applied — the caller
+    must compose from the returned copy. The symptom this heals is live ("raw phone numbers in the
+    brief"): a heal that only lands in the file fixes a future outage fallback, not the brief being
+    composed right now, and a thin pull would render nameless forever while the snapshot on disk
+    quietly stayed healthy."""
+    merged = dict(local)
     try:
         path = _snapshot_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        stamp = local.get("generated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        local = dict(local)
+        stamp = merged.get("generated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         # Contacts carry-forward: contacts (the identity/name-resolution layer) change slowly and a
         # pull can come back thin. If THIS pull has no contacts but the prior snapshot did, keep the
         # old ones so a contacts-less refresh doesn't wipe name resolution (the "raw phone numbers in
@@ -728,20 +733,21 @@ def _save_local_snapshot(local: dict):
         # Bridge reporting a CHOICE (bridge-config.json's disabled_sources), not a thin read, and
         # carrying yesterday's address book forward past that choice keeps a disabled source alive
         # in every later brief. A disabled source is dropped from the snapshot, not remembered.
-        if _s(_obj(local, "source_status").get("contacts")) == _DISABLED_SOURCE:
-            local.pop("contacts", None)
-        elif not _arr(local, "contacts"):
+        if _s(_obj(merged, "source_status").get("contacts")) == _DISABLED_SOURCE:
+            merged.pop("contacts", None)
+        elif not _arr(merged, "contacts"):
             try:
                 with open(path, encoding="utf-8") as f:
                     prev = (json.load(f).get("local") or {})
                 if _arr(prev, "contacts"):
-                    local["contacts"] = prev["contacts"]
+                    merged["contacts"] = prev["contacts"]
             except Exception:
                 pass
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"captured_at": stamp, "local": local}, f)
+            json.dump({"captured_at": stamp, "local": merged}, f)
     except Exception:
         pass
+    return merged
 
 
 
@@ -999,6 +1005,20 @@ def _brief_day(tz: str, now=None) -> str:
     return local.strftime("%Y-%m-%d")
 
 
+def _format_master_context() -> str:
+    """The master memory file (`knowledge/master.md`) rides along in EVERY brief — who the user is,
+    who is around them, and their standing Procedures — read through its one owner module. Absent
+    or unreadable file renders '' and the brief runs exactly as before."""
+    try:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "knowledge")
+        if base not in sys.path:
+            sys.path.insert(0, base)
+        import master_file  # noqa: PLC0415
+        return master_file.render_for_prompt()
+    except Exception:  # noqa: BLE001 — fail toward silence; the file is optional context
+        return ""
+
+
 def build_prompt(template: str, inputs: dict) -> str:
     brief_type = _s(inputs.get("type")) or "morning"
     google = _obj(inputs, "google")
@@ -1111,6 +1131,7 @@ def build_prompt(template: str, inputs: dict) -> str:
         "brief_type": brief_type,
         "user_today": user_today,
         "time_frame": time_frame,
+        "master_context": opt(_format_master_context()),
         "followup_context": opt(followup_context),
         "already_nudged": opt(already_nudged),
         "source_availability": _stale_local_note(local) + _format_source_availability(sa) + trunc_block,
@@ -1811,6 +1832,42 @@ def _apply_followup_commitments(fu: dict, inputs: dict) -> None:
         _diag(f"[compose_brief] followup ledger apply failed ({type(e).__name__}: {str(e)[:120]})")
 
 
+def _pick_procedural_candidate(fu: dict) -> str:
+    """The ONE user-stated standing rule from tonight's transcripts worth a confirmation question,
+    or "". Dedupe is against the master file's whole text (case-insensitive substring), so a rule
+    already standing — or already offered and written — is never offered again. First fresh
+    candidate wins; one question per evening is the cap, by construction."""
+    cands = fu.get("procedural_candidates") if isinstance(fu, dict) else None
+    if not isinstance(cands, list):
+        return ""
+    existing = _format_master_context().lower()
+    for c in cands:
+        rule = _s(c.get("rule") if isinstance(c, dict) else c).strip()
+        if rule and rule.lower() not in existing:
+            return rule[:300]
+    return ""
+
+
+def _append_procedure_offer(out: dict, inputs: dict) -> dict:
+    """Evening only, one line: a transcript showed the user STATING a standing rule, so the brief
+    ends by asking to remember it — and the pending-offer bridge is recorded so a bare "yes" from
+    another session lands on this question. The rule itself is NEVER written here: the gateway
+    writes it after the yes (the explicit-words, confirmed-first bar for master.md)."""
+    rule = _s(inputs.get("_procedure_offer"))
+    if not rule:
+        return out
+    question = f"Heard you say: “{rule}” — make that a standing rule? Say yes and I'll remember it."
+    md = _s(out.get("brief_markdown"))
+    out["brief_markdown"] = (md.rstrip() + "\n\n" + question + "\n") if md.strip() else question
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import pending_offer  # noqa: PLC0415
+        pending_offer.set_offer("procedure", question, detail=rule)
+    except Exception:  # noqa: BLE001 — the question still lands; an explicit reply still works
+        pass
+    return out
+
+
 def _render_followup_context(fu: dict) -> str:
     """Deterministically render the merged followup result as an evening-brief prompt block. Empty
     string when there's nothing worth saying (no markdown, no commitments, no drafts)."""
@@ -2407,6 +2464,7 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
             _apply_followup_commitments(fu, inputs)        # deterministic ledger write (existing path)
             inputs = dict(inputs)
             inputs["_followup_context"] = fu_text
+            inputs["_procedure_offer"] = _pick_procedural_candidate(fu)
 
     prompt = build_prompt(user_template, inputs)
     raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
@@ -2454,6 +2512,9 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     out = _append_receipts(out, inputs, _brief_now(inputs))
     # …and last, the one-line "a newer Sotto is published" notice — housekeeping, once per version.
     out = _append_update_notice(out)
+    # Evening: the one "make that a standing rule?" confirmation, when tonight's transcripts showed
+    # the user stating one (deterministic append + the pending-offer bridge; see the function).
+    out = _append_procedure_offer(out, inputs)
     # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event
     # map. LAST, so the critic's own rewrites are held to the same allowlist as the first draft.
     result = _attach_tap_links(out, event_links, allowlist)
@@ -2527,7 +2588,7 @@ def main():
         if not _local_has_data(local):
             print(json.dumps({"seeded": False, "reason": "seed carried no local data"}))
             return
-        _save_local_snapshot(local)
+        local = _save_local_snapshot(local)   # count what was written (carry-forward included)
         counts = {k: len(_arr(local, k)) for k in _LOCAL_SOURCE_KEYS if _arr(local, k)}
         print(json.dumps({"seeded": True, "path": _snapshot_path(),
                           "contacts": len(_arr(local, "contacts")), "counts": counts}))
@@ -2580,7 +2641,10 @@ def main():
         google["userTimezone"] = args.user_timezone
     local = unwrap_tool_result(load(args.local, {}))   # accept raw read_local tool-result wrappers
     if _local_has_data(local):
-        _save_local_snapshot(local)          # fresh data → remember it for a future Bridge outage
+        # Fresh data → remember it for a future Bridge outage, AND compose from the same healed
+        # copy the snapshot gets: the contacts carry-forward must fix today's brief, not only
+        # tomorrow's fallback.
+        local = _save_local_snapshot(local)
     else:
         local = _local_fallback(local)        # Bridge unreachable → degrade to the last good snapshot
     # Visibility for "the brief didn't marry Gmail + local": log what each side actually contributed,

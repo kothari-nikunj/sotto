@@ -54,6 +54,7 @@ memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); thi
 |---|---|---|
 | `knowledge/last_local_snapshot.json` | **The complete raw Bridge payload** — every message, call, note, reminder, file and contact from the last pull | **Overwritten each brief, never deleted.** The 24h TTL only stops it being *reused*, not *stored*. Delete it by hand or with `forget.py --snapshot` (below). |
 | `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance | Indefinite by design — this is the memory. Superseded facts are archived, not deleted |
+| `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | Indefinite by design — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days |
 | `briefs/*.json` · `*.payload.json` | Delivered briefs and the payload each was built from | Indefinite |
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines |

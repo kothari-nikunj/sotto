@@ -166,6 +166,44 @@ def test_answered_or_outgoing_call_drops(tmp_path, monkeypatch):
     assert out["verdict"] == "drop"
 
 
+def _cal_change(**kw):
+    e = {"source": "calendar_change", "rowid": "e1:declined:ali@x.com", "change": "declined",
+         "timestamp": "2026-08-06T10:00:00Z", "summary": "Coffee",
+         "start": "2026-08-06T18:00:00+00:00", "old_start": "", "who": "Ali Panju",
+         "attendees": [{"name": "Ali Panju", "email": "ali@x.com"}], "is_from_me": False,
+         "text": "Ali Panju just declined your 11:00 AM — Coffee"}
+    e.update(kw)
+    return e
+
+
+def test_calendar_change_nudges_deterministically_and_skips_the_budget(tmp_path, monkeypatch):
+    """A decline/last-minute invite is Tier-0 (the calendar already made the judgment), and it is
+    budget-exempt — 'Ali declined your 11am' at 10:40 must land even on a spent day."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")            # the day's budget is GONE
+    _seed_snapshot(tmp_path)
+    _no_llm(monkeypatch)                                     # no Tier-1 call, ever, for these
+    out = te.triage({"events": [_cal_change()]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "agent"
+    assert out["bundle"]["events"][0]["class"] == "calendar_change"
+    assert "declined" in out["bundle"]["events"][0]["why"]
+    assert out["bundle"]["events"][0]["sender"] == "Ali Panju"
+
+
+def test_calendar_change_respects_quiet_hours_and_mutes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    _no_llm(monkeypatch)
+    out = te.triage({"events": [_cal_change()]}, now_local=NIGHT, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"                         # quiet hours hold it
+    assert _queue_entries(tmp_path)[-1]["verdict_class"] == "quiet"
+    (tmp_path / "preferences.json").write_text(json.dumps(
+        {"explicit": {"mute_people": ["Ali Panju"]}}))
+    out = te.triage({"events": [_cal_change(rowid="e1:declined:2")]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop"                          # a muted person's decline is dropped
+
+
 def test_unknown_non_vip_one_to_one_queues_never_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path)
@@ -996,7 +1034,7 @@ def test_solo_block_and_all_day_event_never_hold(tmp_path, monkeypatch):
 def test_missed_call_is_exempt_from_the_meeting_hold(tmp_path, monkeypatch):
     """A missed call from someone you know is exactly what should reach you mid-meeting. The hold
     exempts LESS than the budget does: a post-meeting tap is budget-free but still hold-able."""
-    assert te.MEETING_HOLD_EXEMPT_CLASSES == {"missed_call", "escalation"}
+    assert te.MEETING_HOLD_EXEMPT_CLASSES == {"missed_call", "escalation", "calendar_change"}
     assert "post_meeting" in te.BUDGET_EXEMPT_CLASSES
     assert "post_meeting" not in te.MEETING_HOLD_EXEMPT_CLASSES
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
@@ -1581,6 +1619,32 @@ def test_escalation_window_expires(tmp_path, monkeypatch):
     monkeypatch.setattr(te, "ESCALATION_WINDOW_MIN_DEFAULT", 120)
     out2 = te.triage({"events": [_email(rowid="e2", threadId="t2")]}, now_local=DAY, now_utc=NOW_UTC)
     assert out2["bundle"]["events"][0]["class"] == "escalation"
+
+
+def test_thin_snapshot_falls_back_to_the_graph_and_supplies_the_name(tmp_path, monkeypatch):
+    """The zero-message-nudges failure (Aug 2026): a starved snapshot (0 contacts) made every text
+    an "unknown sender 1:1" — even for people the graph knew from prewarm — because the graph
+    fallback existed only for email. On every channel now: a contacts miss consults the graph,
+    which resolves knownness AND supplies the display name the nudge uses."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path, contacts=[])                       # the starved snapshot
+    sys.path.insert(0, os.path.join(ROOT, "_shared", "knowledge"))
+    import knowledge as kg
+    os.makedirs(kg.people_dir(), exist_ok=True)
+    person = kg.PersonFile(canonical_id="c_alberto0001", name="Alberto Rivera",
+                           identifiers=["+13055053997"], updated_at="2026-08-01T00:00:00Z",
+                           updated_by="prewarm", facts={})
+    with open(os.path.join(kg.people_dir(), "c_alberto0001.md"), "w", encoding="utf-8") as f:
+        f.write(kg.serialize_person_file(person))
+    monkeypatch.setattr(te, "_classify_tier1", lambda e, o: ("agent", "actionable", "real ask"))
+    out = te.triage({"events": [_im("can you send the deck?", handle="+1 (305) 505-3997", rowid=91)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "agent"
+    assert out["bundle"]["events"][0]["sender"] == "Alberto Rivera"   # the graph supplied the name
+    # …and a number NEITHER source knows still queues as unknown (the gate itself is unchanged).
+    out2 = te.triage({"events": [_im("hi", handle="+19998887777", rowid=92)]},
+                     now_local=DAY, now_utc=NOW_UTC)
+    assert out2["verdict"] == "queue"
 
 
 def test_unknown_sender_never_escalates(tmp_path, monkeypatch):

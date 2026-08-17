@@ -154,6 +154,9 @@ CALCACHE.HOOKS.update({
     "write_json": lambda p, o, mode=0o600, indent=None: CONNECTORS.write_json(p, o, mode, indent),
     "json_transaction": lambda p, **kw: CONNECTORS.json_transaction(p, **kw),
     "local_today": lambda: DASHBOARD._local_today(),
+    # Calendar-diff nudges: same dispatch as the tap — a decline/last-minute invite/move/cancel is
+    # a synthetic event through the one funnel; calcache owns detection + exactly-once.
+    "calendar_change": lambda ev: _dispatch_synthetic(ev, "calendar change"),
     # The post-meeting tap (Step 2 item 3): calcache detects the event-END on the refresh tick, the
     # receiver relays it into the ordinary triage funnel. Late-bound like the rest.
     "meeting_tap": lambda ev: _dispatch_meeting_tap(ev),
@@ -1014,27 +1017,32 @@ def start_valve_thread():
 # can't be delivered. Returning False leaves the event-end UNhandled, so the next tick retries it
 # while it's still inside calcache's window.
 
-def _dispatch_meeting_tap(event: dict) -> bool:
-    """Run one synthetic meeting-end event through triage; stage + spawn on an agent verdict.
-    True ⇒ the tap was dispatched (and counts against calcache's daily tap cap), whatever verdict
-    the funnel returned — a tap held by quiet hours or a meeting still consumed its chance to fire,
-    and its queue entry is the valve's to promote."""
-    if not _delivery_channel_ready("meeting tap"):
+def _dispatch_synthetic(event: dict, label: str) -> bool:
+    """Run one synthetic calcache event (a meeting-end tap OR a calendar change) through triage;
+    stage + spawn on an agent verdict. True ⇒ dispatched, whatever verdict the funnel returned — an
+    event held by quiet hours or a meeting still consumed its chance to fire, and its queue entry
+    is the valve's to promote. ONE function for both producers so the channel-health gate and the
+    failure containment can never drift between them."""
+    if not _delivery_channel_ready(label):
         return False
     try:
         verdict = run_triage([event], False)
     except Exception as e:  # noqa: BLE001
-        print(f"[sotto] meeting tap triage failed: {e}", flush=True)
+        print(f"[sotto] {label} triage failed: {e}", flush=True)
         return False
     if verdict.get("verdict") != "agent":
         return True
     try:
         bundle_path = _stage_bundle(verdict.get("bundle") or {})
     except OSError as e:
-        print(f"[sotto] meeting tap bundle stage failed: {e}", flush=True)
+        print(f"[sotto] {label} bundle stage failed: {e}", flush=True)
         return True     # triage already spent the budget/cooldown — re-firing would double-nudge
     _spawn_event_agent(bundle_path)
     return True
+
+
+def _dispatch_meeting_tap(event: dict) -> bool:
+    return _dispatch_synthetic(event, "meeting tap")
 
 
 QR_FILE = os.path.join(DATA, "whatsapp-pairing.txt")
@@ -1869,7 +1877,9 @@ def _setup_page(code: str = "") -> str:
             if s.get("obtained_at"):
                 when = " since " + time.strftime("%b %-d, %Y", time.localtime(s["obtained_at"]))
             svc_rows.append(f"<p class='tile-status'>{lbl} — "
-                            f"connected{_html.escape(when)}.</p>")
+                            f"connected{_html.escape(when)}. "
+                            f"<a href='#' class='tile-hint' onclick=\"return sdisc('{s['service']}')\">"
+                            "Disconnect</a></p>")
         else:
             svc_rows.append(
                 f"<p>{lbl} — <a class='btn-primary' href='/connect/{s['service']}/start{qs}'>Connect →</a> "
@@ -1905,7 +1915,15 @@ def _setup_page(code: str = "") -> str:
 
     services = ("<p class='tile-hint'>Optional extras — e.g. Granola "
                 "brings meeting notes + transcripts into briefs, prep, and follow-ups.</p>"
-                + "".join(svc_rows))
+                + "".join(svc_rows)
+                # The Disconnect handler: confirm, POST /setup/disconnect, reload. Inline because the
+                # setup CSP deliberately allows inline script (see SETUP_CSP) — same as the timezone
+                # detector and copy button.
+                + "<script>function sdisc(s){if(!confirm('Disconnect '+s+'? Its token is deleted "
+                  "from your volume. You can reconnect anytime.'))return false;"
+                  f"fetch('/setup/disconnect{qs}',{{method:'POST',"
+                  "headers:{'Content-Type':'application/json'},body:JSON.stringify({service:s})})"
+                  ".then(function(){location.reload();});return false;}</script>")
 
     # Steps 1–4 all done (tile 5 is optional and never gates): the wizard's job is finished, so the
     # page's FIRST affordance becomes the handoff to the dashboard. The delivery step uses the SAME
@@ -1974,7 +1992,7 @@ def _setup_page(code: str = "") -> str:
 # live WhatsApp QR, or accept config writes, so it's gated behind the setup code (see resolve_setup_code).
 SETUP_GET_PATHS = frozenset({"/setup", "/pair", "/google/auth", "/google/submit-code",
                              "/whatsapp/qr", "/debug/google"})
-SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client"})
+SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client", "/setup/disconnect"})
 
 # The wizard cookie carries the SAME attribute set as the dashboard's session cookie
 # (dashboard._login_redirect): Secure so it never rides a plaintext hop, HttpOnly so no script can
@@ -1983,9 +2001,10 @@ SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client"})
 # http://localhost: browsers treat localhost as a secure context.)
 SETUP_COOKIE_ATTRS = "Path=/; HttpOnly; Secure; SameSite=Lax"
 
-# The setup surface's CSP, scoped to what the wizard ACTUALLY does. Two inline scripts are load-
-# bearing here — the timezone detector and the pairing-link copy button — so script-src must allow
-# inline; the dashboard's `script-src 'self'` would silently kill timezone auto-detection. Styles
+# The setup surface's CSP, scoped to what the wizard ACTUALLY does. Three inline scripts are load-
+# bearing here — the timezone detector, the pairing-link copy button, and the connector Disconnect
+# handler — so script-src must allow inline; the dashboard's `script-src 'self'` would silently
+# kill timezone auto-detection. Styles
 # are external (/static/app.css + setup.css) and the only image is the favicon's data: URI, so
 # those two stay strict. base-uri/form-action/frame-ancestors don't inherit default-src — pinned.
 SETUP_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; "
@@ -2279,6 +2298,17 @@ class Handler(BaseHTTPRequestHandler):
             ok, detail = set_timezone(tz)
             return self._send(200 if ok else 400,
                               {"ok": ok, "timezone": detail if ok else None, "detail": None if ok else detail})
+        # /setup/disconnect — forget a connected service's token (the /setup tile's Disconnect).
+        if path == "/setup/disconnect":
+            try:
+                service = str((json.loads(raw or b"{}") or {}).get("service", ""))
+            except (json.JSONDecodeError, ValueError):
+                service = ""
+            if service not in CONNECTORS.SERVICES:
+                return self._send(400, {"ok": False, "detail": f"unknown service '{service}' — "
+                                        "known: " + ", ".join(sorted(CONNECTORS.SERVICES))})
+            res = CONNECTORS.disconnect(service)
+            return self._send(200, {"ok": True, **res})
         # /setup/google-client — urlencoded form (no-JS friendly) or JSON
         if ctype == "application/json":
             try:

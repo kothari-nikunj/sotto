@@ -651,6 +651,29 @@ def test_setup_surface_gating_over_http(tmp_path, monkeypatch):
         code, body = post("/setup/timezone", b'{"timezone":"America/Los_Angeles"}',
                           headers={"Cookie": "sotto_setup=sekrit-code-123"})
         assert code == 200 and json.loads(body)["ok"] is True
+        # /setup/disconnect — gated like the other setup POSTs, deletes the token + error file,
+        # rejects unknown services, and succeeds when there is nothing to delete (forget.py posture).
+        r2.CONNECTORS.DATA = str(tmp_path)
+        os.makedirs(os.path.join(str(tmp_path), "connectors"), exist_ok=True)
+        tok = r2.CONNECTORS.token_path("granola")
+        errf = os.path.join(str(tmp_path), "connectors", "granola.error")
+        with open(tok, "w", encoding="utf-8") as f:
+            json.dump({"access_token": "t", "obtained_at": 1}, f)
+        with open(errf, "w", encoding="utf-8") as f:
+            f.write("reconnect needed")
+        code, _ = post("/setup/disconnect", b'{"service":"granola"}')
+        assert code == 403 and os.path.exists(tok)          # no cookie → refused, token intact
+        code, body = post("/setup/disconnect", b'{"service":"granola"}',
+                          headers={"Cookie": "sotto_setup=sekrit-code-123"})
+        assert code == 200 and json.loads(body)["ok"] is True
+        assert not os.path.exists(tok) and not os.path.exists(errf)
+        assert sorted(json.loads(body)["removed"]) == ["granola.error", "granola.json"]
+        code, body = post("/setup/disconnect", b'{"service":"granola"}',
+                          headers={"Cookie": "sotto_setup=sekrit-code-123"})
+        assert code == 200 and json.loads(body)["removed"] == []    # already gone → still success
+        code, _ = post("/setup/disconnect", b'{"service":"evil"}',
+                       headers={"Cookie": "sotto_setup=sekrit-code-123"})
+        assert code == 400                                          # unknown service refused
         # The two deleted routes are GONE, authenticated or not: /bridge/status was an
         # unauthenticated leak of Mac presence (/health already carries the field) and
         # /setup/status was a caller-less JSON twin of /setup.
@@ -1143,6 +1166,8 @@ def test_setup_page_connector_tile_downgrades_to_reconnect(tmp_path, monkeypatch
     monkeypatch.setattr(rec.CONNECTORS, "service_status", lambda: status)
     page = rec._setup_page("abc")
     assert "connected since" in page and "Reconnect" not in page   # healthy: no error file
+    # …and a connected service offers Disconnect (fetch-POSTs /setup/disconnect, code carried)
+    assert "sdisc('granola')" in page and "/setup/disconnect?code=abc" in page
     os.makedirs(os.path.join(str(tmp_path), "connectors"), exist_ok=True)
     with open(os.path.join(str(tmp_path), "connectors", "granola.error"), "w") as f:
         f.write("401 from mcp.granola.ai")
@@ -1435,6 +1460,80 @@ def test_calendar_cache_hooks_resolve_to_the_receiver_s_own_state(tmp_path, monk
     assert rec.CALCACHE.HOOKS["local_today"]() == rec.DASHBOARD._local_today()
     assert rec.CALCACHE.cache_path() == os.path.join(str(tmp_path), "cache",
                                                      "calendar_today.json")
+
+
+def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
+    """The diff that matters: declined / invited / moved / cancelled — and the skips (solo,
+    all-day, outside the window) that keep it high-signal."""
+    from datetime import datetime, timezone
+    cc = rec.CALCACHE
+    now = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
+    me = "nikunj@fpv.com"
+
+    def ev(eid, start, attendees, summary="Coffee", **kw):
+        return {"id": eid, "summary": summary, "start": start, "end": start,
+                "attendees": attendees, **kw}
+
+    other = [{"email": "ali@x.com", "displayName": "Ali Panju", "responseStatus": "accepted"},
+             {"email": me, "responseStatus": "accepted"}]
+    declined = [{"email": "ali@x.com", "displayName": "Ali Panju", "responseStatus": "declined"},
+                {"email": me, "responseStatus": "accepted"}]
+    base = [ev("e1", "2026-08-17T18:00:00+00:00", other),
+            ev("e2", "2026-08-17T19:00:00+00:00", other, summary="Sync"),
+            ev("e3", "2026-08-17T20:00:00+00:00", other, summary="Gone")]
+    cur = [ev("e1", "2026-08-17T18:00:00+00:00", declined),
+           ev("e2", "2026-08-17T21:30:00+00:00", other, summary="Sync"),
+           ev("e4", "2026-08-17T18:30:00+00:00", other, summary="Last minute"),
+           ev("solo", "2026-08-17T18:15:00+00:00", [{"email": me}]),
+           ev("allday", "2026-08-17", other, summary="Conf"),
+           ev("far", "2026-08-20T18:00:00+00:00", other, summary="Next week")]
+    out = cc.calendar_changes(base, cur, now, me)
+    kinds = {(c["kind"], c["summary"]) for c in out}
+    assert kinds == {("declined", "Coffee"), ("moved", "Sync"),
+                     ("invited", "Last minute"), ("cancelled", "Gone")}
+    d = next(c for c in out if c["kind"] == "declined")
+    assert d["who"] == "Ali Panju"
+    e = cc.change_event(d)
+    assert e["source"] == "calendar_change" and e["rowid"] == "e1:declined:ali@x.com"
+    assert "Ali Panju" in e["text"] and "declined" in e["text"]
+
+
+def test_change_tick_baselines_first_dispatches_then_settles(monkeypatch):
+    """First tick after boot only sets the baseline (a restart can't replay the day); a dispatched
+    change settles; a FAILED dispatch keeps the baseline so the next tick retries it; the kill
+    switch disables the whole lane."""
+    from datetime import datetime, timezone
+    cc = rec.CALCACHE
+    now = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
+    other = [{"email": "ali@x.com", "displayName": "Ali", "responseStatus": "needsAction"}]
+    e1 = {"id": "e1", "summary": "Coffee", "start": "2026-08-17T18:00:00+00:00",
+          "end": "2026-08-17T18:30:00+00:00", "attendees": other}
+    sent = []
+    # Pin the user's address: with one-attendee fixtures the docket inference would otherwise
+    # conclude Ali is "everyone's common attendee" — i.e. the user — and skip him as self.
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "nikunj@fpv.com")
+    monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
+    cc._LAST_RAW["events"] = [e1]
+    cc._CHANGE_BASELINE["events"] = None
+    try:
+        assert cc.change_tick(now) == 0 and sent == []       # baseline only
+        e2 = dict(e1, id="e2", summary="Late add", start="2026-08-17T18:30:00+00:00")
+        cc._LAST_RAW["events"] = [e1, e2]
+        assert cc.change_tick(now) == 1
+        assert sent[0]["change"] == "invited" and sent[0]["summary"] == "Late add"
+        assert cc.change_tick(now) == 0                      # settled — nothing re-fires
+        e3 = dict(e1, id="e3", summary="Another", start="2026-08-17T18:45:00+00:00")
+        cc._LAST_RAW["events"] = [e1, e2, e3]
+        monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: False)
+        assert cc.change_tick(now) == 0                      # dispatch failed → baseline kept
+        monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
+        assert cc.change_tick(now) == 1                      # retried next tick, then settled
+        monkeypatch.setenv("SOTTO_CALENDAR_NUDGES", "0")
+        cc._CHANGE_BASELINE["events"] = None
+        assert cc.change_tick(now) == 0                      # kill switch
+    finally:
+        cc._LAST_RAW["events"] = None
+        cc._CHANGE_BASELINE["events"] = None
 
 
 def test_calendar_refresh_thread_knob_and_quiet_idle(tmp_path, monkeypatch):

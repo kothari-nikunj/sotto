@@ -88,6 +88,9 @@ HOOKS = {
     # handed to triage (and so counts against the day's tap cap). The default no-op keeps this
     # module import-safe and makes an unwired process detect nothing, quietly.
     "meeting_tap": lambda ev: False,
+    # Calendar-diff nudge (a decline, a last-minute invite, a move, a cancellation): the receiver
+    # wires the same dispatch the tap uses. Default no-op for import-safety, as above.
+    "calendar_change": lambda ev: False,
 }
 
 CALENDAR_TTL_SECS = 600                # the plan's 10-minute number, unchanged by the extraction
@@ -99,6 +102,13 @@ CACHE_FILENAME = "calendar_today.json"
 # `source` string that IS the contract with triage_event.py's post_meeting branch.
 TAP_STATE_FILENAME = "meeting_taps.json"
 MEETING_END_SOURCE = "meeting_end"
+# Calendar-diff nudges: the `source` string that IS the contract with triage_event.py's
+# calendar_change branch, and the relevance windows (named constants, not knobs). A change matters
+# in real time only while it is imminent — everything further out is the brief's job.
+CALENDAR_CHANGE_SOURCE = "calendar_change"
+CHANGE_WINDOW_HOURS = 24           # invited/moved/cancelled: the meeting starts within this window
+DECLINE_WINDOW_HOURS = 48          # a decline is worth knowing a bit earlier — reschedules take time
+INVITE_GRACE_MIN = 15              # an invite for a meeting that started minutes ago still counts
 TAP_GRACE_MIN_DEFAULT = 5          # "ended ≥5 min ago" — you're out of the room, not packing up
 TAP_MAX_PER_DAY_DEFAULT = 3        # the taps' own daily cap (they don't spend the interrupt budget)
 TAP_LOOKBACK_FLOOR_MIN = 30        # ≥2 ticks at the default cadence, so one missed tick still fires
@@ -205,7 +215,13 @@ def _run_calendar_gather():
             raw = []
     if isinstance(raw, dict):                      # tolerate an {events: […]} envelope
         raw = raw.get("events") or []
-    events = [ev for ev in map(_norm_cal_event, raw if isinstance(raw, list) else []) if ev]
+    raw = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    # The RAW wire events, in memory only — the calendar-diff detector needs the two fields
+    # normalization deliberately strips from everything served or written (the Calendar `id`, which
+    # is the only identity that survives a move, and attendee `responseStatus`, which is what a
+    # decline IS). They live in this process and never reach a file or the browser.
+    _LAST_RAW["events"] = raw
+    events = [ev for ev in map(_norm_cal_event, raw) if ev]
     today = HOOKS["local_today"]()
     keep = {d for d in (today, _date_shift(today, 1)) if d}
     # The gather's window is now→+3d; the Today view wants today + tomorrow. Filter on the start's
@@ -219,6 +235,8 @@ def _run_calendar_gather():
 
 _CAL_LOCK = threading.RLock()
 _CAL_CACHE: dict = {"ts": 0.0, "value": None}
+_LAST_RAW: dict = {"events": None}         # the latest gather's RAW events (see _run_calendar_gather)
+_CHANGE_BASELINE: dict = {"events": None}  # the previous change-tick's raw events — the diff's left side
 
 
 def snapshot() -> dict | None:
@@ -556,6 +574,185 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     return dispatched
 
 
+# ── Calendar-diff nudges: what CHANGED about the imminent calendar since the last tick ────────────
+# "Ali Panju just declined your 11am" / "Jake sent a last-minute invite for 11:30" — the two Poke
+# examples that were unbuildable here because nothing watched the diff. Detection ONLY, the tap's
+# exact posture: every interruption question (quiet hours, snooze, mutes) is triage's, reached by
+# pushing a synthetic `source: "calendar_change"` event through the ordinary funnel. Exactly-once
+# is TWO layers: the in-memory baseline advances only when every change dispatched, and the
+# receiver's (source,rowid) seen-ring dedupes any re-detection after a partial failure. A restart
+# only resets the baseline (first tick after boot detects nothing) — it can never replay the day.
+
+def calendar_nudges_enabled() -> bool:
+    return ((os.environ.get("SOTTO_CALENDAR_NUDGES") or "").strip() or "1") != "0"
+
+
+def _raw_others(ev: dict, self_email: str) -> list:
+    """The OTHER humans on a RAW wire event as {name, email, status} — same self/room skips as
+    _other_attendee_rows, plus the responseStatus a decline is detected from."""
+    rows = []
+    for a in (ev.get("attendees") or []):
+        if isinstance(a, str):
+            a = {"email": a}
+        if not isinstance(a, dict):
+            continue
+        em = _s(a.get("email") or a.get("address")).lower()
+        if em and (em == self_email or ROOM_MARKER in em):
+            continue
+        if not em and not _s(a.get("displayName") or a.get("name")):
+            continue
+        rows.append({"name": _s(a.get("displayName") or a.get("name")), "email": em,
+                     "status": _s(a.get("responseStatus")).lower()})
+    return rows
+
+
+def _hours_until(start: str, now_utc: datetime):
+    """Hours from now until a timed start, or None for all-day/naive/unparseable — the same
+    "never act on a guess" rule the tap applies."""
+    if DATE_RE.match(_s(start)):
+        return None
+    dt = _parse_aware(start)
+    if dt is None:
+        return None
+    return (dt - now_utc).total_seconds() / 3600.0
+
+
+def _wall(start: str) -> str:
+    """'11:00 AM' from an ISO start, best-effort — the human half of the change sentence."""
+    dt = _parse_aware(start)
+    if dt is None:
+        return ""
+    return dt.strftime("%-I:%M %p") if os.name != "nt" else dt.strftime("%I:%M %p").lstrip("0")
+
+
+def calendar_changes(baseline: list, current: list, now_utc: datetime, self_email: str) -> list:
+    """The diff that matters, as candidate dicts — pure, so it tests like ended_meetings.
+    Four kinds, each one sentence: a NEW event with another human starting within
+    CHANGE_WINDOW_HOURS is a last-minute invite; an attendee whose responseStatus turned
+    "declined" on a meeting within DECLINE_WINDOW_HOURS is a decline; a changed start on a
+    meeting within the window is a move; an event that vanished (or turned status=cancelled)
+    within the window is a cancellation. Skipped, silently: all-day events, solo blocks,
+    internal-only standups (the tap's own rule), and anything already past."""
+    old_by_id = {_s(e.get("id")): e for e in baseline if _s(e.get("id"))}
+    new_by_id = {_s(e.get("id")): e for e in current if _s(e.get("id"))}
+    out = []
+
+    def _relevant(ev, window_h, allow_started_min=0.0):
+        h = _hours_until(_s(ev.get("start")), now_utc)
+        return h is not None and (-allow_started_min / 60.0) <= h <= window_h
+
+    def _eligible(ev):
+        others = _raw_others(ev, self_email)
+        if not others:
+            return None
+        if _is_internal_standup(_s(ev.get("summary")), others, self_email):
+            return None
+        return others
+
+    for eid, ev in new_by_id.items():
+        others = _eligible(ev)
+        if others is None:
+            continue
+        summary, start = _s(ev.get("summary")), _s(ev.get("start"))
+        old = old_by_id.get(eid)
+        if old is None:
+            if _relevant(ev, CHANGE_WINDOW_HOURS, allow_started_min=INVITE_GRACE_MIN):
+                out.append({"kind": "invited", "key": f"{eid}:invited:{start}",
+                            "summary": summary, "start": start, "old_start": "",
+                            "who": "", "attendees": others})
+            continue
+        old_start = _s(old.get("start"))
+        if old_start and start and old_start != start and (
+                _relevant(ev, CHANGE_WINDOW_HOURS) or
+                _relevant(old, CHANGE_WINDOW_HOURS)):
+            out.append({"kind": "moved", "key": f"{eid}:moved:{start}",
+                        "summary": summary, "start": start, "old_start": old_start,
+                        "who": "", "attendees": others})
+        if _relevant(ev, DECLINE_WINDOW_HOURS):
+            old_status = {r["email"]: r["status"] for r in _raw_others(old, self_email) if r["email"]}
+            for r in others:
+                if (r["email"] and r["status"] == "declined"
+                        and old_status.get(r["email"], "") != "declined"):
+                    out.append({"kind": "declined", "key": f"{eid}:declined:{r['email']}",
+                                "summary": summary, "start": start, "old_start": "",
+                                "who": r["name"] or r["email"], "attendees": others})
+    for eid, old in old_by_id.items():
+        gone = eid not in new_by_id
+        cancelled = not gone and _s(new_by_id[eid].get("status")).lower() == "cancelled"
+        if not (gone or cancelled):
+            continue
+        others = _eligible(old)
+        if others is None or not _relevant(old, CHANGE_WINDOW_HOURS):
+            continue
+        out.append({"kind": "cancelled", "key": f"{eid}:cancelled",
+                    "summary": _s(old.get("summary")), "start": _s(old.get("start")),
+                    "old_start": "", "who": "", "attendees": others})
+    out.sort(key=lambda c: c["start"])
+    return out
+
+
+def change_event(cand: dict) -> dict:
+    """The synthetic event triage_event.py's calendar_change branch consumes. `text` is the human
+    sentence the Record and the agent both read — composed HERE so detection and phrasing can't
+    drift apart. `timestamp` is now: the change just happened, whatever the meeting's time."""
+    when = _wall(cand["start"])
+    title = cand["summary"] or "a meeting"
+    kind = cand["kind"]
+    if kind == "declined":
+        text = f"{cand['who']} just declined your {when or title}" + (f" — {title}" if when else "")
+    elif kind == "invited":
+        first = next((r["name"] or r["email"] for r in cand["attendees"]), "")
+        text = f"last-minute invite: {title} at {when}" + (f" with {first}" if first else "")
+    elif kind == "moved":
+        text = f"{title} moved to {when}" + (f" (was {_wall(cand['old_start'])})" if cand.get("old_start") else "")
+    else:
+        text = f"your {when or ''} {title} was cancelled".replace("  ", " ")
+    return {
+        "source": CALENDAR_CHANGE_SOURCE,
+        "rowid": cand["key"],
+        "change": kind,
+        "timestamp": _iso(),
+        "summary": cand["summary"],
+        "start": cand["start"],
+        "old_start": cand.get("old_start") or "",
+        "who": cand.get("who") or "",
+        "attendees": cand["attendees"],
+        "is_from_me": False,
+        "text": text,
+    }
+
+
+def change_tick(now_utc: datetime | None = None) -> int:
+    """One calendar-diff pass, riding the refresh thread's clock right after the tap. Returns how
+    many changes were dispatched. First tick (or first after restart) only sets the baseline."""
+    if not calendar_nudges_enabled():
+        return 0
+    current = _LAST_RAW["events"]
+    if current is None:
+        return 0                              # no gather has run yet this process
+    baseline = _CHANGE_BASELINE["events"]
+    if baseline is None:
+        _CHANGE_BASELINE["events"] = current
+        return 0
+    now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
+    self_email = _self_email([e for e in map(_norm_cal_event, current) if e])
+    cands = calendar_changes(baseline, current, now_utc, self_email)
+    dispatched, all_ok = 0, True
+    for cand in cands:
+        try:
+            ok = bool(HOOKS["calendar_change"](change_event(cand)))
+        except Exception as e:  # noqa: BLE001 — a broken dispatch must never kill the refresh thread
+            print(f"[sotto] calendar change error: {e}", flush=True)
+            ok = False
+        if ok:
+            dispatched += 1
+        else:
+            all_ok = False
+    if all_ok:
+        _CHANGE_BASELINE["events"] = current  # every change made it — the diff is settled
+    return dispatched
+
+
 def start_refresh_thread():
     """Start the calendar refresh daemon at server boot (same pattern as the Gmail poll and the
     release-valve heartbeat). SOTTO_CALENDAR_REFRESH_SECS=0 disables it. Refreshes IMMEDIATELY
@@ -582,6 +779,10 @@ def start_refresh_thread():
                 tap_tick()
             except Exception as e:  # noqa: BLE001 — nor may the tap
                 print(f"[sotto] meeting tap tick error: {e}", flush=True)
+            try:
+                change_tick()
+            except Exception as e:  # noqa: BLE001 — nor may the calendar diff
+                print(f"[sotto] calendar change tick error: {e}", flush=True)
             time.sleep(max(secs, 60))
 
     t = threading.Thread(target=_loop, daemon=True)

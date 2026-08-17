@@ -2494,15 +2494,23 @@
     setView(skeletonView(2));
     Promise.all([
       api("/api/learned"),
-      api("/api/voice").catch(function () { return null; })
+      api("/api/voice").catch(function () { return null; }),
+      api("/api/master").catch(function () { return null; })
     ]).then(function (results) {
       if (seq !== state.renderSeq) return;
       var data = results[0] || {};
       var voice = results[1];
+      var master = results[2];
       var frag = document.createDocumentFragment();
       frag.appendChild(el("p", "eyebrow", "Learned"));
       frag.appendChild(el("h1", "view-title", "What Sotto has learned"));
       frag.appendChild(el("p", "view-sub", "How Sotto writes as you, and the rules you've taught it."));
+
+      // Your standing file — knowledge/master.md, the always-in-context memory. Edits ride
+      // POST /api/master → the skills tree's master_file.py (the same writer chat uses).
+      var masterWrap = el("div");
+      frag.appendChild(masterWrap);
+      paintMaster(seq, masterWrap, master);
 
       // Your voice — an editorial summary, not a stat grid.
       frag.appendChild(ledgerCap("Your voice", null));
@@ -2615,6 +2623,92 @@
       }
     }
     container.appendChild(list);
+  }
+
+  /* The standing file: four recommended sections (plus any custom ones the file carries), each a
+     row with an Edit that swaps in a textarea. Save = op:set (empty text = op:remove) through the
+     one writer; the cap error from the CLI surfaces verbatim. */
+  var MASTER_SECTIONS = [
+    { name: "About", sub: "Who you are and what you do." },
+    { name: "People", sub: "Partners, colleagues, family — the cast around you." },
+    { name: "Priorities", sub: "What you're focused on right now." },
+    { name: "Procedures", sub: "Standing rules for how you work — the load-bearing one." }
+  ];
+
+  function paintMaster(seq, container, data) {
+    container.replaceChildren();
+    var d = (data && typeof data === "object") ? data : {};
+    var have = {};
+    var sections = Array.isArray(d.sections) ? d.sections : [];
+    for (var i = 0; i < sections.length; i++) {
+      have[str(sections[i].name)] = str(sections[i].text);
+    }
+    container.appendChild(ledgerCap("Your standing file",
+      capCount((d.chars || 0) + " / " + (d.cap || 8000) + " chars")));
+    container.appendChild(el("p", "cap-sub",
+      "Who you are, your people, your priorities, and your standing rules — in your own words, " +
+      "included in every brief and meeting prep. Also editable from chat: “Sotto, standing rule: …”"));
+    var list = el("div", "ledger");
+    var rows = MASTER_SECTIONS.slice();
+    Object.keys(have).forEach(function (name) {
+      var known = MASTER_SECTIONS.some(function (s) { return s.name.toLowerCase() === name.toLowerCase(); });
+      if (!known) rows.push({ name: name, sub: "" });      // custom sections render too
+    });
+    rows.forEach(function (spec) {
+      list.appendChild(masterRow(seq, spec, have[spec.name] || ""));
+    });
+    container.appendChild(list);
+  }
+
+  function masterRow(seq, spec, text) {
+    var row = el("div", "ledger-row");
+    var mainCol = el("div", "row-main");
+    mainCol.appendChild(el("p", "fact-text", spec.name));
+    if (spec.sub) mainCol.appendChild(el("p", "fact-meta", spec.sub));
+    var body = el("p", "voice-prose", text || "(empty — add it here, or tell Sotto in chat)");
+    mainCol.appendChild(body);
+    var errEl = el("p", "inline-error");
+    errEl.hidden = true;
+    mainCol.appendChild(errEl);
+    row.appendChild(mainCol);
+
+    var actions = el("div", "row-actions");
+    var editBtn = button("text-action", text ? "edit" : "add", function () {
+      editBtn.disabled = true;
+      var ta = document.createElement("textarea");
+      ta.className = "edit-textarea";
+      ta.rows = 4;
+      ta.value = text;
+      var save = button("text-action", "save", function () {
+        save.disabled = true;
+        var val = ta.value.trim();
+        var payload = val ? { op: "set", section: spec.name, text: val }
+                          : { op: "remove", section: spec.name };
+        apiPost("/api/master", payload)
+          .then(function () {
+            if (seq !== state.renderSeq) return;
+            toast("Saved to your standing file.");
+            viewLearned();
+          })
+          .catch(function (err) {
+            save.disabled = false;
+            // The cap refusal carries its own sentence (which section to trim) — surface it.
+            if (!err || !err.handled) {
+              showInlineError(errEl, (err && err.code) || "That didn't save — try again");
+            }
+          });
+      });
+      var cancel = button("text-action", "cancel", function () { viewLearned(); });
+      body.replaceWith(ta);
+      var btnRow = el("div", "row-actions");
+      btnRow.appendChild(save);
+      btnRow.appendChild(cancel);
+      mainCol.appendChild(btnRow);
+      ta.focus();
+    });
+    actions.appendChild(editBtn);
+    row.appendChild(actions);
+    return row;
   }
 
   function voiceRow(sample, repaint) {

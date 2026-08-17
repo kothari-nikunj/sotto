@@ -963,6 +963,15 @@ print(json.dumps({"ok": False, "error": "fact not found: f_x"}))
 sys.exit(2)
 """
 
+# master_file.py speaks positional-verb argv (set --section N --text T), so its fake records the
+# raw argv list rather than knowledge_edit's k=v pairs.
+FAKE_MASTER_CLI = """\
+import json, sys
+with open({rec!r}, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+print(json.dumps({{"ok": True, "chars": 42, "sections": {{}}}}))
+"""
+
 REAL_PREFS = {
     "deprioritization_hints": ["Bob|reply", "Newsletter|digest"],
     "approval_defaults": {"Sarah Chen|reply": "one_tap"},
@@ -1010,7 +1019,46 @@ def _audit_writes(root):
 
 WRITE_REQS = (("/api/people/sarah-chen/facts", {"op": "archive", "fact_id": "f_aaa"}),
               ("/api/loops", {"anchor_key": "thread:abc", "op": "resolve"}),
-              ("/api/prefs", {"op": "delete", "list": "edit_heavy", "value": "Bob|reply"}))
+              ("/api/prefs", {"op": "delete", "list": "edit_heavy", "value": "Bob|reply"}),
+              ("/api/master", {"op": "set", "section": "About", "text": "a line"}))
+
+
+def test_master_card_reads_the_file_and_writes_through_the_one_writer(tmp_path):
+    """GET /api/master is a read-only window (sections parsed, cap stated); POST rides the skills
+    tree's master_file.py with verb-style argv; invalid op → 400 before any subprocess; skills tree
+    absent → 503, never a silent no-op."""
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    rec = os.path.join(str(tmp_path), "master_calls.jsonl")
+    fake = os.path.join(str(tmp_path), "fake_master_file.py")
+    _write(fake, FAKE_MASTER_CLI.format(rec=rec))
+    m._find_sotto_script = lambda *rel: fake
+    _write(os.path.join(str(tmp_path), "knowledge", "master.md"),
+           "## About\nA partner at FPV.\n\n## Procedures\n- Never book Fridays.\n")
+    try:
+        cookie, authed = _login_with_csrf(base)
+        code, body, _ = _get(base, "/api/master", headers=cookie)
+        data = json.loads(body)
+        assert code == 200 and data["present"] is True and data["cap"] == 8000
+        assert [s["name"] for s in data["sections"]] == ["About", "Procedures"]
+        assert "Never book Fridays." in data["sections"][1]["text"]
+        code, body, _ = _post_json(base, "/api/master",
+                                   {"op": "set", "section": "Priorities", "text": "Fund III."},
+                                   headers=authed)
+        assert code == 200
+        with open(rec) as f:
+            argv = json.loads(f.read().strip().splitlines()[-1])
+        assert argv == ["set", "--section", "Priorities", "--text", "Fund III."]
+        code, _, _ = _post_json(base, "/api/master", {"op": "nuke", "section": "About"},
+                                headers=authed)
+        assert code == 400
+        assert len(open(rec).read().strip().splitlines()) == 1   # refused before any subprocess
+        m._find_sotto_script = lambda *rel: None
+        code, _, _ = _post_json(base, "/api/master",
+                                {"op": "set", "section": "About", "text": "x"}, headers=authed)
+        assert code == 503
+    finally:
+        srv.shutdown()
 
 
 def test_write_endpoints_enforce_session_and_csrf(tmp_path, monkeypatch):
