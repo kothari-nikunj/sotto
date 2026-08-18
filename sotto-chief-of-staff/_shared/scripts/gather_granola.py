@@ -25,7 +25,8 @@ Modes:
   gather_google — the brief still runs, honestly Granola-less).
 
 Usage: python3 gather_granola.py [--out P] [--days N] [--transcripts-since-hours H] [--rest]
-Output: {"meetings": [{title, date, time, attendee_emails, your_notes, ai_summary[, transcript]}]}
+Output: {"meetings": [{meeting_id, title, start, end, date, time, attendee_emails,
+                        your_notes, ai_summary[, transcript]}]}
         + "warnings": [...] when anything went wrong (compose_brief marks granola unavailable on it).
 On ConnectorAuthError the one-line file $SOTTO_DATA/connectors/granola.error is written (the
 receiver's /setup tile reads that exact path); a successful gather deletes it.
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import html
 import json
 import os
 import re
@@ -95,12 +97,33 @@ def _parse_dt(v):
             dt = dt.replace(tzinfo=datetime.timezone.utc)
         return dt.astimezone(datetime.timezone.utc)
     except ValueError:
-        return None
+        # Granola's current MCP renders timestamps for humans inside its XML-ish response, e.g.
+        # `Aug 17, 2026 2:00 PM PDT`, rather than returning the ISO values its older JSON shape used.
+        # Parse the small, closed set of zone abbreviations the service emits so --days and the
+        # follow-up window still mean what they say. Unknown display formats remain non-fatal.
+        m = re.fullmatch(r"([A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M)(?: ([A-Z]{2,4}))?", v.strip())
+        if not m:
+            return None
+        offsets = {
+            "UTC": 0, "GMT": 0, "PST": -8, "PDT": -7, "MST": -7, "MDT": -6,
+            "CST": -6, "CDT": -5, "EST": -5, "EDT": -4,
+        }
+        zone = m.group(2) or "UTC"
+        if zone not in offsets:
+            return None
+        try:
+            parsed = datetime.datetime.strptime(m.group(1), "%b %d, %Y %I:%M %p")
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=datetime.timezone(
+            datetime.timedelta(hours=offsets[zone]))).astimezone(datetime.timezone.utc)
 
 
 def _meeting_dt(m: dict):
     """The meeting's timestamp, tolerant of field-name variants (MCP vs REST vs cache shapes)."""
-    for k in ("start_time", "date", "start", "created_at", "createdAt", "startTime"):
+    # Exact instants beat the lossy display/date field. A raw item can carry both; choosing `date`
+    # first turns a meeting later today into midnight and makes the transcript window think it ended.
+    for k in ("start_time", "startTime", "start", "created_at", "createdAt", "date"):
         dt = _parse_dt(m.get(k))
         if dt is not None:
             return dt
@@ -109,9 +132,12 @@ def _meeting_dt(m: dict):
 
 def map_meeting(m: dict) -> dict:
     """Map a raw Granola meeting/note (MCP tool result OR REST /notes item) into the EXISTING
-    granola_meetings shape: {title, date, time, attendee_emails, your_notes, ai_summary}."""
+    granola_meetings shape. Keep the source id + full instant: downstream capture uses those for
+    exact rerun dedup and must never reconstruct "when" from a lossy date/time pair."""
     date, tstr = "", ""
-    dt = _parse_dt(m.get("start_time") or m.get("created_at") or m.get("createdAt") or m.get("start"))
+    dt = _parse_dt(m.get("start_time") or m.get("startTime") or m.get("start")
+                   or m.get("created_at") or m.get("createdAt"))
+    end_dt = _parse_dt(m.get("end_time") or m.get("endTime") or m.get("end"))
     if dt is not None:
         date = dt.strftime("%Y-%m-%d")
         tstr = dt.strftime("%H:%M")
@@ -131,7 +157,10 @@ def map_meeting(m: dict) -> dict:
         emails.extend(e for e in m["attendee_emails"] if e)
 
     return {
+        "meeting_id": _meeting_id(m),
         "title": m.get("title") or m.get("name") or "Untitled Meeting",
+        "start": dt.isoformat() if dt is not None else None,
+        "end": end_dt.isoformat() if end_dt is not None else None,
         "date": date,
         "time": tstr,
         "attendee_emails": emails,
@@ -153,7 +182,7 @@ def _wants_transcript(m: dict, since_hours: int, now) -> bool:
     if dt is None:
         return False
     hours_ago = (now - dt).total_seconds() / 3600.0
-    return -1 <= hours_ago <= since_hours
+    return 0 <= hours_ago <= since_hours
 
 
 def _extract_transcript(result) -> str | None:
@@ -200,6 +229,61 @@ def _salvage_json(text: str):
     return None
 
 
+def _salvage_meeting_markup(text: str) -> list:
+    """Parse Granola's CURRENT LLM-facing MCP response.
+
+    `list_meetings` and `get_meetings` now return guarded XML-ish prose rather than JSON:
+    `<meetings_data> <meeting id="…" title="…" date="…"> <known_participants>…</…>
+    <summary>…</summary> </meeting>`. It is intentionally not fed to an XML parser: summaries are
+    Markdown and may legally contain characters that are not XML-safe. We recognize only the outer
+    meeting/section tags and attributes, unescape their data, and ignore every instruction/preamble
+    outside those tags. No markup means no salvage.
+    """
+    rows = []
+    for match in re.finditer(r"<meeting\b(?P<attrs>[^>]*)>(?P<body>.*?)</meeting>",
+                             text or "", re.DOTALL | re.IGNORECASE):
+        attrs = {
+            k.lower(): html.unescape(v)
+            for k, _, v in re.findall(r"([A-Za-z_][\w-]*)\s*=\s*([\"'])(.*?)\2",
+                                      match.group("attrs"), re.DOTALL)
+        }
+        mid = attrs.get("id") or attrs.get("meeting_id")
+        if not mid:
+            continue
+        raw_date = attrs.get("date") or attrs.get("start_time") or ""
+        parsed_date = _parse_dt(raw_date)
+        row = {
+            "id": mid,
+            "title": attrs.get("title") or attrs.get("name") or "Untitled Meeting",
+            # An ISO instant restores deterministic --days / transcript-window filtering. Keep an
+            # unrecognized display date verbatim rather than discarding a meeting.
+            "start_time": parsed_date.isoformat() if parsed_date else raw_date,
+        }
+        body = match.group("body")
+
+        participants = re.search(r"<known_participants\b[^>]*>(.*?)</known_participants>",
+                                 body, re.DOTALL | re.IGNORECASE)
+        if participants:
+            participant_text = html.unescape(participants.group(1))
+            row["attendee_emails"] = list(dict.fromkeys(
+                re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+                           participant_text, re.IGNORECASE)))
+
+        for tag, field in (("notes", "notes"), ("summary", "summary"),
+                           ("transcript", "transcript")):
+            section = re.search(fr"<{tag}\b[^>]*>(.*?)</{tag}>", body,
+                                re.DOTALL | re.IGNORECASE)
+            if section and section.group(1).strip():
+                row[field] = html.unescape(section.group(1).strip())
+        rows.append(row)
+    return rows
+
+
+def _salvage_tool_result(text: str):
+    """Structured value from an LLM-facing tool response, JSON first and Granola markup second."""
+    return _salvage_json(text) or _salvage_meeting_markup(text) or None
+
+
 def _as_items(result) -> list:
     """Normalize any tool result into a list of dicts (bare list, single object, or an envelope)."""
     if isinstance(result, dict):
@@ -240,14 +324,24 @@ def _tool_props(tools: list, name: str) -> dict | None:
     return None
 
 
-def _list_args(props: dict | None) -> dict:
+def _list_args(props: dict | None, days: int = 14, now=None) -> dict:
     """Args for the list call. mcp.granola.ai's list_meetings declares NO `limit` and sets
     `additionalProperties: false`, so sending one is a schema violation the server rejects — the
     whole gather then fails empty. Send `limit` only when the tool says it takes one; a server that
     publishes no schema keeps the historical behavior."""
     if props is None:
         return {"limit": LIST_LIMIT}
-    return {"limit": LIST_LIMIT} if "limit" in props else {}
+    args = {"limit": LIST_LIMIT} if "limit" in props else {}
+    # Granola's present schema supports a server-side custom range. Use it rather than asking for the
+    # default 30-day window and hoping every returned display timestamp can be filtered locally.
+    if all(k in props for k in ("time_range", "custom_start", "custom_end")):
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        args.update({
+            "time_range": "custom",
+            "custom_start": (now - datetime.timedelta(days=days)).date().isoformat(),
+            "custom_end": now.date().isoformat(),
+        })
+    return args
 
 
 def _fetch_details(client, detail_tool: str, props: dict | None, ids: list, warnings: list) -> dict:
@@ -258,7 +352,7 @@ def _fetch_details(client, detail_tool: str, props: dict | None, ids: list, warn
 
     def _absorb(result):
         if isinstance(result, str):              # same prose-answer salvage as the list call
-            result = _salvage_json(result) or result
+            result = _salvage_tool_result(result) or result
         for item in _as_items(result):
             mid = _meeting_id(item)
             if mid is not None:
@@ -321,9 +415,10 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
     if detail_tool == list_tool:
         detail_tool = None            # one tool doing both jobs already returned whatever it has
 
-    raw = client.call_tool(list_tool, _list_args(_tool_props(tools, list_tool)), timeout=60)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    raw = client.call_tool(list_tool, _list_args(_tool_props(tools, list_tool), days, now), timeout=60)
     if isinstance(raw, str):                      # prose answer (LLM-facing server) → salvage the data
-        raw = _salvage_json(raw) or raw
+        raw = _salvage_tool_result(raw) or raw
     if isinstance(raw, dict):
         for k in ("meetings", "notes", "items", "results", "data"):
             if isinstance(raw.get(k), list):
@@ -336,7 +431,6 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
                         f"Preview: {repr(raw)[:200]}")
         raw = []
 
-    now = now or datetime.datetime.now(datetime.timezone.utc)
     windowed = [m for m in raw if isinstance(m, dict) and _in_window(m, days, now)]
 
     meetings, by_id = [], {}

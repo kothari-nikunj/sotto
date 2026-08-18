@@ -188,6 +188,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -833,14 +834,15 @@ def _surfaced_path() -> str:
     return os.path.join(_events_dir(), "surfaced.jsonl")
 
 
-def _record_surfaced(verdict: str, cls: str, reason: str, sender: str, event: dict) -> None:
-    """Append one {ts, sender, channel, verdict, reason, class} line to surfaced.jsonl at verdict
+def _record_surfaced(verdict: str, cls: str, reason: str, sender: str, event: dict,
+                     decision_id: str = "") -> None:
+    """Append one {ts, sender, channel, verdict, reason, class, decision_id} line at verdict
     time. ts uses the same ISO-Z format the dashboard's /api/ledger parses, so The Record renders
     these rows as-is. Best-effort — recording must never fail (or slow) the triage."""
     try:
         from sotto_log import bounded_append  # noqa: PLC0415
         ev = event if isinstance(event, dict) else {}
-        line = json.dumps({
+        row = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sender": _s(sender) or _s(ev.get("from")) or _s(ev.get("handle"))
                       or _s(ev.get("contact_jid")) or _s(ev.get("phone")) or "",
@@ -848,7 +850,10 @@ def _record_surfaced(verdict: str, cls: str, reason: str, sender: str, event: di
             "verdict": verdict,
             "reason": _s(reason)[:300],
             "class": cls,
-        })
+        }
+        if decision_id:
+            row["decision_id"] = decision_id
+        line = json.dumps(row)
         bounded_append(_surfaced_path(), line, SURFACED_MAX_BYTES, SURFACED_KEEP_LINES)
     except Exception:  # noqa: BLE001
         pass
@@ -1395,6 +1400,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         return bundle_charged
 
     for e in events:
+        decision_id = uuid.uuid4().hex[:16]
         ctx["held_class"] = ""        # per-event scratch: a Tier-0 cadence demotion writes it
         verdict, cls, reason, name = classify_event(e, ctx)
         held_class = _s(ctx.get("held_class"))
@@ -1457,8 +1463,9 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             queued = True
             _append_queue(cls, name, e, held_class=held_class)
         elif verdict == "agent":
-            agent_events.append({"event": e, "sender": name, "class": cls, "why": reason})
-        _record_surfaced(verdict, cls, reason, name, e)   # the diagnostic ledger, every verdict
+            agent_events.append({"event": e, "sender": name, "class": cls, "why": reason,
+                                 "decision_id": decision_id})
+        _record_surfaced(verdict, cls, reason, name, e, decision_id)  # decision, not delivery
         reasons.append(reason)
     overall = "agent" if agent_events else ("queue" if queued else "drop")
     bundle = {}
@@ -1629,11 +1636,14 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
                 charged = True
             _stamp_cooldown(cand["thread_key"], now_ts)
             reason = f"held: {cand['cls']}, {int(cand['age'])}m old"
+            decision_id = uuid.uuid4().hex[:16]
             promoted.append({"event": cand["event"], "sender": cand["sender"],
                              "class": cand["held"],
-                             "why": f"promoted from the deferred queue ({reason})"})
+                             "why": f"promoted from the deferred queue ({reason})",
+                             "decision_id": decision_id})
             promoted_idx.add(i)
-            _record_surfaced("promoted", cand["held"], reason, cand["sender"], cand["event"])
+            _record_surfaced("promoted", cand["held"], reason, cand["sender"], cand["event"],
+                             decision_id)
         if not promoted:
             return {"verdict": "drop", "bundle": {},
                     "reason": (f"daily interrupt budget spent ({_budget_cap()} nudges today) — "
@@ -1716,8 +1726,10 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
                     "reason": f"the day's interrupt budget is spent ({_budget_cap()} nudges today)"}
         _stamp_cooldown(cand["thread_key"], now_ts)
         reason = "user promoted from dashboard"
+        decision_id = uuid.uuid4().hex[:16]
         promoted = [{"event": cand["event"], "sender": cand["sender"], "class": cand["held"],
-                     "why": f"{reason} (held: {cand['cls']}, {int(cand['age'])}m old)"}]
+                     "why": f"{reason} (held: {cand['cls']}, {int(cand['age'])}m old)",
+                     "decision_id": decision_id}]
         try:                                 # the promoted entry leaves the queue (atomic rewrite)
             rest = [ln for i, ln in enumerate(lines) if i != idx]
             tmp = _queue_path() + ".tmp"
@@ -1726,7 +1738,7 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
             os.replace(tmp, _queue_path())
         except OSError:
             pass
-        _record_surfaced("promoted", cand["held"], reason, cand["sender"], cand["event"])
+        _record_surfaced("promoted", cand["held"], reason, cand["sender"], cand["event"], decision_id)
     return {"ok": True, "verdict": "agent", "reason": promoted[0]["why"],
             "bundle": {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                        "catchup": False, "promoted": True, "events": promoted}}

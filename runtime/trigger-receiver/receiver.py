@@ -196,7 +196,8 @@ def _deliver_target() -> str:
     return (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip()
 
 
-def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None) -> None:
+def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None,
+                     decision_ids: list | None = None) -> None:
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
     spawned / delivered / empty / failed; `usage` is the run's ground-truth spend (see _read_usage),
@@ -210,35 +211,41 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
             row["detail"] = detail[:300]
         if usage:
             row["usage"] = usage
+        ids = [str(v) for v in (decision_ids or []) if str(v).strip()]
+        if ids:
+            row["decision_ids"] = ids[:20]
         with open(os.path.join(_events_dir(), "delivery.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:  # noqa: BLE001
         pass
 
 
-def _deliver_text(text: str, label: str, usage: dict | None = None) -> None:
+def _deliver_text(text: str, label: str, usage: dict | None = None,
+                  decision_ids: list | None = None) -> bool:
     """Hand one skill's final text to `hermes send`. Silence is a legitimate outcome for every one
     of these skills ("if there's nothing, say nothing"), so an empty run is recorded and NOT sent —
     an empty message would be the busywork theater the standing bars forbid."""
     body = (text or "").strip()
     if not body:
-        _record_delivery(label, "empty", usage=usage)
-        return
+        _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids)
+        return False
     target = _deliver_target()
     try:
         r = subprocess.run(["hermes", "send", "--to", target, "--quiet", "-"],
                            input=body, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS)
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] {label}: delivery FAILED ({type(e).__name__}: {e})", flush=True)
-        _record_delivery(label, "failed", f"{type(e).__name__}: {e}", usage=usage)
-        return
+        _record_delivery(label, "failed", f"{type(e).__name__}: {e}", usage=usage,
+                         decision_ids=decision_ids)
+        return False
     if r.returncode == 0:
-        _record_delivery(label, "delivered", usage=usage)
-        return
+        _record_delivery(label, "delivered", usage=usage, decision_ids=decision_ids)
+        return True
     detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
     # LOUD: a nudge that was decided and then lost is the failure this whole seam exists to end.
     print(f"[sotto] {label}: delivery FAILED to {target} — {detail[:300]}", flush=True)
-    _record_delivery(label, "failed", detail, usage=usage)
+    _record_delivery(label, "failed", detail, usage=usage, decision_ids=decision_ids)
+    return False
 
 
 # Which of the four numbers a usage report may spell differently. We do not own hermes' schema, so
@@ -281,15 +288,69 @@ def _read_usage(path: str | None) -> dict | None:
     return out or None
 
 
-def _spawn_env() -> dict:
+def _spawn_env(run_id: str = "") -> dict:
     """The environment a spawned one-shot inherits. SOTTO_UNATTENDED=1 is the contract that marks
     an UNATTENDED lane: nobody is at the keyboard, so the send-gate downstream must hold anything
     that would reach a human. The interactive gateway is not spawned by us and therefore never
     carries it — that asymmetry IS the design, not an omission."""
-    return {**os.environ, "SOTTO_UNATTENDED": "1"}
+    env = {**os.environ, "SOTTO_UNATTENDED": "1"}
+    if run_id:
+        env["SOTTO_DELIVERY_RUN_ID"] = run_id
+    return env
 
 
-def _spawn_and_deliver(runner: list, prompt: str, label: str) -> None:
+def _delivery_effects_path(run_id: str) -> str:
+    return os.path.join(_events_dir(), f"delivery-effects-{run_id}.json")
+
+
+def _read_delivery_effects(run_id: str) -> dict:
+    try:
+        with open(_delivery_effects_path(run_id), encoding="utf-8") as f:
+            out = json.load(f)
+        return out if isinstance(out, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _finalize_delivery_effects(effects: list) -> bool:
+    pending = [e for e in (effects or []) if isinstance(e, dict)
+               and e.get("kind") in ("chase", "handoff")
+               and str(e.get("anchor_key") or "").strip()]
+    if not pending:
+        return True
+    script = _find_sotto_script("morning-brief", "scripts", "continuity_resolve.py")
+    if not script:
+        print("[sotto] delivered nudge: continuity finalizer not found", flush=True)
+        return False
+    flags = {"chase": "--finalize-chase", "handoff": "--finalize-handoff"}
+    all_ok = True
+    for effect in pending:
+        flag, anchor = flags.get(effect.get("kind")), str(effect.get("anchor_key") or "").strip()
+        if not (flag and anchor):
+            continue
+        finalized, detail = False, ""
+        # The operation is idempotent, so one immediate retry safely covers a transient fork or
+        # volume error. A delivery that landed must not silently leave its chase uncounted.
+        for _attempt in range(2):
+            try:
+                r = subprocess.run([sys.executable, script, flag, anchor], capture_output=True,
+                                   text=True, timeout=30, env=_skill_env())
+                detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+                payload = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+                if r.returncode == 0 and isinstance(payload, dict) and payload.get("ok") is True:
+                    finalized = True
+                    break
+            except Exception as e:  # noqa: BLE001 — retry once, then make the mismatch loud
+                detail = f"{type(e).__name__}: {e}"
+        if not finalized:
+            all_ok = False
+            print(f"[sotto] delivered nudge: failed to finalize {effect.get('kind')} "
+                  f"{anchor} — {detail[:300]}", flush=True)
+    return all_ok
+
+
+def _spawn_and_deliver(runner: list, prompt: str, label: str,
+                       decision_ids: list | None = None) -> None:
     """Run one skill one-shot and deliver whatever it says. Returns IMMEDIATELY — the work happens
     on a daemon thread, because every caller is either an HTTP handler or a heartbeat tick and none
     of them may block for a brief. The thread swallows its own exceptions, like every other daemon
@@ -325,31 +386,45 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str) -> None:
         except OSError:
             usage_path = None
 
+    run_id = secrets.token_hex(12)
+
     def _work():
         try:
             try:
                 r = subprocess.run([*argv, prompt], capture_output=True, text=True,
-                                   timeout=ONESHOT_TIMEOUT_SECS, env=_spawn_env())
+                                   timeout=ONESHOT_TIMEOUT_SECS, env=_spawn_env(run_id))
             except Exception as e:  # noqa: BLE001
                 print(f"[sotto] {label}: skill run failed ({type(e).__name__}: {e})", flush=True)
                 _record_delivery(label, "failed", f"run: {type(e).__name__}: {e}",
-                                 usage=_read_usage(usage_path))
+                                 usage=_read_usage(usage_path), decision_ids=decision_ids)
                 return
             usage = _read_usage(usage_path)
+            effects = _read_delivery_effects(run_id)
+            correlated_ids = list(dict.fromkeys([
+                *[str(v) for v in (decision_ids or []) if str(v).strip()],
+                *[str(v) for v in (effects.get("decision_ids") or []) if str(v).strip()],
+            ]))
             if r.returncode != 0:
                 detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
                 print(f"[sotto] {label}: skill exited {r.returncode} — {detail[:300]}", flush=True)
-                _record_delivery(label, "failed", f"exit {r.returncode}: {detail}", usage=usage)
+                _record_delivery(label, "failed", f"exit {r.returncode}: {detail}", usage=usage,
+                                 decision_ids=correlated_ids)
                 return
-            _deliver_text(r.stdout, label, usage=usage)
+            delivered = _deliver_text(r.stdout, label, usage=usage, decision_ids=correlated_ids)
+            if delivered:
+                _finalize_delivery_effects(effects.get("effects") or [])
         finally:
             if usage_path:
                 try:
                     os.unlink(usage_path)
                 except OSError:
                     pass
+            try:
+                os.unlink(_delivery_effects_path(run_id))
+            except OSError:
+                pass
 
-    _record_delivery(label, "spawned")
+    _record_delivery(label, "spawned", decision_ids=decision_ids)
     threading.Thread(target=_work, name=f"deliver-{label}", daemon=True).start()
 
 
@@ -676,7 +751,15 @@ def run_event_skill(bundle_path: str) -> None:
         f"group chat. If the bundle is missing or empty, say nothing and end the turn. Deliver as "
         f"Sotto, never as 'Hermes Agent'."
     )
-    _spawn_and_deliver(runner, prompt, "event")
+    decision_ids = []
+    try:
+        with open(bundle_path, encoding="utf-8") as f:
+            bundle = json.load(f) or {}
+        decision_ids = [e.get("decision_id") for e in (bundle.get("events") or [])
+                        if isinstance(e, dict) and e.get("decision_id")]
+    except (OSError, ValueError, TypeError):
+        pass
+    _spawn_and_deliver(runner, prompt, "event", decision_ids=decision_ids)
 
 
 def _stage_bundle(bundle: dict) -> str:

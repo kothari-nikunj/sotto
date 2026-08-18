@@ -261,7 +261,7 @@ const N = [
    d:'<p>The same gather with Gmail skipped, run on a timer and cached for {calendar.ttl_secs:min} minutes. <strong>One calendar cache, not two</strong> — the dashboard and the funnel\'s in-meeting hold read the same snapshot, because two caches is how drift starts.</p>'},
   {id:'granola', l:'Granola', s:'gather_granola.py', x:488, w:126, layer:'sources',
    k:'Connected service', file:'_shared/scripts/gather_granola.py',
-   d:'<p>Meeting notes and transcripts over remote MCP. Sotto registers <em>itself</em> with Granola\'s auth server (discovery → dynamic client registration → PKCE); the tokens stay on your volume and no third party brokers them.</p><p>It went silently empty for weeks once, because only its LIST tool was being called and the list carries no content. It now takes two calls — list, then fetch details — and a gather that fails <strong>says so</strong> in the brief instead of reading as a quiet week.</p>'},
+   d:'<p>Meeting notes and transcripts over remote MCP. The gather preserves the source meeting id and exact start/end, so a rerun is identifiable and a meeting later today is not mistaken for one that ended.</p><p>Sotto registers <em>itself</em> with Granola\'s auth server (discovery → dynamic client registration → PKCE); the tokens stay on your volume. It fetches detail after the list call, and a gather that fails <strong>says so</strong>.</p>'},
   {id:'search', l:'Search ladder', s:'web_research.py', x:630, w:170, layer:'sources',
    k:'Research', file:'_shared/scripts/web_research.py',
    d:'<p>One seam, one rule: <strong>for each capability, the first provider whose key is present answers.</strong> <code>web_search</code>: Exa → Gemini grounding. <code>deep_research</code>: Parallel → Exa → Gemini.</p><p>Presence of the credential is the whole test — nothing is configured, enabled or chosen anywhere else. A provider that errors falls through; nothing left is reported as <em>research unavailable</em>, never answered from memory.</p>'},
@@ -300,7 +300,7 @@ const N = [
    d:'<p>The gather fork, its {calendar.ttl_secs:min}-minute TTL, the refresh thread, and the post-meeting tap detector.</p><p>The funnel refuses to hold on a snapshot older than {calendar.stale_intervals:word} refresh intervals, or one stamped with any day but the local today. <strong>Never act on a stale belief about where you are.</strong></p>'},
   {id:'m-conn', l:'connectors.py', s:'OAuth 2.1 + write_json', x:554, w:162, layer:'receiver',
    k:'Module', file:'runtime/trigger-receiver/connectors.py',
-   d:'<p>The connector registry, both kinds. <code>SERVICES</code> are the ones with an auth server to click through (Granola). <code>KEY_PROVIDERS</code> are the ones without (Exa, Parallel) — rendered read-only beside them, because a page that shows only the connectors with a button answers "is Exa on?" with silence.</p><p>Its second job is the small one that matters everywhere: <code>write_json</code>, tmp-at-0600 then <code>os.replace</code> — the one atomic write in the whole image.</p>'},
+   d:'<p>The connector registry, both kinds. <code>SERVICES</code> are the ones with an auth server to click through (Granola). <code>KEY_PROVIDERS</code> are the ones without (Exa, Parallel) — rendered read-only beside them.</p><p>Its second job is the receiver\'s shared snapshot writer: <code>write_json</code>, tmp-at-0600 then <code>os.replace</code>. Skill-owned transaction files use the same replace pattern in their owning script.</p>'},
   {id:'m-relay', l:'relay.py', s:'reverse MCP, no tunnel', x:732, w:158, layer:'receiver',
    k:'Module', file:'runtime/trigger-receiver/relay.py',
    d:'<p>The Mac long-polls <code>/bridge/poll</code>; Hermes calls <code>/mcp</code> locally. The mechanism that lets a cloud agent read a laptop\'s iMessage database <strong>without the laptop accepting a single inbound connection</strong>.</p>'},
@@ -346,7 +346,7 @@ const N = [
    d:'<p>SUPERSEDE semantics, similarity dedup, provenance, exact-identifier auto-merge, suggestions for the rest. <strong>Every path writes through here</strong> — brief extraction, grounded research, a texted correction, a dashboard tap.</p><p>Two files sharing an exact identifier are one human and auto-merge. Name similarity only ever <em>suggests</em>, forever: name-slug keying is the original identity bug, and two different John Smiths are two people whatever their names say.</p>'},
   {id:'k-cont', l:'continuity_resolve', s:'knowledge/continuity/*.md', x:236, w:186, layer:'memory',
    k:'Memory · the one writer', file:'morning-brief/scripts/continuity_resolve.py',
-   d:'<p>The open-loop ledger. Resolution is deterministic and runs <em>before</em> the model: replied threads close, passed meetings close, a deadline {continuity.deadline_grace_days:word} days gone expires what you owe, terminal items are pruned after {continuity.terminal_retention_days} days.</p><p>The anchor is an <strong>identity, never a label</strong>: a group ask keys on the group\'s own platform id, a person\'s on the person. Rename the group and it is still the one debt.</p>',
+   d:'<p>The open-loop ledger. All mutation paths use its lock and atomic replace. Ordinary replies close what you owe; they never close what someone owes you. A future deadline prevents age expiry, and source-backed Granola commitments require an explicit close.</p><p>Before a Granola write, code checks the meeting id, copied quote, named owner and action/deliverable words against the gathered source; ambiguity drops instead of opening a loop. Occurrence identity is meeting id + direction + verbatim source snippet. The model may suggest one existing anchor; code accepts only a live same-direction match, so no fuzzy matcher is needed.</p>',
    pts:['Owed to you: chase-due after {chase.after_days} silent days, at most {chase.max} chases','Only a DELIVERED chase counts — one quiet hours swallowed is not one of them','After the last one it asks you in plain words, once']},
   {id:'k-prefs', l:'preferences.json', s:'stated + learned', x:438, w:164, layer:'memory',
    k:'Memory · the one shared-write file', file:'_shared/scripts/preferences.py',
@@ -362,7 +362,7 @@ const N = [
   // ── delivery ──
   {id:'d-spawn', l:'_spawn_and_deliver', s:'the ONE place a skill runs', x:30, w:196, layer:'delivery',
    k:'Delivery', file:'runtime/trigger-receiver/receiver.py',
-   d:'<p>Runs the skill one-shot (<code>$SOTTO_RUN_SKILL</code>, default <code>hermes -z</code>) on a daemon thread, then hands its final text to <code>hermes send</code>.</p><p><strong>This used to be fire-and-forget</strong>, on the belief that the skill delivered itself. It doesn\'t: <code>-z</code> prints to stdout, and a detached process\'s stdout goes nowhere — so five of the six producers above wrote every nudge into a sink. The crons were fine only because they carry <code>--deliver</code>.</p><p>Starting is synchronous (a missing runner still raises, because the brief claim is released on exactly that); only the outcome is async.</p>'},
+   d:'<p>Runs the skill one-shot (<code>$SOTTO_RUN_SKILL</code>, default <code>hermes -z</code>) on a daemon thread, then hands its final text to <code>hermes send</code>.</p><p>Each verdict carries a <code>decision_id</code>. A proactive chase leaves one run-scoped effects file; the receiver applies it only after the host send succeeds, then deletes it either way. A failed send cannot count as “already nudged” or consume a chase.</p>'},
   {id:'d-send', l:'hermes send', s:'--to $SOTTO_CRON_DELIVER', x:242, w:172, layer:'delivery',
    k:'Delivery', file:'adapters/hermes/start.sh',
    d:'<p>Pipes text to whichever platform Hermes is already configured for, targeting the home channel — <strong>the same variable the crons are registered with</strong>, so a nudge and a brief can never land in different places.</p><p>An empty run is recorded and never sent. Silence is the correct, common output for every one of these skills.</p>'},
@@ -371,7 +371,7 @@ const N = [
    d:'<p>WhatsApp by default, but nothing about Sotto assumes it — Telegram, Discord, Slack and Signal are the same one variable. A nudge waits for a WhatsApp link only when WhatsApp is the channel; on any other there is nothing to probe, so a Telegram user is never silently denied the valve or the tap.</p>'},
   {id:'d-receipt', l:'delivery.jsonl', s:'spawned · delivered · empty · failed', x:610, w:204, layer:'delivery',
    k:'Delivery · the receipt', file:'$SOTTO_DATA/events/delivery.jsonl',
-   d:'<p>The fact that was missing. <em>Deciding</em> to nudge and <em>delivering</em> a nudge were one thing, so The Record could say "Nudged you" about a message nobody ever received — and did, for weeks.</p><p>Now they are two facts, braided together on the Record page: the verdict, and whether it landed.</p>'}
+   d:'<p>The fact that was missing. <em>Deciding</em> and <em>delivering</em> are separate rows joined by <code>decision_id</code>.</p><p>Only a delivered receipt is allowed back into the next brief as “already nudged”; failed and empty runs remain diagnostic facts, not user-visible outcomes.</p>'}
 ];
 
 /* ═══════════════ edges ═══════════════ */
@@ -434,6 +434,7 @@ const E = [
   {a:'d-spawn',  b:'d-send',   t:'deliver', l:'the one-shot\'s final text'},
   {a:'d-send',   b:'d-chan',   t:'deliver', l:'the home channel'},
   {a:'d-spawn',  b:'d-receipt',t:'write',   l:'did it actually land?'},
+  {a:'d-receipt',b:'s-compose', t:'data',    l:'only correlated delivered nudges'},
   {a:'d-receipt',b:'m-dash',   t:'data',    l:'the Record'},
   {a:'f-record', b:'m-dash',   t:'data',    l:'the Record'}
 ];
@@ -472,6 +473,7 @@ const SHARED_FILES = [
   ["events/last_digest.txt", "skills (digest_check.py --stamp, and the brief that wins the claim)", "skills (the digest window), dashboard (/api/cadence)"],
   ["events/queue.jsonl · events/surfaced.jsonl", "skills (triage_event.py)", "dashboard (the Record + the waiting room), skills (compose_brief.py)"],
   ["events/delivery.jsonl", "receiver (the ONE writer)", "dashboard (the Record, source: delivery) — closing rows carry a usage object"],
+  ["events/delivery-effects-&lt;run&gt;.json", "skills (proactive_scan.py, one receiver-scoped run)", "receiver — apply after successful send, then delete"],
   ["events/sends.jsonl", "skills (google_action.py)", "you — one line per send/reply attempt, allowed or refused"],
   ["cache/calendar_today.json", "calcache", "skills (the in-meeting hold)"],
   ["cache/meeting_taps.json", "calcache", "calcache (exactly-once tap record)"],

@@ -180,6 +180,13 @@ fi
 #    OpenRouter and need OPENROUTER_API_KEY). The key is set as GEMINI_API_KEY/GOOGLE_API_KEY below.
 hermes config set model gemini-3.7-flash || true
 hermes_set_if_supported scheduler.enabled true
+# Sotto's scheduled output is already written as the exact user-facing message. Hermes wraps cron
+# deliveries by default with "Cronjob Response", the job id, and a management footer; that turns a
+# one-line human nudge into a system notification. Disable the global wrapper so the native cron
+# fallback lands through the same clean presentation as Bridge-triggered briefs and nudges. This also
+# keeps personal `user-` routines clean. Older Hermes builds may not expose the key, so use the same
+# capability probe as the legacy scheduler setting instead of making boot depend on it.
+hermes_set_if_supported cron.wrap_response false
 # Timezone — Hermes cron + the system-prompt time injection default to UTC. Set the user's IANA zone so
 # the 6:30/17:30 briefs fire at their LOCAL morning/evening, AND so `hermes cron create` below doesn't
 # block on an interactive timezone PROMPT at boot (a non-interactive boot fails the prompt → NO cron

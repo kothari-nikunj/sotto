@@ -22,9 +22,18 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))            # sotto-chief-of-sta
 HERMES = os.path.dirname(ROOT)                              # sotto-hermes/
 START_SH = os.path.join(HERMES, "adapters", "hermes", "start.sh")
 CRONS_JSON = os.path.join(HERMES, "adapters", "hermes", "crons.json")
+INSTALL_SH = os.path.join(HERMES, "adapters", "hermes", "install.sh")
+CONFIG_TEMPLATE = os.path.join(HERMES, "adapters", "hermes", "config.template.yaml")
+RAILWAY_MD = os.path.join(HERMES, "RAILWAY.md")
 
 with open(START_SH, encoding="utf-8") as f:
     START = f.read()
+with open(INSTALL_SH, encoding="utf-8") as f:
+    INSTALL = f.read()
+with open(CONFIG_TEMPLATE, encoding="utf-8") as f:
+    CONFIG = f.read()
+with open(RAILWAY_MD, encoding="utf-8") as f:
+    RAILWAY = f.read()
 
 # The fixture is shaped like `hermes cron list`: a hex job id opens each block, everything up to the
 # next id belongs to it. Deliberately nasty: duplicate system jobs (the historical pile), the retired
@@ -183,3 +192,14 @@ def test_start_sh_row_parsing_is_untouched(tmp_path):
                           text=True, env=env, timeout=30, check=True).stdout.strip().splitlines()
     parsed = {r.split("\t")[0]: r.split("\t")[1] for r in rows}
     assert "sotto-midday-digest" not in parsed and parsed["sotto-proactive"] == "*/30 * * * *"
+
+
+def test_hermes_cron_delivers_sotto_copy_without_the_scheduler_envelope():
+    """Cloud boot, local install, and the copyable config template all disable Hermes' default
+    `Cronjob Response: ... (job_id: ...)` wrapper. Otherwise the native proactive fallback is the
+    one Sotto lane that reads like a scheduler notification while Bridge-fired messages read clean."""
+    assert "hermes_set_if_supported cron.wrap_response false" in START
+    assert "hermes config get cron.wrap_response" in INSTALL
+    assert "hermes config set cron.wrap_response false" in INSTALL
+    assert re.search(r"(?m)^cron:\n\s+wrap_response:\s+false(?:\s|#|$)", CONFIG)
+    assert "disables Hermes' generic `Cronjob Response` envelope" in RAILWAY

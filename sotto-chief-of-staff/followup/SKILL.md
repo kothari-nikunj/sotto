@@ -1,6 +1,6 @@
 ---
 name: sotto-followup
-description: Use when the user says "follow up on my meetings" / "what did I commit to" / "post-meeting follow-ups" / "anything to send after my meetings", or after a meeting ends — pull commitments + decisions from the recent meeting transcripts and DRAFT the follow-ups to send. On-demand only (the scheduled end-of-day pass now runs inside the evening brief; the standalone 16:45 cron is retired). Draft only, never auto-send.
+description: Use when the user says "follow up on my meetings" / "what did I commit to" / "open items from my Granola notes" / "post-meeting follow-ups" / "anything to send after my meetings", or after a meeting ends — pull commitments + decisions from recent meeting notes/transcripts, record them in open loops, and DRAFT any follow-ups to send. On-demand only (the scheduled end-of-day pass now runs inside the evening brief; the standalone 16:45 cron is retired). Never auto-send.
 metadata:
   hermes:
     tags: [chief-of-staff, sotto, meetings, continuity]
@@ -27,14 +27,19 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
 
 > Scripts live under `$HOME/.hermes/skills/sotto/`. Use absolute paths.
 
-1. **Gather Granola (with transcripts) — REQUIRED, deterministic (ONE command; don't hand-fetch via
-   MCP tools).** `execute_code`:
+1. **Choose the window, then gather — REQUIRED and deterministic.** Do not hand-fetch via MCP tools.
+   Use the short lane for a just-ended meeting or “follow up on my meetings”:
    ```bash
    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_granola.py" --days 3 --transcripts-since-hours 36
    ```
+   Use the backlog lane for “open items from Granola”, “what did I commit to”, or “did we capture
+   these in open loops” — fourteen days of notes, without paying to fetch old transcripts:
+   ```bash
+   python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_granola.py" --days 14 --transcripts-since-hours 0
+   ```
    It reads the Granola connector token from `/setup` (or falls back to `GRANOLA_API_KEY` REST), lists
-   recent meetings, fetches the full **transcript** for each meeting that ended in the last ~36h, and
-   writes `/tmp/sotto_granola.json` as `{"meetings":[{title, date, time, attendee_emails, your_notes,
+   meetings, fetches full transcripts only for the short lane, and
+   writes `/tmp/sotto_granola.json` as `{"meetings":[{meeting_id, title, start, end, date, time, attendee_emails, your_notes,
    ai_summary[, transcript]}]}`. It prints `[gather_granola] N meetings (T with transcripts, K with
    notes) …` — **gate on those counts**: if **T = 0 AND K = 0** (no transcripts and no notes — Granola
    not connected, or nothing ended recently), say "I don't have transcripts for your recent meetings
@@ -42,14 +47,25 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
    (T = 0, K > 0), proceed — `compose_followup.py` works from the `[notes]` branch (fewer, safer items).
 2. **Optional context:** `read_local` → `/tmp/sotto_local.json` (contacts, for resolving attendee
    names/emails) and the calendar → `/tmp/sotto_cal.json`.
-3. **Extract + draft — ONE command (this IS the follow-up; don't write it yourself):**
+3. **Extract + persist — ONE command; use the same window as step 1.** For the short lane:
    ```bash
    python3 "$HOME/.hermes/skills/sotto/followup/scripts/compose_followup.py" \
-     --granola /tmp/sotto_granola.json --local /tmp/sotto_local.json --calendar /tmp/sotto_cal.json
+     --granola /tmp/sotto_granola.json --local /tmp/sotto_local.json --calendar /tmp/sotto_cal.json \
+     --since-hours 36
    ```
-   It picks the meetings that ended in the last 36h (transcript present), runs the extraction prompt, and
-   prints `{followup_markdown, commitments[], drafts[]}`. Deliver `followup_markdown` **verbatim** —
-   it is already chat-ready (markers stripped, `*bold*` WhatsApp syntax); don't re-format it.
+   For the backlog lane, use all fourteen days and require the post-write canonical ledger snapshot:
+   ```bash
+   python3 "$HOME/.hermes/skills/sotto/followup/scripts/compose_followup.py" \
+     --granola /tmp/sotto_granola.json --local /tmp/sotto_local.json --calendar /tmp/sotto_cal.json \
+     --since-hours 336 --reconcile-open-loops
+   ```
+   It picks meetings inside the selected window, runs the extraction prompt, and
+   writes every `commitments[]` item into the continuity ledger **before** it prints
+   `{followup_markdown, commitments[], drafts[], ledger[, open_loops]}`. `ledger` is the deterministic
+   write receipt; backlog mode's `open_loops` is the read-back after those writes. For the short lane,
+   deliver `followup_markdown` **verbatim** — it is already chat-ready. For the backlog lane, answer
+   “what is open” from `open_loops`, not merely from extracted intent; mention anything in
+   `ledger.skipped_terminal > 0` as already closed and not reopened.
    *Native fallback (ONLY if `execute_code` is truly unavailable):* run `references/followup-prompt.md`
    with your model over the same gathered inputs — this still applies the real extraction rules
    (grounded-only, verbatim emails, null-when-unknown), unlike free-handing. The script is strongly preferred.
@@ -63,18 +79,13 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
      address for that attendee. In that branch: present the draft body, ask the user which channel (and
      address) to send it on, and NEVER construct, guess, or look up an address yourself — no tap-link
      until the user supplies the destination.
-5. **Feed the ledger — deterministic, right after the user confirms the follow-up summary.** Save the
-   full compose output (the JSON from step 3) to `/tmp/sotto_followup.json`, then `execute_code`:
-   ```bash
-   python3 "$HOME/.hermes/skills/sotto/followup/scripts/apply_commitments.py" \
-     /tmp/sotto_followup.json --user-email <the user's email>
-   ```
-   It writes each commitment as a continuity-ledger item (`$SOTTO_DATA/knowledge/continuity/*.md`,
-   the same YAML-frontmatter format + `anchor_key` dedup the brief maintains): the user's commitments
-   as `follow_up` (you owe), other attendees' as `waiting_on` (they owe you) — so they show up in
-   `sotto-loops` and the next brief immediately, not a day later. Safe to re-run: existing items are
-   deduped by anchor_key (bumped, not duplicated), already-resolved/dismissed items are never
-   resurrected, and a later brief run won't duplicate them. **Writes files only — never sends.**
+5. **Trust the receipt, not intent.** Recording a private open loop is reversible bookkeeping, not
+   an outward action, so it does **not** require a confirmation turn. Confirmation still gates Gmail
+   drafts and every send in step 4. Never say commitments were captured unless step 3 returned a
+   `ledger` receipt; if the command fails before printing, report that capture failed. Safe re-runs
+   dedupe by `anchor_key`, and terminal items are never resurrected. When the user corrects the
+   result ("that is done", "nothing for me to do", "James will get back to me"), route the explicit
+   edits to `sotto-loops` §C and verify the resulting ledger before confirming them.
 
 ## Notes
 - Deliver as **Sotto**, never "Hermes Agent".

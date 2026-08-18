@@ -284,7 +284,7 @@ removes one. The `sotto-routines` skill owns this.
 |---|---|
 | **Every personal routine is named `user-<slug>`** — that prefix is the FENCE | Boot (`start.sh`) wipes and recreates Sotto's own five jobs on every deploy to kill duplicate crons; it skips `user-` jobs entirely, so a redeploy never eats your routine. Sotto also never *removes* a job without that prefix, and never creates one with it that shadows a system job. The five system jobs live in `adapters/hermes/crons.json` — the one schedule source — and are changed via *set up Sotto*, not here. |
 | **Cap: 10 routines** | The 11th asks which one to drop rather than growing an unread schedule. |
-| **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your WhatsApp home channel) — same target as the briefs. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
+| **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your WhatsApp home channel) — same target as the briefs. Boot disables Hermes' generic `Cronjob Response` envelope, so briefs, nudges, and routines arrive as their clean user-facing copy rather than with a job id and scheduler footer. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
 | **Timezone changes don't move existing routines (v1)** | Hermes captures the zone when a job is created. Changing your timezone re-registers Sotto's own five jobs only — your personal routines keep firing on the **old** clock until you recreate them (ask Sotto to; it's one line each). |
 
 ## Environment variables — full reference

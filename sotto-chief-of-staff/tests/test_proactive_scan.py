@@ -537,6 +537,23 @@ def test_a_delivered_chase_is_finalized_and_a_held_one_is_not(tmp_path, monkeypa
     assert [n["kind"] for n in out["held"]] == ["chase"] and len(finalized) == 1
 
 
+def test_receiver_run_defers_chase_state_until_the_host_confirms_delivery(
+        tmp_path, monkeypatch, capsys):
+    import json
+    finalized = []
+    _quiet_never(monkeypatch, tmp_path)
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "a" * 24)
+    monkeypatch.setattr(ps, "_chase_candidates", lambda date: [_chase()])
+    monkeypatch.setattr(ps, "_finalize", lambda kind, key: finalized.append((kind, key)))
+    out = _run_main(monkeypatch, capsys)
+    assert [n["kind"] for n in out["nudges"]] == ["chase"]
+    assert finalized == []
+    effects = json.loads((tmp_path / "events" / ("delivery-effects-" + "a" * 24 + ".json")).read_text())
+    assert effects["decision_ids"] == [out["nudges"][0]["decision_id"]]
+    assert effects["effects"] == [
+        {"kind": "chase", "anchor_key": "email:waiting_on:id:acme"}]
+
+
 def test_chase_waits_out_a_freshly_delivered_brief(tmp_path, monkeypatch, capsys):
     """The chase stamp is written in the brief's OWN Learn step, so without this guard the chase
     fires minutes after the brief that just listed the item — the same 2h window its two siblings

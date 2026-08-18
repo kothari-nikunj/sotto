@@ -54,6 +54,15 @@ if ! command -v hermes >/dev/null 2>&1 || hermes config get scheduler.enabled >/
 else
   note "[sotto] note: scheduler.enabled not supported by this Hermes version — skipped"
 fi
+# Hermes normally decorates every scheduled delivery with a "Cronjob Response" header, job id, and
+# management footer. Sotto's briefs, nudges, and personal routines already produce complete
+# user-facing copy, so deliver that copy verbatim. Probe first to remain compatible with older Hermes
+# installs that predate this setting.
+if ! command -v hermes >/dev/null 2>&1 || hermes config get cron.wrap_response >/dev/null 2>&1; then
+  run hermes config set cron.wrap_response false
+else
+  note "[sotto] note: cron.wrap_response not supported by this Hermes version — scheduled messages may include a wrapper"
+fi
 
 # 1.5) Gemini key names. Sotto's brief reads GOOGLE_AI_API_KEY, but Hermes' gemini provider reads
 #      GEMINI_API_KEY / GOOGLE_API_KEY. Map whichever the user set (in the environment, or already in

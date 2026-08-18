@@ -92,7 +92,8 @@ looking for more events, and do not re-triage.
      ```bash
      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_granola.py" --days 1 --transcripts-since-hours 3
      python3 "$HOME/.hermes/skills/sotto/followup/scripts/compose_followup.py" \
-       --granola /tmp/sotto_granola.json --local /tmp/sotto_local.json --since-hours 3
+       --granola /tmp/sotto_granola.json --local /tmp/sotto_local.json --since-hours 3 \
+       --no-apply-commitments
      ```
      (the same two commands `sotto-followup` step 1 + 3 run, windowed to the meeting that just
      ended). Use ONLY the `drafts[]`/`commitments[]` whose meeting matches the bundle's `summary` /

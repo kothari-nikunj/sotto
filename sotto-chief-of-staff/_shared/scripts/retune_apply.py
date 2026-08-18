@@ -48,7 +48,7 @@ def _find(anchor_key: str):
     return None
 
 
-def apply(action: str, anchor_key: str, days: int = 7) -> dict:
+def _apply_unlocked(action: str, anchor_key: str, days: int = 7) -> dict:
     anchor_key = (anchor_key or "").strip()
     if not anchor_key:
         return {"ok": False, "detail": "missing anchor_key"}
@@ -89,6 +89,11 @@ def apply(action: str, anchor_key: str, days: int = 7) -> dict:
         cr._persist(it)
         return {"ok": True, "action": "keep", "anchor_key": anchor_key, "detail": "kept (clock reset)"}
     return {"ok": False, "detail": f"unknown action: {action}"}
+
+
+def apply(action: str, anchor_key: str, days: int = 7) -> dict:
+    with cr._ledger_lock():
+        return _apply_unlocked(action, anchor_key, days)
 
 
 def main():

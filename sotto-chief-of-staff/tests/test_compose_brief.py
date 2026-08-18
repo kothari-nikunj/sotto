@@ -1085,8 +1085,10 @@ def _followup_capable_llm(seen, calls):
             calls["followup"] += 1
             return json.dumps({
                 "followup_markdown": "**Acme Sync** — you owe Dana the deck.",
-                "commitments": [{"meeting": "Acme Sync", "owner": "you",
-                                 "what": "send the deck", "to_email": "dana@acme.com"}],
+                "commitments": [{"meeting": "Acme Sync", "meeting_id": "m-acme",
+                                 "owner": "you", "owner_is_user": True,
+                                 "what": "send the deck", "to_email": "dana@acme.com",
+                                 "source_snippet": "you: I'll send the deck"}],
                 "drafts": [{"to_name": "Dana", "to_email": "dana@acme.com", "channel": "email",
                             "subject": "Deck", "body": "Here it is."}]})
         seen["prompt"] = prompt
@@ -1098,7 +1100,8 @@ def test_evening_brief_merges_followup_context(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     seen, calls = {}, {"followup": 0}
     inputs = {"type": "evening", "google": {"events": [], "userEmail": "me@x.com"},
-              "granola": [{"title": "Acme Sync", "date": _iso_hours_ago(2),
+              "granola": [{"meeting_id": "m-acme", "title": "Acme Sync",
+                           "date": _iso_hours_ago(2),
                            "transcript": "you: I'll send the deck",
                            "attendee_emails": ["dana@acme.com"]}],
               "local": {}}
@@ -1162,7 +1165,12 @@ def test_evening_no_ended_meetings_adds_no_block(monkeypatch, tmp_path):
 def _surfaced(tmp_path, rows):
     d = tmp_path / "events"
     d.mkdir(parents=True, exist_ok=True)
+    for i, row in enumerate(rows):
+        row.setdefault("decision_id", f"decision-{i}")
     (d / "surfaced.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    delivered = [{"ts": r["ts"], "status": "delivered", "decision_ids": [r["decision_id"]]}
+                 for r in rows if r.get("verdict") in ("agent", "promoted")]
+    (d / "delivery.jsonl").write_text("".join(json.dumps(r) + "\n" for r in delivered))
 
 
 def _row(ts, sender="Sarah Chen", verdict="agent", cls="urgent", reason="Sarah's ask about the deck"):
@@ -1243,11 +1251,25 @@ def test_already_nudged_reads_the_writers_real_rows(monkeypatch, tmp_path):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     import triage_event as te                       # conftest puts event-triage/scripts on sys.path
     event = {"source": "imessage", "handle": "+15551234567", "text": "can you send the deck?"}
-    te._record_surfaced("agent", "urgent", "Sarah is waiting on the deck", "Sarah Chen", event)
-    te._record_surfaced("queue", "quiet", "quiet hours", "Ben", event)
+    te._record_surfaced("agent", "urgent", "Sarah is waiting on the deck", "Sarah Chen", event,
+                        decision_id="delivered-sarah")
+    te._record_surfaced("queue", "quiet", "quiet hours", "Ben", event,
+                        decision_id="queued-ben")
+    (tmp_path / "events" / "delivery.jsonl").write_text(json.dumps({
+        "ts": _today_at("12:00"), "status": "delivered",
+        "decision_ids": ["delivered-sarah"]}) + "\n")
     rows = cb._load_surfaced_nudges(cb._user_local_date("+00:00"), cb._resolve_tz("+00:00"))
     assert [(r["sender"], r["cls"]) for r in rows] == [("Sarah Chen", "urgent")]
     assert "waiting on the deck" in rows[0]["reason"]
+
+
+def test_failed_delivery_is_never_reported_as_already_nudged(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    ts = _today_at("12:00")
+    _surfaced(tmp_path, [_row(ts)])
+    (tmp_path / "events" / "delivery.jsonl").write_text(json.dumps({
+        "ts": ts, "status": "failed", "decision_ids": ["decision-0"]}) + "\n")
+    assert cb._already_nudged_block("+00:00") == ""
 
 
 def test_already_nudged_placeholder_contract(monkeypatch, tmp_path):

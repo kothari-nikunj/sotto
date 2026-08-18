@@ -1825,7 +1825,11 @@ def _apply_followup_commitments(fu: dict, inputs: dict) -> None:
             sys.path.insert(0, path)
         import apply_commitments as _ac  # noqa: PLC0415
         user_email = _s(_obj(inputs, "google").get("userEmail")) or configured_user_email()
-        res = _ac.apply(fu, user_email)
+        # Recheck the model's meeting id, verbatim quote, deliverable, and ownership at the actual
+        # mutation boundary. compose_followup already filters its output; doing it here as well
+        # keeps a later refactor from turning a trusted in-memory object into a durable obligation.
+        meetings = _arr(_normalize_local(inputs), "granola_meetings")
+        res = _ac.apply(fu, user_email, source_meetings=meetings)
         _diag(f"[compose_brief] followup commitments → ledger: {res.get('written', 0)} written, "
               f"{res.get('deduped', 0)} deduped")
     except Exception as e:  # noqa: BLE001
@@ -1898,7 +1902,7 @@ def _render_followup_context(fu: dict) -> str:
 
 # ── Already-nudged today (the surfaced ledger's brief-side reader) ────────────────────────────────
 # events/surfaced.jsonl records EVERY funnel verdict at verdict time (triage_event._record_surfaced:
-# {ts, sender, channel, verdict, reason, class}). Nothing read it, so a 3pm ask could tap the user at
+# {ts, sender, channel, verdict, reason, class, decision_id}). Nothing read it, so a 3pm ask could tap the user at
 # 3:05 and then get re-derived and re-told at 5:30 as if it were news — the double-tell. The evening
 # brief now reads today's DELIVERED nudges (verdict "agent") and compresses them to one line each.
 # Read-only, bounded, and fail-quiet: a missing or corrupt ledger renders nothing.
@@ -1909,6 +1913,38 @@ SURFACED_NUDGE_MAX = 10       # rows rendered — a brief that lists 30 nudges i
 
 def _surfaced_path() -> str:
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "surfaced.jsonl")
+
+
+def _delivery_path() -> str:
+    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "delivery.jsonl")
+
+
+def _delivered_decision_ids(today: str, tzinfo=None) -> set:
+    """Decision ids whose host send actually succeeded on the user's local day. Generic labels are
+    diagnostic only; correlation is by id, so a failed/empty run can never become "already nudged"."""
+    try:
+        with open(_delivery_path(), encoding="utf-8") as f:
+            lines = f.readlines()[-SURFACED_TAIL_LINES:]
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(row, dict) or _s(row.get("status")) != "delivered":
+            continue
+        ts = _parse_ts(_s(row.get("ts")))
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        local = ts.astimezone(tzinfo) if tzinfo is not None else ts
+        if local.strftime("%Y-%m-%d") != today:
+            continue
+        out.update(_s(v) for v in (row.get("decision_ids") or []) if _s(v))
+    return out
 
 
 def _surfaced_rows_today(today: str, tzinfo=None) -> list:
@@ -1946,8 +1982,10 @@ def _surfaced_rows_today(today: str, tzinfo=None) -> list:
 def _load_surfaced_nudges(today: str, tzinfo=None) -> list:
     """Today's DELIVERED nudges, oldest first: [{time, sender, class, reason}]."""
     out = []
+    delivered = _delivered_decision_ids(today, tzinfo)
     for row, local in _surfaced_rows_today(today, tzinfo):
-        if _s(row.get("verdict")) != "agent":
+        if (_s(row.get("verdict")) not in ("agent", "promoted")
+                or _s(row.get("decision_id")) not in delivered):
             continue
         out.append({"time": f"{local.hour % 12 or 12}:{local.minute:02d}"
                             + ("pm" if local.hour >= 12 else "am"),

@@ -35,9 +35,10 @@ continuity_resolve's OWN machinery — `_normalize_action` → `compute_anchor_k
 exact three calls apply_commitments.py makes when the followup writes a commitment into the ledger —
 so a hand-added loop is byte-shaped like every other ledger entry and the brief's resolution sweep,
 loops_query and the dashboard read it natively. A hand-added loop carries `channel: manual` and
-`source: user_added`: nothing auto-closes it, because nothing in your inbox corresponds to it — you
-close it. Re-adding the same ask on the same day dedupes onto the same anchor (times_surfaced bumps)
-rather than making a second file. `loop-deadline` writes the ONE field, which is also how a loop is
+`source: user_added`. A `you` item has no source thread to auto-close it; a `them` item with a known
+identifier may still close when that person delivers, because direction—not source—owns resolution.
+Re-adding the same ask on the same day dedupes onto the same anchor (times_surfaced bumps) rather
+than making a second file. `loop-deadline` writes the ONE field, which is also how a loop is
 snoozed: the deterministic resolver expires a loop 2 days past its deadline, so moving the deadline
 forward is the only "later" the ledger has — there is no second snooze state to invent.
 
@@ -62,7 +63,7 @@ CLI (runs in the skills tree, where PyYAML + the libs live; invoked by the recei
   knowledge_edit.py --slug <slug> --op company-about --text "..."   (knowledge/companies/<slug>.md)
   knowledge_edit.py --op loop --anchor <anchor_key> --to resolved|dismissed
   knowledge_edit.py --op loop-add --text "..." [--contact "Name"] [--identifier a@b.com]
-                                  [--deadline YYYY-MM-DD]
+                                  [--direction you|them] [--deadline YYYY-MM-DD]
   knowledge_edit.py --op loop-deadline --anchor <anchor_key> --deadline YYYY-MM-DD|""
   knowledge_edit.py --op merge --from <slug> --into <slug>
   knowledge_edit.py --op merge-dismiss --from <slug> --into <slug>
@@ -437,8 +438,8 @@ def _validated_deadline(deadline: str, allow_empty: bool = True) -> str:
     return d
 
 
-def op_loop_add(text: str, contact: str = "", identifier: str = "", deadline: str = "",
-                now: datetime | None = None) -> dict:
+def _op_loop_add_unlocked(text: str, contact: str = "", identifier: str = "", deadline: str = "",
+                          direction: str = "you", now: datetime | None = None, cr=None) -> dict:
     """Add ONE loop by hand, through continuity_resolve's own write path (see module docstring).
     Anchored on a content hash of contact+text+day, so re-adding the same ask today bumps
     times_surfaced instead of forking a second file; an entry the user already closed is never
@@ -448,21 +449,25 @@ def op_loop_add(text: str, contact: str = "", identifier: str = "", deadline: st
     contact = (contact or "").strip()[:120]
     identifier = (identifier or "").strip()[:200]
     deadline = _validated_deadline(deadline)
-    cr = _load_continuity()
+    direction = (direction or "").strip().lower()
+    if direction not in ("you", "them"):
+        raise EditError("direction must be you or them")
+    cr = cr or _load_continuity()
     when = now or cr._now_local(cr.configured_tz() or "+00:00")
     today = when.strftime("%Y-%m-%d")
-    h = hashlib.sha256(f"{contact}|{text}|{today}".encode()).hexdigest()[:12]
+    created_at = when.strftime("%Y-%m-%d %H:%M:%S")
+    h = hashlib.sha256(f"{direction}|{contact}|{text}|{today}".encode()).hexdigest()[:12]
     raw = {
-        "action_type": "follow_up",
-        # A hand-added loop belongs to no inbox: `manual` means the deterministic resolver has
-        # nothing to match it against, so it stays open until the user closes it.
+        "action_type": "follow_up" if direction == "you" else "waiting_on",
+        # A hand-added loop belongs to no source thread. The direction still governs resolution:
+        # a `waiting_on` with a known identifier may close on later inbound delivery.
         "channel": "manual",
         "contact_name": contact,
         "contact_identifier": identifier or None,
         "source_thread_id": f"manual:{h}",
         "summary": text,
         "deadline": deadline or None,
-        "created_at": today,
+        "created_at": created_at,
     }
     a = cr._normalize_action(raw)
     ak = cr.compute_anchor_key(a)
@@ -480,7 +485,7 @@ def op_loop_add(text: str, contact: str = "", identifier: str = "", deadline: st
         "anchor_key": ak, "action_type": a.get("action_type"), "channel": a.get("channel"),
         "contact_name": a.get("contact_name"), "contact_identifier": a.get("contact_identifier"),
         "canonical_id": a.get("canonical_id"), "status": "open",
-        "created_at": today, "times_surfaced": 1,
+        "created_at": created_at, "times_surfaced": 1,
         "summary": a.get("summary", ""), "ask": a.get("ask"),
         "meeting_time": a.get("meeting_time"), "deadline": a.get("deadline"),
         "source_thread_id": a.get("source_thread_id"),
@@ -490,6 +495,68 @@ def op_loop_add(text: str, contact: str = "", identifier: str = "", deadline: st
     return {"ok": True, "anchor_key": ak, "created": True}
 
 
+def op_loop_add(text: str, contact: str = "", identifier: str = "", deadline: str = "",
+                direction: str = "you", now: datetime | None = None) -> dict:
+    cr = _load_continuity()
+    with cr._ledger_lock():
+        return _op_loop_add_unlocked(text, contact, identifier, deadline, direction, now, cr)
+
+
+def op_loop_retarget(anchor: str, text: str, contact: str = "", identifier: str = "",
+                     deadline: str = "", direction: str = "them",
+                     now: datetime | None = None) -> dict:
+    """Correct a loop's direction in one locked command. The replacement is persisted first, so
+    even an exceptional second write can leave a duplicate but can never make the obligation vanish."""
+    if not ANCHOR_RE.match(anchor or ""):
+        raise EditError("invalid anchor key")
+    text = _validated_text(text)
+    contact = (contact or "").strip()[:120]
+    identifier = (identifier or "").strip()[:200]
+    deadline = _validated_deadline(deadline)
+    direction = (direction or "").strip().lower()
+    if direction not in ("you", "them"):
+        raise EditError("direction must be you or them")
+    cr = _load_continuity()
+    when = now or cr._now_local(cr.configured_tz() or "+00:00")
+    today = when.strftime("%Y-%m-%d")
+    created_at = when.strftime("%Y-%m-%d %H:%M:%S")
+    import hashlib
+    h = hashlib.sha256(f"{direction}|{contact}|{text}|{today}".encode()).hexdigest()[:12]
+    raw = {
+        "action_type": "follow_up" if direction == "you" else "waiting_on",
+        "channel": "manual", "contact_name": contact,
+        "contact_identifier": identifier or None, "source_thread_id": f"manual:{h}",
+        "summary": text, "deadline": deadline or None, "created_at": created_at,
+    }
+    action = cr._normalize_action(raw)
+    replacement_key = cr.compute_anchor_key(action)
+    with cr._ledger_lock():
+        items = cr._load_items()
+        old = items.get(anchor)
+        if old is None or str(old.get("status", "open")) in cr.TERMINAL:
+            raise EditError(f"open loop not found: {anchor}")
+        replacement = items.get(replacement_key)
+        if replacement is not None and str(replacement.get("status", "open")) in cr.TERMINAL:
+            raise EditError("the corrected loop was already closed")
+        if replacement is None:
+            replacement = {
+                "anchor_key": replacement_key, "action_type": action.get("action_type"),
+                "channel": action.get("channel"), "contact_name": action.get("contact_name"),
+                "contact_identifier": action.get("contact_identifier"), "status": "open",
+                "created_at": created_at, "times_surfaced": 1, "summary": text,
+                "deadline": action.get("deadline"), "source_thread_id": action.get("source_thread_id"),
+                "source": "user_correction", "corrected_from": anchor,
+            }
+        else:
+            replacement["times_surfaced"] = int(replacement.get("times_surfaced", 1) or 1) + 1
+        cr._persist(replacement)                  # obligation remains live before the old row retires
+        cr._terminate(old, "dismissed", "user_retargeted", today)
+        old["retargeted_to"] = replacement_key
+        cr._persist(old)
+    return {"ok": True, "old_anchor_key": anchor, "anchor_key": replacement_key,
+            "status": "open", "direction": direction}
+
+
 def op_loop_deadline(anchor: str, deadline: str) -> dict:
     """Set (or clear) ONE loop's deadline — which is also how a loop is snoozed: the resolver
     expires a loop 2 days past its deadline, so a later date IS "not yet". Persists the full
@@ -497,19 +564,16 @@ def op_loop_deadline(anchor: str, deadline: str) -> dict:
     if not ANCHOR_RE.match(anchor or ""):
         raise EditError("invalid anchor key")
     deadline = _validated_deadline(deadline)
-    import ledger_io  # lazy: pulls in compose_brief
-    import yaml
-    entry = next((fm for fm in ledger_io.load_entries(with_path=True)
-                  if str(fm.get("anchor_key") or "") == anchor), None)
-    if entry is None:
-        raise EditError(f"loop not found: {anchor}")
-    path = entry.pop("_path")
-    if deadline:
-        entry["deadline"] = deadline
-    else:
-        entry.pop("deadline", None)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"---\n{yaml.safe_dump(entry, sort_keys=False, allow_unicode=True)}---\n")
+    cr = _load_continuity()
+    with cr._ledger_lock():
+        entry = cr._load_items().get(anchor)
+        if entry is None:
+            raise EditError(f"loop not found: {anchor}")
+        if deadline:
+            entry["deadline"] = deadline
+        else:
+            entry.pop("deadline", None)
+        cr._persist(entry)
     return {"ok": True, "anchor_key": anchor, "deadline": deadline}
 
 
@@ -518,22 +582,17 @@ def op_loop(anchor: str, to: str, today: str | None = None) -> dict:
         raise EditError("invalid anchor key")
     if to not in ("resolved", "dismissed"):
         raise EditError("invalid target status")
-    import ledger_io  # lazy: pulls in compose_brief
-    import yaml
-    entry = next((fm for fm in ledger_io.load_entries(with_path=True)
-                  if str(fm.get("anchor_key") or "") == anchor), None)
-    if entry is None:
-        raise EditError(f"loop not found: {anchor}")
+    cr = _load_continuity()
     if today is None:
         import timeutil
         today = timeutil._user_local_date(timeutil.configured_tz() or "+00:00")
-    path = entry.pop("_path")
-    # The resolver's _terminate + _persist field semantics, with the user as the resolution source.
-    entry["status"] = to
-    entry["resolution"] = f"user_{to}"          # user_resolved | user_dismissed
-    entry["resolved_at"] = today
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"---\n{yaml.safe_dump(entry, sort_keys=False, allow_unicode=True)}---\n")
+    with cr._ledger_lock():
+        entry = cr._load_items().get(anchor)
+        if entry is None:
+            raise EditError(f"loop not found: {anchor}")
+        # The resolver's termination semantics, with the user as the resolution source.
+        cr._terminate(entry, to, f"user_{to}", today)
+        cr._persist(entry)
     return {"ok": True, "anchor_key": anchor, "status": to}
 
 
@@ -544,7 +603,7 @@ def run(argv: list) -> dict:
                     "no facts map); a company record is corrected with --op company-about.")
     ap.add_argument("--op", required=True,
                     choices=("correct", "archive", "add", "add-identifier", "company-about",
-                             "loop", "loop-add", "loop-deadline", "merge", "merge-dismiss",
+                             "loop", "loop-add", "loop-retarget", "loop-deadline", "merge", "merge-dismiss",
                              "relation-add", "relation-remove"))
     ap.add_argument("--slug", default="",
                     help="person slug (knowledge/people/<slug>.md) — or the COMPANY slug "
@@ -558,6 +617,8 @@ def run(argv: list) -> dict:
     ap.add_argument("--identifier", default="",
                     help="their email/phone — the one to attach (add-identifier), or the "
                          "counterpart's, if known (loop-add)")
+    ap.add_argument("--direction", default="you", choices=("you", "them"),
+                    help="who owes the action: you (default) or them (loop-add)")
     ap.add_argument("--deadline", default="", help="YYYY-MM-DD, or empty to clear")
     ap.add_argument("--from", default="", dest="from_slug",
                     help="person slug that DISAPPEARS into --into (merge op)")
@@ -587,7 +648,9 @@ def run(argv: list) -> dict:
     if a.op == "merge-dismiss":
         return op_merge_dismiss(a.from_slug, a.into_slug)
     if a.op == "loop-add":
-        return op_loop_add(a.text, a.contact, a.identifier, a.deadline)
+        return op_loop_add(a.text, a.contact, a.identifier, a.deadline, a.direction)
+    if a.op == "loop-retarget":
+        return op_loop_retarget(a.anchor, a.text, a.contact, a.identifier, a.deadline, a.direction)
     if a.op == "loop-deadline":
         return op_loop_deadline(a.anchor, a.deadline)
     return op_loop(a.anchor, a.to)

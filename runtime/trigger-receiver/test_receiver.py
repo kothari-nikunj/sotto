@@ -2206,6 +2206,77 @@ def test_a_failed_delivery_is_loud_and_recorded(tmp_path, monkeypatch, capsys):
     assert "delivery FAILED" in capsys.readouterr().out
 
 
+def test_delivery_receipt_correlates_the_decision_and_only_then_finalizes_effects(
+        tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    finalized = []
+    monkeypatch.setattr(rec, "_finalize_delivery_effects", lambda effects: finalized.extend(effects))
+    monkeypatch.setattr(rec.shutil, "which", lambda b: "/usr/bin/" + b)
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["hermes", "send"]:
+            return _FakeRun(0, "", "")
+        run_id = kw["env"]["SOTTO_DELIVERY_RUN_ID"]
+        os.makedirs(rec._events_dir(), exist_ok=True)
+        with open(rec._delivery_effects_path(run_id), "w", encoding="utf-8") as f:
+            json.dump({"decision_ids": ["proactive-decision"],
+                       "effects": [{"kind": "chase", "anchor_key": "waiting:on:dana"}]}, f)
+        return _FakeRun(0, "a nudge", "")
+
+    monkeypatch.setattr(rec.subprocess, "run", fake_run)
+    rec._spawn_and_deliver(["fake", "-z"], "run it", "correlated",
+                           decision_ids=["event-decision"])
+    for th in threading.enumerate():
+        if th.name == "deliver-correlated":
+            th.join(timeout=5)
+    rows = _delivery_rows(tmp_path)
+    assert rows[-1]["status"] == "delivered"
+    assert rows[-1]["decision_ids"] == ["event-decision", "proactive-decision"]
+    assert finalized == [{"kind": "chase", "anchor_key": "waiting:on:dana"}]
+    assert not list((tmp_path / "events").glob("delivery-effects-*.json"))
+
+
+def test_failed_send_does_not_finalize_deferred_loop_effects(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    finalized = []
+    monkeypatch.setattr(rec, "_finalize_delivery_effects", lambda effects: finalized.extend(effects))
+    monkeypatch.setattr(rec.shutil, "which", lambda b: "/usr/bin/" + b)
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["hermes", "send"]:
+            return _FakeRun(1, "", "gateway offline")
+        run_id = kw["env"]["SOTTO_DELIVERY_RUN_ID"]
+        os.makedirs(rec._events_dir(), exist_ok=True)
+        with open(rec._delivery_effects_path(run_id), "w", encoding="utf-8") as f:
+            json.dump({"decision_ids": ["proactive-decision"],
+                       "effects": [{"kind": "handoff", "anchor_key": "waiting:on:dana"}]}, f)
+        return _FakeRun(0, "a nudge", "")
+
+    monkeypatch.setattr(rec.subprocess, "run", fake_run)
+    rec._spawn_and_deliver(["fake", "-z"], "run it", "failed-effects")
+    for th in threading.enumerate():
+        if th.name == "deliver-failed-effects":
+            th.join(timeout=5)
+    assert _delivery_rows(tmp_path)[-1]["status"] == "failed"
+    assert finalized == []
+
+
+def test_delivery_effect_finalizer_retries_an_idempotent_ledger_write(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rec, "_find_sotto_script", lambda *parts: "/skills/continuity_resolve.py")
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if len(calls) == 1:
+            return _FakeRun(1, "", "temporary volume error")
+        return _FakeRun(0, json.dumps({"ok": True, "chased_count": 1}), "")
+
+    monkeypatch.setattr(rec.subprocess, "run", fake_run)
+    assert rec._finalize_delivery_effects(
+        [{"kind": "chase", "anchor_key": "waiting:on:dana"}]) is True
+    assert len(calls) == 2
+
+
 def test_a_missing_runner_still_fails_synchronously(tmp_path, monkeypatch):
     """'Can we start it?' stays answerable NOW — handle_trigger releases its brief claim on this,
     and the dashboard's run-now button reports it. Only 'did it succeed?' moved to the thread."""

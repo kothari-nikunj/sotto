@@ -94,6 +94,28 @@ def test_incoming_or_earlier_messages_do_not_resolve(tmp_path, monkeypatch):
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
+def test_outgoing_reply_never_closes_something_the_other_person_owes(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "w", action_type="waiting_on", contact_identifier="+14155552222",
+          created_at="2026-06-23 08:00:00")
+    out = cr.resolve({"today": "2026-06-24", "local": {
+        "imessage": [{"is_from_me": True, "handle": "4155552222",
+                      "timestamp": "2026-06-23 20:00:00", "text": "checking in"}]}}, NOW)
+    assert out["resolved"] == [] and [a["anchor_key"] for a in out["active"]] == ["w"]
+
+
+def test_source_backed_explicit_commitment_only_closes_explicitly(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "g", resolution_mode="explicit", source="followup_commitment",
+          contact_identifier="+14155552222", created_at="2026-06-23 08:00:00")
+    out = cr.resolve({"today": "2026-07-20", "local": {
+        "imessage": [{"is_from_me": True, "handle": "4155552222",
+                      "timestamp": "2026-06-23 20:00:00", "text": "done"}]}},
+        datetime(2026, 7, 20, 9, 0, 0))
+    assert out["resolved"] == [] and out["expired"] == []
+    assert [a["anchor_key"] for a in out["active"]] == ["g"]
+
+
 def test_short_or_mismatched_numbers_never_false_positive(tmp_path, monkeypatch):
     # <7-digit identifiers and different last-10s must not match (the _phone_matches guard).
     _env(tmp_path, monkeypatch)
@@ -195,6 +217,15 @@ def test_deadline_two_day_grace_boundaries(tmp_path, monkeypatch):
     out = cr.resolve({"today": "2026-06-24"}, NOW)
     assert [(e["contact_name"], e["resolution"]) for e in out["expired"]] == [("Past", "deadline_passed")]
     assert {a["contact_name"] for a in out["active"]} == {"Grace"}
+
+
+def test_old_loop_with_a_future_deadline_does_not_age_expire(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "future", contact_name="Future", created_at="2026-06-01",
+          deadline="2026-07-01")
+    out = cr.resolve({"today": "2026-06-24"}, NOW)
+    assert out["expired"] == []
+    assert [a["anchor_key"] for a in out["active"]] == ["future"]
 
 
 # ── meeting passed, incl. near-midnight offsets (the strptime[:19] fix) ────────

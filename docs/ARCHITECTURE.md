@@ -31,6 +31,36 @@ owns each of them, and you can enter the system at any stage:
 event-triage funnel, documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
 the six things that can start a nudge are the producer table at the top of that page.
 
+### The open-loop path — input to outcome
+
+This is the complete path for a Granola commitment. It deliberately has one model judgment and
+small deterministic guards around it, rather than a second workflow engine:
+
+```text
+Granola notes / summary / transcript
+  → gather_granola: meeting_id + exact start/end + source text
+  → compose_followup: owner_is_user + verbatim source_snippet + optional existing_anchor_key
+  → apply_commitments:
+       meeting id + copied quote + named owner + action/deliverable words must match source (or drop)
+       same meeting + direction + source snippet → same occurrence
+       validated live same-direction anchor     → merge with that open loop
+       otherwise                                → create a new open loop
+  → continuity ledger → brief / Loops page / proactive watcher
+  → triage verdict with decision_id
+  → receiver send → delivery receipt with the same decision_id
+       delivered → count “already nudged” and finalize a chase/handoff
+       failed     → neither
+```
+
+Capture does **not** wait for a confirmation turn: private bookkeeping is written when the grounded
+extraction succeeds. Both composition and the actual write recheck four mechanical model claims
+against the gathered meeting: its id exists, the supporting quote was copied, that quote names the
+claimed owner, and it contains the obligation's action/deliverable words. Ambiguity drops the
+item instead of opening a loop. Exact occurrence identity handles reruns; the model may suggest at
+most one semantic merge, and code accepts it only if that anchor is live and points in the same
+direction. There is no fuzzy-matching subsystem. Source-backed Granola commitments close explicitly,
+so an ordinary reply, an old creation date, or the user's own chase cannot silently erase them.
+
 ## The two processes
 
 Two processes run side by side: **Hermes** (the agent loop, the chat gateway, the cron scheduler)
@@ -107,10 +137,11 @@ and the one bundled in `/Applications/Sotto Bridge.app`).
 
 ## The shared `$SOTTO_DATA` files
 
-Everything that crosses a process boundary crosses as a file on the volume. Every JSON write goes
-through `connectors.write_json` (tmp at 0600 → `os.replace`), so a crash mid-write can never leave a
-torn file. **"skills" below means the `sotto-chief-of-staff` scripts, running in a different
-process.**
+Everything that crosses a process boundary crosses as a file on the volume. Receiver-owned JSON
+snapshots use `connectors.write_json` (tmp at 0600 → `os.replace`); skill-owned transaction files
+use the same temp-then-replace pattern, and the continuity ledger adds one cross-process lock around
+read/modify/write. JSONL records are append-only and bounded. **"skills" below means the
+`sotto-chief-of-staff` scripts, running in a different process.**
 
 | File | Writer | Reader |
 |---|---|---|
@@ -125,8 +156,9 @@ process.**
 | `events/last.stamp` | receiver | receiver (`/setup` liveness line) |
 | `events/bundle-<ms>.json` | receiver | skills (the `sotto-event` one-shot) |
 | `events/last_digest.txt` | skills (`digest_check.py --stamp`, and the brief that wins the deliver-once claim) | skills (`digest_check.py` window), dashboard (`/api/cadence` context line) |
-| `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads `surfaced`) |
-| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`) — rows that close a run also carry a `usage` object (`{model, cost, input_tokens, output_tokens}`) |
+| `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads only verdicts whose `decision_id` has a delivered receipt) |
+| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage` and correlated `decision_ids` |
+| `events/delivery-effects-<run>.json` | skills (`proactive_scan.py`, one receiver-scoped run) | receiver — ephemeral chase/handoff effects, applied only after successful send and then deleted |
 | `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per send/reply **attempt**, allowed or refused, so "what did Sotto send?" isn't answered by a prompt's promise |
 | `cache/calendar_today.json` | calcache | skills (`triage_event.py` in-meeting hold) |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
@@ -188,7 +220,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 | The people/company graph | `knowledge/*.md` | `_shared/knowledge/knowledge_update.py` (`knowledge.py` is its model + serializer) |
 | Grounded research (people **and** companies) | same files | `meeting-prep/scripts/persist_prep.py` and `_shared/scripts/prewarm_graph.py` — both *through* `knowledge_update.apply()`; there is no second writer for either file type |
 | User-initiated graph edits | same files | `_shared/knowledge/knowledge_edit.py` — which routes *through* `knowledge_update.apply()`, so a dashboard edit and a texted correction are byte-identical |
-| Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` (`ledger_io.py` is the shared read side; it READS `knowledge/people/*.md` to resolve who a debt is with before anchoring it — the graph's own resolution, never a second matcher) |
+| Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` owns the locked, atomic write API; brief extraction, `apply_commitments.py`, and user edits in `knowledge_edit.py` all write through it (`ledger_io.py` is the shared read side) |
 | The master memory file (who the user is, the people around them, their standing Procedures — always in every brief/prep prompt; the gateway reads it in chat; seeded by setup's four questions; editable on the dashboard's Learned page) | `knowledge/master.md` | `_shared/knowledge/master_file.py` — user-stated words only, gateway confirms before writing, dashboard edits shell out to the same CLI; size-capped so "always in context" stays honest |
 | Learned preferences | `preferences.json` (behavioral lists) | `approval-tiers/scripts/learn_preferences.py` |
 | Stated preferences | `preferences.json` (`explicit` block) | `_shared/scripts/preferences.py` |

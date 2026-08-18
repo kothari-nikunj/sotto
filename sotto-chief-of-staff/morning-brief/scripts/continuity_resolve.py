@@ -90,9 +90,12 @@ direction-correct key and the old one leaves by its own resolution/expiry route.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import re
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 import yaml
@@ -132,6 +135,19 @@ def _dir() -> str:
     return os.path.join(_data_root(), "knowledge", "continuity")
 
 
+@contextmanager
+def _ledger_lock():
+    """Cross-process mutation lock. The resolver, Granola capture and user corrections all use this
+    same file, so a load/check/write sequence cannot interleave with another writer."""
+    os.makedirs(_dir(), exist_ok=True)
+    with open(os.path.join(_dir(), ".ledger.lock"), "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _normalize_action(a: dict) -> dict:
     """Map the brief's camelCase actionItems onto the snake_case shape continuity expects.
     Falls through to snake_case keys if already normalized (so both shapes work). PORT: the Mac
@@ -151,6 +167,9 @@ def _normalize_action(a: dict) -> dict:
         "meeting_time": g("meeting_time") or g("meetingTime"),
         "deadline": g("deadline") or g("deadlineDate") or g("contextDeadline"),
         "created_at": g("created_at"),
+        "source": g("source"),
+        "source_refs": g("source_refs") or g("evidence"),
+        "resolution_mode": g("resolution_mode"),
     }
 
 
@@ -229,7 +248,7 @@ def contact_anchor(canonical_id, identifier, name, group_id=None) -> str:
 # counterpart to be keyed by (a commitment with no recipient, a hand-added loop). They are not
 # conversations — they ARE the identity, so they always key the anchor. Collapsing them onto their
 # contact would silently drop the second of two distinct commitments from the same meeting.
-SYNTHETIC_THREAD_PREFIXES = ("commitment:", "manual:")
+SYNTHETIC_THREAD_PREFIXES = ("commitment:", "granola:", "manual:")
 
 
 def _is_synthetic_thread(tid: str) -> bool:
@@ -645,6 +664,11 @@ def _check_action_resolution(it: dict, local: dict, now: datetime):
     action was created? Returns (resolution_type, evidence) or None."""
     if not local:
         return None
+    # A concrete meeting commitment is not the same thing as "reply to this person". Generic traffic
+    # cannot prove the deck was sent or the market map was built; explicit/user-confirmed closure is
+    # safer than silently clearing a deliverable because one unrelated message crossed channels.
+    if _s(it.get("resolution_mode")).strip() == "explicit":
+        return None
     ident = it.get("contact_identifier") or ""
     if not ident:
         return None
@@ -814,7 +838,7 @@ def _follow_merge(items: dict, it: dict) -> dict:
     return it
 
 
-def finalize_chase(anchor_key: str, now: datetime | None = None) -> dict:
+def _finalize_chase_unlocked(anchor_key: str, now: datetime | None = None) -> dict:
     """PHASE TWO: the nudge was DELIVERED, so the chase now counts. Called by proactive_scan's fired
     path (`continuity_resolve.py --finalize-chase <anchor_key>`) so the ledger keeps exactly one
     writer. Idempotent within the day; a no-op when nothing was pending, and never a write to a
@@ -852,7 +876,12 @@ def finalize_chase(anchor_key: str, now: datetime | None = None) -> dict:
             "last_chased_at": today, "chase_after": it["chase_after"], "detail": "chase delivered"}
 
 
-def finalize_handoff(anchor_key: str, now: datetime | None = None) -> dict:
+def finalize_chase(anchor_key: str, now: datetime | None = None) -> dict:
+    with _ledger_lock():
+        return _finalize_chase_unlocked(anchor_key, now)
+
+
+def _finalize_handoff_unlocked(anchor_key: str, now: datetime | None = None) -> dict:
     """The hand-off question was DELIVERED, so the row records that the USER has been asked.
 
     The chase's two-phase rule, applied to the lane that ends it: a question counts when it reaches
@@ -883,6 +912,11 @@ def finalize_handoff(anchor_key: str, now: datetime | None = None) -> dict:
     _persist(it)
     return {"ok": True, "anchor_key": _s(it.get("anchor_key")) or key,
             "handoff_asked_at": today, "detail": "hand-off question delivered"}
+
+
+def finalize_handoff(anchor_key: str, now: datetime | None = None) -> dict:
+    with _ledger_lock():
+        return _finalize_handoff_unlocked(anchor_key, now)
 
 
 def meeting_passed(meeting_time: str, created_at: str, today: str) -> bool:
@@ -1107,8 +1141,8 @@ def _migrate_identity(items: dict, group_index: dict, today: str,
     return folded
 
 
-def resolve(payload: dict, now: datetime | None = None, *,
-            merge: bool = True, resolve_existing: bool = True) -> dict:
+def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
+                      merge: bool = True, resolve_existing: bool = True) -> dict:
     """The full pass by default. `merge=False` (--resolve-only) runs BEFORE the brief composes, so
     the brief reasons about a ledger resolved as of this morning instead of last night's;
     `resolve_existing=False` (--merge-only) runs after it, ingesting the brief's own actions[]."""
@@ -1222,6 +1256,8 @@ def resolve(payload: dict, now: datetime | None = None, *,
                 "meeting_time": a.get("meeting_time"), "deadline": a.get("deadline"),
                 "source_thread_id": a.get("source_thread_id"),
                 "group_id": a.get("group_id"),
+                "source": a.get("source"), "source_refs": a.get("source_refs"),
+                "resolution_mode": a.get("resolution_mode"),
             }
             merged.append(items[ak])
 
@@ -1252,9 +1288,11 @@ def resolve(payload: dict, now: datetime | None = None, *,
             continue
         created = (_s(it.get("created_at")) or today)[:10]
         tid = _s(it.get("source_thread_id")).strip()
+        is_waiting = is_waiting_on(it.get("action_type"))
+        explicit = _s(it.get("resolution_mode")).strip() == "explicit"
 
         # a) replied on the tracked thread (email — most precise)
-        if tid and tid in replied:
+        if tid and tid in replied and not is_waiting and not explicit:
             _terminate(it, "resolved", "replied", today); resolved.append(it); _persist(it); continue
         # b) CROSS-CHANNEL: did the user answer this person on any channel (iMessage/WhatsApp/call/
         #    calendar) since the action was created? The moat — a reply via a different channel
@@ -1264,31 +1302,32 @@ def resolve(payload: dict, now: datetime | None = None, *,
             _terminate(it, "resolved", cross[0], today); it["resolution_evidence"] = cross[1]
             resolved.append(it); _persist(it); continue
         # c) contact appeared in the brief's Already-Handled section (cross-channel id match)
-        if _handled_match(it, handled):
+        if not is_waiting and not explicit and _handled_match(it, handled):
             _terminate(it, "resolved", "brief_handled", today); resolved.append(it); _persist(it); continue
         # d) aged out (open 7d+ with no resolution signal — loops must not pile up forever).
         #    DIRECTION-AWARE: what you OWE expires quietly; what you're OWED is never expired —
         #    silently dropping someone's debt to you is the opposite of a chief of staff. A
         #    `waiting_on` becomes chase-eligible instead (step h) and leaves only by delivery,
         #    by its deadline, or by the user's hand in sotto-loops.
-        is_waiting = is_waiting_on(it.get("action_type"))
-        if created < age_cutoff and not is_waiting:
+        dl = _s(it.get("deadline"))[:10]
+        # A dated commitment lives until its own deadline policy resolves it. The generic age cap is
+        # only for undated communication debts; it must never erase a future promise before it is due.
+        if created < age_cutoff and not is_waiting and not dl and not explicit:
             _terminate(it, "expired", "expired", today); expired.append(it); _persist(it); continue
         # e) deadline passed (2d grace) — for what the USER owes. A deadline never kills a
         #    `waiting_on`: a due date makes a debt owed to the user MORE protected, not less, so a
         #    passed one only makes it chase-eligible immediately and then hands off to sotto-loops.
-        dl = _s(it.get("deadline"))[:10]
-        if dl and dl < deadline_cutoff and not is_waiting:
+        if dl and dl < deadline_cutoff and not is_waiting and not explicit:
             _terminate(it, "expired", "deadline_passed", today); expired.append(it); _persist(it); continue
         # e2) …with one exit: a waiting_on Sotto has chased its full quota on and has NO channel to
         #     chase through (no contact_identifier — it can neither self-resolve nor be nudged) is
         #     closed honestly rather than sat on forever.
-        if (is_waiting and not _s(it.get("contact_identifier")).strip()
+        if (is_waiting and not explicit and not _s(it.get("contact_identifier")).strip()
                 and _int(it.get("chased_count")) >= CHASE_MAX):
             _terminate(it, "expired", "unreachable", today); expired.append(it); _persist(it); continue
         # f) meeting passed (meeting types only) → resolved, not expired
         is_meeting = _normalize_action_type(it.get("action_type")) in MEETING_TYPES
-        if is_meeting and (meeting_passed(_s(it.get("meeting_time")), created, today)
+        if not explicit and is_meeting and (meeting_passed(_s(it.get("meeting_time")), created, today)
                            or (not it.get("meeting_time") and created < deadline_cutoff)):
             _terminate(it, "resolved", "meeting_passed", today); resolved.append(it); _persist(it); continue
         # g) user-snoozed (via sotto-loops): keep the file, but don't surface until the date passes.
@@ -1303,6 +1342,14 @@ def resolve(payload: dict, now: datetime | None = None, *,
     _stamp_chase(active, today, ref)
 
     return {"resolved": _strip(resolved), "expired": _strip(expired), "active": _strip(active)}
+
+
+def resolve(payload: dict, now: datetime | None = None, *,
+            merge: bool = True, resolve_existing: bool = True) -> dict:
+    """Serialize the full ledger transaction; readers remain lock-free because each file replace is
+    atomic."""
+    with _ledger_lock():
+        return _resolve_unlocked(payload, now, merge=merge, resolve_existing=resolve_existing)
 
 
 def _strip(lst: list) -> list:
@@ -1328,8 +1375,19 @@ def _persist(it: dict):
     os.makedirs(_dir(), exist_ok=True)
     path = it.get("_path") or os.path.join(_dir(), f"{_safe(it['anchor_key'])}.md")
     fm = {k: v for k, v in it.items() if k != "_path"}
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"---\n{yaml.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n")
+    body = f"---\n{yaml.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n"
+    fd, tmp = tempfile.mkstemp(prefix=".loop-", suffix=".tmp", dir=_dir())
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _remove(it: dict):

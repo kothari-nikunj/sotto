@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -283,8 +284,8 @@ def _clock_hold(te, now_local: datetime) -> str:
     return ""
 
 
-def _submit(te, fresh: list, now_local: datetime) -> set:
-    """Hand this tick's nudges to the funnel as ONE bundle and return the keys it decided to
+def _submit(te, fresh: list, now_local: datetime) -> dict:
+    """Hand this tick's nudges to the funnel as ONE bundle and return key → decision_id for what it decided to
     deliver; everything it decided otherwise it has already queued or dropped, with a reason, in
     the same ledgers every event writes to.
 
@@ -292,10 +293,32 @@ def _submit(te, fresh: list, now_local: datetime) -> set:
     which IS this lane's "one unit per delivered push" rule — the tick's nudges go out as a single
     message (the skill's own rule), so they cost one unit between them."""
     if not fresh:
-        return set()
+        return {}
     out = te.triage({"events": [_proactive_event(n) for n in fresh]}, now_local=now_local)
-    return {_s((ev.get("event") or {}).get("key"))
+    return {_s((ev.get("event") or {}).get("key")): _s(ev.get("decision_id"))
             for ev in ((out.get("bundle") or {}).get("events") or [])}
+
+
+def _defer_delivery_effects(fired: list) -> bool:
+    """Detached receiver runs learn whether the host send succeeded only after this process exits.
+    Leave the small correlated receipt it needs; interactive runs return False and keep the historical
+    immediate-finalize behavior because their response is the delivery surface."""
+    run_id = _s(os.environ.get("SOTTO_DELIVERY_RUN_ID")).strip()
+    if not run_id or not re.fullmatch(r"[a-f0-9]{16,64}", run_id):
+        return False
+    os.makedirs(os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events"), exist_ok=True)
+    path = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events",
+                        f"delivery-effects-{run_id}.json")
+    payload = {
+        "decision_ids": [_s(n.get("decision_id")) for n in fired if _s(n.get("decision_id"))],
+        "effects": [{"kind": n["kind"], "anchor_key": _s(n.get("anchor_key"))}
+                    for n in fired if n.get("kind") in _FINALIZE_FLAG and _s(n.get("anchor_key"))],
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+    return True
 
 
 # Phase two, per lane: what continuity_resolve records once the nudge has ACTUALLY gone out.
@@ -625,10 +648,11 @@ def main():
             # it is handed, and a quiet night is forty ticks of the same list.
             fresh = [n for n in fresh if f"held:{n['key']}" not in seen]
             result["quiet"], result["reason"] = True, hold
-        fired_keys = _submit(te, fresh, now_local)
-        fired = [n for n in fresh if n["key"] in fired_keys]
+        fired_ids = _submit(te, fresh, now_local)
+        fired = [dict(n, decision_id=fired_ids[n["key"]])
+                 for n in fresh if n["key"] in fired_ids]
         result["nudges"] = fired
-        result["held"] = [n for n in fresh if n["key"] not in fired_keys]
+        result["held"] = [n for n in fresh if n["key"] not in fired_ids]
         # A nudge burns its key once the funnel has DECIDED about it — delivered, queued for the
         # digest, or dropped — so a 15-min cron never repeats it. One held by the CLOCK keeps its
         # key (it fires when the hold lifts) and burns a `held:` marker instead, so The Record
@@ -639,9 +663,11 @@ def main():
             _save_state(date, seen | burned)
     if any(n["kind"] in ("retune_offer", "handoff") for n in fired):
         _stamp_retune_offer(date)   # one cooldown window covers both tidy-up shapes
-    for n in fired:
-        if n["kind"] in _FINALIZE_FLAG:
-            _finalize(n["kind"], n.get("anchor_key"))  # phase two: it went out, so it counts
+    deferred = _defer_delivery_effects(fired) if fired else False
+    if not deferred:
+        for n in fired:
+            if n["kind"] in _FINALIZE_FLAG:
+                _finalize(n["kind"], n.get("anchor_key"))
     try:
         from sotto_log import diag
         diag(f"[proactive_scan] {len(result['nudges'])} nudge(s)"

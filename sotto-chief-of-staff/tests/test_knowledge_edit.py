@@ -331,7 +331,7 @@ def test_merge_dismiss_validates_slugs(tmp_path):
 
 def _loop_files(tmp_path):
     d = os.path.join(str(tmp_path), "knowledge", "continuity")
-    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+    return sorted(name for name in os.listdir(d) if name.endswith(".md")) if os.path.isdir(d) else []
 
 
 def _loop_fm(tmp_path, name):
@@ -354,7 +354,18 @@ def test_loop_add_writes_a_ledger_entry_in_the_resolver_s_shape(tmp_path):
     assert fm["channel"] == "manual" and fm["source"] == "user_added"
     assert fm["summary"] == "Send Sarah the revised deck"
     assert fm["contact_name"] == "Sarah Chen" and fm["deadline"] == "2026-08-12"
-    assert fm["created_at"] == TODAY and fm["times_surfaced"] == 1
+    assert fm["created_at"] == "2026-08-06 07:00:00" and fm["times_surfaced"] == 1
+
+
+def test_loop_add_can_record_something_the_counterpart_owes(tmp_path):
+    _setup(tmp_path)
+    out = ke.op_loop_add("Get back to me about the Hank intro", contact="James Gettinger",
+                         direction="them", now=NOW)
+    assert out["ok"] is True and out["created"] is True
+    fm = _loop_fm(tmp_path, _loop_files(tmp_path)[0])
+    assert fm["action_type"] == "waiting_on"
+    assert fm["contact_name"] == "James Gettinger"
+    assert fm["summary"] == "Get back to me about the Hank intro"
 
 
 def test_loop_add_dedupes_the_same_ask_instead_of_forking_a_file(tmp_path):
@@ -387,6 +398,8 @@ def test_loop_add_validates_its_inputs(tmp_path):
         ke.op_loop_add("   ", now=NOW)
     with pytest.raises(ke.EditError, match="YYYY-MM-DD"):
         ke.op_loop_add("do the thing", deadline="next tuesday", now=NOW)
+    with pytest.raises(ke.EditError, match="direction must be"):
+        ke.op_loop_add("do the thing", direction="someone", now=NOW)
 
 
 def test_loop_deadline_sets_and_clears_the_one_field(tmp_path):
@@ -414,17 +427,52 @@ def test_loop_deadline_validates_and_reports_a_missing_loop(tmp_path):
         ke.op_loop_deadline("thread:nope", "2026-09-01")
 
 
+def test_loop_retarget_replaces_direction_without_losing_the_obligation(tmp_path):
+    _setup(tmp_path)
+    old = ke.op_loop_add("Send James the Hank intro", contact="James Gettinger",
+                         direction="you", now=NOW)["anchor_key"]
+    out = ke.op_loop_retarget(old, "James will get back to me about the Hank intro",
+                              contact="James Gettinger", direction="them", now=NOW)
+    assert out["direction"] == "them" and out["anchor_key"] != old
+    rows = {fm["anchor_key"]: fm for fm in
+            (_loop_fm(tmp_path, name) for name in _loop_files(tmp_path))}
+    assert rows[old]["status"] == "dismissed"
+    assert rows[old]["resolution"] == "user_retargeted"
+    assert rows[old]["retargeted_to"] == out["anchor_key"]
+    assert rows[out["anchor_key"]]["status"] == "open"
+    assert rows[out["anchor_key"]]["action_type"] == "waiting_on"
+    assert rows[out["anchor_key"]]["corrected_from"] == old
+
+
+def test_loop_retarget_validates_everything_before_touching_the_old_loop(tmp_path):
+    _setup(tmp_path)
+    old = ke.op_loop_add("Send the deck", contact="Sarah", now=NOW)["anchor_key"]
+    with pytest.raises(ke.EditError, match="YYYY-MM-DD"):
+        ke.op_loop_retarget(old, "Sarah owes the deck", contact="Sarah", deadline="Friday",
+                            direction="them", now=NOW)
+    rows = {fm["anchor_key"]: fm for fm in
+            (_loop_fm(tmp_path, name) for name in _loop_files(tmp_path))}
+    assert list(rows) == [old]
+    assert rows[old]["status"] == "open"
+
+
 def test_loop_cli_contract_for_the_new_ops(tmp_path):
     _setup(tmp_path)
     env = {**os.environ, "SOTTO_DATA": str(tmp_path)}
     r = subprocess.run([sys.executable, CLI, "--op=loop-add", "--text=Send the deck",
-                        "--contact=Sarah Chen", "--deadline=2026-08-12"],
+                        "--contact=Sarah Chen", "--direction=them", "--deadline=2026-08-12"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0
     anchor = json.loads(r.stdout)["anchor_key"]
+    assert _loop_fm(tmp_path, _loop_files(tmp_path)[0])["action_type"] == "waiting_on"
     r2 = subprocess.run([sys.executable, CLI, "--op=loop-deadline", f"--anchor={anchor}",
                         "--deadline=2026-09-01"], capture_output=True, text=True, env=env)
     assert r2.returncode == 0 and json.loads(r2.stdout)["deadline"] == "2026-09-01"
+    r_retarget = subprocess.run(
+        [sys.executable, CLI, "--op=loop-retarget", f"--anchor={anchor}",
+         "--text=Sarah owes the deck", "--contact=Sarah Chen", "--direction=you"],
+        capture_output=True, text=True, env=env)
+    assert r_retarget.returncode == 0 and json.loads(r_retarget.stdout)["direction"] == "you"
     r3 = subprocess.run([sys.executable, CLI, "--op=loop-add", "--text=x", "--deadline=nope"],
                         capture_output=True, text=True, env=env)
     assert r3.returncode == 2 and "YYYY-MM-DD" in json.loads(r3.stdout)["error"]

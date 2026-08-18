@@ -469,7 +469,7 @@ def test_unparseable_timestamp_never_gates(tmp_path, monkeypatch):
 
 def test_surfaced_ledger_records_every_verdict(tmp_path, monkeypatch):
     """agent/queue/drop all land in surfaced.jsonl with the Record-renderable shape:
-    {ts, sender, channel, verdict, reason, class} (ts ISO-Z, per the dashboard's parser)."""
+    {ts, sender, channel, verdict, reason, class, decision_id} (ts ISO-Z)."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path)
     _no_llm(monkeypatch)
@@ -479,8 +479,9 @@ def test_surfaced_ledger_records_every_verdict(tmp_path, monkeypatch):
     rows = _surfaced_entries(tmp_path)
     assert len(rows) == 3
     for r in rows:
-        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class"}
+        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class", "decision_id"}
         assert r["ts"].endswith("Z")
+        assert r["decision_id"]
     by_verdict = {r["verdict"]: r for r in rows}
     assert by_verdict["drop"]["class"] == "automated"
     assert by_verdict["queue"]["class"] == "unknown"
@@ -914,7 +915,7 @@ def test_snooze_holds_every_agent_verdict_including_missed_calls(tmp_path, monke
     rows = _surfaced_entries(tmp_path)
     assert [r["verdict"] for r in rows] == ["queue", "queue"]
     for r in rows:
-        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class"}
+        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class", "decision_id"}
         assert r["class"] == "snoozed" and "snoozed until 2026-08-06T15:00" in r["reason"]
     assert _budget_file(tmp_path) is None                      # a held event spends no budget
 

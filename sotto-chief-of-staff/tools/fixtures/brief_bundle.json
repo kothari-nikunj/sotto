@@ -8,7 +8,7 @@
     { "id": "a2", "section": "should_handle", "channel": "imessage", "action_type": "follow_up",
       "contact_name": "Dev Patel", "source_thread_id": "t_dev",
       "summary": "Follow up with Dev about the demo time" },
-    { "id": "a3", "section": "already_handled", "channel": "email", "action_type": "waiting_on",
+    { "id": "a3", "section": "already_handled", "channel": "email", "action_type": "reply",
       "contact_name": "Maria Lopez", "source_thread_id": "t_old",
       "summary": "Replied to Maria about the invoice" }
   ],

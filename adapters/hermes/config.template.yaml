@@ -25,6 +25,10 @@ code_execution:
   timeout: 600                                # brief = extraction + critic in one execute_code call;
                                               # the 300s default can kill a 2–4 min brief mid-run
 
+cron:
+  wrap_response: false                        # Sotto copy is already user-facing; omit Hermes'
+                                              # "Cronjob Response" header/job-id/footer envelope
+
 
 # Cron jobs are created with the cronjob tool / CLI, not a config block:
 #   hermes cron create "30 6 * * *"  "Run my morning brief" --skill sotto-morning-brief

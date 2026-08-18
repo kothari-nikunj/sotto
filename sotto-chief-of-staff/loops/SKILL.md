@@ -1,6 +1,6 @@
 ---
 name: sotto-loops
-description: 'Use when the user asks what is outstanding — "what am I waiting on" / "what''s open" / "my open loops" / "what do I owe" / "my action ledger" / "loose ends" — or wants the list tidied: "clear my stale action items" / "clean up my open loops" / "this list is stale" / "I keep seeing the same items" / "tune up Sotto" / "too noisy". Reads the continuity ledger, split into what the user owes vs what they are waiting on others for, and on request clears the stale ones. Never sends anything.'
+description: 'Use when the user asks what is outstanding — "what am I waiting on" / "what''s open" / "my open loops" / "what do I owe" / "my action ledger" / "loose ends" — or corrects that list: "this is done" / "nothing to do" / "they will get back to me" / "did Granola capture these" / "clear my stale action items" / "clean up my open loops" / "this list is stale" / "I keep seeing the same items" / "tune up Sotto" / "too noisy". Reads and applies explicit corrections to the continuity ledger, split into what the user owes vs what they are waiting on others for. Never sends anything.'
 metadata:
   hermes:
     tags: [chief-of-staff, sotto, continuity, preferences]
@@ -24,7 +24,7 @@ gone stale**. Both are read-first. This skill never sends a message, email, or c
 1. **Query — ONE command.** `execute_code` →
    `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/loops_query.py"`
    It reads `$SOTTO_DATA/knowledge/continuity/*.md` (the ledger the brief maintains) and returns
-   `{you_owe:[…], waiting_on_them:[…], counts}`. Each item: `{name, what, channel, identifier,
+   `{you_owe:[…], waiting_on_them:[…], counts}`. Each item: `{anchor_key, name, what, channel, identifier,
    age_days, deadline, overdue, chased_count, last_chased_at, chased_out}`, oldest and most-overdue
    first. Don't hand-read the ledger.
 2. **Deliver, tight and skimmable.**
@@ -87,10 +87,40 @@ when you can't tell which loop they mean, ask.
 4. **Confirm in one line.** "Cleared 4 stale loops, snoozed 2 for a week, and I'll stop surfacing
    Bob. Your list is lighter now."
 
+## C · Applying explicit corrections
+
+When the user directly corrects an item, that statement **is** the authorization to edit the
+private ledger. Do not ask for a second confirmation. Query first (§A) so every edit uses an exact
+`anchor_key`, then apply only what the user said:
+
+- **Done / already handled** → resolve the existing item:
+  ```bash
+  python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_edit.py" \
+    --op loop --anchor '<anchor_key>' --to resolved
+  ```
+- **Not a real obligation / nothing to do / extracted incorrectly** → dismiss it with the same
+  command and `--to dismissed`.
+- **The direction changed** (for example, "James will get back to me") → retarget it in one locked
+  operation with the original grounded wording plus the user's correction:
+  ```bash
+  python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_edit.py" \
+    --op loop-retarget --anchor '<old_anchor_key>' --text '<what is owed>' \
+    --contact '<name>' --identifier '<known email/phone>' \
+    --direction them
+  ```
+  Use `--direction you` when the correction says the user owes it. Omit `--identifier` when unknown;
+  never guess one.
+- **A clearly stated item is missing entirely** → add it with `loop-add` and the correct direction.
+
+Every mutation must return JSON with `"ok": true`. After all edits, run `loops_query.py` again and
+verify the affected item is absent from the old list and present in the correct list when applicable.
+Only then say it was updated, and report the observed counts. If a write or verification fails, say
+which correction did not stick—never describe intended state as actual state.
+
 ## Notes
-- **This skill never resolves loops on its own.** The brief's Learn step (`continuity_resolve.py`)
-  is the single place that opens and closes them; §B only applies what the user just chose. So the
-  view is always consistent with the brief.
+- **Never infer closure.** The brief's Learn step (`continuity_resolve.py`) owns observational
+  resolution; this skill applies only the user's explicit §B/§C edits through the canonical writer.
+  Both paths persist the same terminal fields, so the view stays consistent with the brief.
 - `waiting_on_them` = the things the OTHER side owes — the only kind Sotto chases. Everything else
   active, including a thread gone quiet that needs YOUR nudge, is `you_owe`. One predicate decides
   it (`ledger_io.WAITING_ON_TYPES`), shared with the brief and the stale scan, so all three agree
