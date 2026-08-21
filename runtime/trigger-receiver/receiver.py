@@ -232,7 +232,13 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
         return False
     target = _deliver_target()
     try:
-        r = subprocess.run(["hermes", "send", "--to", target, "--quiet", "-"],
+        # `-f -` (--file -) is the documented way to force the body from stdin. A bare trailing `-`
+        # is NOT: argparse binds it to the optional [message] positional, so the platform receives
+        # the literal string "-" and the piped body is silently ignored — which is exactly what
+        # happened in production (Aug 2026): the first wake-push brief to survive the argv bug
+        # arrived in Telegram as a single dash, with a green "delivered" receipt. Second
+        # CLI-contract bug on this seam; second real-argparse regression test pinning it.
+        r = subprocess.run(["hermes", "send", "--to", target, "--quiet", "-f", "-"],
                            input=body, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS)
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] {label}: delivery FAILED ({type(e).__name__}: {e})", flush=True)

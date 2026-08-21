@@ -2448,6 +2448,44 @@ def test_spawn_argv_survives_a_real_argparse_hermes(tmp_path, monkeypatch):
     assert parsed["z"] == "run it" and parsed["t"] == "sotto-local"
 
 
+def test_deliver_body_survives_a_real_argparse_hermes_send(tmp_path, monkeypatch):
+    """REGRESSION (Aug 2026, found in the user's Telegram): `hermes send --to X --quiet -` binds the
+    trailing dash to the OPTIONAL [message] positional — the platform received the literal string
+    "-" and the piped brief was silently dropped, with a green "delivered" receipt because the send
+    exited 0. Stdin must be forced with `-f -`. Same lesson as the spawn-argv test above: the
+    stubbed sends can't hold a CLI contract, only a real argparse with hermes' exact shape can."""
+    rec.DATA = str(tmp_path)
+    out = os.path.join(str(tmp_path), "sent.txt")
+    fake = os.path.join(str(tmp_path), "hermes")
+    with open(fake, "w", encoding="utf-8") as f:
+        f.write("#!/usr/bin/env python3\n"
+                "import argparse, os, sys\n"
+                "p = argparse.ArgumentParser(prog='hermes')\n"
+                "s = p.add_subparsers(dest='cmd').add_parser('send')\n"
+                "s.add_argument('message', nargs='?')\n"          # <- what the bare dash bound to
+                "s.add_argument('-t', '--to'); s.add_argument('-f', '--file')\n"
+                "s.add_argument('-s', '--subject'); s.add_argument('--json', action='store_true')\n"
+                "s.add_argument('-l', '--list', action='store_true')\n"
+                "s.add_argument('-q', '--quiet', action='store_true')\n"
+                "a = p.parse_args()\n"
+                "if a.file:\n"
+                "    body = sys.stdin.read() if a.file == '-' else open(a.file).read()\n"
+                "elif a.message is not None:\n"
+                "    body = a.message\n"                          # stdin IGNORED — the dash bug
+                "else:\n"
+                "    body = sys.stdin.read()\n"
+                "open(os.environ['SOTTO_FAKE_SEND_OUT'], 'w').write(body)\n")
+    os.chmod(fake, 0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("SOTTO_FAKE_SEND_OUT", out)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "telegram")
+    body = "Ali declined your 11am — want me to offer 2pm instead?"
+    assert rec._deliver_text(body, "event") is True
+    with open(out, encoding="utf-8") as f:
+        assert f.read() == body, "the platform did not receive the piped body — the dash bug is back"
+    assert _delivery_rows(tmp_path)[-1]["status"] == "delivered"
+
+
 def test_what_a_run_cost_lands_on_its_receipt(tmp_path, monkeypatch):
     """Cost is ground truth, not an estimate: hermes writes the usage report, we copy the four
     fields onto the row that closes the run."""
