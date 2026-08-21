@@ -14,12 +14,16 @@ of ours from the path. It does not mean local.
 | Who | What they see | Why |
 |---|---|---|
 | **Your host** (Railway, or your own Mac in local mode) | Everything, at rest, on the volume you own | It runs the container and holds `$SOTTO_DATA` |
-| **Your model provider** (Gemini by default; any of the [supported models](MODELS.md)) | The **text of the brief prompt** — message bodies, email bodies, calendar events, notes, and the facts already in your graph | A brief is one model call, and the material is the prompt |
+| **Your model provider** (Gemini — the brief pipeline is Gemini-only today, see [MODELS.md](MODELS.md); the chat layer is switchable) | The **text of the brief prompt** — message bodies, email bodies, calendar events, notes, and the facts already in your graph | A brief is one model call, and the material is the prompt |
 | **Google** (if you connect Gmail/Calendar) | Nothing new — it is already their data | OAuth read scopes |
 
 Optional, only if you enable them: your **search provider** (Exa / Parallel / Gemini grounding) sees
 the *names and companies* of people you are meeting — and, when you ask Sotto to read a specific
 link, that link's URL (the provider fetches the page on your behalf) — never your message content.
+**Browser Use Cloud** (only with `BROWSER_USE_API_KEY` set — the last rung of the link-reading
+ladder, for pages the crawler rungs can't render): their hosted browser sees the URL you asked
+about and the rendered page. It is never given credentials or your message content, and without the
+key that rung simply doesn't exist.
 **Granola** sees nothing new — Sotto reads *from* it. **DocSend** is its own case: asking Sotto to
 read a deck submits **your own email** to the deck's gate, and the sender sees the view (your email,
 the timestamp, per-page time) in their DocSend analytics — which is why deck-reading only works when
@@ -71,6 +75,11 @@ memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); thi
 | `cache/research_<date>.json` | Attendee research render cache | 7 days |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect |
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, kept until you delete the files |
+| `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them |
+| `proactive/*` (incl. `pending_offer.json`) | The watcher's dedup stamps, and the one standing question Sotto last asked you (it can name a person) | Overwritten in place; the offer clears when answered |
+| `briefs/<date>.<kind>.named.json` | Which open loops that brief NAMED (so a chase isn't a double-tell) | Overwritten per brief |
+| `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
+| `dashboard_sessions.json` · `dashboard_audit.jsonl` | Dashboard login sessions, and one line per dashboard write | Sessions expire; the audit log rotates |
 
 ## Deleting it — `forget.py`
 

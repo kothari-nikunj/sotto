@@ -5,12 +5,11 @@ code is the source of truth; this is the map you read first. For *why* a nudge f
 [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md); for every env var, [RAILWAY.md](../RAILWAY.md).
 
 > **Prefer to click than to read?** [playground-architecture.html](playground-architecture.html) is
-> this page made explorable — the module table, the thread table and the shared-file table are the
-> same rows, and the funnel at the bottom will walk a real event (a friend's ask · an automated
-> email · a second channel within 45 min · a message during a meeting · the fifth nudge of the day ·
-> a post-meeting tap) through its gates and show the verdict with its reason.
+> this page made explorable — a layered node map of the same modules, threads and shared files,
+> with six saved views, a clickable drawer per node, and the shared-file sheet; every number on it
+> is interpolated from the same rules island the drift guard checks against code.
 > [playground-feedback-loops.html](playground-feedback-loops.html) does the same for the six
-> self-improvement loops, each badged CLOSED / RECORDING / PLANNED. Both are single self-contained
+> self-improvement loops, each badged CLOSED, RECORDING or PLANNED. Both are single self-contained
 > files: open them from disk, or visit `/static/playground-architecture.html` on a running deploy.
 
 ## The spine — read this first
@@ -29,7 +28,7 @@ owns each of them, and you can enter the system at any stage:
 
 **The LLM writes prose — it never decides *whether* to interrupt you.** That decision is the
 event-triage funnel, documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
-the six things that can start a nudge are the producer table at the top of that page.
+the seven things that can start a nudge are the producer table at the top of that page.
 
 ### The open-loop path — input to outcome
 
@@ -202,7 +201,7 @@ The container half above is the *plumbing*; the spine at the top of this page is
 small tables finish the map — the same writer/reader treatment as the `$SOTTO_DATA` table, applied
 to the two questions it doesn't answer.
 
-**Nudge producers** — six, and only six, things can start a nudge. (Full version, with the gate each
+**Nudge producers** — seven, and only seven, things can start a nudge. (Full version, with the gate each
 one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES.md#who-can-produce-a-nudge).)
 
 | Producer | Entry point | Cadence |
@@ -211,6 +210,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 | Gmail poll | `receiver._poll_gmail_once` | `SOTTO_EMAIL_POLL_SECS` (90s) |
 | Release valve | `receiver._valve_tick` → `triage_event.release_valve` | `receiver.VALVE_INTERVAL_SECS_DEFAULT` (900s) |
 | Post-meeting tap | `calcache.tap_tick` → `receiver._dispatch_meeting_tap` | on the calendar refresh tick |
+| Calendar diff | `calcache.change_tick` → `receiver._dispatch_synthetic` | the same refresh tick — declines, last-minute invites, moves, cancellations of imminent meetings |
 | Proactive watcher | `proactive_scan.main` → `triage_event.triage` (in process, one bundle) | the `*/15` cron |
 | "Nudge me now" | `dashboard._post_cadence` → `receiver.run_promote` → `triage_event.promote_one` | you, on the Cadence page |
 
@@ -240,8 +240,9 @@ volume with no lock.
 > nothing situational is ever stored.** (CLAUDE.md § Standing bars.)
 
 Research is the most expensive thing Sotto does, so it is the one loop that must compound. Three
-grounded call shapes go out through the ONE search seam (`_shared/scripts/web_research.py`:
-Parallel → Exa → Gemini grounding, by key presence); all three come back through
+grounded call shapes go out through the ONE search seam (`_shared/scripts/web_research.py` — per
+capability, the first provider with a key present wins; the three ladders are in
+[MODELS.md §5c](MODELS.md)); all three come back through
 `persist_prep.py` into `knowledge_update.apply()`:
 
 | Call | What it buys | Where it lands | Read back as |

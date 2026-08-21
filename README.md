@@ -135,13 +135,13 @@ local material, and the escape hatch) plus how to add a service:
 | [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the five modules, four daemon threads, five subprocess boundaries, and every shared file on the volume |
-| [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: click a module, walk a real event through the funnel's gates, watch the feedback loops close ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the five modules, four daemon threads, six subprocess boundaries, and every shared file on the volume |
+| [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
 | [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
 | **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — WhatsApp (default) · Telegram · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |
 | [INTEGRATIONS.md](INTEGRATIONS.md) | Connecting services (Granola, …): the one-click Connect tiles + the four-lane doctrine |
 | [docs/BLUEBUBBLES.md](docs/BLUEBUBBLES.md) | Optional: give Sotto its own iMessage identity |
-| [docs/UNINSTALL.md](docs/UNINSTALL.md) | Removing the Mac app cleanly |
+| [ONBOARDING.md §If something's off](ONBOARDING.md#if-somethings-off) | Troubleshooting, and removing the Mac app cleanly |
 
 ## For developers
 
@@ -168,6 +168,9 @@ cd .. && python3 -m pytest runtime/trigger-receiver -q
 CI runs exactly these three, in this order, on every push and pull request — so green locally means
 green there. A handful of tests exercise release tooling that lives outside this repo; they skip
 themselves rather than fail, which is why a clean clone goes green with nothing pending.
+
+(Working in the monorepo? `docs/ADDING-A-SOURCE.md` there covers adding a new Bridge data source —
+it edits Bridge source, so it deliberately doesn't ship in this repo.)
 
 The Bridge app ships signed [on Releases](https://github.com/kothari-nikunj/sotto/releases/latest);
 its macOS data readers are not part of this source tree. It updates itself: a daily check against

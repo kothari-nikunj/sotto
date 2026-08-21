@@ -31,7 +31,9 @@ Get a `sotto-bridged` engine onto this Mac. Step 4's installer
 finds it on its own and registers it — you never type a path.
 
 *Install the app (no toolchain needed).* Download **"Sotto Bridge.app"**
-from the Releases page and drag it to **/Applications**. The signed app bundles the engine inside
+from the Releases page and drag it to **/Applications**. First launch asks for an **access code** —
+the Bridge is invite-only for now; the code is checked on your Mac and never sent anywhere, and
+[Issues](https://github.com/kothari-nikunj/sotto/issues) is where to ask for one. The signed app bundles the engine inside
 itself at:
 ```
 /Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged
@@ -48,6 +50,7 @@ Grant **Full Disk Access to your terminal app** (Terminal/iTerm — System Setti
 the `chat.db` read to the process that *spawns* the Bridge — and both the verify command below and
 Hermes-launched runs are children of your terminal, so the terminal is the TCC principal. Adding
 `/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged` itself is belt-and-braces only. Verify:
+rebuild — the terminal grant doesn't.) Verify:
 ```bash
 # the installed app:
 "/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged" --doctor
@@ -104,7 +107,8 @@ it names — do step 1 (option A is the quick one) and re-run the installer.
 **6. Connect Google + a channel, then run:**
 ```bash
 hermes setup            # connect Google Workspace — interactive OAuth via the google-workspace CLI
-                        # (Granola: a community stdio MCP — see RAILWAY.md §6c)
+                        # (Granola locally: set GRANOLA_API_KEY, or GRANOLA_MCP_CMD for a stdio
+                        #  MCP — RAILWAY.md § Granola fallbacks; the /setup wizard tile is cloud-only)
 hermes gateway setup    # WhatsApp (scan a QR) or Telegram (bot token) — for scheduled-brief delivery
                         # WhatsApp is only the default; the choice is in CHANNELS.md
 hermes                  # then: "Sotto, set up"  →  "Sotto, morning brief"

@@ -76,9 +76,11 @@ repo exercises**, so read the caveats at the end before you commit to it.
    name and a username → it replies with a **bot token**. Then message your new bot once (`/start`) so
    it is allowed to message you back.
 2. **Set the variables in Railway.** The token variable and the allow/home-channel variables belong to
-   **Hermes**, not Sotto — run `hermes gateway setup` ▸ Telegram once (locally, or in a container
-   shell) to see the exact names it wants for your Hermes version, then set those same names in
-   Railway → Variables. Every variable you set whose name starts with `TELEGRAM_` is forwarded into
+   **Hermes**, not Sotto — run `hermes gateway setup` ▸ Telegram once to see the exact names it
+   wants for your Hermes version, then set those same names in Railway → Variables. On a
+   cloud-only deploy you get that shell from Railway itself: your service ▸ the **⋮ menu ▸ Shell**
+   (or `railway shell` with the CLI) drops you inside the running container — no local Hermes
+   install needed. Every variable you set whose name starts with `TELEGRAM_` is forwarded into
    `~/.hermes/.env` on boot, which is where Hermes reads messaging-platform settings from — the same
    mechanism the WhatsApp keys use. Your chat id is what the home-channel variable wants (ask
    [@userinfobot](https://t.me/userinfobot) for it).
@@ -92,7 +94,10 @@ repo exercises**, so read the caveats at the end before you commit to it.
 5. **Redeploy**, then check the boot log for `[sotto] gateway variable forwarded to Hermes:
    TELEGRAM_…` and `deliver=telegram` on the `[sotto] cron scheduler:` line. Message your bot
    **"set up Sotto"** — the guided setup verifies your connections and reports the delivery channel it
-   found. When it works, the 6:30/17:30 briefs arrive as messages from your bot.
+   found. When it works, the 6:30/17:30 briefs arrive as messages from your bot — and Sotto
+   acknowledges every message you send with a tapback (👀 while it works, ✅ when it's replied,
+   ❌ on an error; `SOTTO_REACTIONS=0` turns them off). Tapbacks are a Telegram perk: Hermes has
+   no bot-reaction support on WhatsApp.
 
 **What is and isn't verified.** Sotto's *own* channel-awareness is real and unit-tested: the cron
 `--deliver` target, the nudge delivery-gate (a Telegram deployer is never denied the release valve or

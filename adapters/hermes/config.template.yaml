@@ -3,10 +3,10 @@ model: gemini-3.7-flash                     # NATIVE Gemini id (gemini provider 
                                             # "google/…" would route via OpenRouter and need OPENROUTER_API_KEY
 
 mcp_servers:
-  sotto-local:                               # the Bridge
-    url: "https://<bridge-tunnel>"            # from Bridge pairing (stdio `command:` if Hermes is local)
-    headers:
-      Authorization: "Bearer <pairing_token>"
+  sotto-local:                               # the Bridge, via the receiver's ALWAYS-UP reverse relay:
+    url: "http://127.0.0.1:8787/mcp"          # the Mac dials OUT to the container — no tunnel, no
+    headers:                                  # BRIDGE_URL. On the cloud, start.sh registers this for
+      Authorization: "Bearer <BRIDGE_TOKEN>"  # you (port = $PORT); shown here for local installs.
   granola:                                    # optional; NOT in the Hermes MCP catalog — a community
     command: "<granola-mcp-command>"          # stdio server (see RAILWAY.md §6c / GRANOLA_MCP_CMD)
     env:
@@ -30,10 +30,11 @@ cron:
                                               # "Cronjob Response" header/job-id/footer envelope
 
 
-# Cron jobs are created with the cronjob tool / CLI, not a config block:
-#   hermes cron create "30 6 * * *"  "Run my morning brief" --skill sotto-morning-brief
-#   hermes cron create "30 17 * * *" "Run my evening brief" --skill sotto-evening-brief
-# The real brief is normally fired by the Bridge online-push (SPEC §4.1); cron is the
-# "Mac already up at target" fallback.
+# Cron jobs are created with the cronjob tool / CLI, not a config block — the schedule's ONE source
+# is adapters/hermes/crons.json (start.sh and the installers register it for you). Creating one by
+# hand? ALWAYS pass --name (boot dedup) and --deliver (without it output goes to the `local` sink
+# and never reaches you):
+#   hermes cron create "30 6 * * *" "Run my morning brief" --skill sotto-morning-brief \
+#     --name sotto-morning-brief --deliver "${SOTTO_CRON_DELIVER:-whatsapp}" 
 
 storage: /data                                # Railway volume → $SOTTO_DATA (knowledge/*, briefs/, style.json, …)

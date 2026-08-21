@@ -37,7 +37,10 @@ how tested each one is) in **[CHANNELS.md — Choosing your channel and model](C
 **Option A — one-click (recommended once the template is published).** Click this: Railway builds the container, adds the `/data`
 volume, generates `BRIDGE_TOKEN`, and gives the service a public domain automatically. You fill in
 only your **Gemini key** and **WhatsApp number** (entered twice — once as the allowlist, once as the
-delivery channel) at the prompt — then jump to step 2.
+delivery channel) at the prompt. Before moving on, check **Settings → Networking** shows a public
+domain — click **Generate Domain** if it doesn't, then redeploy once so the setup link in the logs
+is printed with it (without a domain that link reads `localhost` and goes nowhere). Then jump to
+step 2.
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
 
@@ -149,7 +152,7 @@ tool, which needs no approval.
 
 The guided setup verifies every connection, then seeds your memory and **writing voice** from ~6
 weeks of history — a few minutes, up to ~8 the very first time (it's researching the people in your
-calendar), and it narrates as it goes — schedules the briefs, and closes with an honest checklist:
+calendar), walks you through it step by step — schedules the briefs, and closes with an honest checklist:
 
 > Here's where you stand:
 > - **Bridge** (Mac: messages, calls, contacts) — ✓ connected
@@ -231,8 +234,9 @@ per-job override by design. Tune or disable any of them with the `SOTTO_PROACTIV
 The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: setup link says
 `localhost` (generate a domain), no reply in self-chat (allowlist number must match exactly), briefs
 never arrive (check the boot key-check line + `/debug/brief-log`), Google dying after a week (consent
-screen left in Testing — step 3②.3). Uninstalling the Mac app:
-**[docs/UNINSTALL.md](docs/UNINSTALL.md)**.
+screen left in Testing — step 3②.3). **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
+icon, drag `/Applications/Sotto Bridge.app` to the Trash, and remove its Full Disk Access entry in
+System Settings → Privacy & Security. That's everything — it keeps no other state on the Mac.
 
 **On a managed Mac (ThreatLocker, CrowdStrike, Jamf, …):** endpoint security will get in the way
 twice, and the symptoms look nothing alike. If the app is killed at launch, its *execution* is

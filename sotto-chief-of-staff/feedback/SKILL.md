@@ -123,6 +123,24 @@ Confirm in ONE line with the lift time the script printed, as Sotto — e.g. "Qu
 tomorrow — I'll hold everything and catch you up then." Plain chat text, no markdown headings/bold
 (the chatfmt rule — chat clients render them literally).
 
+## D · Standing rules & who-I-am — "remember: never book Fridays", "my focus this quarter is the fund raise"
+
+A durable fact or rule the user STATES about themselves goes to the **master file**
+(`$SOTTO_DATA/knowledge/master.md` — loaded into every brief and every meeting prep), not to
+preferences and not to a person file:
+
+    python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" append --section Procedures --text "<their rule, their words>"
+
+- `--section Procedures` for standing rules ("always send intros as forwardable emails");
+  `Priorities` for what matters right now; `About` / `People` for who they are and their inner
+  circle. One line per rule, their words.
+- **Explicit words only, confirmed first** — "Adding to your standing file: <the line> — right?"
+  Never write an inferred pattern; offer it instead. (Same contract as the persona's capture rule.)
+- If the write fails because the file is at its cap, say which section is largest and ask what to
+  trim — never trim on your own.
+- Routing test: *behavioral preference about Sotto's output* → §A (`preferences.py`); *fact about a
+  third person* → §B (graph correction); *fact or rule about the user themselves* → here.
+
 ## Deliver
 One line, as Sotto: e.g. *"Done — I'll stop surfacing newsletters from example.com."* or *"Got it —
 fixed Peyton's record; I won't repeat that."* Nothing else; no message is sent anywhere.

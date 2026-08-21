@@ -206,6 +206,11 @@ def test_release_valve():
 def test_calendar_cache_and_staleness():
     _same("calendar.ttl_secs", R["calendar"]["ttl_secs"], cal.CALENDAR_TTL_SECS)
     _same("calendar.stale_intervals", R["calendar"]["stale_intervals"], te.CALENDAR_STALE_INTERVALS)
+    _same("calendar.change_window_hours", R["calendar"]["change_window_hours"],
+          cal.CHANGE_WINDOW_HOURS)
+    _same("calendar.decline_window_hours", R["calendar"]["decline_window_hours"],
+          cal.DECLINE_WINDOW_HOURS)
+    _same("calendar.invite_grace_min", R["calendar"]["invite_grace_min"], cal.INVITE_GRACE_MIN)
     _same("intervals.calendar_refresh_secs", R["intervals"]["calendar_refresh_secs"],
           cal.REFRESH_SECS_DEFAULT)
     # triage_event's docstring calls its copy a mirror — hold it to that

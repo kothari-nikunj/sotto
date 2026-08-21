@@ -6,7 +6,7 @@ metadata:
     tags: [chief-of-staff, sotto, setup]
     category: productivity
     requires_toolsets: [sotto-local]
-    requires_tools: [execute_code]
+    requires_tools: [execute_code, terminal]
 ---
 
 # Sotto — Setup (guided first run)
@@ -89,7 +89,9 @@ This is `knowledge/master.md` — it rides along in every brief and meeting prep
 and they can edit it anytime on the dashboard's **Learned** page or by telling you in chat. If they
 skip everything, say "no problem — tell me anytime" and move on; never block setup on it.
 
-**4. Schedule the briefs — dedup first, ALWAYS.** Run `hermes cron list` FIRST and check which of the five jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers all five at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
+**4. Schedule the briefs — dedup first, ALWAYS.** Run every `hermes cron …` command in this step
+through the **`terminal` tool**, verbatim (`execute_code` is for the Python scripts, not host CLIs —
+the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check which of the five jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers all five at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
    The five jobs, their schedules and their skills live in **`adapters/hermes/crons.json`** — the one
    source `start.sh` and the installers read; if a schedule here ever disagrees with it, `crons.json`
    is right. Always pass **`--name`** (so boot-time dedup recognizes the job) and
@@ -119,12 +121,14 @@ skip everything, say "no problem — tell me anytime" and move on; never block s
    >   every message I write — brief, nudge, reply — is a draft that you send.
    > - Every silence is auditable. Anything I didn't surface has a row saying why, in the **Record**
    >   view of your dashboard (`/app#record`).
-   If they want the full rules, point them at `docs/HOW-SOTTO-DECIDES.md` — one line, then move on.
+   If they want the full rules, point them at the project's **HOW-SOTTO-DECIDES** doc on GitHub
+   (`docs/HOW-SOTTO-DECIDES.md` in the repo they deployed from — it isn't installed locally) — one
+   line, then move on.
    A ✗ delivery row is worth one extra line — a scheduled brief with nowhere to land is silently lost — but it never blocks an on-demand brief in this chat.
    Then offer the first brief: if Bridge AND Google are ✓ → "You're all set ✅ — want your first brief right now? Just say *good morning*. Otherwise I'll have it ready at 6:30am." If anything required is ✗ → "Once that's fixed, say *set up Sotto* again and I'll re-check — you can still say *good morning* for a partial brief from what I can see." If they say yes → run `sotto-morning-brief`.
 
 ## Notes
-- **WhatsApp and Gemini are defaults, not requirements.** If they ask about Telegram, iMessage, or a non-Gemini model, don't improvise — point them at `CHANNELS.md` ("Choosing your channel and model"), which carries the tradeoffs, the exact steps, and how tested each one is. One line, then move on.
+- **WhatsApp and Gemini are defaults, not requirements.** If they ask about Telegram, iMessage, or a non-Gemini model, don't improvise — point them at the project's **CHANNELS.md** ("Choosing your channel and model") on GitHub, in the repo they deployed from (it isn't installed locally); it carries the tradeoffs, the exact steps, and how tested each one is. One line, then move on.
 - Keep it to ~5 short exchanges total. During step 2, don't narrate every green check one by one — the step-5 checklist is the summary; only surface a check mid-flow when it's red and needs the user.
 - Never assume a grant; always verify via `health()`. Never retry a failed tool call in a loop.
 - If they come back later with "is Sotto working?", just run steps 2 + (if green) 5.

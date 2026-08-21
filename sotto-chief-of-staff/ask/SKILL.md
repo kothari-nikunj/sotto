@@ -85,7 +85,8 @@ inflate it with capabilities that aren't in the skill list:
 > - **Scheduling** — find time, put it on the calendar. *"find 30 min with Alex next week"*
 > - **Open loops & cleanup** — what you're waiting on, and pruning the stale ones. *"what am I waiting on"* / *"clean up stale loops"*
 > - **People & relationship pulse** — what I know about someone, who's drifting. *"what do I know about Sarah"* / *"who am I losing touch with"*
-> - **Feedback & mutes** — correct me, quiet what you don't want. *"stop surfacing newsletters"*
+> - **Routines** — your own scheduled asks, on your words. *"every Friday at 4, summarize my open loops"*
+> - **Feedback & mutes** — correct me, quiet what you don't want, or switch briefs to voice notes. *"stop surfacing newsletters"* / *"send my briefs as voice notes"*
 >
 > And if a brief looks thin or wrong: say **"that's wrong about X"** (I'll fix my memory), **"stop surfacing newsletters"** (mute), or **"clean up stale loops"** (`sotto-loops` tidies them).
 

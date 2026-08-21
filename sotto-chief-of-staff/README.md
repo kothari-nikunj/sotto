@@ -2,6 +2,7 @@
 
 The git **tap** that carries Sotto's brain: `SKILL.md` procedures + the extraction prompt + the deterministic Python algorithms. Hermes installs this and runs it; its Gemini does the LLM work, `execute_code` runs the scripts over the exhaust on the Hermes volume.
 
+- How it all fits: [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) (end-to-end data flow, process boundaries) · why you get nudged: [`../docs/HOW-SOTTO-DECIDES.md`](../docs/HOW-SOTTO-DECIDES.md)
 
 > The persona + bundle live in `../adapters/hermes/` (`sotto-persona.md`, `sotto.bundle.yaml`), not in the tap root. The tap root only carries `skills.sh.json` + the skill dirs below.
 
@@ -28,7 +29,7 @@ followup/                            # post-meeting: commitments + ready-to-send
 proactive/                           # ~15-min watcher: meeting-prep/commitment/chase/birthday/handoff/tidy-up nudges
   SKILL.md
   scripts/proactive_scan.py          # what is due (lead window, dedup) → the funnel decides who hears it
-event-triage/                        # real-time event funnel (Bridge/Gmail events -> act now or stay silent)
+event-triage/                        # real-time event funnel (Bridge/Gmail events -> act now or stay silent) — skill: sotto-event
   SKILL.md
   scripts/triage_event.py            # Tier 0+1 of the funnel (deterministic gate + cheap LLM triage)
   scripts/poll_gmail.py              # cloud-side email events (receiver shells out to it — not an orphan)
@@ -55,6 +56,7 @@ _shared/
   lib/chatfmt.py                     # the ONE markdown→chat-text transform (to_chat) every surface shares
   lib/connector_tokens.py            # read/refresh per-service OAuth tokens from the receiver's /setup
   lib/gemini.py                      # direct Gemini REST call (call_gemini) + retryable-error classification + diagnostics
+  lib/jsonstore.py                   # locked JSON read/write for shared state files (pending_offer, preferences)
   lib/keys.py                        # queue/style-sample ids — VENDORED byte-identical into runtime/trigger-receiver/
   lib/mcp_client.py                  # minimal Streamable-HTTP MCP client for deterministic gathers
   lib/metrics.py                     # per-run cost/latency accumulator ([brief-cost] lines)
@@ -76,7 +78,7 @@ _shared/
   scripts/log_outcome.py             # outcomes + analytics (parity C2)
   scripts/action_links.py            # deep-link / tap-to-send URL builder
   scripts/brief_marker.py            # delivered-once gate (cloud cron ↔ Bridge wake-push)
-  scripts/pending_offer.py       # the one question Sotto is waiting on an answer to (proactive writes, gateway reads+clears)
+  scripts/pending_offer.py           # the one question Sotto is waiting on an answer to (proactive + the evening brief write, gateway reads+clears)
   scripts/ledger_io.py               # shared READ helpers for the continuity ledger
   scripts/loops_query.py             # open-loops/action-ledger read view (sotto-loops, proactive)
   scripts/retune_scan.py             # read-only stale-loop scan behind sotto-loops §B
@@ -88,17 +90,22 @@ _shared/
     knowledge_query.py               # read + pack for the LLM (--calendar exempts today's cast)
     knowledge_edit.py                # user-initiated writes (facts, company About, loops, merges, relations) for chat + dashboard
     master_file.py                   # the ONE writer/reader for knowledge/master.md (the always-in-context master memory file)
-evals/                               # brief-quality eval harness (run_evals.py + fixtures/baselines)
+evals/                               # brief-quality eval harness
+  README.md                          # how to run it + the Golden Corpus doctrine
+  run_evals.py                       # fixture evals (shape + invariants, stubbed LLM)
   run_golden.py                      # Golden Corpus replay: the owner's real history, scored vs his labels
   LABELING.md                        # the one-hour labeling runbook (evals/README.md § The Golden Corpus)
+  fixtures/ · baselines/             # canned inputs + committed expected outputs
   corpus/                            # NEVER committed, NEVER shipped — real user data, built locally
 tests/                               # pytest: parity fixtures in → expected exhaust out (conftest sets sys.path)
-tools/                               # dry_run.py (offline full-loop) + validate_skills.py (SKILL.md lint)
+tools/                               # skill-tree tooling
+  dry_run.py                         # offline full-loop rehearsal (no LLM, no network; fixtures/brief_bundle.json)
+  validate_skills.py                 # SKILL.md lint (one leg of the four-guard gauntlet)
   forget.py                          # delete the exhaust (snapshot, caches, logs, receipts) — never the memory
   build_golden_corpus.py             # builds the Golden Corpus from $SOTTO_DATA (runs where the data lives)
 ```
 
 ## Rules
-- Every `SKILL.md` is valid agentskills (frontmatter `name`+`description`, `requires_toolsets`).
+- Every `SKILL.md` is valid agentskills (frontmatter `name`+`description`; `requires_toolsets`/`requires_tools` where the skill needs them — the validator enforces name+description).
 - Python scripts read/write the exhaust at `$SOTTO_DATA` (the Hermes volume); keep person/company `.md` + `style.json` schemas **byte-compatible** with today's Sotto files.
 - Ship parity tests with fixtures for every script (cite the ported source file in a header comment).

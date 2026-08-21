@@ -4,7 +4,7 @@
 
 | Host | Setup | Cost | Always-on | Guide |
 |---|---|---|---|---|
-| **Cloud Hermes (Railway)** | ~10 steps, ~15 min | hosting bill | yes — fires even with the Mac asleep | [ONBOARDING.md](../ONBOARDING.md) · [RAILWAY.md](../RAILWAY.md) |
+| **Cloud Hermes (Railway)** | ~10 steps, ~35 min the first time | hosting bill | yes — fires even with the Mac asleep | [ONBOARDING.md](../ONBOARDING.md) · [RAILWAY.md](../RAILWAY.md) |
 | **Local Hermes (Mac)** | `install.sh`, ~5 min | $0 | only while the Mac is awake | [LOCAL-SETUP.md](../LOCAL-SETUP.md) |
 | **OpenClaw** | `adapters/openclaw/install.sh` + wire 3 CLI lines | depends | depends | [openclaw/README.md](openclaw/README.md) |
 
@@ -40,6 +40,8 @@ host-specific lives here:
 | config template | model + `mcp_servers` + scheduler | `config.template.yaml` | `~/.openclaw/openclaw.json` (JSON5) |
 | MCP registration | register `sotto-local` | `configure_mcp.py` (writes config.yaml) | `openclaw mcp add`/`mcp set` (JSON5 snippet printed as fallback) |
 | scheduler / cron | the fallback timer | `hermes cron create … --skill` | `openclaw cron add "<cron>" "<prompt>"` (prompt-based, no `--skill`) — printed by `install.sh` |
+| skill-run command | how the trigger receiver runs a skill (one-shot: prompt in, final text out) | `SOTTO_RUN_SKILL="hermes -z"` | `SOTTO_RUN_SKILL="openclaw agent -m"` |
+| installer | one command to wire it all | `adapters/hermes/install.sh` | `adapters/openclaw/install.sh` (validated end to end against a live OpenClaw, Aug 2026 — the short "Still unverified" list is in [openclaw/README.md](openclaw/README.md)) |
 
 **The cron schedule has ONE source: `adapters/hermes/crons.json`** (host-neutral despite living under
 `hermes/`). It is an array of `{name, schedule, prompt, skill}` plus two optional keys — `gate`, the
@@ -53,8 +55,6 @@ timezone re-registration) — so a schedule can never drift between them.
 are the owner's personal routines (the `sotto-routines` skill); they never appear in `crons.json`,
 boot cleanup skips them by prefix, and the timezone re-registration drops them. A host adapter that
 adds its own scheduler wiring must keep that fence: touch only the jobs `crons.json` names.
-| skill-run command | how the trigger receiver runs a skill (one-shot: prompt in, final text out) | `SOTTO_RUN_SKILL="hermes -z"` | `SOTTO_RUN_SKILL="openclaw agent -m"` |
-| installer | one command to wire it all | `adapters/hermes/install.sh` | `adapters/openclaw/install.sh` (validated end to end against a live OpenClaw, Aug 2026 — the short "Still unverified" list is in [openclaw/README.md](openclaw/README.md)) |
 
 **Rule:** if a change would only make sense on one runtime, it belongs in `adapters/<host>/`, never in
 the core. Adding a new host = a new `adapters/<host>/`, not a fork.

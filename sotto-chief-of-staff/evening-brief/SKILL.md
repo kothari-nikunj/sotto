@@ -6,7 +6,7 @@ metadata:
     tags: [brief, chief-of-staff, sotto]
     category: productivity
     requires_toolsets: [sotto-local, google-workspace]
-    requires_tools: [execute_code]
+    requires_tools: [execute_code, terminal]
 required_environment_variables:
   - name: GOOGLE_AI_API_KEY
     prompt: Gemini API key (for the brief extraction)
@@ -39,6 +39,12 @@ Follow `sotto-morning-brief` steps 1–6 (including step 6's Deliver: claim the 
   delivered, loops closed, interruptions held, people prepped, follow-ups offered), naming who moved
   what, and rendered only for the counts that are nonzero. It reports outcomes, never throughput, and
   a day where nothing moved gets no block at all. Do not write your own version of it.
+- **The trailing "make that a standing rule?" question is composer-written too.** When today's
+  transcripts showed the user stating a durable rule, `compose_brief.py` appends at most ONE
+  `Heard you say: "…" — make that a standing rule?` question and records a `pending_offer` of kind
+  `procedure`. Leave it in place — never strip it as an "extra section". The user's later "yes" is
+  handled by the gateway persona (it writes the rule to the master file via `master_file.py` and
+  clears the offer); nothing for this run to do beyond delivering the brief verbatim.
 - **A new Sotto version is one composer-written line too.** When the daily update check finds a newer
   published build, `compose_brief.py` adds ONE line to whichever brief comes next (morning or evening)
   and never mentions that version again. It is housekeeping — never a separate message, never a nudge.

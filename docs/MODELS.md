@@ -7,7 +7,8 @@ Gemini-shaped response. A key from any other provider does nothing for briefs.
 
 **The one exception, and it is new: web research.** Search is no longer Gemini's alone — the seam
 (`_shared/scripts/web_research.py`) resolves a provider by key presence, `web_search`: **Exa →
-Gemini grounding**, `deep_research`: **Parallel → Exa → Gemini grounding**. That is the hole §5(c)
+Gemini grounding**, `deep_research`: **Parallel → Exa → Gemini grounding**, `fetch_url` (read a
+link someone sent): **Exa → Gemini url_context → Browser Use Cloud**. That is the hole §5(c)
 used to describe, and it is closed; everything else below still needs the Gemini key.
 
 **What already runs on other models today: the chat layer.** Hermes — not Sotto — owns the
@@ -33,7 +34,7 @@ on its own key, so what remains is genuinely just the client.
 | 2 | `compose_brief.run_critic` | Quality critic over the generated brief | ≤2×/day; auto-skipped on quiet days (`payload < 15,000` chars **and** ≤5 actions) | 20,199 chars |
 | 3 | `compose_brief.critique_and_revise` | Revise pass applying the critic's patches | only when the critic found something | 11,548 chars |
 | 4 | `_shared/scripts/research_attendees.py` | **Attendee research** — the `deep_research` capability (Parallel → Exa → Gemini grounding), 5 attendees/batch, cap 25 | ≤5 batches per brief (+ deep/focus passes) | 2,360 chars/batch |
-| 5 | `_shared/scripts/web_research.py` | **THE search seam** — the resolver, plus the `web_search` capability (Exa → Gemini grounding): ad-hoc lookups, venue checks | on demand | query only (~10²  chars) |
+| 5 | `_shared/scripts/web_research.py` | **THE search seam** — the resolver, plus `web_search` (Exa → Gemini grounding: ad-hoc lookups, venue checks) and `fetch_url` (Exa → Gemini url_context → Browser Use Cloud: read a link someone sent) | on demand | query/URL only (~10² chars) |
 | 6 | `meeting-prep/scripts/compose_meeting_prep.py` | Meeting prep sweep / focused prep | ~1×/day | 27,838 chars (4 meetings, 8 researched attendees) |
 | 7 | `followup/scripts/compose_followup.py` | Evening follow-up extraction | 1×/day (evening) | 3,707-char template + the day's ended meetings |
 | 8 | `event-triage/scripts/triage_event.py` → `_gemini_once` | **Tier-1 triage** on every inbound event that survives the deterministic gates | event-driven — Gmail polled every 90 s + Bridge pushes; not capped (the caps are on *delivered* nudges) | ≤2,378 chars (`TIER1_TEXT_MAX` 1,500 + 878 scaffolding) |
@@ -231,17 +232,19 @@ making; the Anthropic one is a separate, later decision.**
 ### (c) Research when Gemini is absent — SOLVED
 
 > **Rule: research uses the first provider whose key is present — `web_search`: Exa → Gemini
-> grounding; `deep_research`: Parallel → Exa → Gemini grounding — and with none of them the brief
-> says the research is unavailable rather than inventing it.**
+> grounding; `deep_research`: Parallel → Exa → Gemini grounding; `fetch_url`: Exa → Gemini
+> url_context → Browser Use Cloud (last on purpose: a real hosted browser, real credits — only for
+> pages the crawler rungs can't render) — and with none of them the brief says the research is
+> unavailable rather than inventing it.**
 
 This section used to say the opposite ("there is no second search provider in this repo"). That is
-no longer true. `_shared/scripts/web_research.py` is now the seam: one resolver, two capabilities,
-three providers, selection **by key presence only** — no `SOTTO_SEARCH_PROVIDER`, no per-capability
-override, nothing to keep in sync. `research_attendees.py` calls the same seam for its batched
+no longer true. `_shared/scripts/web_research.py` is now the seam: one resolver, three capabilities
+(`web_search` · `deep_research` · `fetch_url`), four providers, selection **by key presence only**
+— no `SOTTO_SEARCH_PROVIDER`, no per-capability override, nothing to keep in sync. `research_attendees.py` calls the same seam for its batched
 structured research, so sites 4 AND 5 run with no Gemini key at all.
 
-The two new variables are `EXA_API_KEY` and `PARALLEL_API_KEY`, and they are the only ones this
-change adds — credentials, which is the one kind of variable a default cannot serve. Provider
+The new variables are `EXA_API_KEY`, `PARALLEL_API_KEY`, and `BROWSER_USE_API_KEY` — credentials,
+which is the one kind of variable a default cannot serve. Provider
 details and the lane-1 rationale: [INTEGRATIONS.md](../INTEGRATIONS.md).
 
 So a non-Gemini deployment has two honest options, and both work today:

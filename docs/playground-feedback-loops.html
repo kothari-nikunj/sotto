@@ -115,7 +115,7 @@
   "intervals":  { "events_tick_secs": 3, "email_poll_secs": 90, "valve_interval_secs": 900,
                   "calendar_refresh_secs": 900, "triage_fork_secs": 30, "gmail_fork_secs": 180,
                   "calendar_gather_fork_secs": 60, "dashboard_cli_fork_secs": 30 },
-  "calendar":   { "ttl_secs": 600, "stale_intervals": 2 },
+  "calendar":   { "ttl_secs": 600, "stale_intervals": 2, "change_window_hours": 24, "decline_window_hours": 48, "invite_grace_min": 15 },
   "tap":        { "grace_min": 5, "max_per_day": 3 },
   "quiet":      { "start_hour": 21, "end_hour": 7 },
   "vip":        { "min_priority": 10 },
@@ -281,7 +281,7 @@ const LOOPS = [
     hub: ["Style", "the writing fingerprint"],
     closes: "The seed-to-draft circuit is closed today: the gather's <code>in:sent</code> lane and the Mac's own outbound rows feed the extractor every brief, and <code>style_apply.py</code> quotes verbatim samples into the drafter prompt — per-person first, then the context bucket.",
     detail: [
-      "Confirming a sample on the dashboard's Voice card forks <code>style_extract.py --confirm &lt;hash&gt;</code>, copying it into the <code>confirmed</code> bucket. That bucket is weighted hardest — it is floored at {style.confirmed_floor} quality, immune to TTL eviction, and quoted first as “drafts the user has shipped before (highest signal)”. <strong>That consumer weighting is live.</strong>",
+      "Confirming a sample on the dashboard's Voice card forks <code>style_extract.py --confirm &lt;hash&gt;</code>, copying it into the <code>confirmed</code> bucket. That bucket is weighted hardest — it is floored at {style.confirmed_floor:pct}% quality, immune to TTL eviction, and quoted first as “drafts the user has shipped before (highest signal)”. <strong>That consumer weighting is live.</strong>",
       "The arc this loop does <em>not</em> close is “what did he change about what I wrote”. That is loop 5, and it lands with the Step 3 learning loop.",
       "Accumulation is real, not a sketch: three context buckets, quality scoring, promotion after a week above the quality bar, and per-bucket TTL eviction ({style.ttl_days:slash} days) so a voice from last spring doesn't outvote this week's."
     ],
@@ -292,7 +292,7 @@ const LOOPS = [
       { s: "Store", name: "style.json", file: "$SOTTO_DATA/style.json (schema v2)", note: "Canonical, recent, per-person and confirmed samples, each with an age and a score." },
       { s: "Apply", name: "Into the prompt", file: "_shared/scripts/style_apply.py", note: "Verbatim samples, per-person first, then the bucket, plus master guardrails: capitalization, exclamation habit, openers and closings." },
       { s: "Draft", name: "The draft sounds like you", file: "draft-reply skill · the nudge's ready-to-send reply", note: "Never sent — always a draft behind a tap." },
-      { s: "Confirm", name: "You confirm a sample", file: "dashboard Voice card → style_extract.py --confirm", note: "Floored at {style.confirmed_floor}, TTL-immune, quoted first. The one place a human vote outranks the extractor." }
+      { s: "Confirm", name: "You confirm a sample", file: "dashboard Voice card → style_extract.py --confirm", note: "Floored at {style.confirmed_floor:pct}%, TTL-immune, quoted first. The one place a human vote outranks the extractor." }
     ]
   },
   {

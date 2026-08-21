@@ -16,7 +16,10 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
 - **Calendar** — a background thread refreshes today's events every `SOTTO_CALENDAR_REFRESH_SECS`
   (default 15 min). It powers the in-meeting hold, detects meetings that just ended, and **diffs
   each refresh against the last** to catch what changed about the imminent calendar: a decline, a
-  last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables).
+  last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables). Only
+  *imminent* changes count: the meeting must start within 24 hours (48 for a decline, plus a 15-min
+  grace on an invite to a meeting that just started), and solo blocks, all-day events and internal
+  standups never mint a change.
 
 **What arrives is untrusted.** A message's text is written by whoever sent it, so nothing in the
 text can steer Sotto: the deterministic gates below read only metadata (sender, channel, clock,
@@ -36,7 +39,7 @@ including for the ones the clock suppressed — because they are the same code, 
 
 ## Who can produce a nudge
 
-Six things in the whole system can start a nudge. Each one is listed here with the function that
+Seven things in the whole system can start a nudge. Each one is listed here with the function that
 begins it and the point where it rejoins the rules below — so "where does a message become a nudge?"
 is a table lookup, not a code search.
 
@@ -109,7 +112,8 @@ queues** — the funnel fails toward silence, never toward noise.
   VIP" in chat or the toggle on her dashboard page) is checked first, then two fallbacks: a
   top-of-queue relationship-pulse priority, or a "family" mention in their file.
 - **In-meeting hold** — while you are inside a timed calendar event with at least one other human,
-  would-be nudges queue as `meeting_hold`. Solo blocks and all-day events never hold, and a calendar
+  would-be nudges queue as `meeting_hold` — except missed calls, escalations and calendar changes,
+  which come through anyway. Solo blocks and all-day events never hold, and a calendar
   cache that is stale or from another day never holds — Sotto won't act on a stale belief about
   where you are.
 - **The release valve** — every 15 min, when nothing is holding, up to 2 queued events per tick

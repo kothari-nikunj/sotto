@@ -63,8 +63,10 @@ no research at all. Two lane-1 keys close that, and beat grounding when they're 
 
 **The rule, in one sentence:** *for each capability Sotto uses the first provider whose key is
 present — `web_search`: **Exa → Gemini grounding**; `deep_research`: **Parallel → Exa → Gemini
-grounding** — and a provider that errors falls through to the next, with nothing left reported as
-"research unavailable" rather than answered from memory.*
+grounding**; `fetch_url` (read a link someone sent): **Exa → Gemini url_context → Browser Use
+Cloud** (last on purpose — a real hosted browser, real credits, only for pages the crawler rungs
+can't render; `BROWSER_USE_API_KEY`) — and a provider that errors falls through to the next, with
+nothing left reported as "research unavailable" rather than answered from memory.*
 
 Where it says so: the brief's **Data Source Availability** line names *Attendee Research (web
 search)* as unavailable, exactly as it does a meeting-notes gather that failed. A day with no
@@ -164,9 +166,11 @@ rejections are listed under the table with their reasons.
   developer-heavy user asks.
 - **Stripe.** Revenue numbers in a brief are a dashboard: you cannot act on MRR at 6:30am. A chief
   of staff reports what moved and what you owe, not a metric.
-- **DocSend.** "Someone spent eight minutes on your deck" is genuinely a chase trigger — but there
-  is no public viewer-analytics API to read it from, and the rest of the product is a dashboard.
-  Feasibility kills it before doctrine does.
+- **DocSend.** *Viewer analytics* ("someone spent eight minutes on your deck") stays out: there is
+  no public API to read it from, and the rest of that product is a dashboard — feasibility kills it
+  before doctrine does. *Reading a deck someone sent you* is different and ships today:
+  `docsend_fetch.py` opens the link through its email gate, reads the pages with Gemini vision, and
+  hands you a PDF + summary — chat-only, because a fresh view is visible to the deck's sender.
 - **X / LinkedIn.** What Sotto needs from them — what this person said or shipped recently —
   already arrives through the search seam above. Direct integration means paid API tiers (X) or
   scraping against terms (LinkedIn) for material we already have.

@@ -70,5 +70,7 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
   volume-only ranking, so the weighting only ever sharpens the order — it never hides anyone.
 - Cron: the weekly job (Monday 9am) is registered at boot from `adapters/hermes/crons.json`. To
   (re)create it by hand, use the host's own scheduler the way the installer does — Hermes:
-  `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse`;
-  OpenClaw: `openclaw cron add "0 9 * * 1" "Run my relationship pulse (use the sotto-relationship-pulse skill)" --name sotto-relationship-pulse --declaration-key sotto:sotto-relationship-pulse`.
+  `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`;
+  OpenClaw: `openclaw cron add "0 9 * * 1" "Run my relationship pulse (use the sotto-relationship-pulse skill)" --name sotto-relationship-pulse --declaration-key sotto:sotto-relationship-pulse --announce --channel "${SOTTO_CRON_DELIVER:-whatsapp}"`.
+  Without `--deliver` (Hermes) / `--announce --channel` (OpenClaw) the job runs and its output goes
+  to the default `local` sink — the user never sees it (setup/SKILL.md step 4 states the same rule).

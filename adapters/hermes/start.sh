@@ -315,16 +315,37 @@ else
   hermes config set whatsapp.reply_prefix $'*Sotto*\n' >/dev/null 2>&1 || true
   echo "[sotto] whatsapp reply prefix: *Sotto* (set SOTTO_HIDE_AGENT_NAME=1 for none)"
 fi
-# Progress UX. We want what the Mac app showed: human-readable phase updates ("Pulling your calendar…",
-# "Researching the people you're meeting…"), NOT raw tool spam ("execute_code", "pip install",
-# "iteration N/60"), and NOT dead silence for 2–3 min. Two levers:
-#  • interim_assistant_messages=on → the agent's own plain-language narration streams LIVE (this is the
-#    Mac-app-style progress; the skills are instructed to narrate each phase).
-#  • tool_progress=new → a lightweight heartbeat so it's never silent even if the model under-narrates;
-#    `accumulate` keeps it to ONE edit-in-place bubble, and cleanup_progress deletes it once the brief
-#    lands — so the end state is just the narration + the brief. Set SOTTO_TOOL_PROGRESS=off for
-#    narration-only (no tool bubble), or =all/verbose for debugging.
-hermes config set display.interim_assistant_messages true >/dev/null 2>&1 || true
+# Progress UX (owner, Aug 2026): a chat channel is a place for RESULTS, not a terminal. By default
+# NOTHING streams mid-turn — no model narration ("thinking" text), no tool breadcrumbs; the
+# platform's native typing indicator (hermes default: on) plus the "⏳ Working — N min" heartbeat
+# cover the wait, and the first thing the user reads is the deliverable. One knob restores the old
+# streaming: SOTTO_TOOL_PROGRESS=new → plain-language narration + ONE edit-in-place tool bubble
+# (cleaned up on delivery); =all/verbose → full breadcrumbs for debugging. `off` is the default.
+TP="${SOTTO_TOOL_PROGRESS:-off}"
+if [ "$TP" = "off" ]; then
+  hermes config set display.interim_assistant_messages false >/dev/null 2>&1 || true
+  echo "[sotto] progress stream: off (typing indicator only; SOTTO_TOOL_PROGRESS=new restores narration)"
+else
+  hermes config set display.interim_assistant_messages true >/dev/null 2>&1 || true
+  echo "[sotto] progress stream: $TP (narration + tool bubble)"
+fi
+hermes config set display.tool_progress "$TP" >/dev/null 2>&1 || true
+hermes config set display.tool_progress_grouping accumulate >/dev/null 2>&1 || true
+for k in whatsapp telegram discord; do
+  hermes config set "display.platforms.$k.cleanup_progress" true >/dev/null 2>&1 || true
+done
+# Tapbacks (owner ask, Aug 2026): with the progress stream off, the reaction IS the acknowledgment
+# — Hermes reacts on YOUR message: 👀 when it starts working, ✅ when the reply lands, ❌ on an
+# error (Telegram Bot API replaces the bot's reaction atomically, so you only ever see one).
+# Telegram-only: hermes has no bot-reaction support on WhatsApp, and the key is ignored where
+# unsupported. Hermes ships it off; Sotto turns it on — SOTTO_REACTIONS=0 restores off.
+if [ "${SOTTO_REACTIONS:-1}" = "1" ]; then
+  hermes config set telegram.reactions true >/dev/null 2>&1 || true
+  echo "[sotto] tapbacks: on — 👀 working · ✅ replied · ❌ error (telegram; SOTTO_REACTIONS=0 to disable)"
+else
+  hermes config set telegram.reactions false >/dev/null 2>&1 || true
+  echo "[sotto] tapbacks: off (SOTTO_REACTIONS=0)"
+fi
 
 # Hermes's daily session reset (mode/idle_minutes/at_hour — no silence key in any version we've
 # seen) BROADCASTS "◐ Session automatically reset…" to the home channel when it fires. Sotto keeps
@@ -332,12 +353,6 @@ hermes config set display.interim_assistant_messages true >/dev/null 2>&1 || tru
 # notice stands alone in the middle of the night. Move it to 6:00: the notice attaches to the next
 # session activity (the 6:30 brief run), which buries it, and the day's first run starts fresh.
 hermes_set_if_supported session_reset.at_hour 6
-TP="${SOTTO_TOOL_PROGRESS:-new}"
-hermes config set display.tool_progress "$TP" >/dev/null 2>&1 || true
-hermes config set display.tool_progress_grouping accumulate >/dev/null 2>&1 || true
-for k in whatsapp telegram discord; do
-  hermes config set "display.platforms.$k.cleanup_progress" true >/dev/null 2>&1 || true
-done
 # Voice (read + listen). Enable Hermes-native TTS so Sotto can deliver a SPOKEN brief and voice replies
 # (and transcribe voice notes you send — two-way). Default `edge` (Microsoft Edge TTS — free, no key,
 # good quality); set SOTTO_TTS_PROVIDER=gemini to use the Google key you already have (voice via

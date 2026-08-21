@@ -67,7 +67,7 @@ cron already sent.
      `detail` as the whole message — it is already the sentence: *"I've nudged Maya twice about the
      contract — nudge them again, or let it go?"* Person, thing, binary choice. Don't dress it up,
      don't add a draft unless they say "nudge them", and don't fold it into a list of other items.
-     If they say let it go, run **`sotto-loops`**' drop for that item; if they say nudge again,
+     If they say let it go, run **`sotto-loops`** §B `dismiss` for that item; if they say nudge again,
      draft a chase per the rules above.
    - `birthday` → draft a short, warm note and present it with the contact's tap-link.
      When the nudge carries **`lead_days`** (the birthday is a few days out, not today), it's a *gift*

@@ -8,10 +8,11 @@ the fallback, or for a repo without a published template. The Mac side (Bridge) 
 then see §8.
 
 > **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the friendly fresh-cloud walkthrough.
-> This page is the click-by-click reference behind it. Honest budget for the manual deploy: **~15
-> minutes** — four Railway settings, four variables, then the one-page `/setup` wizard (paste your
-> Google client JSON + auth code, scan one WhatsApp QR). Call it a dozen clicks and copy-pastes end
-> to end for the manual path; the **one-click template** cuts that to ~5 (two prompts + the wizard).
+> This page is the click-by-click reference behind it. Honest budget for the manual deploy: **~35
+> minutes the first time** (only ~15 of it active — four Railway settings, four variables, then the
+> one-page `/setup` wizard: paste your Google client JSON + auth code, scan one WhatsApp QR; the
+> rest is waiting on builds). The **one-click template** cuts the active part to ~5 (two prompts +
+> the wizard), call it ~20 end to end.
 
 ## 0. Before you start (prerequisites)
 
@@ -52,6 +53,9 @@ Railway dashboard ▸ **New Project** ▸ **Deploy from GitHub repo** ▸ pick y
 ## 2. Builder + build context (CRITICAL)
 The `Dockerfile` sits at the **root of the Sotto folder**, and its `COPY` lines are relative to that
 folder — in this standalone repo that folder *is* the repo root:
+
+> The repo ships a `railway.toml` that already pins `builder = "DOCKERFILE"` — on most deploys
+> Railway honors it and the settings below are just what to verify (or set when the UI disagrees).
 
 - **Settings ▸ Build ▸ Builder** → **Dockerfile**
 - Leave **Root Directory** and **Dockerfile Path** blank. Railway auto-detects `./Dockerfile`; context = repo root. Done.
@@ -187,7 +191,7 @@ Fallbacks, only if you want them:
 Granola is optional — fine to skip and ship Gmail + Calendar + the Bridge first.
 
 ## 7. Talk to Sotto
-You chose **personal number / self-chat** (`SOTTO_WHATSAPP_MODE=2`), so *your own WhatsApp is the bot* —
+Sotto defaults to **personal number / self-chat** (`SOTTO_WHATSAPP_MODE=2` — the installer answers this for you), so *your own WhatsApp is the bot* —
 you talk to Sotto by **messaging yourself**:
 - WhatsApp ▸ new chat ▸ **"Message Yourself"** (your name with "(You)"), or search your own number.
 - Send **"hi"** → the agent replies, prefixed ***Sotto*** (so you can tell its messages from yours —
@@ -202,7 +206,7 @@ WhatsApp number — then people message that number directly.)*
 ## 8. Connect the Mac Bridge (local iMessage/SMS/calls)
 Gmail + Calendar come from Google; your **local** signals come from the Sotto Bridge on your Mac. It
 connects **tunnel-free**: the Mac dials *out* to this Railway host, so there's nothing to expose — no
-Cloudflare, no domain, no inbound port.
+Cloudflare, no domain, no inbound port. How the reverse link works end to end: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (the relay module).
 
 1. **Railway → Variables:** make sure `BRIDGE_TOKEN` is set — the shared bearer. Template deploys
    generate it automatically (you never see or type it); on a manual deploy, set a long random secret
@@ -211,7 +215,8 @@ Cloudflare, no domain, no inbound port.
    type the token into the Mac app — the pairing link below carries it. *(The wake-push uses
    `BRIDGE_TOKEN` too; `SOTTO_TRIGGER_TOKEN` only exists to give it a separate bearer.)*
 2. **On your Mac:** install the signed **Sotto Bridge** menu bar app — [download it from GitHub
-   Releases](https://github.com/kothari-nikunj/sotto/releases/latest) — then **pair it in one click**:
+   Releases](https://github.com/kothari-nikunj/sotto/releases/latest); it ships as a signed DMG
+   only (the Bridge source isn't in this repo) — then **pair it in one click**:
    - Open the **setup link from the deploy logs** (step 6 — `/setup` needs its access code) on that Mac
      → click **“Open in Sotto Bridge”**. It fills the host + token (no typing, and the host always
      carries `https://`).
@@ -237,6 +242,8 @@ The button below collapses the whole manual checklist above — build, `/data` v
 `BRIDGE_TOKEN` — into one click, leaving just two prompts (your Gemini key and your WhatsApp number). Your email isn't one of them: Sotto learns it from the Google account you connect in the wizard. Once
 the template is published it's the fastest path; until then, the manual checklist above is the way in.
 
+<!-- The publish pipeline injects the published Railway template URL here; until a template is
+     published this button is a placeholder and the manual checklist above is the path. -->
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
 
 *(Button 404s? The template isn't published for this repo yet — use the manual checklist above.)*
@@ -296,6 +303,7 @@ research caps — are named constants in the code that owns them, not variables 
 
 | Variable | Purpose | When |
 |---|---|---|
+| `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface) | never |
 | `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for the briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
 | `WHATSAPP_ALLOWED_USERS` | who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | **required** |
 | `WHATSAPP_HOME_CHANNEL` | where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | **required** (delivery) |
@@ -341,7 +349,8 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_WHATSAPP_MODE` | `2` self-chat (default) · `1` dedicated bot number (needs a 2nd WhatsApp number). | optional |
 | `SOTTO_WHATSAPP_PAIR_TIMEOUT` | how long the boot-time QR pairing step stays open, in seconds (default `900` = 15 min). | optional |
 | `SOTTO_HIDE_AGENT_NAME` | `1` drops the ***Sotto*** reply prefix on WhatsApp messages entirely (default: prefixed, so you can tell its messages from yours in self-chat). | optional |
-| `SOTTO_TOOL_PROGRESS` | tool-progress heartbeat while Sotto works: `new` (default — one edit-in-place bubble, cleaned up on delivery) · `off` (narration only) · `all`/`verbose` (debugging). | optional (UX) |
+| `SOTTO_TOOL_PROGRESS` | what streams into chat while Sotto works: `off` (default — nothing mid-turn; the typing indicator and the periodic "⏳ Working" heartbeat cover the wait) · `new` (plain-language narration + one edit-in-place tool bubble, cleaned up on delivery) · `all`/`verbose` (debugging). | optional (UX) |
+| `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Telegram only (Hermes has no bot reactions on WhatsApp). | optional (UX) |
 | `GATEWAY_ALLOW_ALL_USERS` | `true` = open access (testing only). | optional |
 | `GOOGLE_OAUTH_CLIENT_JSON` | **optional now** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy). This var remains as a legacy/headless fallback (loaded at boot). | optional (legacy) |
 | `GOOGLE_AUTH_CODE` | the one-time code from `/google/auth`; **clear it** after `Google: connected ✓`. | during Google connect |

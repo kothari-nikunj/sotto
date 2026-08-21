@@ -54,7 +54,7 @@ meeting?" and never fall back to the sweep.
 > company ("VC firm", "Alive *Ventures*") from the event title, the email domain, or memory. Concretely:
 > - Company name = **exactly** what the event title's parenthetical or email domain gives. `alive.inc`
 >   → "Alive" (never "Alive Ventures"); `(Browserbase)` → "Browserbase" with **no** role attached.
-> - `session_search`/recall is for continuity (open loops, "last time you discussed X"), **never** for
+> - Your host's session/recall search (if it has one) is for continuity (open loops, "last time you discussed X"), **never** for
 >   inferring who someone is. A familiar-sounding fact you can't point to in the gathered data is a guess.
 > - If you didn't run research and have no graph entry, deliver a **bare schedule** — time, meeting
 >   title, and the attendee names + grounded company only — and say "I don't have backgrounds on them
