@@ -145,6 +145,15 @@ looking for more events, and do not re-triage.
    - Ground ONLY in the bundle + the calendar cache + the graph — never invent WHY something
      changed, and never speculate about the decliner's reasons.
 
+3e. **A message whose whole point is a LINK** (an intro'd memo, an article, a doc): you may read
+   it before drafting — `execute_code`:
+   `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/web_research.py" --url "<the link>"`
+   — and use ONE line of what it says to make the nudge concrete ("the memo argues X"). Could not
+   read it → nudge without it; never guess a page's contents. **Never `docsend_fetch.py` from
+   here**: viewing a DocSend logs the user's visit with the sender, so it is chat-only by
+   construction (the script refuses in unattended runs) — the nudge says a deck was sent and lets
+   the user ask Sotto to read it.
+
 4. **Draft the reply in the user's voice** (this is what makes the nudge actionable, not just noisy):
    - `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/style_apply.py" '{"recipient":…,"channel":…,"canonical_id":…}'`
      → verbatim sample messages + voice guardrails. **Match the quoted samples' voice, length, and

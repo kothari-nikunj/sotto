@@ -43,6 +43,30 @@ whose answer lives only in the chat scrollback.
 are researching a PERSON or a COMPANY, use the path above — a fact you paid for and threw away is
 the one thing this skill must not do.
 
+## Links the user asks about ("what's this?", "read this", a link that IS the message)
+
+- **Any ordinary link** — `execute_code`:
+  `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/web_research.py" --url "<the link>"`
+  → `{url, title, text, provider}`. Answer from `text`; empty text + `error` means say plainly you
+  couldn't read it — never summarize a page from imagination. Read links the user SENT or ASKED
+  about, one at a time — this is a reader, not a crawler.
+- **A DocSend link** (`docsend.com/view/…` — founders' decks) — `execute_code`:
+  `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/docsend_fetch.py" --url "<the link>"`
+  It submits the USER's own email to the deck's gate, reads the page images with Gemini, and
+  returns `{title, pages, text, pdf, cached}` — it also SAVES the deck: the pages assembled into
+  one PDF plus the extracted text under `$SOTTO_DATA/decks/`. Tell the user both halves: the
+  summary, and that the PDF is downloadable from their dashboard at `/api/decks/<view_id>.pdf`
+  (logged in). `cached: true` means this deck was read before and answered from disk — say so; no
+  new view was logged. A re-read on purpose is `--fresh` (which DOES log a new view).
+  **Know what this does before running it: the founder sees the
+  view — the user's email and timestamp land in their DocSend analytics.** That is why it only
+  runs from chat (it refuses in unattended runs) — the user asked, so the view is theirs. On a
+  `gate` error, relay it verbatim — and if the deck wants a passcode and the user gives you one,
+  re-run with `--passcode "<it>"`; verification-required decks (click-the-link email) genuinely
+  need the user to open the link themselves once. After a successful read, treat the deck like any other
+  source: durable company facts belong in the graph via the research path above, the pitch itself
+  is situational and stays in chat.
+
 ## Output format
 - Lead with the direct answer in 1–3 sentences, then (only if useful) short supporting bullets — each one traceable to a graph fact, ledger item, message, email, or transcript you actually retrieved.
 - Person/company questions: one identity line first (**Name** — title, company, if known), then facts.

@@ -222,6 +222,9 @@ DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 KIND_RE = re.compile(r"\A[a-z0-9_-]{1,32}\Z")
 BRIEF_FILE_RE = re.compile(r"\A(\d{4}-\d{2}-\d{2})_([a-z0-9_-]{1,32})\.json\Z")
 PERSON_API_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})\Z")
+# The deck PDFs docsend_fetch.py saves under $SOTTO_DATA/decks/ — the filename is the DocSend view
+# id (its charset), matched whole so a path can never traverse; served session-gated like every api.
+DECK_API_RE = re.compile(r"\A/api/decks/([A-Za-z0-9_-]{1,80}\.pdf)\Z")
 PERSON_FACTS_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})/facts\Z")
 PERSON_RELATIONS_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})/relations\Z")
 FACT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
@@ -806,6 +809,17 @@ def _handle_api(h, path: str):
             return _json(h, 200, api_learned())
         if path == "/api/master":
             return _json(h, 200, api_master())
+        m = DECK_API_RE.match(path)
+        if m:
+            # A deck PDF the user asked Sotto to capture (docsend_fetch.py) — the download half of
+            # the private docsend2pdf. Binary, attachment-named, same session gate as everything.
+            try:
+                with open(os.path.join(_root(), "decks", m.group(1)), "rb") as f:
+                    data = f.read()
+            except OSError:
+                return _json(h, 404, {"error": "no such deck"})
+            return _respond(h, 200, "application/pdf", data, _headers() + [
+                ("Content-Disposition", f'attachment; filename="{m.group(1)}"')])
         if path == "/api/cadence":
             return _json(h, 200, api_cadence())
         if path == "/api/graph":

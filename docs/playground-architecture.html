@@ -484,6 +484,7 @@ const SHARED_FILES = [
   ["connectors/&lt;service&gt;.json", "connectors (OAuth write; /setup Disconnect deletes)", "skills, receiver (presence only)"],
   ["connectors/&lt;service&gt;.error", "skills (the gather; /setup Disconnect deletes)", "receiver (reconnect hint)"],
   ["dashboard_sessions.json · dashboard_audit.jsonl", "dashboard", "dashboard"],
+  ["decks/&lt;view_id&gt;.pdf · decks/&lt;view_id&gt;.json", "docsend_fetch.py (pdf = assembled pages; json = read cache — a re-ask never logs a second view)", "dashboard GET /api/decks, skills (cache hits)"],
   ["knowledge/master.md", "master_file.py (the ONE writer — user-stated words; gateway confirms, dashboard edits shell out to it)", "compose_brief + compose_meeting_prep (always in the prompt), gateway chat, dashboard (Learned page)"],
   ["knowledge/last_local_snapshot.json", "skills (compose_brief.py)", "skills — the RAW Bridge payload, kept until deleted"],
   ["knowledge/relationship_state.json", "skills (relationship_pulse.py)", "skills (compose_brief.py, the VIP floor), dashboard (attention queue)"],

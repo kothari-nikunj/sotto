@@ -1023,6 +1023,31 @@ WRITE_REQS = (("/api/people/sarah-chen/facts", {"op": "archive", "fact_id": "f_a
               ("/api/master", {"op": "set", "section": "About", "text": "a line"}))
 
 
+def test_deck_pdf_download_is_gated_named_and_traversal_proof(tmp_path):
+    """GET /api/decks/<id>.pdf serves the file docsend_fetch saved — session-gated like every api,
+    filename matched whole (no traversal), 404 for a deck that isn't there."""
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    os.makedirs(os.path.join(str(tmp_path), "decks"), exist_ok=True)
+    with open(os.path.join(str(tmp_path), "decks", "abc123.pdf"), "wb") as f:
+        f.write(b"%PDF-1.4 fake deck")
+    try:
+        code, _, _ = _get(base, "/api/decks/abc123.pdf")
+        assert code == 401                                     # no session → gated
+        cookie = _login(base)
+        code, body, hdrs = _get(base, "/api/decks/abc123.pdf", headers=cookie)
+        assert code == 200 and hdrs.get("Content-Type") == "application/pdf"
+        assert "abc123.pdf" in hdrs.get("Content-Disposition", "")
+        code, _, _ = _get(base, "/api/decks/nope.pdf", headers=cookie)
+        assert code == 404
+        for evil in ("/api/decks/../config/settings.json", "/api/decks/a%2Fb.pdf",
+                     "/api/decks/abc123.json"):
+            code, _, _ = _get(base, evil, headers=cookie)
+            assert code in (400, 404), evil                    # only <safe-name>.pdf ever matches
+    finally:
+        srv.shutdown()
+
+
 def test_master_card_reads_the_file_and_writes_through_the_one_writer(tmp_path):
     """GET /api/master is a read-only window (sections parsed, cap stated); POST rides the skills
     tree's master_file.py with verb-style argv; invalid op → 400 before any subprocess; skills tree

@@ -67,7 +67,8 @@ _shared/
   scripts/gather_granola.py          # deterministic Granola gather (MCP lane + REST break-glass)
   scripts/google_action.py           # the WRITE side of google-workspace (Gmail draft/send, calendar writes)
   scripts/research_attendees.py      # batched two-pass attendee research (deep_research capability)
-  scripts/web_research.py            # THE search seam: the provider resolver + the web_search capability
+  scripts/web_research.py            # THE search seam: the provider resolver + web_search / deep_research / fetch_url
+  scripts/docsend_fetch.py           # read a DocSend deck via its email gate + Gemini vision (chat-only — a view is visible to the sender)
   scripts/prewarm_graph.py           # setup-time graph seed (stubs + default-on low-conf research)
   scripts/style_extract.py           # PORT: style-profile.ts (fingerprint v2)
   scripts/style_apply.py             # PORT: style-profile.ts formatStyleForWorker (verbatim sample injection)

@@ -11,12 +11,19 @@ Selection is by KEY PRESENCE only. There is no provider knob and there never wil
 new variables are credentials (`EXA_API_KEY`, `PARALLEL_API_KEY`), and a credential is the only kind
 of variable a default can't serve.
 
-The two capabilities are the two shapes this tree actually asks for — not an invented taxonomy:
+The three capabilities are the three shapes this tree actually asks for — not an invented taxonomy:
   web_search    — a query in, grounded text + citations out. This module's `research()`; the
                   schedule skill's venue lookups, ad-hoc one-offs.
   deep_research — a prompt + a JSON schema in, a grounded structured object out. That is
                   `research_attendees.py`'s `_grounded_json` (attendee profiles, the recency sweep,
                   the focus company dive) — multi-step research whose answer must land in fields.
+  fetch_url     — ONE specific URL in, that page's text out (BROWSER-USE.md §5's "the cheaper
+                  80%": read the link someone actually SENT the user). Exa's /contents endpoint,
+                  then Gemini's url_context tool — both crawler-class and cheap — and only when
+                  BOTH fail, Browser Use Cloud (key-gated, a real hosted browser, read-only by
+                  fence) for the JS-rendered / bot-walled pages no crawler can read. Fenced by
+                  DOCTRINE to links from the user's own correspondence or their own ask — this is
+                  a reader, not a crawler.
 Every provider here answers natively in the shape the capability names: Exa `/search` (semantic,
 `type:"deep"` + `outputSchema` for the structured shape), Parallel `/v1/tasks/runs` (research task
 with `output_schema`), Gemini `generateContent` with the `google_search` tool.
@@ -28,6 +35,7 @@ search, and because until now a deploy without `GOOGLE_AI_API_KEY` had NO resear
 Usage:
   web_research.py "Peyton Casper Browserbase"   # prints {query, text, citations:[{title,uri}], provider}
   web_research.py --json '["q1","q2"]'          # batch: prints [{query,text,citations,provider}, …]
+  web_research.py --url https://example.com/post   # prints {url, title, text, provider}
 Env: EXA_API_KEY / PARALLEL_API_KEY / GOOGLE_AI_API_KEY (any one is enough), SOTTO_GEMINI_MODEL
      (default gemini-3.7-flash).
 Test: SOTTO_LLM_STUB=/path/to/response.json bypasses the network entirely (returns that file's text).
@@ -51,15 +59,24 @@ if _LIB not in sys.path:
 # ── the resolver ─────────────────────────────────────────────────────────────────────────────────
 # One table, one precedence per capability, one presence check. Everything else in this file is a
 # provider implementation; nothing else decides who answers.
-KEY_ENV = {"exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY", "gemini": "GOOGLE_AI_API_KEY"}
+KEY_ENV = {"exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY", "gemini": "GOOGLE_AI_API_KEY",
+           "browseruse": "BROWSER_USE_API_KEY"}
 CAPABILITIES = {
     "web_search": ("exa", "gemini"),
     "deep_research": ("parallel", "exa", "gemini"),
+    # browseruse is LAST, not a middle rung (owner, Aug 2026): Exa and Gemini's url_context are both
+    # crawler-class fetches — fast, and already paid for — so the hosted browser (real credits,
+    # 10-60s of session) is the escalation for the pages NO crawler can read: JS-rendered SPAs and
+    # bot-walled sites. READ fence (BROWSER-USE.md §4 still governs): public pages only, a
+    # read-this-one-page task, never a profile, never a credential, never an action — their cloud
+    # runs the browser and sees the page, which is exactly what the key opts into.
+    "fetch_url": ("exa", "gemini", "browseruse"),
 }
 
 HTTP_TIMEOUT = 60             # a one-off lookup's whole budget (the old grounded-call timeout)
 EXA_NUM_RESULTS = 6           # enough sources for a bio; more is noise you pay to read
 EXA_TEXT_MAX_CHARS = 2000     # per result — the caller reads this text, it never needs whole pages
+FETCH_TEXT_MAX_CHARS = 8000   # fetch_url reads ONE page the user cares about — a memo, not a book
 PARALLEL_BASE = "https://api.parallel.ai"
 PARALLEL_PROCESSOR = "base"   # the cheap end of Parallel's research processors; deep_research is
                               # called inside research_attendees' 60–90s per-batch budget, so a
@@ -113,10 +130,10 @@ def _first_answer(capability: str, attempt) -> tuple:
 
 # ── wire primitives (stdlib only, like every other gather in this tree) ──────────────────────────
 
-def _post(url: str, body: dict, headers: dict, timeout: float) -> dict:
+def _post(url: str, body: dict, headers: dict, timeout: float, method: str = "POST") -> dict:
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", **headers}, method="POST")
+        headers={"Content-Type": "application/json", **headers}, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
@@ -170,6 +187,113 @@ def _exa_deep(prompt: str, schema: dict, timeout: float) -> dict | None:
         except (json.JSONDecodeError, ValueError):
             return None
     return content if isinstance(content, dict) else None
+
+
+def _exa_contents(url: str, timeout: float) -> dict | None:
+    """Exa POST /contents — page text for ONE known URL (same header, same key as /search; the
+    endpoint is in the same exa-labs/openapi-spec the module header cites)."""
+    data = _post("https://api.exa.ai/contents",
+                 {"urls": [url], "text": {"maxCharacters": FETCH_TEXT_MAX_CHARS}},
+                 {"x-api-key": _key("exa")}, timeout)
+    for r in (data.get("results") or []):
+        if isinstance(r, dict) and (r.get("text") or "").strip():
+            return {"url": url, "title": r.get("title") or "", "text": r["text"].strip()}
+    return None
+
+
+def _gemini_fetch_url(url: str, timeout: float) -> dict | None:
+    """Gemini's url_context tool — the model fetches the URL server-side and answers from it. The
+    floor rung: works on the key every deploy already has; JS-heavy or blocked pages may come back
+    empty, which falls through to the caller's honest 'could not read it'."""
+    api = (f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}"
+           f":generateContent?key={_key('gemini')}")
+    prompt = ("Read this page and return its content as plain text — the title on the first line, "
+              f"then the substantive text, no commentary: {url}")
+    data = _post(api, {"contents": [{"parts": [{"text": prompt}]}],
+                       "tools": [{"url_context": {}}]}, {}, timeout)
+    cand = (data.get("candidates") or [{}])[0]
+    text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
+    if not text:
+        return None
+    return {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
+            "text": text[:FETCH_TEXT_MAX_CHARS]}
+
+
+# ── Browser Use Cloud (https://api.browser-use.com/api/v2 — their CLOUD.md is the spec source) ───
+# The hosted browser, key-gated (BROWSER_USE_API_KEY), READ-ONLY BY TASK TEXT and by fence: this
+# rung exists for the pages Exa can't crawl (JS-rendered, bot-walled), not for acting on the web.
+# No Browser Profile is ever created or synced (their cookie-upload feature is the "be me" custody
+# class BROWSER-USE.md rejects) and no credential ever rides a task. Sessions bill while open, so
+# the session is stopped the moment the task terminates — and on a timeout, before falling through.
+
+BROWSERUSE_BASE = "https://api.browser-use.com/api/v2"
+BROWSERUSE_POLL_SECS = 3
+BROWSERUSE_CREATE_TIMEOUT = 20
+
+_BROWSERUSE_TASK = ("Open {url} and return the page's title on the first line, then the page's "
+                    "full readable text content. Read this ONE page only: do not click links, do "
+                    "not log in, do not fill or submit anything, do not navigate anywhere else.")
+
+
+def _browseruse_stop(session_id: str, headers: dict) -> None:
+    """Best-effort session stop — an open session bills for up to 15 minutes."""
+    if not session_id:
+        return
+    try:
+        _post(f"{BROWSERUSE_BASE}/sessions/{session_id}", {"action": "stop"}, headers,
+              10, method="PATCH")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _browseruse_fetch(url: str, timeout: float) -> dict | None:
+    headers = {"X-Browser-Use-API-Key": _key("browseruse")}
+    deadline = time.monotonic() + timeout
+    run = _post(f"{BROWSERUSE_BASE}/tasks", {"task": _BROWSERUSE_TASK.format(url=url)},
+                headers, min(BROWSERUSE_CREATE_TIMEOUT, timeout))
+    task_id, session_id = run.get("id"), run.get("sessionId")
+    if not task_id:
+        return None
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(BROWSERUSE_POLL_SECS)
+            tv = _get(f"{BROWSERUSE_BASE}/tasks/{task_id}", headers,
+                      max(5, min(20, deadline - time.monotonic())))
+            if tv.get("status") in ("finished", "stopped"):
+                text = (tv.get("output") or "").strip()
+                if not text:
+                    return None
+                return {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
+                        "text": text[:FETCH_TEXT_MAX_CHARS]}
+        return None                       # out of budget → fall through to the Gemini floor
+    finally:
+        _browseruse_stop(session_id, headers)
+
+
+_FETCH_URL = {"exa": _exa_contents, "browseruse": _browseruse_fetch, "gemini": _gemini_fetch_url}
+
+
+def fetch_url(url: str) -> dict:
+    """Read ONE specific URL — the link someone sent, the page the user asked about. Returns
+    {url, title, text, provider}; with nothing able to read it, empty text plus `error`, so the
+    caller says "couldn't read the link" instead of summarizing from imagination. Same never-raise,
+    one-deadline contract as research()."""
+    stub = os.environ.get("SOTTO_LLM_STUB")
+    if stub:
+        try:
+            with open(stub, encoding="utf-8") as f:
+                return {"url": url, "title": "", "text": f.read(), "provider": "stub"}
+        except Exception:
+            return {"url": url, "title": "", "text": "", "provider": "stub"}
+    deadline = time.monotonic() + HTTP_TIMEOUT
+    out, provider = _first_answer("fetch_url",
+                                  lambda p: _FETCH_URL[p](url, _remaining(deadline)))
+    if out is None:
+        return {"url": url, "title": "", "text": "", "provider": None,
+                "error": NO_PROVIDER if not provider_chain("fetch_url") else "could not read the page"}
+    out["provider"] = provider
+    _diag(f"[web_research] fetch_url {url[:80]} → {provider}: {len(out['text'])} chars")
+    return out
 
 
 # ── Parallel (https://api.parallel.ai) ───────────────────────────────────────────────────────────
@@ -267,6 +391,9 @@ def main():
     if args and args[0] == "--json":
         queries = json.loads(args[1]) if len(args) > 1 else json.loads(sys.stdin.read())
         print(json.dumps([research(str(q)) for q in queries]))
+        return
+    if args and args[0] == "--url":
+        print(json.dumps(fetch_url(args[1] if len(args) > 1 else sys.stdin.read().strip())))
         return
     query = " ".join(args) if args else sys.stdin.read().strip()
     print(json.dumps(research(query)))

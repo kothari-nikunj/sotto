@@ -75,14 +75,18 @@ KEY_PROVIDERS = {
             "does": "web search, and deep research when Parallel isn't set"},
     "parallel": {"label": "Parallel", "env": "PARALLEL_API_KEY",
                  "does": "deep research (first choice when set)"},
+    "browseruse": {"label": "Browser Use Cloud", "env": "BROWSER_USE_API_KEY",
+                   "does": "a real hosted browser for JS-heavy link reads — their cloud sees the "
+                           "page; read-only, never your logins"},
     "gemini": {"label": "Gemini grounding", "env": "GOOGLE_AI_API_KEY",
-               "does": "the built-in fallback for both — already set if briefs work"},
+               "does": "the built-in fallback for the others — already set if briefs work"},
 }
 
 # Per capability, the providers that could answer it, in precedence order. First one with a key wins.
 CAPABILITIES = {
     "web_search": ("exa", "gemini"),
     "deep_research": ("parallel", "exa", "gemini"),
+    "fetch_url": ("exa", "gemini", "browseruse"),
 }
 
 DISCOVERY_TTL_SECS = 24 * 3600   # re-discover daily; providers move endpoints rarely but do

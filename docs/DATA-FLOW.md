@@ -18,8 +18,13 @@ of ours from the path. It does not mean local.
 | **Google** (if you connect Gmail/Calendar) | Nothing new — it is already their data | OAuth read scopes |
 
 Optional, only if you enable them: your **search provider** (Exa / Parallel / Gemini grounding) sees
-the *names and companies* of people you are meeting, never your message content. **Granola** sees
-nothing new — Sotto reads *from* it.
+the *names and companies* of people you are meeting — and, when you ask Sotto to read a specific
+link, that link's URL (the provider fetches the page on your behalf) — never your message content.
+**Granola** sees nothing new — Sotto reads *from* it. **DocSend** is its own case: asking Sotto to
+read a deck submits **your own email** to the deck's gate, and the sender sees the view (your email,
+the timestamp, per-page time) in their DocSend analytics — which is why deck-reading only works when
+you ask in chat and refuses to run unattended (a deck already read answers from its saved copy under
+`decks/` — a re-ask, or a brief mentioning it, never logs a second view).
 
 **Nothing goes anywhere else.** There is no telemetry, no analytics, no crash reporting, no update
 ping that carries content. The only outbound call Sotto makes on its own behalf is a daily
@@ -65,6 +70,7 @@ memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); thi
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB |
 | `cache/research_<date>.json` | Attendee research render cache | 7 days |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect |
+| `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, kept until you delete the files |
 
 ## Deleting it — `forget.py`
 
