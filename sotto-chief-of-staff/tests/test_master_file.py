@@ -198,3 +198,16 @@ def test_persona_documents_read_and_confirmed_capture():
     assert "append --section Procedures" in text             # …and the capture command
     assert "confirm" in text.lower()                         # explicit words, confirmed first
     assert "`procedure`" in text                             # the yes-handler for the evening offer
+
+
+def test_persona_searches_for_emails_before_asking():
+    """REGRESSION (Aug 2026, the Ron invite): the agent had Gmail tools in hand, needed an
+    attendee's email, and asked the user instead of searching. The persona now spells out the
+    lookup order — graph, then Gmail — with asking as the last resort."""
+    persona = os.path.join(ROOT, "..", "adapters", "hermes", "sotto-persona.md")
+    with open(persona, encoding="utf-8") as f:
+        text = f.read()
+    assert "search before you ever ask" in text.lower()
+    assert 'knowledge_query.py" --person' in text             # step 1: the graph
+    assert "search your Gmail tool" in text                   # step 2: Gmail From/To history
+    assert "last resort" in text                              # asking comes third, not first

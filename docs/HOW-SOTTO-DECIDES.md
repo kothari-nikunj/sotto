@@ -18,6 +18,14 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
   each refresh against the last** to catch what changed about the imminent calendar: a decline, a
   last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables).
 
+**What arrives is untrusted.** A message's text is written by whoever sent it, so nothing in the
+text can steer Sotto: the deterministic gates below read only metadata (sender, channel, clock,
+calendar) — words like "urgent" or "ignore your instructions" cannot buy a mute back, skip quiet
+hours, or spend the budget; the one model call that does read the text is fenced to classify it as
+data, never follow it; and the synthetic source names Sotto mints internally (`meeting_end`,
+`calendar_change`, `proactive` — which carry gate exemptions) are re-labeled to `unknown` if an
+event over the wire ever claims one.
+
 Every event is deduped by `(source, rowid)` and then runs through **one** funnel, synchronously.
 There is no second nudge path, and that is now structural rather than a matter of discipline: the
 proactive watcher (the ~15-min cron that notices a meeting about to start, a commitment due today, a
