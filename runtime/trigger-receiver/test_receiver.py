@@ -546,6 +546,65 @@ def test_fresh_claim_still_dedupes(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_wake_after_delivered_folds_payload_into_snapshot(tmp_path, monkeypatch):
+    """The owner's design (Aug 2026): the 6:31 cron brief is THE brief even when the Mac slept
+    through it. When the Bridge wakes hours later and pushes morning_ready with fresh local_data,
+    handle_trigger must NOT compose a second brief (the old path burned a full compose only to lose
+    brief_marker's deliver-once claim and discard the text) — it stages the payload and folds it
+    into the local snapshot, and the funnel (nudges/digest) surfaces the catch-up."""
+    rec.DATA = str(tmp_path)
+    calls, seeded = [], []
+    monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
+    monkeypatch.setattr(rec, "_seed_snapshot_from", lambda p: seeded.append(p))
+
+    class SyncThread:  # run the seed inline so the assertions below aren't racing a real thread
+        def __init__(self, target=None, args=(), daemon=None):
+            self._target, self._args = target, args
+            assert daemon is True  # the fold must never block receiver shutdown
+        def start(self):
+            self._target(*self._args)
+    monkeypatch.setattr(rec.threading, "Thread", SyncThread)
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    open(os.path.join(str(tmp_path), "briefs", "2026-08-21.morning.delivered"), "w").close()
+    body = {"type": "morning_ready", "date": "2026-08-21",
+            "local_data": {"contacts": [{"name": "Ali Panju", "phone": "+15551234567"}]}}
+    code, r = rec.handle_trigger(body)
+    assert (code, r["status"]) == (200, "already_delivered")
+    assert r.get("snapshot") == "seeding"
+    assert calls == []                                  # no second brief, ever
+    payload = os.path.join(str(tmp_path), "briefs", "2026-08-21.morning_ready.payload.json")
+    assert seeded == [payload]
+    with open(payload, encoding="utf-8") as f:
+        assert json.load(f)["contacts"][0]["name"] == "Ali Panju"
+    rows = [x for x in _delivery_rows(tmp_path) if x["label"].startswith("brief:")]
+    assert [x["status"] for x in rows] == ["skipped"]
+    assert "folded into the snapshot" in rows[0]["detail"]
+    # a payload-less retry of the same push stays a plain dedupe — nothing to fold, nothing recorded
+    code2, r2 = rec.handle_trigger({"type": "morning_ready", "date": "2026-08-21"})
+    assert (code2, r2["status"]) == (200, "already_delivered") and "snapshot" not in r2
+    assert len(seeded) == 1
+
+
+def test_seed_snapshot_from_wire_format(tmp_path, monkeypatch):
+    """_seed_snapshot_from's subprocess line is a wire format: THIS interpreter, compose_brief.py's
+    real path, --seed-snapshot <payload>, SOTTO_DATA pointing at the receiver's volume. Pin it so a
+    refactor can't silently detach the fold from the one snapshot writer."""
+    rec.DATA = str(tmp_path)
+    ran = []
+    class R:
+        returncode, stdout, stderr = 0, '{"seeded": true}', ""
+    monkeypatch.setattr(rec.subprocess, "run",
+                        lambda argv, **kw: (ran.append((argv, kw)), R)[1])
+    ok = rec._seed_snapshot_from("/data/briefs/x.payload.json")
+    assert ok is True
+    argv, kw = ran[0]
+    assert argv[0] == rec.sys.executable
+    assert argv[1].endswith(os.path.join("_shared", "scripts", "compose_brief.py"))
+    assert argv[2:] == ["--seed-snapshot", "/data/briefs/x.payload.json"]
+    assert kw["env"]["SOTTO_DATA"] == str(tmp_path)
+    assert kw["timeout"] == rec.SEED_SNAPSHOT_TIMEOUT_SECS
+
+
 def test_setup_code_env_override(monkeypatch):
     monkeypatch.setattr(rec, "SETUP_CODE", None)
     monkeypatch.setenv("SOTTO_SETUP_CODE", "from-env-123")
@@ -2359,6 +2418,34 @@ def test_toolsets_are_scoped_only_when_asked_and_only_for_hermes(tmp_path, monke
     assert argv[-1] == "run it"                                         # the prompt stays last
     _run_oneshot(rec, ["openclaw", "run"])
     assert "-t" not in runs[4]["argv"] and "--usage-file" not in runs[4]["argv"]
+
+
+def test_spawn_argv_survives_a_real_argparse_hermes(tmp_path, monkeypatch):
+    """REGRESSION (Aug 2026, found in production receipts): flags appended after a runner ending in
+    `-z` become -z's ARGUMENT — argparse exits 2 with a usage dump and every spawned nudge fails at
+    delivery. The stubbed-subprocess tests above can't catch ordering, so this one runs a real
+    argparse fake with hermes' exact option shape and requires the run to SUCCEED."""
+    rec.DATA = str(tmp_path)
+    fake = os.path.join(str(tmp_path), "hermes")
+    with open(fake, "w", encoding="utf-8") as f:
+        f.write("#!/usr/bin/env python3\n"
+                "import argparse, json, sys\n"
+                "p = argparse.ArgumentParser()\n"
+                "p.add_argument('-z'); p.add_argument('-t'); p.add_argument('--usage-file')\n"
+                "a = p.parse_args()\n"
+                "print(json.dumps({'z': a.z, 't': a.t}))\n")
+    os.chmod(fake, 0o755)
+    monkeypatch.setenv("SOTTO_SPAWN_TOOLSETS", "sotto-local")
+    delivered = []
+    monkeypatch.setattr(rec, "_deliver_text",
+                        lambda text, label, usage=None, decision_ids=None:
+                        (delivered.append(text), True)[1])
+    _run_oneshot(rec, [fake, "-z"])
+    rows = _delivery_rows(tmp_path)
+    assert [r["status"] for r in rows] == ["spawned"], rows   # delivery stubbed → only the spawn row
+    assert delivered, "the run failed argparse — flags are in the wrong position again"
+    parsed = json.loads(delivered[0])
+    assert parsed["z"] == "run it" and parsed["t"] == "sotto-local"
 
 
 def test_what_a_run_cost_lands_on_its_receipt(tmp_path, monkeypatch):

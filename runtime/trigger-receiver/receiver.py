@@ -200,7 +200,8 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
                      decision_ids: list | None = None) -> None:
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
-    spawned / delivered / empty / failed; `usage` is the run's ground-truth spend (see _read_usage),
+    spawned / delivered / empty / failed / skipped (nothing spawned — e.g. a wake trigger after the
+    day's brief already went out); `usage` is the run's ground-truth spend (see _read_usage),
     present only on the row that closes a run. Best-effort: a receipt that can't be written must
     never cost the delivery it is describing."""
     try:
@@ -372,19 +373,26 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
     argv = list(runner)
     usage_path = None
     if os.path.basename(argv[0]) == "hermes":
+        extra = []
         # Toolset ids vary per install, so there is no safe default to guess — unset means today's
         # behavior (whatever toolsets the runner picks itself). `hermes tools --summary` lists them.
         toolsets = (os.environ.get("SOTTO_SPAWN_TOOLSETS") or "").strip()
         if toolsets:
-            argv += ["-t", toolsets]
+            extra += ["-t", toolsets]
         # Ground truth for what the run cost — hermes writes this report even when the run fails.
         # If tmp is unwritable we simply go without: a receipt is never worth losing a brief over.
         try:
             fd, usage_path = tempfile.mkstemp(prefix="sotto-usage-", suffix=".json")
             os.close(fd)
-            argv += ["--usage-file", usage_path]
+            extra += ["--usage-file", usage_path]
         except OSError:
             usage_path = None
+        # INSERTED right after the binary, never appended: the default runner ENDS in `-z`, and
+        # `-z` consumes the NEXT token as its prompt — a flag appended after it makes argparse
+        # exit 2 with a usage dump, which is exactly how every spawned nudge died for a day
+        # (Aug 2026) while the stubbed tests kept passing. The prompt is appended last by the
+        # caller, so `-z` stays adjacent to it.
+        argv[1:1] = extra
 
     run_id = secrets.token_hex(12)
 
@@ -464,6 +472,32 @@ def _claim_is_stale(flag: str, date: str, kind_short: str) -> bool:
     try:
         return (time.time() - os.path.getmtime(flag)) > CLAIM_STALE_SECS
     except OSError:
+        return False
+
+
+SEED_SNAPSHOT_TIMEOUT_SECS = 120  # file IO + one JSON rewrite; no LLM, no network
+
+
+def _seed_snapshot_from(payload_path: str) -> bool:
+    """Fold a staged wake payload into the local snapshot via compose_brief.py --seed-snapshot —
+    the already-delivered path of handle_trigger. Deterministic and LLM-free: the same writer the
+    brief uses (_save_local_snapshot), so contacts carry-forward and file shape can't diverge.
+    Runs on a daemon thread (the Bridge's POST shouldn't wait on it); failure is logged, never
+    raised — the snapshot just stays one day staler and the next delivered brief heals it."""
+    script = _find_sotto_script("_shared", "scripts", "compose_brief.py")
+    if not script:
+        print("[sotto] snapshot seed: compose_brief.py not found in any skills tree", flush=True)
+        return False
+    try:
+        r = subprocess.run([sys.executable, script, "--seed-snapshot", payload_path],
+                           capture_output=True, text=True, env=_skill_env(),
+                           timeout=SEED_SNAPSHOT_TIMEOUT_SECS)
+        out = (r.stdout or "").strip().splitlines()
+        print(f"[sotto] snapshot seed from {os.path.basename(payload_path)}: "
+              f"{out[-1] if out else f'exit {r.returncode}'}", flush=True)
+        return r.returncode == 0
+    except Exception as e:  # noqa: BLE001
+        print(f"[sotto] snapshot seed FAILED ({type(e).__name__}: {e})", flush=True)
         return False
 
 
@@ -567,6 +601,32 @@ def handle_trigger(body: dict) -> tuple[int, dict]:
     if not DATE_RE.match(date):
         return 400, {"error": "bad date"}
     kind_short = kind.replace("_ready", "")
+    # ── Brief already delivered? Fold the wake payload into the snapshot instead. ──────────────────
+    # The owner's design (Aug 2026): the 6:31 cron brief goes out even when the Mac was asleep
+    # (degraded to the snapshot), and it is THE brief for the day. When the Bridge wakes hours later
+    # and pushes {kind}_ready with fresh local_data, composing again would either duplicate the brief
+    # or (what actually happened) burn a full compose only to lose brief_marker's deliver-once claim
+    # and discard the text. So: no second brief, ever. The fresh payload still matters — it carries
+    # today's contacts/messages/calls — so seed it into the local snapshot via compose_brief.py
+    # --seed-snapshot (deterministic, no LLM; the same writer the brief uses, so carry-forward and
+    # shape can't diverge). From there the funnel does the surfacing: triage names senders from the
+    # healed snapshot, and the midday digest/nudges flag what the morning brief missed.
+    if os.path.exists(os.path.join(DATA, "briefs", f"{date}.{kind_short}.delivered")):
+        local = body.get("local_data") or {}
+        if not local:
+            return 200, {"status": "already_delivered"}
+        payload_path = os.path.join(DATA, "briefs", f"{date}.{kind}.payload.json")
+        try:
+            os.makedirs(os.path.join(DATA, "briefs"), exist_ok=True)
+            with open(payload_path, "w") as f:
+                json.dump(local, f)
+        except Exception as e:  # noqa: BLE001
+            return 500, {"error": f"payload stage failed: {e}"}
+        threading.Thread(target=_seed_snapshot_from, args=(payload_path,), daemon=True).start()
+        _record_delivery(f"brief:{SKILL[kind]}", "skipped",
+                         "already delivered — wake payload folded into the snapshot; "
+                         "nudges/digest surface the catch-up")
+        return 200, {"status": "already_delivered", "snapshot": "seeding"}
     flag = delivered_flag(date, kind_short)
     os.makedirs(os.path.dirname(flag), exist_ok=True)
     # Atomically CLAIM this (date, kind) so two near-simultaneous triggers (e.g. cron + wake-push, or a

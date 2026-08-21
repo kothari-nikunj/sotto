@@ -100,10 +100,10 @@ never take the server with it.
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
 
-## The five subprocess boundaries
+## The six subprocess boundaries
 
 The receiver image carries no PyYAML and cannot import the skills tree; everything that needs the
-tree is a fork. All five run on `sys.executable` with `SOTTO_DATA` passed explicitly — one policy,
+tree is a fork. All six run on `sys.executable` with `SOTTO_DATA` passed explicitly — one policy,
 because interpreter ambiguity has bitten before (`receiver._skill_env`). The tree is located by
 `receiver._find_sotto_script`: `SOTTO_SKILLS_ROOT` → the Hermes layout → the repo-relative source
 tree, resolved once per script name.
@@ -115,8 +115,9 @@ tree, resolved once per script name.
 | `receiver._poll_gmail_once` | `event-triage/scripts/poll_gmail.py` | event list on stdout, 180s |
 | `dashboard._run_skill_cli` | `_shared/knowledge/knowledge_edit.py` · `preferences.py` · `style_extract.py --confirm` · `event-triage/scripts/triage_event.py --promote` (via `receiver.run_promote`) | `{"ok": …}` on stdout, 30s — ONE subprocess policy for the whole write surface, so every dashboard edit rides the identical code path the same instruction typed in chat would |
 | `calcache._run_calendar_gather` | `_shared/scripts/gather_google.py --skip-gmail` | writes a temp JSON file, 60s |
+| `receiver._seed_snapshot_from` | `_shared/scripts/compose_brief.py --seed-snapshot` | daemon thread, 120s — a wake-push that arrives after the day's brief already delivered composes nothing; its payload is folded into the local snapshot by the brief's own snapshot writer, and the funnel surfaces the catch-up |
 
-A sixth boundary is different in kind: every lane that runs a SKILL goes through
+A seventh boundary is different in kind: every lane that runs a SKILL goes through
 `receiver._spawn_and_deliver` — `$SOTTO_RUN_SKILL` (`hermes -z "<prompt>"`) on a daemon thread,
 whose final text is then piped to `hermes send --to $SOTTO_CRON_DELIVER`, the same home channel
 the crons are registered with. It used to be fire-and-forget on the belief that the skill
@@ -124,7 +125,7 @@ delivered itself; `-z` prints to stdout, so five of the six nudge producers were
 sink (Aug 2026). Starting it is synchronous — a missing runner still raises, because
 `handle_trigger` releases its brief claim on that — and only the outcome is asynchronous, which
 is why it leaves a receipt in `events/delivery.jsonl`.
-The Hermes `google-workspace` skill's `setup.py` is a seventh, forked for Google auth only.
+The Hermes `google-workspace` skill's `setup.py` is an eighth, forked for Google auth only.
 
 **Adapter/plumbing variables** (script-to-script, never a user setting — they are deliberately
 absent from RAILWAY.md's table): `SOTTO_DATA` (the volume path, `/data` in the image),
