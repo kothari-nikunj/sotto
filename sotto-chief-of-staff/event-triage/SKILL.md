@@ -112,7 +112,8 @@ looking for more events, and do not re-triage.
      discussed. Fall back to what you can ground: open loops with the attendee
      (`loops_query.py`) and their graph file (`knowledge_query.py --person`), and draft a short
      "good talking — here's what I owe you" note built ONLY from those. **If there is no transcript
-     AND no open loop, say nothing and end the turn** — a follow-up with nothing in it is noise.
+     AND no open loop, your entire reply is the single token `NO_NUDGES`** (the delivery seam turns
+     that into silence) — a follow-up with nothing in it is noise.
    - **The nudge**: the meeting, the offer, the draft — e.g. "Your 2:00 PM with Sarah Chen just
      wrapped. Want me to send the follow-up? — 'Great chat — I'll get you the revised deck by
      Thursday and loop in Dhruv on pricing.'" Still ONE short message, plain chat text (chatfmt:

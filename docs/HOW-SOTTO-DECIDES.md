@@ -76,9 +76,13 @@ is a table lookup, not a code search.
 9. anything with no text to judge → queued.
 
 **Tier 1 is one cheap LLM call** (`SOTTO_TRIAGE_MODEL`) on whatever survives: the event text plus a
-one-line "who is this" from the knowledge graph. It returns exactly one of
+one-line "who is this" from the knowledge graph, and — for email — whether you were To'd or merely
+Cc'd. It returns exactly one of
 `urgent` · `actionable` · `scheduling_ask` → nudge; `ambient` → queue; `ignore` → drop. **Any error
-queues** — the funnel fails toward silence, never toward noise.
+queues** — the funnel fails toward silence, never toward noise. One taught judgment worth naming:
+**a reply on an intro you made, where the two people you introduced are now coordinating with each
+other, is ambient** — once both sides are talking your job is done, and a courtesy "leaving you two
+to connect!" never earns an interrupt.
 
 ## The rules, one sentence each
 

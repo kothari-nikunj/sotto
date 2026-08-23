@@ -125,6 +125,13 @@ def _to_event(item: dict, full: dict) -> dict:
         "source": "email",
         "rowid": str(mid),
         "from": _addr_str(_pick(full, "from", "sender") or _pick(item, "from", "sender") or ""),
+        # To/Cc feed exactly one triage signal: "the user is Cc'd, not To'd" (triage_event.
+        # _addressed_line) — a reply aimed at someone else (an intro handoff) must not read as an
+        # ask of the user. Absent fields simply omit the signal; nothing downstream requires them.
+        "to": _addr_str(_pick(full, "to", "to_recipients", "toRecipients")
+                        or _pick(item, "to") or ""),
+        "cc": _addr_str(_pick(full, "cc", "cc_recipients", "ccRecipients")
+                        or _pick(item, "cc") or ""),
         "subject": _pick(full, "subject", "title") or _pick(item, "subject", "title") or "",
         "body": _pick(full, "body", "text", "content", "plain_text")
                 or _pick(item, "snippet", "preview") or "",

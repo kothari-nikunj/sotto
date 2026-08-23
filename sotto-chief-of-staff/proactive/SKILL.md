@@ -25,8 +25,10 @@ cron already sent.
 
 > **CRITICAL — the decision is deterministic; do NOT improvise nudges.** Run `proactive_scan.py` and act
 > ONLY on the nudges it returns. It already enforces quiet hours, the meeting lead window, and
-> once-per-day dedup. If it returns `{"nudges": []}` — **say nothing, end the turn.** Do not compose a
-> brief, do not "check in", do not announce that there's nothing. Silence is the correct, common output.
+> once-per-day dedup. If it returns `{"nudges": []}` — **your entire reply is the single token
+> `NO_NUDGES`** (the delivery seam turns that into silence). Do not compose a brief, do not "check
+> in", do not announce that there's nothing — no "all clear", no "scan complete". A no-nudge run is
+> the correct, common output, and the user never hears about it.
 
 ## Procedure
 

@@ -123,7 +123,10 @@ the crons are registered with. It used to be fire-and-forget on the belief that 
 delivered itself; `-z` prints to stdout, so five of the six nudge producers were writing to a
 sink (Aug 2026). Starting it is synchronous — a missing runner still raises, because
 `handle_trigger` releases its brief claim on that — and only the outcome is asynchronous, which
-is why it leaves a receipt in `events/delivery.jsonl`.
+is why it leaves a receipt in `events/delivery.jsonl`. Silence is a token, not a hope: a spawned
+run with nothing to deliver replies the `NO_NUDGES` sentinel, which the seam records as an empty
+run instead of sending — "say nothing and end the turn" was an instruction models reliably
+ignored, and three "all clear" messages in one evening proved it (Aug 2026).
 The Hermes `google-workspace` skill's `setup.py` is an eighth, forked for Google auth only.
 
 **Adapter/plumbing variables** (script-to-script, never a user setting — they are deliberately
