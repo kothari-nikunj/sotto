@@ -455,7 +455,7 @@ def _is_internal_standup(summary: str, others: list, self_email: str) -> bool:
     don't have makes "internal" unprovable, and unprovable means don't skip."""
     if not self_email or not STANDUP_RE.search(_s(summary)):
         return False
-    domain = self_email.split("@")[-1]
+    domain = self_email.rsplit("@", maxsplit=1)[-1]
     if not domain or not others:
         return False
     return all(_s(o.get("email")).lower().split("@")[-1] == domain for o in others)

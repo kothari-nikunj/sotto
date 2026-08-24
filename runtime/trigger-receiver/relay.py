@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import queue
+import secrets
 import threading
 import time
 
@@ -58,7 +59,7 @@ class Relay:
 
     def __init__(self, bridge_timeout: float = 40.0):
         self._q: queue.Queue = queue.Queue()      # tool-call requests awaiting the Bridge's poll
-        self._waiters: dict = {}                    # request id -> {"event", "value"}
+        self._waiters: dict = {}                    # internal id -> {event, value, external_id}
         self._lock = threading.Lock()
         # monotonic time of the last Bridge poll/respond. -inf, NOT 0.0: monotonic() is host uptime
         # on Linux, so a 0.0 start read as "connected" for the first bridge_timeout seconds after boot.
@@ -124,17 +125,20 @@ class Relay:
         return _err(rid, -32000, "Sotto Bridge offline")
 
     def _forward(self, req: dict, timeout: float):
-        rid = req.get("id")
+        external_id = req.get("id")
+        internal_id = secrets.token_hex(16)
+        forwarded = {**req, "id": internal_id}
         ev = threading.Event()
         with self._lock:
-            self._waiters[rid] = {"event": ev, "value": None}
-        self._q.put(req)
+            self._waiters[internal_id] = {"event": ev, "value": None,
+                                          "external_id": external_id}
+        self._q.put((time.monotonic() + timeout, forwarded))
         if ev.wait(timeout):
             with self._lock:
-                slot = self._waiters.pop(rid, None)
+                slot = self._waiters.pop(internal_id, None)
             return slot["value"] if slot else None
         with self._lock:
-            self._waiters.pop(rid, None)
+            self._waiters.pop(internal_id, None)
         return None
 
     # ---- Bridge side (poll / respond) ------------------------------------
@@ -142,10 +146,19 @@ class Relay:
         """Long-poll: block up to `timeout` for the next request to hand the Bridge. Returns the
         request dict, or None (→ the Bridge re-polls). Marks the Bridge alive."""
         self._touch()
-        try:
-            return self._q.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                request_deadline, req = self._q.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if request_deadline > time.monotonic():
+                return req
+            # The Hermes caller has already timed out. Never execute its stale tool call when the
+            # Mac reconnects; continue within the original long-poll budget for a live request.
 
     def respond(self, resp: dict):
         """Deliver the Bridge's result for a request id back to the waiting Hermes call."""
@@ -154,5 +167,5 @@ class Relay:
         with self._lock:
             slot = self._waiters.get(rid)
             if slot:
-                slot["value"] = resp
+                slot["value"] = {**resp, "id": slot["external_id"]}
                 slot["event"].set()

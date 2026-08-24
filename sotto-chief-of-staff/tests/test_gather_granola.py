@@ -4,7 +4,6 @@ import datetime
 import importlib.util
 import json
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 

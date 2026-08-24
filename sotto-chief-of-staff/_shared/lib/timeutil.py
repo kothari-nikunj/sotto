@@ -29,7 +29,7 @@ from textutil import _s  # noqa: E402
 def _date_only(ts) -> str:
     """The YYYY-MM-DD date part of a timestamp, accepting either the Mac's space-separated
     "2026-06-24 09:00:00" or the Bridge's ISO "2026-06-24T13:00:00Z" — both must render as a date."""
-    return re.split(r"[ T]", _s(ts), 1)[0]
+    return re.split(r"[ T]", _s(ts), maxsplit=1)[0]
 
 
 

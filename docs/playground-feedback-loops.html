@@ -245,7 +245,7 @@ const LOOPS = [
     stations: [
       { s: "Say it", name: "You state a rule", file: "feedback skill · dashboard mute / VIP / snooze / add-a-rule", note: "“Mute Bob”, “make Sarah a VIP”, “be quiet until 3”, “keep my briefs terse”." },
       { s: "One CLI", name: "One write path", file: "_shared/scripts/preferences.py (the explicit block)", note: "Chat and dashboard both fork it. No second implementation." },
-      { s: "Behave", name: "You act on drafts", file: "_shared/scripts/log_outcome.py → outcomes.jsonl", note: "draft_created · opened · copied · dismissed · executed · viewed · edited_and_sent." },
+      { s: "Behave", name: "You act on drafts", file: "_shared/scripts/log_outcome.py → outcomes.jsonl", note: "draft_created · opened · copied · dismissed · executed · viewed · edited_and_sent. Since Aug 2026 the draft→outcome matcher (<code>draft_outcomes.py</code>) writes these automatically: every offered tap-link draft is matched against what you actually sent — verbatim → executed, edited → edited_and_sent, a day-old unmatched draft → dismissed." },
       { s: "Learn", name: "Derive the rules", file: "approval-tiers/scripts/learn_preferences.py", note: "Runs in every brief's Learn step. Deprioritization, approval defaults, style feedback, completion analytics." },
       { s: "Store", name: "preferences.json", file: "$SOTTO_DATA/preferences.json", note: "explicit · learned lists · the <code>suppressed</code> tombstones." },
       { s: "Obey", name: "The funnel obeys", file: "triage_event.py (mutes, VIP, snooze) · compose_brief.py (tone, muted sections)", note: "The mutes and the VIP list are read in Tier 0 — before any model call is made." }
@@ -277,12 +277,12 @@ const LOOPS = [
     id: "style",
     title: "Style",
     status: "closed",
-    one: "Sent mail and sent messages → style.json → drafts in your voice; the confirmed bucket is seeded from the dashboard.",
+    one: "Sent mail and sent messages → style.json → drafts in your voice; the confirmed bucket is fed by the dashboard AND by drafts you ship verbatim.",
     hub: ["Style", "the writing fingerprint"],
     closes: "The seed-to-draft circuit is closed today: the gather's <code>in:sent</code> lane and the Mac's own outbound rows feed the extractor every brief, and <code>style_apply.py</code> quotes verbatim samples into the drafter prompt — per-person first, then the context bucket.",
     detail: [
       "Confirming a sample on the dashboard's Voice card forks <code>style_extract.py --confirm &lt;hash&gt;</code>, copying it into the <code>confirmed</code> bucket. That bucket is weighted hardest — it is floored at {style.confirmed_floor:pct}% quality, immune to TTL eviction, and quoted first as “drafts the user has shipped before (highest signal)”. <strong>That consumer weighting is live.</strong>",
-      "The arc this loop does <em>not</em> close is “what did he change about what I wrote”. That is loop 5, and it lands with the Step 3 learning loop.",
+      "The “did he actually use it” arc closed in Aug 2026: the draft→outcome matcher confirms a verbatim-shipped draft's sample into the <code>confirmed</code> bucket automatically, so the register is graded by real sends, not only dashboard votes. The arc still open is the edit <em>diff</em> — “what did he change about what I wrote” driving prompt refinement; today an edit lands as an <code>edited_and_sent</code> count in learn_preferences' style_feedback.",
       "Accumulation is real, not a sketch: three context buckets, quality scoring, promotion after a week above the quality bar, and per-bucket TTL eviction ({style.ttl_days:slash} days) so a voice from last spring doesn't outvote this week's."
     ],
     live: 6,
@@ -292,7 +292,7 @@ const LOOPS = [
       { s: "Store", name: "style.json", file: "$SOTTO_DATA/style.json (schema v2)", note: "Canonical, recent, per-person and confirmed samples, each with an age and a score." },
       { s: "Apply", name: "Into the prompt", file: "_shared/scripts/style_apply.py", note: "Verbatim samples, per-person first, then the bucket, plus master guardrails: capitalization, exclamation habit, openers and closings." },
       { s: "Draft", name: "The draft sounds like you", file: "draft-reply skill · the nudge's ready-to-send reply", note: "Never sent — always a draft behind a tap." },
-      { s: "Confirm", name: "You confirm a sample", file: "dashboard Voice card → style_extract.py --confirm", note: "Floored at {style.confirmed_floor:pct}%, TTL-immune, quoted first. The one place a human vote outranks the extractor." }
+      { s: "Confirm", name: "A sample is confirmed", file: "dashboard Voice card → style_extract.py --confirm · draft_outcomes.py on a verbatim send", note: "Floored at {style.confirmed_floor:pct}%, TTL-immune, quoted first. Two voters, one writer: your explicit dashboard vote, or the strongest implicit one — you pressed send on it." }
     ]
   },
   {

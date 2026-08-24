@@ -1,6 +1,6 @@
 """web_research.py — THE search seam: the provider ladder (Exa / Parallel / Gemini), the honest
 no-provider path, and each client's response parsing against its verified wire shape."""
-import importlib.util, io, json, os, sys
+import importlib.util, io, json, os
 
 import pytest
 

@@ -70,6 +70,41 @@ def test_full_forward_cycle_with_a_bridge():
     assert resp["id"] == 7
 
 
+def test_forward_uses_unique_internal_ids_and_restores_the_external_id():
+    r = relay.Relay()
+    got = []
+
+    def bridge():
+        first = r.poll(timeout=5)
+        second = r.poll(timeout=5)
+        got.extend([first["id"], second["id"]])
+        r.respond({"jsonrpc": "2.0", "id": first["id"], "result": {"n": 1}})
+        r.respond({"jsonrpc": "2.0", "id": second["id"], "result": {"n": 2}})
+
+    r._touch()
+    bt = threading.Thread(target=bridge)
+    bt.start()
+    results = []
+    calls = [threading.Thread(target=lambda n=n: results.append(r.mcp_call(
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": f"t{n}"}},
+        timeout=5))) for n in (1, 2)]
+    for t in calls:
+        t.start()
+    for t in calls:
+        t.join()
+    bt.join()
+    assert len(set(got)) == 2 and all(len(v) == 32 for v in got)
+    assert [v["id"] for v in results] == [7, 7]
+    assert {v["result"]["n"] for v in results} == {1, 2}
+
+
+def test_expired_forward_is_never_delivered_after_reconnect():
+    r = relay.Relay()
+    r._touch()
+    assert r._forward({"jsonrpc": "2.0", "id": 9, "method": "tools/call"}, timeout=0.01) is None
+    assert r.poll(timeout=0.02) is None
+
+
 def test_tools_list_caches_after_a_connected_listing():
     r = relay.Relay()
 

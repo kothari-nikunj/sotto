@@ -67,7 +67,7 @@ def resolve_imessage_name(handle: str, lookup: dict) -> str:
         return "Unknown"
     if "@" in handle:
         el = handle.lower().strip()
-        return lookup.get(el) or handle.split("@")[0]
+        return lookup.get(el) or handle.split("@", maxsplit=1)[0]
     d = _digits(handle)
     if lookup.get(d):
         return lookup[d]

@@ -382,104 +382,13 @@ fi
 # schedule can never drift between them again. `--deliver` is NOT per job: SOTTO_CRON_DELIVER below
 # is the one delivery target for all of them.
 CRONS_JSON="${SOTTO_CRONS_JSON:-/app/adapters/hermes/crons.json}"
-SOTTO_CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"   # platform-only → uses WHATSAPP_HOME_CHANNEL
-cron_rows() {   # name<TAB>schedule<TAB>prompt<TAB>skill for each job whose env gate is ON
-  python3 -c 'import json, os, sys
-for j in json.load(open(sys.argv[1])):
-    if j.get("gate") and os.environ.get(j["gate"], "1") != "1":
-        continue
-    sched = os.environ.get(j.get("schedule_env") or "", "") or j["schedule"]
-    print("\t".join([j["name"], sched, j["prompt"], j["skill"]]))' "$CRONS_JSON"
-}
-#
-# THE USER-ROUTINE FENCE: personal routines (the `sotto-routines` skill) are registered as crons named
-# `user-<slug>` and are NOT ours to remove or to be shadowed by. This cleanup exists to de-duplicate
-# the crons.json SYSTEM jobs; a user routine must survive every redeploy untouched. Both halves below
-# are fenced — the removal loop skips any block carrying a `user-` name, and the recreate guard reads a
-# SYSTEM-ONLY view of the list (its `case` also matches on prompt text, so a routine quoting a system
-# prompt would otherwise suppress that system job forever). System names never start with `user-`.
-CRON_LIST_SYSTEM="$(mktemp 2>/dev/null || echo /tmp/sotto-cron-system.txt)"
-python3 - "$CRONS_JSON" "$CRON_LIST_SYSTEM" <<'PY' || echo "[sotto] cron dedup skipped (parse/list error)"
-import json, re, subprocess, sys
-# Every name/prompt in crons.json (gates IGNORED here — a job turned OFF must still be removed),
-# plus the RETIRED registrations older deploys may still carry.
-MARKERS = ["sotto-followup", "Run my followup"]
-try:
-    for j in json.load(open(sys.argv[1])):
-        MARKERS += [j["name"], j["prompt"]]
-except Exception as e:
-    print(f"[sotto] cron dedup: could not read {sys.argv[1]}: {e}"); raise SystemExit(0)
+SOTTO_CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"
+# One reconciler owns boot convergence and live timezone changes. It removes only crons.json system
+# jobs (plus retired Sotto markers), fences every user-* routine, and recreates the enabled spec.
+python3 /app/adapters/hermes/reconcile_crons.py \
+  --spec "$CRONS_JSON" --deliver "$SOTTO_CRON_DELIVER" \
+  || echo "[sotto] WARNING: cron reconciliation did not complete; next boot will retry"
 
-
-def cron_list():
-    return subprocess.run(["hermes", "cron", "list"], capture_output=True, text=True,
-                          timeout=60).stdout
-
-
-try:
-    out = cron_list()
-except Exception as e:
-    print(f"[sotto] cron dedup: `cron list` failed: {e}"); raise SystemExit(0)
-# Job ids in `cron list` are hex (12-char, or a full uuid). Treat the text from each id to the next as
-# that job's block; if the block names a sotto skill/prompt, the job is ours → remove it.
-ID = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{12,})\b")
-# A `user-` name anywhere in a block fences the whole block off (the FENCE above). Deliberately
-# fail-safe: the worst case of a false positive is one un-deduped system job; the worst case of a
-# false negative is silently deleting something the user asked for.
-USER_FENCE = re.compile(r"(?<![A-Za-z0-9_-])user-[a-z0-9]")
-
-
-def blocks(text):
-    ms = list(ID.finditer(text))
-    for i, m in enumerate(ms):
-        yield m.group(1), text[m.start():(ms[i + 1].start() if i + 1 < len(ms) else len(text))]
-
-
-ids, seen, fenced = [], set(), 0
-for jid, block in blocks(out):
-    if USER_FENCE.search(block):
-        fenced += 1; continue                     # a personal routine — never ours to remove
-    if any(mk in block for mk in MARKERS) and jid not in seen:
-        seen.add(jid); ids.append(jid)
-print(f"[sotto] cron dedup: removing {len(ids)} existing sotto job(s) before recreating"
-      + (f"; leaving {fenced} user routine(s) alone" if fenced else ""))
-for jid in ids:
-    try:  # answer any "are you sure?" prompt non-interactively; never hang the boot
-        subprocess.run(["hermes", "cron", "remove", jid], input="y\ny\n",
-                       capture_output=True, text=True, timeout=30)
-    except Exception as e:
-        print(f"[sotto] cron dedup: remove {jid} failed: {e}")
-# Post-dedup, SYSTEM-ONLY listing for the recreate guard below. Always written (leading marker line,
-# so an empty-but-present file is distinguishable from "the dedup never ran" — see the [ -s ] test).
-try:
-    keep = "".join(b for _, b in blocks(cron_list()) if not USER_FENCE.search(b))
-    with open(sys.argv[2], "w", encoding="utf-8") as f:
-        f.write("# sotto: system-only view of `hermes cron list` (user- routines fenced out)\n" + keep)
-except Exception as e:
-    print(f"[sotto] cron dedup: system-only list unavailable ({e}) — recreate guard uses the raw list")
-PY
-# Recreate exactly one of each gate-ON job from crons.json. The `case` guard is a backstop: if dedup
-# above failed to parse the list, this still avoids ADDING fresh dupes (it just can't fix a stale
-# "local" deliver until dedup works). Stable --name makes future removes/edits addressable by name.
-# Times use the tz set above. Gates (crons.json `gate`): SOTTO_PROACTIVE=0 drops the mostly-silent
-# ~15-min nudge watcher; SOTTO_DIGEST=0 drops the adaptive 12:30 catch-up digest — the dedup above
-# still removes a stale registration of either. Post-meeting follow-up cron RETIRED (Sprint 0): its
-# content now runs inside the 17:30 evening brief, and "sotto-followup"/"Run my followup" stay in the
-# dedup MARKERS so registrations from earlier deploys are removed on every boot.
-# The list it matches against is the fenced, system-only view when the dedup produced one; only when
-# that step failed outright do we fall back to the raw list (backstop beats fence in that corner).
-if [ -s "$CRON_LIST_SYSTEM" ]; then
-  crons="$(cat "$CRON_LIST_SYSTEM")"
-else
-  crons="$(hermes cron list 2>/dev/null || true)"
-fi
-rm -f "$CRON_LIST_SYSTEM" 2>/dev/null || true
-cron_rows | while IFS="$(printf '\t')" read -r cname csched cprompt cskill; do
-  [ -n "$cname" ] || continue
-  case "$crons" in *"$cname"*|*"$cprompt"*) continue ;; esac
-  hermes cron create "$csched" "$cprompt" --skill "$cskill" --name "$cname" \
-    --deliver "$SOTTO_CRON_DELIVER" 2>&1 | sed "s|^|[sotto] cron-create $cname: |" || true
-done
 # Dump the registered crons so cron is OBSERVABLE (empty list, UTC next-run, or "Deliver: local" are
 # all bugs visible at a glance). Capped with `head` — the old uncapped dump of dozens of dupes hit
 # Railway's 500-logs/sec limit ("Messages dropped"). After dedup it's ~3 jobs, so the cap rarely bites.

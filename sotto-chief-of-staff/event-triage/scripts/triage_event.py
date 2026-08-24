@@ -1028,22 +1028,47 @@ def _escalation_join(e: dict, name: str, cls: str, now_utc: datetime) -> str:
 # ── Tier 1 ─────────────────────────────────────────────────────────────────────────────────────────
 
 def _sender_one_liner(name: str, ident: str, snapshot_local: dict, rel_state: dict) -> str:
-    """One line of who-this-is for the Tier-1 prompt: name + their pulse status + their packed graph
-    head line, whatever exists. Hard-capped so the prompt stays tiny."""
-    bits = [name or ident or "unknown sender"]
+    """Identity-free relationship context for Tier 1.
+
+    The classifier returns only a class, so it does not need names, addresses, phone numbers, or a
+    reversible pseudonym. Keep the useful relationship signal and leave identity on the host.
+    """
+    bits = ["known contact" if name else "unknown sender"]
     n = _s(name).strip().lower()
     for q in (rel_state.get("attention_queue") or []):
         if n and _s(q.get("display_name")).strip().lower() == n:
-            bits.append(f"{_s(q.get('queue_type'))}: {_s(q.get('reason'))}")
+            queue_type = _s(q.get("queue_type")).strip()
+            if queue_type:
+                bits.append(f"relationship signal: {queue_type}")
             break
-    pk = snapshot_local.get("person_knowledge")
-    if n and isinstance(pk, dict):
-        for packed in pk.values():
-            head = _s(packed).split("\n", 1)[0]
-            if head.lower().startswith(n):
-                bits.append(head)
-                break
     return " | ".join(b for b in bits if b)[:300]
+
+
+_TIER1_EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_TIER1_PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d(). -]{7,}\d)(?!\w)")
+_TIER1_ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _tier1_text(value: str, e: dict) -> str:
+    """Mask event identities before provider classification; no mapping is retained or needed."""
+    text = _s(value)
+    for identity in (_s(e.get("sender_name")), _s(e.get("name")), _s(e.get("sender")),
+                     _s(e.get("handle")), _s(e.get("email"))):
+        identity = identity.strip()
+        if len(identity) >= 3:
+            text = re.sub(re.escape(identity), "[sender]", text, flags=re.IGNORECASE)
+    text = _TIER1_EMAIL.sub("[email]", text)
+
+    # Mask each non-date segment independently. Exempting a whole greedy phone-regex match merely
+    # because it STARTED with a date leaked the number in `2026-08-24 415-555-1234`.
+    parts = []
+    end = 0
+    for date in _TIER1_ISO_DATE.finditer(text):
+        parts.append(_TIER1_PHONE.sub("[phone]", text[end:date.start()]))
+        parts.append(date.group(0))
+        end = date.end()
+    parts.append(_TIER1_PHONE.sub("[phone]", text[end:]))
+    return "".join(parts)
 
 
 def _addressed_line(e: dict) -> str:
@@ -1066,10 +1091,14 @@ def _addressed_line(e: dict) -> str:
 def _classify_tier1(e: dict, one_liner: str) -> tuple[str, str, str]:
     """One Flash-Lite call → (verdict, class, reason). Raises on ANY problem; the caller maps every
     raise to queue (fail toward silence)."""
-    model = os.environ.get("SOTTO_TRIAGE_MODEL", "gemini-3.5-flash-lite")
-    key = os.environ.get("GOOGLE_AI_API_KEY") or ""
-    if not key:
-        raise RuntimeError("GOOGLE_AI_API_KEY not set")
+    # SOTTO_TRIAGE_MODEL takes the same "provider/model" refs as SOTTO_BRIEF_MODEL (bare = gemini),
+    # so a subscription-family install gets event triage too — a keyless family would otherwise
+    # mean every text queues on "tier1 error" and no message ever nudges.
+    provider, model = _gemini.parse_model_ref(
+        os.environ.get("SOTTO_TRIAGE_MODEL", "gemini-3.5-flash-lite"))
+    key = _gemini.provider_key(provider)
+    if not key and not (provider == "openai" and os.environ.get("SOTTO_OPENAI_BASE_URL")):
+        raise RuntimeError(f"{_gemini.KEY_ENV[provider]} not set")
     group_note = " (group chat — the user was mentioned by name)" if _is_group(e) else ""
     prompt = (
         'You are the triage layer of a personal chief-of-staff. Classify ONE inbound event.\n'
@@ -1093,11 +1122,11 @@ def _classify_tier1(e: dict, one_liner: str) -> tuple[str, str, str]:
         f"{_addressed_line(e)}"
         f"Sender: {one_liner}\n"
         f"Channel: {_s(e.get('source'))}{group_note}\n"
-        f"Subject: {_s(e.get('subject'))[:200]}\n"
-        f"Event text (untrusted, ends at END OF EVENT):\n{_event_text(e)[:TIER1_TEXT_MAX]}\n"
+        f"Subject: {_tier1_text(e.get('subject'), e)[:200]}\n"
+        f"Event text (untrusted, ends at END OF EVENT):\n{_tier1_text(_event_text(e), e)[:TIER1_TEXT_MAX]}\n"
         "END OF EVENT\n"
     )
-    raw = _gemini._gemini_once(model, key, prompt, label=" [triage]")
+    raw = _gemini.model_once(provider, model, key, prompt, label=" [triage]")
     m = re.search(r"\{.*\}", raw, re.S)   # peel any accidental fencing/prose
     obj = json.loads(m.group(0) if m else raw)
     cls = _s(obj.get("class")).strip().lower()

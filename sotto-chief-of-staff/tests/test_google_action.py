@@ -300,7 +300,7 @@ def test_calendar_create_location_falls_back_to_patch_on_old_host_cli(monkeypatc
 
 
 def test_calendar_create_location_patch_failure_is_honest(monkeypatch, capsys):
-    calls = _cap_run(monkeypatch, [
+    _cap_run(monkeypatch, [
         {"status": "error", "error": "usage: ... unrecognized arguments"},
         {"status": "created", "id": "E9"},
         {"status": "error", "error": "usage: ... invalid choice: 'patch'"},
@@ -408,7 +408,7 @@ def test_gmail_draft_threads_when_a_thread_id_exists(monkeypatch, capsys):
 
 
 def test_gmail_draft_does_not_double_prefix_re(monkeypatch, capsys):
-    cap = _fake_service(monkeypatch, thread_result={"messages": [
+    _fake_service(monkeypatch, thread_result={"messages": [
         {"payload": {"headers": [{"name": "Subject", "value": "Re: Railway SAFE"}]}}]})
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-draft", "--to", "a@b.com",
                                      "--body", "hi", "--thread-id", "T1"])

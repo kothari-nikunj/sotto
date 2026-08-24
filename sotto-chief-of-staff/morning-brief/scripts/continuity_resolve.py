@@ -97,6 +97,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parseaddr, parsedate_to_datetime
 
 import yaml
 
@@ -615,7 +616,21 @@ def _inbound_cutoff(created_at) -> str:
     return c if len(c) > 10 else f"{c[:10]} 23:59:59"
 
 
-def _check_inbound_delivery(identifiers: list, after: str, local: dict):
+def _message_is_after(value, after: str) -> bool:
+    """Compare ISO/local/RFC-2822 message dates against the ledger cutoff."""
+    cutoff = _parse_dt(after)
+    observed = _parse_dt(value)
+    if observed is None:
+        try:
+            observed = parsedate_to_datetime(_s(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if cutoff is None:
+        return True
+    return _to_user_zone(observed) > _to_user_zone(cutoff)
+
+
+def _check_inbound_delivery(identifiers: list, after: str, local: dict, thread_id: str = ""):
     """Did THEY send something substantive since the loop was created? Mirrors
     _check_outgoing_message exactly, with `is_from_me` inverted and the substance gate applied."""
     after = _inbound_cutoff(after)
@@ -636,6 +651,21 @@ def _check_inbound_delivery(identifiers: list, after: str, local: dict):
         if (any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers)
                 and _is_delivery(m.get("text"))):
             return ("delivered", f"Inbound WhatsApp from {jid}")
+    for m in (local.get("emails") or []):
+        labels = m.get("labelIds") or m.get("labels") or []
+        if m.get("isSent") or (isinstance(labels, list) and "SENT" in {str(v).upper() for v in labels}):
+            continue
+        if not _message_is_after(m.get("date") or m.get("timestamp"), after):
+            continue
+        sender = parseaddr(_s(m.get("from") or m.get("sender")))[1].lower()
+        sender_match = any(_handle_matches(sender, i) for i in identifiers)
+        same_thread = bool(thread_id and _s(m.get("threadId") or m.get("thread_id")) == thread_id)
+        text = m.get("body") or m.get("text") or m.get("snippet") or ""
+        if sender_match and (same_thread or not thread_id) and _is_delivery(text):
+            detail = f"Inbound email from {sender}"
+            if same_thread:
+                detail += f" on thread {thread_id}"
+            return ("delivered", detail)
     return None
 
 
@@ -679,7 +709,7 @@ def _check_action_resolution(it: dict, local: dict, now: datetime):
         # The mirrored branch: you're owed something, so the evidence is INBOUND. Deliberately NOT
         # the calendar check the outgoing branches use — a meeting appearing on the books proves
         # the user scheduled something, not that the other side delivered what they promised.
-        return _check_inbound_delivery(ids, created, local)
+        return _check_inbound_delivery(ids, created, local, _s(it.get("source_thread_id")))
     if at == "call_back":
         for c in (local.get("calls") or []):
             if c.get("is_outgoing") and (c.get("timestamp") or "") > created:
@@ -1161,6 +1191,11 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     local_data = unwrap_tool_result(payload.get("local") or {})
     if payload.get("events") and "events" not in local_data:
         local_data = {**local_data, "events": payload["events"]}
+    email_data = payload.get("emails")
+    if isinstance(email_data, dict):
+        email_data = email_data.get("emails") or email_data.get("items") or []
+    if isinstance(email_data, list) and "emails" not in local_data:
+        local_data = {**local_data, "emails": email_data}
     items, shadowed = _load_items(with_shadowed=True)
     # Group identity, straight from the snapshot the model was shown (see canonicalize_counterpart).
     group_index = group_identity(local_data)

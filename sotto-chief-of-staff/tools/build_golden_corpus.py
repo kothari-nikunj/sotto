@@ -258,7 +258,7 @@ class IdentityMap:
 
     def _alloc_email(self, sig: str, email: str, idx: int, taken: set) -> str:
         a = self.alias[sig]
-        dom = email.split("@")[-1]
+        dom = email.rsplit("@", maxsplit=1)[-1]
         fake_dom = self.domain_alias.get(dom) or self._alloc_domain(dom, set())
         self.domain_alias[dom] = fake_dom
         local = f"{a['first']}.{a['last']}".lower()
@@ -899,27 +899,27 @@ def _llm_refine(labels: dict, days: list, llm) -> None:
 def emit_labels_yaml(labels: dict) -> str:
     """Hand-rolled YAML (the corpus builder stays stdlib-shaped, same discipline as run_evals'
     frontmatter emitter) — flat enough that PyYAML round-trips it and a human edits it happily."""
-    L = [f"# Golden labels for {labels['corpus']} — DRAFT. See evals/LABELING.md.",
+    lines = [f"# Golden labels for {labels['corpus']} — DRAFT. See evals/LABELING.md.",
          "# Correct the proposals, fill every `open_loops_after:`, then set reviewed: true.",
          f"corpus: {labels['corpus']}",
          f"reviewed: {'true' if labels['reviewed'] else 'false'}",
          "days:"]
     for name, d in labels["days"].items():
-        L.append(f"  {name}:")
-        L.append("    needs_attention: [" + ", ".join(d["needs_attention"]) + "]")
-        L.append("    not_needs_attention: [" + ", ".join(d["not_needs_attention"]) + "]")
-        L.append("    entity_count: " + str(d["entity_count"]))
-        L.append("    open_loops_after: " + ("null" if d["open_loops_after"] is None
+        lines.append(f"  {name}:")
+        lines.append("    needs_attention: [" + ", ".join(d["needs_attention"]) + "]")
+        lines.append("    not_needs_attention: [" + ", ".join(d["not_needs_attention"]) + "]")
+        lines.append("    entity_count: " + str(d["entity_count"]))
+        lines.append("    open_loops_after: " + ("null" if d["open_loops_after"] is None
                                              else "[" + ", ".join(d["open_loops_after"]) + "]"))
-        L.append("    chases_after: " + ("null" if d.get("chases_after") is None
+        lines.append("    chases_after: " + ("null" if d.get("chases_after") is None
                                          else "{" + ", ".join(f"{k}: {v}" for k, v
                                                               in d["chases_after"].items()) + "}"))
-        L.append("    nudge:")
+        lines.append("    nudge:")
         for gid, verdict in d["nudge"].items():
-            L.append(f"      {gid}: {verdict}")
+            lines.append(f"      {gid}: {verdict}")
         if not d["nudge"]:
-            L[-1] = "    nudge: {}"
-    return "\n".join(L) + "\n"
+            lines[-1] = "    nudge: {}"
+    return "\n".join(lines) + "\n"
 
 
 # ── Leak scan: the last gate before anything is left on disk ─────────────────────────────────────
@@ -1027,7 +1027,7 @@ def build(args) -> int:
         json.dump(manifest, f, ensure_ascii=False, indent=1, sort_keys=True)
     labels_path = os.path.join(out_dir, "labels.yaml")
     if os.path.exists(labels_path) and not args.overwrite_labels:
-        print(f"-- labels.yaml exists — kept (owner edits win); draft at labels.draft.yaml")
+        print("-- labels.yaml exists — kept (owner edits win); draft at labels.draft.yaml")
         labels_path = os.path.join(out_dir, "labels.draft.yaml")
     with open(labels_path, "w", encoding="utf-8") as f:
         f.write(emit_labels_yaml(labels))

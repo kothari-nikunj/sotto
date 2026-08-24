@@ -14,7 +14,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import yaml  # PyYAML

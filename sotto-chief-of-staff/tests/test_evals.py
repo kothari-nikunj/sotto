@@ -10,7 +10,6 @@ Fully offline (SOTTO_LLM_STUB-style injected stub inside the harness), <5s, neve
 """
 import importlib.util
 import os
-import sys
 
 import pytest
 

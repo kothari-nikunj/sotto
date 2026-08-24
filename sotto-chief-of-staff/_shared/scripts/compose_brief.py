@@ -1118,6 +1118,10 @@ def build_prompt(template: str, inputs: dict) -> str:
     # never twice).
     followup_context = _s(inputs.get("_followup_context")) if brief_type == "evening" else ""
     reconciliation = opt(_format_reconciliation(local, brief_type))
+    prior_brief = _prior_brief_context(
+        brief_type, _brief_now(inputs) or datetime.now(timezone.utc), tz)
+    if prior_brief:
+        reconciliation += opt(prior_brief)
     if followup_context and "{{followup_context}}" not in template:
         reconciliation += opt(followup_context)
 
@@ -2585,6 +2589,31 @@ def _archive_brief(out: dict, brief_type: str) -> None:
         os.replace(tmp, os.path.join(d, f"{date}_{brief_type}.json"))
     except Exception:
         pass
+
+
+PRIOR_BRIEF_CONTEXT_MAX = 8_000
+
+
+def _prior_brief_context(brief_type: str, now: datetime, tz: str = "") -> str:
+    """The nearest earlier delivered brief, as anti-repetition context for the next composition."""
+    root = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs")
+    day = _brief_day(tz, now)
+    yesterday = (datetime.fromisoformat(day) - timedelta(days=1)).strftime("%Y-%m-%d")
+    candidates = ([(day, "morning"), (yesterday, "evening")] if brief_type == "evening"
+                  else [(yesterday, "evening"), (yesterday, "morning")])
+    for date, kind in candidates:
+        try:
+            with open(os.path.join(root, f"{date}_{kind}.json"), encoding="utf-8") as handle:
+                archived = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            continue
+        text = _s(archived.get("brief_markdown") if isinstance(archived, dict) else "").strip()
+        if text:
+            return ("## PRIOR DELIVERED BRIEF — DELTA REFERENCE ONLY\n"
+                    "Do not repeat an item merely because it appeared here. Surface it again only "
+                    "when today's evidence changed its state, it became urgent, or it remains an "
+                    "urgent open commitment. Name the change.\n" + text[:PRIOR_BRIEF_CONTEXT_MAX])
+    return ""
 
 
 def main():

@@ -5,7 +5,6 @@ import threading
 import time
 
 import pytest
-import sys
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("receiver", os.path.join(HERE, "receiver.py"))
@@ -165,8 +164,8 @@ class _CronCLI:
 
 def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     """Root fix for first-night UTC briefs: boot registered the crons under UTC; when the wizard's
-    tz lands (config set succeeds, zone changed), every sotto cron is re-registered — removed by
-    stable --name and recreated with EXACTLY start.sh's schedule/skill/deliver — under the new zone."""
+    tz lands (config set succeeds, zone changed), the shared reconciler recreates every Sotto cron
+    with exactly crons.json's schedule/skill/deliver under the new zone."""
     monkeypatch.setattr(rec, "SETTINGS_FILE", os.path.join(str(tmp_path), "config", "settings.json"))
     for k in ("SOTTO_TIMEZONE", "SOTTO_PROACTIVE", "SOTTO_DIGEST", "SOTTO_PROACTIVE_CRON",
               "SOTTO_CRON_DELIVER"):
@@ -178,7 +177,7 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     assert ["hermes", "config", "set", "timezone", "America/Los_Angeles"] in cli.calls
     names = {"sotto-morning-brief", "sotto-evening-brief", "sotto-relationship-pulse",
              "sotto-proactive", "sotto-midday-digest"}
-    assert {c[3] for c in cli.cron("remove")} == names
+    assert ["hermes", "cron", "list"] in cli.calls
     creates = {c[c.index("--name") + 1]: c for c in cli.cron("create")}
     assert set(creates) == names
     # schedules + skills mirror start.sh step 3 exactly; deliver defaults to whatsapp
@@ -190,8 +189,9 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     assert creates["sotto-midday-digest"][creates["sotto-midday-digest"].index("--skill") + 1] == "sotto-event"
     for c in creates.values():
         assert c[c.index("--deliver") + 1] == "whatsapp"
-    # every remove precedes its create (never leave a duplicate pair behind)
-    assert cli.calls.index(cli.cron("remove")[0]) < cli.calls.index(cli.cron("create")[0])
+    # Existing registrations are removed by parsed job id; that path is exercised against a real
+    # list-shaped fixture in test_cron_fence.py. This fake reports an empty scheduler.
+    assert cli.cron("remove") == []
 
 
 def test_set_timezone_skips_cron_rereg_when_unchanged(tmp_path, monkeypatch):
@@ -293,6 +293,26 @@ def test_sotto_cron_jobs_empty_when_spec_missing(monkeypatch):
     hardcoded copy: the boot registration simply stands until the next redeploy."""
     monkeypatch.setenv("SOTTO_CRONS_JSON", "/nonexistent/crons.json")
     assert rec._sotto_cron_jobs() == []
+
+
+def test_personal_routines_are_a_read_only_parsed_view(monkeypatch):
+    listing = """Scheduled jobs (2):
+  a1b2c3d4e5f6 user-friday-loops
+    Schedule: 0 16 * * 5
+    Prompt: Summarize my open loops
+    Deliver: whatsapp
+  b1b2c3d4e5f6 sotto-morning-brief
+    Schedule: 30 6 * * *
+    Prompt: Run my morning brief
+"""
+
+    def run(argv, **kwargs):
+        assert argv == ["hermes", "cron", "list"]
+        return type("Result", (), {"returncode": 0, "stdout": listing})()
+
+    monkeypatch.setattr(rec.subprocess, "run", run)
+    assert rec._personal_routines() == [{"name": "user-friday-loops", "schedule": "0 16 * * 5",
+                                         "prompt": "Summarize my open loops", "deliver": "whatsapp"}]
 
 
 def test_setup_google_client_rejects_bad_input(tmp_path, monkeypatch):
@@ -1082,6 +1102,50 @@ def test_bridge_events_triage_failure_is_claim_free(tmp_path, monkeypatch):
     assert calls and [e["rowid"] for e in calls[0]] == [60]   # retry actually re-triaged
 
 
+def test_bridge_events_claim_is_single_flight(tmp_path, monkeypatch):
+    """The seen check and acceptance are one claim: a concurrent duplicate never runs triage."""
+    rec.DATA = str(tmp_path)
+    rec._EVENTS_INFLIGHT.clear()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocked(evs, catchup):
+        calls.append(evs)
+        entered.set()
+        assert release.wait(5)
+        return {"verdict": "queue", "reason": "ok", "bundle": {}}
+
+    monkeypatch.setattr(rec, "run_triage", blocked)
+    first = []
+    t = threading.Thread(target=lambda: first.append(rec.handle_events({"events": [_ev(61)]})))
+    t.start()
+    assert entered.wait(5)
+    code, duplicate = rec.handle_events({"events": [_ev(61)]})
+    assert code == 200 and duplicate["verdict"] == "drop" and "in flight" in duplicate["reason"]
+    assert len(calls) == 1
+    release.set()
+    t.join(5)
+    assert first and first[0][0] == 200
+    assert rec._EVENTS_INFLIGHT == set()
+
+
+def test_event_bundles_are_unique_atomic_and_pruned(tmp_path):
+    rec.DATA = str(tmp_path)
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    old = events_dir / "bundle-old.json"
+    old.write_text("{}")
+    os.utime(old, (0, 0))
+    p1 = rec._stage_bundle({"n": 1})
+    p2 = rec._stage_bundle({"n": 2})
+    assert p1 != p2
+    assert json.load(open(p1)) == {"n": 1}
+    assert json.load(open(p2)) == {"n": 2}
+    assert not old.exists()
+    assert not list(events_dir.glob("*.tmp.*"))
+
+
 def test_bridge_events_bad_shapes_400(tmp_path):
     rec.DATA = str(tmp_path)
     assert rec.handle_events({})[0] == 400
@@ -1181,6 +1245,20 @@ def test_poll_gmail_once_raises_when_script_missing(monkeypatch):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "not found" in str(e)
+
+
+def test_gmail_cursor_is_acknowledged_only_after_acceptance(monkeypatch):
+    monkeypatch.setattr(rec, "_find_sotto_script", lambda *a: "/skills/poll_gmail.py")
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = '{"acknowledged": 2}'
+        stderr = ""
+
+    monkeypatch.setattr(rec.subprocess, "run", lambda argv, **kw: (calls.append(argv), Result())[1])
+    rec._ack_gmail_events([{"rowid": "m1"}, {"rowid": "m2"}])
+    assert calls == [[rec.sys.executable, "/skills/poll_gmail.py", "--ack", "m1", "m2"]]
 
 
 def test_events_stamp_written_and_surfaced(tmp_path, monkeypatch):

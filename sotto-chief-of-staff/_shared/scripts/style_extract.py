@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from keys import sample_hash, sample_key  # noqa: E402,F401  (shared with the Voice card)
+import jsonstore  # noqa: E402
 from textutil import unwrap_tool_result  # noqa: E402  (shared MCP tool-result unwrap)
 
 # ── Constants (style-profile.ts:156-182) ─────────────────────────────────────
@@ -395,37 +396,33 @@ def confirm_sample(key: str, now=None) -> dict:
         return {"ok": False, "error": "no sample named"}
     path = os.path.join(_root(), "style.json")
     try:
-        with open(path, encoding="utf-8") as f:
-            style = json.load(f) or {}
-    except (OSError, json.JSONDecodeError, ValueError):
+        with jsonstore.lock(path):
+            style = jsonstore.read(path, None, strict=True)
+            if not isinstance(style, dict):
+                return {"ok": False, "error": "no style fingerprint on file yet"}
+            pool = []
+            canonical = style.get("canonical")
+            if isinstance(canonical, dict):
+                for bucket in ALL_BUCKETS:
+                    pool += [s for s in (canonical.get(bucket) or []) if isinstance(s, dict)]
+            pool += [s for s in (style.get("recent") or []) if isinstance(s, dict)]
+            hit = next((s for s in pool if sample_hash(s) == key), None)
+            if hit is None:
+                return {"ok": False, "error": "that sample is no longer in the fingerprint"}
+            confirmed = [s for s in (style.get("confirmed") or []) if isinstance(s, dict)]
+            if any(sample_hash(s) == key for s in confirmed):
+                return {"ok": True, "confirmed": len(confirmed), "already": True,
+                        "bucket": hit.get("bucket") or ""}
+            entry = {**hit, "source": "confirmed"}
+            entry["quality"] = score_sample(entry)
+            entry["confirmed_at"] = _iso(_now(now))
+            confirmed.append(entry)
+            style["confirmed"] = confirmed
+            jsonstore.write_atomic(path, style, indent=2)
+            return {"ok": True, "confirmed": len(confirmed), "already": False,
+                    "bucket": entry.get("bucket") or ""}
+    except (OSError, jsonstore.Unreadable, ValueError):
         return {"ok": False, "error": "no style fingerprint on file yet"}
-    if not isinstance(style, dict):
-        return {"ok": False, "error": "no style fingerprint on file yet"}
-    pool = []
-    canonical = style.get("canonical")
-    if isinstance(canonical, dict):
-        for bucket in ALL_BUCKETS:
-            pool += [s for s in (canonical.get(bucket) or []) if isinstance(s, dict)]
-    pool += [s for s in (style.get("recent") or []) if isinstance(s, dict)]
-    hit = next((s for s in pool if sample_hash(s) == key), None)
-    if hit is None:
-        return {"ok": False, "error": "that sample is no longer in the fingerprint"}
-    confirmed = [s for s in (style.get("confirmed") or []) if isinstance(s, dict)]
-    if any(sample_hash(s) == key for s in confirmed):
-        return {"ok": True, "confirmed": len(confirmed), "already": True,
-                "bucket": hit.get("bucket") or ""}
-    entry = {**hit, "source": "confirmed"}
-    entry["quality"] = score_sample(entry)
-    entry["confirmed_at"] = _iso(_now(now))
-    confirmed.append(entry)
-    style["confirmed"] = confirmed
-    os.makedirs(_root(), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(style, f, indent=2)
-    os.replace(tmp, path)
-    return {"ok": True, "confirmed": len(confirmed), "already": False,
-            "bucket": entry.get("bucket") or ""}
 
 
 def _ingest(payload: dict, now: datetime) -> list:
@@ -503,17 +500,14 @@ def _rebuild_per_person(all_samples: list) -> dict:
     return out
 
 
-def extract(payload: dict, now=None, gmail=None) -> dict:
-    now = _now(now)
+def _extract_unlocked(payload: dict, now, gmail, path: str) -> dict:
     payload = _adapt_read_local(payload)
     sent_gmail = _adapt_gmail(gmail)
     if sent_gmail:   # merge WITHOUT mutating the caller's payload (passthrough contract above)
         payload = {**payload, "sent_messages": list(payload.get("sent_messages") or []) + sent_gmail}
-    path = os.path.join(_root(), "style.json")
-    style = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            style = json.load(f)
+    style = jsonstore.read(path, {}, strict=True)
+    if not isinstance(style, dict):
+        raise jsonstore.Unreadable(f"{path}: expected object")
 
     canonical = {b: list(style.get("canonical", {}).get(b, [])) for b in ALL_BUCKETS}
     recent = list(style.get("recent", []))
@@ -565,12 +559,17 @@ def extract(payload: dict, now=None, gmail=None) -> dict:
         "sample_keys": list(seen_keys | set(new_keys))[-500:],
         "preferences": style.get("preferences", []),
     })
-    os.makedirs(_root(), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(style, f, indent=2)
+    jsonstore.write_atomic(path, style, indent=2)
     return {"messages_analyzed": style["messages_analyzed"],
             "canonical_counts": {b: len(canonical[b]) for b in ALL_BUCKETS},
             "people": len(style["per_person"])}
+
+
+def extract(payload: dict, now=None, gmail=None) -> dict:
+    now = _now(now)
+    path = os.path.join(_root(), "style.json")
+    with jsonstore.lock(path):
+        return _extract_unlocked(payload, now, gmail, path)
 
 
 if __name__ == "__main__":

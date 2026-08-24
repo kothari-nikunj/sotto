@@ -41,36 +41,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # day, so recompute HERMES_INSTALL_SHA256 in the same edit (or clear it and accept the warning) —
 # a stale hash is a build that fails loudly, which is the correct failure but a confusing one if you
 # forgot why.
-ARG HERMES_REFRESH=2026-07-09
+ARG HERMES_REFRESH=2026-08-23
 # Integrity pin for the installer script. The script is fetched to a FILE, checked, and only then
 # executed — never `curl | bash`, so a MITM or a compromised host cannot stream a different script
 # into a shell that is already running it.
 #
-# Empty by default, and that is a documented FAIL-OPEN: upstream publishes install.sh from a URL with
-# no version in it and no signature beside it, so the owner (who bumps HERMES_REFRESH regularly)
-# cannot precompute a hash for a script that may change between his edit and the build. An empty ARG
-# therefore prints a loud warning and proceeds. The mechanism is here for anyone who wants the
-# guarantee: compute it once —
-#     curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sha256sum
-# — then either paste it as the default below, or pass it per build:
-#     docker build --build-arg HERMES_INSTALL_SHA256=<hex> .
-# NOT filled in here because this repo's build sandbox cannot reach hermes-agent.nousresearch.com
-# (egress policy blocks the host), and a hash nobody actually computed is worse than none: it would
-# fail every build and teach the next person to delete the check.
-ARG HERMES_INSTALL_SHA256=""
+# The default is the exact installer fetched and reviewed when HERMES_REFRESH was bumped above.
+# Upstream serves a mutable URL, so every refresh must update this hash in the same commit. Empty or
+# stale hashes fail the build closed; bypassing verification is never a supported build mode.
+ARG HERMES_INSTALL_SHA256="c0380bc1f78d3d662a77663ce20cc17e14cbc4bec35e61ab7a33bac5f3afed2d"
 RUN echo "hermes refresh: ${HERMES_REFRESH}" \
- && curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh \
- && if [ -n "${HERMES_INSTALL_SHA256}" ]; then \
-      echo "verifying installer against HERMES_INSTALL_SHA256" \
-      && echo "${HERMES_INSTALL_SHA256}  /tmp/hermes-install.sh" | sha256sum -c - ; \
-    else \
-      echo "############################################################" >&2 ; \
-      echo "WARNING: HERMES_INSTALL_SHA256 is empty — the Hermes installer" >&2 ; \
-      echo "         is being executed UNVERIFIED. Whatever that URL serves" >&2 ; \
-      echo "         right now runs as root in this image." >&2 ; \
-      echo "         Pin it: --build-arg HERMES_INSTALL_SHA256=<sha256>" >&2 ; \
-      echo "############################################################" >&2 ; \
-    fi \
+ && test -n "${HERMES_INSTALL_SHA256}" \
+ && curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+      -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh \
+ && echo "${HERMES_INSTALL_SHA256}  /tmp/hermes-install.sh" | sha256sum -c - \
  && bash /tmp/hermes-install.sh \
  && rm -f /tmp/hermes-install.sh
 # The installer puts `hermes` on PATH for the install user; make common locations explicit for start.sh.

@@ -1,5 +1,5 @@
 """research_attendees.py — batched grounded research (port of gemini-research.ts): stub, dedup/cap, batching."""
-import importlib.util, json, os, sys
+import importlib.util, json, os
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -258,7 +258,7 @@ def test_deep_batch_failure_never_kills_profile_results(monkeypatch):
 
 
 def test_deep_horizon_gate():
-    from datetime import datetime, timedelta, timezone
+    from datetime import timezone
     soon = (datetime.now(timezone.utc) + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     far = (datetime.now(timezone.utc) + timedelta(hours=100)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     assert ra._within_research_horizon({"meeting_start": soon})

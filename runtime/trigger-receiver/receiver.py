@@ -81,7 +81,7 @@ def resolve_setup_code() -> str:
                     f.write(code)
             except OSError:
                 pass  # no volume yet — the code still holds for this process's lifetime
-    SETUP_CODE = code
+    SETUP_CODE = code  # noqa: N806 — assignment to the process-global setup credential
     return code
 
 # Reverse-MCP relay: the Mac dials OUT to /bridge/poll|respond; Hermes calls /mcp locally. No tunnel.
@@ -129,6 +129,7 @@ DASHBOARD.HOOKS.update({
     # "Run it now" on Briefs: the same prompt crons.json holds, fired through the same runner.
     "run_job": lambda name: _run_dashboard_job(name),
     "job_names": lambda: [j[0] for j in _sotto_cron_jobs()],
+    "personal_routines": lambda: _personal_routines(),
     # Delivery honesty for the Cadence panel — the channel and whether it's live right now.
     "delivery_channel": lambda: (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip(),
     "delivery_ready": lambda: _delivery_ready(),
@@ -710,6 +711,8 @@ TRIAGE_TIMEOUT_SECS = 30          # Tier 0 is sub-second; Tier 1 is one Flash-Li
 RESERVED_SYNTHETIC_SOURCES = frozenset(
     {CALCACHE.MEETING_END_SOURCE, CALCACHE.CALENDAR_CHANGE_SOURCE, "proactive"})
 _EVENTS_LOCK = threading.Lock()   # serializes seen-ring read/modify/write across handler threads
+_EVENTS_INFLIGHT: set[str] = set()  # check-through-accept claims; process-local handler concurrency
+EVENT_BUNDLE_RETENTION_SECS = 7 * 24 * 3600
 
 
 def _events_dir() -> str:
@@ -863,9 +866,28 @@ def _stage_bundle(bundle: dict) -> str:
     """Write an event bundle under $SOTTO_DATA/events/ and return its path. Raises OSError on a
     failed write — callers decide whether that's a 500 (handle_events) or a logged skip (valve)."""
     os.makedirs(_events_dir(), exist_ok=True)
-    bundle_path = os.path.join(_events_dir(), f"bundle-{int(time.time() * 1000)}.json")
-    with open(bundle_path, "w", encoding="utf-8") as f:
-        json.dump(bundle or {}, f)
+    now = time.time()
+    for name in os.listdir(_events_dir()):
+        if not (name.startswith("bundle-") and (name.endswith(".json") or ".json.tmp." in name)):
+            continue
+        path = os.path.join(_events_dir(), name)
+        try:
+            if now - os.path.getmtime(path) > EVENT_BUNDLE_RETENTION_SECS:
+                os.unlink(path)
+        except OSError:
+            pass
+    bundle_path = os.path.join(_events_dir(), f"bundle-{secrets.token_hex(12)}.json")
+    tmp = f"{bundle_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(bundle or {}, f)
+        os.replace(tmp, bundle_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return bundle_path
 
 
@@ -899,35 +921,40 @@ def handle_events(body: dict) -> tuple[int, dict]:
     for e in events:
         if str(e.get("source") or "").strip().lower() in RESERVED_SYNTHETIC_SOURCES:
             e["source"] = "unknown"
+    fresh, keys = [], []
     with _EVENTS_LOCK:
         seen_set = set(_load_seen())
-    fresh, keys = [], []
-    for e in events:
-        k = _event_key(e)
-        if k is not None and k in seen_set:
-            continue
-        fresh.append(e)
-        if k is not None and k not in keys:
-            keys.append(k)
+        for e in events:
+            k = _event_key(e)
+            if k is not None and (k in seen_set or k in _EVENTS_INFLIGHT or k in keys):
+                continue
+            fresh.append(e)
+            if k is not None:
+                keys.append(k)
+        _EVENTS_INFLIGHT.update(keys)
     if not fresh:
-        return 200, {"verdict": "drop", "reason": "duplicate events (already seen)", "bundle": {}}
+        return 200, {"verdict": "drop", "reason": "duplicate events (seen or in flight)", "bundle": {}}
     try:
-        verdict = run_triage(fresh, bool(body.get("catchup")))
-    except Exception as e:  # noqa: BLE001
-        return 500, {"error": f"triage failed: {e}"}
-    if verdict.get("verdict") == "agent":
         try:
-            bundle_path = _stage_bundle(verdict.get("bundle") or {})
-        except OSError as e:
-            return 500, {"error": f"bundle stage failed: {e}"}
-        _spawn_event_agent(bundle_path)
-    with _EVENTS_LOCK:
-        try:
-            _save_seen(_load_seen() + keys)
-        except OSError:
-            pass  # dedupe is best-effort; a lost ring write only risks a re-triage, never a loss
-    _touch_event_stamp()   # fresh events made it through the pipeline — /setup can say so
-    return 200, verdict
+            verdict = run_triage(fresh, bool(body.get("catchup")))
+        except Exception as e:  # noqa: BLE001
+            return 500, {"error": f"triage failed: {e}"}
+        if verdict.get("verdict") == "agent":
+            try:
+                bundle_path = _stage_bundle(verdict.get("bundle") or {})
+            except OSError as e:
+                return 500, {"error": f"bundle stage failed: {e}"}
+            _spawn_event_agent(bundle_path)
+        with _EVENTS_LOCK:
+            try:
+                _save_seen(_load_seen() + keys)
+            except OSError:
+                pass  # dedupe is best-effort; a lost ring write only risks a re-triage, never a loss
+        _touch_event_stamp()   # fresh events made it through the pipeline — /setup can say so
+        return 200, verdict
+    finally:
+        with _EVENTS_LOCK:
+            _EVENTS_INFLIGHT.difference_update(keys)
 
 
 # ── Gmail poll thread (Phase 2): server-side email events, no Pub/Sub ─────────────────────────────
@@ -942,8 +969,7 @@ def _email_poll_secs() -> int:
 def _poll_gmail_once() -> list:
     """One poll_gmail.py run → email events. RAISES on what's distinguishable at this layer (script
     missing, exec failure, non-zero exit, non-list/bad JSON) so the loop can count consecutive
-    failures — a quiet mailbox and a broken poll must not both look like []. (poll_gmail.py itself
-    is fail-silent for transient fetch errors; those still come back as an empty list here.)"""
+    failures — a quiet mailbox and a broken poll must not both look like []."""
     script = _find_sotto_script("event-triage", "scripts", "poll_gmail.py")
     if not script:
         raise RuntimeError("poll_gmail.py not found in this image")
@@ -955,6 +981,21 @@ def _poll_gmail_once() -> list:
     if not isinstance(out, list):
         raise RuntimeError("poll_gmail.py returned non-list JSON")
     return out
+
+
+def _ack_gmail_events(events: list) -> None:
+    """Commit Gmail's cursor only after handle_events accepted the batch."""
+    ids = [str(e.get("rowid") or "").strip() for e in events if isinstance(e, dict)]
+    ids = [v for v in ids if v]
+    if not ids:
+        return
+    script = _find_sotto_script("event-triage", "scripts", "poll_gmail.py")
+    if not script:
+        raise RuntimeError("poll_gmail.py not found while acknowledging events")
+    r = subprocess.run([sys.executable, script, "--ack", *ids], capture_output=True, text=True,
+                       timeout=30, env=_skill_env())
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "gmail acknowledgement failed").strip()[:400])
 
 
 # One `[sotto] gmail poll: N consecutive failures` line after this many failures, then at most
@@ -978,7 +1019,8 @@ def _gmail_poll_loop(secs: int) -> None:
             if events:
                 code, resp = handle_events({"events": events, "catchup": False})
                 if code != 200:
-                    print(f"[sotto] gmail poll triage error: {resp}", flush=True)
+                    raise RuntimeError(f"gmail poll triage error: {resp}")
+                _ack_gmail_events(events)
         except Exception as e:  # noqa: BLE001
             fails += 1
             if fails >= GMAIL_FAIL_ALERT_AFTER and (time.time() - last_alert) >= GMAIL_FAIL_ALERT_EVERY_SECS:
@@ -1526,9 +1568,10 @@ def read_settings() -> dict:
 
 
 def write_setting(key: str, value) -> None:
-    s = read_settings()
-    s[key] = value
-    CONNECTORS.write_json(SETTINGS_FILE, s)
+    with CONNECTORS.json_transaction(SETTINGS_FILE, default={}, mode=0o600, indent=None) as s:
+        if not isinstance(s, dict):
+            raise ValueError("settings.json must contain an object")
+        s[key] = value
 
 
 _IANA_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_+./-]{0,63}\Z")
@@ -1560,6 +1603,20 @@ def _crons_file() -> str:
 USER_ROUTINE_PREFIX = "user-"   # personal routines (sotto-routines skill) — never a SYSTEM job
 
 
+def _cron_reconciler():
+    """Load the one boot/timezone cron reconciler from the adapter tree."""
+    for path in ("/app/adapters/hermes/reconcile_crons.py",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                              "adapters", "hermes", "reconcile_crons.py")):
+        if not os.path.exists(path):
+            continue
+        spec = importlib.util.spec_from_file_location("sotto_reconcile_crons", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    return None
+
+
 def _sotto_cron_jobs() -> list:
     """The sotto cron jobs start.sh registers at boot, as (name, schedule, prompt, skill). Read
     straight from adapters/hermes/crons.json — the ONE source both registrars share, so a
@@ -1573,25 +1630,39 @@ def _sotto_cron_jobs() -> list:
     no consumer of this function can remove, recreate or fire one. crons.json should never contain
     such a name; this is the belt to start.sh's braces (same fence, same prefix)."""
     path = _crons_file()
+    reconciler = _cron_reconciler()
+    if reconciler is None:
+        print("[sotto] cron reconciler not found", flush=True)
+        return []
     try:
-        with open(path, encoding="utf-8") as f:
-            spec = json.load(f)
+        return reconciler.active_jobs(path)
     except (OSError, json.JSONDecodeError, ValueError) as e:
         print(f"[sotto] cron spec unreadable ({path or 'not found'}): {e}", flush=True)
         return []
-    jobs = []
-    for j in spec if isinstance(spec, list) else []:
-        name = str(j.get("name") or "")
-        if name.startswith(USER_ROUTINE_PREFIX):
-            print(f"[sotto] cron spec: ignoring {name!r} — `{USER_ROUTINE_PREFIX}` names are personal "
-                  "routines, not system jobs", flush=True)
+
+
+def _personal_routines() -> list[dict]:
+    """Read-only, bounded view of user-* jobs for the dashboard; never mutates the scheduler."""
+    reconciler = _cron_reconciler()
+    if reconciler is None:
+        return []
+    try:
+        result = subprocess.run(["hermes", "cron", "list"], capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return []
+    if result.returncode != 0:
+        return []
+    out = []
+    for _, block in reconciler.blocks(result.stdout):
+        match = re.search(r"(?<![A-Za-z0-9_-])(user-[a-z0-9][A-Za-z0-9_-]*)", block)
+        if not match:
             continue
-        gate = j.get("gate")
-        if gate and os.environ.get(gate, "1") != "1":
-            continue
-        sched = os.environ.get(j.get("schedule_env") or "", "") or j["schedule"]
-        jobs.append((name, sched, j["prompt"], j["skill"]))
-    return jobs
+        fields = {}
+        for key in ("Schedule", "Prompt", "Deliver"):
+            found = re.search(rf"(?im)^\s*{key}:\s*(.+)$", block)
+            fields[key.lower()] = found.group(1).strip() if found else ""
+        out.append({"name": match.group(1), **fields})
+    return out[:10]
 
 
 def _reregister_sotto_crons(tz: str) -> None:
@@ -1607,21 +1678,13 @@ def _reregister_sotto_crons(tz: str) -> None:
     `user-` name, so a personal routine is never removed or recreated here. Honest v1 limitation
     (stated in the sotto-routines skill): a personal routine therefore keeps the zone it was created
     under until the user recreates it — a timezone change moves Sotto's five jobs, not theirs."""
-    deliver = os.environ.get("SOTTO_CRON_DELIVER", "whatsapp")
-    for name, sched, prompt, skill in _sotto_cron_jobs():
-        try:  # answer any "are you sure?" prompt non-interactively (same as start.sh's dedup)
-            subprocess.run(["hermes", "cron", "remove", name], input="y\ny\n",
-                           capture_output=True, text=True, timeout=30)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            subprocess.run(["hermes", "cron", "create", sched, prompt, "--skill", skill,
-                            "--name", name, "--deliver", deliver],
-                           capture_output=True, text=True, timeout=60)
-        except Exception:  # noqa: BLE001
-            pass
-    print(f"[sotto] re-registered sotto crons for timezone {tz} (was registered at boot under the "
-          "old zone)", flush=True)
+    reconciler = _cron_reconciler()
+    if reconciler is None:
+        print("[sotto] cron reconciler not found; timezone cron refresh skipped", flush=True)
+        return
+    ok = reconciler.reconcile(_crons_file(), os.environ.get("SOTTO_CRON_DELIVER", "whatsapp"))
+    state = "re-registered" if ok else "could not re-register"
+    print(f"[sotto] {state} sotto crons for timezone {tz}", flush=True)
 
 
 def set_timezone(tz: str) -> tuple[bool, str]:

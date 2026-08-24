@@ -12,7 +12,10 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
 - **Bridge events** — the Mac app watches iMessage, WhatsApp, and calls and POSTs new rows to
   `/bridge/events` within seconds (`SOTTO_EVENTS_TICK_SECS`, default 3s).
 - **Email** — the container polls Gmail itself every `SOTTO_EMAIL_POLL_SECS` (default 90s) and feeds
-  new mail through the same endpoint. No Mac needed.
+  new mail through the same endpoint. No Mac needed. A smaller `in:sent` lane rides the same poll:
+  your OWN outbound mail enters as a silent "signal" (queued, never a nudge, never a model call) —
+  it exists so offered email drafts can be graded against what you actually sent and so replies you
+  send can close loops.
 - **Calendar** — a background thread refreshes today's events every `SOTTO_CALENDAR_REFRESH_SECS`
   (default 15 min). It powers the in-meeting hold, detects meetings that just ended, and **diffs
   each refresh against the last** to catch what changed about the imminent calendar: a decline, a
@@ -50,7 +53,7 @@ is a table lookup, not a code search.
 | **Release valve** (something held earlier, let out now) | `receiver._valve_tick` — every 15 min (`receiver.VALVE_INTERVAL_SECS_DEFAULT`) | `triage_event.release_valve` — re-checks class, sender, age and cooldown, then spends the budget like any nudge |
 | **Post-meeting tap** (a meeting just ended) | `calcache.tap_tick` → `receiver._dispatch_meeting_tap` | `triage_event.triage` as an ordinary event, classified `post_meeting` — its own daily cap, exempt from the interrupt budget |
 | **Calendar diff** (a decline · a last-minute invite · a move · a cancellation of an imminent meeting) | `calcache.change_tick` — the same refresh tick as the tap | `triage_event.triage` as a `calendar_change` event — snooze, quiet hours and mutes still hold it; exempt from the budget, the in-meeting hold and the cooldown, because a change expires with the meeting it's about (per-change deduped at the source) |
-| **Proactive watcher** (meeting prep · commitment · chase · birthday · handoff · retune offer) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
+| **Proactive watcher** (intention · meeting prep · commitment · chase · birthday · handoff · retune offer) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
 | **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses, spending exactly one budget unit |
 
 ## The gate order

@@ -2,7 +2,6 @@
 import importlib.util
 import json
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -1767,13 +1766,46 @@ def test_the_ledger_block_names_the_chases_that_already_happened():
 
 def test_ledger_ages_follow_an_injected_clock():
     """A replayed day is six weeks old; wall-clock ages would inflate every number in its prompt."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
     local = {"action_ledger": [{"status": "open", "action_type": "reply", "contact_name": "Sarah",
                                 "channel": "email", "summary": "the deck",
                                 "created_at": "2026-06-20 09:00:00"}]}
     now = datetime(2026, 6, 22, 9, 0, 0, tzinfo=timezone.utc)
     assert "(2d)" in cb._format_action_ledger(local, now)
     assert cb.build_prompt("{{action_ledger}}", {"local": local, "now": "2026-06-22 09:00:00"}).count("(2d)") == 1
+
+
+def test_evening_prompt_receives_the_morning_brief_as_delta_context(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    briefs = tmp_path / "briefs"
+    briefs.mkdir()
+    (briefs / "2026-08-23_morning.json").write_text(json.dumps({
+        "brief_markdown": "## Needs Attention Now\n\n- Sarah — review the deck"}))
+    block = cb._prior_brief_context("evening", datetime(2026, 8, 23, 17, tzinfo=timezone.utc))
+    assert "PRIOR DELIVERED BRIEF" in block and "Sarah — review the deck" in block
+    assert "Do not repeat" in block
+
+
+def test_morning_never_reads_a_same_day_archive(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    briefs = tmp_path / "briefs"
+    briefs.mkdir()
+    (briefs / "2026-08-23_morning.json").write_text(json.dumps({"brief_markdown": "current rerun"}))
+    assert cb._prior_brief_context("morning", datetime(2026, 8, 23, 7, tzinfo=timezone.utc)) == ""
+
+
+def test_prior_brief_uses_the_user_day_not_the_utc_day(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    briefs = tmp_path / "briefs"
+    briefs.mkdir()
+    (briefs / "2026-08-22_morning.json").write_text(json.dumps({"brief_markdown": "local morning"}))
+    # 00:30 UTC on Aug 23 is still Aug 22 in Los Angeles.
+    block = cb._prior_brief_context(
+        "evening", datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc), "America/Los_Angeles")
+    assert "local morning" in block
 
 
 # ── "What moved today": the evening brief's outcome receipts ──────────────────

@@ -76,7 +76,9 @@ _shared/
   scripts/style_apply.py             # PORT: style-profile.ts formatStyleForWorker (verbatim sample injection)
   scripts/preferences.py             # explicit preference memory (mute/tone rules)
   scripts/log_outcome.py             # outcomes + analytics (parity C2)
-  scripts/action_links.py            # deep-link / tap-to-send URL builder
+  scripts/draft_outcomes.py          # draft→outcome matcher: offered drafts × what you actually sent
+  scripts/schedule_wakeup.py         # one-shot intentions (create/list/cancel; serviced by the 15-min heartbeat)
+  scripts/action_links.py            # deep-link / tap-to-send URL builder (+ the offered-drafts ledger)
   scripts/brief_marker.py            # delivered-once gate (cloud cron ↔ Bridge wake-push)
   scripts/pending_offer.py           # the one question Sotto is waiting on an answer to (proactive + the evening brief write, gateway reads+clears)
   scripts/ledger_io.py               # shared READ helpers for the continuity ledger

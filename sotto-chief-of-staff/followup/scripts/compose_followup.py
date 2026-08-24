@@ -24,7 +24,7 @@ import json
 import os
 import re
 import sys
-from datetime import timezone, timedelta
+from datetime import timezone
 
 _SHARED = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "scripts")
 _SHARED_LIB = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "lib")

@@ -6,7 +6,6 @@ passed at the top level but the renderers read everything from `local`, so they 
 import importlib.util
 import json
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")

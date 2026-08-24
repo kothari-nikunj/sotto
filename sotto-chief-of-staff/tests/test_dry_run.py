@@ -2,7 +2,6 @@
 import importlib.util
 import json
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")

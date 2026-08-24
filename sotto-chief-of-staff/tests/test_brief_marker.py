@@ -1,5 +1,5 @@
 """brief_marker.py — the atomic deliver-once gate (cron ↔ wake-push coordination)."""
-import importlib.util, os, sys
+import importlib.util, os
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")

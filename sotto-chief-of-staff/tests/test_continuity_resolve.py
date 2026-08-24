@@ -495,7 +495,7 @@ def test_meeting_actions_never_create_ledger_entries(tmp_path, monkeypatch):
         ],
         "local": {}, "events": [],
     }
-    out = cr.resolve(payload)
+    cr.resolve(payload)
     cont_dir = tmp_path / "knowledge" / "continuity"
     files = list(cont_dir.glob("*.md")) if cont_dir.exists() else []
     texts = "\n".join(f.read_text() for f in files)
@@ -538,6 +538,42 @@ def test_inbound_delivery_via_whatsapp_jid_through_contacts(tmp_path, monkeypatc
                       "text": "attached the revised deck — final_deck.pdf"}]}}, NOW)
     assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
     assert "Inbound WhatsApp" in out["resolved"][0]["resolution_evidence"]
+
+
+def test_inbound_email_on_the_tracked_thread_resolves_a_waiting_on(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _waiting(tmp_path, channel="email", contact_name="Dana", contact_identifier="dana@acme.com",
+             source_thread_id="thread-1", created_at="2026-06-23 08:00:00")
+    out = cr.resolve({"today": "2026-06-24", "emails": {"emails": [{
+        "from": "Dana Roe <dana@acme.com>", "threadId": "thread-1",
+        "date": "Tue, 23 Jun 2026 20:00:00 -0700",
+        "body": "Here is the signed agreement: https://drive.example.com/agreement.pdf",
+        "isSent": False,
+    }]}}, NOW)
+    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
+    assert "Inbound email" in out["resolved"][0]["resolution_evidence"]
+
+
+def test_email_delivery_requires_counterpart_thread_substance_and_inbound_direction(tmp_path, monkeypatch):
+    cases = [
+        {"from": "Dana <dana@acme.com>", "threadId": "wrong", "date": "2026-06-23T20:00:00-07:00",
+         "body": "Here is the signed agreement https://x.example/a.pdf"},
+        {"from": "Other <other@acme.com>", "threadId": "thread-1", "date": "2026-06-23T20:00:00-07:00",
+         "body": "Here is the signed agreement https://x.example/a.pdf"},
+        {"from": "Dana <dana@acme.com>", "threadId": "thread-1", "date": "2026-06-23T20:00:00-07:00",
+         "body": "I'll send it tomorrow"},
+        {"from": "Me <me@mine.com>", "to": "dana@acme.com", "threadId": "thread-1",
+         "date": "2026-06-23T20:00:00-07:00", "body": "Here is the agreement https://x.example/a.pdf",
+         "isSent": True},
+    ]
+    for email in cases:
+        _env(tmp_path, monkeypatch)
+        for f in (tmp_path / "knowledge" / "continuity").glob("*.md"):
+            f.unlink()
+        _waiting(tmp_path, channel="email", contact_name="Dana", contact_identifier="dana@acme.com",
+                 source_thread_id="thread-1", created_at="2026-06-23 08:00:00")
+        out = cr.resolve({"today": "2026-06-24", "emails": [email]}, NOW)
+        assert out["resolved"] == [], email
 
 
 def test_a_date_only_created_at_never_closes_on_its_own_day(tmp_path, monkeypatch):

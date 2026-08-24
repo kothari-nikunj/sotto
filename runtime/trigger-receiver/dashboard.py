@@ -112,6 +112,7 @@ HOOKS = {
     "run_job": lambda name: {"ok": False, "error": "unavailable",
                              "reason": "runs aren't available on this box"},
     "job_names": lambda: [],
+    "personal_routines": lambda: [],
     # Delivery honesty for the Cadence panel — which channel briefs and nudges leave by, and
     # whether it is live right now (the existing _whatsapp_status wording: "linked (ever)").
     "delivery_channel": lambda: "whatsapp",
@@ -1462,6 +1463,24 @@ def api_cadence() -> dict:
         channel = _s(HOOKS["delivery_channel"]()) or "whatsapp"
     except Exception:  # noqa: BLE001
         channel = "whatsapp"
+    intentions = []
+    latest = {}
+    try:
+        with open(os.path.join(_root(), "intentions.jsonl"), encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if isinstance(row, dict) and _s(row.get("id")):
+                    latest[_s(row.get("id"))] = row
+    except (OSError, ValueError, TypeError):
+        latest = {}
+    for row in sorted(latest.values(), key=lambda item: _s(item.get("due"))):
+        if row.get("status") == "scheduled":
+            intentions.append({"id": _s(row.get("id")), "due": _s(row.get("due")),
+                               "action": _s(row.get("action")), "context": _s(row.get("context"))})
+    try:
+        routines = HOOKS["personal_routines"]()
+    except Exception:  # noqa: BLE001
+        routines = []
     return {
         "date": day,
         "budget": _budget_today(day),
@@ -1477,6 +1496,8 @@ def api_cadence() -> dict:
         "vip_people": [x for x in (ex.get("vip_people") or []) if isinstance(x, str)],
         "waiting": waiting,
         "waiting_total": waiting_total,
+        "intentions": intentions[:20],
+        "routines": routines[:10] if isinstance(routines, list) else [],
     }
 
 

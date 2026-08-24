@@ -8,7 +8,6 @@ proves the [brief-cost] line actually gets written.
 import importlib.util
 import json
 import os
-import sys
 import threading
 
 HERE = os.path.dirname(__file__)

@@ -150,7 +150,7 @@ def build_pdf(images: list) -> bytes | None:
     objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
     objs.append(b"<< /Type /Pages /Kids [" + kids + b"] /Count " + str(len(images)).encode() + b" >>")
     for i, (img, (w, h, comps)) in enumerate(zip(images, sizes)):
-        page, xobj, cont = (first_page + i * 3, first_page + i * 3 + 1, first_page + i * 3 + 2)
+        _, xobj, cont = (first_page + i * 3, first_page + i * 3 + 1, first_page + i * 3 + 2)
         objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources "
                     b"<< /XObject << /Im0 %s >> >> /Contents %s >>"
                     % (w, h, ref(xobj), ref(cont)))

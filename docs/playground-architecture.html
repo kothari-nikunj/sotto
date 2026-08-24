@@ -285,7 +285,7 @@ const N = [
    d:'<p>Each refresh tick diffs the raw calendar against the last: a decline (within {calendar.decline_window_hours}h of the meeting), a last-minute invite (within {calendar.change_window_hours}h, plus a {calendar.invite_grace_min}-min grace for a meeting that just started), a move, a cancellation — each distinct change becomes one synthetic <code>calendar_change</code> event, once, ever.</p><p>Solo blocks, all-day events and internal standups never count. In the funnel the class is exempt from the budget, the in-meeting hold and the cooldown — a change expires with the meeting it is about — but snooze, quiet hours and mutes still hold it.</p>'},
   {id:'p-proactive', l:'Proactive watcher', s:'proactive_scan.py', x:710, w:150, layer:'producers',
    k:'Producer · */{cron.proactive_min} cron', file:'proactive/scripts/proactive_scan.py',
-   d:'<p>Every {cron.proactive_min} minutes it asks what is genuinely due <em>now</em>: a meeting you haven\'t prepped, a commitment due today, one chase for something you\'re owed, a birthday {birthday.lead_days} days out and again on the day, the plain question after an ask nobody answered {chase.max} times, and an offer to tidy a heavy pile.</p><p><strong>It is not a second lane.</strong> It decides only WHAT is due, then hands the tick to <code>triage()</code> in-process as one bundle — so it passes the same gates because it is the same code, and spends one budget unit for the whole push.</p>'},
+   d:'<p>Every {cron.proactive_min} minutes it asks what is genuinely due <em>now</em>: a one-shot intention, a meeting you haven\'t prepped, a commitment due today, one chase for something you\'re owed, a birthday {birthday.lead_days} days out and again on the day, the plain question after an ask nobody answered {chase.max} times, or an offer to tidy a heavy pile.</p><p><strong>It is not a second lane.</strong> It decides only WHAT is due, then hands the tick to <code>triage()</code> in-process as one bundle — so it passes the same gates because it is the same code, and spends one budget unit for the whole push.</p>'},
   {id:'p-now', l:'Nudge me now', s:'dashboard → --promote', x:870, w:136, layer:'producers',
    k:'Producer · you', file:'runtime/trigger-receiver/dashboard.py',
    d:'<p>The Cadence page\'s waiting room: you pick something the funnel held and release it yourself. Routed through <code>triage_event.py --promote</code>, so even a human override rides the one funnel.</p>'},
@@ -474,9 +474,10 @@ const SHARED_FILES = [
   ["events/seen.json", "receiver", "receiver (idempotency ring — Bridge events)"],
   ["events/gmail_seen.json", "skills (poll_gmail.py)", "skills (poll_gmail.py) — the same ring for polled Gmail"],
   ["events/last.stamp", "receiver", "receiver (/setup liveness line)"],
-  ["events/bundle-&lt;ms&gt;.json", "receiver", "skills (the event one-shot)"],
+  ["events/bundle-&lt;random&gt;.json", "receiver", "skills (the event one-shot)"],
   ["events/last_digest.txt", "skills (digest_check.py --stamp, and the brief that wins the claim)", "skills (the digest window), dashboard (/api/cadence)"],
   ["events/queue.jsonl · events/surfaced.jsonl", "skills (triage_event.py)", "dashboard (the Record + the waiting room), skills (compose_brief.py)"],
+  ["events/drafts.jsonl", "skills (action_links.py — every tap link built with a draft)", "skills (draft_outcomes.py, run inside learn_preferences.py each brief)"],
   ["events/delivery.jsonl", "receiver (the ONE writer)", "dashboard (the Record, source: delivery) — closing rows carry a usage object"],
   ["events/delivery-effects-&lt;run&gt;.json", "skills (proactive_scan.py, one receiver-scoped run)", "receiver — apply after successful send, then delete"],
   ["events/sends.jsonl", "skills (google_action.py)", "you — one line per send/reply attempt, allowed or refused"],
@@ -499,6 +500,7 @@ const SHARED_FILES = [
   ["proactive/wake_run.last", "receiver (handle_proactive_wake)", "receiver — its mtime IS the sleep→wake throttle"],
   ["proactive/retune_offer.last", "skills (proactive_scan.py)", "skills — the retune-offer cooldown stamp"],
   ["proactive/pending_offer.json", "skills (pending_offer.py set — the ONE writer, the proactive lane after a push that asked something)", "the gateway (get, then clear) — the bare &quot;sure&quot; lands in a session that never saw the question; one offer, newest wins, 180 min"],
+  ["intentions.jsonl", "skills (schedule_wakeup.py)", "skills (proactive_scan.py), dashboard (/api/cadence) — one-shot recipes, optionally tied to an open loop"],
   ["hermes/platforms/whatsapp/session/creds.json", "the Hermes gateway (not Sotto)", "receiver (_whatsapp_status) — the positive linked probe"],
   ["whatsapp-pairing.txt · google-auth-url.txt", "pairing / start.sh", "receiver"]
 ];

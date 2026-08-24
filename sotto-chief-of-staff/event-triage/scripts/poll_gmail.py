@@ -4,14 +4,20 @@ poll_gmail.py — cloud-side email events for the Phase 2 funnel (no Pub/Sub set
 
 The receiver's Gmail poll thread runs this every SOTTO_EMAIL_POLL_SECS. One run:
   1. locate the google-workspace `google_api.py` CLI (same discovery as gather_google.py),
-  2. `gmail search "newer_than:1h in:inbox" --max 20`,
-  3. dedupe against the capped ring $SOTTO_DATA/events/gmail_seen.json,
+  2. `gmail search "newer_than:1h in:inbox" --max 20` — plus a smaller `in:sent` lane (SENT_QUERY):
+     the user's OWN outbound mail, marked `is_from_me: true`, which Tier 0 queues as a silent
+     "signal" (never a nudge, never Tier-1) — the email half of what the Bridge's is_from_me rows
+     already provide for texts. It exists so the draft→outcome matcher can grade email drafts and
+     deterministic loop resolution can see email replies; a sent-lane failure never costs the
+     inbox lane,
+  3. dedupe against the capped ring $SOTTO_DATA/events/gmail_seen.json (one ring, both lanes),
   4. fetch full bodies for the NEW ids only (gather_google's per-message `gmail get` pattern),
   5. print the events JSON the triage funnel expects:
-       [{"source":"email","rowid":"<gmail id>","from":…,"subject":…,"body":…,"threadId":…,"date":…}]
+       [{"source":"email","rowid":"<gmail id>","from":…,"to":…,"cc":…,"subject":…,"body":…,…}]
 
-Fail-silent by contract: ANY failure prints `[]`, logs one diag line (sotto_log → /debug/brief-log),
-and exits 0 — the poll thread must never see a crash, and a missed poll is retried in ~90s anyway.
+The poll command is CLAIM-FREE: it does not advance gmail_seen.json. The receiver acknowledges the
+returned message ids with `--ack` only after its event pipeline returns 200. A fetch/parse failure
+exits non-zero so the receiver can distinguish a broken lane from a genuinely quiet inbox.
 
 Env: SOTTO_DATA (state dir), HERMES_HOME (optional install root override).
 """
@@ -31,6 +37,8 @@ if _SHARED_LIB not in sys.path:
 GMAIL_SEEN_MAX = 1000   # ring size — 20 msgs/poll × ~1h windows leaves plenty of overlap margin
 SEARCH_QUERY = "newer_than:1h in:inbox"
 SEARCH_MAX = 20
+SENT_QUERY = "newer_than:1h in:sent"
+SENT_MAX = 15
 
 
 def _diag(msg: str) -> None:
@@ -119,6 +127,28 @@ def _save_seen(ids: list) -> None:
         pass
 
 
+def acknowledge(ids: list[str]) -> int:
+    """Commit ids only after the receiver durably accepted their events.
+
+    The Gmail poll and receiver are separate processes, so this tiny CLI handshake is the cursor
+    transaction boundary: fetch is read-only; `--ack` is the commit. Repeated acknowledgements are
+    harmless and the ring remains capped.
+    """
+    clean = [str(v).strip() for v in ids if str(v).strip()]
+    if not clean:
+        return 0
+    seen = _load_seen()
+    known = set(seen)
+    fresh = []
+    for v in clean:
+        if v not in known:
+            known.add(v)
+            fresh.append(v)
+    if fresh:
+        _save_seen(seen + fresh)
+    return len(fresh)
+
+
 def _to_event(item: dict, full: dict) -> dict:
     mid = _pick(item, "id", "message_id", "messageId")
     return {
@@ -145,11 +175,27 @@ def poll() -> list:
     if not api:
         raise RuntimeError("google_api.py not found — google-workspace skill missing")
     items = _as_list(_run(api, ["gmail", "search", SEARCH_QUERY, "--max", str(SEARCH_MAX)]))
+    sent_ids = set()
+    try:
+        # The sent lane is additive and fail-silent ON ITS OWN: a broken in:sent search must never
+        # cost the inbox lane (the funnel's whole email intake).
+        for it in _as_list(_run(api, ["gmail", "search", SENT_QUERY, "--max", str(SENT_MAX)])):
+            if isinstance(it, dict) and _pick(it, "id", "message_id", "messageId"):
+                sent_ids.add(str(_pick(it, "id", "message_id", "messageId")))
+                items.append(it)
+    except Exception:  # noqa: BLE001
+        pass
     seen = _load_seen()
     seen_set = set(seen)
-    new = [it for it in items
-           if isinstance(it, dict) and _pick(it, "id", "message_id", "messageId")
-           and str(_pick(it, "id", "message_id", "messageId")) not in seen_set]
+    new, new_ids = [], set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mid = _pick(it, "id", "message_id", "messageId")
+        if not mid or str(mid) in seen_set or str(mid) in new_ids:
+            continue   # one ring, both lanes — a self-addressed mail is one event, not two
+        new.append(it)
+        new_ids.add(str(mid))
     events = []
     for it in new:
         mid = str(_pick(it, "id", "message_id", "messageId"))
@@ -158,22 +204,27 @@ def poll() -> list:
             full = _run(api, ["gmail", "get", mid], timeout=30) or {}
         except Exception:  # noqa: BLE001
             pass   # snippet-only event is still an event
-        events.append(_to_event(it, full))
-    if new:
-        _save_seen(seen + [str(_pick(it, "id", "message_id", "messageId")) for it in new])
+        ev = _to_event(it, full)
+        if mid in sent_ids:
+            ev["is_from_me"] = True   # Tier 0 queues these as silent signals, never a nudge
+        events.append(ev)
     return events
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--ack":
+        print(json.dumps({"acknowledged": acknowledge(sys.argv[2:])}))
+        return
     try:
         events = poll()
         if events:
-            _diag(f"[poll_gmail] {len(events)} new inbox message(s)")
+            outbound = sum(1 for e in events if e.get("is_from_me"))
+            _diag(f"[poll_gmail] {len(events) - outbound} new inbox message(s), {outbound} sent")
         print(json.dumps(events))
     except Exception as e:  # noqa: BLE001
-        _diag(f"[poll_gmail] poll failed (silent): {e}")
-        print("[]")
-    sys.exit(0)
+        _diag(f"[poll_gmail] poll failed: {e}")
+        print(json.dumps({"error": str(e)[:300]}))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

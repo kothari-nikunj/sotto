@@ -132,11 +132,11 @@ def test_all_removes_every_exhaust_file_and_no_memory_file(vol):
     summary = fg.forget(set(fg.VERBS))
     assert sorted(r["path"] for r in summary["removed"]) == sorted(ALL_EXHAUST)
 
-    for rel in MEMORY:
+    for rel, body in MEMORY.items():
         path = os.path.join(vol, *rel.split("/"))
         assert os.path.exists(path), f"--all deleted {rel}, which is memory, not exhaust"
         with open(path, encoding="utf-8") as f:
-            assert f.read() == MEMORY[rel], f"--all rewrote {rel}"
+            assert f.read() == body, f"--all rewrote {rel}"
 
     # the graph directories themselves survive too — an empty people/ would be its own kind of lie
     for protected in fg.PROTECTED:

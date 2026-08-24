@@ -1,9 +1,22 @@
 # Models — what changes if you don't use Gemini
 
-**Supported today: Gemini, full stop.** The brief pipeline is not model-agnostic — it POSTs directly
-to Google's Generative Language API (`generativelanguage.googleapis.com/v1beta/models/<model>:generateContent?key=…`),
-sends Gemini-shaped fields (`systemInstruction`, `generationConfig.responseSchema`), reads a
-Gemini-shaped response. A key from any other provider does nothing for briefs.
+**Supported today: Gemini by default — openai and anthropic families by one env var.** The compose
+calls (brief, evening, meeting prep, follow-up, Tier-1 triage) go through one provider seam
+(`_shared/lib/gemini.py`, per `docs/plans/model-agnostic-pipeline.md`): set
+`SOTTO_BRIEF_MODEL=openai/<model>` or `anthropic/<model>` (and `SOTTO_TRIAGE_MODEL` likewise) with
+that family's key, and the pipeline runs there — provided the model clears the brief's 400K-token
+context floor (the prompt has hit 170K tokens in production; known-small models are refused with a
+named error, unknown models warn and proceed). **Gemini stays the opinionated default** and a
+plain `GOOGLE_AI_API_KEY` install behaves exactly as always. Two rules the seam enforces: the
+429/5xx fallback never crosses families (your data never goes to a provider you didn't key), and
+the gemini-only capabilities below still want a Gemini key regardless of where composing runs.
+
+**Using a subscription instead of an API key (Codex, Claude Code):** subscriptions expose no raw
+key, so the route is an OpenAI-compatible endpoint that carries your auth —
+`SOTTO_OPENAI_BASE_URL=<endpoint>` points the openai family anywhere that speaks
+`/chat/completions` (a LiteLLM/OpenRouter proxy, a local gateway riding your subscription; with
+the override set, `OPENAI_API_KEY` is optional). If you can serve your subscription as an
+OpenAI-compatible URL, Sotto can run on it.
 
 **The one exception, and it is new: web research.** Search is no longer Gemini's alone — the seam
 (`_shared/scripts/web_research.py`) resolves a provider by key presence, `web_search`: **Exa →
@@ -19,10 +32,10 @@ Sotto code changes**. You still need the Gemini key for the briefs themselves �
 container there is one boot-time pin to know about (§5a). The short version of this whole page, for
 someone choosing at setup time, is in [CHANNELS.md](../CHANNELS.md).
 
-**What's coming: one OpenAI-compatible client beside `call_gemini`.** That single change puts the
-brief pipeline on GPT-5.x, Kimi, DeepSeek and anything else that speaks `/chat/completions` — the
-scope is one file. The honest blocker used to be grounded search; the search seam (§5c) now stands
-on its own key, so what remains is genuinely just the client.
+**What stays Gemini-keyed regardless of the compose family:** search grounding and `url_context`
+(the keyless research rungs — on another family, connect Exa or research is skipped and the brief
+says so) and DocSend's vision read (falls back to your Gemini key if present, refuses with the
+reason if not). `SOTTO_GEMINI_MODEL` keeps its meaning for exactly these lanes.
 
 ---
 

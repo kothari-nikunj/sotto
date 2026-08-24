@@ -342,14 +342,14 @@ def test_one_stranger_cannot_lock_the_owner_out(tmp_path):
 def test_a_repeat_offender_is_locked_out_for_longer_each_time(tmp_path):
     """Doubling per repeat offense, capped — so a patient attacker gets slower, not free retries."""
     m, srv, base = _server(tmp_path)
-    D = m.DASHBOARD
+    dash = m.DASHBOARD
     try:
-        for expected in (D.LOCKOUT_SECS, D.LOCKOUT_SECS * 2, D.LOCKOUT_SECS * 4):
+        for expected in (dash.LOCKOUT_SECS, dash.LOCKOUT_SECS * 2, dash.LOCKOUT_SECS * 4):
             _fail_from(base, "203.0.113.9", 5)
-            b = D._LOGIN_BUCKETS["203.0.113.9"]
+            b = dash._LOGIN_BUCKETS["203.0.113.9"]
             assert expected - 5 <= b["locked_until"] - time.time() <= expected
             b["locked_until"] = time.time() - 1     # serve the sentence, come back for more
-        assert D.LOCKOUT_SECS * 2 ** 8 > D.LOCKOUT_MAX_SECS     # the ceiling is reachable and real
+        assert dash.LOCKOUT_SECS * 2 ** 8 > dash.LOCKOUT_MAX_SECS     # the ceiling is reachable and real
     finally:
         srv.shutdown()
 
@@ -371,12 +371,12 @@ def test_a_distributed_spray_still_hits_the_global_backstop(tmp_path):
     """Per-key buckets don't help against a botnet with a fresh IP per try — the old global rule
     survives as the last resort, at a threshold no single honest user can trip."""
     m, srv, base = _server(tmp_path)
-    D = m.DASHBOARD
+    dash = m.DASHBOARD
     try:
-        D.GLOBAL_LOCKOUT_AFTER = 12                       # 100 real requests is a slow test
-        for i in range(D.GLOBAL_LOCKOUT_AFTER):
+        dash.GLOBAL_LOCKOUT_AFTER = 12                       # 100 real requests is a slow test
+        for i in range(dash.GLOBAL_LOCKOUT_AFTER):
             _fail_from(base, f"203.0.113.{i}", 1)
-        assert D._LOGIN_GLOBAL["locked_until"] > time.time()
+        assert dash._LOGIN_GLOBAL["locked_until"] > time.time()
         # everyone is now held, including a caller who has never failed once
         code, _, _ = _post(base, "/app/login", _login_form(SETUP_CODE),
                            {"X-Forwarded-For": "198.51.100.4"})
@@ -390,12 +390,12 @@ def test_a_distributed_spray_still_hits_the_global_backstop(tmp_path):
 def test_the_bucket_table_cannot_grow_without_bound(tmp_path):
     """A spray of unique keys must cost memory that is bounded by a constant, not by the spray."""
     m, srv, base = _server(tmp_path)
-    D = m.DASHBOARD
+    dash = m.DASHBOARD
     try:
-        D.LOCKOUT_KEYS_MAX = 4
+        dash.LOCKOUT_KEYS_MAX = 4
         for i in range(20):
             _fail_from(base, f"203.0.113.{i}", 1)
-        assert len(D._LOGIN_BUCKETS) <= D.LOCKOUT_KEYS_MAX
+        assert len(dash._LOGIN_BUCKETS) <= dash.LOCKOUT_KEYS_MAX
     finally:
         srv.shutdown()
 
@@ -1462,7 +1462,7 @@ def test_api_calendar_degrades_quietly(tmp_path):
             code, body, _ = _get(base, "/api/calendar", headers=cookie)
             assert code == 200 and json.loads(body) == {"events": [], "unavailable": True}
         # a crashing gather → empty events, and the failure IS cached (no re-fork per refresh)
-        count = _stub_gather(m, tmp_path, source=FAKE_GATHER_CRASH)
+        _stub_gather(m, tmp_path, source=FAKE_GATHER_CRASH)
         m._find_sotto_script = lambda *rel: os.path.join(str(tmp_path), "fake_gather_google.py")
         cal = json.loads(_get(base, "/api/calendar", headers=cookie)[1])
         assert cal["events"] == [] and cal["cached"] is False and "unavailable" not in cal
@@ -1859,6 +1859,11 @@ def _cadence_fixtures(root, queue_lines=None):
 def test_api_cadence_reads_the_funnel_s_own_state_files(tmp_path):
     m, srv, base = _server(tmp_path)
     day = _cadence_fixtures(str(tmp_path))
+    _write(os.path.join(str(tmp_path), "intentions.jsonl"), json.dumps({
+        "id": "int_1", "due": "2026-08-27T15:00:00-07:00", "action": "Review the deck",
+        "context": "Before partners", "status": "scheduled"}) + "\n")
+    m._personal_routines = lambda: [{"name": "user-friday-loops", "schedule": "0 16 * * 5",
+                                     "prompt": "Summarize my open loops", "deliver": "whatsapp"}]
     try:
         cookie = _login(base)
         data = json.loads(_get(base, "/api/cadence", headers=cookie)[1])
@@ -1870,6 +1875,8 @@ def test_api_cadence_reads_the_funnel_s_own_state_files(tmp_path):
         assert data["quiet"] == {"start": 21, "end": 7}
         assert data["vip_people"] == ["Sarah Chen"]
         assert data["delivery"]["channel"] == "whatsapp"
+        assert data["intentions"][0]["action"] == "Review the deck"
+        assert data["routines"][0]["name"] == "user-friday-loops"
         # the waiting room: newest first, with the funnel's own class vocabulary
         assert [w["class"] for w in data["waiting"]] == ["group", "cooldown"]
         held = data["waiting"][1]

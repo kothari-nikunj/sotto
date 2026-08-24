@@ -15,20 +15,51 @@ reason now: A DECLINE IS NEVER LINKED. That is the never-pre-link-a-decline rule
 moved out of prose and into code — pass `action_type: "decline"` and this module hands back an empty
 URL, whatever the channel, so a decline is presented as text and approved by a human every time.
 
-(This module used to also append every built link to $SOTTO_DATA/events/drafts.jsonl, the left half
-of Step 3's draft-diff matcher. Nothing ever read it, so it was deleted — see ROADMAP; re-add it
-with the matcher, when there is a consumer.)
+Every built link also leaves one row in $SOTTO_DATA/events/drafts.jsonl — the offered-drafts
+ledger, the left half of the draft→outcome matcher (_shared/scripts/draft_outcomes.py, which
+learn_preferences.py runs in every brief's Learn step). This module is the ONE place a draft
+becomes tappable, which makes it the one honest place to record that a draft was offered. The
+ledger row is best-effort: a failed append never costs the link.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 # The one action_type with a rule of its own: a decline is `review` tier forever, so it is presented
 # as text and never pre-linked.
 DECLINE_ACTION = "decline"
+
+# Offered-drafts ledger bounds (rotate-keeping-tail, same mechanism as the event queue).
+DRAFTS_MAX_BYTES = 2 * 1024 * 1024
+DRAFTS_KEEP_LINES = 2000
+
+
+def drafts_path() -> str:
+    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "drafts.jsonl")
+
+
+def record_draft(channel: str, identifier: str, message: str, action_type: str = "") -> None:
+    """One line per offered draft. Declines are recorded too — they're presented as text, and the
+    matcher still wants to know whether the user sent one. Empty-message links (a bare "open the
+    thread" tap) are not drafts and leave no row."""
+    if not (message or "").strip():
+        return
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+        from sotto_log import bounded_append  # noqa: PLC0415
+        row = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "channel": (channel or "").lower(),
+               "identifier": normalized_identifier(channel, identifier),
+               "text": message,
+               "action_type": (action_type or "").strip().lower()}
+        bounded_append(drafts_path(), json.dumps(row), DRAFTS_MAX_BYTES, DRAFTS_KEEP_LINES)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _digits(identifier: str) -> str:
@@ -107,6 +138,7 @@ def link_for(channel: str, identifier: str, message: str = "", subject: str = ""
         url = (identifier or "").strip()   # a meeting/event link is ALREADY a URL — the caller resolved it
     else:
         raise ValueError(f"unknown channel: {channel}")
+    record_draft(channel, identifier, message, action_type)
     # The decline is built (so the channel is still validated) and then withheld. Enforcing it
     # here means the rule holds even if a prompt forgets it.
     return "" if (action_type or "").strip().lower() == DECLINE_ACTION else url

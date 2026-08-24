@@ -241,6 +241,24 @@ def test_confirm_survives_the_next_extraction_and_reaches_the_drafter(tmp_path):
     assert "shipped before" in out["guidance"] and sample["text"][:40] in out["guidance"]
 
 
+def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, monkeypatch):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    original = se.jsonstore.write_atomic
+    observed = []
+
+    def checked(path, obj, **kwargs):
+        lock = se.jsonstore.lock_path(path)
+        observed.append(se.jsonstore._ReentrantLock._depth.get(lock, 0))
+        assert observed[-1] > 0
+        return original(path, obj, **kwargs)
+
+    monkeypatch.setattr(se.jsonstore, "write_atomic", checked)
+    se.extract(json.loads(json.dumps(SNAPSHOT)))
+    _, sample = _some_sample(tmp_path)
+    assert se.confirm_sample(se.sample_hash(sample))["ok"] is True
+    assert observed == [1, 1]
+
+
 def test_confirm_cli_contract(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     se.extract(json.loads(json.dumps(SNAPSHOT)))

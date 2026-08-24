@@ -4,7 +4,6 @@ Covers both server response styles (plain JSON body and SSE stream), the Mcp-Ses
 capture/echo, tool-result text extraction (json-decoded when possible), and 401 → ConnectorAuthError."""
 import json
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 

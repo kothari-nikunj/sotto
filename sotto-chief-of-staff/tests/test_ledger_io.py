@@ -2,7 +2,6 @@
 continuity_resolve (no more copy-paste drift between the readers)."""
 import importlib.util
 import os
-import sys
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(__file__)

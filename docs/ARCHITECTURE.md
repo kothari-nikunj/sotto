@@ -76,7 +76,7 @@ imports the receiver back.
 | Module | Owns |
 |---|---|
 | `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
-| `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now), each of which shells out to the CLI chat uses |
+| `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
 | `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel) |
 | `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_json`, the one atomic-write helper the whole image uses** |
 | `relay.py` | The reverse-MCP relay: the Mac long-polls `/bridge/poll`, Hermes calls `/mcp` locally, no tunnel |
@@ -94,7 +94,7 @@ never take the server with it.
 
 | Thread | Cadence | What it does |
 |---|---|---|
-| Gmail poll (`receiver.start_gmail_poll_thread`) | `SOTTO_EMAIL_POLL_SECS`, default 90s | Forks `poll_gmail.py`, feeds new mail through the same funnel as Bridge events |
+| Gmail poll (`receiver.start_gmail_poll_thread`) | `SOTTO_EMAIL_POLL_SECS`, default 90s | Claims nothing while polling; feeds new mail through the same funnel as Bridge events, then acknowledges ids only after the receiver durably accepts them |
 | Release valve (`receiver.start_valve_thread`) | `receiver.VALVE_INTERVAL_SECS_DEFAULT` = 900s | Forks `triage_event.py --valve` so a nudge held during cooldown/quiet/catchup can still get out |
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
@@ -155,11 +155,12 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `briefs/<date>_<kind>.json` | skills | dashboard |
 | `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
 | `events/seen.json` | receiver | receiver (idempotency ring — Bridge events, keyed `(source,rowid)`) |
-| `events/gmail_seen.json` | skills (`poll_gmail.py`) | skills (`poll_gmail.py`) — the same ring for polled Gmail; a *separate* file because a different process owns it |
+| `events/gmail_seen.json` | receiver, through `poll_gmail.py --ack` after accepted ingest | skills (`poll_gmail.py`) — a provider fetch alone never advances the cursor, so a receiver failure is retried rather than lost |
 | `events/last.stamp` | receiver | receiver (`/setup` liveness line) |
-| `events/bundle-<ms>.json` | receiver | skills (the `sotto-event` one-shot) |
+| `events/bundle-<random>.json` | receiver | skills (the `sotto-event` one-shot); atomically staged with thread/process-unique names and seven-day cleanup |
 | `events/last_digest.txt` | skills (`digest_check.py --stamp`, and the brief that wins the deliver-once claim) | skills (`digest_check.py` window), dashboard (`/api/cadence` context line) |
 | `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads only verdicts whose `decision_id` has a delivered receipt) |
+| `events/drafts.jsonl` | skills (`action_links.py` — every tap link built with a draft) | skills (`draft_outcomes.py`, run inside `learn_preferences.py` each brief: matched against the queue's `is_from_me` signals → outcomes.jsonl + style confirms) |
 | `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage` and correlated `decision_ids` |
 | `events/delivery-effects-<run>.json` | skills (`proactive_scan.py`, one receiver-scoped run) | receiver — ephemeral chase/handoff effects, applied only after successful send and then deleted |
 | `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per send/reply **attempt**, allowed or refused, so "what did Sotto send?" isn't answered by a prompt's promise |
@@ -182,6 +183,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `proactive/wake_run.last` | receiver (`handle_proactive_wake`) | receiver — its *mtime* is the sleep→wake throttle, nothing is read from inside it |
 | `proactive/retune_offer.last` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the retune-offer cooldown stamp |
 | `proactive/pending_offer.json` | skills (`pending_offer.py set` — the ONE writer, called by the proactive lane right after it delivers a push that ENDED in a question) | the gateway (`pending_offer.py get`, then `clear`) — a nudge is delivered by a detached run, so the user's bare "sure" lands in a session that never saw the question; this file is where it is written down. One offer at a time, newest wins, expires after 180 min at read |
+| `intentions.jsonl` | skills (`schedule_wakeup.py`) | skills (`proactive_scan.py`), dashboard (`/api/cadence`) — append-only one-shot recipes, folded by id; an optional loop anchor cancels the recipe when the loop closes |
 | `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
 | **`preferences.json`** | **skills *and* dashboard** | skills, dashboard |
@@ -214,7 +216,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 | Release valve | `receiver._valve_tick` → `triage_event.release_valve` | `receiver.VALVE_INTERVAL_SECS_DEFAULT` (900s) |
 | Post-meeting tap | `calcache.tap_tick` → `receiver._dispatch_meeting_tap` | on the calendar refresh tick |
 | Calendar diff | `calcache.change_tick` → `receiver._dispatch_synthetic` | the same refresh tick — declines, last-minute invites, moves, cancellations of imminent meetings |
-| Proactive watcher | `proactive_scan.main` → `triage_event.triage` (in process, one bundle) | the `*/15` cron |
+| Proactive watcher | `proactive_scan.main` → `triage_event.triage` (in process, one bundle; due one-shot intentions are one input to this producer) | the `*/15` cron |
 | "Nudge me now" | `dashboard._post_cadence` → `receiver.run_promote` → `triage_event.promote_one` | you, on the Cadence page |
 
 **Memory owners** — every durable thing Sotto remembers has exactly one writer. (Shapes:
@@ -233,6 +235,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 | Relationship analytics | `knowledge/relationship_state.json` | `relationship-pulse/scripts/relationship_pulse.py` |
 | The Record (every verdict) | `events/surfaced.jsonl` · `events/queue.jsonl` | `event-triage/scripts/triage_event.py` |
 | Outcomes | `outcomes.jsonl` | `_shared/scripts/log_outcome.py` |
+| One-shot intentions | `intentions.jsonl` | `_shared/scripts/schedule_wakeup.py` |
 
 Reading is unrestricted; writing is not. One writer per file is what lets two processes share the
 volume with no lock.
@@ -279,7 +282,8 @@ research declines to overwrite it: a correction you made stays made.
 
 ## Where the schedule lives
 
-`adapters/hermes/crons.json` is the ONE source for the cron jobs. Four registrars read it —
-`adapters/hermes/start.sh` (cloud boot), `adapters/hermes/install.sh`, `adapters/openclaw/install.sh`
-and `receiver._sotto_cron_jobs` (the re-registration that fires when the setup wizard sets a
-timezone). See [adapters/README.md](../adapters/README.md) for its field contract.
+`adapters/hermes/crons.json` is the ONE schedule declaration and
+`adapters/hermes/reconcile_crons.py` is the ONE Hermes desired-state implementation. Cloud boot and
+the receiver's live timezone change both call that reconciler; it replaces Sotto system jobs by
+parsed job id and always fences `user-*` routines. The install adapters consume the same declaration
+for their host-specific setup. See [adapters/README.md](../adapters/README.md) for its field contract.

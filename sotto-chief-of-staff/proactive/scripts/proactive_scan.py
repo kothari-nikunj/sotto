@@ -8,7 +8,8 @@ lives here, testable, so the agent only DRAFTS and DELIVERS what this returns. W
 reaches the user is the event funnel's call, below. PRINCIPLE: auto-draft, never auto-send; a nudge
 surfaces a ready draft, it never sends on the user's behalf.
 
-Six nudge kinds:
+Seven nudge kinds:
+  - intention     — a one-shot plain-language recipe whose due time has arrived
   - meeting_prep  — an external meeting starting within the lead window that you haven't prepped
                     (deterministic test: none of its external attendees are in TODAY's research
                     cache, i.e. no prep or brief run has covered this meeting's people yet)
@@ -375,6 +376,7 @@ def _open_loops() -> list:
         out.append({"id": f"you_owe:{_s(it.get('name'))}:{_s(it.get('what'))[:40]}",
                     "title": f"{_s(it.get('name'))} — {_s(it.get('what'))}",
                     "name": _s(it.get("name")),
+                    "anchor_key": _s(it.get("anchor_key")),
                     "deadline": _s(it.get("deadline")),
                     "channel": _s(it.get("channel")),
                     "identifier": _s(it.get("identifier")),
@@ -446,6 +448,58 @@ def _handoff_candidates() -> list:
     return out
 
 
+def _all_open_anchor_keys() -> set[str] | None:
+    """Every live loop anchor, both directions; conditional recipes may track either direction."""
+    try:
+        import loops_query as lq  # noqa: PLC0415
+        data = lq.query()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {_s(item.get("anchor_key"))
+            for lane in (data.get("you_owe") or [], data.get("waiting_on_them") or [])
+            for item in lane if isinstance(item, dict) and _s(item.get("anchor_key"))}
+
+
+def _intention_candidates(now_local: datetime, continuity=None) -> list:
+    """Due recipes, auto-canceling conditional ones whose tracked open loop already closed.
+
+    `continuity` is an explicit test/caller override. Production reads both ledger directions:
+    "if Sarah hasn't replied" tracks waiting_on_them, which the due-commitment view omits on
+    purpose.
+    """
+    try:
+        import schedule_wakeup  # noqa: PLC0415
+        if continuity is None:
+            open_anchors = _all_open_anchor_keys()
+        else:
+            open_anchors = {_s(item.get("anchor_key")) for item in
+                            (continuity if isinstance(continuity, list)
+                             else _arr(continuity, "items"))
+                            if isinstance(item, dict) and _s(item.get("anchor_key"))}
+        out = []
+        for item in schedule_wakeup.due(now_local):
+            anchor = _s(item.get("anchor_key"))
+            if anchor and open_anchors is None:
+                continue  # ledger unavailable: retry later; never guess that the condition passed
+            if anchor and anchor not in open_anchors:
+                schedule_wakeup.transition(item["id"], "canceled")
+            else:
+                out.append(item)
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _finish_intention(ident: str) -> None:
+    try:
+        import schedule_wakeup  # noqa: PLC0415
+        schedule_wakeup.transition(ident, "fired")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _stale_loop_count() -> int:
     """Reuse retune_scan's exact stale definition (overdue / 3–7d / repeat-surfaced) so the offer
     triggers on the same pile the cleanup would act on. Best-effort; 0 on any error."""
@@ -460,7 +514,7 @@ def scan(calendar, continuity, local, user_email, now_local,
          stale_count: int = 0, retune_offer_allowed: bool = False,
          prepped_emails=None, brief_recent: bool = False,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
-         brief_named=None) -> dict:
+         brief_named=None, intentions=None) -> dict:
     """Pure decision (no I/O, no gates): given the inputs and the local 'now', return every nudge
     that is DUE now. Whether any of them reaches the user — the snooze, quiet hours, the mutes, the
     in-meeting hold, the daily interrupt budget — is the funnel's call, made in one place, on the
@@ -474,6 +528,15 @@ def scan(calendar, continuity, local, user_email, now_local,
     user_domain = user_email.split("@")[1] if "@" in user_email else ""
     today = now_local.strftime("%Y-%m-%d")
     nudges = []
+
+    # 0) One-shot intentions — explicitly scheduled by the user or a source-backed follow-up. The
+    # heartbeat supplies timing; the ordinary funnel still owns whether this tick may interrupt.
+    for item in (intentions or []):
+        if not isinstance(item, dict) or not _s(item.get("id")) or not _s(item.get("action")):
+            continue
+        nudges.append({"kind": "intention", "key": f"intention:{_s(item.get('id'))}",
+                       "intention_id": _s(item.get("id")), "title": _s(item.get("action")),
+                       "detail": _s(item.get("context"))})
 
     # 1) Meeting prep — external meeting starting within the lead window (and not already started).
     if isinstance(calendar, dict):
@@ -635,7 +698,8 @@ def main():
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
                handoff_candidates=_handoff_candidates(),
-               brief_named=_brief_named_keys(now_local))["nudges"]
+               brief_named=_brief_named_keys(now_local),
+               intentions=_intention_candidates(now_local))["nudges"]
 
     te = _funnel()
     result = {"nudges": [], "held": [], "quiet": False}
@@ -661,6 +725,10 @@ def main():
                   else {n["key"] for n in fresh})
         if burned:
             _save_state(date, seen | burned)
+        if not hold:
+            for n in fresh:
+                if n.get("kind") == "intention" and n.get("intention_id"):
+                    _finish_intention(n["intention_id"])
     if any(n["kind"] in ("retune_offer", "handoff") for n in fired):
         _stamp_retune_offer(date)   # one cooldown window covers both tidy-up shapes
     deferred = _defer_delivery_effects(fired) if fired else False

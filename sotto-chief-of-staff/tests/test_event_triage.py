@@ -314,7 +314,7 @@ def test_tier1_ambient_queues_and_ignore_drops(tmp_path, monkeypatch):
     assert out2["verdict"] == "drop"
 
 
-def test_tier1_prompt_carries_event_text_and_sender(tmp_path, monkeypatch):
+def test_tier1_prompt_carries_event_text_without_sender_identity(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setenv("SOTTO_TRIAGE_MODEL", "gemini-3.5-flash-lite")
@@ -325,8 +325,9 @@ def test_tier1_prompt_carries_event_text_and_sender(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["model"] == "gemini-3.5-flash-lite"
     assert "can you review the deck today?" in calls[0]["prompt"]
-    assert "Sarah Chen" in calls[0]["prompt"]                 # sender one-liner present
-    assert "Founder @ Acme" in calls[0]["prompt"]             # graph head line woven in
+    assert "known contact" in calls[0]["prompt"]              # relationship role survives
+    assert "Sarah Chen" not in calls[0]["prompt"]             # identity stays on the host
+    assert "Founder @ Acme" not in calls[0]["prompt"]         # graph identity stays local too
     assert len(calls[0]["prompt"]) < 8000                     # ≈ ≤ 2k tokens
 
 
@@ -555,7 +556,9 @@ def _q(cls, sender="Sarah Chen", rowid=1, handle="+14155551234", held=None,
 def _seed_queue(tmp_path, entries):
     d = tmp_path / "events"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "queue.jsonl").write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    with open(d / "queue.jsonl", "a", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
 
 
 def test_the_valve_never_promotes_sottos_own_proactive_nudge(tmp_path, monkeypatch):
@@ -1438,14 +1441,6 @@ def _seed_surfaced(tmp_path, rows):
             f.write(json.dumps(r) + "\n")
 
 
-def _seed_queue(tmp_path, entries):
-    d = tmp_path / "events"
-    d.mkdir(parents=True, exist_ok=True)
-    with open(d / "queue.jsonl", "a", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e) + "\n")
-
-
 def _prior_call(ts="2026-08-06T09:45:00Z", sender="Sarah Chen", cls="missed_call"):
     """The surfaced row a live missed call leaves behind (20 min before NOW_UTC by default)."""
     return {"ts": ts, "sender": sender, "channel": "calls", "verdict": "agent",
@@ -2013,3 +2008,43 @@ def test_poll_gmail_events_carry_to_and_cc():
     assert ev["to"] == "Aditya <aditya@acme.com>"
     assert ev["cc"] == "N K <nk@fpv.example.com>"
     assert pg._to_event({"id": "m2"}, {"from": "x@y.com", "body": "hi"})["to"] == ""  # absent = ""
+
+
+def test_tier1_rides_the_provider_seam(tmp_path, monkeypatch):
+    """SOTTO_TRIAGE_MODEL takes provider/model refs like SOTTO_BRIEF_MODEL — a subscription-family
+    install gets event triage too, instead of every text queuing on 'tier1 error'."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_TRIAGE_MODEL", "openai/gpt-tiny")
+    monkeypatch.setenv("OPENAI_API_KEY", "key-oai")
+    monkeypatch.delenv("GOOGLE_AI_API_KEY", raising=False)
+    _seed_snapshot(tmp_path)
+    seen = []
+    monkeypatch.setattr(te._gemini, "_openai_once",
+                        lambda model, key, prompt, label="", **kw:
+                        (seen.append((model, key)), '{"class":"ambient","why":"x"}')[1])
+    out = te.triage({"events": [_im("fyi the doc is updated", rowid=41)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"
+    assert seen == [("gpt-tiny", "key-oai")]
+    # a keyless non-gemini family raises inside tier1 → the caller queues (fail toward silence)
+    monkeypatch.setenv("SOTTO_TRIAGE_MODEL", "anthropic/claude-h")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    out2 = te.triage({"events": [_im("also this", rowid=42)]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out2["verdict"] == "queue"
+
+
+def test_tier1_masking_hides_identity_but_not_dates():
+    """The mask is identity-only: sender name, phones, and emails go; a date-time survives —
+    "2026-08-24 10" is classification signal the phone regex would otherwise eat as [phone]."""
+    e = {"sender_name": "Sarah Chen", "handle": "+14155551234", "source": "imessage"}
+    out = te._tier1_text(
+        "Sarah Chen here — call me at (415) 555-1234 or sarah@acme.com re 2026-08-24 10:00", e)
+    assert "Sarah Chen" not in out and "[sender]" in out
+    assert "555-1234" not in out and "[phone]" in out
+    assert "sarah@acme.com" not in out and "[email]" in out
+    assert "2026-08-24 10:00" in out
+
+    # A phone immediately after a date is a separate identity span. The old callback preserved
+    # the regex's entire greedy match when it merely began with an ISO date.
+    adjacent = te._tier1_text("2026-08-24 415-555-1234", {})
+    assert adjacent == "2026-08-24 [phone]"

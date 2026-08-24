@@ -1,5 +1,5 @@
 """loops_query.py — splits the continuity ledger into you-owe vs waiting-on, oldest/overdue first."""
-import importlib.util, os, sys
+import importlib.util, os
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")

@@ -319,6 +319,15 @@ def _gmail_draft(to: str, body: str, subject: str = "", thread_id: str = "") -> 
         d = service.users().drafts().create(userId="me", body={"message": message}).execute()
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"draft not created: {e}", "fallback": "deep_link"}
+    # The offered-drafts ledger: a Gmail draft is a draft OFFERED (the user reviews and sends it
+    # themselves), so it's graded by the same matcher as tap-link drafts — the sent-mail poll lane
+    # provides the outcome side. Best-effort, sibling import; never costs the draft.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import action_links  # noqa: PLC0415
+        action_links.record_draft("email", to, body or "", "reply" if thread_id else "send")
+    except Exception:  # noqa: BLE001
+        pass
     return {"status": "drafted", "draft_id": (d or {}).get("id", ""),
             "thread_id": ((d or {}).get("message") or {}).get("threadId", "") or thread_id,
             "threaded": bool(thread_id), "reply_headers": threaded_headers,

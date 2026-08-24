@@ -1,7 +1,6 @@
 """relationship_pulse.py — weekly losing-touch / waiting-on-you detection from read_local history."""
 import importlib.util
 import os
-import sys
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(__file__)

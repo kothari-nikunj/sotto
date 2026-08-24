@@ -219,7 +219,6 @@ def test_proactive_verdicts_are_recorded_even_on_a_quiet_budget(tmp_path, monkey
 def test_meeting_prep_skipped_when_todays_research_covers_the_attendees(tmp_path, monkeypatch):
     """The docstring's 'that you haven't prepped', made real: today's research cache means a prep
     or brief run already covered this meeting's people."""
-    import json
     now = _at(10)
     soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
     cal = [{"id": "ev1", "summary": "Pitch", "start": soon,
@@ -285,13 +284,15 @@ def test_open_loops_read_straight_from_the_ledger_one_direction_only(tmp_path, m
     import loops_query as lq
     monkeypatch.setattr(lq, "query", lambda: {
         "you_owe": [{"name": "Sarah", "what": "send the deck", "deadline": "2026-08-08",
-                     "channel": "email", "identifier": "sarah@x.com"},
+                     "channel": "email", "identifier": "sarah@x.com",
+                     "anchor_key": "email:you_owe:id:sarah"},
                     {"name": "NoDeadline", "what": "someday", "deadline": None}],
         "waiting_on_them": [{"name": "Ben", "what": "the contract", "deadline": "2026-08-01",
                              "channel": "imessage", "identifier": "+15551112222"}]})
     loops = ps._open_loops()
     assert [l["title"] for l in loops] == ["Sarah — send the deck"]
     assert loops[0]["identifier"] == "sarah@x.com" and loops[0]["name"] == "Sarah"
+    assert loops[0]["anchor_key"] == "email:you_owe:id:sarah"
 
 
 # ── Cadence: the same nudge snooze the event funnel honors ────────────────────────────────────────

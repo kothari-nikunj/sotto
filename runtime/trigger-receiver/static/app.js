@@ -1082,6 +1082,30 @@
       deliveryRule(delivery)));
     frag.appendChild(levers);
 
+    // Scheduled work — recurring user routines and one-shot intentions, read-only here. Creation
+    // and cancellation stay conversational so the user can state the actual intent in plain words.
+    var intentions = Array.isArray(data.intentions) ? data.intentions : [];
+    var routines = Array.isArray(data.routines) ? data.routines : [];
+    frag.appendChild(ledgerCap("Scheduled", capCount((intentions.length + routines.length) || "none")));
+    var scheduled = el("div", "ledger");
+    for (var si = 0; si < intentions.length; si++) {
+      var intention = intentions[si] || {};
+      var due = parseWhen(intention.due);
+      var when = due ? shortDate(intention.due) + " · " + fmtClock(due) : str(intention.due);
+      scheduled.appendChild(meterRow(str(intention.action) || "One-time reminder", when,
+        str(intention.context) || "Runs once, then disappears."));
+    }
+    for (var sr = 0; sr < routines.length; sr++) {
+      var routine = routines[sr] || {};
+      scheduled.appendChild(meterRow(prettyKey(str(routine.name).replace(/^user-/, "")),
+        str(routine.schedule) || "recurring", str(routine.prompt)));
+    }
+    if (!intentions.length && !routines.length) {
+      scheduled.appendChild(emptyState("Nothing scheduled",
+        "Ask Sotto for a one-time reminder or a recurring routine in plain language."));
+    }
+    frag.appendChild(scheduled);
+
     // The waiting room
     var waiting = Array.isArray(data.waiting) ? data.waiting : [];
     var total = typeof data.waiting_total === "number" ? data.waiting_total : waiting.length;

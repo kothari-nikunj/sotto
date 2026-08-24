@@ -7,7 +7,6 @@ token_endpoint, client_id, resource, mcp_url, obtained_at}. Refresh is OAuth 2.1
 import json
 import os
 import stat
-import sys
 import urllib.parse
 
 HERE = os.path.dirname(__file__)

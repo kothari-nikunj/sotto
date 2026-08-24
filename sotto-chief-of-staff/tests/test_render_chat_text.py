@@ -7,7 +7,6 @@ conversion is now deterministic — compose_brief runs the brief through to_chat
 result as `brief_text`.
 """
 import os
-import sys
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")

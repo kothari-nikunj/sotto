@@ -3,7 +3,6 @@ import glob
 import hashlib
 import importlib.util
 import os
-import sys
 from datetime import datetime
 
 import yaml

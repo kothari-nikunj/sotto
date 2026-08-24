@@ -76,6 +76,17 @@ def _suppressed(existing: dict) -> dict:
 
 
 def learn() -> dict:
+    # The draft→outcome matcher runs FIRST, so the ledger this tally reads already carries
+    # today's graded drafts — one Learn invocation does match → tally in order, and there is no
+    # separate SKILL step for an agent to forget. Best-effort: a broken matcher never costs the
+    # tally (and the matcher itself is a no-op when there are no drafts or no signals).
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "..", "_shared", "scripts"))
+        import draft_outcomes  # noqa: PLC0415
+        draft_outcomes.run()
+    except Exception:  # noqa: BLE001
+        pass
     path = os.path.join(_root(), "outcomes.jsonl")
     rows = []
     if os.path.exists(path):
