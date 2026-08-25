@@ -347,12 +347,32 @@ else
   echo "[sotto] tapbacks: off (SOTTO_REACTIONS=0)"
 fi
 
-# Hermes's daily session reset (mode/idle_minutes/at_hour — no silence key in any version we've
-# seen) BROADCASTS "◐ Session automatically reset…" to the home channel when it fires. Sotto keeps
-# no memory in chat history, so the reset itself is good hygiene — but at the default 4:00 the
-# notice stands alone in the middle of the night. Move it to 6:00: the notice attaches to the next
-# session activity (the 6:30 brief run), which buries it, and the day's first run starts fresh.
-hermes_set_if_supported session_reset.at_hour 6
+# Session reset tied to DEPLOYS, not the clock (owner, Aug 2026). The clock-driven reset had to go
+# because its "◐ Session automatically reset… ◆ Model/Provider/Context" broadcast has no silence
+# key in any Hermes version or doc (re-checked Aug 2026; scheduling it at 6:00 so the brief would
+# bury the notice failed — it stood alone on the phone). But a NEVER-resetting session would
+# freeze the persona: sessions snapshot their system prompt, so the SOUL.md this boot just
+# refreshed only reaches a NEW session. Deploys are exactly when freshness matters — new code, new
+# session — so: mode none kills the daily banner, and every boot archives the gateway sessions
+# below. The next message then starts a fresh session SILENTLY (no reset event fires, so nothing
+# is broadcast) carrying this deploy's persona. Context rot stays bounded by deploy cadence plus
+# Hermes' own compaction; /new in chat remains the manual reset; /resume can still reopen an
+# archived transcript. Sotto's REAL memory never lived in the transcript anyway (graph + master
+# file — the persona persists feedback via sotto-feedback precisely because chat is disposable).
+hermes_set_if_supported session_reset.mode none
+# Best-effort and never fatal: ids in `sessions list` are hex/uuid tokens (the same shape the cron
+# reconciler matches). `archive` keeps the transcript — this is "start fresh", never "destroy
+# history". If the CLI shape drifts, nothing archives and the only cost is a stale persona
+# snapshot until the user types /new — which the log line below says out loud.
+if hermes sessions list >/dev/null 2>&1; then
+  archived=0
+  for sid in $(hermes sessions list 2>/dev/null | grep -oE '\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{12,})\b' | sort -u); do
+    if hermes sessions archive "$sid" >/dev/null 2>&1; then archived=$((archived + 1)); fi
+  done
+  echo "[sotto] fresh-per-deploy: archived $archived session(s) — the first message after this deploy starts a new session with the refreshed persona (silently; /resume can reopen old transcripts)"
+else
+  echo "[sotto] fresh-per-deploy: sessions CLI unavailable — persona updates reach chat only after /new"
+fi
 # Voice (read + listen). Enable Hermes-native TTS so Sotto can deliver a SPOKEN brief and voice replies
 # (and transcribe voice notes you send — two-way). Default `edge` (Microsoft Edge TTS — free, no key,
 # good quality); set SOTTO_TTS_PROVIDER=gemini to use the Google key you already have (voice via
