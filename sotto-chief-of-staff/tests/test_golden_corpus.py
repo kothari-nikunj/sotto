@@ -119,9 +119,12 @@ def seed_data(root: str) -> str:
     return root
 
 
-def build_corpus(tmp_path, key=KEY_A, monkeypatch=None, **overrides) -> dict:
-    """Run the REAL builder over a synthetic volume. Returns paths + the parsed output."""
+def build_corpus(tmp_path, key=KEY_A, monkeypatch=None, mutate=None, **overrides) -> dict:
+    """Run the REAL builder over a synthetic volume. Returns paths + the parsed output.
+    `mutate(data_root)` edits the seeded volume before the build (extra contacts, extra prose)."""
     data = seed_data(str(tmp_path / "data"))
+    if mutate:
+        mutate(data)
     out = str(tmp_path / "corpus" / "corpus-v1")
     map_path = str(tmp_path / "keys" / "corpus-v1.map.json")
     argv = ["--out", out, "--map", map_path, "--days", "5", "--end", "2026-08-09",
@@ -264,6 +267,200 @@ def test_a_named_sensitive_sender_is_dropped_entirely(tmp_path):
     assert not day["inputs"]["local"]["imessage"]
     assert not day["inputs"]["local"]["calls"]
     assert marcus["alias"]["name"] not in json.dumps(day["inputs"]["local"]["imessage"])
+
+
+def _add_person_and_prose(name: str, email: str, prose: str):
+    """Volume mutation: one more contact plus one iMessage mentioning them, inside the window."""
+    def mutate(root):
+        snap_path = os.path.join(root, "knowledge", "last_local_snapshot.json")
+        with open(snap_path, encoding="utf-8") as f:
+            snap = json.load(f)
+        snap["local"]["contacts"].append({"name": name, "phones": [], "emails": [email]})
+        snap["local"]["imessage"].append({"handle": MARCUS_PHONE, "is_from_me": False,
+                                          "is_group_chat": False,
+                                          "timestamp": "2026-08-09 10:00:00", "text": prose})
+        with open(snap_path, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+    return mutate
+
+
+def test_a_stop_listed_first_name_is_outside_the_promise_and_outside_the_scan(tmp_path):
+    """The scrubber deliberately never rewrites a bare stop-listed name ('Grace', 'Mark', 'Will') —
+    rewriting every English word that doubles as a name would eat the corpus. The scan must share
+    that definition: a contact named Grace may not fail the build (the owner's real 617-person map
+    did exactly this). Her FULL name is still scrubbed, and ordinary words stay intact."""
+    res = build_corpus(tmp_path / "stop", mutate=_add_person_and_prose(
+        "Grace Porter", "grace@porterco.test",
+        "Grace Porter said Grace will chase it — graceful as ever."))
+    assert res["rc"] == 0
+    blob = _blob(res)
+    assert "Grace Porter" not in blob and "Porter" not in blob
+    assert "graceful" in blob                     # ordinary words untouched
+    assert "Grace will chase" in blob             # the accepted, documented cost
+
+
+def test_a_name_inside_a_longer_word_is_not_a_leak_but_standalone_is_rewritten(tmp_path):
+    """'Rita' inside 'margarita' is not Rita — the old raw-substring scan failed builds on exactly
+    this. Whole-word occurrences still get rewritten and would still be caught."""
+    res = build_corpus(tmp_path / "infix", mutate=_add_person_and_prose(
+        "Rita Okafor", "rita@okaforlabs.test",
+        "margarita night — Rita Okafor is in, Rita confirmed."))
+    assert res["rc"] == 0
+    blob = _blob(res)
+    assert "margarita" in blob
+    assert "Okafor" not in blob
+    assert "Rita" not in blob                     # standalone token: rewritten, everywhere
+
+
+def test_handles_and_url_slugs_are_scrubbed(tmp_path):
+    """'@dana' and 'linkedin.com/in/danawells' are exactly how names travel in real messages; both
+    escaped the old rewriter (the @ lookbehind, the squashed no-boundary form)."""
+    res = build_corpus(tmp_path / "slug", mutate=_add_person_and_prose(
+        "Zuri Mbeki", "zuri@mbekico.test",
+        "ping @dana or grab linkedin.com/in/danawells before the call"))
+    assert res["rc"] == 0
+    blob = _blob(res).lower()
+    assert "danawells" not in blob
+    assert "@dana" not in blob
+
+
+def test_leak_scan_and_rewriter_share_one_definition_of_scrubbed():
+    """Unit contract: the scan's needle IS the rewrite regex. A whole-word survivor is a hit; the
+    same letters inside another word are not; a scrubbed text scans clean."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Rita Okafor"], ["rita@okaforlabs.test"])
+    im.freeze()
+    hits = dict(bgc.leak_scan("dinner with Rita tonight, margarita after", im))
+    assert hits.get("rita") == 1 and len(hits) == 1
+    assert bgc.leak_scan(im.rewrite_text("dinner with Rita Okafor, margarita after"), im) == []
+
+
+def test_a_fake_alias_never_collides_with_a_real_name(tmp_path):
+    """A real contact named straight out of the alias pools ('Lena Ashby') must not reappear as
+    someone's fake — the scan could no longer tell fake from leak."""
+    res = build_corpus(tmp_path / "collide", mutate=_add_person_and_prose(
+        "Lena Ashby", "lena@ashbyworks.test", "Lena Ashby wants the doc today."))
+    assert res["rc"] == 0
+    blob = _blob(res)
+    assert "Lena" not in blob and "Ashby" not in blob
+    for p in res["map_data"]["people"]:
+        assert {p["alias"]["first"].lower(), p["alias"]["last"].lower()}.isdisjoint({"lena", "ashby"})
+
+
+def test_archived_snapshots_extend_the_corpus_message_history(tmp_path):
+    """One live snapshot holds ~a day of messages — the owner's first 42-day corpus had two days.
+    Dated archives under knowledge/snapshots/ are merged in (exact duplicates collapsed), so the
+    corpus grows a day of message history for every day the archive has been accumulating."""
+    def mutate(root):
+        arch = os.path.join(root, "knowledge", "snapshots")
+        os.makedirs(arch)
+        older = {"captured_at": "2026-08-06T07:00:00Z",
+                 "local": {"generated_at": "2026-08-06T07:00:00Z",
+                           "source_status": {"imessage": "ok"},
+                           "imessage": [
+                               {"handle": MARCUS_PHONE, "is_from_me": False, "is_group_chat": False,
+                                "timestamp": "2026-08-06 09:15:00", "text": "archived-day ping"},
+                               # exact duplicate of a live-snapshot row — must collapse, not double
+                               {"handle": MARCUS_PHONE, "is_from_me": False, "is_group_chat": False,
+                                "timestamp": "2026-08-09 07:30:00",
+                                "text": f"Dana Wells said the AcmeCorp redlines land today — she's "
+                                        f"at {DANA_EMAIL}, or loop in {STRANGER_EMAIL}"}]}}
+        with open(os.path.join(arch, "2026-08-06.json"), "w", encoding="utf-8") as f:
+            json.dump(older, f)
+    res = build_corpus(tmp_path / "arch", mutate=mutate)
+    assert res["rc"] == 0
+    assert "day-03" in res["days"]                              # 2026-08-06, from the archive alone
+    day0 = res["days"]["day-00"]
+    assert len(day0["inputs"]["local"]["imessage"]) == 1        # the duplicate collapsed
+
+
+def test_shapeless_registered_identifiers_are_swept_everywhere():
+    """Ledger anchor_keys carry thread ids, event ids, graph slugs and masked phones — registered
+    identifiers no email or phone regex can recognize. The owner's real build leaked 35 of them.
+    The sweep replaces their exact bytes wherever they appear, with a stable keyed hash."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Aalap Sanghvi"], ["aalap_sanghvi"])
+    im.add([], ["19fa89c963f80869", "32665(smsft)", "+120****1166"])
+    im.freeze()
+    text = ("affinity:follow_up:id:aalap_sanghvi thread:19fa89c963f80869 "
+            "handle 32665(smsft) call +120****1166 back")
+    out = im.rewrite_text(text)
+    for real in ("aalap_sanghvi", "19fa89c963f80869", "32665(smsft)", "+120****1166"):
+        assert real not in out
+    assert out == im.rewrite_text(text)                       # stable across mentions
+    assert bgc.leak_scan(out, im) == []
+    assert im.identifier_for("19fa89c963f80869") == im.identifier_for("19fa89c963f80869")
+    assert "1555" not in im.identifier_for("32665(smsft)")    # letters ⇒ not phone-shaped
+
+
+def test_real_subdomains_are_pseudonymized_in_fake_domains():
+    """'andrew.cmu.edu' names a person — the fake domain must not keep the real subdomain."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Andrew Lee"], ["prof@andrew.cmu.test"])
+    im.freeze()
+    fake = im.email_for("prof@andrew.cmu.test")
+    assert "andrew" not in fake.lower() and "cmu" not in fake.lower()
+
+
+def test_newsletter_names_do_not_eat_schema_enums_or_prose():
+    """Senders are 'named' Morning Brew or Deadline; their tokens are also schema enums and plain
+    English. Bare tokens are stop-listed (never rewritten, never scanned); the WHOLE name still is."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Morning Brew"], ["crew@morningbrew.test"])
+    im.freeze()
+    assert bgc.scrub({"type": "morning"}, im) == {"type": "morning"}
+    out = im.rewrite_text("the Morning Brew digest lands every morning")
+    assert "Morning Brew" not in out
+    assert out.endswith("every morning")
+    assert bgc.leak_scan({"type": "morning", "deadline": "Monday morning"}, im) == []
+
+
+def test_scan_reads_values_as_data_and_keys_as_schema():
+    """A registered name matching a JSON KEY is not a leak ('google' the input key); the same name
+    in a VALUE is. Hard identifiers stay leaks even as keys — a dict keyed by an address leaks."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Rita Okafor"], ["rita@okaforlabs.test"])
+    im.freeze()
+    assert bgc.leak_scan({"rita": "all clean here"}, im) == []
+    assert dict(bgc.leak_scan({"note": "ask Rita"}, im)).get("rita") == 1
+    assert bgc.leak_scan({"rita@okaforlabs.test": "x"}, im) != []
+
+
+def test_scrub_treats_every_unrouted_string_as_prose():
+    """Fail toward scrubbing: the Bridge and the ledger grow fields faster than any allowlist can
+    chase — the owner's real volume leaked 162 names through exactly such fields. Unknown string
+    fields, unknown lists and non-identifier ident-field values all get rewritten; only
+    timestamp-shaped strings pass through (the tokenizer owns them)."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    im.add(["Rita Okafor"], ["rita@okaforlabs.test"])
+    im.freeze()
+    out = bgc.scrub({"brand_new_field": "Rita Okafor said hi",
+                     "nested": [{"unknown_note": "call Rita back"}],
+                     "bare_list": ["Rita Okafor owes a reply"],
+                     "handle": "Rita Okafor",                    # ident field, not identifier-shaped
+                     "seen_at_times": ["2026-08-09 07:30:00"],
+                     "some_clock": "2026-08-09T07:30:00Z"}, im)
+    blob = json.dumps(out)
+    assert "Rita" not in blob and "Okafor" not in blob
+    assert out["seen_at_times"] == ["2026-08-09 07:30:00"]
+    assert out["some_clock"] == "2026-08-09T07:30:00Z"
+
+
+def test_alias_allocation_survives_a_large_population_with_pool_collisions():
+    """The owner's real 617-person volume exhausted the old allocator (its two-stride walk reached
+    only 120 of the 720 first×last combos, and the avoid-set shrank that further). 750 people plus
+    EVERY pool first name existing as a real contact must still allocate — unique aliases, none
+    colliding with a real name."""
+    im = bgc.IdentityMap(bytes.fromhex(KEY_A))
+    for i in range(750):
+        im.add([f"Bulkperson{i:03d} Qz{i:03d}"], [f"p{i:03d}@bulk{i % 40:02d}.test"])
+    for first in bgc.FIRST_NAMES:
+        im.add([f"{first} Vex{first.lower()}"], [f"{first.lower()}@vexco.test"])
+    im.freeze()
+    fulls = [a["name"] for a in im.alias.values()]
+    assert len(fulls) == len(im._groups) and len(fulls) == len(set(fulls))
+    pool_firsts = {f.lower() for f in bgc.FIRST_NAMES}
+    assert all(a["first"].lower() not in pool_firsts for a in im.alias.values())
 
 
 def test_the_builder_refuses_to_write_a_leaking_corpus(tmp_path, monkeypatch):

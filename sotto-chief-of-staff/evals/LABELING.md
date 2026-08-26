@@ -11,14 +11,25 @@ of these deserved a nudge" question is literally the same question, asked once.
 
 ```bash
 # On the machine with the volume (the container, or a Mac with $SOTTO_DATA):
+# 1. Backfill Gmail + Calendar for the whole window (the daily gather only keeps 1 day):
+python3 _shared/scripts/gather_google.py --window-days 42 --max 400 --bodies 60
+# 2. Build:
 SOTTO_DATA=/data python3 tools/build_golden_corpus.py --version corpus-v1 --days 42 \
     --user-email you@yourdomain --draft-labels-llm
 ```
 
+Message depth is different: iMessage/WhatsApp history comes from the dated snapshot archive
+(`knowledge/snapshots/`), which accumulates one file per day from the moment this version deploys.
+A corpus built before the archive has grown holds only ~2 days of messages — that first corpus is
+still worth labeling (email + calendar carry most `needs_attention` truth), and a later
+corpus-v2 gets the full message window for free.
+
 That writes `evals/corpus/corpus-v1/` (days + manifest + a drafted `labels.yaml`) and the identity
 map to `$SOTTO_DATA/corpus-keys/corpus-v1.map.json`. Check the run said `LEAK SCAN: PASS` — if it
-didn't, nothing was written, and the fix is to widen the entity list (add the missing people to the
-knowledge graph and rebuild), never `--allow-leaks`.
+didn't, nothing was written. Re-run with `--leak-context` to see each surviving string in place
+(real data — your terminal only): a hit is either a person the graph doesn't know yet (add them and
+rebuild) or a field the scrub genuinely missed (a bug — report it). Never `--allow-leaks`. A
+stop-listed bare first name ('Grace', 'Mark') surviving in prose is by design and is not scanned.
 
 If a thread is genuinely too sensitive to keep even pseudonymized, name it and it never enters the
 corpus at all — `--drop-sender them@theirdomain` or `--drop-thread <gmail-threadId>`, repeatable,

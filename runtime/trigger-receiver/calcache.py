@@ -106,8 +106,14 @@ MEETING_END_SOURCE = "meeting_end"
 # calendar_change branch, and the relevance windows (named constants, not knobs). A change matters
 # in real time only while it is imminent — everything further out is the brief's job.
 CALENDAR_CHANGE_SOURCE = "calendar_change"
-CHANGE_WINDOW_HOURS = 24           # invited/moved/cancelled: the meeting starts within this window
+CHANGE_WINDOW_HOURS = 24           # moved/cancelled: the meeting starts within this window
 DECLINE_WINDOW_HOURS = 48          # a decline is worth knowing a bit earlier — reschedules take time
+# A NEW invite is "last-minute" only when the meeting starts THIS soon. A next-day invite is
+# ordinary scheduling, not an interrupt (owner, Aug 25: four "Last-minute:" pings in 15 minutes,
+# three of them for tomorrow) — the email lane already nudges a real invite with a draft, and the
+# brief covers tomorrow. Declines/moves/cancellations keep the wider windows above: they change
+# plans you already made; a new invite only proposes one.
+INVITE_SOON_HOURS = 4
 INVITE_GRACE_MIN = 15              # an invite for a meeting that started minutes ago still counts
 TAP_GRACE_MIN_DEFAULT = 5          # "ended ≥5 min ago" — you're out of the room, not packing up
 TAP_MAX_PER_DAY_DEFAULT = 3        # the taps' own daily cap (they don't spend the interrupt budget)
@@ -628,7 +634,8 @@ def _wall(start: str) -> str:
 def calendar_changes(baseline: list, current: list, now_utc: datetime, self_email: str) -> list:
     """The diff that matters, as candidate dicts — pure, so it tests like ended_meetings.
     Four kinds, each one sentence: a NEW event with another human starting within
-    CHANGE_WINDOW_HOURS is a last-minute invite; an attendee whose responseStatus turned
+    INVITE_SOON_HOURS is a last-minute invite (a next-day invite is scheduling, not an
+    interrupt); an attendee whose responseStatus turned
     "declined" on a meeting within DECLINE_WINDOW_HOURS is a decline; a changed start on a
     meeting within the window is a move; an event that vanished (or turned status=cancelled)
     within the window is a cancellation. Skipped, silently: all-day events, solo blocks,
@@ -656,7 +663,7 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         summary, start = _s(ev.get("summary")), _s(ev.get("start"))
         old = old_by_id.get(eid)
         if old is None:
-            if _relevant(ev, CHANGE_WINDOW_HOURS, allow_started_min=INVITE_GRACE_MIN):
+            if _relevant(ev, INVITE_SOON_HOURS, allow_started_min=INVITE_GRACE_MIN):
                 out.append({"kind": "invited", "key": f"{eid}:invited:{start}",
                             "summary": summary, "start": start, "old_start": "",
                             "who": "", "attendees": others})

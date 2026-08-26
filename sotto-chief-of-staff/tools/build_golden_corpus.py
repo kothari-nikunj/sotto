@@ -99,7 +99,18 @@ NAME_STOP = {
     "two", "new", "now", "day", "week", "call", "team", "time", "mark", "bill", "grace", "hope",
     "art", "may", "june", "april", "august", "sun", "dawn", "rose", "chase", "drew", "reed",
     "amber", "summer", "autumn", "faith", "joy", "rich", "frank", "max", "sky", "ray", "dean",
-}
+    # Sender display names are registered like any other name, and newsletters are "named" things
+    # like Morning Brew or Deadline — tokens that are ALSO schema enums and everyday prose. A key
+    # here is never rewritten and never scanned; "Morning Brew" as a WHOLE name still is.
+    "morning", "evening", "afternoon", "night", "today", "tomorrow", "yesterday",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "july", "september", "october", "november", "december",
+    "deadline", "source", "text", "email", "mail", "phone", "thread", "reply", "group", "chat",
+    "meeting", "invite", "event", "note", "notes", "draft", "review", "update", "news", "daily",
+    "weekly", "brief", "video", "link", "sign", "home", "work", "info", "support", "alert",
+    "alerts", "service", "message", "photo", "test", "docs", "sheet", "term", "best", "thanks",
+    "hello", "love", "baby", "mom", "dad",
+}  # a stop-listed contact's bare name surviving is the accepted cost of a readable corpus
 
 # Any run of >=10 digits with phone punctuation. Deliberately greedy: an unmapped number is
 # pseudonymized rather than trusted.
@@ -148,6 +159,9 @@ class IdentityMap:
         self._sig: dict[str, str] = {}          # gid -> signature (set by freeze)
         self._text_re = None
         self._text_map: dict[str, str] = {}
+        self._avoid: set = set()                # real text keys no fake alias may collide with
+        self._ident_re = None                   # the identifier sweep (set by freeze)
+        self._hard_set: set = set()
         self._frozen = False
 
     # -- construction ----------------------------------------------------------------------------
@@ -208,6 +222,7 @@ class IdentityMap:
             keys = sorted(g["idents"]) + sorted(_normalize_name_key(n) for n in g["names"])
             self._sig[gid] = keys[0] if keys else gid
 
+        self._avoid = self._real_text_keys()
         taken_names, taken_emails, taken_phones, taken_domains = set(), set(), set(), set()
         for dom in sorted(self.domain_alias):
             self.domain_alias[dom] = self._alloc_domain(dom, taken_domains)
@@ -225,15 +240,29 @@ class IdentityMap:
         for name in sorted(self.company_alias):
             self.company_alias[name] = self._alloc_company(name)
         self._build_text_rewriter()
+        # The identifier sweep: every registered identifier, replaced wherever its exact bytes
+        # appear — ledger anchor_keys carry thread ids, event ids, graph slugs and masked phones
+        # that no email/phone regex can recognize. Same set the leak scan hunts, by construction.
+        hard = sorted({h.lower() for h in self.hard_strings()}, key=len, reverse=True)
+        self._hard_set = set(hard)
+        self._ident_re = re.compile("|".join(re.escape(h) for h in hard), re.IGNORECASE) \
+            if hard else None
         self._frozen = True
 
     def _alloc_name(self, sig: str, taken: set) -> dict:
+        """Walk the FULL first×last cross product (the old two-stride walk only ever reached 120 of
+        the 720 combos — a 617-person volume exhausted it), then numbered tiers ('Nila2 Ashby2') so
+        allocation succeeds for any population no matter how much the avoid-set removes."""
         n = _hx(self.key, "name", sig)
-        for bump in range(4096):
-            first = _pick(FIRST_NAMES, n, bump)
-            last = _pick(LAST_NAMES, n // len(FIRST_NAMES), bump * 7)
+        total = len(FIRST_NAMES) * len(LAST_NAMES)
+        for bump in range(total * 8):
+            first = _pick(FIRST_NAMES, n, bump % len(FIRST_NAMES))
+            last = _pick(LAST_NAMES, n // len(FIRST_NAMES), bump // len(FIRST_NAMES))
+            if bump >= total:
+                tier = bump // total + 1
+                first, last = f"{first}{tier}", f"{last}{tier}"
             full = f"{first} {last}"
-            if full not in taken:
+            if full not in taken and not self._avoid & {first.lower(), last.lower(), full.lower()}:
                 taken.add(full)
                 return {"name": full, "first": first, "last": last}
         raise RuntimeError("alias name pool exhausted")
@@ -248,13 +277,22 @@ class IdentityMap:
             if not fake_base:
                 n = _hx(self.key, "domain", base)
                 for bump in range(4096):
-                    cand = _pick(DOMAIN_WORDS, n, bump) + (f"{bump}" if bump else "") + ".example"
-                    if cand not in taken:
+                    label = _pick(DOMAIN_WORDS, n, bump) + (f"{bump}" if bump else "")
+                    cand = label + ".example"
+                    if cand not in taken and label.lower() not in self._avoid:
                         fake_base = cand
                         break
                 taken.add(fake_base)
             self.domain_alias[base] = fake_base
-        return f"{sub}.{fake_base}" if sub else fake_base
+        if not sub:
+            return fake_base
+        # The real subdomain is a real string too — 'andrew.cmu.edu' names a person
+        n = _hx(self.key, "sub", sub)
+        for bump in range(len(DOMAIN_WORDS)):
+            w = _pick(DOMAIN_WORDS, n, bump)
+            if w.lower() not in self._avoid:
+                return f"{w}.{fake_base}"
+        return f"sub{n % 100}.{fake_base}"
 
     def _alloc_email(self, sig: str, email: str, idx: int, taken: set) -> str:
         a = self.alias[sig]
@@ -280,8 +318,14 @@ class IdentityMap:
 
     def _alloc_company(self, name: str) -> str:
         dom = self.domain_alias.get(_base_domain(name)) or ""
-        word = dom.split(".")[0] if dom else _pick(DOMAIN_WORDS, _hx(self.key, "company", name), 0)
-        return word.capitalize()
+        if dom:
+            return dom.split(".")[0].capitalize()
+        n = _hx(self.key, "company", name)
+        for bump in range(len(DOMAIN_WORDS)):
+            word = _pick(DOMAIN_WORDS, n, bump)
+            if word.lower() not in self._avoid:
+                return word.capitalize()
+        return (_pick(DOMAIN_WORDS, n, 0) + "co").capitalize()
 
     # -- lookup ----------------------------------------------------------------------------------
     def name_for(self, name: str = "", identifier: str = "") -> str:
@@ -326,27 +370,64 @@ class IdentityMap:
             if _digits(prefix):
                 return self.phone_for(prefix).lstrip("+") + "@" + suffix
             return f"{_hx(self.key, 'jid', prefix):x}"[:12] + "@" + suffix
-        if len(_digits(v)) >= 7:
+        if len(_digits(v)) >= 7 and not re.search(r"[A-Za-z]", v):
             return self.phone_for(v)
-        return v
+        if v.lower() in getattr(self, "_hard_set", ()):
+            # registered but shapeless — a thread id, an event id, a graph slug, a shortcode:
+            # a keyed hash keeps it stable across every mention without keeping any real byte
+            return f"{_hx(self.key, 'opaque', v.lower()):x}"[:12]
+        return self.rewrite_text(v)     # not identifier-shaped after all — treat it as prose
 
     # -- layer 2: in-text rewrite ------------------------------------------------------------------
+    def _name_keys(self, real: str) -> list:
+        """The prose keys ONE real name contributes — the single definition of what the rewriter
+        promises to remove, which is therefore also what alias allocation must never collide with
+        and exactly what the leak scan hunts. A name shorter than 4 chars or on the stop-list is
+        never a key (a contact called 'Will' would eat the corpus); a multiword name also
+        contributes its first and last tokens (>=3 chars) and its squashed form ('nikunjkothari',
+        the shape names take inside URL slugs and social handles)."""
+        keys = []
+        if len(real) >= 4 and real.lower() not in NAME_STOP:
+            keys.append(real)
+        parts = real.split()
+        if len(parts) > 1:
+            keys += [t for t in (parts[0], parts[-1]) if len(t) >= 3 and t.lower() not in NAME_STOP]
+            joined = "".join(parts)
+            if len(joined) >= 7:
+                keys.append(joined)
+        return keys
+
+    def _real_text_keys(self) -> set:
+        """Lowercased key-set BEFORE aliases exist — freeze() computes it first so no fake name,
+        domain word or company word can equal a string the scan will later hunt."""
+        out = set()
+        for g in self._groups.values():
+            for real in g["names"]:
+                out |= {k.lower() for k in self._name_keys(real)}
+        out |= {c.lower() for c in self.company_alias}
+        out |= {d.lower() for d in self.domain_alias}
+        return out
+
     def _build_text_rewriter(self) -> None:
         """One alternation over every real string the graph knows, longest-first so 'Dana Wells'
         wins over 'Dana'. Emails and phone numbers are handled by their own regexes (below) because
-        they have too many surface forms to enumerate. A name shorter than 4 chars or on the
-        stop-list is never rewritten in prose — otherwise a contact called 'You' eats the corpus."""
+        they have too many surface forms to enumerate. The key-set comes from _name_keys — the
+        rewriter's promise — and the SAME compiled regex is the leak scan's needle: scrubbed has
+        exactly one definition."""
         m: dict[str, str] = {}
         for gid, g in self._groups.items():
             alias = self.alias[self._sig[gid]]
             for real in g["names"]:
-                if len(real) >= 4 and real.lower() not in NAME_STOP:
-                    m[real] = alias["name"]
                 parts = real.split()
+                fake_of = {real: alias["name"], "".join(parts): alias["first"] + alias["last"]}
                 if len(parts) > 1:
-                    for token, fake in ((parts[0], alias["first"]), (parts[-1], alias["last"])):
-                        if len(token) >= 3 and token.lower() not in NAME_STOP:
-                            m.setdefault(token, fake)
+                    fake_of.setdefault(parts[0], alias["first"])
+                    fake_of.setdefault(parts[-1], alias["last"])
+                for k in self._name_keys(real):
+                    if k == real:
+                        m[k] = alias["name"]
+                    else:
+                        m.setdefault(k, fake_of[k])
         for real, fake in self.company_alias.items():
             m.setdefault(real, fake)
         for real, fake in self.domain_alias.items():
@@ -356,8 +437,8 @@ class IdentityMap:
             self._text_re = None
             return
         keys = sorted(self._text_map, key=lambda s: (-len(s), s))
-        self._text_re = re.compile(r"(?<![\w.@])(" + "|".join(re.escape(k) for k in keys)
-                                   + r")(?![\w@])", re.IGNORECASE)
+        self._text_re = re.compile(r"(?<!\w)(" + "|".join(re.escape(k) for k in keys)
+                                   + r")(?!\w)", re.IGNORECASE)
 
     def rewrite_text(self, text: str) -> str:
         """Layer 2 + the residual sweep: known entities become their alias, and anything still
@@ -369,6 +450,8 @@ class IdentityMap:
         s = PHONE_RE.sub(lambda mo: (self.phone_for(mo.group(0))
                                      if len(_digits(mo.group(0))) >= 10 and not DATEISH_RE.search(mo.group(0))
                                      else mo.group(0)), s)
+        if getattr(self, "_ident_re", None) is not None:
+            s = self._ident_re.sub(lambda mo: self.identifier_for(mo.group(0)), s)
         if self._text_re is not None:
             lower = {k.lower(): v for k, v in self._text_map.items()}
             s = self._text_re.sub(lambda mo: lower.get(mo.group(1).lower(), mo.group(1)), s)
@@ -392,16 +475,15 @@ class IdentityMap:
             "companies": self.company_alias,
         }
 
-    def real_strings(self) -> set:
-        """Every string that MUST NOT survive into the corpus — the leak scan's needle list."""
+    def hard_strings(self) -> set:
+        """Identifiers that must not survive even as SUBSTRINGS — an email or a phone number has no
+        innocent reading inside a longer word, unlike a name ('Rita' in 'margarita'). Names,
+        companies and domains are scanned with the rewriter's own whole-word regex instead."""
         out = set()
         for g in self._groups.values():
-            out |= {n for n in g["names"] if len(n) >= 4}
             out |= {i for i in g["idents"] if len(i) >= 6}
         out |= {e for e in self.email_alias if len(e) >= 6}
         out |= {p for p in self.phone_alias if len(p) >= 7}
-        out |= {d for d in self.domain_alias if len(d) >= 5}
-        out |= {c for c in self.company_alias if len(c) >= 4}
         return out
 
 
@@ -425,12 +507,43 @@ def _arr(d, key):
     return v if isinstance(v, list) else []
 
 
+def _merged_local(data_root: str, local_path: str) -> dict:
+    """The live snapshot plus every dated archive (knowledge/snapshots/*.json) — one snapshot holds
+    ~a day of messages; the archive is where a 42-day corpus's message history actually lives.
+    Live snapshot first: its scalars (source_status, generated_at) and contacts win; list items are
+    unioned with exact-duplicate collapse (overlapping windows re-report the same messages)."""
+    def _local_of(d):
+        return d.get("local") if isinstance(d.get("local"), dict) else d
+
+    locals_ = [_local_of(_read_json(
+        local_path or os.path.join(data_root, "knowledge", "last_local_snapshot.json"), {}))]
+    for p in sorted(glob.glob(os.path.join(data_root, "knowledge", "snapshots", "*.json")),
+                    reverse=True):
+        locals_.append(_local_of(_read_json(p, {})))
+    out: dict = {}
+    seen: dict = {}
+    for local in locals_:
+        if not isinstance(local, dict):
+            continue
+        for k, v in local.items():
+            if isinstance(v, list):
+                bucket = out.setdefault(k, [])
+                marks = seen.setdefault(k, set())
+                for item in v:
+                    mark = json.dumps(item, sort_keys=True, default=str)
+                    if mark not in marks:
+                        marks.add(mark)
+                        bucket.append(item)
+            else:
+                out.setdefault(k, v)
+    return out
+
+
 def gather(data_root: str, local_path: str, gmail_path: str, cal_path: str,
            granola_path: str) -> dict:
     """Everything the corpus is built from. Missing pieces are simply absent — a volume with no
     Granola still produces a corpus."""
-    snap = _read_json(local_path or os.path.join(data_root, "knowledge", "last_local_snapshot.json"), {})
-    local = snap.get("local") if isinstance(snap.get("local"), dict) else snap
+    local = _merged_local(data_root, local_path)
     gmail = _read_json(gmail_path, [])
     if isinstance(gmail, dict):
         gmail = _arr(gmail, "emails")
@@ -554,23 +667,16 @@ def _display_name(header: str, addr: str) -> str:
 
 _IDENT_FIELDS = ("handle", "contact_jid", "sender_jid", "chat_guid", "phone", "jid",
                  "contact_identifier")
-# Clock fields are carried through untouched — the tokenizer owns them, and a timestamp that went
-# through the text rewriter first comes out the other side as a phone number.
-_TIME_FIELDS = ("timestamp", "date", "start", "end", "created_at", "updated_at", "due_date",
-                "created_date",  # undated reminders carry when they were WRITTEN
-                "modified_date", "generated_at", "last_used", "date_added", "birthday",
-                "last_researched", "captured_at", "expires_at",
-                # Ledger clocks — every one of them, spelled the way the ledger spells it. A field
-                # named here but not written ("chased_after") tokenizes nothing at all.
-                "deadline", "resolved_at", "snoozed_until", "reopened_at", "prior_resolved_at",
-                "chase_after", "chase_pending", "last_chased_at", "handoff_asked_at")
-_TEXT_FIELDS = ("text", "body", "snippet", "subject", "summary", "title", "description",
-                "notes", "ai_summary", "location", "group_name", "partner_name", "reason")
-
-
 def scrub(obj, im: IdentityMap):
-    """Walk any pipeline payload: identifier fields go through the map, prose fields through the
-    text rewriter, address headers keep their shape ('Name <addr>'), everything else is left alone."""
+    """Walk any pipeline payload. The router names only what must keep STRUCTURE — identifiers
+    through the map, address headers keeping their 'Name <addr>' shape — and EVERY other string is
+    prose and gets rewritten, except timestamp-SHAPED strings, which pass through byte-exact for
+    the tokenizer (the same shapes tokenize() recognizes; a field allowlist chased the ledger's
+    clock fields and then let 'deadline: Monday morning' through as if it were one). Nothing is
+    left alone by default: the owner's first real build leaked 162 names through fields an older
+    allowlist didn't know."""
+    if isinstance(obj, str):
+        return obj if _parse_any(obj)[0] is not None else im.rewrite_text(obj)
     if isinstance(obj, list):
         return [scrub(v, im) for v in obj]
     if not isinstance(obj, dict):
@@ -581,8 +687,6 @@ def scrub(obj, im: IdentityMap):
             out[k] = [_scrub_bare(k, x, im) for x in v]
         elif isinstance(v, (dict, list)):
             out[k] = scrub(v, im)
-        elif k in _TIME_FIELDS:
-            out[k] = v
         elif k in ("from", "to", "organizer", "creator") and isinstance(v, str):
             out[k] = _scrub_address_header(v, im)
         elif k in _IDENT_FIELDS and isinstance(v, str):
@@ -593,12 +697,8 @@ def scrub(obj, im: IdentityMap):
             out[k] = im.name_for(name=v) or im.rewrite_text(v)
         elif k in ("phones", "emails") and isinstance(v, str):
             out[k] = im.identifier_for(v)
-        elif k == "anchor_key" and isinstance(v, str):
-            out[k] = im.rewrite_text(v)
-        elif k in _TEXT_FIELDS and isinstance(v, str):
-            out[k] = im.rewrite_text(v)
-        elif isinstance(v, str) and ("@" in v or len(_digits(v)) >= 10) and _parse_any(v)[0] is None:
-            out[k] = im.rewrite_text(v)
+        elif isinstance(v, str):
+            out[k] = v if _parse_any(v)[0] is not None else im.rewrite_text(v)
         else:
             out[k] = v
     return out
@@ -924,18 +1024,40 @@ def emit_labels_yaml(labels: dict) -> str:
 
 # ── Leak scan: the last gate before anything is left on disk ─────────────────────────────────────
 
-def leak_scan(blob: str, im: IdentityMap) -> list:
-    """Every real string the map knows must be GONE from the emitted corpus. Reports the KIND and
-    the count of each hit — never the value, because a leak report is itself a leak."""
-    hits = []
-    low = blob.lower()
-    for real in sorted(im.real_strings()):
+def _string_values(obj):
+    """Every string VALUE in a payload — the bytes that are data. Dict keys are schema."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _string_values(v)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _string_values(v)
+
+
+def leak_scan(payload, im: IdentityMap) -> list:
+    """ONE definition of scrubbed, shared with the rewriter: any whole-word match of the SAME regex
+    rewrite_text() uses, in any string VALUE, is a field the scrub never reached — schema keys are
+    code, not data ('deadline' the JSON key is not Deadline the newsletter). Emails, phones and
+    other identifiers are hunted as raw substrings over EVERY emitted byte, keys included (a dict
+    keyed by an address is still a leak). Stop-listed names sit outside the promise on both sides,
+    by design. Returns (real_needle, count) pairs; callers hash before printing (a leak report is
+    itself a leak)."""
+    hits: dict[str, int] = {}
+    values = "\n".join(_string_values(payload))
+    if im._text_re is not None:
+        for mo in im._text_re.finditer(values):
+            k = mo.group(1).lower()
+            hits[k] = hits.get(k, 0) + 1
+    low = json.dumps(payload, ensure_ascii=False).lower() if not isinstance(payload, str) \
+        else payload.lower()
+    for real in sorted(im.hard_strings()):
         needle = real.lower()
         n = low.count(needle)
         if n:
-            hits.append((f"{'identifier' if ('@' in real or real.isdigit()) else 'name'}"
-                         f":{hashlib.sha256(needle.encode()).hexdigest()[:8]}", n))
-    return hits
+            hits[needle] = hits.get(needle, 0) + n
+    return sorted(hits.items())
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1008,12 +1130,23 @@ def build(args) -> int:
         "note": "CONFIDENTIAL REGARDLESS — scrubbed is not shareable. See docs/plans/golden-corpus.md.",
     }
 
-    blob = json.dumps({"manifest": manifest, "days": days}, ensure_ascii=False)
-    hits = leak_scan(blob, im)
+    payload = {"manifest": manifest, "days": days}
+    blob = json.dumps(payload, ensure_ascii=False)
+    hits = leak_scan(payload, im)
     if hits and not args.allow_leaks:
         print(f"LEAK SCAN: FAIL — {len(hits)} known real string(s) survived the scrub; nothing written.")
-        for kind, n in hits[:20]:
-            print(f"    {kind} × {n}")
+        for needle, n in hits[:20]:
+            kind = "identifier" if ("@" in needle or needle.isdigit()) else "name"
+            print(f"    {kind}:{hashlib.sha256(needle.encode()).hexdigest()[:8]} × {n}")
+        if args.leak_context:
+            low = blob.lower()
+            print("\n-- leak context (REAL strings — your terminal only, never share this output):")
+            for needle, _n in hits[:40]:
+                i = low.find(needle)
+                ctx = blob[max(0, i - 60):i + len(needle) + 60].replace("\n", " ")
+                print(f"    {needle!r}  …{ctx}…")
+        else:
+            print("    (re-run with --leak-context to see each string in place — prints real data)")
         return 3
     print(f"LEAK SCAN: {'PASS' if not hits else f'{len(hits)} hit(s) FORCED PAST (--allow-leaks)'}")
 
@@ -1067,6 +1200,9 @@ def main() -> int:
                     help="let Gemini draft the needs-attention labels (needs GOOGLE_AI_API_KEY)")
     ap.add_argument("--overwrite-labels", dest="overwrite_labels", action="store_true",
                     help="replace an existing labels.yaml (default: keep it, write labels.draft.yaml)")
+    ap.add_argument("--leak-context", dest="leak_context", action="store_true",
+                    help="on a leak-scan FAIL, print each surviving string with its surrounding "
+                         "text — REAL data, for the owner's terminal only")
     ap.add_argument("--allow-leaks", dest="allow_leaks", action="store_true",
                     help="write the corpus even if the leak scan finds known real strings (don't)")
     return build(ap.parse_args())

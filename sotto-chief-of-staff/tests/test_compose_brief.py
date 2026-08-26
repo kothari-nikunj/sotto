@@ -2238,3 +2238,51 @@ def test_granola_notes_reach_the_model_and_a_broken_gather_says_so():
         **_sources_inputs({}),
         "granola": {"meetings": [], "warnings": ["no usable detail for 2 meeting(s)"]}})
     assert "Unavailable on this device: Meeting Notes (Granola)" in broken
+
+
+def test_calendar_formatter_flags_meetings_with_nowhere_to_go():
+    """A meeting with other humans, no location, and no video link gets the logistics flag the
+    brief's Coming Up line carries — and the calendar's own htmlLink (which gather folds into
+    meetingLink) is NOT a way to join."""
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "rl_flag", os.path.join(os.path.dirname(__file__), "..", "_shared", "lib", "render_local.py"))
+    rl = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(rl)
+    others = [{"email": "ron@example.com", "displayName": "Ron"}]
+    base = {"id": "e1", "summary": "Coffee", "start": "2026-08-26T11:30:00-07:00",
+            "attendees": others, "location": "", "description": "", "meetingLink": ""}
+    FLAG = "no video link and no address"
+    assert FLAG in rl._format_calendar([base])
+    assert FLAG not in rl._format_calendar([dict(base, location="Mendocino Farms, 300 Mission St")])
+    assert FLAG not in rl._format_calendar([dict(base, meetingLink="https://meet.google.com/abc")])
+    assert FLAG not in rl._format_calendar(
+        [dict(base, description="join: https://us02web.zoom.us/j/123")])
+    # the calendar EVENT page is not a place to meet — the pollution case the regex must not accept
+    assert FLAG in rl._format_calendar(
+        [dict(base, meetingLink="https://www.google.com/calendar/event?eid=abc")])
+    # solo blocks and all-day events are not meetings
+    assert FLAG not in rl._format_calendar([dict(base, attendees=[])])
+    assert FLAG not in rl._format_calendar([dict(base, start="2026-08-26")])
+
+
+def test_snapshot_archive_accumulates_dated_copies_and_prunes(tmp_path):
+    """The live snapshot answers "now"; the dated archive is the Golden Corpus's message history.
+    One file per day (last write wins), pruned past SNAPSHOT_ARCHIVE_DAYS."""
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    try:
+        arch = tmp_path / "knowledge" / "snapshots"
+        arch.mkdir(parents=True)
+        (arch / "1999-01-01.json").write_text("{}")            # ancient — must be pruned
+        cb._save_local_snapshot({"imessage": [{"text": "hi", "timestamp": "2026-08-25 09:00:00"}],
+                                 "generated_at": "2026-08-25 09:00:00",
+                                 "source_status": {"imessage": "ok"}})
+        cb._save_local_snapshot({"imessage": [{"text": "later", "timestamp": "2026-08-25 18:00:00"}],
+                                 "generated_at": "2026-08-25 18:00:00",
+                                 "source_status": {"imessage": "ok"}})
+        names = sorted(p.name for p in arch.iterdir())
+        assert names == ["2026-08-25.json"]                    # dated, deduped by day, pruned
+        day = json.load(open(arch / "2026-08-25.json"))
+        assert day["local"]["imessage"][0]["text"] == "later"  # last write of the day wins
+    finally:
+        del os.environ["SOTTO_DATA"]

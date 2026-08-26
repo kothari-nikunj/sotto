@@ -153,8 +153,8 @@ def test_default_max_raised_to_40(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(gg, "_find_google_api", lambda: "/fake/api.py")
     monkeypatch.setattr(gg, "_ensure_google_deps", lambda: True)
-    monkeypatch.setattr(gg, "gather_gmail", lambda api, mx, bodies: captured.update(max=mx) or [])
-    monkeypatch.setattr(gg, "gather_calendar", lambda *a: [])
+    monkeypatch.setattr(gg, "gather_gmail", lambda api, mx, bodies, days=1: captured.update(max=mx) or [])
+    monkeypatch.setattr(gg, "gather_calendar", lambda *a, **k: [])
     g, c = tmp_path / "g.json", tmp_path / "c.json"
     monkeypatch.setattr("sys.argv", ["gather_google.py", "--gmail-out", str(g), "--cal-out", str(c)])
     gg.main()
@@ -278,8 +278,8 @@ def test_skip_gmail_calendar_only(tmp_path, monkeypatch):
     called = {"gmail": False, "cal": False}
     monkeypatch.setattr(gg, "_find_google_api", lambda: "/fake/google_api.py")
     monkeypatch.setattr(gg, "_ensure_google_deps", lambda: True)   # don't shell out to pip in tests
-    monkeypatch.setattr(gg, "gather_gmail", lambda *a: called.__setitem__("gmail", True) or [{"id": "x"}])
-    monkeypatch.setattr(gg, "gather_calendar", lambda *a: called.__setitem__("cal", True) or [{"id": "e"}])
+    monkeypatch.setattr(gg, "gather_gmail", lambda *a, **k: called.__setitem__("gmail", True) or [{"id": "x"}])
+    monkeypatch.setattr(gg, "gather_calendar", lambda *a, **k: called.__setitem__("cal", True) or [{"id": "e"}])
     g, c = tmp_path / "g.json", tmp_path / "c.json"
     monkeypatch.setattr("sys.argv", ["gather_google.py", "--skip-gmail", "--gmail-out", str(g), "--cal-out", str(c)])
     gg.main()
@@ -380,3 +380,25 @@ def test_gather_sent_uses_the_in_sent_query(monkeypatch):
     assert calls[0] == ["gmail", "search", "in:sent newer_than:1d", "--max", "15"]
     assert len(rows) == 1 and rows[0]["isSent"] is True
     assert rows[0]["body"] == "the full sent body"             # bodies fetched: snippets can't teach voice
+
+
+def test_window_days_widens_gmail_sent_and_calendar(monkeypatch):
+    """--window-days is the Golden Corpus backfill: the same gather that does 1 day for the brief
+    does 42 for a corpus, and the calendar gains the same history behind its 3-day lookahead."""
+    import datetime
+    calls = []
+
+    def fake_run(api, args, timeout=60):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(gg, "_run", fake_run)
+    gg.gather_gmail("api.py", 400, 0, days=42)
+    gg.gather_sent("api.py", 15, 0, days=42)
+    gg.gather_calendar("api.py", back_days=41)
+    assert calls[0][2] == "newer_than:42d"
+    assert calls[1][2] == "in:sent newer_than:42d"
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    start = datetime.datetime.strptime(calls[2][calls[2].index("--start") + 1], fmt)
+    end = datetime.datetime.strptime(calls[2][calls[2].index("--end") + 1], fmt)
+    assert (end - start).days == 44                            # 41 back + 3 forward

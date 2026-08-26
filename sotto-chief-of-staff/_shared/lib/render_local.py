@@ -845,6 +845,26 @@ def _format_emails(emails) -> str:
 
 
 
+# A real way-to-join: a conferencing URL (the calendar's own htmlLink is NOT one — gather folds it
+# into meetingLink, and a calendar page is not a place to meet).
+_CONF_URL = re.compile(r"(meet\.google\.com|zoom\.us|zoom\.com|teams\.microsoft\.com|teams\.live"
+                       r"\.com|webex\.com|whereby\.com|around\.co|meet\.jit\.si|gather\.town)", re.I)
+
+
+def _missing_logistics(e) -> bool:
+    """A meeting with other humans and NOWHERE TO GO: no location on the invite, and no video link
+    in meetingLink or the description. All-day events and solo blocks are not meetings; a location
+    of any kind (an address, a restaurant, even 'lobby') counts as knowing where to go."""
+    if not (e.get("attendees") or []):
+        return False
+    if "T" not in _s(e.get("start")):
+        return False
+    if _s(e.get("location")).strip():
+        return False
+    blob = f"{_s(e.get('meetingLink'))} {_s(e.get('description'))}"
+    return not _CONF_URL.search(blob)
+
+
 def _format_calendar(events, lookup: dict | None = None) -> str:
     if not events:
         return "(no upcoming events)"
@@ -875,6 +895,8 @@ def _format_calendar(events, lookup: dict | None = None) -> str:
             line += f"\n    event_id: {e.get('id')}"
             if e.get("start"):
                 line += f" | start: {e.get('start')}"
+            if _missing_logistics(e):
+                line += "\n    ⚠ no video link and no address on the invite yet"
             if e.get("meetingLink"):
                 line += f"\n    meetingLink: {e.get('meetingLink')}"
             if e.get("description"):

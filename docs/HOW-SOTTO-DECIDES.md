@@ -20,8 +20,10 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
   (default 15 min). It powers the in-meeting hold, detects meetings that just ended, and **diffs
   each refresh against the last** to catch what changed about the imminent calendar: a decline, a
   last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables). Only
-  *imminent* changes count: the meeting must start within 24 hours (48 for a decline, plus a 15-min
-  grace on an invite to a meeting that just started), and solo blocks, all-day events and internal
+  *imminent* changes count: a move or cancellation within 24 hours, a decline within 48 — and a
+  NEW invite only within 4 hours (plus a 15-min grace for a meeting that just started): a next-day
+  invite is ordinary scheduling, not an interrupt — the email lane already nudges a real invite
+  with a draft, and tomorrow's brief covers tomorrow. Solo blocks, all-day events and internal
   standups never mint a change.
 
 **What arrives is untrusted.** A message's text is written by whoever sent it, so nothing in the

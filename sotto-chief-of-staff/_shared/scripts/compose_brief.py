@@ -93,6 +93,12 @@ PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "morning-brief
 # day(s)-old "needs reply" threads as if they're fresh, so an expired snapshot is dropped.
 LOCAL_SNAPSHOT_TTL_HOURS = 24
 
+# Dated snapshot archive (knowledge/snapshots/YYYY-MM-DD.json, last write of the day wins). The
+# live snapshot answers "what's happening now"; the archive is what gives the Golden Corpus its
+# message history — without it a 42-day corpus holds ~2 days of iMessage/WhatsApp, exactly as deep
+# as one snapshot's window. Kept this many days, then pruned.
+SNAPSHOT_ARCHIVE_DAYS = 60
+
 # The `source_status` value that means the user switched a source OFF (Bridge config.rs: a source in
 # `disabled_sources` is never read and reports "disabled"). Distinct from every other status —
 # "needs_fda"/"unavailable"/"degraded" are a source that BROKE, and a broken source's last good data
@@ -745,6 +751,20 @@ def _save_local_snapshot(local: dict) -> dict:
                 pass
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"captured_at": stamp, "local": merged}, f)
+        # Dated archive copy — the Golden Corpus reads these for message history (its own try:
+        # an archive hiccup must never cost the live snapshot, let alone the brief).
+        try:
+            arch_dir = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "knowledge", "snapshots")
+            os.makedirs(arch_dir, exist_ok=True)
+            day = _s(stamp)[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            with open(os.path.join(arch_dir, f"{day}.json"), "w", encoding="utf-8") as f:
+                json.dump({"captured_at": stamp, "local": merged}, f)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_ARCHIVE_DAYS)).strftime("%Y-%m-%d")
+            for old in os.listdir(arch_dir):
+                if old.endswith(".json") and old[:10] < cutoff:
+                    os.remove(os.path.join(arch_dir, old))
+        except Exception:
+            pass
     except Exception:
         pass
     return merged

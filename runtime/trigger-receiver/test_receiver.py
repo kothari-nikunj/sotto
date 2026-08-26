@@ -1623,11 +1623,17 @@ def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
            ev("e4", "2026-08-17T18:30:00+00:00", other, summary="Last minute"),
            ev("solo", "2026-08-17T18:15:00+00:00", [{"email": me}]),
            ev("allday", "2026-08-17", other, summary="Conf"),
+           # REGRESSION (owner, Aug 25: four "Last-minute:" pings in 15 min, three for TOMORROW):
+           # a NEW invite is last-minute only within INVITE_SOON_HOURS — a next-day invite is
+           # scheduling, not an interrupt. A MOVE of tomorrow's meeting still counts (24h window):
+           # it changes plans already made.
+           ev("tmrw", "2026-08-18T13:00:00+00:00", other, summary="Tomorrow add"),
            ev("far", "2026-08-20T18:00:00+00:00", other, summary="Next week")]
     out = cc.calendar_changes(base, cur, now, me)
     kinds = {(c["kind"], c["summary"]) for c in out}
     assert kinds == {("declined", "Coffee"), ("moved", "Sync"),
                      ("invited", "Last minute"), ("cancelled", "Gone")}
+    assert cc.INVITE_SOON_HOURS < cc.CHANGE_WINDOW_HOURS      # the asymmetry IS the design
     d = next(c for c in out if c["kind"] == "declined")
     assert d["who"] == "Ali Panju"
     e = cc.change_event(d)

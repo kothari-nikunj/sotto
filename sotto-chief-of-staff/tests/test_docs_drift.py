@@ -210,6 +210,7 @@ def test_calendar_cache_and_staleness():
           cal.CHANGE_WINDOW_HOURS)
     _same("calendar.decline_window_hours", R["calendar"]["decline_window_hours"],
           cal.DECLINE_WINDOW_HOURS)
+    _same("calendar.invite_soon_hours", R["calendar"]["invite_soon_hours"], cal.INVITE_SOON_HOURS)
     _same("calendar.invite_grace_min", R["calendar"]["invite_grace_min"], cal.INVITE_GRACE_MIN)
     _same("intervals.calendar_refresh_secs", R["intervals"]["calendar_refresh_secs"],
           cal.REFRESH_SECS_DEFAULT)

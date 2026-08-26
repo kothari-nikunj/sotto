@@ -217,8 +217,8 @@ def _search_gmail(api, query: str, max_n: int, bodies: int):
             if isinstance(it, dict)]
 
 
-def gather_gmail(api, max_n: int, bodies: int):
-    return _search_gmail(api, "newer_than:1d", max_n, bodies)
+def gather_gmail(api, max_n: int, bodies: int, days: int = 1):
+    return _search_gmail(api, f"newer_than:{days}d", max_n, bodies)
 
 
 def mark_sent(e: dict) -> dict:
@@ -238,10 +238,10 @@ def mark_sent(e: dict) -> dict:
     return e
 
 
-def gather_sent(api, max_n: int = SENT_MAX, bodies: int = SENT_BODIES):
-    """The user's own outgoing mail from the last 24h — same normalized shape as the inbox rows,
+def gather_sent(api, max_n: int = SENT_MAX, bodies: int = SENT_BODIES, days: int = 1):
+    """The user's own outgoing mail from the window — same normalized shape as the inbox rows,
     with isSent/SENT guaranteed. Failures are the caller's to swallow (the gather never dies on it)."""
-    return [mark_sent(e) for e in _search_gmail(api, "in:sent newer_than:1d", max_n, bodies)]
+    return [mark_sent(e) for e in _search_gmail(api, f"in:sent newer_than:{days}d", max_n, bodies)]
 
 
 def merge_sent(inbox: list, sent: list) -> list:
@@ -268,11 +268,14 @@ def merge_sent(inbox: list, sent: list) -> list:
     return out
 
 
-def gather_calendar(api):
+def gather_calendar(api, back_days: int = 0):
+    """Next 3 days, plus `back_days` of history — the daily gather looks only forward; the Golden
+    Corpus backfill (--window-days) needs the meetings that already happened."""
     now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(days=back_days)
     end = now + datetime.timedelta(days=3)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    items = _as_list(_run(api, ["calendar", "list", "--start", now.strftime(fmt), "--end", end.strftime(fmt)]))
+    items = _as_list(_run(api, ["calendar", "list", "--start", start.strftime(fmt), "--end", end.strftime(fmt)]))
     return [normalize_event(e) for e in items]
 
 
@@ -385,6 +388,10 @@ def main():
     ap.add_argument("--cal-out", default="/tmp/sotto_cal.json")
     ap.add_argument("--max", type=int, default=40)
     ap.add_argument("--bodies", type=int, default=12)
+    ap.add_argument("--window-days", dest="window_days", type=int, default=1,
+                    help="how many days back to gather (default 1 — the daily brief window). "
+                         "The Golden Corpus backfill uses e.g. 42; calendar gains the same "
+                         "history alongside its usual 3-day lookahead.")
     ap.add_argument("--skip-gmail", action="store_true", help="calendar only (e.g. meeting-prep)")
     ap.add_argument("--skip-calendar", action="store_true", help="gmail only")
     ap.add_argument("--sent-max", type=int, default=SENT_MAX,
@@ -464,19 +471,19 @@ def main():
         _ensure_google_deps()   # guarantee googleapiclient in THIS interpreter before any fetch
         if not a.skip_gmail:
             try:
-                emails = gather_gmail(api, a.max, a.bodies)
+                emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
             except Exception as e:  # noqa: BLE001
                 err = f"gmail: {e}"
             # Sent lane is exhaust, not brief content — its own try so a failure here can never
             # cost the brief its inbox.
             if not a.skip_sent and a.sent_max > 0:
                 try:
-                    sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max))
+                    sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max), days=a.window_days)
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; sent: {e}") if err else f"sent: {e}"
         if not a.skip_calendar:
             try:
-                events = gather_calendar(api)
+                events = gather_calendar(api, back_days=max(0, a.window_days - 1))
             except Exception as e:  # noqa: BLE001
                 err = (err + f"; calendar: {e}") if err else f"calendar: {e}"
 
