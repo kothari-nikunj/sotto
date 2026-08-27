@@ -3326,6 +3326,197 @@
     return ev ? prettyKey(ev) : "An event was recorded";
   }
 
+  /* ---------------- Labels (the Golden Corpus labeling hour, without the YAML) ----------------
+     One question per item: did this deserve your attention when it arrived? The corpus stays on
+     the volume; this page reads its day fixtures and writes back only the judgment fields. */
+
+  function viewLabels(dayName) {
+    var seq = ++state.renderSeq;
+    setView(skeletonView(3));
+    if (dayName) {
+      Promise.all([api("/api/labels"), api("/api/labels/" + dayName)]).then(function (both) {
+        if (seq !== state.renderSeq) return;
+        renderLabelsDay(seq, both[0] || {}, both[1] || {});
+      }).catch(function (err) {
+        if (seq !== state.renderSeq || err.handled) return;
+        setView(errorView("That day didn't load.", function () { viewLabels(dayName); }));
+      });
+      return;
+    }
+    api("/api/labels").then(function (data) {
+      if (seq !== state.renderSeq) return;
+      renderLabelsHome(seq, data || {});
+    }).catch(function (err) {
+      if (seq !== state.renderSeq || err.handled) return;
+      setView(errorView("The labels page didn't load.", function () { viewLabels(); }));
+    });
+  }
+
+  function renderLabelsHome(seq, data) {
+    if (seq !== state.renderSeq) return;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el("p", "eyebrow", "Labels"));
+    frag.appendChild(el("h1", "view-title", "Teach Sotto what mattered"));
+    var days = data.days || [];
+    if (!data.corpus || !days.length) {
+      frag.appendChild(el("p", "view-sub",
+        "No corpus on the volume yet. Build one first — evals/LABELING.md has the two commands."));
+      setView(frag);
+      return;
+    }
+    var done = 0;
+    for (var i = 0; i < days.length; i++) if (days[i].labeled) done++;
+    frag.appendChild(el("p", "view-sub",
+      "One question per item: did this deserve your attention when it arrived? Newest day first, " +
+      "stop whenever — an unlabeled day is simply unscored, and ten honest days beat forty " +
+      "guessed ones. " + done + " of " + days.length + " days labeled."));
+    var list = el("div", "labels-days");
+    days.forEach(function (d) {
+      var row = el("a", "labels-day-row" + (d.labeled ? " done" : ""));
+      row.href = "#labels/" + d.name;
+      append(row,
+        el("span", "labels-day-dot" + (d.labeled ? " on" : "")),
+        el("span", "labels-day-name", d.name),
+        el("span", "labels-day-meta",
+           d.emails + " emails · " + d.nudges + " interrupt calls" + (d.labeled ? " · labeled" : "")));
+      list.appendChild(row);
+    });
+    frag.appendChild(list);
+    var footer = el("div", "labels-review");
+    if (data.reviewed) {
+      footer.appendChild(el("p", "view-sub",
+        "Marked reviewed — the golden evals score against these labels now."));
+    } else {
+      footer.appendChild(button("btn", "Mark corpus reviewed", function () {
+        if (!window.confirm("Done labeling? The harness refuses to score until the corpus is marked reviewed.")) return;
+        apiPost("/api/labels/review", { reviewed: true }).then(function () { viewLabels(); })
+          .catch(function (err) { if (!err.handled) toast("Couldn't mark reviewed"); });
+      }));
+      footer.appendChild(el("p", "labels-foot",
+        "Label what you can, newest first — then mark the corpus reviewed so scoring can run."));
+    }
+    frag.appendChild(footer);
+    setView(frag);
+  }
+
+  function renderLabelsDay(seq, home, day) {
+    if (seq !== state.renderSeq) return;
+    var days = home.days || [];
+    var needsSel = {};
+    (day.emails || []).forEach(function (e) { needsSel[e.gid] = !!e.needs; });
+    var nudgeSel = {};
+    (day.nudges || []).forEach(function (n) { nudgeSel[n.gid] = n.verdict || "queue"; });
+
+    var frag = document.createDocumentFragment();
+    var back = el("a", "labels-back", "← All days");
+    back.href = "#labels";
+    frag.appendChild(back);
+    frag.appendChild(el("p", "eyebrow", "Labels · " + (day.name || "")));
+    frag.appendChild(el("h1", "view-title",
+      day.name === "day-00" ? "The most recent day" : (day.name || "").replace("day-", "") + " days back"));
+    frag.appendChild(el("p", "view-sub",
+      "Everything is pseudonymized — same people, fake names. Tap what's wrong, leave what's right."));
+
+    function segBtn(label, on, onClick) {
+      var b = button("labels-segbtn" + (on ? " on" : ""), label, onClick);
+      return b;
+    }
+
+    if ((day.emails || []).length) {
+      frag.appendChild(el("h2", "labels-h2", "Did this email need you that day?"));
+      frag.appendChild(el("p", "labels-hint",
+        "“Needed me” is the brief's Needs-Attention-Now bar: a chief of staff would put it in front of you."));
+      day.emails.forEach(function (e) {
+        var card = el("div", "labels-card");
+        append(card,
+          el("div", "labels-card-from", e.from || ""),
+          el("div", "labels-card-subj", e.subject || "(no subject)"),
+          e.snippet ? el("div", "labels-card-snip", e.snippet) : null);
+        var seg = el("div", "labels-seg");
+        var yes, no;
+        yes = segBtn("Needed me", needsSel[e.gid], function () {
+          needsSel[e.gid] = true; yes.classList.add("on"); no.classList.remove("on");
+        });
+        no = segBtn("Fine in the brief", !needsSel[e.gid], function () {
+          needsSel[e.gid] = false; no.classList.add("on"); yes.classList.remove("on");
+        });
+        append(seg, yes, no);
+        card.appendChild(seg);
+        frag.appendChild(card);
+      });
+    }
+
+    if ((day.nudges || []).length) {
+      var proposed = [], rest = [];
+      day.nudges.forEach(function (n) { (n.verdict === "nudge" ? proposed : rest).push(n); });
+      var nudgeCard = function (n) {
+        var card = el("div", "labels-card");
+        append(card,
+          el("div", "labels-card-from", (n.channel || "") + (n.who ? " · " + n.who : "")),
+          n.text ? el("div", "labels-card-snip", n.text) : null);
+        var seg = el("div", "labels-seg");
+        var btns = {};
+        ["nudge", "queue", "drop"].forEach(function (v) {
+          btns[v] = segBtn(v.charAt(0).toUpperCase() + v.slice(1), nudgeSel[n.gid] === v, function () {
+            nudgeSel[n.gid] = v;
+            for (var k in btns) btns[k].classList.toggle("on", k === v);
+          });
+          seg.appendChild(btns[v]);
+        });
+        card.appendChild(seg);
+        return card;
+      };
+      if (proposed.length) {
+        frag.appendChild(el("h2", "labels-h2", "Sotto would have interrupted you for these"));
+        frag.appendChild(el("p", "labels-hint",
+          "Right call? Nudge = it should have buzzed your phone at that moment. Demote the ones " +
+          "that could have waited."));
+        proposed.forEach(function (n) { frag.appendChild(nudgeCard(n)); });
+      }
+      if (rest.length) {
+        frag.appendChild(el("h2", "labels-h2", "Everything else stayed quiet"));
+        var restWrap = el("div", "labels-rest");
+        var show = button("labels-segbtn", "Review the " + rest.length + " quiet items (optional)",
+          function () {
+            show.remove();
+            rest.forEach(function (n) { restWrap.appendChild(nudgeCard(n)); });
+          });
+        frag.appendChild(el("p", "labels-hint",
+          "These queued for the brief — almost always the right answer. Only open this if " +
+          "something that day should have buzzed you and didn't."));
+        frag.appendChild(show);
+        frag.appendChild(restWrap);
+      }
+    }
+
+    if (!(day.emails || []).length && !(day.nudges || []).length) {
+      frag.appendChild(el("p", "view-sub", "Nothing to judge on this day."));
+    }
+
+    var bar = el("div", "labels-savebar");
+    var save = button("btn labels-save", day.labeled ? "Save again" : "Save day", function () {
+      save.disabled = true;
+      var needs = [];
+      for (var gid in needsSel) if (needsSel[gid]) needs.push(gid);
+      apiPost("/api/labels/" + day.name, { needs_attention: needs, nudge: nudgeSel })
+        .then(function () {
+          toast(day.name + " labeled");
+          var next = null;
+          for (var i = 0; i < days.length; i++) {
+            if (!days[i].labeled && days[i].name !== day.name) { next = days[i].name; break; }
+          }
+          location.hash = next ? "#labels/" + next : "#labels";
+        })
+        .catch(function (err) {
+          save.disabled = false;
+          if (!err.handled) toast("Couldn't save — nothing was changed");
+        });
+    });
+    bar.appendChild(save);
+    frag.appendChild(bar);
+    setView(frag);
+  }
+
   /* ---------------- Router ---------------- */
 
   var routes = {
@@ -3335,7 +3526,8 @@
     briefs: function (parts) { viewBriefs(decodePart(parts[1]), decodePart(parts[2])); },
     people: function (parts) { viewPeople(decodePart(parts[1])); },
     learned: function () { viewLearned(); },
-    record: function (parts) { viewRecord(decodePart(parts[1])); }
+    record: function (parts) { viewRecord(decodePart(parts[1])); },
+    labels: function (parts) { viewLabels(decodePart(parts[1])); }
   };
 
   function decodePart(part) {

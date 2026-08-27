@@ -11,10 +11,14 @@ of these deserved a nudge" question is literally the same question, asked once.
 
 ```bash
 # On the machine with the volume (the container, or a Mac with $SOTTO_DATA):
-# 1. Backfill Gmail + Calendar for the whole window (the daily gather only keeps 1 day):
-python3 _shared/scripts/gather_google.py --window-days 42 --max 400 --bodies 60
-# 2. Build:
+# 1. Backfill Gmail + Calendar for the whole window (the daily gather only keeps 1 day; wide
+#    windows are fetched in date slices past the CLIs' page caps). Dedicated output files —
+#    the daily brief cron overwrites the default /tmp paths underneath you:
+python3 _shared/scripts/gather_google.py --window-days 42 --max 500 --bodies 60 \
+    --gmail-out /tmp/corpus_gmail.json --cal-out /tmp/corpus_cal.json
+# 2. Build from those files:
 SOTTO_DATA=/data python3 tools/build_golden_corpus.py --version corpus-v1 --days 42 \
+    --gmail /tmp/corpus_gmail.json --calendar /tmp/corpus_cal.json \
     --user-email you@yourdomain --draft-labels-llm
 ```
 
@@ -39,6 +43,12 @@ Keep the map. Rebuilding with the same key produces the same aliases, so **score
 across rebuilds of the same corpus version**. Losing it means the next corpus is a new version.
 
 ## The hour
+
+**The easy way: the dashboard's Labels page** (`/app` → Labels). It reads the corpus straight off
+the volume and shows one card per item with tap buttons — "Needed me / Fine in the brief" for each
+email, "Nudge / Queue / Drop" for each interrupt call — saving back into `labels.yaml` as you go
+and stamping each day labeled. Work newest-first, stop whenever, then tap **Mark corpus reviewed**.
+Everything below describes the same fields for anyone who prefers the file.
 
 Open `evals/corpus/corpus-v1/labels.yaml`. It has one block per day. Work newest-first and stop when
 the hour is up — **an unlabeled day is simply unscored**, and ten well-labeled days beat forty

@@ -2416,3 +2416,67 @@ def test_frontmatter_parser_reads_block_sequences(tmp_path):
     assert meta["tags"] == ["one", "two"] and meta["name"] == "X"
     # a dash with no key it can belong to is skipped, not crashed on
     assert fm("---\n- orphan: 1\nname: X\n---\n")[0] == {"name": "X"}
+
+
+# ── The Labels page (the Golden Corpus labeling hour, without the YAML) ──────────────────────────
+
+def test_labels_page_reads_and_writes_the_golden_labels(tmp_path):
+    """GET /api/labels lists the corpus days; GET a day pairs each judged item with its content;
+    POST a day rewrites ONLY the judgment fields (needs/not partition rebuilt from the day's
+    inbound set, nudge ids frozen to the day's set) and stamps labeled_at; POST review flips the
+    one bit the scoring harness gates on. The sent email is never up for judgment."""
+    import yaml
+    m, srv, base = _server(tmp_path)
+    corp = os.path.join(str(tmp_path), "corpus", "corpus-v1")
+    os.makedirs(os.path.join(corp, "days"))
+    _write(os.path.join(corp, "manifest.json"), json.dumps({"version": "corpus-v1"}))
+    with open(os.path.join(corp, "labels.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({"corpus": "corpus-v1", "reviewed": False,
+                        "days": {"day-00": {"needs_attention": ["em-02"],
+                                            "not_needs_attention": ["em-01"],
+                                            "entity_count": 3, "open_loops_after": None,
+                                            "chases_after": None,
+                                            "nudge": {"im-01": "queue", "em-01": "queue"}}}}, f)
+    _write(os.path.join(corp, "days", "day-00.json"), json.dumps(
+        {"inputs": {"google": {"emails": [
+            {"_gid": "em-01", "from": "Nila Ashby <n@x.example>", "subject": "Redlines",
+             "snippet": "sign off?", "date": "{{ISO+1h}}"},
+            {"_gid": "em-02", "from": "Bram Kettle <b@y.example>", "subject": "Pricing",
+             "snippet": "confirm", "date": "{{ISO+2h}}"},
+            {"_gid": "em-03", "from": "me", "subject": "sent one", "isSent": True}]},
+         "local": {"imessage": [{"_gid": "im-01", "handle": "+15551234567",
+                                 "text": "call me", "timestamp": "{{TS}}"}]}}}))
+    try:
+        cookie, authed = _login_with_csrf(base)
+        code, body, _ = _get(base, "/api/labels", headers=cookie)
+        data = json.loads(body)
+        assert code == 200 and data["corpus"] == "corpus-v1" and data["reviewed"] is False
+        assert data["days"] == [{"name": "day-00", "emails": 2, "needs": 1,
+                                 "nudges": 2, "labeled": False}]
+        code, body, _ = _get(base, "/api/labels/day-00", headers=cookie)
+        d = json.loads(body)
+        assert code == 200
+        assert [e["gid"] for e in d["emails"]] == ["em-01", "em-02"]
+        assert d["emails"][1]["needs"] is True
+        assert {n["gid"]: n["channel"] for n in d["nudges"]} == {"em-01": "Email",
+                                                                "im-01": "iMessage"}
+        code, body, _ = _post_json(base, "/api/labels/day-00",
+                                   {"needs_attention": ["em-01"],
+                                    "nudge": {"im-01": "nudge", "em-01": "drop"}}, headers=authed)
+        assert code == 200
+        with open(os.path.join(corp, "labels.yaml"), encoding="utf-8") as f:
+            entry = yaml.safe_load(f)["days"]["day-00"]
+        assert entry["needs_attention"] == ["em-01"]
+        assert entry["not_needs_attention"] == ["em-02"]
+        assert entry["nudge"] == {"em-01": "drop", "im-01": "nudge"}
+        assert entry["entity_count"] == 3 and entry["labeled_at"]
+        code, _b, _h = _post_json(base, "/api/labels/day-00",
+                                  {"needs_attention": [], "nudge": {"im-99": "drop"}},
+                                  headers=authed)
+        assert code == 400                                # labels never grow new ids
+        code, _b, _h = _post_json(base, "/api/labels/review", {"reviewed": True}, headers=authed)
+        assert code == 200
+        with open(os.path.join(corp, "labels.yaml"), encoding="utf-8") as f:
+            assert yaml.safe_load(f)["reviewed"] is True
+    finally:
+        srv.shutdown()

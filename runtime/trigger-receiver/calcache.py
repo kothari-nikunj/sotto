@@ -110,9 +110,10 @@ CHANGE_WINDOW_HOURS = 24           # moved/cancelled: the meeting starts within 
 DECLINE_WINDOW_HOURS = 48          # a decline is worth knowing a bit earlier — reschedules take time
 # A NEW invite is "last-minute" only when the meeting starts THIS soon. A next-day invite is
 # ordinary scheduling, not an interrupt (owner, Aug 25: four "Last-minute:" pings in 15 minutes,
-# three of them for tomorrow) — the email lane already nudges a real invite with a draft, and the
-# brief covers tomorrow. Declines/moves/cancellations keep the wider windows above: they change
-# plans you already made; a new invite only proposes one.
+# three of them for tomorrow) — this lane is the ONE owner of meeting interrupts: the invite's
+# email copy always queues (triage_event gate 4b), and the brief covers tomorrow. Declines/moves/
+# cancellations keep the wider windows above: they change plans you already made; a new invite
+# only proposes one.
 INVITE_SOON_HOURS = 4
 INVITE_GRACE_MIN = 15              # an invite for a meeting that started minutes ago still counts
 TAP_GRACE_MIN_DEFAULT = 5          # "ended ≥5 min ago" — you're out of the room, not packing up

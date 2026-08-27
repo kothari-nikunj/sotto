@@ -1290,6 +1290,15 @@ def _classify_calendar_change(e: dict, ctx: dict) -> tuple[str, str, str, str]:
 
 # ── The per-event decision ─────────────────────────────────────────────────────────────────────────
 
+# Formal calendar invite / RSVP notification emails, by their generated subject prefixes (Google
+# and Outlook both stamp them). One sentence: accepting an invite is a CALENDAR action, not an
+# email draft — so the email copy always queues, and meeting interrupts stay owned by the calendar
+# lane, which nudges a brand-new invite only when it starts within calcache.INVITE_SOON_HOURS.
+_CAL_INVITE_SUBJECT = re.compile(
+    r"^\s*(invitation|updated invitation|new event|canceled event|cancelled event|"
+    r"accepted|declined|tentatively accepted)\s*:", re.I)
+
+
 def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     """(verdict, class, reason, sender_name) for ONE event, per the Tier-0 matrix + Tier 1.
     Cooldown is applied by the caller (it needs disk + a shared stamp across the batch).
@@ -1353,6 +1362,14 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     if name and any(_s(name).strip().lower() == _s(m).strip().lower()
                     for m in ctx["prefs"]["mute_people"]):
         return "drop", "muted", f"muted person {name}", name
+
+    # 4b) A formal calendar invite or RSVP notification arriving as email → queue, always. The
+    #     calendar lane owns meeting interrupts (calcache: a NEW invite nudges only within
+    #     INVITE_SOON_HOURS); the email copy drafting "thanks for setting this up!" replies for a
+    #     next-week orientation was pure noise (owner, Aug 26). Queued, it still reaches the brief.
+    if src == "email" and _CAL_INVITE_SUBJECT.match(_s(e.get("subject"))):
+        return ("queue", "calendar_invite",
+                "calendar invite/RSVP email — the calendar lane owns meeting interrupts", name)
 
     # 5) Cadence: an active snooze queues everything that survives the drops — before Tier 1, so a
     #    snoozed hour costs nothing in LLM calls. Then quiet hours (VIP missed calls handled above).

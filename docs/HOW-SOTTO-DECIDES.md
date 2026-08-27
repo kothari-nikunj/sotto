@@ -72,13 +72,16 @@ is a table lookup, not a code search.
    unknown number → queued;
 4. an OTP, shortcode, or system message → dropped silently;
 5. from a muted sender or muted person → dropped;
-6. inside an active snooze → queued; inside quiet hours → queued;
-7. a group message that doesn't name you → queued;
-8. an unknown non-VIP 1:1 → queued (never a nudge). **Known, on every channel,** means your
+6. a formal calendar invite or RSVP notification arriving as **email** → queued: accepting an
+   invite is a calendar action, not an email draft, and meeting interrupts belong to the calendar
+   lane — a brand-new invite nudges there only when the meeting starts within 4 hours;
+7. inside an active snooze → queued; inside quiet hours → queued;
+8. a group message that doesn't name you → queued;
+9. an unknown non-VIP 1:1 → queued (never a nudge). **Known, on every channel,** means your
    Contacts resolved a real name **or the knowledge graph has a person file for the sender** — the
    graph fallback exists because a thin contacts snapshot must not turn everyone who texts you
    into a stranger, and a graph hit also supplies the name the nudge uses;
-9. anything with no text to judge → queued.
+10. anything with no text to judge → queued.
 
 **Tier 1 is one cheap LLM call** (`SOTTO_TRIAGE_MODEL`) on whatever survives: the event text plus a
 one-line "who is this" from the knowledge graph, and — for email — whether you were To'd or merely

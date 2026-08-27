@@ -382,23 +382,43 @@ def test_gather_sent_uses_the_in_sent_query(monkeypatch):
     assert rows[0]["body"] == "the full sent body"             # bodies fetched: snippets can't teach voice
 
 
-def test_window_days_widens_gmail_sent_and_calendar(monkeypatch):
-    """--window-days is the Golden Corpus backfill: the same gather that does 1 day for the brief
-    does 42 for a corpus, and the calendar gains the same history behind its 3-day lookahead."""
+def test_window_days_slices_the_backfill_past_the_page_caps(monkeypatch):
+    """One Gmail search clamps at ~500 results and one calendar list pages at ~25 events — the
+    owner's 42-day backfill came back ~5 days deep. A wide window becomes date-bounded slices
+    (after:/before: for Gmail, short --start/--end spans for calendar), deduped by id; the daily
+    1-day gather keeps its single query and tight 60s leash."""
     import datetime
-    calls = []
+    calls, touts = [], []
 
     def fake_run(api, args, timeout=60):
         calls.append(args)
-        return []
+        touts.append(timeout)
+        return [{"id": "same-row"}]                    # every slice returns the same id
 
     monkeypatch.setattr(gg, "_run", fake_run)
-    gg.gather_gmail("api.py", 400, 0, days=42)
-    gg.gather_sent("api.py", 15, 0, days=42)
-    gg.gather_calendar("api.py", back_days=41)
-    assert calls[0][2] == "newer_than:42d"
-    assert calls[1][2] == "in:sent newer_than:42d"
+    rows = gg.gather_gmail("api.py", 500, 0, days=42)
+    gmail_calls = list(calls)
+    assert len(gmail_calls) >= 6                       # ~weekly slices cover the window
+    assert all(c[0] == "gmail" and "after:" in c[2] and "before:" in c[2] for c in gmail_calls)
+    assert len(rows) == 1                              # boundary overlap deduped by id
+
+    calls.clear()
+    sent = gg.gather_sent("api.py", 15, 0, days=42)
+    assert all(c[2].startswith("in:sent after:") for c in calls)
+    assert len(sent) == 1 and sent[0]["isSent"] is True
+
+    calls.clear()
+    evs = gg.gather_calendar("api.py", back_days=41)
+    assert len(calls) >= 20                            # ~2-day spans beat the 25-event page
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    start = datetime.datetime.strptime(calls[2][calls[2].index("--start") + 1], fmt)
-    end = datetime.datetime.strptime(calls[2][calls[2].index("--end") + 1], fmt)
-    assert (end - start).days == 44                            # 41 back + 3 forward
+    first = datetime.datetime.strptime(calls[0][calls[0].index("--start") + 1], fmt)
+    last = datetime.datetime.strptime(calls[-1][calls[-1].index("--end") + 1], fmt)
+    assert (last - first).days == 44                   # 41 back + 3 forward, covered end to end
+    assert len(evs) == 1                               # deduped by event id
+    assert all(t == gg.BACKFILL_TIMEOUT for t in touts)
+
+    calls.clear()
+    touts.clear()
+    gg.gather_gmail("api.py", 40, 0)
+    assert calls == [["gmail", "search", "newer_than:1d", "--max", "40"]]
+    assert touts == [60]                               # the daily brief is untouched

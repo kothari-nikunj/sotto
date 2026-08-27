@@ -110,6 +110,11 @@ NAME_STOP = {
     "weekly", "brief", "video", "link", "sign", "home", "work", "info", "support", "alert",
     "alerts", "service", "message", "photo", "test", "docs", "sheet", "term", "best", "thanks",
     "hello", "love", "baby", "mom", "dad",
+    # …and the plurals ("Luma Events", "…Plans" are sender names too; owner build, Aug 2026)
+    "events", "plans", "plan", "meetings", "invites", "messages", "updates", "links", "photos",
+    "sheets", "terms", "threads", "groups", "emails", "phones", "drafts", "reviews",
+    "calendar", "schedule", "reminder", "reminders", "task", "tasks", "weekend", "digest",
+    "list", "lists",
 }  # a stop-listed contact's bare name surviving is the accepted cost of a readable corpus
 
 # Any run of >=10 digits with phone punctuation. Deliberately greedy: an unmapped number is
@@ -124,6 +129,12 @@ _TS_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]
 _TS_NAIVE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 _TS_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_MD = re.compile(r"^\d{2}-\d{2}$")
+# Gmail's own clock shapes — the date HEADER ("Tue, 26 Aug 2026 09:00:00 -0700") and internalDate
+# (epoch MILLISECONDS; exactly 13 digits, which no phone number is — 10-digit epoch-seconds are
+# deliberately NOT parsed, they collide with bare US phone numbers). The owner's first full corpus
+# bucketed zero of 1258 emails because every date wore one of these two shapes.
+_TS_RFC2822 = re.compile(r"^(?:[A-Z][a-z]{2},\s*)?\d{1,2} [A-Z][a-z]{2} \d{4} \d{1,2}:\d{2}")
+_TS_EPOCH_MS = re.compile(r"^\d{13}$")
 
 
 def _hx(key: bytes, kind: str, value: str) -> int:
@@ -743,7 +754,13 @@ def _parse_any(value: str):
             return datetime.strptime(v, "%Y-%m-%d %H:%M:%S"), "TS"
         if _TS_DATE.match(v):
             return datetime.strptime(v, "%Y-%m-%d"), "D"
-    except ValueError:
+        if _TS_RFC2822.match(v):
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(v)
+            return (dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt), "ISO"
+        if _TS_EPOCH_MS.match(v) and 978_307_200_000 <= int(v) <= 4_102_444_800_000:  # 2001..2100
+            return datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc).replace(tzinfo=None), "ISO"
+    except (ValueError, TypeError):
         return None, ""
     return None, ""
 

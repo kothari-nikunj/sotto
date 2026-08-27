@@ -191,9 +191,11 @@ looking for more events, and do not re-triage.
    It reads the ambient queue since the last digest/brief and decides deterministically.
 2. **If it prints `{"deliver": false}` → output NOTHING and stop.** Silence is the correct, common
    outcome — a quiet day has no midday digest. Do not announce that there's nothing.
-3. Else compose **ONE compact catch-up message** from its `items` — **hard cap 6 lines** (the digest
-   format in `_shared/references/voice.md`), grouped by person, most actionable first, no drafts and
-   no links needed here (the user can ask for any). Deliver as Sotto.
+3. Else compose **ONE compact catch-up message** from its `items` — a bold **Midday catch-up**
+   title line first (the reader must know what this message IS before line one; owner, Aug 26:
+   an untitled digest "reads weird"), then **hard cap 6 lines** (the digest format in
+   `_shared/references/voice.md`; the title doesn't count), grouped by person, most actionable
+   first, no drafts and no links needed here (the user can ask for any). Deliver as Sotto.
    - An item Sotto raised itself (a birthday, something you're owed, a meeting it wanted to prep)
      may ride along at the bottom, on its own line, in plain words — it never counts toward the
      heavy-day threshold, because that gate measures signals from PEOPLE.

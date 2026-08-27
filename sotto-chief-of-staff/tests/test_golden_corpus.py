@@ -104,6 +104,9 @@ def seed_data(root: str) -> str:
             {"id": "m2", "threadId": "t-2", "from": f"Marcus Lee <{MARCUS_EMAIL}>", "to": USER_EMAIL,
              "subject": "Pricing", "snippet": "please confirm", "body": "Need the model by tomorrow.",
              "date": "2026-08-08T15:00:00+00:00", "labelIds": ["INBOX"]},
+            {"id": "m3", "threadId": "t-3", "from": f"Dana Wells <{DANA_EMAIL}>", "to": USER_EMAIL,
+             "subject": "Wire-format clock", "snippet": "dated like a real Gmail header",
+             "body": "", "date": "Sun, 09 Aug 2026 10:00:00 +0000", "labelIds": ["INBOX"]},
         ], f)
     with open(os.path.join(root, "cal.json"), "w", encoding="utf-8") as f:
         json.dump([{"id": "evt-1", "summary": "AcmeCorp <> partnership",
@@ -374,6 +377,23 @@ def test_archived_snapshots_extend_the_corpus_message_history(tmp_path):
     assert len(day0["inputs"]["local"]["imessage"]) == 1        # the duplicate collapsed
 
 
+def test_gmail_wire_dates_parse_and_bucket(corpus):
+    """Gmail's own clock shapes — the RFC-2822 date header and epoch-ms internalDate — must parse
+    like ISO does: the owner's first full corpus bucketed ZERO of 1258 emails because every date
+    wore one of them. Bare 10-digit numbers stay unparsed — they collide with US phone numbers."""
+    from datetime import datetime, timezone
+    dt, kind = bgc._parse_any("Tue, 26 Aug 2026 09:00:00 -0700")
+    assert kind == "ISO" and dt.hour == 16                     # normalized to UTC
+    ms = str(int(datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc).timestamp() * 1000))
+    dt3, kind3 = bgc._parse_any(ms)
+    assert kind3 == "ISO" and (dt3.hour, dt3.minute) == (12, 0)
+    assert bgc._parse_any("4155552211")[0] is None             # a phone is not a clock
+    assert bgc._parse_any("2065551234")[0] is None
+    m3 = next(e for e in corpus["days"]["day-00"]["inputs"]["google"]["emails"]
+              if e.get("subject") == "Wire-format clock")      # header-dated mail reached its day
+    assert m3["date"].startswith("{{") and m3["date"].endswith("}}")
+
+
 def test_shapeless_registered_identifiers_are_swept_everywhere():
     """Ledger anchor_keys carry thread ids, event ids, graph slugs and masked phones — registered
     identifiers no email or phone regex can recognize. The owner's real build leaked 35 of them.
@@ -413,6 +433,8 @@ def test_newsletter_names_do_not_eat_schema_enums_or_prose():
     assert "Morning Brew" not in out
     assert out.endswith("every morning")
     assert bgc.leak_scan({"type": "morning", "deadline": "Monday morning"}, im) == []
+    # the owner's build kept finding new members of this family — pin the ones that bit
+    assert {"events", "plans", "morning", "deadline"} <= bgc.NAME_STOP
 
 
 def test_scan_reads_values_as_data_and_keys_as_schema():

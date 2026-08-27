@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import calendar
 import collections
+import glob
 import hashlib
 import hmac
 import html as _htmlmod
@@ -227,6 +228,8 @@ PERSON_API_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})\Z")
 # id (its charset), matched whole so a path can never traverse; served session-gated like every api.
 DECK_API_RE = re.compile(r"\A/api/decks/([A-Za-z0-9_-]{1,80}\.pdf)\Z")
 PERSON_FACTS_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})/facts\Z")
+LABELS_DAY_RE = re.compile(r"\A/api/labels/(day-\d{2,3})\Z")
+GID_RE = re.compile(r"\A(em|ev|im|wa|cl)-\d{1,4}\Z")
 PERSON_RELATIONS_RE = re.compile(r"\A/api/people/([a-z0-9_-]{1,128})/relations\Z")
 FACT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 MEMORY_TYPE_RE = re.compile(r"\A[a-z_]{1,32}\Z")
@@ -836,6 +839,12 @@ def _handle_api(h, path: str):
         if path == "/api/ledger":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(h.path).query)
             return _json(h, 200, api_ledger((q.get("days") or [""])[0]))
+        if path == "/api/labels":
+            return _json(h, 200, api_labels())
+        m = LABELS_DAY_RE.match(path)
+        if m:
+            obj = api_labels_day(m.group(1))
+            return _json(h, 200, obj) if obj is not None else _json(h, 404, {"error": "no such day"})
         return _json(h, 404, {"error": "not found"})
     except Exception as e:  # noqa: BLE001 — a data-shape surprise must not 500 the dashboard
         print(f"[sotto] dashboard api error on {path}: {e}", flush=True)
@@ -1914,6 +1923,185 @@ def _edit_failure(h, result: dict):
     return _json(h, 404 if "not found" in err else 400, {"error": err})
 
 
+# ── The Labels page: the Golden Corpus labeling hour, without the YAML ───────────────────────────
+# The corpus lives on the volume and never leaves it (scrubbed is not shareable), so the place to
+# label it is the dashboard the owner already trusts. The page reads the day fixtures + labels.yaml
+# that tools/build_golden_corpus.py wrote, and writes back ONLY the owner-judgment fields the
+# labeling session owns (needs_attention / not_needs_attention / nudge, plus a labeled_at stamp).
+
+def _corpus_root() -> str:
+    """Newest corpus under $SOTTO_DATA/corpus/ (where build_golden_corpus --out puts it)."""
+    best, best_m = "", -1.0
+    base = os.path.join(_root(), "corpus")
+    for mf in glob.glob(os.path.join(base, "*", "manifest.json")):
+        try:
+            m = os.path.getmtime(mf)
+        except OSError:
+            continue
+        if m > best_m:
+            best, best_m = os.path.dirname(mf), m
+    return best
+
+
+_LABELS_CACHE = {"path": "", "mtime": -1.0, "data": None}
+
+
+def _labels_load(root: str) -> dict:
+    """labels.yaml, cached by mtime — pure-Python YAML on a 40-day file costs seconds, and the
+    page hits this on every view. The C loader is used when the wheel carries it."""
+    import yaml  # noqa: PLC0415 — ships in the image; lazy so a missing dep breaks only this page
+    path = os.path.join(root, "labels.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = -1.0
+    if (_LABELS_CACHE["path"] == path and _LABELS_CACHE["mtime"] == mtime
+            and isinstance(_LABELS_CACHE["data"], dict)):
+        return _LABELS_CACHE["data"]
+    with open(path, encoding="utf-8") as f:
+        data = yaml.load(f, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+    data = data if isinstance(data, dict) else {}
+    _LABELS_CACHE.update(path=path, mtime=mtime, data=data)
+    return data
+
+
+def _labels_save(root: str, data: dict) -> None:
+    import yaml  # noqa: PLC0415
+    path = os.path.join(root, "labels.yaml")
+    tmp = f"{path}.tmp.{secrets.token_hex(4)}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# Golden labels — edited on the dashboard's Labels page. See evals/LABELING.md.\n")
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+    os.replace(tmp, path)
+    try:
+        _LABELS_CACHE.update(path=path, mtime=os.path.getmtime(path), data=data)
+    except OSError:
+        _LABELS_CACHE.update(path="", mtime=-1.0, data=None)
+
+
+def _gid_sort(gid: str):
+    kind, _, num = gid.partition("-")
+    return (kind, int(num) if num.isdigit() else 0)
+
+
+def api_labels() -> dict:
+    root = _corpus_root()
+    if not root:
+        return {"corpus": "", "days": []}
+    try:
+        labels = _labels_load(root)
+    except Exception:  # noqa: BLE001
+        return {"corpus": os.path.basename(root), "days": [], "error": "labels.yaml unreadable"}
+    days = []
+    for name, entry in (labels.get("days") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        needs = entry.get("needs_attention") or []
+        days.append({"name": _s(name),
+                     "emails": len(needs) + len(entry.get("not_needs_attention") or []),
+                     "needs": len(needs),
+                     "nudges": len(entry.get("nudge") or {}),
+                     "labeled": bool(entry.get("labeled_at"))})
+    days.sort(key=lambda d: _gid_sort(d["name"]))
+    return {"corpus": os.path.basename(root), "reviewed": bool(labels.get("reviewed")), "days": days}
+
+
+def api_labels_day(name: str):
+    root = _corpus_root()
+    if not root:
+        return None
+    try:
+        labels = _labels_load(root)
+        with open(os.path.join(root, "days", f"{name}.json"), encoding="utf-8") as f:
+            day = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    entry = (labels.get("days") or {}).get(name)
+    if not isinstance(entry, dict):
+        return None
+    needs = set(entry.get("needs_attention") or [])
+    google = (day.get("inputs") or {}).get("google") or {}
+    local = (day.get("inputs") or {}).get("local") or {}
+    emails = []
+    for e in (google.get("emails") or []):
+        if not isinstance(e, dict) or not e.get("_gid") or e.get("isSent"):
+            continue
+        emails.append({"gid": e["_gid"], "from": _s(e.get("from"))[:120],
+                       "subject": _s(e.get("subject"))[:160],
+                       "snippet": (_s(e.get("snippet")) or _s(e.get("body")))[:260],
+                       "needs": e["_gid"] in needs})
+    emails.sort(key=lambda e: _gid_sort(e["gid"]))
+    by_gid = {}
+    for section, channel in (("imessage", "iMessage"), ("whatsapp", "WhatsApp"), ("calls", "Call")):
+        for it in (local.get(section) or []):
+            if isinstance(it, dict) and it.get("_gid"):
+                who = (_s(it.get("partner_name")) or _s(it.get("handle"))
+                       or _s(it.get("contact_jid")) or _s(it.get("phone")))
+                by_gid[it["_gid"]] = {"channel": channel, "who": who[:60],
+                                      "text": _s(it.get("text"))[:200]}
+    for e in (google.get("emails") or []):
+        if isinstance(e, dict) and e.get("_gid"):
+            by_gid.setdefault(e["_gid"], {"channel": "Email", "who": _s(e.get("from"))[:60],
+                                          "text": (_s(e.get("subject")) or _s(e.get("snippet")))[:200]})
+    nudges = [{"gid": gid, "verdict": _s(verdict),
+               **(by_gid.get(gid) or {"channel": gid.split("-")[0], "who": "", "text": ""})}
+              for gid, verdict in sorted((entry.get("nudge") or {}).items(),
+                                         key=lambda kv: _gid_sort(kv[0]))]
+    return {"name": name, "emails": emails, "nudges": nudges,
+            "labeled": bool(entry.get("labeled_at"))}
+
+
+def _post_labels_day(h, name: str, body: dict):
+    root = _corpus_root()
+    if not root:
+        return _json(h, 404, {"error": "no corpus"})
+    needs = body.get("needs_attention")
+    nudge = body.get("nudge")
+    if not isinstance(needs, list) or not all(isinstance(g, str) and GID_RE.match(g) for g in needs):
+        return _json(h, 400, {"error": "bad needs_attention"})
+    if not isinstance(nudge, dict) or not all(
+            isinstance(g, str) and GID_RE.match(g) and v in ("nudge", "queue", "drop")
+            for g, v in nudge.items()):
+        return _json(h, 400, {"error": "bad nudge"})
+    try:
+        labels = _labels_load(root)
+        with open(os.path.join(root, "days", f"{name}.json"), encoding="utf-8") as f:
+            day = json.load(f)
+    except Exception:  # noqa: BLE001
+        return _json(h, 404, {"error": "no such day"})
+    entry = (labels.get("days") or {}).get(name)
+    if not isinstance(entry, dict):
+        return _json(h, 404, {"error": "no such day"})
+    inbound = [e["_gid"] for e in ((day.get("inputs") or {}).get("google") or {}).get("emails") or []
+               if isinstance(e, dict) and e.get("_gid") and not e.get("isSent")]
+    if not set(needs) <= set(inbound):
+        return _json(h, 400, {"error": "needs_attention ids not in this day"})
+    if set(nudge) != set(entry.get("nudge") or {}):
+        return _json(h, 400, {"error": "nudge ids must match the day's set"})
+    entry["needs_attention"] = sorted(set(needs), key=_gid_sort)
+    entry["not_needs_attention"] = [g for g in sorted(inbound, key=_gid_sort) if g not in set(needs)]
+    entry["nudge"] = {g: nudge[g] for g in sorted(nudge, key=_gid_sort)}
+    entry["labeled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _labels_save(root, labels)
+    _audit("write", endpoint=f"/api/labels/{name}", target=name, op="label-day")
+    return _json(h, 200, {"ok": True, "labeled": True})
+
+
+def _post_labels_review(h, body: dict):
+    root = _corpus_root()
+    if not root:
+        return _json(h, 404, {"error": "no corpus"})
+    try:
+        labels = _labels_load(root)
+    except Exception:  # noqa: BLE001
+        return _json(h, 404, {"error": "labels unreadable"})
+    labels["reviewed"] = bool(body.get("reviewed"))
+    _labels_save(root, labels)
+    _audit("write", endpoint="/api/labels/review", target="labels.yaml",
+           op="reviewed" if labels["reviewed"] else "unreviewed")
+    return _json(h, 200, {"ok": True, "reviewed": labels["reviewed"]})
+
+
 def _handle_api_post(h, path: str):
     rec = _session_record(h)
     if rec is None:
@@ -1948,6 +2136,11 @@ def _handle_api_post(h, path: str):
             return _post_voice(h, body)
         if path == "/api/runs":
             return _post_runs(h, body)
+        if path == "/api/labels/review":
+            return _post_labels_review(h, body)
+        m = LABELS_DAY_RE.match(path)
+        if m:
+            return _post_labels_day(h, m.group(1), body)
         return _json(h, 404, {"error": "not found"})
     except Exception as e:  # noqa: BLE001 — a shape surprise must not 500-loop the dashboard
         print(f"[sotto] dashboard write error on {path}: {e}", flush=True)

@@ -2048,3 +2048,26 @@ def test_tier1_masking_hides_identity_but_not_dates():
     # the regex's entire greedy match when it merely began with an ISO date.
     adjacent = te._tier1_text("2026-08-24 415-555-1234", {})
     assert adjacent == "2026-08-24 [phone]"
+
+
+def test_calendar_invite_email_queues_without_a_tier1_call(tmp_path, monkeypatch):
+    """A formal invite arriving as email never nudges and never burns a model call: accepting an
+    invite is a CALENDAR action, not an email draft (owner, Aug 26: nudged 'want this in your Gmail
+    drafts?' for an orientation eight days out). The calendar lane owns meeting interrupts. Mutes
+    still outrank the gate, and RSVP notifications ('Accepted: …') queue the same way."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path)
+    _stub_llm(monkeypatch, AssertionError("tier1 must not run for an invite"))
+    invite = _email(subject="Invitation: FPV <> Verkada Orientation @ Thu Sep 3, 2026 10am (PDT)",
+                    body="Tina Wong has invited you")
+    out = te.triage({"events": [invite]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"
+    assert "calendar invite/RSVP email" in out["reason"]
+    rsvp = _email(rowid="e2", subject="Accepted: Nikunj / Will @ Fri Aug 28 10am",
+                  body="Will Roberts has accepted this invitation.")
+    out2 = te.triage({"events": [rsvp]}, now_local=DAY, now_utc=NOW_UTC)
+    assert "calendar invite/RSVP email" in out2["reason"]
+    # a plain email with an ordinary subject still reaches Tier 1 (the stub raises → queue+error)
+    out3 = te.triage({"events": [_email(rowid="e3")]}, now_local=DAY, now_utc=NOW_UTC)
+    assert "tier1 error" in out3["reason"]

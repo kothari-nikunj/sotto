@@ -200,9 +200,9 @@ def _fetch_body(api, mid):
         return mid, None
 
 
-def _search_gmail(api, query: str, max_n: int, bodies: int):
+def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60):
     """One Gmail search → normalized rows, with full bodies for the top `bodies` hits."""
-    items = _as_list(_run(api, ["gmail", "search", query, "--max", str(max_n)]))
+    items = _as_list(_run(api, ["gmail", "search", query, "--max", str(max_n)], timeout=timeout))
     # Snippets are thin; fetch full bodies for the top N — CONCURRENTLY (the pattern proven in
     # research_attendees.py). Sequentially this was up to N × 30s of the brief's wall clock.
     # Output order is preserved: `full` is a lookup, the emit loop below follows `items`.
@@ -217,8 +217,50 @@ def _search_gmail(api, query: str, max_n: int, bodies: int):
             if isinstance(it, dict)]
 
 
+# A 1-day search answers in seconds; a 42-day × 400-result backfill (the Golden Corpus) paged past
+# 60s on the owner's real mailbox and came back EMPTY. The window knows which one it is.
+BACKFILL_TIMEOUT = 600
+# One Gmail search clamps at ~500 results and one calendar list pages at ~25 events — a single
+# query can never backfill a busy 42-day window (the owner's 800-max ask came back exactly 500,
+# reaching ~5 days). Backfills slice the window into date-bounded queries and dedup by id.
+GMAIL_SLICE_DAYS = 7
+CAL_SLICE_DAYS = 2
+
+
+def _window_timeout(days: int) -> int:
+    return 60 if days <= 1 else BACKFILL_TIMEOUT
+
+
+def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int):
+    """Date-bounded weekly searches (after:/before:, upper bound exclusive), newest first, deduped
+    by message id (boundary days overlap on purpose), bodies budget spread across slices so every
+    week labels rich — not just the newest."""
+    end = datetime.date.today() + datetime.timedelta(days=2)
+    start = end - datetime.timedelta(days=days + 2)
+    bounds = []
+    hi = end
+    while hi > start:
+        lo = max(start, hi - datetime.timedelta(days=GMAIL_SLICE_DAYS))
+        bounds.append((lo, hi))
+        hi = lo
+    per = max(0, bodies // len(bounds))
+    out, seen = [], set()
+    for i, (lo, hi) in enumerate(bounds):
+        q = f"{base_query} after:{lo:%Y/%m/%d} before:{hi:%Y/%m/%d}".strip()
+        for e in _search_gmail(api, q, max_n, per + (bodies % len(bounds) if i == 0 else 0),
+                               timeout=BACKFILL_TIMEOUT):
+            mid = str(e.get("id") or "")
+            if mid and mid in seen:
+                continue
+            seen.add(mid)
+            out.append(e)
+    return out
+
+
 def gather_gmail(api, max_n: int, bodies: int, days: int = 1):
-    return _search_gmail(api, f"newer_than:{days}d", max_n, bodies)
+    if days <= 1:
+        return _search_gmail(api, "newer_than:1d", max_n, bodies)
+    return _sliced_gmail(api, "", max_n, bodies, days)
 
 
 def mark_sent(e: dict) -> dict:
@@ -241,7 +283,9 @@ def mark_sent(e: dict) -> dict:
 def gather_sent(api, max_n: int = SENT_MAX, bodies: int = SENT_BODIES, days: int = 1):
     """The user's own outgoing mail from the window — same normalized shape as the inbox rows,
     with isSent/SENT guaranteed. Failures are the caller's to swallow (the gather never dies on it)."""
-    return [mark_sent(e) for e in _search_gmail(api, f"in:sent newer_than:{days}d", max_n, bodies)]
+    if days <= 1:
+        return [mark_sent(e) for e in _search_gmail(api, "in:sent newer_than:1d", max_n, bodies)]
+    return [mark_sent(e) for e in _sliced_gmail(api, "in:sent", max_n, bodies, days)]
 
 
 def merge_sent(inbox: list, sent: list) -> list:
@@ -270,13 +314,29 @@ def merge_sent(inbox: list, sent: list) -> list:
 
 def gather_calendar(api, back_days: int = 0):
     """Next 3 days, plus `back_days` of history — the daily gather looks only forward; the Golden
-    Corpus backfill (--window-days) needs the meetings that already happened."""
+    Corpus backfill (--window-days) needs the meetings that already happened. History comes in
+    CAL_SLICE_DAYS windows deduped by id: the calendar CLI pages at ~25 events per list."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    start = now - datetime.timedelta(days=back_days)
     end = now + datetime.timedelta(days=3)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    items = _as_list(_run(api, ["calendar", "list", "--start", start.strftime(fmt), "--end", end.strftime(fmt)]))
-    return [normalize_event(e) for e in items]
+    if back_days <= 0:
+        items = _as_list(_run(api, ["calendar", "list", "--start", now.strftime(fmt),
+                                    "--end", end.strftime(fmt)]))
+        return [normalize_event(e) for e in items]
+    out, seen = [], set()
+    lo = now - datetime.timedelta(days=back_days)
+    while lo < end:
+        hi = min(lo + datetime.timedelta(days=CAL_SLICE_DAYS), end)
+        items = _as_list(_run(api, ["calendar", "list", "--start", lo.strftime(fmt),
+                                    "--end", hi.strftime(fmt)], timeout=BACKFILL_TIMEOUT))
+        for e in (normalize_event(x) for x in items):
+            key = str(e.get("id") or "") or json.dumps(e, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        lo = hi
+    return out
 
 
 def _attendee_emails_from_file(path: str) -> list:
