@@ -1,16 +1,21 @@
-# Everything the test gauntlet needs, and nothing else. Four packages:
+# Everything the test gauntlet needs, and nothing else. Five packages:
 #
 #   pytest                     — the two suites (sotto-chief-of-staff/tests, runtime/trigger-receiver)
 #   ruff                       — static correctness checks (undefined names, dead imports/locals)
 #   pyyaml                     — skills front-matter; tools/validate_skills.py parses it
 #   google-api-python-client   — imported by the google-workspace skill's google_api.py, which a
 #                                handful of tests import rather than mock
+#   firecrawl-anydoc           — the attachment lane's local converter. tests/test_attachments.py
+#                                deliberately does NOT mock it: the lane's whole claim is that a
+#                                PDF becomes Markdown in-process with no network and no hosted OCR,
+#                                and a suite that mocked the converter would prove none of that.
 #
-# Pinned to the versions the gauntlet is actually validated against (`pip show`, 2026-08-12), so a
-# red CI run means a real regression and never "PyPI shipped something this morning". pyyaml and
-# google-api-python-client are held at the SAME versions as requirements.txt (the image), so the
-# suites test the libraries the container will run.
+# Pinned to the versions the gauntlet is actually validated against (`pip show`, 2026-08-12; the
+# converter 2026-08-28), so a red CI run means a real regression and never "PyPI shipped something
+# this morning". pyyaml, google-api-python-client and firecrawl-anydoc are held at the SAME versions
+# as requirements.txt (the image), so the suites test the libraries the container will run.
 pytest==9.1.1
 ruff==0.16.4
 pyyaml==6.0.1
 google-api-python-client==2.198.0
+firecrawl-anydoc==0.2.4

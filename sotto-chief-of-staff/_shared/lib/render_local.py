@@ -30,6 +30,12 @@ from textutil import (  # noqa: E402
     _normalize_identifier, _names_match, _looks_like_phone_number, _is_likely_automated,
 )
 from timeutil import _parse_ts, _date_only  # noqa: E402
+# The attachment lane's caps, from their owner. This module RE-APPLIES the per-attachment character
+# cap rather than trusting the gather to have done it: a row can also reach here from an MCP-host
+# gather or a replayed fixture, and the prompt budget is this side's responsibility.
+from attachments import (  # noqa: E402
+    MAX_ATTACHMENTS_PER_EMAIL, MAX_ATTACHMENT_CHARS, TRUNCATION_MARKER,
+)
 
 # Mirrors api/src/lib/constants.ts
 DEFERRED_UNREAD_PROMPT_CAP = 15
@@ -806,9 +812,51 @@ def _trim_email(e, lookup: dict | None = None) -> dict:
         "isPromotional": "CATEGORY_PROMOTIONS" in labels,
         "isUpdate": "CATEGORY_UPDATES" in labels,
         "isSocial": "CATEGORY_SOCIAL" in labels,
+        # The attachment lane (gather_google.py, converted by _shared/lib/attachments.py). Rows are
+        # {filename, text} or {filename, unreadable}; absent for every email that had none, and for
+        # every host whose gather predates the lane.
+        "attachments": e.get("attachments") or [],
     }
 
 
+
+
+def _format_attachments(attachments) -> str:
+    """The attachment lane's rendering: one `↳ attachment` line per file, under its email.
+
+        ↳ attachment "Deck.pdf": <the converted markdown>
+        ↳ attachment "scan.pdf" (unreadable: scanned document — no local text)
+
+    An attachment Sotto can read becomes text under its email; one it can't is NAMED — which is the
+    whole point of the unreadable half. A brief that silently omitted the file it couldn't open
+    would let the model write about a document nobody read; a named one tells it plainly that there
+    is a file here and its contents are not in evidence.
+
+    Budget: at most MAX_ATTACHMENTS_PER_EMAIL rendered blocks with text, each re-capped at
+    MAX_ATTACHMENT_CHARS. Named-only rows are cheap (one short line) and are never dropped."""
+    if not attachments:
+        return ""
+    lines, with_text = [], 0
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        name = _s(a.get("filename")).strip() or "(unnamed)"
+        reason = _s(a.get("unreadable")).strip()
+        if reason:
+            lines.append(f'↳ attachment "{name}" (unreadable: {reason})')
+            continue
+        text = _s(a.get("text")).strip()
+        if not text:
+            continue
+        if with_text >= MAX_ATTACHMENTS_PER_EMAIL:
+            lines.append(f'↳ attachment "{name}" (unreadable: '
+                         f'over the {MAX_ATTACHMENTS_PER_EMAIL}-attachment limit)')
+            continue
+        with_text += 1
+        if len(text) > MAX_ATTACHMENT_CHARS:
+            text = text[:MAX_ATTACHMENT_CHARS].rstrip() + TRUNCATION_MARKER
+        lines.append(f'↳ attachment "{name}": {text}')
+    return "\n".join(lines)
 
 
 def _format_emails(emails) -> str:
@@ -849,8 +897,10 @@ def _format_emails(emails) -> str:
         else:
             addr = f"From: {e['from']}\nSenderEmail: {e['senderEmail']}"
         body = (e.get("body") or "").strip()
+        atts = _format_attachments(e.get("attachments"))
         return (f"### {e['subject'] or '(no subject)'}{flag_str}\n{addr}\n"
-                f"Date: {e['date']}\nThreadId: {e['threadId'] or 'none'}" + (f"\n\n{body}" if body else ""))
+                f"Date: {e['date']}\nThreadId: {e['threadId'] or 'none'}"
+                + (f"\n\n{body}" if body else "") + (f"\n\n{atts}" if atts else ""))
 
     sections = []
     if active:

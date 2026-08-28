@@ -1,5 +1,7 @@
 """gather_google.py — normalizes google_api.py output to compose_brief's shapes; never crashes."""
-import importlib.util, json, os
+import importlib.util, json, os, re
+
+import pytest
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("gg", os.path.join(HERE, "..", "_shared", "scripts", "gather_google.py"))
@@ -422,3 +424,214 @@ def test_window_days_slices_the_backfill_past_the_page_caps(monkeypatch):
     gg.gather_gmail("api.py", 40, 0)
     assert calls == [["gmail", "search", "newer_than:1d", "--max", "40"]]
     assert touts == [60]                               # the daily brief is untouched
+
+
+# --- the attachment lane -------------------------------------------------------------------
+# An attachment Sotto can read becomes text under its email; one it can't is named, never guessed.
+# The Gmail service is faked here because the lane talks to the Gmail API DIRECTLY (the host's
+# google_api.py has no attachments verb and its `gmail get` discards the MIME part tree) — the same
+# direct-to-Google precedent google_action.py's gmail-draft set.
+
+
+class _FakeGmail:
+    """The three chained calls the lane makes, and nothing else. `parts` is the payload's part list;
+    `blobs` maps attachmentId → base64url data for the ones Gmail didn't inline."""
+
+    def __init__(self, parts, blobs=None, boom=False):
+        self._parts, self._blobs, self._boom = parts, blobs or {}, boom
+        self.attachment_gets = []
+
+    def users(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def get(self, userId=None, id=None, format=None):
+        if self._boom:
+            raise RuntimeError("Gmail said no")
+        return _Exec({"id": id, "payload": {"parts": self._parts}})
+
+    def attachments(self):
+        return _Attachments(self)
+
+
+class _Attachments:
+    def __init__(self, gmail):
+        self._g = gmail
+
+    def get(self, userId=None, messageId=None, id=None):
+        self._g.attachment_gets.append(id)
+        return _Exec({"data": self._g._blobs.get(id, "")})
+
+
+class _Exec:
+    def __init__(self, payload):
+        self._p = payload
+
+    def execute(self):
+        return self._p
+
+
+def _b64(raw):
+    import base64
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _wire_attachment_gather(monkeypatch, parts, blobs=None, boom=False):
+    """The inbox search + body fetch stay on the fake CLI; the attachment lane gets a fake Gmail."""
+    svc = _FakeGmail(parts, blobs, boom)
+
+    def fake_run(api, args, timeout=60):
+        if args[:2] == ["gmail", "search"]:
+            return [{"id": "m1", "subject": "Q3 numbers", "labels": ["INBOX"]}]
+        return {"body": "see attached"}
+
+    monkeypatch.setattr(gg, "_run", fake_run)
+    monkeypatch.setattr(gg, "_token_path", lambda: "/fake/google_token.json")
+    monkeypatch.setattr(gg, "_gmail_service", lambda: svc)
+    return svc
+
+
+def test_inbox_attachment_is_converted_and_hung_on_the_email(monkeypatch):
+    """The end-to-end claim: a CSV attached to an inbox email in the bodies cohort arrives on the
+    normalized row as converted Markdown."""
+    parts = [{"filename": "", "mimeType": "text/plain", "body": {"size": 4}},
+             {"filename": "numbers.csv", "mimeType": "text/csv",
+              "body": {"size": 8, "attachmentId": "att-1"}}]
+    _wire_attachment_gather(monkeypatch, parts, {"att-1": _b64(b"a,b\n1,2\n")})
+    emails = gg.gather_gmail("/fake/api.py", 25, 12)
+    atts = emails[0]["attachments"]
+    assert len(atts) == 1 and atts[0]["filename"] == "numbers.csv"
+    assert "| a | b |" in atts[0]["text"]
+
+
+def test_gmail_inlined_bytes_need_no_second_api_call(monkeypatch):
+    """Gmail inlines small attachment bodies. When it has, the lane uses them — an attachments().get
+    for an attachment we already hold is a call spent for nothing."""
+    parts = [{"filename": "numbers.csv", "mimeType": "text/csv",
+              "body": {"size": 8, "data": _b64(b"a,b\n1,2\n")}}]
+    svc = _wire_attachment_gather(monkeypatch, parts)
+    emails = gg.gather_gmail("/fake/api.py", 25, 12)
+    assert "| 1 | 2 |" in emails[0]["attachments"][0]["text"]
+    assert svc.attachment_gets == []                 # nothing was downloaded twice
+
+
+def test_an_email_with_no_attachments_makes_no_attachment_call(monkeypatch):
+    """A part with no filename is not an attachment. No filename anywhere → no attachments().get,
+    and no `attachments` key on the row at all."""
+    svc = _wire_attachment_gather(monkeypatch, [{"filename": "", "mimeType": "text/html",
+                                                 "body": {"size": 20}}])
+    emails = gg.gather_gmail("/fake/api.py", 25, 12)
+    assert "attachments" not in emails[0]
+    assert svc.attachment_gets == []
+
+
+def test_the_sent_lane_never_fetches_attachments(monkeypatch):
+    """v1 is the inbox. The sent lane is style exhaust — converting the files the user attached to
+    their own mail would spend API calls and prompt budget telling them what they already know."""
+    monkeypatch.setattr(gg, "_token_path",
+                        lambda: pytest.fail("attachment lane touched on the sent path"))
+
+    def fake_run(api, args, timeout=60):
+        if args[:2] == ["gmail", "search"]:
+            return [{"id": "s1", "subject": "my reply"}]
+        return {"body": "sent body"}
+
+    monkeypatch.setattr(gg, "_run", fake_run)
+    sent = gg.gather_sent("/fake/api.py", 15, 10)
+    assert sent[0]["isSent"] is True and "attachments" not in sent[0]
+
+
+def test_an_attachment_failure_never_drops_the_email(monkeypatch):
+    """Fail toward silence: Gmail erroring on the metadata call costs that email its attachments,
+    never its place in the brief."""
+    _wire_attachment_gather(monkeypatch, [], boom=True)
+    emails = gg.gather_gmail("/fake/api.py", 25, 12)
+    assert len(emails) == 1 and emails[0]["subject"] == "Q3 numbers"
+    assert "attachments" not in emails[0]
+
+
+def test_google_not_connected_costs_the_lane_nothing(monkeypatch):
+    """No token file → the lane returns immediately, without building a client or importing the
+    Google libs. The gather is otherwise untouched."""
+    def fake_run(api, args, timeout=60):
+        if args[:2] == ["gmail", "search"]:
+            return [{"id": "m1", "subject": "Q3"}]
+        return {"body": "b"}
+
+    monkeypatch.setattr(gg, "_run", fake_run)
+    monkeypatch.setattr(gg, "_token_path", lambda: "")
+    monkeypatch.setattr(gg, "_gmail_service",
+                        lambda: pytest.fail("client built without a token"))
+    emails = gg.gather_gmail("/fake/api.py", 25, 12)
+    assert len(emails) == 1 and "attachments" not in emails[0]
+
+
+def test_an_oversized_attachment_is_named_and_never_downloaded(monkeypatch):
+    """The byte cap is enforced BEFORE the download, so a 9MB file costs one metadata read and a
+    name — not 9MB of the brief's wall clock."""
+    parts = [{"filename": "video.mov", "mimeType": "video/quicktime",
+              "body": {"size": gg.MAX_ATTACHMENT_BYTES + 1, "attachmentId": "att-big"}}]
+    svc = _wire_attachment_gather(monkeypatch, parts, {"att-big": _b64(b"x" * 10)})
+    atts = gg.gather_gmail("/fake/api.py", 25, 12)[0]["attachments"]
+    assert atts == [{"filename": "video.mov", "unreadable": "too large to read"}]
+    assert svc.attachment_gets == []                 # never fetched
+
+
+def test_every_filename_is_listed_even_past_the_per_email_cap(monkeypatch):
+    """ALL filenames are named; only the CONVERTED ones are capped. "There were two more files" is
+    itself information the brief must not lose."""
+    parts = [{"filename": f"f{i}.csv", "mimeType": "text/csv",
+              "body": {"size": 8, "data": _b64(b"a,b\n1,2\n")}} for i in range(5)]
+    _wire_attachment_gather(monkeypatch, parts)
+    atts = gg.gather_gmail("/fake/api.py", 25, 12)[0]["attachments"]
+    assert len(atts) == 5                                             # every file named
+    assert sum(1 for a in atts if "text" in a) == gg.MAX_ATTACHMENTS_PER_EMAIL
+    assert all(f"over the {gg.MAX_ATTACHMENTS_PER_EMAIL}-attachment limit" == a["unreadable"]
+               for a in atts[gg.MAX_ATTACHMENTS_PER_EMAIL:])
+
+
+def test_attachment_parts_walks_nested_multipart():
+    """multipart/mixed wrapping multipart/alternative is the ordinary shape of a real email — a flat
+    scan of payload["parts"] misses everything one level down."""
+    payload = {"parts": [
+        {"mimeType": "multipart/alternative", "filename": "",
+         "parts": [{"filename": "", "mimeType": "text/plain", "body": {"size": 4}},
+                   {"filename": "inner.pdf", "mimeType": "application/pdf",
+                    "body": {"size": 100, "attachmentId": "deep"}}]},
+        {"filename": "outer.csv", "mimeType": "text/csv", "body": {"size": 9}}]}
+    names = [p["filename"] for p in gg._attachment_parts(payload)]
+    assert names == ["inner.pdf", "outer.csv"]                # depth-first, message order
+
+
+def test_a_download_failure_names_that_one_attachment_only(monkeypatch):
+    """One attachment failing to download names IT — the others on the same email still convert."""
+    parts = [{"filename": "good.csv", "mimeType": "text/csv",
+              "body": {"size": 8, "data": _b64(b"a,b\n1,2\n")}},
+             {"filename": "bad.csv", "mimeType": "text/csv",
+              "body": {"size": 8, "attachmentId": "nope"}}]
+    svc = _wire_attachment_gather(monkeypatch, parts)
+
+    def _boom(*a, **k):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(gg, "_attachment_bytes",
+                        lambda s, m, p: _boom() if p["filename"] == "bad.csv" else b"a,b\n1,2\n")
+    atts = gg.gather_gmail("/fake/api.py", 25, 12)[0]["attachments"]
+    assert "text" in atts[0] and atts[1]["unreadable"] == "could not be downloaded"
+    assert svc is not None
+
+
+def test_the_caps_have_one_owner():
+    """gather_google IMPORTS the caps from attachments.py rather than keeping its own copy — the
+    fetch side and the render side cannot state two different numbers. Asserted on the import
+    statement itself, because equal-but-separately-declared constants is exactly the drift this
+    guards against."""
+    src = open(os.path.join(HERE, "..", "_shared", "scripts", "gather_google.py"),
+               encoding="utf-8").read()
+    assert "from attachments import" in src
+    assert "MAX_ATTACHMENTS_PER_EMAIL" in src and "MAX_ATTACHMENT_BYTES" in src
+    # …and nowhere does it declare one of its own
+    assert not re.search(r"^MAX_ATTACHMENT\w*\s*=", src, re.M)
+    assert (gg.MAX_ATTACHMENTS_PER_EMAIL, gg.MAX_ATTACHMENT_BYTES) == (3, 8_000_000)

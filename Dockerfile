@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # day, so recompute HERMES_INSTALL_SHA256 in the same edit (or clear it and accept the warning) —
 # a stale hash is a build that fails loudly, which is the correct failure but a confusing one if you
 # forgot why.
-ARG HERMES_REFRESH=2026-08-23
+ARG HERMES_REFRESH=2026-08-28.2
 # Integrity pin for the installer script. The script is fetched to a FILE, checked, and only then
 # executed — never `curl | bash`, so a MITM or a compromised host cannot stream a different script
 # into a shell that is already running it.
@@ -49,7 +49,12 @@ ARG HERMES_REFRESH=2026-08-23
 # The default is the exact installer fetched and reviewed when HERMES_REFRESH was bumped above.
 # Upstream serves a mutable URL, so every refresh must update this hash in the same commit. Empty or
 # stale hashes fail the build closed; bypassing verification is never a supported build mode.
-ARG HERMES_INSTALL_SHA256="c0380bc1f78d3d662a77663ce20cc17e14cbc4bec35e61ab7a33bac5f3afed2d"
+# (2026-08-28.2: fetched with the build's exact curl -A string minutes before merging; the diff
+# against the 08-23 script was reviewed — a Node support-line gate (22.22+/24.11+/26+) and an
+# isolated `uv sync` helper for uv 0.12+, no new download hosts. Adopts Hermes v0.20.6. The first
+# 08-28 attempt is history: upstream replaced the script between verification and build — the pin
+# failed the build closed, as designed.)
+ARG HERMES_INSTALL_SHA256="e6c7f2b516b2888ab740fd36cbceb5fd4e1db68d2ebc29f7306c6313c835b7d9"
 RUN echo "hermes refresh: ${HERMES_REFRESH}" \
  && test -n "${HERMES_INSTALL_SHA256}" \
  && curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \

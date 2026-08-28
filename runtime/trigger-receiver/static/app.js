@@ -278,6 +278,11 @@
     return typeof v === "string" ? v.trim() : "";
   }
 
+  /* …and its counterpart for counts: anything that isn't a finite number is zero. */
+  function num(v) {
+    return typeof v === "number" && isFinite(v) ? v : 0;
+  }
+
   function isDateOnly(v) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(v || ""));
   }
@@ -1679,6 +1684,27 @@
     var list = el("div", "ledger");
     for (var i = 0; i < jobs.length; i++) list.appendChild(runRow(jobs[i] || {}, runs));
     frag.appendChild(list);
+    appendOutboxLine(frag, runs.outbox);
+  }
+
+  /* One mono line, and only when there is something to say: a quiet outbox is the
+     normal state and gets no furniture. "Waiting" is a message the channel hasn't
+     acknowledged yet and is still being retried; "gave up" is one it will not. */
+
+  function appendOutboxLine(frag, outbox) {
+    var pending = num(outbox && outbox.pending);
+    var failed = num(outbox && outbox.failed);
+    if (!pending && !failed) return;
+    var items = [];
+    if (pending) {
+      items.push({ text: pending + (pending === 1 ? " message" : " messages") + " waiting",
+                   hint: "Nothing is marked delivered until the channel says so — these are being retried." });
+    }
+    if (failed) {
+      items.push({ text: failed + " gave up",
+                   hint: "Retried until its day ran out and never landed. The Record says why." });
+    }
+    frag.appendChild(statStrip(items));
   }
 
   function runRow(job) {
@@ -3281,9 +3307,41 @@
 
   function recordSentence(entry) {
     if (entry.source === "triage" || str(entry.verdict)) return triageSentence(entry);
+    if (entry.source === "delivery") return deliverySentence(entry);
     return entry.source === "outcome" || str(entry.outcome)
       ? outcomeSentence(entry)
       : dashboardSentence(entry);
+  }
+
+  /* receiver.py delivery.jsonl vocabulary — status: spawned | delivered | empty |
+     failed | skipped | expired, with the outbox's detail saying whether a failure
+     is the latest attempt or the last one. Deciding to send and sending are two
+     facts; this is the second one, in the words a person would use. */
+
+  var DELIVERY_THING = {
+    brief: "your brief", digest: "the midday digest",
+    event: "a nudge", proactive: "a nudge", "run-now": "the run you started"
+  };
+
+  function deliveryThing(label) {
+    var head = str(label).split(":")[0].toLowerCase();
+    return DELIVERY_THING[head] || "a message";
+  }
+
+  function deliverySentence(e) {
+    var thing = deliveryThing(e.label);
+    var why = str(e.detail);
+    switch (str(e.status)) {
+      case "delivered": return "Delivered " + thing;
+      case "empty": return "Nothing worth saying — " + thing + " stayed silent";
+      case "skipped": return "Skipped " + thing + (why ? " — " + why : "");
+      case "expired": return "Dropped " + thing + (why ? " — " + why : "");
+      case "failed":
+        return (why.indexOf("gave up") !== -1 ? "Gave up on " : "Couldn't deliver ") +
+          thing + (why ? " — " + why : "");
+      case "spawned": return "Started composing " + thing;
+      default: return "Recorded " + thing;
+    }
   }
 
   /* triage_event.py surfaced.jsonl vocabulary — verdict: agent | queue | drop |

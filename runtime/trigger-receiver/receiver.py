@@ -164,6 +164,29 @@ CALCACHE.HOOKS.update({
 })
 DASHBOARD.HOOKS["calendar_snapshot"] = lambda: CALCACHE.snapshot()
 
+# The durable delivery outbox (ROADMAP § Reliability P0 item 2): nothing Sotto says is marked
+# delivered until the channel says so; what fails waits its turn instead of dying. It owns
+# events/outbox.json and every constant about retrying — this module owns only the CHANNEL
+# (`_send_via_channel`) and the receipt (`_record_delivery`), handed over as hooks.
+_outbox_spec = importlib.util.spec_from_file_location(
+    "outbox", os.path.join(os.path.dirname(__file__), "outbox.py"))
+OUTBOX = importlib.util.module_from_spec(_outbox_spec)
+_outbox_spec.loader.exec_module(OUTBOX)
+OUTBOX.HOOKS.update({
+    "data_root": lambda: DATA,
+    "json_transaction": lambda p, **kw: CONNECTORS.json_transaction(p, **kw),
+    # The ONE call that touches the channel. When a channel offers a real receipt (a gateway send
+    # API returning an id), this is the single function that gets stronger and every lane inherits it.
+    "send": lambda body, target: _send_via_channel(body, target),
+    "record": lambda label, status, detail="", usage=None, decision_ids=None: _record_delivery(
+        label, status, detail, usage=usage, decision_ids=decision_ids),
+    # A chase is only counted once the message that chased actually landed — wherever it landed,
+    # first try or fifth. The ack is what finalizes effects, so this rides the ack.
+    "on_delivered": lambda payload: _finalize_delivery_effects(payload.get("effects") or []),
+    "local_today": lambda: DASHBOARD._local_today(),
+})
+DASHBOARD.HOOKS["outbox_counts"] = lambda: OUTBOX.counts()
+
 
 def delivered_flag(date: str, kind: str) -> str:
     # The TRIGGER-dedup claim (prevents two near-simultaneous triggers double-enqueuing). Distinct from
@@ -217,7 +240,11 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
     spawned / delivered / empty / failed / skipped (nothing spawned — e.g. a wake trigger after the
-    day's brief already went out); `usage` is the run's ground-truth spend (see _read_usage),
+    day's brief already went out) / expired (it aged past its kind's window in the outbox and was
+    never sent). Since the outbox, a `failed` row says in its detail whether the failure is final
+    ("gave up after N attempts") or the latest of several ("queued, retry 2/96") — so the Record
+    can never read one attempt's failure as the message being gone.
+    `usage` is the run's ground-truth spend (see _read_usage),
     present only on the row that closes a run. Best-effort: a receipt that can't be written must
     never cost the delivery it is describing."""
     try:
@@ -237,20 +264,14 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
         pass
 
 
-def _deliver_text(text: str, label: str, usage: dict | None = None,
-                  decision_ids: list | None = None) -> bool:
-    """Hand one skill's final text to `hermes send`. Silence is a legitimate outcome for every one
-    of these skills ("if there's nothing, say nothing"), so an empty run is recorded and NOT sent —
-    an empty message would be the busywork theater the standing bars forbid."""
-    body = (text or "").strip()
-    if not body:
-        _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids)
-        return False
-    if _is_silence(body):
-        _record_delivery(label, "empty", f"{SILENCE_SENTINEL} sentinel — nothing to deliver",
-                         usage=usage, decision_ids=decision_ids)
-        return False
-    target = _deliver_target()
+def _send_via_channel(body: str, target: str) -> tuple[bool, str]:
+    """THE call that hands one message to the channel — and the only thing in this image that knows
+    how. `(True, "")` when the channel ACKNOWLEDGED it, `(False, why)` otherwise; it decides
+    nothing, records nothing, and retries nothing (outbox.py owns all three).
+
+    The ack available here is `hermes send` exiting 0 — the CLI's own report that the platform took
+    the message. It is the strongest ack this seam has; a gateway that returns a message id would be
+    stronger, and this is the one function that would learn it."""
     try:
         # `-f -` (--file -) is the documented way to force the body from stdin. A bare trailing `-`
         # is NOT: argparse binds it to the optional [message] positional, so the platform receives
@@ -261,18 +282,32 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
         r = subprocess.run(["hermes", "send", "--to", target, "--quiet", "-f", "-"],
                            input=body, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS)
     except Exception as e:  # noqa: BLE001
-        print(f"[sotto] {label}: delivery FAILED ({type(e).__name__}: {e})", flush=True)
-        _record_delivery(label, "failed", f"{type(e).__name__}: {e}", usage=usage,
-                         decision_ids=decision_ids)
-        return False
+        return False, f"{type(e).__name__}: {e}"
     if r.returncode == 0:
-        _record_delivery(label, "delivered", usage=usage, decision_ids=decision_ids)
-        return True
-    detail = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
-    # LOUD: a nudge that was decided and then lost is the failure this whole seam exists to end.
-    print(f"[sotto] {label}: delivery FAILED to {target} — {detail[:300]}", flush=True)
-    _record_delivery(label, "failed", detail, usage=usage, decision_ids=decision_ids)
-    return False
+        return True, ""
+    return False, (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+
+
+def _deliver_text(text: str, label: str, usage: dict | None = None,
+                  decision_ids: list | None = None, effects: list | None = None) -> bool:
+    """Hand one skill's final text to the channel, THROUGH THE OUTBOX. Silence is a legitimate
+    outcome for every one of these skills ("if there's nothing, say nothing"), so an empty run is
+    recorded and never enqueued — an empty message would be the busywork theater the standing bars
+    forbid, and an outbox row for it would retry that theater for hours.
+
+    Returns True only when the channel acknowledged the message. False no longer means lost: the row
+    is on file and the drain owns it until it lands, ages out, or gives up loudly."""
+    body = (text or "").strip()
+    if not body:
+        _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids)
+        return False
+    if _is_silence(body):
+        _record_delivery(label, "empty", f"{SILENCE_SENTINEL} sentinel — nothing to deliver",
+                         usage=usage, decision_ids=decision_ids)
+        return False
+    return OUTBOX.deliver({"label": label, "body": body, "target": _deliver_target(),
+                           "usage": usage, "decision_ids": decision_ids,
+                           "effects": effects or []})
 
 
 # Which of the four numbers a usage report may spell differently. We do not own hermes' schema, so
@@ -444,9 +479,11 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
                 _record_delivery(label, "failed", f"exit {r.returncode}: {detail}", usage=usage,
                                  decision_ids=correlated_ids)
                 return
-            delivered = _deliver_text(r.stdout, label, usage=usage, decision_ids=correlated_ids)
-            if delivered:
-                _finalize_delivery_effects(effects.get("effects") or [])
+            # The effects ride the outbox row rather than being applied here: a chase is counted
+            # when the message that chased actually LANDED, and that may be the fifth retry an hour
+            # from now, in the drain thread, long after this one has exited.
+            _deliver_text(r.stdout, label, usage=usage, decision_ids=correlated_ids,
+                          effects=effects.get("effects") or [])
         finally:
             if usage_path:
                 try:
@@ -1338,10 +1375,14 @@ RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 
 def pairing_link() -> str:
     """The `sotto-bridge://` deep link the Mac app ingests in ONE click — it carries the full host
-    (with https://, so the schemeless-downgrade bug can't happen) and the bearer token, so the user
-    types nothing. Same string doubles as the copy-paste 'pairing code'."""
+    (with https://, so the schemeless-downgrade bug can't happen), the bearer token, and the setup
+    code, so the user types nothing. The setup code rides along because the app's cloud-services
+    card opens the host's /setup page in a browser — a browser sends no bearer, so without the code
+    that click lands on the 403 page. The link is only ever rendered ON the setup page, which the
+    reader could not have opened without the code — same trust context, nothing new exposed. Same
+    string doubles as the copy-paste 'pairing code'; older Bridges ignore the extra param."""
     host = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else ""
-    q = urllib.parse.urlencode({"host": host, "token": MCP_TOKEN})
+    q = urllib.parse.urlencode({"host": host, "token": MCP_TOKEN, "setup": resolve_setup_code()})
     return f"sotto-bridge://pair?{q}"
 
 
@@ -2671,6 +2712,9 @@ def main():
     start_gmail_poll_thread()
     # Deferred-queue release valve (Step 2 item 3): heartbeat thread, channel-health gated per tick.
     start_valve_thread()
+    # The delivery outbox's retry heartbeat: anything the channel didn't acknowledge waits here and
+    # is tried again, until it lands, ages out per its kind, or gives up loudly.
+    OUTBOX.start_drain_thread()
     # "A newer Sotto is published" — one GET a day, flagged on /setup only. No-op on a dev build.
     start_update_check_thread()
     # The shared calendar cache (Step 2 item 2): refreshes cache/calendar_today.json every 15 min

@@ -65,7 +65,9 @@ sx = _load("dd_style_extract", PACK, "_shared", "scripts", "style_extract.py")
 lp = _load("dd_learn_prefs", PACK, "approval-tiers", "scripts", "learn_preferences.py")
 rec = _load("dd_receiver", HERMES, "runtime", "trigger-receiver", "receiver.py")
 cal = _load("dd_calcache", HERMES, "runtime", "trigger-receiver", "calcache.py")
+ob = _load("dd_outbox", HERMES, "runtime", "trigger-receiver", "outbox.py")
 dsh = _load("dd_dashboard", HERMES, "runtime", "trigger-receiver", "dashboard.py")
+att = _load("dd_attachments", PACK, "_shared", "lib", "attachments.py")
 
 ISLAND_RE = re.compile(
     r'<script\s+type="application/json"\s+id="sotto-rules">(.*?)</script>', re.S)
@@ -203,6 +205,27 @@ def test_release_valve():
           rec.VALVE_INTERVAL_SECS_DEFAULT)
 
 
+def test_delivery_outbox():
+    """The outbox's retry numbers, and the one it is not allowed to invent.
+
+    A queued nudge and a held nudge are the same nudge at two different moments, so they must age
+    out on the SAME clock: `outbox.NUDGE_MAX_AGE_MIN` mirrors `triage_event.VALVE_MAX_AGE_MIN` for
+    the same copy-plus-guard reason keys.py and the dashboard's mirrors exist — the receiver image
+    cannot import the skills tree, so the constant is duplicated exactly once and this is what keeps
+    the copies honest. The day-long expiries (a brief, the digest) are a date comparison against the
+    local day, not a number, so there is nothing here for them to drift from."""
+    _same("outbox.drain_interval_secs", R["outbox"]["drain_interval_secs"], ob.DRAIN_INTERVAL_SECS)
+    _same("outbox.backoff_base_secs", R["outbox"]["backoff_base_secs"], ob.BACKOFF_BASE_SECS)
+    _same("outbox.backoff_max_secs", R["outbox"]["backoff_max_secs"], ob.BACKOFF_MAX_SECS)
+    _same("outbox.max_attempts", R["outbox"]["max_attempts"], ob.MAX_ATTEMPTS)
+    _same("outbox.nudge_max_age_min", R["outbox"]["nudge_max_age_min"], ob.NUDGE_MAX_AGE_MIN)
+    _same("outbox.nudge_max_age_min (the funnel's own window)", ob.NUDGE_MAX_AGE_MIN,
+          te.VALVE_MAX_AGE_MIN)
+    _anchor("retries every minute")
+    _anchor("doubling to a fifteen-minute cap")
+    _anchor("older than 240 minutes")
+
+
 def test_calendar_cache_and_staleness():
     _same("calendar.ttl_secs", R["calendar"]["ttl_secs"], cal.CALENDAR_TTL_SECS)
     _same("calendar.stale_intervals", R["calendar"]["stale_intervals"], te.CALENDAR_STALE_INTERVALS)
@@ -319,6 +342,30 @@ def test_chase_and_birthday_cadence():
           _env_default(ps, "SOTTO_BIRTHDAY_LEAD_DAYS"))
 
 
+# ── the attachment lane ─────────────────────────────────────────────────────────────────────────
+
+def test_attachment_caps():
+    """The three caps of the attachment lane, whose ONE owner is `_shared/lib/attachments.py` —
+    gather_google imports them from there rather than declaring its own, so there is exactly one
+    number per cap in the tree and the island states that number."""
+    _same("attachment.per_email", R["attachment"]["per_email"], att.MAX_ATTACHMENTS_PER_EMAIL)
+    _same("attachment.max_bytes", R["attachment"]["max_bytes"], att.MAX_ATTACHMENT_BYTES)
+    _same("attachment.max_chars", R["attachment"]["max_chars"], att.MAX_ATTACHMENT_CHARS)
+    _same("attachment.per_brief", R["attachment"]["per_brief"], att.MAX_ATTACHMENT_CHARS_PER_BRIEF)
+
+
+def test_the_attachment_caps_have_no_second_declaration():
+    """`attachments.py` owns the caps for BOTH the fetch side and the prompt side. A sibling that
+    re-declared one would pass the island check above while quietly enforcing a different number —
+    so the guard is that no other file declares them at all."""
+    for rel in (("_shared", "scripts", "gather_google.py"), ("_shared", "lib", "render_local.py")):
+        with open(os.path.join(PACK, *rel), encoding="utf-8") as f:
+            src = f.read()
+        assert "from attachments import" in src, (rel, "must import the caps, not restate them")
+        assert not re.search(r"^MAX_ATTACHMENT\w*\s*=", src, re.M), (
+            f"{'/'.join(rel)} declares its own attachment cap — attachments.py is the one owner.\n{RULE}")
+
+
 # ── the schedule ────────────────────────────────────────────────────────────────────────────────
 
 def test_cron_line_matches_crons_json():
@@ -370,6 +417,13 @@ def test_how_sotto_decides_states_every_number():
     _anchor(f"`SOTTO_EMAIL_POLL_SECS` (default {_env_default(rec, 'SOTTO_EMAIL_POLL_SECS')}s)")
     _anchor(f"`SOTTO_EVENTS_TICK_SECS`, default {R['intervals']['events_tick_secs']}s")
     _anchor(" · ".join(f"`{c}`" for c in R["classes"]["tier1_nudge"]) + " → nudge")
+    # the attachment lane — the same three numbers the island carries, stated in prose
+    _anchor(f"At most {att.MAX_ATTACHMENTS_PER_EMAIL} converted per email")
+    _anchor(f"{att.MAX_ATTACHMENT_BYTES // 1_000_000} MB per attachment")
+    _anchor(f"{att.MAX_ATTACHMENT_CHARS:,} characters each")
+    _anchor(f"share one {att.MAX_ATTACHMENT_CHARS_PER_BRIEF:,}-character budget")
+    _anchor("An attachment Sotto can read becomes text under its email; "
+            "one it can't is named, never guessed.")
 
 
 # ── the vendored key module, which exists in two processes ──────────────────────────────────────

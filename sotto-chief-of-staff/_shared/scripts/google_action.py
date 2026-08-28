@@ -47,7 +47,10 @@ import sys
 from email.mime.text import MIMEText
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gather_google import _find_google_api  # noqa: E402  (reuse the CLI locator)
+# The CLI locator AND the direct-to-Gmail client, both owned by the read side. Two files talk to the
+# Gmail API without the host CLI — this one for `gmail-draft`, gather_google for the attachment lane
+# — and they authenticate through ONE builder on ONE token file, never two copies of it.
+from gather_google import _find_google_api, _gmail_service, _token_path  # noqa: E402,F401
 
 
 # ── The send gate ────────────────────────────────────────────────────────────────────────────────
@@ -246,28 +249,6 @@ def _rsvp(event_id: str, response: str, calendar: str = "primary", comment: str 
 # ---------------------------------------------------------------------------------------------
 # gmail-draft — the only path that talks to Google directly (see the module docstring for why).
 # ---------------------------------------------------------------------------------------------
-
-def _token_path() -> str:
-    """The google-workspace token file — the SAME one google_api.py authenticates with
-    ($HERMES_HOME/google_token.json, written by its setup.py). "" when Google isn't connected."""
-    for base in (os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"), "/root/.hermes"):
-        if base and os.path.isfile(os.path.join(base, "google_token.json")):
-            return os.path.join(base, "google_token.json")
-    return ""
-
-
-def _gmail_service():
-    """A Gmail client on the host's existing credentials. Scopes are NOT passed (setup.py's own
-    rule: the user may have granted a subset, and passing them makes refresh fail with
-    invalid_scope)."""
-    path = _token_path()
-    if not path:
-        raise RuntimeError("Google isn't connected on this host (no google_token.json)")
-    from google.oauth2.credentials import Credentials  # noqa: PLC0415
-    from googleapiclient.discovery import build        # noqa: PLC0415
-    return build("gmail", "v1", credentials=Credentials.from_authorized_user_file(path),
-                 cache_discovery=False)
-
 
 def _thread_tail(service, thread_id: str) -> dict:
     """The last message's Subject + RFC-822 Message-ID on a thread — what a reply needs to land IN

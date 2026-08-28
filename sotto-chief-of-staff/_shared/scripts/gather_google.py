@@ -31,6 +31,7 @@ Exits 0 even on failure (writes empty files + a WARNING line) so the brief still
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import glob
 import json
@@ -38,6 +39,14 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+
+# The attachment lane's caps and its converter, imported from their OWNER in _shared/lib. The three
+# numbers are defined once, there, and read here — the fetch side and the render side sharing one
+# set of constants is what keeps "3 per email, 8MB, 3,500 chars" from becoming two different claims.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from attachments import (  # noqa: E402
+    MAX_ATTACHMENTS_PER_EMAIL, MAX_ATTACHMENT_BYTES, apply_attachment_budget, convert_attachment,
+)
 
 BODY_FETCH_WORKERS = 5   # concurrent full-body fetches (each its own google_api.py subprocess)
 
@@ -200,8 +209,144 @@ def _fetch_body(api, mid):
         return mid, None
 
 
-def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60):
-    """One Gmail search → normalized rows, with full bodies for the top `bodies` hits."""
+# ── the attachment lane ─────────────────────────────────────────────────────────────────────────
+# An attachment Sotto can read becomes text under its email; one it can't is named, never guessed.
+#
+# WHY THIS DOESN'T GO THROUGH THE HOST CLI — the same reason google_action.py's `gmail-draft`
+# doesn't, and by the precedent that file set: the Hermes `google-workspace` `google_api.py` has no
+# attachments verb (its gmail actions are search/get/send/reply/labels/modify), and that CLI is
+# installed from UPSTREAM, not from this repo — a subcommand added to it would be overwritten by the
+# next image build. Worse, its `gmail get` discards the MIME part tree entirely (it returns only the
+# flattened body), so the filenames aren't reachable through it at any price. The granted token
+# already carries the Gmail read scope, so this reads straight from the Gmail API using the SAME
+# token file the CLI authenticates with. `_gmail_service` below is that one shared client builder;
+# google_action.py imports it from here rather than keeping a second copy.
+#
+# ONE EXTRA CALL, ONLY FOR THE COHORT: one `messages().get(format="full")` per bodies-cohort INBOX
+# message. Attachment bytes that Gmail already inlined cost nothing more; only the ones it hands
+# back as an `attachmentId` need the second `attachments().get`, so an email with no attachments
+# never makes one. The sent lane is skipped entirely — it is style exhaust, not brief content.
+
+
+def _token_path() -> str:
+    """The google-workspace token file — the SAME one google_api.py authenticates with
+    ($HERMES_HOME/google_token.json, written by its setup.py). "" when Google isn't connected."""
+    for base in (os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"), "/root/.hermes"):
+        if base and os.path.isfile(os.path.join(base, "google_token.json")):
+            return os.path.join(base, "google_token.json")
+    return ""
+
+
+def _gmail_service():
+    """A Gmail client on the host's existing credentials. Scopes are NOT passed (setup.py's own
+    rule: the user may have granted a subset, and passing them makes refresh fail with
+    invalid_scope)."""
+    path = _token_path()
+    if not path:
+        raise RuntimeError("Google isn't connected on this host (no google_token.json)")
+    from google.oauth2.credentials import Credentials  # noqa: PLC0415
+    from googleapiclient.discovery import build        # noqa: PLC0415
+    return build("gmail", "v1", credentials=Credentials.from_authorized_user_file(path),
+                 cache_discovery=False)
+
+
+def _attachment_parts(payload) -> list:
+    """Every part of a Gmail MIME tree that carries a filename, depth-first in message order.
+
+    A filename is what makes a part an attachment — an inline text/html alternative has none. The
+    walk is recursive because multipart/mixed wrapping multipart/alternative is the ordinary shape
+    of a real email, and a flat scan of `payload["parts"]` misses everything one level down."""
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    name = str(payload.get("filename") or "").strip()
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    if name:
+        out.append({"filename": name,
+                    "mime": str(payload.get("mimeType") or ""),
+                    "size": int(body.get("size") or 0),
+                    "attachment_id": body.get("attachmentId") or "",
+                    "inline_data": body.get("data") or ""})
+    for part in payload.get("parts") or []:
+        out.extend(_attachment_parts(part))
+    return out
+
+
+def _attachment_bytes(service, mid: str, part: dict) -> bytes:
+    """The part's raw bytes: Gmail's inlined copy when it sent one, otherwise one
+    `attachments().get`. b"" when neither is available."""
+    raw = part.get("inline_data") or ""
+    if not raw and part.get("attachment_id"):
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=str(mid), id=str(part["attachment_id"])).execute()
+        raw = (att or {}).get("data") or ""
+    if not raw:
+        return b""
+    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+
+
+def _fetch_attachments(service, mid: str) -> list:
+    """One message → its attachment rows, ready to hang on the normalized email.
+
+    EVERY attachment is named. The first MAX_ATTACHMENTS_PER_EMAIL that are also under
+    MAX_ATTACHMENT_BYTES are fetched and converted; the rest are named with the reason they weren't
+    ("too large to read", "over the 3-attachment limit"). A message with no attachments costs
+    nothing beyond the one metadata call and returns []."""
+    msg = service.users().messages().get(userId="me", id=str(mid), format="full").execute()
+    parts = _attachment_parts((msg or {}).get("payload") or {})
+    rows, converted = [], 0
+    for part in parts:
+        name = part["filename"]
+        if part["size"] > MAX_ATTACHMENT_BYTES:
+            rows.append({"filename": name, "unreadable": "too large to read"})
+            continue
+        if converted >= MAX_ATTACHMENTS_PER_EMAIL:
+            rows.append({"filename": name,
+                         "unreadable": f"over the {MAX_ATTACHMENTS_PER_EMAIL}-attachment limit"})
+            continue
+        converted += 1
+        try:
+            data = _attachment_bytes(service, mid, part)
+        except Exception:  # noqa: BLE001  (one attachment failing to download names it, nothing more)
+            rows.append({"filename": name, "unreadable": "could not be downloaded"})
+            continue
+        rows.append(convert_attachment(name, data))
+    return rows
+
+
+def _attachments_for(mids: list) -> dict:
+    """{message_id: [attachment rows]} for the bodies-cohort inbox messages that have any.
+
+    NEVER RAISES. Google not connected, the client libs missing, an API error, one bad message —
+    every one of them means the brief runs with fewer attachments, never that the gather dies. That
+    is the fail-toward-silence bar; the brief's own source-availability line is where a broken
+    source speaks up."""
+    if not mids or not _token_path():
+        return {}
+    try:
+        service = _gmail_service()
+    except Exception as e:  # noqa: BLE001
+        _diag(f"[gather_google] attachments unavailable: {e}")
+        return {}
+
+    def _one(mid):
+        try:
+            return mid, _fetch_attachments(service, mid)
+        except Exception:  # noqa: BLE001
+            return mid, []
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(mids))) as ex:
+        for mid, rows in ex.map(_one, mids):
+            if rows:
+                out[mid] = rows
+    return out
+
+
+def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
+                  attachments: bool = False):
+    """One Gmail search → normalized rows, with full bodies for the top `bodies` hits (and, when
+    `attachments` is on, their attachments converted to Markdown under them)."""
     items = _as_list(_run(api, ["gmail", "search", query, "--max", str(max_n)], timeout=timeout))
     # Snippets are thin; fetch full bodies for the top N — CONCURRENTLY (the pattern proven in
     # research_attendees.py). Sequentially this was up to N × 30s of the brief's wall clock.
@@ -213,8 +358,24 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60):
             for mid, msg in ex.map(lambda m: _fetch_body(api, m), mids):
                 if msg is not None:
                     full[mid] = msg
-    return [normalize_email(it, full.get(it.get("id"), {})) for it in items
-            if isinstance(it, dict)]
+    # The attachment lane rides the SAME cohort as the bodies: an email thin enough to be
+    # snippet-only is not one the brief is reading closely enough to need its files. The fetches
+    # run concurrently, then the per-brief budget is spent deterministically in cohort order —
+    # concurrency decides when the bytes arrive, never who gets the budget.
+    atts = _attachments_for(mids) if attachments else {}
+    if atts:
+        budgeted = apply_attachment_budget([atts.get(m) or [] for m in mids])
+        atts = {m: rows for m, rows in zip(mids, budgeted) if rows}
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        e = normalize_email(it, full.get(it.get("id"), {}))
+        got = atts.get(it.get("id"))
+        if got:
+            e["attachments"] = got
+        rows.append(e)
+    return rows
 
 
 # A 1-day search answers in seconds; a 42-day × 400-result backfill (the Golden Corpus) paged past
@@ -231,7 +392,8 @@ def _window_timeout(days: int) -> int:
     return 60 if days <= 1 else BACKFILL_TIMEOUT
 
 
-def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int):
+def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int,
+                  attachments: bool = False):
     """Date-bounded weekly searches (after:/before:, upper bound exclusive), newest first, deduped
     by message id (boundary days overlap on purpose), bodies budget spread across slices so every
     week labels rich — not just the newest."""
@@ -248,7 +410,7 @@ def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int):
     for i, (lo, hi) in enumerate(bounds):
         q = f"{base_query} after:{lo:%Y/%m/%d} before:{hi:%Y/%m/%d}".strip()
         for e in _search_gmail(api, q, max_n, per + (bodies % len(bounds) if i == 0 else 0),
-                               timeout=BACKFILL_TIMEOUT):
+                               timeout=BACKFILL_TIMEOUT, attachments=attachments):
             mid = str(e.get("id") or "")
             if mid and mid in seen:
                 continue
@@ -258,9 +420,10 @@ def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int):
 
 
 def gather_gmail(api, max_n: int, bodies: int, days: int = 1):
+    """The inbox lane — the ONE lane that carries attachments (the sent lane below does not)."""
     if days <= 1:
-        return _search_gmail(api, "newer_than:1d", max_n, bodies)
-    return _sliced_gmail(api, "", max_n, bodies, days)
+        return _search_gmail(api, "newer_than:1d", max_n, bodies, attachments=True)
+    return _sliced_gmail(api, "", max_n, bodies, days, attachments=True)
 
 
 def mark_sent(e: dict) -> dict:
@@ -282,7 +445,11 @@ def mark_sent(e: dict) -> dict:
 
 def gather_sent(api, max_n: int = SENT_MAX, bodies: int = SENT_BODIES, days: int = 1):
     """The user's own outgoing mail from the window — same normalized shape as the inbox rows,
-    with isSent/SENT guaranteed. Failures are the caller's to swallow (the gather never dies on it)."""
+    with isSent/SENT guaranteed. Failures are the caller's to swallow (the gather never dies on it).
+
+    NO ATTACHMENTS, deliberately: this lane exists to teach the style fingerprint the user's email
+    VOICE and to close loops against what they sent. Converting the files they attached to their own
+    mail would cost API calls and prompt budget to tell them what they already know."""
     if days <= 1:
         return [mark_sent(e) for e in _search_gmail(api, "in:sent newer_than:1d", max_n, bodies)]
     return [mark_sent(e) for e in _sliced_gmail(api, "in:sent", max_n, bodies, days)]

@@ -52,6 +52,7 @@ _shared/
   references/approval-tiers.md       # the autonomy policy every skill honors (PORT: approval-policy.ts)
   references/audio-script-prompt.md  # PORT: audio-brief.ts narration (parity C3)
   references/voice.md                # Sotto's voice/persona notes shared by the skills
+  lib/attachments.py                 # email attachments → Markdown, LOCALLY (anydoc); owns the lane's three caps
   lib/brief_validate.py              # deterministic post-hoc brief validator
   lib/chatfmt.py                     # the ONE markdown→chat-text transform (to_chat) every surface shares
   lib/connector_tokens.py            # read/refresh per-service OAuth tokens from the receiver's /setup

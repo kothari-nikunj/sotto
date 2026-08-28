@@ -51,14 +51,15 @@ catches up quietly — old messages go to the digest, never a barrage of stale p
 
 ## Install
 
-About **20 minutes** with the deploy button; ~35 the first time on the manual path — most of it
-waiting on builds. Full walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**.
-The shape:
+About **35 minutes** the first time — only ~15 of it active; the rest is waiting on builds. Full
+walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. The shape:
 
-1. **Deploy the agent** — one click via the Deploy button in [ONBOARDING.md](ONBOARDING.md)
-   (Railway sets up the container, storage, and secrets; you add a
-   [Gemini API key](https://aistudio.google.com/apikey) — the only key Sotto needs — and your
-   WhatsApp number). *WhatsApp and Gemini are the **defaults**, not requirements — Telegram and
+1. **Deploy the agent** on Railway from your own copy of this repo — four settings and four
+   variables, all listed in [ONBOARDING.md § 1](ONBOARDING.md) (a
+   [Gemini API key](https://aistudio.google.com/apikey) is the only key Sotto needs, plus your
+   WhatsApp number, a `/data` volume and a public domain). *A one-click Deploy button is in there
+   too, but no Railway template is published for this repo yet, so it 404s — the manual path is the
+   working one.* *WhatsApp and Gemini are the **defaults**, not requirements — Telegram and
    iMessage delivery, and other models, are a variable each:*
    **[Choosing your channel and model](CHANNELS.md)**.
 2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
@@ -70,9 +71,9 @@ The shape:
    a code once, and it stops streaming to your cloud until you enter one — nothing else is lost
    (pairing, Full Disk Access and your settings all survive), and the same
    [Issues](https://github.com/kothari-nikunj/sotto/issues) link is where you ask for a code.
-   A 3-step wizard
-   in the app covers disk access and privacy toggles. Connect Google + scan the WhatsApp QR on the
-   same setup page.
+   A 3-step wizard in the app then covers **disk access → connect → privacy toggles**, in that
+   order, and nothing is read or sent until you press **Save & Connect** at the end. Connect Google
+   + scan the WhatsApp QR on the same setup page.
 3. **Say "set up Sotto"** in chat. It verifies every connection honestly, seeds its memory and your
    writing voice from ~6 weeks of history, and offers your first brief on the spot.
 
@@ -135,7 +136,7 @@ local material, and the escape hatch) plus how to add a service:
 | [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the five modules, four daemon threads, six subprocess boundaries, and every shared file on the volume |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the six modules, five daemon threads, six subprocess boundaries, and every shared file on the volume |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
 | [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
 | **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — WhatsApp (default) · Telegram · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |

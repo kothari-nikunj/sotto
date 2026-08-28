@@ -2147,6 +2147,40 @@ def test_api_runs_gates_on_the_deliver_once_marker(tmp_path):
         srv.shutdown()
 
 
+def test_api_runs_surfaces_what_the_channel_has_not_acknowledged(tmp_path):
+    """Pending and failed delivery are STATE, not history: the Briefs page reads them off the
+    outbox itself, so "your evening brief is still waiting on WhatsApp" is answerable without
+    digging through the receipts. A quiet outbox reports zeroes and the page renders nothing."""
+    m, srv, base = _server(tmp_path)
+    try:
+        cookie = _login(base)
+        assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
+            "pending": 0, "failed": 0}
+        _write(os.path.join(str(tmp_path), "events", "outbox.json"), json.dumps({"rows": [
+            {"id": "a" * 16, "kind": "brief", "created_at": time.time(), "day": "2026-08-28",
+             "attempts": 2, "next_at": 0, "last_error": "gateway offline", "status": "pending",
+             "payload": {"label": "brief:sotto-evening-brief", "body": "your evening brief"}},
+            {"id": "b" * 16, "kind": "nudge", "created_at": time.time(), "day": "2026-08-28",
+             "attempts": 1, "next_at": 0, "last_error": "", "status": "pending", "payload": {}},
+            {"id": "c" * 16, "kind": "brief", "created_at": time.time(), "day": "2026-08-27",
+             "attempts": 96, "next_at": 0, "last_error": "gave up", "status": "failed",
+             "payload": {}},
+            {"id": "d" * 16, "kind": "nudge", "created_at": time.time(), "day": "2026-08-28",
+             "attempts": 1, "next_at": 0, "last_error": "", "status": "delivered", "payload": {}},
+            {"id": "e" * 16, "kind": "nudge", "created_at": time.time(), "day": "2026-08-28",
+             "attempts": 0, "next_at": 0, "last_error": "", "status": "expired", "payload": {}},
+        ]}))
+        # delivered and expired are closed business; only what is owed and what was lost show
+        assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
+            "pending": 2, "failed": 1}
+        # an unreadable outbox degrades to zeroes — a stat line is never worth a 500
+        _write(os.path.join(str(tmp_path), "events", "outbox.json"), "{not json")
+        assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
+            "pending": 0, "failed": 0}
+    finally:
+        srv.shutdown()
+
+
 def test_post_runs_fires_the_cron_prompt_and_refuses_what_it_reported_closed(tmp_path):
     m, srv, base = _server(tmp_path)
     day = time.strftime("%Y-%m-%d")

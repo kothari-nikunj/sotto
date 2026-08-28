@@ -7,9 +7,21 @@
 #   google-auth*               — its OAuth/transport half. WITHOUT these, google_api.py dies with
 #                                ModuleNotFoundError even though the token is valid, and briefs
 #                                silently fall back to local-only.
+#   firecrawl-anydoc           — the attachment lane's LOCAL document→Markdown converter
+#                                (_shared/lib/attachments.py). PDFs, Office files and CSVs attached
+#                                to inbox mail become text under their email instead of a filename
+#                                the brief has to guess at. It converts IN-PROCESS: `ocr='reject'`
+#                                is its default and the lane never overrides it, so there is no
+#                                hosted-OCR call, no API key, and no new env var — a page of the
+#                                user's mail never leaves the box. Zero runtime dependencies of its
+#                                own (MIT), so this pin adds exactly one wheel.
 #
 # Versions verified against PyPI on 2026-08-12 (each is the version this repo is developed against;
 # every one has cp312 wheels for linux amd64 + arm64, so the image needs no compiler for them).
+# firecrawl-anydoc verified 2026-08-28: it ships abi3 wheels (cp310-abi3), which cover 3.12 —
+# firecrawl_anydoc-0.2.4-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl and the matching
+# …manylinux_2_17_aarch64.manylinux2014_aarch64.whl. Both architectures the image builds for have a
+# binary wheel; nothing here is built from source.
 # requirements-dev.txt pins the SAME pyyaml + google-api-python-client for the test lanes — one
 # version of a library across CI and the image, or a green suite proves nothing about the container.
 pyyaml==6.0.1
@@ -17,3 +29,4 @@ google-api-python-client==2.198.0
 google-auth==2.56.3
 google-auth-oauthlib==1.4.0
 google-auth-httplib2==0.4.1
+firecrawl-anydoc==0.2.4

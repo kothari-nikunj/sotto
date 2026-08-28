@@ -137,6 +137,8 @@
   "cooldown":   { "min": 20 },
   "budget":     { "nudge_per_day": 4 },
   "valve":      { "max_per_tick": 2, "max_per_hour": 2, "max_age_min": 240 },
+  "outbox":     { "drain_interval_secs": 60, "backoff_base_secs": 60, "backoff_max_secs": 900,
+                  "max_attempts": 96, "nudge_max_age_min": 240 },
   "digest":     { "min_signals": 8 },
   "ledger":     { "max_mb": 4, "keep_lines": 4000 },
   "style":      { "confirmed_floor": 0.95,
@@ -145,6 +147,7 @@
   "continuity": { "deadline_grace_days": 2, "terminal_retention_days": 30 },
   "chase":      { "after_days": 3, "max": 2 },
   "birthday":   { "lead_days": 3 },
+  "attachment": { "per_email": 3, "max_bytes": 8000000, "max_chars": 12000, "per_brief": 60000 },
   "classes":    {
     "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
     "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
@@ -219,12 +222,13 @@
 /* ═══════════════ the island, and the one function that reads it ═══════════════ */
 const R = JSON.parse(document.getElementById('sotto-rules').textContent);
 
-/** `{group.key}` -> the island's value. Formats: :min (secs->min), :pct, :word, :slash, :list. */
+/** `{group.key}` -> the island's value. Formats: :min (secs->min), :mb (bytes->MB), :pct, :word, :slash, :list. */
 function fill(s){
   return String(s).replace(/\{([a-z_]+)\.([a-z_]+)(?::([a-z]+))?\}/g, function(m,g,k,fmt){
     var v = (R[g]||{})[k];
     if (v === undefined) return m;
     if (fmt === 'min')   return String(Math.round(v/60));
+    if (fmt === 'mb')    return String(Math.round(v/1000000));
     if (fmt === 'pct')   return String(Math.round(v*100));
     if (fmt === 'word')  return ['zero','one','two','three','four','five','six','seven'][v] || v;
     if (fmt === 'slash') return Object.keys(v).map(function(x){return v[x];}).join('/');
@@ -255,7 +259,8 @@ const N = [
    pts:['Notes and Reminders: the last 7 days and the next 3','Contacts are what turn a phone number into a name','Every source sits behind its own consent toggle']},
   {id:'gmail', l:'Gmail', s:'gather_google.py', x:196, w:118, layer:'sources',
    k:'Google', file:'_shared/scripts/gather_google.py',
-   d:'<p>Mail, gathered by deterministic Python — never by the agent. Agent-driven fetching is the number-one historical failure mode of this system.</p><p>The gather also runs a small <code>in:sent</code> lane, which is what teaches the style fingerprint your email voice.</p>'},
+   d:'<p>Mail, gathered by deterministic Python — never by the agent. Agent-driven fetching is the number-one historical failure mode of this system.</p><p>The gather also runs a small <code>in:sent</code> lane, which is what teaches the style fingerprint your email voice.</p><p><strong>Bodies are not the whole email.</strong> For the same top messages that get a full body, the inbox lane also fetches their <strong>attachments</strong> and converts them to Markdown <em>locally</em> — so the brief reasons over the deck the thread is about, not just its filename.</p>',
+   pts:['<b>An attachment Sotto can read becomes text under its email; one it can\'t is named, never guessed</b>','{attachment.per_email} converted per email · {attachment.max_bytes:mb} MB fetch cap · {attachment.max_chars} characters each, sharing one {attachment.per_brief}-character budget per brief spent in email order','Scanned, encrypted and oversized files are NAMED, never read — conversion is in-process, and there is no hosted-OCR path to turn on','Inbox only: the <code>in:sent</code> lane carries no attachments, and the interrupt funnel never opens one']},
   {id:'gcal', l:'Calendar', s:'gather_google.py', x:330, w:142, layer:'sources',
    k:'Google', file:'runtime/trigger-receiver/calcache.py',
    d:'<p>The same gather with Gmail skipped, run on a timer and cached for {calendar.ttl_secs:min} minutes. <strong>One calendar cache, not two</strong> — the dashboard and the funnel\'s in-meeting hold read the same snapshot, because two caches is how drift starts.</p>'},
@@ -330,7 +335,7 @@ const N = [
   // ── the skills spine ──
   {id:'s-gather', l:'gather', s:'deterministic Python', x:30, w:150, layer:'skills',
    k:'Spine 01', file:'_shared/scripts/gather_google.py',
-   d:'<p>Scripts, never the agent. Gmail and Calendar through the workspace CLI, Granola over MCP, the Mac\'s messages and calls through the Bridge, and attendee research through the search ladder.</p>'},
+   d:'<p>Scripts, never the agent. Gmail and Calendar through the workspace CLI, Granola over MCP, the Mac\'s messages and calls through the Bridge, and attendee research through the search ladder.</p><p>Two reads go <em>straight</em> to Google rather than through the host CLI, because that CLI is installed from upstream and lacks the verb: the Gmail draft, and the <strong>attachment lane</strong> (its <code>gmail get</code> discards the MIME part tree entirely). Both authenticate through one builder on the one token file.</p>'},
   {id:'s-compose', l:'compose', s:'one Gemini call', x:196, w:150, layer:'skills',
    k:'Spine 02', file:'_shared/scripts/compose_brief.py',
    d:'<p>One model call turns the packed context into prose and actions. It receives prior knowledge, the open-loop ledger, today\'s research, and — for the evening brief — the nudges you already got today, so it cannot re-tell them as news.</p><p><strong>The LLM writes prose. It never decides whether to interrupt you.</strong></p>'},
@@ -482,7 +487,8 @@ const SHARED_FILES = [
   ["events/queue.jsonl · events/surfaced.jsonl", "skills (triage_event.py)", "dashboard (the Record + the waiting room), skills (compose_brief.py)"],
   ["events/drafts.jsonl", "skills (action_links.py — every tap link built with a draft)", "skills (draft_outcomes.py, run inside learn_preferences.py each brief)"],
   ["events/delivery.jsonl", "receiver (the ONE writer)", "dashboard (the Record, source: delivery) — closing rows carry a usage object"],
-  ["events/delivery-effects-&lt;run&gt;.json", "skills (proactive_scan.py, one receiver-scoped run)", "receiver — apply after successful send, then delete"],
+  ["events/outbox.json", "outbox.py (the ONE writer)", "receiver (the retry drain), dashboard (/api/runs pending·failed) — written before the first send attempt, flipped to delivered only on the channel's ack"],
+  ["events/delivery-effects-&lt;run&gt;.json", "skills (proactive_scan.py, one receiver-scoped run)", "receiver — carried on the outbox row, applied once the message is acknowledged, then deleted"],
   ["events/sends.jsonl", "skills (google_action.py)", "you — one line per send/reply attempt, allowed or refused"],
   ["cache/calendar_today.json", "calcache", "skills (the in-meeting hold)"],
   ["cache/meeting_taps.json", "calcache", "calcache (exactly-once tap record)"],
@@ -507,7 +513,8 @@ const SHARED_FILES = [
   ["proactive/pending_offer.json", "skills (pending_offer.py set — the ONE writer, the proactive lane after a push that asked something)", "the gateway (get, then clear) — the bare &quot;sure&quot; lands in a session that never saw the question; one offer, newest wins, 180 min"],
   ["intentions.jsonl", "skills (schedule_wakeup.py)", "skills (proactive_scan.py), dashboard (/api/cadence) — one-shot recipes, optionally tied to an open loop"],
   ["hermes/platforms/whatsapp/session/creds.json", "the Hermes gateway (not Sotto)", "receiver (_whatsapp_status) — the positive linked probe"],
-  ["whatsapp-pairing.txt · google-auth-url.txt", "pairing / start.sh", "receiver"]
+  ["whatsapp-pairing.txt · google-auth-url.txt", "pairing / start.sh", "receiver"],
+  ["telegram-link.json", "telegram_link.py (the Telegram setup CLI, run by hand)", "nobody yet — the handoff for the planned /setup Telegram tile; holds the bot token, so 0600, and start.sh still configures the gateway from the Railway variables"]
 ];
 
 const SHARED_WRITE_ROW = ["preferences.json", "skills <em>and</em> dashboard", "skills, dashboard"];

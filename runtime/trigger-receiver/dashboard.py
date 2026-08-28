@@ -119,6 +119,10 @@ HOOKS = {
     "delivery_channel": lambda: "whatsapp",
     "delivery_ready": lambda: False,
     "whatsapp_status": lambda: "pairing",
+    # {pending, failed} from the delivery outbox (outbox.counts) — what Sotto has said but the
+    # channel has not yet acknowledged, and what it eventually gave up on. Unwired → zeroes, which
+    # render as nothing at all: a quiet outbox is the normal state and deserves no furniture.
+    "outbox_counts": lambda: {"pending": 0, "failed": 0},
     # "A newer Sotto is published" for the Today banner: the receiver's daily update check, already
     # freshness-gated (receiver.update_notice). Unwired, or a check that has stopped succeeding →
     # {"available": False} and the banner simply isn't rendered.
@@ -1657,7 +1661,23 @@ def api_runs() -> dict:
         else:
             job["at"] = _digest_window_at()
         jobs.append(job)
-    return {"jobs": jobs, "channel": _s(_hook_str("delivery_channel")) or "whatsapp"}
+    return {"jobs": jobs, "channel": _s(_hook_str("delivery_channel")) or "whatsapp",
+            "outbox": _outbox_counts()}
+
+
+def _outbox_counts() -> dict:
+    """{pending, failed} from the outbox — what has been said but not yet acknowledged by the
+    channel, and what it gave up on. Read from the outbox itself rather than from the delivery
+    receipts, because the receipts are history and this is what is still owed to you."""
+    try:
+        raw = HOOKS["outbox_counts"]() or {}
+    except Exception:  # noqa: BLE001 — a stat line is never worth a 500 on the Briefs page
+        raw = {}
+    out = {}
+    for field in ("pending", "failed"):
+        value = raw.get(field) if isinstance(raw, dict) else None
+        out[field] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return out
 
 
 def _digest_window_at():

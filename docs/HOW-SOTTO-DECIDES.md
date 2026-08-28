@@ -42,6 +42,51 @@ process. Its nudges pass the rules below in the order below — quiet hours, the
 the in-meeting hold, the daily budget, the digest queue, and the same ledger row per verdict,
 including for the ones the clock suppressed — because they are the same code, not a second copy.
 
+## Attachments — what the brief reads, and what it only names
+
+**An attachment Sotto can read becomes text under its email; one it can't is named, never guessed.**
+
+Until this lane existed the gather fetched email *bodies* only, so the deck the whole thread was
+about was invisible: Sotto would write "Dana sent the Q3 deck" without ever having opened the Q3
+deck. Now the files on the mail it is already reading closely get converted to Markdown and rendered
+under their email, and the ones it cannot open are listed by name so the brief never writes about a
+document nobody read.
+
+Four bounds, and they are the whole rule:
+
+- **The bodies cohort only, inbox only.** Attachments are fetched for the same top emails that get a
+  full body (`--bodies`, default 12) and for the inbox lane alone. An email thin enough to be
+  snippet-only is not one the brief is reading closely enough to need its files, and the `in:sent`
+  lane is style exhaust — converting the files you attached to your own mail would tell you what you
+  already know.
+- **At most 3 converted per email** (`attachments.MAX_ATTACHMENTS_PER_EMAIL`). *Every* filename is
+  still listed; the cap bounds how many get read, not how many the brief knows about, because "there
+  were two more files" is itself information.
+- **8 MB per attachment** (`attachments.MAX_ATTACHMENT_BYTES`) — bigger ones are named without ever
+  being downloaded, so one video attachment can't spend the brief's whole wall clock.
+- **12,000 characters each** (`attachments.MAX_ATTACHMENT_CHARS`), truncated with a visible
+  `… [truncated]` tail so the model knows it is reading an excerpt. That is a whole deck or a
+  contract's operative sections — the cap bounds the pathological document, not the ordinary one.
+- **A day's attachments share one 60,000-character budget**
+  (`attachments.MAX_ATTACHMENT_CHARS_PER_BRIEF`), spent in email order: one document can be read
+  whole, ten documents can't blow up the prompt. The document that crosses the line is truncated
+  to what remains; everything after it is named with *"the brief's attachment budget is spent"* —
+  told, never silently thinner.
+
+**Conversion is local, and there is no second option.** It runs in-process through `anydoc`, whose
+`ocr='reject'` default is never overridden anywhere in the lane. So a **scanned** PDF is named
+*"scanned document — no local text"*, an **encrypted** one *"password-protected"*, an **oversized**
+one *"too large to read"*, and an image *"image — not converted"* — named, never read, and never
+sent anywhere to be made readable. There is no hosted-OCR path, no API key, and no environment
+variable to turn one on; the three caps above are named constants in
+`_shared/lib/attachments.py`, which owns them for both the fetch side and the prompt side.
+
+Attachment text is **untrusted content**, exactly like a message body: it is rendered into the
+brief's data section for the writing model to summarize, and it reaches no gate. Nothing inside a
+PDF can spend the interrupt budget, buy a mute back, or skip quiet hours — the funnel below never
+opens an attachment at all. Deciding whether to ring you is made on metadata, and this lane is the
+brief's, not the funnel's.
+
 ## Who can produce a nudge
 
 Seven things in the whole system can start a nudge. Each one is listed here with the function that
@@ -214,6 +259,30 @@ The digest window is anchored to the brief that actually *delivered* — the del
 morning brief just covered. Briefs and nudges are always **drafts**; Sotto never sends for you — a
 Gmail draft is the most literal version of that promise, since it sits in your own drafts folder
 until you press send.
+
+## Delivery — what happens after Sotto decides to say something
+
+**Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn
+instead of dying.** Deciding to send and actually sending are two facts, and the second one used to
+be a hope: a gateway that was down for ninety seconds threw away the words, the interrupt budget
+and the tokens that produced them, and left an honest "failed" receipt in place of the message.
+
+So every message Sotto composes is written down — with its own id — **before** the first send
+attempt, and only the channel's acknowledgement moves it to delivered. Anything else waits and is
+tried again: the outbox retries every minute, backing off 1 → 2 → 4 minutes and doubling to a
+fifteen-minute cap, and the same message is never sent twice (the id is the words themselves, so a
+repeated attempt is recognised as the same message rather than a second one).
+
+Waiting is not forever, and how long depends on what it is:
+
+| | Waits until | Then |
+|---|---|---|
+| A nudge | it is older than 240 minutes — the same window the release valve refuses to promote a held nudge past | it is dropped, and the reason is written to the Record. A *"meeting in 10 minutes"* ping delivered an hour late is worse than silence |
+| A morning or evening brief (and the weekly pulse) | the end of its local day | it **fails visibly** — a day with no brief is something you should be told about |
+| The midday digest | the end of its local day, which ends before the next digest window opens | it is dropped: tomorrow's digest covers what it would have said |
+
+Nothing is thrown away quietly: every failure and every expiry is a row in the Record with its
+reason, and the Briefs page carries a line whenever anything is still waiting or has given up.
 
 ## Where to see what happened
 

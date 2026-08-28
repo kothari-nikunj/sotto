@@ -20,7 +20,7 @@ owns each of them, and you can enter the system at any stage:
 
 | Stage | Owner | In one sentence |
 |---|---|---|
-| **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. |
+| **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. |
 | **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Deterministic checks reject a malformed or hallucinated brief, and back the still-open appendix, before you ever see it. |
 | **deliver** | [`_shared/scripts/brief_marker.py`](../sotto-chief-of-staff/_shared/scripts/brief_marker.py) (the deliver-once claim; the host's gateway sends) | Exactly one process wins the claim and delivers; the loser discards its draft. |
@@ -29,6 +29,19 @@ owns each of them, and you can enter the system at any stage:
 **The LLM writes prose — it never decides *whether* to interrupt you.** That decision is the
 event-triage funnel, documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
 the seven things that can start a nudge are the producer table at the top of that page.
+
+**Two reads bypass the host CLI, on one shared client.** The Hermes `google-workspace`
+`google_api.py` is installed from upstream, not from this repo, and it lacks two verbs this system
+needs: a Gmail *draft* (`google_action.py`), and message *attachments* — its `gmail get` flattens
+the message to a body and discards the MIME part tree, so filenames aren't reachable through it at
+any price. Both go straight to the Gmail API on the SAME `google_token.json` the CLI authenticates
+with, through one builder — `gather_google._gmail_service`, which `google_action.py` imports rather
+than copying. The attachment half converts what it fetched through
+[`_shared/lib/attachments.py`](../sotto-chief-of-staff/_shared/lib/attachments.py), the owner of the
+lane's three caps for both the fetch side and the prompt side: *an attachment Sotto can read becomes
+text under its email; one it can't is named, never guessed.* Conversion is in-process and local —
+no hosted OCR, no API key, no env var (see [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md) §
+*Attachments*).
 
 ### The open-loop path — input to outcome
 
@@ -67,9 +80,9 @@ and the **trigger receiver** (a stdlib HTTP server on `$PORT`). `adapters/hermes
 the receiver first so Railway's `/health` answers within seconds, then boots Hermes. They share
 exactly one thing: the `$SOTTO_DATA` volume.
 
-## The five modules
+## The six modules
 
-All under `runtime/trigger-receiver/`, all stdlib-only. `receiver.py` loads the other four with
+All under `runtime/trigger-receiver/`, all stdlib-only. `receiver.py` loads the other five with
 `importlib` and injects `HOOKS` — late-bound lambdas over its own globals — so no module ever
 imports the receiver back.
 
@@ -79,15 +92,16 @@ imports the receiver back.
 | `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
 | `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel) |
 | `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_json`, the one atomic-write helper the whole image uses** |
+| `outbox.py` | The durable delivery outbox — `events/outbox.json`, the idempotency key, the retry backoff, the per-kind expiry, and the drain heartbeat. **Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn instead of dying.** |
 | `relay.py` | The reverse-MCP relay: the Mac long-polls `/bridge/poll`, Hermes calls `/mcp` locally, no tunnel |
 
-A sixth file sits in that directory and is **not** a module: `keys.py` is a byte-identical vendored
+A seventh file sits in that directory and is **not** a module: `keys.py` is a byte-identical vendored
 copy of `_shared/lib/keys.py`. The two runtimes must compute the same ids (`queue_key`,
 `sample_hash`) for "nudge me now" and the Voice card to address the right row, and the receiver
 image has to render those surfaces with no skills tree on the box — so it copies rather than
 imports, and `tests/test_docs_drift.py` fails the suite the moment the copies diverge.
 
-## The four daemon threads
+## The five daemon threads
 
 Every one is a `daemon=True` loop that swallows its own exceptions — a thread must never die and
 never take the server with it.
@@ -96,6 +110,7 @@ never take the server with it.
 |---|---|---|
 | Gmail poll (`receiver.start_gmail_poll_thread`) | `SOTTO_EMAIL_POLL_SECS`, default 90s | Claims nothing while polling; feeds new mail through the same funnel as Bridge events, then acknowledges ids only after the receiver durably accepts them |
 | Release valve (`receiver.start_valve_thread`) | `receiver.VALVE_INTERVAL_SECS_DEFAULT` = 900s | Forks `triage_event.py --valve` so a nudge held during cooldown/quiet/catchup can still get out |
+| Delivery outbox drain (`outbox.start_drain_thread`) | `outbox.DRAIN_INTERVAL_SECS` = 60s | Retries every message the channel hasn't acknowledged — backoff doubling from 60s to a 900s cap, then `failed` (a brief, loudly, when its local day ends) or `expired` (a nudge past 240 min, the same window the valve refuses to promote in). `SOTTO_OUTBOX=0` turns the heartbeat off; nothing is ever sent unrecorded either way |
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
 
@@ -123,7 +138,11 @@ the crons are registered with. It used to be fire-and-forget on the belief that 
 delivered itself; `-z` prints to stdout, so five of the six nudge producers were writing to a
 sink (Aug 2026). Starting it is synchronous — a missing runner still raises, because
 `handle_trigger` releases its brief claim on that — and only the outcome is asynchronous, which
-is why it leaves a receipt in `events/delivery.jsonl`. Silence is a token, not a hope: a spawned
+is why it leaves a receipt in `events/delivery.jsonl`. That send is the ONE path outward, so it is
+also where the outbox sits: `receiver._deliver_text` writes the row and its idempotency key BEFORE
+the first attempt and flips it to `delivered` only on the channel's ack (`hermes send` exiting 0 —
+the strongest ack this seam has; `receiver._send_via_channel` is the one function a channel with a
+real receipt would strengthen). A failed send is now queued, not lost. Silence is a token, not a hope: a spawned
 run with nothing to deliver replies the `NO_NUDGES` sentinel, which the seam records as an empty
 run instead of sending — "say nothing and end the turn" was an instruction models reliably
 ignored, and three "all clear" messages in one evening proved it (Aug 2026).
@@ -162,7 +181,8 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads only verdicts whose `decision_id` has a delivered receipt) |
 | `events/drafts.jsonl` | skills (`action_links.py` — every tap link built with a draft) | skills (`draft_outcomes.py`, run inside `learn_preferences.py` each brief: matched against the queue's `is_from_me` signals → outcomes.jsonl + style confirms) |
 | `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage` and correlated `decision_ids` |
-| `events/delivery-effects-<run>.json` | skills (`proactive_scan.py`, one receiver-scoped run) | receiver — ephemeral chase/handoff effects, applied only after successful send and then deleted |
+| `events/outbox.json` | `outbox.py` (the ONE writer) | receiver (the retry drain), dashboard (`/api/runs` — the pending/failed line) — one row per message Sotto composed, written BEFORE the first send attempt and flipped to `delivered` only on the channel's ack |
+| `events/delivery-effects-<run>.json` | skills (`proactive_scan.py`, one receiver-scoped run) | receiver — ephemeral chase/handoff effects, carried on the outbox row and applied only once the message is acknowledged, then deleted |
 | `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per send/reply **attempt**, allowed or refused, so "what did Sotto send?" isn't answered by a prompt's promise |
 | `cache/calendar_today.json` | calcache | skills (`triage_event.py` in-meeting hold) |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
@@ -188,6 +208,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `intentions.jsonl` | skills (`schedule_wakeup.py`) | skills (`proactive_scan.py`), dashboard (`/api/cadence`) — append-only one-shot recipes, folded by id; an optional loop anchor cancels the recipe when the loop closes |
 | `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
+| `telegram-link.json` | `telegram_link.py` (the Telegram setup CLI, run by hand — [CHANNELS.md](../CHANNELS.md) § Telegram setup) | **nobody yet** — the handoff for the planned `/setup` Telegram tile (ROADMAP § Front Door). It holds the bot token, so 0600; `start.sh` configures the gateway from the Railway variables, never from this file |
 | **`preferences.json`** | **skills *and* dashboard** | skills, dashboard |
 
 Every row but the last is **one-way**: exactly one writer, and readers that never write. That is the

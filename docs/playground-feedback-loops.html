@@ -125,6 +125,8 @@
   "cooldown":   { "min": 20 },
   "budget":     { "nudge_per_day": 4 },
   "valve":      { "max_per_tick": 2, "max_per_hour": 2, "max_age_min": 240 },
+  "outbox":     { "drain_interval_secs": 60, "backoff_base_secs": 60, "backoff_max_secs": 900,
+                  "max_attempts": 96, "nudge_max_age_min": 240 },
   "digest":     { "min_signals": 8 },
   "ledger":     { "max_mb": 4, "keep_lines": 4000 },
   "style":      { "confirmed_floor": 0.95,
@@ -133,6 +135,7 @@
   "continuity": { "deadline_grace_days": 2, "terminal_retention_days": 30 },
   "chase":      { "after_days": 3, "max": 2 },
   "birthday":   { "lead_days": 3 },
+  "attachment": { "per_email": 3, "max_bytes": 8000000, "max_chars": 12000, "per_brief": 60000 },
   "classes":    {
     "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
     "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
@@ -194,6 +197,7 @@ function fill(s){
     var v = (R[g]||{})[k];
     if (v === undefined) return m;
     if (fmt === 'min')   return String(Math.round(v/60));
+    if (fmt === 'mb')    return String(Math.round(v/1000000));
     if (fmt === 'pct')   return String(Math.round(v*100));
     if (fmt === 'word')  return ['zero','one','two','three','four','five','six','seven'][v] || v;
     if (fmt === 'slash') return Object.keys(v).map(function(x){return v[x];}).join('/');

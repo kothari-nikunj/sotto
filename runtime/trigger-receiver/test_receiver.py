@@ -37,14 +37,18 @@ def test_enqueue_failure_leaves_no_delivered_flag(tmp_path, monkeypatch):
     assert not os.path.exists(rec.delivered_flag("2026-06-23", "morning"))
 
 
-def test_pairing_link_carries_scheme_host_and_token(monkeypatch):
+def test_pairing_link_carries_scheme_host_token_and_setup_code(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "SETUP_CODE", "sc456")
     link = rec.pairing_link()
     assert link.startswith("sotto-bridge://pair?")
     # full https host (prevents the schemeless-downgrade bug) + the bearer, both URL-encoded
     assert "host=https%3A%2F%2Fmyapp.up.railway.app" in link
     assert "token=tok123" in link
+    # the /setup access code rides along so the Bridge's cloud-services card can open /setup in a
+    # browser (which sends no bearer) without landing on the 403 page
+    assert "setup=sc456" in link
 
 
 def test_exchange_google_code_rejects_empty():
@@ -2493,15 +2497,20 @@ def test_toolsets_are_scoped_only_when_asked_and_only_for_hermes(tmp_path, monke
     And a foreign runner (SOTTO_RUN_SKILL can be an OpenClaw command) never sees hermes' flags."""
     rec.DATA = str(tmp_path)
     runs = _capture_oneshot(monkeypatch, rec)
+    # The SKILL runs, not the sends: identical text under the identical label is ONE message to the
+    # outbox, so the send only happens on the first pass — which is the point of the idempotency
+    # key, and no business of this test.
+    def spawns():
+        return [r for r in runs if r["argv"][:2] != ["hermes", "send"]]
     _run_oneshot(rec, ["hermes", "-z"])
-    assert "-t" not in runs[0]["argv"]                                  # unset → unchanged argv
+    assert "-t" not in spawns()[0]["argv"]                              # unset → unchanged argv
     monkeypatch.setenv("SOTTO_SPAWN_TOOLSETS", "sotto-local,google-workspace")
     _run_oneshot(rec, ["hermes", "-z"])
-    argv = runs[2]["argv"]
+    argv = spawns()[1]["argv"]
     assert argv[argv.index("-t") + 1] == "sotto-local,google-workspace"
     assert argv[-1] == "run it"                                         # the prompt stays last
     _run_oneshot(rec, ["openclaw", "run"])
-    assert "-t" not in runs[4]["argv"] and "--usage-file" not in runs[4]["argv"]
+    assert "-t" not in spawns()[2]["argv"] and "--usage-file" not in spawns()[2]["argv"]
 
 
 def test_spawn_argv_survives_a_real_argparse_hermes(tmp_path, monkeypatch):
@@ -2522,7 +2531,7 @@ def test_spawn_argv_survives_a_real_argparse_hermes(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_SPAWN_TOOLSETS", "sotto-local")
     delivered = []
     monkeypatch.setattr(rec, "_deliver_text",
-                        lambda text, label, usage=None, decision_ids=None:
+                        lambda text, label, usage=None, decision_ids=None, effects=None:
                         (delivered.append(text), True)[1])
     _run_oneshot(rec, [fake, "-z"])
     rows = _delivery_rows(tmp_path)
@@ -2693,3 +2702,264 @@ def test_spawn_prompts_teach_the_silence_sentinel(tmp_path, monkeypatch):
     rec.run_event_skill(b)
     assert all(rec.SILENCE_SENTINEL in p for p in prompts) and len(prompts) == 2
     assert "all clear" in prompts[0]  # the failure mode is named, not implied
+
+
+# ── the durable delivery outbox (ROADMAP § Reliability P0 item 2) ────────────────────────────────
+# "Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn
+# instead of dying." The receipts above made a lost nudge honest; these make it not lost. Every
+# lane reaches the channel through _deliver_text, so the outbox wraps exactly that call: the row
+# and its idempotency key are written BEFORE the first send attempt, and only the channel's ack
+# (`hermes send` exiting 0) moves it to delivered.
+
+def _outbox_rows(tmp_path):
+    path = os.path.join(str(tmp_path), "events", "outbox.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return (json.load(f) or {}).get("rows") or []
+
+
+def _channel(monkeypatch, *results):
+    """Stub THE channel call with a scripted list of (ok, detail) answers, recording each body.
+    A shorter script repeats its last answer — most tests only care about "always fails"."""
+    sent = []
+    answers = list(results) or [(True, "")]
+
+    def fake_send(body, target):
+        sent.append({"body": body, "target": target})
+        return answers[min(len(sent) - 1, len(answers) - 1)]
+
+    monkeypatch.setattr(rec, "_send_via_channel", fake_send)
+    return sent
+
+
+def _no_backoff(monkeypatch):
+    """Every retry is due immediately — the backoff arithmetic has its own test below."""
+    monkeypatch.setattr(rec.OUTBOX, "backoff_secs", lambda attempts: 0)
+
+
+def test_the_row_is_on_file_before_the_channel_is_ever_asked(tmp_path, monkeypatch):
+    """The ordering that makes the whole thing durable: if the box dies mid-send, the words are
+    already written down. Simulated by crashing INSIDE the send and reading the volume from there."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    during = []
+
+    def crash_mid_send(body, target):
+        during.append(_outbox_rows(tmp_path))
+        raise RuntimeError("the box died mid-send")
+
+    monkeypatch.setattr(rec, "_send_via_channel", crash_mid_send)
+    assert rec._deliver_text("Ashton needs the deck by 4", "event") is False
+    # the row existed, with its attempt already charged, while the channel was being asked
+    (row,) = during[0]
+    assert row["status"] == "pending" and row["attempts"] == 1
+    assert row["payload"]["body"] == "Ashton needs the deck by 4"
+    # …and it is STILL pending afterwards: a send that raised is a send that failed, not a loss
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["pending"]
+
+    # the drain is what finishes the job the dead process started
+    sent = _channel(monkeypatch)
+    assert rec.OUTBOX.drain() == {"attempted": 1, "delivered": 1}
+    assert [s["body"] for s in sent] == ["Ashton needs the deck by 4"]
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["delivered"]
+
+
+def test_an_acknowledged_message_is_delivered_exactly_once(tmp_path, monkeypatch):
+    """Two drains over the same volume must not produce two messages. The transition is inside the
+    locked read-modify-write, so a row that is already terminal is simply not claimed again."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    sent = _channel(monkeypatch, (True, ""))
+    assert rec._deliver_text("your morning brief", "brief:sotto-morning-brief") is True
+    assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0}
+    assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0}
+    assert len(sent) == 1, "the channel was asked twice for one message"
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["delivered"]
+    assert [r["status"] for r in _delivery_rows(tmp_path)] == ["delivered"]
+
+
+def test_a_duplicate_enqueue_of_the_same_message_is_a_no_op(tmp_path, monkeypatch):
+    """The idempotency key IS the message: same label, same words, same key. A lane that re-fires
+    (a retried trigger, a replayed wake) adds nothing and sends nothing."""
+    rec.DATA = str(tmp_path)
+    sent = _channel(monkeypatch, (True, ""))
+    assert rec._deliver_text("Dana replied about the invoice", "event") is True
+    assert rec._deliver_text("Dana replied about the invoice", "event") is False
+    assert len(_outbox_rows(tmp_path)) == 1 and len(sent) == 1
+    # …but a DIFFERENT message under the same label is a different message
+    assert rec._deliver_text("Dana replied again", "event") is True
+    assert len(_outbox_rows(tmp_path)) == 2 and len(sent) == 2
+
+
+def test_a_failed_attempt_says_it_is_queued_and_the_drain_keeps_trying(tmp_path, monkeypatch):
+    """A failed send is no longer a lost message, and the receipt has to say which it is: the
+    Record must never read 'failed' as 'gone' while the drain is still working on it."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    sent = _channel(monkeypatch, (False, "gateway offline"), (False, "gateway offline"), (True, ""))
+    assert rec._deliver_text("a real ask from Alberto", "event") is False
+    assert _outbox_rows(tmp_path)[0]["attempts"] == 1
+    assert "queued, retry 1/" in _delivery_rows(tmp_path)[0]["detail"]
+    assert rec.OUTBOX.drain() == {"attempted": 1, "delivered": 0}
+    assert rec.OUTBOX.drain() == {"attempted": 1, "delivered": 1}
+    assert len(sent) == 3
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["delivered"]
+    assert [r["status"] for r in _delivery_rows(tmp_path)] == ["failed", "failed", "delivered"]
+
+
+def test_max_attempts_gives_up_loudly_and_the_dashboard_can_see_it(tmp_path, monkeypatch, capsys):
+    """The backstop under every expiry: a channel that has refused the same message MAX_ATTEMPTS
+    times is broken, not busy — so the row goes `failed`, says how many tries it took, and is
+    counted where a person will see it. Never silent."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    monkeypatch.setattr(rec.OUTBOX, "MAX_ATTEMPTS", 3)
+    sent = _channel(monkeypatch, (False, "no route to host"))
+    rec._deliver_text("Ali called twice", "event")
+    assert rec.OUTBOX.counts() == {"pending": 1, "failed": 0}
+    rec.OUTBOX.drain()
+    rec.OUTBOX.drain()
+    assert len(sent) == 3
+    (row,) = _outbox_rows(tmp_path)
+    assert row["status"] == "failed" and row["attempts"] == 3
+    assert "gave up after 3 attempts" in _delivery_rows(tmp_path)[-1]["detail"]
+    assert "delivery FAILED" in capsys.readouterr().out
+    assert rec.OUTBOX.counts() == {"pending": 0, "failed": 1}
+    # a terminal row is never claimed again, however many drains run over it
+    assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0} and len(sent) == 3
+
+
+def _plant(tmp_path, monkeypatch, kind, label, *, age_secs=0, day=None):
+    """One pending row, aged to order, without waiting for the clock."""
+    rec.DATA = str(tmp_path)
+    path = os.path.join(str(tmp_path), "events", "outbox.json")
+    if os.path.exists(path):
+        os.unlink(path)                       # one planted row per call, whatever ran before
+    sent = _channel(monkeypatch, (False, "gateway offline"))
+    rec._deliver_text(f"{label} body", label)
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    row = doc["rows"][0]
+    assert row["kind"] == kind, f"{label!r} should be a {kind}, not a {row['kind']}"
+    row.update({"created_at": time.time() - age_secs, "next_at": 0, "attempts": 0})
+    if day is not None:
+        row["day"] = day
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    sent.clear()
+    return sent
+
+
+def test_a_stale_nudge_expires_on_the_funnels_own_window(tmp_path, monkeypatch):
+    """A "meeting in 10 minutes" ping delivered an hour late is worse than nothing, so a queued
+    nudge ages out on exactly the window the release valve refuses to promote a held one past —
+    ledgered, never sent."""
+    minutes = rec.OUTBOX.NUDGE_MAX_AGE_MIN
+    sent = _plant(tmp_path, monkeypatch, "nudge", "event", age_secs=minutes * 60 + 5)
+    assert rec.OUTBOX.drain() == {"attempted": 1, "delivered": 0}
+    assert sent == [], "a stale nudge must never reach the channel"
+    (row,) = _outbox_rows(tmp_path)
+    assert row["status"] == "expired" and str(minutes) in row["last_error"]
+    assert _delivery_rows(tmp_path)[-1]["status"] == "expired"
+    # one minute inside the window it is still a live nudge
+    sent = _plant(tmp_path, monkeypatch, "nudge", "proactive", age_secs=minutes * 60 - 60)
+    rec.OUTBOX.drain()
+    assert len(sent) == 1
+
+
+def test_a_brief_fails_visibly_when_its_day_ends_and_a_digest_goes_quiet(tmp_path, monkeypatch):
+    """Two kinds, two endings, one rule each. A day with no brief is something you must be told
+    about; a digest whose day is over is superseded by tomorrow's, so it goes quietly."""
+    sent = _plant(tmp_path, monkeypatch, "brief", "brief:sotto-morning-brief", day="2026-08-27")
+    rec.OUTBOX.drain()
+    (row,) = _outbox_rows(tmp_path)
+    assert row["status"] == "failed" and "2026-08-27 ended" in row["last_error"] and sent == []
+
+    sent = _plant(tmp_path, monkeypatch, "digest", "run-now:sotto-midday-digest", day="2026-08-27")
+    rec.OUTBOX.drain()
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["expired"] and sent == []
+    # …and a brief whose day is still today keeps trying
+    sent = _plant(tmp_path, monkeypatch, "brief", "brief:sotto-evening-brief")
+    rec.OUTBOX.drain()
+    assert len(sent) == 1 and _outbox_rows(tmp_path)[0]["status"] == "pending"
+
+
+def test_every_lane_lands_under_the_kind_that_governs_its_expiry(tmp_path):
+    """The label the seam already carries is what decides which clock a message waits on."""
+    for label, kind in (("brief:sotto-morning-brief", "brief"),
+                        ("brief:sotto-evening-brief", "brief"),
+                        ("run-now:sotto-relationship-pulse", "brief"),
+                        ("run-now:sotto-midday-digest", "digest"),
+                        ("event", "nudge"), ("proactive", "nudge"),
+                        ("run-now:sotto-proactive", "nudge")):
+        assert rec.OUTBOX.kind_for(label) == kind, label
+
+
+def test_the_backoff_doubles_and_stops_at_its_cap():
+    """One sentence, no schedule table: wait a minute, then two, then four, and never longer than
+    a quarter of an hour."""
+    ob = rec.OUTBOX
+    assert [ob.backoff_secs(n) for n in (1, 2, 3, 4)] == [60, 120, 240, 480]
+    assert ob.backoff_secs(5) == ob.BACKOFF_MAX_SECS == ob.backoff_secs(50)
+
+
+def test_a_chase_is_counted_only_when_the_message_that_chased_actually_landed(tmp_path, monkeypatch):
+    """The effects ride the outbox row, not the spawn thread: a loop is finalized on the ACK, even
+    when the ack is a retry an hour later in the drain."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    finalized = []
+    monkeypatch.setattr(rec, "_finalize_delivery_effects", lambda e: finalized.extend(e))
+    effects = [{"kind": "chase", "anchor_key": "waiting:on:dana"}]
+    _channel(monkeypatch, (False, "gateway offline"), (True, ""))
+    assert rec._deliver_text("nudging Dana", "proactive", effects=effects) is False
+    assert finalized == [], "a failed send must not count the chase"
+    rec.OUTBOX.drain()
+    assert finalized == effects
+
+
+def test_an_empty_run_never_enters_the_outbox(tmp_path, monkeypatch):
+    """Silence is the common, correct outcome — an outbox row for it would retry that silence for
+    hours. Nothing composed, nothing queued."""
+    rec.DATA = str(tmp_path)
+    _channel(monkeypatch)
+    assert rec._deliver_text("   \n ", "proactive") is False
+    assert rec._deliver_text(rec.SILENCE_SENTINEL, "event") is False
+    assert _outbox_rows(tmp_path) == []
+
+
+def test_a_closed_row_keeps_its_reason_and_forgets_the_words(tmp_path, monkeypatch):
+    """The outbox holds what Sotto said only while it might still have to say it. A row that landed
+    or gave up keeps its id, kind, attempts and reason — everything the counts and the Record need —
+    and none of the message, because keeping a delivered brief's text on the volume for a week is
+    exactly the situational storage the standing bars forbid."""
+    rec.DATA = str(tmp_path)
+    _channel(monkeypatch, (True, ""), (False, "gateway offline"))
+    rec._deliver_text("Ashton needs the deck by 4", "event")
+    rec._deliver_text("still trying", "event")
+    landed, pending = sorted(_outbox_rows(tmp_path), key=lambda r: r["status"])
+    assert landed["status"] == "delivered" and landed["payload"] == {"label": "event"}
+    assert pending["status"] == "pending" and pending["payload"]["body"] == "still trying"
+    assert "Ashton" not in json.dumps(_outbox_rows(tmp_path))
+
+
+def test_terminal_rows_are_pruned_but_pending_ones_never_are(tmp_path, monkeypatch):
+    """Only a terminal transition may end a row's life — that is the whole promise. Delivered and
+    failed rows leave after RETENTION_SECS so 'what failed?' stays answerable without growing."""
+    rec.DATA = str(tmp_path)
+    _channel(monkeypatch, (True, ""), (False, "gateway offline"))
+    rec._deliver_text("landed", "event")
+    rec._deliver_text("still trying", "event")
+    path = os.path.join(str(tmp_path), "events", "outbox.json")
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    for row in doc["rows"]:
+        if row["status"] != "pending":                # only the CLOSED row is aged past retention
+            row["created_at"] = time.time() - rec.OUTBOX.RETENTION_SECS - 10
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    rec.OUTBOX.drain()
+    kept = _outbox_rows(tmp_path)
+    assert [r["status"] for r in kept] == ["pending"]
+    assert kept[0]["payload"]["body"] == "still trying"

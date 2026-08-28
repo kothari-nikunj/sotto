@@ -68,6 +68,7 @@ memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); thi
 | `briefs/*.json` · `*.payload.json` | Delivered briefs and the payload each was built from | Indefinite |
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines |
 | `events/delivery.jsonl` | Whether each nudge actually landed | Rotates with the above |
+| `events/outbox.json` | One row per message Sotto composed, **carrying its text only while that text might still have to be sent** | The words are dropped the moment the row closes (delivered, gave up, or aged out); the closed row — id, kind, attempts, reason — is pruned after 7 days |
 | `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; leftovers after a crash are never reused |
 | `style.json` | Verbatim samples of things **you** wrote | Per-bucket TTL, 30–90 days |
 | `outcomes.jsonl` | What you did with drafts | Indefinite |

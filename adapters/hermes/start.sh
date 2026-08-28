@@ -556,7 +556,12 @@ if [ "${WHATSAPP_ENABLED:-true}" = "true" ] && [ ! -f "$WA_CREDS" ]; then
   # and relays the QR to these logs. Override with SOTTO_WHATSAPP_MODE=1 for a separate bot number.
   python3 /app/adapters/hermes/wa_pair.py &
   WA_PID=$!
-  for _ in $(seq 1 180); do    # up to ~15 min to scan, or until the pairing process exits / creds appear
+  # Wait for the scan as long as the pairer itself is allowed to run: derive the loop from the SAME
+  # env var wa_pair.py honors (SOTTO_WHATSAPP_PAIR_TIMEOUT, default 900s), so raising it actually
+  # buys more time — a fixed count here once silently capped the var at 15 min. Non-numeric → 900.
+  WA_WAIT="${SOTTO_WHATSAPP_PAIR_TIMEOUT:-900}"
+  case "$WA_WAIT" in ''|*[!0-9]*) WA_WAIT=900 ;; esac
+  for _ in $(seq 1 $(( (WA_WAIT + 4) / 5 ))); do
     [ -f "$WA_CREDS" ] && { echo "[sotto] WhatsApp paired ✓"; break; }
     kill -0 "$WA_PID" 2>/dev/null || break
     sleep 5
