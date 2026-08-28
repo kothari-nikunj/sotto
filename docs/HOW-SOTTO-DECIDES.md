@@ -122,7 +122,7 @@ to connect!" never earns an interrupt.
   explicit "be quiet until…" snooze holds *everything*, missed calls included. **VIP** is whoever
   you said it is — the stated list (`preferences.explicit.vip_people`, written by "make Sarah a
   VIP" in chat or the toggle on her dashboard page) is checked first, then two fallbacks: a
-  top-of-queue relationship-pulse priority, or a "family" mention in their file.
+  top-of-queue relationship-pulse priority, or a typed `family_of` relation in their file.
 - **In-meeting hold** — while you are inside a timed calendar event with at least one other human,
   would-be nudges queue as `meeting_hold` — except missed calls, escalations and calendar changes,
   which come through anyway. Solo blocks and all-day events never hold, and a calendar

@@ -342,13 +342,15 @@ Do NOT duplicate pre-computed commitments that already appear in the Action Ledg
 
 ## Knowledge Extraction (extract alongside the brief)
 While generating the brief, extract durable knowledge from raw messages into the extractedKnowledge field.
-- person_updates: [{canonical_id?, person_name, identifier, facts: [{fact, memory_type, confidence, change_type}], profile_patch: {title, company}, relations?: [{type, other_person_name, other_identifier?, date?, confidence}]}]
-- company_updates: [{company_name, news: [{text, date}], context_updates: [...]}]
+- person_updates: [{canonical_id?, person_name, identifier, facts: [{fact, memory_type, confidence, change_type, source_ref?}], profile_patch: {title, company}, relations?: [{type, other_person_name, other_identifier?, date?, confidence}]}]
+- company_updates: [{company_name, about?, domain?, news: [{text, date, url?}], context_updates: [...]}]
 - memory_types: milestone, commitment, preference, working_style, relationship_change, life_event, interest, context
 - Delta-aware: for people whose knowledge appears in "What You Know About Today's People" above, extract ONLY facts that are NEW (not already listed), CHANGED (updates an existing fact), or CONTRADICTORY (corrects a wrong fact — use change_type: "correction"). For people NOT in that section, extract aggressively.
 - If a person's knowledge block carries their id — the parenthetical in the identity line ("Sarah Chen (c_ab12cd34ef56) | …") or an explicit [canonical_id: ...] — copy it back EXACTLY as canonical_id in person_updates. This is the stable identity anchor across days; never invent or alter one.
 - Include identifier whenever the source gives you a stable email or phone. Never use a thread ID as identifier.
 - Skip low-value interaction-count facts like "1 meeting" or "1 email thread" unless they add real context.
+- **source_ref — every fact SHOULD name where it came from**: the id of the email, message, or meeting you read it in, using the SAME ids the action items' `evidence.sourceId` uses. A fact whose source you cannot name is a fact the user cannot check or correct; omit `source_ref` only when the data gave you no id.
+- **Company knowledge is first-class.** A news item carries its `url` when the source gave one (that URL is also how duplicates are recognized — the same story reported twice is one line). `about` is the company's durable identity paragraph — what it builds, who founded it, the market — and it REPLACES what's on file, so write it only when yours is better. `domain` only when an email domain makes it certain (a message from `sarah@northstar.io` about Northstar Labs → `"domain": "northstar.io"`), never guessed from a name — it is what keeps "YC" and "Y Combinator" one company instead of two.
 - Confidence 0.8+ for clearly stated, 0.5-0.7 for inferred. Skip below 0.5.
 - Facts about contacts only — never about the user.
 - **relations** — how two people know each other, when the data SAYS so. A relation is a typed edge between the person this update is about and one other person, written from the user's vantage. The vocabulary is CLOSED — use one of these five or omit the relation entirely: `introduced_by` (this person was introduced to the user by the other), `introduced` (this person introduced the other to the user), `works_with`, `family_of`, `partner_of`, `met_through`. Anything else is discarded.
@@ -440,10 +442,13 @@ The data also contained an iMessage thread with **Sam Rivera** — "that game la
 
 {"person_updates": [
   {"person_name": "Morgan Lee", "identifier": "morgan@northstarlabs.ai",
-   "facts": [{"fact": "Founder of Northstar Labs, building workflow tools for clinics", "memory_type": "context", "confidence": 0.9, "change_type": "new"},
-             {"fact": "Backed by Ridgeview Ventures, raising seed round", "memory_type": "milestone", "confidence": 0.9, "change_type": "new"}],
+   "facts": [{"fact": "Founder of Northstar Labs, building workflow tools for clinics", "memory_type": "context", "confidence": 0.9, "change_type": "new", "source_ref": "thr_5510cd"},
+             {"fact": "Backed by Ridgeview Ventures, raising seed round", "memory_type": "milestone", "confidence": 0.9, "change_type": "new", "source_ref": "thr_5510cd"}],
    "profile_patch": {"title": "Founder", "company": "Northstar Labs"}}
-], "company_updates": []}
+], "company_updates": [
+  {"company_name": "Northstar Labs", "domain": "northstarlabs.ai",
+   "news": [{"text": "Raising a seed round led by Ridgeview Ventures", "date": "2026-06-24"}]}
+]}
 
 ## Validation Checklist
 Before output, verify (this list is self-contained — the 9 highest-yield checks):

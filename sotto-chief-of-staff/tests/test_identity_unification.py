@@ -455,3 +455,63 @@ def test_the_resolver_is_reachable_from_every_production_thread_builder():
         assert "build_identity_resolver" in src, (
             f"{fn} builds threads without the shared identity resolver — group labels there will "
             "fall back to raw phone numbers for anyone not in Apple Contacts")
+
+
+# ── the F1 fork fix (memory-moat audit, Aug 2026): one id, minted once, adopted everywhere ──
+
+def _load_script(rel, name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, rel))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+se = _load_script(os.path.join("_shared", "scripts", "style_extract.py"), "style_extract_idu")
+
+CONTACT = {"name": "Dana Wells", "emails": ["dana@acmecorp.test"], "phones": ["+14155552211"]}
+
+
+def test_all_three_id_mints_agree_byte_for_byte():
+    """Formula drift between the three generators IS the fork — pinned here so it fails loudly."""
+    for c in (CONTACT, {"name": "Leo Fry", "emails": [], "phones": ["+12065551234"]}):
+        want = kg.default_canonical_id(c["name"], c["emails"])
+        seeded = rl.seed_contact_index_from_contacts([c])[0]["canonical_id"]
+        styled = se._seed_contact_index([c])[0][0]["canonical_id"]
+        assert want == seeded == styled
+
+
+def test_resolver_adopts_the_graph_cid_on_any_identifier_overlap():
+    """A Contacts card sharing ONE identifier with a graph file must carry the FILE's id — even
+    when the card has a new email the file never saw (the exact drift that used to fork)."""
+    local = {
+        "contacts": [{"name": "Dana Wells", "emails": ["dana@newjob.test"],
+                      "phones": ["+14155552211"]}],
+        "contact_index": [{"canonical_id": "c_ab12cd34ef56", "display_name": "Dana Wells",
+                           "identifiers": ["4155552211"], "confidence": "medium"}],
+    }
+    resolve = rl.build_identity_resolver(local)
+    for idv in ("dana@newjob.test", "+14155552211"):
+        got = resolve(idv)
+        assert got and got["canonical_id"] == "c_ab12cd34ef56", idv
+
+
+def test_style_seed_adopts_the_person_files_cid(tmp_path, monkeypatch):
+    """style.json's per_person buckets must key by the graph's id, not a freshly minted one —
+    otherwise one human's iMessage voice and email voice live in two buckets forever."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    pdir = tmp_path / "knowledge" / "people"
+    pdir.mkdir(parents=True)
+    (pdir / "c_1234567890ab.md").write_text(
+        "---\ncanonical_id: c_1234567890ab\nname: Dana Wells\nidentifiers:\n"
+        "- dana@acmecorp.test\nschema_version: 1\n---\n\n## Summary\nDana.\n",
+        encoding="utf-8")
+    index, lookup = se._seed_contact_index([CONTACT])
+    assert index[0]["canonical_id"] == "c_1234567890ab"
+    assert lookup["dana@acmecorp.test"][0] == "c_1234567890ab"
+    assert lookup["4155552211"][0] == "c_1234567890ab"     # the phone rides the same adoption
+
+
+def test_style_seed_still_mints_when_the_graph_is_silent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    index, _lookup = se._seed_contact_index([CONTACT])
+    assert index[0]["canonical_id"] == kg.default_canonical_id("Dana Wells", ["dana@acmecorp.test"])

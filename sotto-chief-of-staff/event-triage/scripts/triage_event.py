@@ -146,7 +146,7 @@ name is on preferences.explicit.vip_people, written by the same preferences.py C
 dashboard's VIP toggle both use — or (b) their attention-queue entry in relationship_state.json has
 priority >= VIP_PRIORITY_MIN (10 — the pulse's priority is interactions × days-waiting ×
 type-weight, so 10+ means a top-of-queue relationship), or (c) their knowledge-graph person file
-mentions "family" (family clears the quiet-hours bar for missed calls). The stated list is checked
+carries a typed family_of relation (family clears the quiet-hours bar for missed calls). The stated list is checked
 FIRST because a user's own word outranks any heuristic.
 
 User promotion (`triage_event.py --promote <queue-key>`, the dashboard's "nudge me now"): the same
@@ -236,7 +236,7 @@ VALVE_MAX_AGE_MIN = 240
 # in real time — it queues for the digest/next brief. Missed calls are exempt.
 EVENT_MAX_AGE_MIN = 30
 # The attention-queue priority at which a contact counts as a VIP — VIPs are the only senders whose
-# missed call clears quiet hours. A stated vip_people entry or a "family" mention also qualifies.
+# missed call clears quiet hours. A stated vip_people entry or a family_of relation also qualifies.
 VIP_PRIORITY_MIN = 10
 # "budget" belongs here (a held real ask, same as the others) — the valve's own budget check keeps a
 # promotion from exceeding the day's cap, so in practice these wait for the day to roll over.
@@ -643,7 +643,7 @@ def _graph_display_name(ident: str) -> str:
 def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -> bool:
     """VIP (simple, documented — see module docstring): the user's STATED vip_people list first,
     then a top-of-queue attention_queue priority (>= VIP_PRIORITY_MIN), then a
-    'family' mention in their graph file."""
+    typed family_of relation in their graph file."""
     n = _s(name).strip().lower()
     if not n:
         return False
@@ -665,8 +665,11 @@ def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -
         path = knowledge.find_person_file(name=name, identifier=ident or "")
         if path:
             with open(path, encoding="utf-8") as f:
-                if re.search(r"\bfamily\b", f.read(), re.I):
-                    return True
+                p = knowledge.parse_person_file(f.read())
+            # The TYPED family_of relation, not a word-grep: the old `\bfamily\b` regex over the
+            # raw file made anyone whose notes said "family office" the user's sibling.
+            if any(_s(getattr(r, "type", "")) == "family_of" for r in (p.relations or [])):
+                return True
     except Exception:  # noqa: BLE001
         pass
     return False

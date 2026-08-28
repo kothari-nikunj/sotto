@@ -247,9 +247,12 @@ BRIEF_RESPONSE_SCHEMA = {
             "person_updates": {"type": "array", "items": {"type": "object", "properties": {
                 "canonical_id": {"type": "string"}, "person_name": {"type": "string"},
                 "identifier": {"type": "string"},
+                # source_ref: the email/message/meeting id the fact came from — the same ids the
+                # action items' evidence uses. A fact you can't trace is a fact you can't correct.
                 "facts": {"type": "array", "items": {"type": "object", "properties": {
                     "fact": {"type": "string"}, "memory_type": {"type": "string"},
-                    "confidence": {"type": "number"}, "change_type": {"type": "string"}}}},
+                    "confidence": {"type": "number"}, "change_type": {"type": "string"},
+                    "source_ref": {"type": "string"}}}},
                 "profile_patch": {"type": "object", "properties": {
                     "title": {"type": "string"}, "company": {"type": "string"}}},
                 # Typed edges between two people — closed vocabulary, enforced by
@@ -258,10 +261,15 @@ BRIEF_RESPONSE_SCHEMA = {
                     "type": {"type": "string"}, "other_person_name": {"type": "string"},
                     "other_identifier": {"type": "string"}, "date": {"type": "string"},
                     "confidence": {"type": "number"}}}}}}},
+            # A company is a first-class entity, not a bag of news: `about` is its durable identity
+            # paragraph and `domain` is what stops "YC" and "Y Combinator" becoming two files. Each
+            # news item carries its `url` when the source gave one — that URL is also the dedupe key.
             "company_updates": {"type": "array", "items": {"type": "object", "properties": {
                 "company_name": {"type": "string"},
+                "about": {"type": "string"}, "domain": {"type": "string"},
                 "news": {"type": "array", "items": {"type": "object", "properties": {
-                    "text": {"type": "string"}, "date": {"type": "string"}}}},
+                    "text": {"type": "string"}, "date": {"type": "string"},
+                    "url": {"type": "string"}}}},
                 "context_updates": {"type": "array", "items": {"type": "string"}}}}},
         }},
     },

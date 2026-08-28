@@ -54,10 +54,10 @@ supersedes the wrong fact rather than piling on). State the truth the user gave 
 told you what's wrong, the negation. **Do not invent the replacement fact.**
 
 ```bash
-echo '{"person_updates":[{"person_name":"Peyton Lewis","facts":[
+echo '{"person_updates":[{"person_name":"Peyton Lewis","updated_by":"user_edit","facts":[
   {"fact":"Peyton is NOT the founder of Alive; correct her role per the user.",
    "change_type":"correction","confidence":0.95,"memory_type":"context",
-   "source_ref":"user-correction"}]}]}' \
+   "source":"user_edit","source_ref":"user-correction"}]}]}' \
 | python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_update.py"
 ```
 - Use the person's real display name (as it appears in the brief / graph) so it maps to the right file.

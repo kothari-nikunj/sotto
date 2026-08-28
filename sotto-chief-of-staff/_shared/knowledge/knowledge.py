@@ -333,6 +333,11 @@ def effective_confidence(fact: FactMeta, now: Optional[datetime] = None) -> floa
 def prune_stale_facts(facts: dict, now: Optional[datetime] = None) -> None:
     cutoff = ((now or datetime.now()) - timedelta(days=PRUNE_STALE_AFTER_DAYS)).strftime("%Y-%m-%d")
     for fact in facts.values():
+        # A correction the user made by hand is never restated by a pipeline, so seen stays 1 —
+        # pruning it would let the wrong fact it corrected (re-BUMPed by every re-research)
+        # outlive the correction. User words don't expire.
+        if fact.source == "user_edit":
+            continue
         if fact.status == "active" and fact.seen <= 1 and fact.last < cutoff:
             fact.status = "archived"
             fact.archived_text = fact.text
@@ -484,8 +489,12 @@ def companies_dir() -> str:
 
 def normalize_identifier(idv: str) -> str:
     """Mirror of textutil._normalize_identifier so file-store keys line up with the brief pipeline:
-    phone-ish strings → last-10 digits; everything else (emails) → lowercase trimmed."""
+    phone-ish strings → last-10 digits; everything else (emails) → lowercase trimmed.
+    A WhatsApp `@lid` JID is a rotating PRIVACY id, not a phone: its digit tail can collide with a
+    real number and auto-merge two strangers irreversibly, so it never becomes a store key."""
     trimmed = (idv or "").strip().lower()
+    if trimmed.endswith("@lid"):
+        return ""
     before_at = re.sub(r"@.*", "", trimmed)
     if re.fullmatch(r"[\d\s\-\+\(\)]+", before_at or ""):
         digits = re.sub(r"\D", "", trimmed)

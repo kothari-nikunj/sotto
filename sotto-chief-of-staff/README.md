@@ -71,7 +71,8 @@ _shared/
   scripts/research_attendees.py      # batched two-pass attendee research (deep_research capability)
   scripts/web_research.py            # THE search seam: the provider resolver + web_search / deep_research / fetch_url
   scripts/docsend_fetch.py           # read a DocSend deck via its email gate + Gemini vision (chat-only — a view is visible to the sender)
-  scripts/prewarm_graph.py           # setup-time graph seed (stubs + default-on low-conf research)
+  scripts/granola_graph.py           # Granola attendance → dated, sourced facts on the people you met
+  scripts/prewarm_graph.py           # setup-time graph seed (stubs + research) + --sync-contacts (identifiers/notes/birthdays)
   scripts/style_extract.py           # PORT: style-profile.ts (fingerprint v2)
   scripts/style_apply.py             # PORT: style-profile.ts formatStyleForWorker (verbatim sample injection)
   scripts/preferences.py             # explicit preference memory (mute/tone rules)
@@ -89,7 +90,7 @@ _shared/
   knowledge/                         # THE memory subsystem — one directory, four jobs
     knowledge.py                     # graph core: model + serializer (PORT: knowledge_files.rs schemas)
     knowledge_update.py              # apply an extraction (dedup/decay/prune) + the ONE relations and company writer
-    knowledge_query.py               # read + pack for the LLM (--calendar exempts today's cast)
+    knowledge_query.py               # read + pack for the LLM (people + companies; today's inputs pack, mtime is the fallback)
     knowledge_edit.py                # user-initiated writes (facts, company About, loops, merges, relations) for chat + dashboard
     master_file.py                   # the ONE writer/reader for knowledge/master.md (the always-in-context master memory file)
 evals/                               # brief-quality eval harness

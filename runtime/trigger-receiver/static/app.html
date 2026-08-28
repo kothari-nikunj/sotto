@@ -14,21 +14,32 @@
 <body>
 <div class="site">
   <header class="sidebar">
-    <a class="brand" href="#today">Sotto</a>
-    <nav class="nav" id="navlinks" aria-label="Main">
-      <a href="#today" data-nav="today">Today</a>
-      <a href="#cadence" data-nav="cadence">Cadence</a>
-      <a href="#loops" data-nav="loops">Loops</a>
-      <a href="#briefs" data-nav="briefs">Briefs</a>
-      <a href="#people" data-nav="people">People</a>
-      <a href="#learned" data-nav="learned">Learned</a>
-      <a href="#record" data-nav="record">Record</a>
+    <a class="brand" href="#now">Sotto</a>
+    <nav class="nav nav-tabs" id="navlinks" aria-label="Main">
+      <a href="#now" data-nav="now">Now</a>
+      <a href="#activity" data-nav="activity">Activity</a>
+      <a href="#memory" data-nav="memory">Memory</a>
       <a href="#labels" data-nav="labels">Labels</a>
-      <a href="/setup">Integrations</a>
+      <a href="/setup" class="nav-setup">Integrations</a>
     </nav>
+    <!-- On a phone the nav is the bottom tab bar, so Integrations keeps a home
+         up here instead. -->
+    <a class="top-setup" href="/setup">Integrations</a>
     <p class="sidebar-foot">your private chief of staff</p>
   </header>
-  <main class="content" id="view" tabindex="-1">
+  <!-- Every pre-redesign address still resolves. Each entry names a route
+       app.js keeps (so an old bookmark renders the page it meant) and the tab
+       that should light up while it is open. app.js reads this list. -->
+  <div id="nav-aliases" hidden>
+    <span data-nav="today" data-home="now"></span>
+    <span data-nav="loops" data-home="now"></span>
+    <span data-nav="cadence" data-home="activity"></span>
+    <span data-nav="record" data-home="activity"></span>
+    <span data-nav="briefs" data-home="activity"></span>
+    <span data-nav="people" data-home="memory"></span>
+    <span data-nav="learned" data-home="memory"></span>
+  </div>
+  <main class="content content-tabs" id="view" tabindex="-1">
     <noscript>
       <div class="card noscript-card">
         <h2>Turn JavaScript on</h2>

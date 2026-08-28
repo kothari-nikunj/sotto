@@ -119,6 +119,12 @@ def test_brief_response_schema_shape():
         assert f in item, f
     ek = s["properties"]["extractedKnowledge"]["properties"]
     assert "person_updates" in ek and "company_updates" in ek
+    # An extracted fact can name where it came from; a company is an entity, not a bag of news.
+    fact = ek["person_updates"]["items"]["properties"]["facts"]["items"]["properties"]
+    assert "source_ref" in fact
+    comp = ek["company_updates"]["items"]["properties"]
+    assert "about" in comp and "domain" in comp
+    assert "url" in comp["news"]["items"]["properties"]
 
 
 # --- critic mandate fix (Sprint 1 #1) ------------------------------------------

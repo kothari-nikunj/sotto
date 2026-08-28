@@ -290,12 +290,20 @@ def persist(research: dict, attendees_in: list | None = None, now: datetime | No
                           "source": FACT_SOURCE, "source_ref": m.group(0).rstrip(").,")})
         if not facts:
             continue   # nothing grounded → nothing to persist
-        updates.append({
+        update = {
             "person_name": name or email,
             "identifier": email,
+            "updated_by": FACT_SOURCE,
             "last_researched": today,   # freshness stamp profile_is_fresh keys off (not mtime)
             "facts": facts,
-        })
+        }
+        # Research hands us title/company as TYPED fields — they land as typed fields, not only
+        # inside the prose fact above. Every consumer of the graph's identity line (the pack's
+        # "Title at Company", the pulse's weighting, the dashboard, the People filter) reads the
+        # typed pair; without this, a fully-researched person still looked blank there.
+        if title or company:
+            update["profile_patch"] = {k: v for k, v in (("title", title), ("company", company)) if v}
+        updates.append(update)
 
     try:
         companies = _company_updates(research, today)

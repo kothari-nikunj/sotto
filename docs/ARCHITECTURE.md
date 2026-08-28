@@ -24,7 +24,7 @@ owns each of them, and you can enter the system at any stage:
 | **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Deterministic checks reject a malformed or hallucinated brief, and back the still-open appendix, before you ever see it. |
 | **deliver** | [`_shared/scripts/brief_marker.py`](../sotto-chief-of-staff/_shared/scripts/brief_marker.py) (the deliver-once claim; the host's gateway sends) | Exactly one process wins the claim and delivers; the loser discards its draft. |
-| **learn** | [`_shared/knowledge/knowledge_update.py`](../sotto-chief-of-staff/_shared/knowledge/knowledge_update.py) (+ `continuity_resolve.py`, `learn_preferences.py`, `style_extract.py`) | What the brief found is written back into memory, so tomorrow starts from today. |
+| **learn** | [`_shared/knowledge/knowledge_update.py`](../sotto-chief-of-staff/_shared/knowledge/knowledge_update.py) (+ `continuity_resolve.py`, `learn_preferences.py`, `style_extract.py`, `granola_graph.py`, `prewarm_graph.py --sync-contacts`) | What the brief found is written back into memory, so tomorrow starts from today. |
 
 **The LLM writes prose — it never decides *whether* to interrupt you.** That decision is the
 event-triage funnel, documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
@@ -228,6 +228,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 |---|---|---|
 | The people/company graph | `knowledge/*.md` | `_shared/knowledge/knowledge_update.py` (`knowledge.py` is its model + serializer) |
 | Grounded research (people **and** companies) | same files | `meeting-prep/scripts/persist_prep.py` and `_shared/scripts/prewarm_graph.py` — both *through* `knowledge_update.apply()`; there is no second writer for either file type |
+| Meeting attendance + Apple Contacts identity | same files | `_shared/scripts/granola_graph.py` (who you sat with) and `_shared/scripts/prewarm_graph.py --sync-contacts` (every email/phone as an identifier, the card's notes + birthday) — both *through* `knowledge_update.apply()` |
 | User-initiated graph edits | same files | `_shared/knowledge/knowledge_edit.py` — which routes *through* `knowledge_update.apply()`, so a dashboard edit and a texted correction are byte-identical |
 | Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` owns the locked, atomic write API; brief extraction, `apply_commitments.py`, and user edits in `knowledge_edit.py` all write through it (`ledger_io.py` is the shared read side) |
 | The master memory file (who the user is, the people around them, their standing Procedures — always in every brief/prep prompt; the gateway reads it in chat; seeded by setup's four questions; editable on the dashboard's Learned page) | `knowledge/master.md` | `_shared/knowledge/master_file.py` — user-stated words only, gateway confirms before writing, dashboard edits shell out to the same CLI; size-capped so "always in context" stays honest |
@@ -261,7 +262,22 @@ capability, the first provider with a key present wins; the three ladders are in
 
 The company half is why the deep dive is worth its call twice: it is knowledge about an
 *organization*, so parking it on whichever human was researched that morning means the next person
-from that company arrives cold. `company_knowledge()` is its one read side.
+from that company arrives cold. `company_knowledge()` is its one read side — for the next research
+run, and (through `knowledge_query.py`) for the brief's **Company Context** block.
+
+### What the brief reads back — `knowledge_query.py`
+
+The read side of all of the above, and the one place the retrieval question is answered:
+
+| Emits | From | Gated by |
+|---|---|---|
+| `person_knowledge` — the compact packed block per person | `knowledge/people/*.md` | **today's inputs**: a person packs when they appear in `--gmail` (today's From/To) or on `--calendar`; the `--relevant-days 7` file-mtime cohort is the fallback, used only when no inputs were supplied |
+| `company_knowledge` — About + the 3 newest news lines, ≤5 companies | `knowledge/companies/*.md`, via `knowledge_update.company_knowledge()` | today's attendee email domains + the packed people's `company`, deduped by file |
+| `contact_index` — the identity map | EVERY person file | ungated: it is what resolves a phone and an email to one person |
+
+`mtime` says when a file was last *rewritten*, which was never the same question as "does this
+person matter today" — under it, someone who emailed you this morning packed nothing and the model
+re-derived what the graph already knew.
 
 Two things deliberately do NOT persist, and both are correct:
 
@@ -280,7 +296,10 @@ auto-merge reads as proof they are one human). A company has no facts map (its o
 byte-compatible with the Mac app's `knowledge_files.rs`), so its one correctable field is the
 About paragraph — `--op company-about`, through the same `apply()` lane research writes through,
 from chat or from the dashboard's company page. The write stamps `updated_by: user_edit`, and
-research declines to overwrite it: a correction you made stays made.
+research declines to overwrite it: a correction you made stays made. The same rule covers the
+*name-merge suggestions*: `--op merge-dismiss` ("these really are two people") tombstones the pair
+in `knowledge/merge_suggestions.json`'s `dismissed` list, because the suggestions are recomputed
+from the files on disk on every apply and would otherwise ask again tomorrow.
 
 ## Where the schedule lives
 

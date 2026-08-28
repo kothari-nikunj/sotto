@@ -174,6 +174,7 @@ def _chat_payload(p: "kg.PersonFile", fact_text: str, change_type: str, memory_t
         "person_name": p.name,
         "identifier": next((str(i) for i in p.identifiers if str(i).strip()), ""),
         "canonical_id": p.canonical_id if kg.valid_canonical_id(p.canonical_id) else "",
+        "updated_by": SOURCE,   # the file-level stamp tells the truth, like the company lane
         "facts": [{"fact": fact_text, "change_type": change_type, "confidence": 1.0,
                    "source": SOURCE, "memory_type": memory_type}],
     }]}
@@ -249,6 +250,9 @@ def _validated_identifier(identifier: str) -> str:
     ident = (identifier or "").strip()
     if not ident or len(ident) > MAX_IDENTIFIER_CHARS:
         raise EditError("identifier must be a non-empty email address or phone number")
+    if ident.lower().endswith("@lid"):
+        raise EditError("a WhatsApp @lid JID is a rotating privacy id, not an identifier — "
+                        "use the person's phone number or email")
     if "@" in ident:
         ident = ident.lower()
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", ident):
@@ -367,12 +371,13 @@ def op_merge(from_slug: str, into_slug: str, now: datetime | None = None) -> dic
 
 def op_merge_dismiss(from_slug: str, into_slug: str, now: datetime | None = None) -> dict:
     """Forget a merge suggestion without merging ("these really are two people"). The write is
-    knowledge_update.drop_merge_suggestion — the SAME call op_merge makes after a confirmed merge,
-    so confirming and dismissing leave the suggestions file in the same shape by the same code."""
+    knowledge_update.dismiss_merge_suggestion, which drops it AND tombstones the pair — a confirmed
+    merge needs no tombstone (a file disappears), but a dismissal does, because the suggestions are
+    recomputed from the people on disk on every apply and would otherwise re-ask tomorrow."""
     if not SLUG_RE.match(from_slug or "") or not SLUG_RE.match(into_slug or ""):
         raise EditError("invalid slug")
     ku = _load_knowledge_update()
-    ku.drop_merge_suggestion(from_slug, into_slug, now)
+    ku.dismiss_merge_suggestion(from_slug, into_slug, now)
     return {"ok": True, "dismissed": [from_slug, into_slug]}
 
 

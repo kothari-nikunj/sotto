@@ -8,23 +8,33 @@
 
    THE SURFACE SYSTEM (Aug 2026 design pass — the reference brief was
    party.pro/book, the Anthropic blog, and Amplify Partners):
-   grouped content sits on a soft, BORDERLESS panel one shade off the ground
-   (.panel / .ledger / .card / setup.css's .tile), radius --radius-panel, no
-   border, no shadow. The panel boundary is what used to be a hairline, so
-   sections now separate by SURFACE + AIR rather than by lines. Sectional
-   spacing is roughly double what a dense tool would use: essay-calm, never
-   cramped. Every page still carries its full content — the air comes from the
-   spacing scale, never from hiding rows.
+   grouped content sits on a soft panel one shade off the ground (.panel /
+   .ledger / .card / setup.css's .tile), radius --radius-panel, no shadow —
+   and, since the Aug 2026 de-chrome pass, a real 1px --hairline edge. Tint
+   alone read as a boundary on a page with one panel; on a page with five
+   stacked it read as a guess. Sections separate by SURFACE + EDGE + AIR, and
+   the air came down (32px between panels, 48px of page tail, 12px rows) now
+   that the edge is carrying its share. Every page still carries its full
+   content — density comes from the spacing scale, never from hiding rows.
 
-   Rule inventory (what is left after the panels took over):
+   Rule inventory:
      1. .head-rule  — the masthead double rule. ONE per page, the signature.
      2. .sidebar    — the chrome divider (right on desktop, bottom on the
                       phone's translucent top bar)
-     3. form-control borders (.edit-textarea, .edit-select, .edit-input,
+     3. .hairline   — the panel edge (.panel/.ledger/.card/.stat-strip)
+     4. form-control borders (.edit-textarea, .edit-select, .edit-input,
                       setup.css .field) — inputs, not rules
-   Everything else that used to be a hairline (.ledger's section cap rule,
-   .head-rule.single) is now a panel edge. .head-rule.single is retained as a
-   no-op-safe spacer for the markup that still emits it.
+   .head-rule.single is retained as a no-op-safe spacer for the markup that
+   still emits it.
+
+   CHROME: explanatory sentences are not furniture. They live behind .hint-btn
+   (a 16px "?") and pop as .hint-pop; page subtitles were deleted outright, and
+   .view-title dropped from display scale to 1.75rem. Scalars read as one
+   .stat-strip line rather than a stack of .meter rows.
+
+   PHONE: below 640px the nav is a fixed bottom tab bar (.nav-tabs), four equal
+   cells, no hidden horizontal scroll. /setup's server-rendered nav is a plain
+   .nav and keeps its top bar.
 
    TYPE TOKENS — the closed set (5 steps; nothing else may invent a size):
      --text-display  clamp(2rem → 2.6rem)      page titles + the masthead
@@ -80,6 +90,10 @@
   --paper-nav: rgba(244, 239, 228, 0.85);
   --border: #ddd4c0;
   --border-light: #e7e0cf;
+  /* The panel edge — a true hairline at ~12% ink. A panel that is one shade off
+     the ground reads as a surface only where the ground is visible around it;
+     with a page of stacked panels it needs a real boundary. */
+  --hairline: rgba(34, 28, 18, 0.12);
 
   /* Surfaces — the panel system. ONE shade off the ground, borderless.
      --panel      the grouped-content surface (.panel/.ledger/.card/.tile)
@@ -165,6 +179,7 @@
     --paper-nav: rgba(25, 21, 16, 0.85);
     --border: #362e20;
     --border-light: #2a2419;
+    --hairline: rgba(234, 227, 211, 0.12);
 
     /* Same relationships, inverted: the panel is one shade UP from the dark
        ground, and the lift is one shade up from the panel. */
@@ -261,13 +276,14 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 }
 
 /* ---------- The panel — the one grouped-content surface ----------
-   Soft, borderless, one shade off the ground. This is what replaced the
-   hairline section rules: a panel edge IS the boundary. Nothing here casts a
-   shadow — the tint alone does the separating, in both themes. */
+   Soft, one shade off the ground, and drawn with a real hairline edge. The
+   tint alone was doing the separating; on a page of five stacked panels that
+   boundary was a guess rather than a line, so the edge came back — 12% ink,
+   the same relationship in both themes. Nothing here casts a shadow. */
 
 .panel, .ledger, .card {
   background: var(--panel);
-  border: none;
+  border: 1px solid var(--hairline);
   border-radius: var(--radius-panel);
 }
 
@@ -295,14 +311,14 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 
 /* Materials honesty: translucency and blur are a preference, not a requirement */
 @media (prefers-reduced-transparency: reduce) {
-  .sidebar {
+  .sidebar, .nav-tabs {
     background: var(--paper);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
 }
 @media (prefers-contrast: more) {
-  .sidebar {
+  .sidebar, .nav-tabs {
     background: var(--paper);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
@@ -311,8 +327,8 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   .chip { box-shadow: inset 0 0 0 1px var(--ink-muted); }
   /* Borderless panels lean on a 1-shade tint. When the reader has asked for
      more contrast, give every panel an explicit edge back. */
-  .panel, .ledger, .card, .company-prose, .company-empty, .voice-prose,
-  .search-input { box-shadow: inset 0 0 0 1px var(--ink-muted); }
+  .panel, .ledger, .card, .stat-strip, .company-prose, .company-empty,
+  .voice-prose, .search-input { box-shadow: inset 0 0 0 1px var(--ink-muted); }
 }
 
 .brand, .wordmark {
@@ -372,6 +388,70 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   margin: 0;
 }
 
+/* Integrations only needs a top-bar home while the nav is the bottom tab bar. */
+.top-setup { display: none; }
+
+/* ---------- Phone: the nav is a bottom tab bar ----------
+   Four destinations, four equal cells, always all visible. The horizontal
+   scroller it replaces hid half its items off the right edge with no scrollbar
+   to say so — a nav you have to discover by swiping is not a nav. Scoped to
+   .nav-tabs so the server-rendered /setup pages keep their own top nav. */
+@media (max-width: 639px) {
+  .nav-tabs {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 60;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+    overflow: visible;
+    background: var(--paper-nav);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    backdrop-filter: blur(14px) saturate(1.4);
+    border-top: 1px solid var(--border);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .nav-tabs a {
+    text-align: center;
+    padding: 13px 4px 11px;
+    border-bottom: none;
+    border-top: 2px solid transparent;   /* the active marker's rail, moved up */
+  }
+  .nav-tabs a[aria-current="page"],
+  .nav-tabs a.active {
+    color: var(--ink);
+    border-bottom-color: transparent;
+    border-top-color: var(--accent);
+    background: var(--accent-muted);
+  }
+  .nav-tabs .nav-setup { display: none; }   /* it lives in the top bar instead */
+
+  .top-setup {
+    display: inline-block;
+    margin-left: auto;
+    flex: none;
+    font-family: var(--font-mono);
+    font-size: var(--text-eyebrow);
+    text-transform: uppercase;
+    letter-spacing: var(--ls-eyebrow);
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .top-setup:hover { color: var(--accent-text); text-decoration: none; }
+
+  /* The bar is chrome, so it never sits on top of the last row of the page. */
+  .content-tabs {
+    padding-bottom: calc(var(--space-12) + 56px + env(safe-area-inset-bottom));
+  }
+  .toast-root { bottom: calc(var(--space-4) + 56px + env(safe-area-inset-bottom)); }
+}
+
+/* Tablet: the top bar stays, and with five items it no longer overflows —
+   so nothing hides behind an invisible scroll. */
+@media (min-width: 640px) and (max-width: 899px) {
+  .nav-tabs { overflow-x: visible; flex-wrap: wrap; }
+}
+
 @media (min-width: 900px) {
   .site {
     display: grid;
@@ -426,7 +506,9 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   width: 100%;
   max-width: 700px;
   margin: 0 auto;
-  padding: var(--space-8) var(--space-5) calc(var(--space-16) + env(safe-area-inset-bottom));
+  /* 48px of tail, not 64+: the old runway was a screenful of nothing under the
+     last panel on every page. */
+  padding: var(--space-8) var(--space-5) calc(var(--space-12) + env(safe-area-inset-bottom));
   outline: none;
 }
 
@@ -441,23 +523,116 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   margin: 0 0 var(--space-3);
 }
 
+/* The page title. Display scale is now the Today masthead's alone — a section
+   page opening with 42px type and an italic subtitle cost ~200px before any
+   content appeared. One notch above the title step (21px × 1.35) is enough to
+   name a page. The subtitle is gone entirely; what it said rides behind the "?"
+   on the title line. */
 .view-title {
   font-family: var(--font-serif);
-  font-size: var(--text-display);
+  font-size: 1.75rem;
   font-weight: 600;
-  letter-spacing: -0.022em;
-  line-height: 1.08;
-  margin: 0 0 var(--space-3);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin: 0;
   text-wrap: balance;
 }
 
-.view-sub {
+.view-head { margin-bottom: var(--space-6); }
+
+/* A title (or a row title) with its "?" beside it. */
+.title-line, .row-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.title-line { margin-bottom: var(--space-1); }
+
+/* ---------- The hint: one rule, one tap, no permanent chrome ----------
+   Every sentence that used to sit under a row forever now lives behind this.
+   The button is a 16px mono circle in the label layer's muted ink; the popped
+   sentence takes the italic aside voice the subtitles used to have. */
+
+button.hint-btn {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1;
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+  background: none;
+  color: var(--ink-muted);
+  cursor: pointer;
+  align-self: center;
+  transition: color var(--dur-hover) ease, background-color var(--dur-hover) ease,
+              border-color var(--dur-hover) ease;
+}
+button.hint-btn:hover {
+  color: var(--accent-text);
+  background: var(--accent-muted);
+  border-color: var(--accent-underline);
+}
+button.hint-btn[aria-expanded="true"] {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: var(--accent-underline);
+}
+
+.hint-pop {
+  font-family: var(--font-serif);
   font-style: italic;
+  font-size: var(--text-body);
+  line-height: 1.5;
   color: var(--ink-light);
+  margin: var(--space-1) 0 var(--space-3);
+  max-width: 52ch;
+}
+
+/* A live form label that changes with its select (the Add-a-rule form) — not
+   chrome, so it stays on the page. */
+.form-hint {
+  font-family: var(--font-serif);
+  font-style: italic;
   font-size: var(--text-body);
   line-height: 1.55;
-  margin: 0 0 var(--space-8);
-  max-width: 46ch;
+  color: var(--ink-light);
+  margin: var(--space-2) 0 0;
+  max-width: 52ch;
+}
+
+/* ---------- The stat strip — scalars on one line ----------
+   Six full-height meter rows for six numbers was a page of furniture. One mono
+   line, wrapping, each segment optionally carrying its rule behind a "?". */
+.stat-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-secondary);
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-panel);
+  padding: var(--space-3) var(--space-4);
+  margin: 0 0 var(--space-4);
+}
+.stat-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.stat-strip .hint-pop {
+  flex: 1 0 100%;
+  margin: 0;
+  white-space: normal;
 }
 
 .back-link {
@@ -591,6 +766,12 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   color: var(--ink-muted);
   margin: 0 0 var(--space-3);
 }
+.ledger-cap .cap-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
 .ledger-cap .cap-count { color: var(--ink-faint); font-weight: 500; }
 .ledger-cap a { text-decoration: none; color: var(--ink-muted); }
 .ledger-cap a:hover { color: var(--accent-text); }
@@ -602,8 +783,9 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .ledger {
   /* The sectional gap lives on the PANEL's bottom margin, not on the cap's top:
      a cap is often the first child of a section wrapper, where a top margin
-     would collapse or miss. Panel-then-air is the page's whole rhythm. */
-  margin-bottom: var(--space-12);
+     would collapse or miss. Panel-then-air is the page's whole rhythm — with a
+     real edge back on the panel, 32px of air separates as well as 48 did. */
+  margin-bottom: var(--space-8);
   padding: var(--space-2) var(--space-4);
 }
 
@@ -612,7 +794,9 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   grid-template-columns: minmax(0, 1fr) auto;
   column-gap: var(--space-4);
   align-items: baseline;
-  padding: var(--space-4) 0;
+  /* 12px at every width. The old 16/20px was air a touch device paid for twice:
+     once in scroll distance, once in how few rows fit above the fold. */
+  padding: var(--space-3) 0;
   border-radius: var(--radius-sm);
   position: relative;
 }
@@ -707,19 +891,40 @@ a.ledger-row:active, .ledger-row.pressable:active { background: var(--accent-sof
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
   color: var(--ink);
-  margin-top: var(--space-2);
+  margin-top: 2px;
 }
-.meter-reading + .row-sub { margin-top: var(--space-2); color: var(--ink-light); }
 
-/* an italic aside tied to a ledger cap (section explanations on Learned) */
-.cap-sub {
+/* ---------- The record grid — a line you scan, not a paragraph you read ----------
+   Clock · sentence · channel, on one ~44px row. The sentence clamps to two lines
+   so a long triage reason never turns one entry into a block of prose. */
+.record-grid-row {
+  display: grid;
+  grid-template-columns: 3.6rem minmax(0, 1fr) auto;
+  column-gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  min-height: 44px;
+}
+.record-grid-row .rg-clock,
+.record-grid-row .rg-folio {
+  font-family: var(--font-mono);
+  font-size: var(--mono-meta);
+  letter-spacing: var(--ls-tight);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.record-grid-row .rg-folio { text-align: right; }
+.record-grid-row .rg-text {
   font-family: var(--font-serif);
-  font-style: italic;
-  font-size: var(--text-body);
-  line-height: 1.55;
-  color: var(--ink-light);
-  margin: 0 0 var(--space-3);
-  max-width: 52ch;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 /* Row actions — revealed on hover/focus on pointer devices; always on touch.
@@ -760,7 +965,7 @@ a.ledger-row:active, .ledger-row.pressable:active { background: var(--accent-sof
 
 /* The Record's day stack: cap + panel per day, the page's sectional rhythm. */
 .record-days { margin-bottom: var(--space-12); }
-.record-days > .ledger { margin-bottom: var(--space-10); }
+.record-days > .ledger { margin-bottom: var(--space-8); }
 .record-days > .ledger:last-child { margin-bottom: 0; }
 .record-days > .ledger-sub { padding: 0 0 var(--space-3); }
 
@@ -869,13 +1074,30 @@ button.text-action:hover { color: var(--accent-text); background: var(--accent-m
 button.text-action:active { transform: scale(0.96); }
 button.text-action:disabled { opacity: 0.5; cursor: default; }
 
+/* An armed two-tap confirm. Reserved for the irreversible (a merge); it reads
+   as a warning because the next tap really is the last one. Row-action reveal
+   is overridden — an armed control must not fade out from under a finger. */
+button.confirm-armed,
+.ledger-row .row-actions button.confirm-armed {
+  color: var(--urgent);
+  background: var(--urgent-soft);
+  opacity: 1;
+}
+button.confirm-armed:hover { color: var(--urgent); background: var(--urgent-soft); }
+.ledger-row .row-actions:has(button.confirm-armed) { opacity: 1; }
+
 /* ---------- Segmented filter (People: All / People / Companies) ---------- */
 
 .seg {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-1);
-  margin-bottom: var(--space-8);
+  margin-bottom: var(--space-6);
 }
+/* A filter nested UNDER a section switcher (the People index inside Memory) —
+   the same control, one step quieter, so the outer one stays the page's spine. */
+.seg-inner { margin-bottom: var(--space-5); }
+.seg-inner button { font-size: var(--mono-meta); letter-spacing: var(--ls-tight); }
 .seg button {
   font-family: var(--font-mono);
   font-size: var(--mono-meta);
@@ -1161,7 +1383,8 @@ details.archived-facts .ledger-row { opacity: 0.55; }
    the panel's own bottom margin is what covers every other case. */
 .voice-chips + .ledger-cap,
 .note + .ledger-cap,
-.add-fact + .ledger-cap { margin-top: var(--space-12); }
+.hint-pop + .ledger-cap,
+.add-fact + .ledger-cap { margin-top: var(--space-8); }
 
 /* a quiet italic aside — no border decoration, the voice carries it */
 .note {
@@ -1442,10 +1665,9 @@ a.research-src:hover { text-decoration: none; color: var(--accent-text); backgro
 /* ---------- Wider screens ---------- */
 
 @media (min-width: 640px) {
-  .content { padding: var(--space-12) var(--space-8) calc(var(--space-16) * 1.5); }
+  .content { padding: var(--space-12) var(--space-8) var(--space-12); }
   .row-folio { max-width: 15rem; }
   .ledger { padding: var(--space-3) var(--space-6); }
-  .ledger-row { padding: var(--space-5) 0; }
   @media (hover: hover) and (pointer: fine) {
     a.ledger-row, .ledger-row.pressable {
       margin: 0 calc(var(--space-4) * -1);

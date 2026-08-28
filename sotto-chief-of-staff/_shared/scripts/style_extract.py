@@ -288,7 +288,37 @@ def _seed_contact_index(contacts) -> tuple:
             d = _digits(p)
             if len(d) >= 7:
                 lookup.setdefault(d[-10:], (cid, name))
+    _adopt_graph_cids(index, lookup)
     return index, lookup
+
+
+def _adopt_graph_cids(index: list, lookup: dict) -> None:
+    """Re-key seeded cards to the knowledge graph's canonical_id wherever an identifier already
+    belongs to a person file. The seed formula reproduces the file's id only when name + first
+    email agree byte-for-byte; a drifted id put one human's iMessage voice and email voice in two
+    per_person buckets. The graph is the register; the seed only fills the gaps. Fail-soft: no
+    graph on this box → the seeds stand as minted."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "knowledge"))
+        import knowledge as kg  # noqa: PLC0415
+        by_ident = kg.build_people_index().get("by_identifier") or {}
+        if not by_ident:
+            return
+        remap = {}
+        for card in index:
+            for i in (card.get("identifiers") or []):
+                path = by_ident.get(kg.normalize_identifier(str(i)))
+                if path:
+                    file_cid = os.path.splitext(os.path.basename(path))[0]
+                    if kg.valid_canonical_id(file_cid):
+                        remap[card["canonical_id"]] = file_cid
+                        card["canonical_id"] = file_cid
+                    break
+        for key, (cid, name) in list(lookup.items()):
+            if cid in remap:
+                lookup[key] = (remap[cid], name)
+    except Exception:  # noqa: BLE001 — identity adoption is an upgrade, never a blocker
+        return
 
 
 def _adapt_read_local(payload: dict) -> dict:

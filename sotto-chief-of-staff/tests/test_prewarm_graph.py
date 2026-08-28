@@ -119,9 +119,12 @@ def test_research_persists_one_combined_fact_profiles_only(tmp_path, monkeypatch
     assert calls["deep_env"] == "0"                        # Pass B disabled for the prewarm call
     assert "SOTTO_RESEARCH_DEEP" not in os.environ         # caller's env restored
     dhruv = open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read()
-    facts = [f.text for _fid, f in kg.sorted_active_facts(kg.parse_person_file(dhruv).facts)]
+    parsed = kg.parse_person_file(dhruv)
+    facts = [(f.text, f.source) for _fid, f in kg.sorted_active_facts(parsed.facts)]
     assert len(facts) == 1                                 # ONE fact — nothing to BUMP-swallow
-    assert facts[0] == "Per web search: Eng Lead at Acme — Builds infra tools."  # title AND summary
+    assert facts[0][0] == "Per web search: Eng Lead at Acme — Builds infra tools."  # title AND summary
+    assert facts[0][1] == "web_research"                   # provenance truthful, not brief_extraction
+    assert parsed.updated_by == "web_research"
 
 
 def test_research_sentinel_no_public_profile_never_persists(tmp_path, monkeypatch):
@@ -154,3 +157,98 @@ def test_main_unwraps_mcp_tool_result_wrapper(tmp_path, monkeypatch, capsys):
     pw.main()
     out = json.loads(capsys.readouterr().out)
     assert set(out["people"]) == {"Dhruv", "Sarah"}
+
+
+# ── Apple Contacts sync: the graph stops depending on a live Contacts read ─────────────────────
+
+
+def _card(name="Dhruv", **kw):
+    c = {"name": name, "phones": ["+1", "+15559998888"],   # "+1" is the handle _local()'s messages use
+         "emails": ["dhruv@acme.com", "d@personal.io"]}
+    c.update(kw)
+    return c
+
+
+def _snapshot(tmp_path, local):
+    kn = tmp_path / "knowledge"
+    kn.mkdir(parents=True, exist_ok=True)
+    (kn / "last_local_snapshot.json").write_text(json.dumps({"local": local}))
+
+
+def test_setup_stub_keeps_every_email_and_phone(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_PREWARM_RESEARCH", "0")
+    local = _local()
+    local["contacts"][0] = _card()
+    pw.prewarm(local)
+    p = kg.parse_person_file(open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read())
+    assert set(p.identifiers) == {"dhruv@acme.com", "d@personal.io", "+1", "+15559998888"}
+    # and the second address resolves to that same file — no fork
+    assert kg.find_person_file(identifier="d@personal.io") == kg.find_person_file(identifier="+15559998888")
+
+
+def test_notes_and_birthday_become_sourced_facts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _snapshot(tmp_path, {"contacts": [_card(notes="Met at YC. Runs the infra team.", birthday="06-26")]})
+    out = pw.sync_contacts(pw._snapshot_local())
+    assert out == {"contacts": 1, "synced": 1, "facts": 2}
+    p = kg.parse_person_file(open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read())
+    facts = {f.text: f for _fid, f in kg.sorted_active_facts(p.facts)}
+    note = facts["Met at YC. Runs the infra team."]                 # ONE fact, verbatim
+    assert note.source == "apple_contacts" and note.source_ref == "contacts"
+    assert note.type == "context" and note.conf == 0.9
+    bday = facts["Birthday: 06-26 (Apple Contacts)"]
+    assert bday.type == "personal" and bday.source == "apple_contacts"
+    assert p.updated_by == "apple_contacts"                          # honest provenance
+
+
+def test_resync_bumps_and_never_duplicates(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _snapshot(tmp_path, {"contacts": [_card(notes="Met at YC.", birthday="06-26")]})
+    pw.sync_contacts(pw._snapshot_local())
+    pw.sync_contacts(pw._snapshot_local())
+    p = kg.parse_person_file(open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read())
+    facts = [f for _fid, f in kg.sorted_active_facts(p.facts)]
+    assert len(facts) == 2 and all(f.seen == 2 for f in facts)
+
+
+def test_nameless_and_emailless_card_is_never_a_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _snapshot(tmp_path, {"contacts": [
+        {"name": "", "phones": ["+15550000000"], "notes": "unknown number"},
+        {"name": "", "emails": ["someone@acme.com"], "notes": "the ops alias"}]})
+    out = pw.sync_contacts(pw._snapshot_local())
+    assert out["synced"] == 1                                # only the emailed one is a person
+    assert kg.find_person_file(identifier="+15550000000") is None
+    assert kg.find_person_file(identifier="someone@acme.com") is not None
+
+
+def test_plain_address_book_rows_are_not_minted_as_people(tmp_path, monkeypatch):
+    """An address book is a directory, not a graph: a card with no note, no birthday, and nobody
+    already on file stays out. The same card syncs once Sotto knows the person."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _snapshot(tmp_path, {"contacts": [_card(name="Random Plumber", emails=["plumber@pipes.com"],
+                                            phones=["+15551110000"])]})
+    assert pw.sync_contacts(pw._snapshot_local())["synced"] == 0
+    assert kg.find_person_file(identifier="plumber@pipes.com") is None
+
+    import knowledge_update as ku
+    ku.apply({"person_updates": [{"person_name": "Random Plumber", "identifier": "plumber@pipes.com"}]})
+    assert pw.sync_contacts(pw._snapshot_local())["synced"] == 1
+    p = kg.parse_person_file(open(kg.find_person_file(identifier="plumber@pipes.com")).read())
+    assert "+15551110000" in p.identifiers                   # the known person gains the phone
+
+
+def test_sync_contacts_cli_reads_the_snapshot(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _snapshot(tmp_path, {"contacts": [_card(notes="Met at YC.")]})
+    monkeypatch.setattr(sys, "argv", ["prewarm_graph.py", "--sync-contacts"])
+    pw.main()
+    assert json.loads(capsys.readouterr().out) == {"contacts": 1, "synced": 1, "facts": 1}
+
+
+def test_sync_contacts_without_a_snapshot_is_a_no_op(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["prewarm_graph.py", "--sync-contacts"])
+    pw.main()
+    assert json.loads(capsys.readouterr().out) == {"contacts": 0, "synced": 0, "facts": 0}

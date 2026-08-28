@@ -45,7 +45,12 @@ def test_persist_writes_low_confidence_sourced_facts(tmp_path, monkeypatch):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert f.conf == 0.55                                       # prewarm's low-confidence decay pattern
     assert f.source_ref == f"meeting-prep-research:{today}"
-    assert p.company is None and p.title is None               # never authoritative identity fields
+    # REVERSED (owner, Aug 2026: "all research gets utilized"): research hands us title/company
+    # as typed fields and they now LAND typed — the pack's identity line, the pulse's weighting
+    # and the People filter all read this pair, and the brief lane already writes it from far
+    # less grounded LLM output. A wrong pair is corrected like any fact, via chat or dashboard.
+    assert p.title == "CEO" and p.company == "Acme"
+    assert p.updated_by == "web_research"                       # provenance stamp tells the truth
     assert "dana@acme.com" in p.identifiers
 
 

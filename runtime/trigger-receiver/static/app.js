@@ -5,17 +5,34 @@
    Write rule: NEVER optimistic — every edit re-renders from the server's
    response. The dashboard is a window, not a second brain.
 
-   Design system: the LEDGER. Every list is ruled rows under a heavy top
-   rule — serif entries, mono folio meta right-aligned. Views open with a
-   thesis (Today composes an editorial status sentence from live data),
-   never a stat-tile row. Motion is gated: view switches render instantly;
-   the entrance stagger runs once per view per session; row exits and toasts
-   are the only other movers.
+   Design system: the LEDGER. Every list is ruled rows on a hairlined panel —
+   serif entries, mono folio meta right-aligned. Motion is gated: view switches
+   render instantly; the entrance stagger runs once per view per session; row
+   exits and toasts are the only other movers.
 
-   M3 surfaces: Today's docket (GET /api/calendar) + research cards
-   (GET /api/research) fold into the morning memo; The Record (#record,
-   GET /api/ledger) is the date-grouped action timeline. All three parse
-   defensively — unknown shapes render what exists, never crash. */
+   FOUR DESTINATIONS, by intent rather than by backing file:
+     #now       the day — dateline, thesis, docket, the open loops (with their
+                actions), what was delivered today
+     #activity  what Sotto has been doing — the cadence strip + snooze over
+                [Held | Log | Briefs]
+     #memory    what it holds — [People | Rules | Voice | Standing file]
+     #labels    the Golden Corpus labeling hour
+   Two detail pages are routed but never in the nav (#people/<slug>,
+   #briefs/<date>/<kind>), and every pre-redesign address is still a real route
+   that renders the page it meant (see the router's alias block and app.html's
+   #nav-aliases list).
+
+   CHROME RULE: a rule Sotto follows is one sentence, and it lives behind a "?"
+   (hintBtn) on the row or cap it explains — never as permanent furniture. Page
+   subtitles do not exist; scalars read as one stat strip, not as a stack of
+   full-height rows.
+
+   CONFIRM GRADIENT: taps scale with the cost of being wrong. Irreversible
+   (a person merge) takes two — armConfirm. Re-addable (a house rule, a loop)
+   takes one.
+
+   Every endpoint parses defensively — unknown shapes render what exists,
+   never crash. */
 (function () {
   "use strict";
 
@@ -69,16 +86,109 @@
     return b;
   }
 
-  /* The ledger: cap (mono label + right slot) over a ruled row list. */
-  function ledgerCap(label, rightNode) {
+  /* The ledger: cap (mono label + right slot) over a ruled row list.
+     A `hint` sentence rides behind a "?" on the cap instead of standing as
+     permanent chrome under it. */
+  function ledgerCap(label, rightNode, hint) {
     var cap = el("div", "ledger-cap");
-    cap.appendChild(el("span", null, label));
+    var left = el("span", "cap-label");
+    left.appendChild(document.createTextNode(String(label)));
+    if (hint) left.appendChild(hintBtn(hint, cap));
+    cap.appendChild(left);
     if (rightNode) cap.appendChild(rightNode);
     return cap;
   }
 
   function capCount(text) {
     return el("span", "cap-count", text);
+  }
+
+  /* ---------------- The hint affordance ----------------
+     Every rule Sotto follows is still one sentence, and every sentence is still
+     one tap away — it just no longer sits on the page as permanent furniture.
+     A small round "?" toggles the sentence in, inserted after the row or cap it
+     explains; a second tap takes it back out. */
+
+  function hintBtn(text, host) {
+    var b = button("hint-btn", "?");
+    b.setAttribute("aria-label", "Why");
+    b.setAttribute("aria-expanded", "false");
+    var pop = null;
+    b.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (pop) {
+        if (pop.parentNode) pop.parentNode.removeChild(pop);
+        pop = null;
+        b.setAttribute("aria-expanded", "false");
+        return;
+      }
+      var anchorEl = host || b.parentNode;
+      if (!anchorEl || !anchorEl.parentNode) return;
+      pop = el("p", "hint-pop", text);
+      anchorEl.parentNode.insertBefore(pop, anchorEl.nextSibling);
+      b.setAttribute("aria-expanded", "true");
+    });
+    return b;
+  }
+
+  /* ---------------- The stat strip ----------------
+     Scalars that used to each claim a full-height row now read as one mono line:
+     "2/4 nudges · 1/3 taps · quiet 9pm–7am". Each segment can carry its own rule
+     behind a "?" — items: [{text, hint}]. */
+
+  function statStrip(items) {
+    var strip = el("div", "stat-strip");
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item || !item.text) continue;
+      var seg = el("span", "stat-seg");
+      seg.appendChild(el("span", "stat-text", item.text));
+      if (item.hint) seg.appendChild(hintBtn(item.hint, seg));
+      strip.appendChild(seg);
+    }
+    return strip;
+  }
+
+  /* A page masthead for the composed views: eyebrow over a compact title, with
+     whatever the page used to say in an italic sub-line folded behind a "?". */
+  function viewHead(eyebrow, title, hint) {
+    var wrap = el("div", "view-head");
+    wrap.appendChild(el("p", "eyebrow", eyebrow));
+    var line = el("div", "title-line");
+    line.appendChild(el("h1", "view-title", title));
+    if (hint) line.appendChild(hintBtn(hint, line));
+    wrap.appendChild(line);
+    return wrap;
+  }
+
+  /* Two-tap confirm, reserved for the irreversible: the first tap arms the
+     button, the second runs it, and a click anywhere else backs out. Everything
+     re-addable (a house rule, a loop) stays one tap — the gradient follows the
+     cost of being wrong, not the loudness of the verb. */
+  function armConfirm(btn, armedLabel, run) {
+    var idleLabel = btn.textContent;
+    var armed = false;
+    var away = function (ev) {
+      if (ev.target === btn) return;
+      disarm();
+    };
+    function disarm() {
+      if (!armed) return;
+      armed = false;
+      btn.textContent = idleLabel;
+      btn.classList.remove("confirm-armed");
+      document.removeEventListener("click", away, true);
+    }
+    btn.addEventListener("click", function () {
+      if (armed) { disarm(); run(); return; }
+      armed = true;
+      btn.textContent = armedLabel;
+      btn.classList.add("confirm-armed");
+      // Deferred: the click that armed it would otherwise reach this listener.
+      setTimeout(function () { document.addEventListener("click", away, true); }, 0);
+    });
+    return btn;
   }
 
   /* Marks a ledger for the once-per-session entrance stagger. */
@@ -452,35 +562,37 @@
     return dl;
   }
 
-  /* ---------------- View: Today ---------------- */
+  /* ---------------- View: Now ----------------
+     The day and what it is waiting on, on ONE page: the dateline, the docket,
+     and the open loops themselves — the real rows with their real actions, never
+     a read-only excerpt of a list that lives somewhere else. */
 
-  function viewToday(anchor) {
+  function viewNow(anchor) {
     var seq = ++state.renderSeq;
     setView(skeletonView(3));
     Promise.all([
       api("/api/overview"),
       api("/api/loops").catch(function () { return null; }),
       api("/api/calendar").catch(function () { return null; }),
-      api("/api/research").catch(function () { return null; }),
-      api("/api/cadence").catch(function () { return null; })
+      api("/api/research").catch(function () { return null; })
     ])
       .then(function (results) {
         if (seq !== state.renderSeq) return;
         var data = results[0] || {};
-        var loops = results[1] && Array.isArray(results[1].loops) ? results[1].loops : null;
+        var loops = results[1] && Array.isArray(results[1].loops) ? results[1].loops : [];
         var cal = results[2];
         var research = results[3];
-        data._cadence = results[4];
         var frag = document.createDocumentFragment();
 
-        // Masthead — dateline + folio number
+        // Masthead — dateline + folio number. This page keeps the display-scale
+        // date: it is the brand moment, and the only one left on the site.
         var head = el("div", "masthead");
         var folio = el("div", "masthead-folio");
         folio.appendChild(el("span", null, "Today"));
         folio.appendChild(el("span", "folio-no", "№ " + String(data.date || "").replace(/-/g, "·")));
         head.appendChild(folio);
         head.appendChild(el("h1", "masthead-date", friendlyDate(data.date || new Date().toISOString())));
-        head.appendChild(buildThesis(data, loops, cal));
+        head.appendChild(buildThesis(data, cal));
         frag.appendChild(head);
         frag.appendChild(el("hr", "head-rule"));
 
@@ -491,28 +603,8 @@
         var googleOk = !!(data.services && data.services.google === true);
         frag.appendChild(buildDocket(cal, research, googleOk));
 
-        // Waiting on you — open loops that deserve attention today
-        var loopRows = loops || [];
-        var docket = el("div");
-        var capRight;
-        if (loopRows.length > 5) {
-          capRight = el("a", "cap-count", "all " + loopRows.length + " →");
-          capRight.href = "#loops";
-        } else {
-          capRight = capCount(loopRows.length ? String(loopRows.length) + " open" : "clear");
-        }
-        docket.appendChild(ledgerCap("Waiting on you", capRight));
-        var dl = el("div", "ledger");
-        if (!loopRows.length) {
-          dl.appendChild(emptyState("Nothing is waiting on you",
-            "When a thread needs a reply or a promise needs keeping, it lands here."));
-        } else {
-          for (var i = 0; i < Math.min(loopRows.length, 5); i++) {
-            dl.appendChild(docketRow(loopRows[i] || {}));
-          }
-        }
-        docket.appendChild(enterOnce("today", dl));
-        frag.appendChild(docket);
+        // Waiting on you — the loops, actionable in place
+        buildLoopsSection(frag, loops, "now");
 
         // Today's briefs, when any have landed
         var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];
@@ -525,7 +617,7 @@
           frag.appendChild(bl);
         }
 
-        state.entered.today = true;
+        state.entered.now = true;
         setView();
         main.appendChild(frag);
         if (anchor === "docket") {
@@ -534,7 +626,7 @@
         }
       }).catch(function (err) {
         if (seq !== state.renderSeq || err.handled) return;
-        setView(errorView("The Today page didn't load.", function () { viewToday(); }));
+        setView(errorView("The Now page didn't load.", function () { viewNow(); }));
       });
   }
 
@@ -559,8 +651,12 @@
     return p;
   }
 
-  /* One editorial sentence, composed from live data — every clause a link. */
-  function buildThesis(data, loops, cal) {
+  /* One editorial sentence, composed from live data — every clause a link.
+     THREE clauses at most, and only one of them is ever bad news: whatever needs
+     a hand, whether a brief has landed, and the next meeting. The loop count and
+     the snooze used to live here; both now live as real rows further down this
+     same page, where they can be acted on instead of merely counted. */
+  function buildThesis(data, cal) {
     var p = el("p", "thesis");
 
     function clause(text, href, isDown) {
@@ -572,15 +668,19 @@
 
     var parts = [];
 
-    // 1 · The Bridge (the Mac feeding Sotto)
-    var ago = timeAgo(data.last_event_at);
-    if (data.bridge_connected === true) {
-      parts.push(clause("Bridge live" + (ago ? ", last event " + ago : ""), "/setup"));
-    } else {
+    // 1 · Trouble only — the Bridge and the services, and silence when all is well
+    var trouble = [];
+    if (data.bridge_connected !== true) {
+      var ago = timeAgo(data.last_event_at);
       var since = ago && ago !== "just now"
         ? " since " + ago.replace(" ago", "") + " ago" : (ago ? "" : " yet");
-      parts.push(clause("your Mac hasn't checked in" + since, "/setup", true));
+      trouble.push("your Mac hasn't checked in" + since);
     }
+    var svc = (data.services && typeof data.services === "object") ? data.services : {};
+    if (svc.google !== true) trouble.push("Google needs connecting");
+    if (svc.whatsapp !== true) trouble.push("WhatsApp isn't linked");
+    if (svc.granola === "reconnect") trouble.push("Granola needs a reconnect");
+    if (trouble.length) parts.push(clause(trouble.join(", "), "/setup", true));
 
     // 2 · Briefs today
     var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];
@@ -588,9 +688,9 @@
       parts.push(clause(String(todays[0].kind) + " brief delivered — read it",
         "#briefs/" + encodeURIComponent(data.date || "") + "/" + encodeURIComponent(todays[0].kind)));
     } else if (todays.length > 1) {
-      parts.push(clause(todays.length + " briefs delivered today", "#briefs"));
+      parts.push(clause(todays.length + " briefs delivered today", "#activity/briefs"));
     } else {
-      parts.push(clause("no brief has landed yet today", "#briefs"));
+      parts.push(clause("no brief has landed yet today", "#activity/briefs"));
     }
 
     // 3 · The docket — one clause; once today is behind you it looks at tomorrow
@@ -605,7 +705,7 @@
         if (st && st.getTime() > Date.now()) { next = st; break; }
       }
       if (next) mtext += " — next at " + fmtClock(next);
-      parts.push(clause(mtext, "#today/docket"));
+      parts.push(clause(mtext, "#now/docket"));
     } else if (docketSplit.tomorrow.length) {
       var tn = docketSplit.tomorrow.length;
       var ttext = tn === 1 ? "1 meeting tomorrow" : tn + " meetings tomorrow";
@@ -615,38 +715,7 @@
         if (ts2) { firstStart = ts2; break; }
       }
       if (firstStart) ttext += " — first at " + fmtClock(firstStart);
-      parts.push(clause(ttext, "#today/docket"));
-    }
-
-    // 4 · Open loops
-    var n = loops ? loops.length : (typeof data.loops_active === "number" ? data.loops_active : 0);
-    parts.push(clause(n === 0 ? "no loops open" : n === 1 ? "1 loop open" : n + " loops open", "#loops"));
-
-    // 5 · Cadence — only when something is actually holding Sotto back. Silence
-    //     here means nothing is being withheld, which is the common, good case.
-    var cad = data._cadence;
-    if (cad && typeof cad === "object") {
-      var held = typeof cad.waiting_total === "number" ? cad.waiting_total : 0;
-      var snoozed = !!(cad.snooze && cad.snooze.active);
-      if (snoozed) {
-        parts.push(clause("nudges are snoozed until " +
-          snoozeUntilText(cad.snooze.until), "#cadence", true));
-      } else if (held) {
-        parts.push(clause(held === 1 ? "1 thing is being held" : held + " things are being held",
-          "#cadence"));
-      }
-    }
-
-    // 6 · Services — name only what needs a hand; quiet when all is well
-    var svc = (data.services && typeof data.services === "object") ? data.services : {};
-    var trouble = [];
-    if (svc.google !== true) trouble.push("Google needs connecting");
-    if (svc.whatsapp !== true) trouble.push("WhatsApp isn't linked");
-    if (svc.granola === "reconnect") trouble.push("Granola needs a reconnect");
-    if (trouble.length) {
-      parts.push(clause(trouble.join(", "), "/setup", true));
-    } else {
-      parts.push(clause("all services connected", "/setup"));
+      parts.push(clause(ttext, "#now/docket"));
     }
 
     for (var i = 0; i < parts.length; i++) {
@@ -663,22 +732,27 @@
     return p;
   }
 
-  /* Compact loop row for Today — links to #loops where the actions live. */
-  function docketRow(loop) {
-    var a = el("a", "ledger-row has-dot");
-    a.href = "#loops";
-    a.appendChild(statusDot(loop.status));
-    var mainCol = el("div", "row-main");
-    var name = typeof loop.contact_name === "string" ? loop.contact_name.trim() : "";
-    var summary = typeof loop.summary === "string" ? loop.summary.trim() : "";
-    mainCol.appendChild(el("div", "row-title", name || summary || "Open loop"));
-    if (name && summary) mainCol.appendChild(el("div", "row-sub", summary));
-    a.appendChild(mainCol);
-    var folio = el("div", "row-folio");
-    var opened = timeAgo(loop.created_at);
-    if (opened) folio.appendChild(el("span", null, opened.replace(" ago", "")));
-    a.appendChild(folio);
-    return a;
+  /* Waiting on you — the ONE rendering of the loop list, actions and all. There
+     is no second, read-only copy of it anywhere: a row you can see is a row you
+     can close. */
+  function buildLoopsSection(frag, loops, viewName) {
+    var counter = { count: loops.length, cap: capCount(""), list: null };
+    frag.appendChild(ledgerCap("Waiting on you", counter.cap));
+    var list = el("div", "ledger");
+    counter.list = list;
+    if (!loops.length) {
+      list.appendChild(emptyState("Nothing is waiting on you",
+        "When a thread needs a reply or a promise needs keeping, it lands here."));
+    } else {
+      for (var i = 0; i < loops.length; i++) {
+        list.appendChild(loopRow(loops[i] || {}, counter));
+      }
+    }
+    // Count set AFTER the list is built: on an already-empty page the empty
+    // state above stands alone — "All closed" is only for the last row closing.
+    updateLoopCount(counter);
+    frag.appendChild(enterOnce(viewName, list));
+    frag.appendChild(addLoopControl());
   }
 
   /* ---------------- Today's docket (GET /api/calendar) ---------------- */
@@ -919,7 +993,7 @@
         tomorrowCap = sub;
       }
     }
-    section.appendChild(enterOnce("today", ledger));
+    section.appendChild(enterOnce("now", ledger));
     if (tomorrowCap) { section.appendChild(tomorrowCap); section.appendChild(tomorrowLedger); }
     return section;
   }
@@ -1010,83 +1084,142 @@
     return clock + (day ? " " + day : "");
   }
 
-  /* One ledger row: a label, a mono reading, and an optional one-sentence rule. */
+  /* One ledger row: a label, a mono reading, and an optional one-sentence rule
+     that rides behind a "?" rather than standing under every reading forever. */
   function meterRow(title, reading, rule) {
     // The data-moment treatment (app.css .meter): title, then the READING on its
-    // own line with room around it, then the one-sentence rule. A figure like
-    // "3 of 4 spent" was unreadable squeezed into a right-aligned folio on a
-    // phone — on a panel it earns a line.
+    // own line with room around it. A figure like "3 of 4 spent" was unreadable
+    // squeezed into a right-aligned folio on a phone — on a panel it earns a line.
     var row = el("div", "ledger-row meter");
     var mainCol = el("div", "row-main");
-    mainCol.appendChild(el("div", "row-title", title));
+    var line = el("div", "row-line");
+    line.appendChild(el("div", "row-title", title));
+    if (rule) line.appendChild(hintBtn(rule, mainCol));
+    mainCol.appendChild(line);
     mainCol.appendChild(el("div", "meter-reading", reading));
-    if (rule) mainCol.appendChild(el("div", "row-sub", rule));
     row.appendChild(mainCol);
     return row;
   }
 
-  function viewCadence() {
+  /* ---------------- View: Activity ----------------
+     What Sotto has been doing and what it is sitting on, one page, three
+     segments: Held (the waiting room + what's scheduled), Log (the record), and
+     Briefs (run one now, read the archive). The cadence readings ride above all
+     three as a single mono strip — they are scalars, not sections. */
+
+  var ACTIVITY_SEGS = [["held", "Held"], ["log", "Log"], ["briefs", "Briefs"]];
+
+  function viewActivity(parts) {
     var seq = ++state.renderSeq;
+    var seg = str(parts && parts[1]).toLowerCase();
+    var known = false;
+    for (var i = 0; i < ACTIVITY_SEGS.length; i++) {
+      if (ACTIVITY_SEGS[i][0] === seg) known = true;
+    }
+    if (!known) seg = "held";
     setView(skeletonView(3));
     api("/api/cadence").then(function (data) {
       if (seq !== state.renderSeq) return;
-      renderCadence(seq, data || {});
+      renderActivity(seq, data || {}, seg, parts || []);
     }).catch(function (err) {
       if (seq !== state.renderSeq || err.handled) return;
-      setView(errorView("The cadence page didn't load.", viewCadence));
+      setView(errorView("The activity page didn't load.", function () { viewActivity(parts); }));
     });
   }
 
-  function renderCadence(seq, data) {
+  function renderActivity(seq, data, seg, parts) {
     if (seq !== state.renderSeq) return;
     var frag = document.createDocumentFragment();
-    frag.appendChild(el("p", "eyebrow", "Cadence"));
-    frag.appendChild(el("h1", "view-title", "How loud Sotto is today"));
-    frag.appendChild(el("p", "view-sub",
+    frag.appendChild(viewHead("Activity", "What Sotto has been doing",
       "What it has spent, what is holding it back, and who is waiting behind the holds."));
 
     var repaint = function (resp) {
-      if (resp && typeof resp === "object" && resp.date) renderCadence(seq, resp);
-      else viewCadence();
+      if (resp && typeof resp === "object" && resp.date) renderActivity(seq, resp, seg, parts);
+      else viewActivity(parts);
     };
 
-    // Today's allowance — three counters, each with its rule
+    // Today's allowance and the standing levers — one strip, every rule still
+    // one tap away behind its own "?".
     var budget = (data.budget && typeof data.budget === "object") ? data.budget : {};
     var taps = (data.taps && typeof data.taps === "object") ? data.taps : {};
     var valve = (data.valve && typeof data.valve === "object") ? data.valve : {};
-    frag.appendChild(ledgerCap("Today's allowance", capCount(String(data.date || ""))));
-    var meters = el("div", "ledger");
-    meters.appendChild(meterRow("Interrupt budget",
-      (budget.spent || 0) + " of " + (budget.cap || 0) + " spent",
-      "Every nudge spends one; when they're gone the rest wait for the digest or the brief."));
-    meters.appendChild(meterRow("Post-meeting taps",
-      (taps.fired || 0) + " of " + (taps.cap || 0) + " fired",
-      "Taps have their own daily cap, so they and your interrupts never starve each other."));
-    meters.appendChild(meterRow("Released from the queue",
-      valve.enabled === false ? "the valve is off"
-        : (valve.promoted || 0) + " of " + (valve.cap || 0) + " this hour",
-      "The release valve lets a held ask out once the hold lifts — at most a couple an hour."));
-    frag.appendChild(enterOnce("cadence", meters));
+    var quiet = (data.quiet && typeof data.quiet === "object") ? data.quiet : {};
+    var delivery = (data.delivery && typeof data.delivery === "object") ? data.delivery : {};
+    frag.appendChild(statStrip([
+      { text: (budget.spent || 0) + "/" + (budget.cap || 0) + " nudges",
+        hint: "Every nudge spends one; when they're gone the rest wait for the digest or the brief." },
+      { text: (taps.fired || 0) + "/" + (taps.cap || 0) + " taps",
+        hint: "Taps have their own daily cap, so they and your interrupts never starve each other." },
+      { text: valve.enabled === false ? "valve off"
+          : (valve.promoted || 0) + "/" + (valve.cap || 0) + " released",
+        hint: "The release valve lets a held ask out once the hold lifts — at most a couple an hour." },
+      { text: "quiet " + hourLabel(quiet.start) + "–" + hourLabel(quiet.end),
+        hint: "Between these hours nothing interrupts you but a VIP's missed call." },
+      { text: "via " + (str(delivery.channel) || "chat"), hint: deliveryRule(delivery) }
+    ]));
 
-    // The levers — snooze (writable), quiet hours, delivery
-    frag.appendChild(ledgerCap("The levers", null));
     var levers = el("div", "ledger");
     levers.appendChild(snoozeRow(data, repaint));
-    var quiet = (data.quiet && typeof data.quiet === "object") ? data.quiet : {};
-    levers.appendChild(meterRow("Quiet hours",
-      hourLabel(quiet.start) + " – " + hourLabel(quiet.end),
-      "Between these hours nothing interrupts you but a VIP's missed call."));
-    var delivery = (data.delivery && typeof data.delivery === "object") ? data.delivery : {};
-    levers.appendChild(meterRow("Delivery",
-      str(delivery.channel) || "chat",
-      deliveryRule(delivery)));
     frag.appendChild(levers);
+
+    // The segment control — same .seg pattern the People index uses.
+    var body = el("div");
+    var segRow = el("div", "seg");
+    segRow.setAttribute("role", "group");
+    segRow.setAttribute("aria-label", "Which activity to show");
+    for (var s = 0; s < ACTIVITY_SEGS.length; s++) {
+      (function (pair) {
+        var b = button(null, pair[1], function () {
+          location.hash = pair[0] === "log" ? "#activity/log" : "#activity/" + pair[0];
+        });
+        b.setAttribute("aria-pressed", String(pair[0] === seg));
+        segRow.appendChild(b);
+      }(ACTIVITY_SEGS[s]));
+    }
+    frag.appendChild(segRow);
+    frag.appendChild(body);
+
+    setView();
+    main.appendChild(frag);
+
+    // The section builds AFTER the shell is in the DOM, and each marks its own
+    // entrance flag — set here it would suppress the stagger it is meant to arm.
+    if (seg === "held") buildHeldSection(seq, body, data, repaint);
+    else if (seg === "log") buildRecordSection(seq, body, parts[2], parts[3]);
+    else buildBriefsSection(seq, body);
+  }
+
+  /* Held: what Sotto decided not to interrupt you with, and what it has been
+     asked to do later. Both are "not yet" — they belong on one surface. */
+  function buildHeldSection(seq, container, data, repaint) {
+    container.replaceChildren();
+    var waiting = Array.isArray(data.waiting) ? data.waiting : [];
+    var total = typeof data.waiting_total === "number" ? data.waiting_total : waiting.length;
+    container.appendChild(ledgerCap("The waiting room",
+      capCount(total ? (total === 1 ? "1 held" : total + " held") : "empty"),
+      "Events Sotto decided not to interrupt you with. This is the answer to “why haven't I heard about that?”"));
+    var room = el("div", "ledger");
+    if (!waiting.length) {
+      room.appendChild(emptyState("Nothing is being held",
+        "Everything that arrived either reached you or wasn't worth your attention."));
+    } else {
+      for (var i = 0; i < waiting.length; i++) {
+        room.appendChild(waitingRow(waiting[i] || {}, data, repaint));
+      }
+    }
+    container.appendChild(enterOnce("activity", room));
+    state.entered.activity = true;
+    if (total > waiting.length) {
+      container.appendChild(el("p", "note",
+        "Showing the newest " + waiting.length + " of " + total + " held items."));
+    }
 
     // Scheduled work — recurring user routines and one-shot intentions, read-only here. Creation
     // and cancellation stay conversational so the user can state the actual intent in plain words.
     var intentions = Array.isArray(data.intentions) ? data.intentions : [];
     var routines = Array.isArray(data.routines) ? data.routines : [];
-    frag.appendChild(ledgerCap("Scheduled", capCount((intentions.length + routines.length) || "none")));
+    container.appendChild(ledgerCap("Scheduled",
+      capCount((intentions.length + routines.length) || "none")));
     var scheduled = el("div", "ledger");
     for (var si = 0; si < intentions.length; si++) {
       var intention = intentions[si] || {};
@@ -1104,33 +1237,7 @@
       scheduled.appendChild(emptyState("Nothing scheduled",
         "Ask Sotto for a one-time reminder or a recurring routine in plain language."));
     }
-    frag.appendChild(scheduled);
-
-    // The waiting room
-    var waiting = Array.isArray(data.waiting) ? data.waiting : [];
-    var total = typeof data.waiting_total === "number" ? data.waiting_total : waiting.length;
-    frag.appendChild(ledgerCap("The waiting room",
-      capCount(total ? (total === 1 ? "1 held" : total + " held") : "empty")));
-    frag.appendChild(el("p", "cap-sub",
-      "Events Sotto decided not to interrupt you with. This is the answer to “why haven't I heard about that?”"));
-    var room = el("div", "ledger");
-    if (!waiting.length) {
-      room.appendChild(emptyState("Nothing is being held",
-        "Everything that arrived either reached you or wasn't worth your attention."));
-    } else {
-      for (var i = 0; i < waiting.length; i++) {
-        room.appendChild(waitingRow(waiting[i] || {}, data, repaint));
-      }
-      if (total > waiting.length) {
-        frag.appendChild(el("p", "note",
-          "Showing the newest " + waiting.length + " of " + total + " held items."));
-      }
-    }
-    frag.appendChild(room);
-
-    state.entered.cadence = true;
-    setView();
-    main.appendChild(frag);
+    container.appendChild(scheduled);
   }
 
   function hourLabel(h) {
@@ -1159,8 +1266,10 @@
     var active = snooze.active === true;
     var row = el("div", "ledger-row");
     var mainCol = el("div", "row-main");
-    mainCol.appendChild(el("div", "row-title", "Nudge snooze"));
-    mainCol.appendChild(el("div", "row-sub", "A snooze lifts when quiet hours do."));
+    var line = el("div", "row-line");
+    line.appendChild(el("div", "row-title", "Nudge snooze"));
+    line.appendChild(hintBtn("A snooze lifts when quiet hours do.", mainCol));
+    mainCol.appendChild(line);
     row.appendChild(mainCol);
 
     var folio = el("div", "row-folio");
@@ -1222,7 +1331,7 @@
       }
       send({ op: "snooze", spec: input.value });
     });
-    append(actions, input, save, button("btn", "Cancel", function () { viewCadence(); }));
+    append(actions, input, save, button("btn", "Cancel", function () { reroute(); }));
     input.focus();
   }
 
@@ -1295,50 +1404,7 @@
     return Math.floor(h / 24) + "d";
   }
 
-  /* ---------------- View: Open Loops ---------------- */
-
-  function viewLoops() {
-    var seq = ++state.renderSeq;
-    setView(skeletonView(3));
-    api("/api/loops").then(function (data) {
-      if (seq !== state.renderSeq) return;
-      var loops = (data && Array.isArray(data.loops)) ? data.loops : [];
-      var frag = document.createDocumentFragment();
-      frag.appendChild(el("p", "eyebrow", "Loops"));
-      frag.appendChild(el("h1", "view-title", "Open loops"));
-      frag.appendChild(el("p", "view-sub", "What Sotto is holding open until you close it."));
-
-      var counter = {
-        count: loops.length,
-        cap: capCount(""),
-        list: null
-      };
-
-      frag.appendChild(ledgerCap("Waiting on you", counter.cap));
-      var list = el("div", "ledger");
-      counter.list = list;
-
-      if (!loops.length) {
-        list.appendChild(emptyState("Nothing is waiting on you",
-          "When a thread needs a reply or a promise needs keeping, it lands here."));
-      } else {
-        for (var i = 0; i < loops.length; i++) {
-          list.appendChild(loopRow(loops[i] || {}, counter));
-        }
-      }
-      // Count set AFTER the list is built: on an already-empty page the empty
-      // state above stands alone — "All closed" is only for the last row closing.
-      updateLoopCount(counter);
-      frag.appendChild(enterOnce("loops", list));
-      frag.appendChild(addLoopControl());
-      state.entered.loops = true;
-      setView();
-      main.appendChild(frag);
-    }).catch(function (err) {
-      if (seq !== state.renderSeq || err.handled) return;
-      setView(errorView("The loops didn't load.", viewLoops));
-    });
-  }
+  /* ---------------- Open loops (rendered by Now) ---------------- */
 
   function updateLoopCount(counter) {
     counter.cap.textContent = counter.count === 1 ? "1 open" : counter.count + " open";
@@ -1444,7 +1510,7 @@
       save.disabled = cancel.disabled = true;
       if (clear) clear.disabled = true;
       apiPost("/api/loops", { anchor_key: anchor, op: "deadline", deadline: value })
-        .then(function () { viewLoops(); })
+        .then(function () { reroute(); })
         .catch(function (err) {
           save.disabled = cancel.disabled = false;
           if (clear) clear.disabled = false;
@@ -1458,7 +1524,7 @@
       }
       send(input.value);
     });
-    cancel = button("btn", "Cancel", function () { viewLoops(); });
+    cancel = button("btn", "Cancel", function () { reroute(); });
     append(actions, input, save);
     if (current) {
       clear = button("text-action", "clear", function () { send(""); });
@@ -1504,7 +1570,7 @@
         apiPost("/api/loops", {
           op: "add", text: text, contact: who.value.trim(),
           deadline: /^\d{4}-\d{2}-\d{2}$/.test(due.value) ? due.value : ""
-        }).then(function () { viewLoops(); }).catch(function (err) {
+        }).then(function () { reroute(); }).catch(function (err) {
           saveBtn.disabled = cancelBtn.disabled = false;
           if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
         });
@@ -1558,10 +1624,9 @@
     return a;
   }
 
-  function viewBriefs(date, kind) {
-    if (date && kind) return viewBriefDetail(date, kind);
-    var seq = ++state.renderSeq;
-    setView(skeletonView(4));
+  /* The Briefs segment of Activity: run one by hand, then the archive. */
+  function buildBriefsSection(seq, container) {
+    container.replaceChildren(skeletonView(2));
     Promise.all([
       api("/api/briefs"),
       api("/api/runs").catch(function () { return null; })
@@ -1570,14 +1635,11 @@
       var data = results[0];
       var runs = results[1];
       var briefs = (data && Array.isArray(data.briefs)) ? data.briefs : [];
-      var frag = document.createDocumentFragment();
-      frag.appendChild(el("p", "eyebrow", "Briefs"));
-      frag.appendChild(el("h1", "view-title", "What Sotto has delivered"));
-      frag.appendChild(el("p", "view-sub", "Every morning and evening brief, kept on file."));
+      container.replaceChildren();
 
-      appendRunNow(frag, runs);
+      appendRunNow(container, runs);
 
-      frag.appendChild(ledgerCap("On file",
+      container.appendChild(ledgerCap("On file",
         capCount(briefs.length === 1 ? "1 brief" : briefs.length + " briefs")));
       var list = el("div", "ledger");
       if (!briefs.length) {
@@ -1588,13 +1650,12 @@
           list.appendChild(briefRow(briefs[i] || {}, "archive"));
         }
       }
-      frag.appendChild(enterOnce("briefs", list));
-      state.entered.briefs = true;
-      setView();
-      main.appendChild(frag);
+      container.appendChild(list);
     }).catch(function (err) {
       if (seq !== state.renderSeq || err.handled) return;
-      setView(errorView("The briefs didn't load.", function () { viewBriefs(); }));
+      container.replaceChildren(errorView("The briefs didn't load.", function () {
+        buildBriefsSection(seq, container);
+      }));
     });
   }
 
@@ -1612,8 +1673,7 @@
   function appendRunNow(frag, runs) {
     var jobs = (runs && Array.isArray(runs.jobs)) ? runs.jobs : [];
     if (!jobs.length) return;
-    frag.appendChild(ledgerCap("Run it now", null));
-    frag.appendChild(el("p", "cap-sub",
+    frag.appendChild(ledgerCap("Run it now", null,
       "The web triggers it; the brief still arrives on " +
       humanChannel(str(runs.channel) || "chat") + ", where your messages live."));
     var list = el("div", "ledger");
@@ -1625,11 +1685,13 @@
     var labels = RUN_LABELS[str(job.kind)] || [prettyKey(job.kind), str(job.kind)];
     var row = el("div", "ledger-row");
     var mainCol = el("div", "row-main");
-    mainCol.appendChild(el("div", "row-title", labels[0]));
+    var line = el("div", "row-line");
+    line.appendChild(el("div", "row-title", labels[0]));
     if (str(job.kind) === "digest") {
-      mainCol.appendChild(el("div", "row-sub",
-        "It stays silent unless the day has been heavy enough to be worth a catch-up."));
+      line.appendChild(hintBtn(
+        "It stays silent unless the day has been heavy enough to be worth a catch-up.", mainCol));
     }
+    mainCol.appendChild(line);
     row.appendChild(mainCol);
 
     var folio = el("div", "row-folio");
@@ -1675,7 +1737,7 @@
         var page = el("div", "reading");
 
         var back = el("a", "back-link", "← All briefs");
-        back.href = "#briefs";
+        back.href = "#activity/briefs";
         page.appendChild(back);
 
         var head = el("div", "masthead");
@@ -1694,7 +1756,7 @@
           card.appendChild(append(el("div", "data-walk"), renderDataWalk(data.data)));
           page.appendChild(card);
         } else {
-          page.appendChild(el("p", "view-sub", "This brief was archived without readable text."));
+          page.appendChild(emptyState(null, "This brief was archived without readable text."));
         }
         frag.appendChild(page);
         setView();
@@ -1705,23 +1767,16 @@
       });
   }
 
-  /* ---------------- View: People (one memory graph, legible halves) ---------------- */
+  /* ---------------- The People index (the People segment of Memory) ---------------- */
 
-  function viewPeople(slug) {
-    if (slug) return viewPerson(slug);
-    var seq = ++state.renderSeq;
-
-    var frag = document.createDocumentFragment();
-    frag.appendChild(el("p", "eyebrow", "People"));
-    frag.appendChild(el("h1", "view-title", "Who Sotto knows"));
-    frag.appendChild(el("p", "view-sub",
-      "One memory graph — the people you talk to and the companies around them. Open anyone to correct what's on file."));
+  function buildPeopleSection(seq, container) {
+    container.replaceChildren();
 
     // The two things about the graph that are waiting on a human: possible duplicate
     // people, and relationships going quiet. Rendered above the index because both
     // are rare, short, and actionable — and empty means nothing renders at all.
     var graphWrap = el("div");
-    frag.appendChild(graphWrap);
+    container.appendChild(graphWrap);
 
     var wrap = el("div", "search-wrap");
     var label = el("label", "visually-hidden", "Search people and companies");
@@ -1733,10 +1788,10 @@
     input.autocomplete = "off";
     input.value = state.peopleQuery;
     append(wrap, label, input);
-    frag.appendChild(wrap);
+    container.appendChild(wrap);
 
     // Segmented filter — All / People / Companies (counts fill in after load)
-    var seg = el("div", "seg");
+    var seg = el("div", "seg seg-inner");
     seg.setAttribute("role", "group");
     seg.setAttribute("aria-label", "Filter the index");
     var segBtns = {};
@@ -1753,11 +1808,8 @@
       segBtns[key] = b;
       seg.appendChild(b);
     });
-    frag.appendChild(seg);
-    frag.appendChild(results);
-
-    setView();
-    main.appendChild(frag);
+    container.appendChild(seg);
+    container.appendChild(results);
 
     var debounceTimer = null;
     input.addEventListener("input", function () {
@@ -1785,8 +1837,7 @@
     var attention = Array.isArray(data.attention) ? data.attention : [];
 
     if (merges.length) {
-      container.appendChild(ledgerCap("Possible duplicates", capCount(String(merges.length))));
-      container.appendChild(el("p", "cap-sub",
+      container.appendChild(ledgerCap("Possible duplicates", capCount(String(merges.length)),
         "Sotto never merges two people on a name alone — holding two files for one person is the cheaper mistake. Say the word and it merges."));
       var ledger = el("div", "ledger");
       for (var i = 0; i < merges.length; i++) {
@@ -1798,8 +1849,7 @@
     }
 
     if (attention.length) {
-      container.appendChild(ledgerCap("Going quiet", capCount(String(attention.length))));
-      container.appendChild(el("p", "cap-sub",
+      container.appendChild(ledgerCap("Going quiet", capCount(String(attention.length)),
         "From the weekly relationship pulse — who's waiting on you, and who you used to talk to more."));
       var alist = el("div", "ledger");
       for (var a = 0; a < attention.length; a++) {
@@ -1858,7 +1908,10 @@
           }
         });
     };
-    yes = button("text-action", "same person — merge", function () { send("merge"); });
+    // Merging is the one write on this page that cannot be undone, so it is the
+    // one that takes a second tap. "Different people" is re-suggestible: one tap.
+    yes = armConfirm(button("text-action", "same person — merge"), "merge — sure?",
+      function () { send("merge"); });
     no = button("text-action", "different people", function () { send("dismiss"); });
     append(actions, yes, no);
     row.appendChild(actions);
@@ -1991,7 +2044,7 @@
     var frag = document.createDocumentFragment();
 
     var back = el("a", "back-link", "← People");
-    back.href = "#people";
+    back.href = "#memory";
     frag.appendChild(back);
 
     var head = el("div", "dossier-head");
@@ -2013,9 +2066,6 @@
     if (isCompany) {
       renderCompanySections(frag, data);
       frag.appendChild(companyAboutControl(data, ctx));
-      frag.appendChild(el("p", "note",
-        "Company pages are written by research and the briefs' Learn step. Rewriting About here is "
-        + "the same correction as telling Sotto in chat — and research won't overwrite it afterwards."));
       setView();
       main.appendChild(frag);
       return;
@@ -2164,9 +2214,11 @@
 
     var muteRow = el("div", "ledger-row");
     var muteMain = el("div", "row-main");
-    muteMain.appendChild(el("div", "row-title", "Muted"));
-    muteMain.appendChild(el("div", "row-sub",
-      "A muted person never triggers a nudge and never appears in a brief."));
+    var muteLine = el("div", "row-line");
+    muteLine.appendChild(el("div", "row-title", "Muted"));
+    muteLine.appendChild(hintBtn(
+      "A muted person never triggers a nudge and never appears in a brief.", muteMain));
+    muteMain.appendChild(muteLine);
     muteRow.appendChild(muteMain);
     var muteFolio = el("div", "row-folio");
     muteFolio.appendChild(el("span", null, muted ? "muted" : "not muted"));
@@ -2182,9 +2234,11 @@
 
     var vipRow = el("div", "ledger-row");
     var vipMain = el("div", "row-main");
-    vipMain.appendChild(el("div", "row-title", "VIP"));
-    vipMain.appendChild(el("div", "row-sub",
-      "A VIP's missed call reaches you even during quiet hours."));
+    var vipLine = el("div", "row-line");
+    vipLine.appendChild(el("div", "row-title", "VIP"));
+    vipLine.appendChild(hintBtn(
+      "A VIP's missed call reaches you even during quiet hours.", vipMain));
+    vipMain.appendChild(vipLine);
     vipRow.appendChild(vipMain);
     var vipFolio = el("div", "row-folio");
     vipFolio.appendChild(el("span", null, vip ? "vip" : "not a vip"));
@@ -2209,9 +2263,12 @@
   function mergeControlRow(slug, name, errEl) {
     var row = el("div", "ledger-row");
     var mainCol = el("div", "row-main");
-    mainCol.appendChild(el("div", "row-title", "Same as someone else"));
-    mainCol.appendChild(el("div", "row-sub",
-      "Merging folds this file into theirs and deletes this one — it's refused if the two carry different emails or phones."));
+    var line = el("div", "row-line");
+    line.appendChild(el("div", "row-title", "Same as someone else"));
+    line.appendChild(hintBtn(
+      "Merging folds this file into theirs and deletes this one — it's refused if the two carry different emails or phones.",
+      mainCol));
+    mainCol.appendChild(line);
     row.appendChild(mainCol);
     var actions = el("div", "row-actions");
     var openBtn = button("text-action", "merge with…", function () {
@@ -2241,7 +2298,8 @@
           select.appendChild(opt);
         }
         var go, cancel;
-        go = button("btn btn-primary", "Merge", function () {
+        // This file disappears into theirs — the second tap is the whole safety net.
+        go = armConfirm(button("btn btn-primary", "Merge"), "Merge — sure?", function () {
           if (!select.value) return;
           errEl.hidden = true;
           go.disabled = cancel.disabled = true;
@@ -2460,6 +2518,10 @@
       ta.focus();
     });
     wrap.appendChild(openBtn);
+    wrap.appendChild(hintBtn(
+      "Company pages are written by research and the briefs' Learn step. Rewriting About here is "
+      + "the same correction as telling Sotto in chat — and research won't overwrite it afterwards.",
+      wrap));
     return wrap;
   }
 
@@ -2511,34 +2573,80 @@
     return wrap;
   }
 
-  /* ---------------- View: Learned ---------------- */
+  /* ---------------- View: Memory ----------------
+     Everything Sotto holds on to, in one place and four segments: the People
+     graph, the house rules you've taught it, the voice it writes in, and your
+     standing file. Person pages stay their own (hidden) route — #people/<slug> —
+     and come back here. */
 
-  function viewLearned() {
+  var MEMORY_SEGS = [["people", "People"], ["rules", "Rules"],
+                     ["voice", "Voice"], ["standing", "Standing file"]];
+
+  function viewMemory(parts) {
     var seq = ++state.renderSeq;
-    setView(skeletonView(2));
+    var seg = str(parts && parts[1]).toLowerCase();
+    var known = false;
+    for (var i = 0; i < MEMORY_SEGS.length; i++) {
+      if (MEMORY_SEGS[i][0] === seg) known = true;
+    }
+    if (!known) seg = "people";
+
+    var frag = document.createDocumentFragment();
+    frag.appendChild(viewHead("Memory", "What Sotto knows",
+      "One memory graph — the people you talk to, the rules you've taught it, the voice it writes in, and your standing file."));
+
+    var segRow = el("div", "seg");
+    segRow.setAttribute("role", "group");
+    segRow.setAttribute("aria-label", "Which memory to show");
+    for (var s = 0; s < MEMORY_SEGS.length; s++) {
+      (function (pair) {
+        var b = button(null, pair[1], function () { location.hash = "#memory/" + pair[0]; });
+        b.setAttribute("aria-pressed", String(pair[0] === seg));
+        segRow.appendChild(b);
+      }(MEMORY_SEGS[s]));
+    }
+    frag.appendChild(segRow);
+
+    var body = el("div");
+    frag.appendChild(body);
+    setView();
+    main.appendChild(frag);
+
+    if (seg === "people") buildPeopleSection(seq, body);
+    else if (seg === "rules") buildRulesSection(seq, body);
+    else if (seg === "voice") buildVoiceSection(seq, body);
+    else buildStandingSection(seq, body);
+  }
+
+  /* The house rules — the learner's ledgers, each row deletable. */
+  function buildRulesSection(seq, container) {
+    container.replaceChildren(skeletonView(2));
+    api("/api/learned").then(function (data) {
+      if (seq !== state.renderSeq) return;
+      container.replaceChildren();
+      paintPrefs(seq, container, (data || {}).preferences);
+    }).catch(function (err) {
+      if (seq !== state.renderSeq || err.handled) return;
+      container.replaceChildren(errorView("The rules didn't load.", function () {
+        buildRulesSection(seq, container);
+      }));
+    });
+  }
+
+  /* Your voice — the fingerprint's own summary, then the samples behind it. */
+  function buildVoiceSection(seq, container) {
+    container.replaceChildren(skeletonView(2));
     Promise.all([
       api("/api/learned"),
-      api("/api/voice").catch(function () { return null; }),
-      api("/api/master").catch(function () { return null; })
+      api("/api/voice").catch(function () { return null; })
     ]).then(function (results) {
       if (seq !== state.renderSeq) return;
       var data = results[0] || {};
       var voice = results[1];
-      var master = results[2];
-      var frag = document.createDocumentFragment();
-      frag.appendChild(el("p", "eyebrow", "Learned"));
-      frag.appendChild(el("h1", "view-title", "What Sotto has learned"));
-      frag.appendChild(el("p", "view-sub", "How Sotto writes as you, and the rules you've taught it."));
+      container.replaceChildren();
 
-      // Your standing file — knowledge/master.md, the always-in-context memory. Edits ride
-      // POST /api/master → the skills tree's master_file.py (the same writer chat uses).
-      var masterWrap = el("div");
-      frag.appendChild(masterWrap);
-      paintMaster(seq, masterWrap, master);
-
-      // Your voice — an editorial summary, not a stat grid.
-      frag.appendChild(ledgerCap("Your voice", null));
-      frag.appendChild(el("hr", "head-rule single"));
+      container.appendChild(ledgerCap("Your voice", null,
+        "The fingerprint tunes itself from what you actually send — to steer it, just tell Sotto in chat."));
       var style = (data.style && typeof data.style === "object") ? data.style : {};
       // The server sends the real registers (the fingerprint's canonical keys:
       // work_email / work_message / personal_message) — render them as-is.
@@ -2555,37 +2663,45 @@
         }
         var updAgo = timeAgo(style.updated_at);
         append(prose, updAgo ? " — last tuned " + updAgo + "." : ".");
-        frag.appendChild(prose);
+        container.appendChild(prose);
         if (buckets.length) {
           var chips = el("div", "voice-chips");
           for (var i = 0; i < buckets.length; i++) {
             chips.appendChild(el("span", "chip", String(buckets[i]).replace(/[_-]+/g, " ")));
           }
-          frag.appendChild(chips);
+          container.appendChild(chips);
         }
       } else {
-        frag.appendChild(el("p", "voice-prose",
+        container.appendChild(el("p", "voice-prose",
           "No fingerprint yet. Text “set up Sotto” and it reads your recent messages to learn how you sound."));
       }
-      frag.appendChild(el("p", "note",
-        "The fingerprint tunes itself from what you actually send — to steer it, just tell Sotto in chat."));
 
       // The samples behind that summary, each confirmable (the fingerprint's one
       // deterministic write).
       var voiceWrap = el("div");
-      frag.appendChild(voiceWrap);
+      container.appendChild(voiceWrap);
       paintVoice(seq, voiceWrap, voice);
-
-      // Preferences — the real rule ledgers, each row deletable (M2).
-      var prefWrap = el("div");
-      frag.appendChild(prefWrap);
-      paintPrefs(seq, prefWrap, data.preferences);
-
-      setView();
-      main.appendChild(frag);
     }).catch(function (err) {
       if (seq !== state.renderSeq || err.handled) return;
-      setView(errorView("The Learned page didn't load.", viewLearned));
+      container.replaceChildren(errorView("The voice page didn't load.", function () {
+        buildVoiceSection(seq, container);
+      }));
+    });
+  }
+
+  /* Your standing file — knowledge/master.md, the always-in-context memory. Edits ride
+     POST /api/master → the skills tree's master_file.py (the same writer chat uses). */
+  function buildStandingSection(seq, container) {
+    container.replaceChildren(skeletonView(2));
+    api("/api/master").then(function (master) {
+      if (seq !== state.renderSeq) return;
+      container.replaceChildren();
+      paintMaster(seq, container, master);
+    }).catch(function (err) {
+      if (seq !== state.renderSeq || err.handled) return;
+      container.replaceChildren(errorView("The standing file didn't load.", function () {
+        buildStandingSection(seq, container);
+      }));
     });
   }
 
@@ -2634,8 +2750,7 @@
     }
 
     container.appendChild(ledgerCap("Learned from what you sent",
-      capCount(candidates.length ? String(candidates.length) : "none")));
-    container.appendChild(el("p", "cap-sub",
+      capCount(candidates.length ? String(candidates.length) : "none"),
       "Confirm one and Sotto leans on it hardest when it drafts as you."));
     var list = el("div", "ledger");
     if (!candidates.length) {
@@ -2668,8 +2783,7 @@
       have[str(sections[i].name)] = str(sections[i].text);
     }
     container.appendChild(ledgerCap("Your standing file",
-      capCount((d.chars || 0) + " / " + (d.cap || 8000) + " chars")));
-    container.appendChild(el("p", "cap-sub",
+      capCount((d.chars || 0) + " / " + (d.cap || 8000) + " chars"),
       "Who you are, your people, your priorities, and your standing rules — in your own words, " +
       "included in every brief and meeting prep. Also editable from chat: “Sotto, standing rule: …”"));
     var list = el("div", "ledger");
@@ -2712,7 +2826,7 @@
           .then(function () {
             if (seq !== state.renderSeq) return;
             toast("Saved to your standing file.");
-            viewLearned();
+            reroute();
           })
           .catch(function (err) {
             save.disabled = false;
@@ -2722,7 +2836,7 @@
             }
           });
       });
-      var cancel = button("text-action", "cancel", function () { viewLearned(); });
+      var cancel = button("text-action", "cancel", function () { reroute(); });
       body.replaceWith(ta);
       var btnRow = el("div", "row-actions");
       btnRow.appendChild(save);
@@ -2870,8 +2984,7 @@
     container.appendChild(el("hr", "head-rule single"));
     for (var s = 0; s < sections.length; s++) {
       var sec = sections[s];
-      container.appendChild(ledgerCap(sec.label, capCount(String(sec.rows.length))));
-      if (sec.sub) container.appendChild(el("p", "cap-sub", sec.sub));
+      container.appendChild(ledgerCap(sec.label, capCount(String(sec.rows.length)), sec.sub));
       var ledger = el("div", "ledger");
       for (var rI = 0; rI < sec.rows.length; rI++) {
         ledger.appendChild(prefRow(sec.rows[rI], deleteRule));
@@ -2920,7 +3033,7 @@
       input.className = "edit-input";
       input.setAttribute("aria-label", "The rule's value");
 
-      var hint = el("p", "cap-sub", "");
+      var hint = el("p", "form-hint", "");
       var applyHint = function () {
         var spec = ADDABLE_RULES[select.selectedIndex] || ADDABLE_RULES[0];
         hint.textContent = spec.hint;
@@ -2986,35 +3099,20 @@
 
     var errEl = el("p", "inline-error");
     errEl.hidden = true;
+    // ONE tap. A house rule is re-addable in the form directly below this
+    // ledger (and by saying it to Sotto in chat), so a confirm dance here was
+    // spending three taps to protect a thirty-second mistake.
     var slot = el("span", "pref-confirm reveal");
-    var showX = function (refocus) {
-      slot.replaceChildren();
-      var x = button("text-action", "remove", function () {
-        slot.replaceChildren();
-        var yes = button("text-action", "confirm", function () {
-          errEl.hidden = true;
-          yes.disabled = keep.disabled = true;
-          deleteRule(spec.list, spec.value).catch(function (err) {
-            yes.disabled = keep.disabled = false;
-            if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
-          });
-        });
-        var keep = button("text-action", "keep", function () { showX(true); });
-        append(slot, yes, keep);
-        yes.focus();
+    var x = button("text-action", "remove", function () {
+      errEl.hidden = true;
+      x.disabled = true;
+      deleteRule(spec.list, spec.value).catch(function (err) {
+        x.disabled = false;
+        if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
       });
-      x.setAttribute("aria-label", "Remove this rule: " + spec.main);
-      slot.appendChild(x);
-      if (refocus) x.focus();
-    };
-    // Escape backs out of the confirm and returns focus to the remove control.
-    slot.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" && slot.childNodes.length > 1) {
-        e.stopPropagation();
-        showX(true);
-      }
     });
-    showX();
+    x.setAttribute("aria-label", "Remove this rule: " + spec.main);
+    slot.appendChild(x);
     folio.appendChild(slot);
     row.appendChild(folio);
     mainCol.appendChild(errEl);
@@ -3043,11 +3141,19 @@
     return filter === "actions";
   }
 
-  function viewRecord(daysPart) {
-    var seq = ++state.renderSeq;
+  /* The Log segment of Activity. Both controls live in the HASH — the window AND
+     the filter — so navigating away and back, or changing the window, keeps the
+     filter you chose instead of silently resetting it to All. */
+  function buildRecordSection(seq, container, daysPart, filterPart) {
     var days = RECORD_WINDOWS.indexOf(parseInt(daysPart, 10)) !== -1
       ? parseInt(daysPart, 10) : 7;
-    setView(skeletonView(3));
+    var filter = "all";
+    for (var f = 0; f < RECORD_FILTERS.length; f++) {
+      if (RECORD_FILTERS[f][0] === str(filterPart)) filter = RECORD_FILTERS[f][0];
+    }
+    var logHash = function (d, fl) { return "#activity/log/" + d + "/" + fl; };
+
+    container.replaceChildren(skeletonView(2));
     api("/api/ledger?days=" + days).then(function (data) {
       if (seq !== state.renderSeq) return;
       var entries = [];
@@ -3055,11 +3161,7 @@
       for (var i = 0; i < raw.length; i++) {
         if (raw[i] && typeof raw[i] === "object") entries.push(raw[i]);
       }
-      var frag = document.createDocumentFragment();
-      frag.appendChild(el("p", "eyebrow", "Record"));
-      frag.appendChild(el("h1", "view-title", "What Sotto has done"));
-      frag.appendChild(el("p", "view-sub",
-        "Every action taken, every nudge surfaced or held, every correction made — kept on file."));
+      container.replaceChildren();
 
       // Window selector — mono links; the served window carries the mark.
       var range = el("div", "range-row");
@@ -3067,57 +3169,41 @@
       for (var w = 0; w < RECORD_WINDOWS.length; w++) {
         if (w > 0) range.appendChild(el("span", "sep", "·"));
         var a = el("a", null, String(RECORD_WINDOWS[w]));
-        a.href = "#record/" + RECORD_WINDOWS[w];
+        a.href = logHash(RECORD_WINDOWS[w], filter);
         if (RECORD_WINDOWS[w] === days) a.setAttribute("aria-current", "true");
         range.appendChild(a);
       }
       range.appendChild(el("span", "range-label", "days"));
-      frag.appendChild(range);
+      container.appendChild(range);
 
-      // Filter row — same mono structure as the window selector; client-side
-      // only (the filter re-renders the already-fetched entries).
-      var filter = "all";
+      // Filter row — same mono structure, and a real link: the filter is part of
+      // the address, so it survives a window change and a trip to another page.
       var frow = el("div", "range-row");
       frow.appendChild(el("span", "range-label", "show"));
-      var filterLinks = [];
       RECORD_FILTERS.forEach(function (pair, idx) {
         if (idx > 0) frow.appendChild(el("span", "sep", "·"));
         var fa = el("a", null, pair[1]);
-        fa.href = "#record/" + days;
+        fa.href = logHash(days, pair[0]);
         if (pair[0] === filter) fa.setAttribute("aria-current", "true");
-        fa.addEventListener("click", function (ev) {
-          ev.preventDefault();
-          filter = pair[0];
-          for (var fi = 0; fi < filterLinks.length; fi++) {
-            filterLinks[fi].removeAttribute("aria-current");
-          }
-          fa.setAttribute("aria-current", "true");
-          renderList();
-        });
-        filterLinks.push(fa);
         frow.appendChild(fa);
       });
-      frag.appendChild(frow);
+      container.appendChild(frow);
 
       // A plain stack, not a panel: each DAY below carries its own panel.
       var list = el("div", "record-days");
-
-      function renderList() {
-        list.replaceChildren();
-        var rows = [];
-        for (var e = 0; e < entries.length; e++) {
-          if (recordFilterMatch(filter, entries[e])) rows.push(entries[e]);
-        }
-        if (!rows.length) {
-          var none = el("div", "ledger");
-          none.appendChild(filter === "all"
-            ? emptyState("Nothing on the record yet",
-              "Approve a draft or close a loop — every action Sotto takes lands here.")
-            : emptyState("Nothing here for this filter",
-              "Try All — every nudge, hold, and action in the window is under it."));
-          list.appendChild(none);
-          return;
-        }
+      var rows = [];
+      for (var e = 0; e < entries.length; e++) {
+        if (recordFilterMatch(filter, entries[e])) rows.push(entries[e]);
+      }
+      if (!rows.length) {
+        var none = el("div", "ledger");
+        none.appendChild(filter === "all"
+          ? emptyState("Nothing on the record yet",
+            "Approve a draft or close a loop — every action Sotto takes lands here.")
+          : emptyState("Nothing here for this filter",
+            "Try All — every nudge, hold, and action in the window is under it."));
+        list.appendChild(none);
+      } else {
         // Group by local day, preserving the server's newest-first order.
         var groups = [];
         var byKey = {};
@@ -3139,42 +3225,38 @@
             groups[g].when ? shortDate(groups[g].key) : "Undated"));
           sub.appendChild(el("span", "cap-count", String(groups[g].rows.length)));
           list.appendChild(sub);
-          var day = el("div", "ledger");
+          var day = el("div", "ledger record-grid");
           for (var r = 0; r < groups[g].rows.length; r++) {
             day.appendChild(recordRow(groups[g].rows[r]));
           }
           list.appendChild(day);
         }
       }
-
-      renderList();
-      frag.appendChild(enterOnce("record", list));
+      container.appendChild(enterOnce("record", list));
       state.entered.record = true;
-      setView();
-      main.appendChild(frag);
     }).catch(function (err) {
       if (seq !== state.renderSeq || err.handled) return;
-      setView(errorView("The record didn't load.", function () { viewRecord(days); }));
+      container.replaceChildren(errorView("The record didn't load.", function () {
+        buildRecordSection(seq, container, daysPart, filterPart);
+      }));
     });
   }
 
+  /* One line of the record: mono clock, the sentence, the channel folio. A
+     compact GRID row, not a paragraph — the Record is scanned far more often
+     than it is read, and 240 prose sentences is not a page anyone scans. */
   function recordRow(entry) {
-    var row = el("div", "ledger-row");
-    var mainCol = el("div", "row-main");
+    var row = el("div", "record-grid-row");
+    var d = parseWhen(entry.ts);
+    row.appendChild(el("span", "rg-clock", d ? fmtClock(d) : "—"));
     var sentence = recordSentence(entry);
     if (!/[.!?]$/.test(sentence)) sentence += ".";
-    mainCol.appendChild(el("div", "row-sub", sentence));
-    row.appendChild(mainCol);
-
-    // ONE mono folio line: the clock, plus the channel when it's known.
-    var folio = el("div", "row-folio");
-    var d = parseWhen(entry.ts);
-    var bits = [d ? fmtClock(d) : "—"];
+    row.appendChild(el("span", "rg-text", sentence));
+    var channel = "";
     if ((entry.source === "outcome" || entry.source === "triage") && str(entry.channel)) {
-      bits.push(humanChannel(entry.channel));
+      channel = humanChannel(entry.channel);
     }
-    folio.appendChild(el("span", null, bits.join(" · ")));
-    row.appendChild(folio);
+    row.appendChild(el("span", "rg-folio", channel));
     return row;
   }
 
@@ -3359,14 +3441,14 @@
     frag.appendChild(el("h1", "view-title", "Teach Sotto what mattered"));
     var days = data.days || [];
     if (!data.corpus || !days.length) {
-      frag.appendChild(el("p", "view-sub",
+      frag.appendChild(el("p", "labels-hint",
         "No corpus on the volume yet. Build one first — evals/LABELING.md has the two commands."));
       setView(frag);
       return;
     }
     var done = 0;
     for (var i = 0; i < days.length; i++) if (days[i].labeled) done++;
-    frag.appendChild(el("p", "view-sub",
+    frag.appendChild(el("p", "labels-hint",
       "One question per item: did this deserve your attention when it arrived? Newest day first, " +
       "stop whenever — an unlabeled day is simply unscored, and ten honest days beat forty " +
       "guessed ones. " + done + " of " + days.length + " days labeled."));
@@ -3384,7 +3466,7 @@
     frag.appendChild(list);
     var footer = el("div", "labels-review");
     if (data.reviewed) {
-      footer.appendChild(el("p", "view-sub",
+      footer.appendChild(el("p", "labels-foot",
         "Marked reviewed — the golden evals score against these labels now."));
     } else {
       footer.appendChild(button("btn", "Mark corpus reviewed", function () {
@@ -3414,7 +3496,7 @@
     frag.appendChild(el("p", "eyebrow", "Labels · " + (day.name || "")));
     frag.appendChild(el("h1", "view-title",
       day.name === "day-00" ? "The most recent day" : (day.name || "").replace("day-", "") + " days back"));
-    frag.appendChild(el("p", "view-sub",
+    frag.appendChild(el("p", "labels-hint",
       "Everything is pseudonymized — same people, fake names. Tap what's wrong, leave what's right."));
 
     function segBtn(label, on, onClick) {
@@ -3490,7 +3572,7 @@
     }
 
     if (!(day.emails || []).length && !(day.nudges || []).length) {
-      frag.appendChild(el("p", "view-sub", "Nothing to judge on this day."));
+      frag.appendChild(emptyState(null, "Nothing to judge on this day."));
     }
 
     var bar = el("div", "labels-savebar");
@@ -3517,18 +3599,54 @@
     setView(frag);
   }
 
-  /* ---------------- Router ---------------- */
+  /* ---------------- Router ----------------
+     Four destinations (now · activity · memory · labels) plus two detail routes
+     that are reachable but not in the nav (#people/<slug>, #briefs/<date>/<kind>).
+     Every pre-redesign address is still a real route: the aliases below CALL the
+     new views directly rather than rewriting location.hash, so an old bookmark
+     lands on the page it meant instead of bouncing to the default. The
+     alias→tab mapping lives in app.html's #nav-aliases block, which the nav
+     highlight below reads — one list, checked by the shipped-frontend test. */
 
   var routes = {
-    today: function (parts) { viewToday(decodePart(parts[1])); },
-    cadence: function () { viewCadence(); },
-    loops: function () { viewLoops(); },
-    briefs: function (parts) { viewBriefs(decodePart(parts[1]), decodePart(parts[2])); },
-    people: function (parts) { viewPeople(decodePart(parts[1])); },
-    learned: function () { viewLearned(); },
-    record: function (parts) { viewRecord(decodePart(parts[1])); },
-    labels: function (parts) { viewLabels(decodePart(parts[1])); }
+    now: function (parts) { viewNow(decodePart(parts[1])); },
+    activity: function (parts) { viewActivity(parts); },
+    memory: function (parts) { viewMemory(parts); },
+    labels: function (parts) { viewLabels(decodePart(parts[1])); },
+
+    // Detail pages — routed, never in the nav.
+    people: function (parts) {
+      var slug = decodePart(parts[1]);
+      if (slug) return viewPerson(slug);
+      return viewMemory(["memory", "people"]);
+    },
+    briefs: function (parts) {
+      var date = decodePart(parts[1]);
+      var kind = decodePart(parts[2]);
+      if (date && kind) return viewBriefDetail(date, kind);
+      return viewActivity(["activity", "briefs"]);
+    },
+
+    // Aliases for the pre-redesign addresses.
+    today: function (parts) { viewNow(decodePart(parts[1])); },
+    loops: function () { viewNow(); },
+    cadence: function () { viewActivity(["activity", "held"]); },
+    record: function (parts) {
+      viewActivity(["activity", "log", decodePart(parts[1]), decodePart(parts[2])]);
+    },
+    learned: function () { viewMemory(["memory", "rules"]); }
   };
+
+  /* alias/detail route name → the nav tab it belongs under. Built once from the
+     markup so the two never drift. */
+  var NAV_HOME = (function () {
+    var map = {};
+    var declared = document.querySelectorAll("#nav-aliases [data-nav]");
+    for (var i = 0; i < declared.length; i++) {
+      map[declared[i].getAttribute("data-nav")] = declared[i].getAttribute("data-home");
+    }
+    return map;
+  }());
 
   function decodePart(part) {
     if (!part) return null;
@@ -3536,14 +3654,15 @@
   }
 
   function route() {
-    var hash = location.hash.replace(/^#/, "") || "today";
+    var hash = location.hash.replace(/^#/, "") || "now";
     var parts = hash.split("/");
-    var name = routes[parts[0]] ? parts[0] : "today";
+    var name = routes[parts[0]] ? parts[0] : "now";
+    var tab = NAV_HOME[name] || name;
 
     // Nav highlight
     var links = navlinks.querySelectorAll("a[data-nav]");
     for (var i = 0; i < links.length; i++) {
-      if (links[i].getAttribute("data-nav") === name) {
+      if (links[i].getAttribute("data-nav") === tab) {
         links[i].setAttribute("aria-current", "page");
       } else {
         links[i].removeAttribute("aria-current");
@@ -3554,6 +3673,11 @@
     main.focus({ preventScroll: true });
     window.scrollTo(0, 0);
   }
+
+  /* Re-render the page that is on screen. Loop edits, snooze writes and standing
+     file saves all live inside composed views now, so "reload what I'm looking
+     at" is the honest refresh — a fresh server read, never an optimistic patch. */
+  function reroute() { route(); }
 
   /* ---------------- Boot ---------------- */
 

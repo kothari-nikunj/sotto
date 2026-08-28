@@ -84,7 +84,7 @@ def _knowledge():
     return _KG or None
 
 
-def _graph_lookup(name: str):
+def _graph_lookup(name: str, cid: str = ""):
     """(weight, context) for a person from the knowledge graph. Untracked → (1.0, None), so the
     weighting is a pure enhancement that degrades to the old volume-only ranking when the graph is
     empty or unreadable. `context` carries grounded material (company/title/a talking point/a fact)
@@ -95,7 +95,8 @@ def _graph_lookup(name: str):
     try:
         # canonical-id store: files are keyed by cid, so resolve through the identity index
         # (name form here comes from message resolution — the same Contacts name the store saw).
-        path = kg.find_person_file(name=name)
+        path = kg.find_person_file(cid=cid) if cid else None
+        path = path or kg.find_person_file(name=name)
         if not path or not os.path.exists(path):
             return 1.0, None
         with open(path, encoding="utf-8") as f:
@@ -125,10 +126,15 @@ def _ts(s: str):
 
 def _interactions_by_contact(local: dict) -> dict:
     """Group every inbound/outbound touch (message + call) per resolved contact. Skips group chats
-    and unknown (phone-named) senders — same is_known_contact gate as the brief."""
+    and unknown (phone-named) senders — same is_known_contact gate as the brief.
+
+    Keyed by canonical_id when the resolver attached one, display name only as the fallback — a
+    Contacts rename used to reset a person's whole longitudinal history, and two people sharing a
+    name collapsed into one cadence. Each entry also tracks last-contact PER CHANNEL, so the state
+    can finally say "last texted yesterday, last emailed never"."""
     people: dict = {}
 
-    def add(name, ts, from_me):
+    def add(name, ts, from_me, channel, cid=""):
         nm = _s(name).strip()
         # "Unknown" is the resolver's sentinel — merging every unresolved sender into one fake
         # contact would fabricate cadence/waiting signals for a person who doesn't exist.
@@ -139,23 +145,45 @@ def _interactions_by_contact(local: dict) -> dict:
             return
         if d.tzinfo is None:
             d = d.replace(tzinfo=timezone.utc)
-        p = people.setdefault(nm, {"dates": [], "from_me": [], "from_them": []})
+        key = _s(cid).strip() or nm
+        p = people.setdefault(key, {"name": nm, "cid": _s(cid).strip(),
+                                    "dates": [], "from_me": [], "from_them": [],
+                                    "by_channel": {}})
+        if _s(cid).strip() and not p["cid"]:
+            p["cid"] = _s(cid).strip()
         p["dates"].append(d)
         (p["from_me"] if from_me else p["from_them"]).append(d)
+        prev = p["by_channel"].get(channel)
+        if prev is None or d > prev:
+            p["by_channel"][channel] = d
 
     for m in _arr(local, "imessage"):
         if m.get("is_group_chat"):
             continue
-        add(m.get("resolved_name"), m.get("timestamp"), m.get("is_from_me"))
+        add(m.get("resolved_name"), m.get("timestamp"), m.get("is_from_me"),
+            "imessage", m.get("canonical_id"))
     for m in _arr(local, "whatsapp"):
         if m.get("is_group_chat"):
             continue
         nm = _s(m.get("resolved_name")) or _s(m.get("partner_name"))
-        add(nm, m.get("timestamp"), m.get("is_from_me"))
+        add(nm, m.get("timestamp"), m.get("is_from_me"), "whatsapp", m.get("canonical_id"))
     for c in _arr(local, "missed_calls") + _arr(local, "recent_calls"):
         # Processed call dicts carry direction: "outgoing"|"incoming" (_process_recent_calls),
         # not is_outgoing — missed calls have no direction and correctly count as inbound.
-        add(c.get("name"), c.get("timestamp"), c.get("direction") == "outgoing")
+        add(c.get("name"), c.get("timestamp"), c.get("direction") == "outgoing",
+            "calls", c.get("canonical_id"))
+    # A channel that resolves a name but not an id (processed calls) must not split a person in
+    # two: fold each name-keyed entry into the cid-keyed entry carrying the same display name —
+    # exactly what the old all-name keying did implicitly.
+    by_name = {p["name"]: k for k, p in people.items() if p["cid"]}
+    for key in [k for k, p in people.items() if not p["cid"] and by_name.get(p["name"], k) != k]:
+        dst, src = people[by_name[people[key]["name"]]], people.pop(key)
+        dst["dates"] += src["dates"]
+        dst["from_me"] += src["from_me"]
+        dst["from_them"] += src["from_them"]
+        for ch, d in src["by_channel"].items():
+            if ch not in dst["by_channel"] or d > dst["by_channel"][ch]:
+                dst["by_channel"][ch] = d
     return people
 
 
@@ -194,18 +222,20 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
                 "degraded": True}
 
     profiles = []
-    for name, p in people.items():
+    for key, p in people.items():
         if not p["dates"]:
             continue
         last = max(p["dates"])
         days_since = int((now - last).total_seconds() // 86400)
         last_them = max(p["from_them"]) if p["from_them"] else None
         last_you = max(p["from_me"]) if p["from_me"] else None
-        weight, gctx = _graph_lookup(name)
+        weight, gctx = _graph_lookup(p["name"], p["cid"])
         profiles.append({
-            "name": name, "interactions": len(p["dates"]), "days_since": days_since,
+            "key": key, "name": p["name"], "cid": p["cid"],
+            "interactions": len(p["dates"]), "days_since": days_since,
             "last_from_them": last_them, "last_from_you": last_you,
             "trend": _cadence_trend(p["dates"]),
+            "by_channel": p["by_channel"],
             "graph_weight": weight, "graph_context": gctx,
         })
 
@@ -245,18 +275,20 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
     # Without history, a contact silent longer than the ~6-week read vanishes entirely. The prior
     # run's snapshot lets us surface them as fully-lost-touch, ranked BELOW losing_touch.
     lapsed = []
-    current_names = set(people.keys())
-    for name, h in history.items():
-        if not isinstance(h, dict) or name in current_names:
-            continue
+    current_keys = set(people.keys())
+    current_names = {p["name"] for p in people.values()}
+    for hkey, h in history.items():
+        display = _s((h or {}).get("name")) or hkey    # pre-identity entries were keyed by name
+        if not isinstance(h, dict) or hkey in current_keys or display in current_names:
+            continue   # present this window — under this key, or migrated to a cid key below
         if int(h.get("interactions") or 0) < LAPSED_MIN_INTERACTIONS:
             continue   # a one-off back then isn't a lapsed relationship now
         last_known = _s(h.get("last_contact"))
-        weight, gctx = _graph_lookup(name)
+        weight, gctx = _graph_lookup(display, hkey if hkey != display else "")
         reason = "You've fully lost touch — no contact in this whole window"
         if last_known:
             reason += f" (last contact {last_known})"
-        e = {"display_name": name, "queue_type": "lapsed", "reason": reason,
+        e = {"display_name": display, "queue_type": "lapsed", "reason": reason,
              "last_contact": last_known, "days_waiting": 0,
              "priority": round(int(h.get("interactions") or 0) * weight, 2)}
         if gctx:
@@ -274,34 +306,47 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
     # forward (so they stay lapsed candidates), pruned once silent > HISTORY_MAX_AGE_DAYS.
     merged = {}
     dropped = []
-    for name, h in history.items():
-        if not isinstance(h, dict) or name in current_names:
-            continue
+    for hkey, h in history.items():
+        display = _s((h or {}).get("name")) or hkey
+        if not isinstance(h, dict) or hkey in current_keys or display in current_names:
+            continue   # a name-keyed entry for a person now cid-keyed migrates via the peak-merge
         last = _ts(_s(h.get("last_contact")))
         if last is None:
             # No parseable last_contact → the entry would dodge the >365d prune and resurface
             # forever. Drop it so pruning actually bounds the file.
-            dropped.append(name)
+            dropped.append(display)
             continue
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         if (now - last).total_seconds() / 86400.0 > HISTORY_MAX_AGE_DAYS:
             continue
-        merged[name] = h
+        merged[hkey] = h
     if dropped:
         print("[relationship_pulse] dropping history entries with no parseable last_contact: "
               + ", ".join(dropped), file=sys.stderr)
     for pp in profiles:
-        last = max(people[pp["name"]]["dates"])
-        prev = history.get(pp["name"]) if isinstance(history.get(pp["name"]), dict) else {}
+        last = max(people[pp["key"]]["dates"])
+        # Peak-merge against BOTH possible prior keys: this key, and (for a person the resolver
+        # only now identified) the old display-name key — the migration path off name-keyed state.
+        prev = history.get(pp["key"]) if isinstance(history.get(pp["key"]), dict) else {}
+        if not prev and pp["cid"]:
+            prev = history.get(pp["name"]) if isinstance(history.get(pp["name"]), dict) else {}
         try:
             prev_n = int(prev.get("interactions") or 0)
         except (TypeError, ValueError):
             prev_n = 0
         # Keep the PEAK interaction count: a 20-interaction regular who sends one ping must not
         # reset to 1 (they could then never clear the lapsed >= LAPSED_MIN_INTERACTIONS gate).
-        merged[pp["name"]] = {"last_contact": last.strftime("%Y-%m-%d"),
-                              "interactions": max(pp["interactions"], prev_n), "trend": pp["trend"]}
+        channels = {}
+        for ch, prev_day in ((prev.get("channels") or {}) if isinstance(prev.get("channels"), dict) else {}).items():
+            channels[ch] = _s(prev_day)
+        for ch, d in pp["by_channel"].items():
+            day = d.strftime("%Y-%m-%d")
+            if channels.get(ch, "") < day:
+                channels[ch] = day
+        merged[pp["key"]] = {"name": pp["name"], "last_contact": last.strftime("%Y-%m-%d"),
+                             "interactions": max(pp["interactions"], prev_n), "trend": pp["trend"],
+                             "channels": channels}
 
     return {"attention_queue": queue + lapsed, "relationship_insights": insights,
             "lapsed": lapsed, "history": merged,

@@ -26,6 +26,15 @@ def _local(*msgs):
     return {"contacts": [{"name": n, "phones": ["+1"]} for n in names], "imessage": list(msgs)}
 
 
+def _hist(out, name):
+    """History is identity-keyed now (cid when the resolver has one, name as fallback) — find a
+    person's entry by the display name it carries."""
+    for key, h in out["history"].items():
+        if key == name or (isinstance(h, dict) and h.get("name") == name):
+            return h
+    raise AssertionError(f"no history entry for {name}: {sorted(out['history'])}")
+
+
 def test_no_history_degrades_cleanly(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW)          # no history arg at all
@@ -51,7 +60,7 @@ def test_contact_in_current_window_is_not_lapsed(tmp_path, monkeypatch):
     history = {"Bob": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
     out = rp.compute(_local(_msg("Bob", 2, False)), NOW, history=history)
     assert out["lapsed"] == []
-    assert out["history"]["Bob"]["last_contact"] == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+    assert _hist(out, "Bob")["last_contact"] == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
 
 
 def test_one_off_past_contact_is_not_lapsed(tmp_path, monkeypatch):
@@ -93,7 +102,7 @@ def test_history_snapshot_written_and_carried_forward(tmp_path, monkeypatch):
     out = rp.compute(_local(_msg("Bob", 1, True), _msg("Bob", 3, False)), NOW, history=history)
     rp._persist_state(out)
     state = json.load(open(os.path.join(str(tmp_path), "knowledge", "relationship_state.json")))
-    assert state["history"]["Bob"]["interactions"] == 2           # current window snapshotted
+    assert next(h for h in state["history"].values() if h.get("name") == "Bob")["interactions"] == 2           # current window snapshotted
     assert "Maya" in state["history"]                             # absent contact carried forward…
     assert "Ancient" not in state["history"]                      # …but >1y silence is pruned
     # a lapsed entry is in the persisted attention_queue so the daily brief can surface it too
@@ -135,8 +144,8 @@ def test_present_contact_keeps_peak_interactions(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Bob": {"last_contact": "2026-05-01", "interactions": 20, "trend": "stable"}}
     out = rp.compute(_local(_msg("Bob", 2, False)), NOW, history=history)
-    assert out["history"]["Bob"]["interactions"] == 20            # peak, not the window count of 1
-    assert out["history"]["Bob"]["last_contact"] == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+    assert _hist(out, "Bob")["interactions"] == 20            # peak, not the window count of 1
+    assert _hist(out, "Bob")["last_contact"] == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
 
 
 def test_history_entry_without_last_contact_is_dropped(tmp_path, monkeypatch):
@@ -165,3 +174,38 @@ def test_healthy_message_suppressed_when_only_lapsed(tmp_path, monkeypatch):
     history = {"Maya": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
     assert "healthy" not in out["pulse_markdown"].lower()
+
+
+def test_history_survives_a_contact_rename_and_migrates_off_name_keys(tmp_path, monkeypatch):
+    """The re-key's whole point (memory-moat audit F3): history keys by canonical_id, so a
+    Contacts rename no longer resets a person's longitudinal record — and a pre-identity entry
+    keyed by display name folds into the cid entry via the peak-merge instead of ghosting."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    # The person has a GRAPH identity — the register the seeds adopt (Tier 2's adoption rule).
+    gidx = [{"canonical_id": "c_bobstable001", "display_name": "Bob",
+             "identifiers": ["+1"], "confidence": "medium"}]
+    history = {"Bob": {"last_contact": "2026-05-01", "interactions": 20, "trend": "stable"}}
+    local = _local(_msg("Bob", 2, False))
+    local["contact_index"] = gidx
+    out = rp.compute(local, NOW, history=history)
+    entry = _hist(out, "Bob")
+    assert entry["interactions"] == 20                    # peak carried across the key migration
+    assert "Bob" not in out["history"]                    # the old name key is gone, not doubled
+    assert out["history"]["c_bobstable001"]["name"] == "Bob"   # keyed by the graph's id
+    # The rename: same contact card (same phone → same graph id), new display name.
+    local2 = _local(_msg("Bobby", 1, False))
+    local2["contact_index"] = gidx
+    out2 = rp.compute(local2, NOW, history=out["history"])
+    assert _hist(out2, "Bobby")["interactions"] == 20     # history followed the HUMAN, not the name
+
+
+def test_history_records_last_contact_per_channel(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    ts_call = (NOW - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    local = _local(_msg("Bob", 3, False))
+    local["calls"] = [{"phone": "+1", "timestamp": ts_call, "is_outgoing": True,
+                       "is_answered": True, "call_type": "phone"}]
+    out = rp.compute(local, NOW)
+    ch = _hist(out, "Bob")["channels"]
+    assert ch["imessage"] == (NOW - timedelta(days=3)).strftime("%Y-%m-%d")
+    assert ch["calls"] == (NOW - timedelta(days=1)).strftime("%Y-%m-%d")

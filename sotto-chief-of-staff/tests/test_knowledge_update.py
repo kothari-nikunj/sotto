@@ -81,6 +81,23 @@ def test_prune_keeps_seen_more_than_once():
     assert facts["f_1"].status == "active"
 
 
+def test_prune_never_expires_a_user_correction():
+    """A hand-made correction is never restated by a pipeline (seen stays 1) — the old prune
+    archived it at day 60 while the wrong fact it corrected kept getting re-BUMPed by research.
+    User words don't expire."""
+    facts = {"f_1": kg.FactMeta(text="she is COO, not founder", seen=1, status="active",
+                                last="2025-01-01", source="user_edit")}
+    kg.prune_stale_facts(facts, NOW)
+    assert facts["f_1"].status == "active"
+
+
+def test_lid_jid_never_becomes_a_store_key():
+    """A WhatsApp @lid JID is a rotating privacy id whose digit tail can collide with a real
+    phone — auto-merge would then fold two strangers into one file, irreversibly."""
+    assert kg.normalize_identifier("123456789012345@lid") == ""
+    assert kg.normalize_identifier("15551234567@s.whatsapp.net") == "5551234567"
+
+
 # ── fact id ────────────────────────────────────────────────────────────────────
 def test_fact_id_is_stable_sha_prefix():
     a = kg.generate_fact_id("c_abc", "CTO at Acme", "2026-06-23")
@@ -400,6 +417,46 @@ def test_suggestion_survives_reruns_and_is_capped(tmp_path):
     sugg = _suggestions()
     assert len(sugg) == 1 and sugg[0]["first_seen"] == "2026-06-23"
     assert len(sugg) <= ku.MERGE_SUGGESTIONS_MAX
+
+
+def test_a_dismissed_pair_never_comes_back(tmp_path):
+    """The suggestions are recomputed from the files on disk on every apply, so "these really are
+    two people" has to be written down — as a tombstone the refresh obeys."""
+    _setup(tmp_path)
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
+    ku.apply({}, NOW)
+    assert len(_suggestions()) == 1
+    ku.dismiss_merge_suggestion("c_eeeeeeeeeeee", "c_ffffffffffff", NOW)
+    assert _suggestions() == []
+    for day in (7, 14, 30):                         # every later Learn step recomputes; still gone
+        ku.apply({}, datetime(2026, 6, 23 + (day % 8), 7, 0, 0))
+        assert _suggestions() == []
+    assert len(ku.load_merge_dismissed()) == 1      # …and the tombstone survives every rewrite
+
+
+def test_a_dismissal_matches_the_pair_in_either_order(tmp_path):
+    """A merge pair names two people, not a direction — the tombstone is order-insensitive, and the
+    suggester picks the direction itself (sparser file → richer one)."""
+    _setup(tmp_path)
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
+    ku.dismiss_merge_suggestion("c_ffffffffffff", "c_eeeeeeeeeeee", NOW)   # reversed
+    ku.apply({}, NOW)
+    assert _suggestions() == []
+
+
+def test_dismissals_are_capped_at_the_newest(tmp_path):
+    _setup(tmp_path)
+    for i in range(ku.MERGE_DISMISSED_MAX + 5):
+        ku.dismiss_merge_suggestion(f"c_from{i:08d}", f"c_into{i:08d}", NOW)
+    tombs = ku.load_merge_dismissed()
+    assert len(tombs) == ku.MERGE_DISMISSED_MAX
+    assert tombs[0]["from"] == f"c_from{ku.MERGE_DISMISSED_MAX + 4:08d}"   # newest first
+    # dismissing the same pair twice does not grow the list
+    before = len(ku.load_merge_dismissed())
+    ku.dismiss_merge_suggestion("c_from00000000", "c_into00000000", NOW)
+    assert len(ku.load_merge_dismissed()) == before
 
 
 def test_identifiers_conflict_only_within_a_kind(tmp_path):
@@ -772,3 +829,45 @@ def test_migration_repoints_edges_when_a_file_is_re_keyed(tmp_path):
     assert new_slug == vishnu.canonical_id and new_slug != "vishnu-sharma"
     assert [(r.type, r.slug) for r in _people_by_name("Priya Patel")[1].relations] == \
         [("introduced_by", new_slug)]
+
+
+# ── Traceability: an extracted fact names its source, a company keeps its identity ──────────────
+
+def test_extracted_fact_keeps_its_source_ref(tmp_path):
+    """A fact you can't trace is a fact the user can't check — source_ref survives the write."""
+    _setup(tmp_path)
+    ku.apply({"person_updates": [{"person_name": "Morgan Lee", "identifier": "morgan@northstar.io",
+              "facts": [{"fact": "Founder of Northstar Labs", "memory_type": "context",
+                         "confidence": 0.9, "source_ref": "thr_5510cd"}]}]}, NOW)
+    p = kg.parse_person_file(open(kg.find_person_file(identifier="morgan@northstar.io")).read())
+    fact = next(f for _fid, f in kg.sorted_active_facts(p.facts))
+    assert fact.source_ref == "thr_5510cd"
+    assert fact.source == "brief_extraction"      # the label still tells you WHICH pipeline wrote it
+
+
+def test_company_domain_lands_once_and_never_overwrites(tmp_path):
+    _setup(tmp_path)
+    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.io"}]}, NOW)
+    path = os.path.join(kg.companies_dir(), "northstar.md")
+    assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.io"
+    # A later, wrong domain never rewrites the one on file (and resolves INTO the same company).
+    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.example"}]}, NOW)
+    assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.io"
+
+
+def test_company_about_is_written_and_a_user_edit_is_never_overwritten(tmp_path):
+    _setup(tmp_path)
+    ku.apply({"company_updates": [{"company_name": "Acme Corp", "about": "Builds dev tools."}]}, NOW)
+    path = os.path.join(kg.companies_dir(), "acme.md")
+    assert "Builds dev tools." in open(path).read()
+    # A pipeline may improve a pipeline's About…
+    ku.apply({"company_updates": [{"company_name": "Acme Corp", "about": "Builds CI tooling for teams.",
+                                   "updated_by": "web_research"}]}, NOW)
+    assert "Builds CI tooling for teams." in open(path).read()
+    # …but a correction the user made by hand outranks every later pipeline write.
+    ku.apply({"company_updates": [{"company_name": "Acme Corp", "about": "Builds CI tooling. Bootstrapped.",
+                                   "updated_by": "user_edit"}]}, NOW)
+    ku.apply({"company_updates": [{"company_name": "Acme Corp", "about": "Builds dev tools.",
+                                   "updated_by": "web_research"}]}, NOW)
+    body = open(path).read()
+    assert "Builds CI tooling. Bootstrapped." in body and "Builds dev tools." not in body

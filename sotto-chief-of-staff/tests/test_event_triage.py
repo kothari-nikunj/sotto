@@ -2071,3 +2071,22 @@ def test_calendar_invite_email_queues_without_a_tier1_call(tmp_path, monkeypatch
     # a plain email with an ordinary subject still reaches Tier 1 (the stub raises → queue+error)
     out3 = te.triage({"events": [_email(rowid="e3")]}, now_local=DAY, now_utc=NOW_UTC)
     assert "tier1 error" in out3["reason"]
+
+
+def test_vip_family_is_the_typed_relation_not_a_word_grep(tmp_path, monkeypatch):
+    """The old check was `\\bfamily\\b` over the raw file — anyone whose notes said "family
+    office" became the user's sibling and cleared quiet hours. Only the typed family_of
+    relation counts now."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    pdir = tmp_path / "knowledge" / "people"
+    pdir.mkdir(parents=True)
+    (pdir / "c_aaa111bbb222.md").write_text(
+        "---\ncanonical_id: c_aaa111bbb222\nname: Mara Chen\nidentifiers:\n- mara@kin.test\n"
+        "schema_version: 1\nrelations:\n- type: family_of\n  slug: c_user\n  name: You\n"
+        "  source: user_edit\n  confidence: 1.0\n---\n\n## Summary\nSister.\n", encoding="utf-8")
+    (pdir / "c_ccc333ddd444.md").write_text(
+        "---\ncanonical_id: c_ccc333ddd444\nname: Vik Rao\nidentifiers:\n- vik@fund.test\n"
+        "schema_version: 1\n---\n\n## Summary\nRuns a family office out of Menlo Park.\n",
+        encoding="utf-8")
+    assert te._is_vip("Mara Chen", "mara@kin.test", {}, {}) is True
+    assert te._is_vip("Vik Rao", "vik@fund.test", {}, {}) is False

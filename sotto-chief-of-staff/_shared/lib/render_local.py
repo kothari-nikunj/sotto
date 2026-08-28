@@ -289,7 +289,30 @@ def build_identity_resolver(local: dict):
     email but who were not in Apple Contacts rendered as “+1 (404) 247-4568 & +1 (408) 666-3190”
     while the same people were named correctly in their own 1:1 threads."""
     seeded = seed_contact_index_from_contacts(_arr(local, "contacts"))
-    by_identifier, _by_id = build_canonical_resolver(_arr(local, "contact_index") + seeded)
+    graph = _arr(local, "contact_index")
+    # A Contacts card and a graph file for the same human must carry the SAME canonical_id. The
+    # seed formula only reproduces the file's id when name + first email agree byte-for-byte — a
+    # person first graphed from a phone (no email) minted a DIFFERENT id, the extraction copied
+    # that drifted id back verbatim, and the updater's "different id = different person" safeguard
+    # forked one human into two files. The graph is the register: any identifier overlap re-keys
+    # the whole Contacts card to the graph's id before the two indexes merge.
+    if graph and seeded:
+        by_ident = {}
+        for g in graph:
+            gcid = _s(g.get("canonical_id"))
+            if not gcid:
+                continue
+            for i in (g.get("identifiers") or []):
+                k = _normalize_identifier(_s(i))
+                if k:
+                    by_ident.setdefault(k, gcid)
+        for card in seeded:
+            for i in (card.get("identifiers") or []):
+                cid = by_ident.get(_normalize_identifier(_s(i)))
+                if cid:
+                    card["canonical_id"] = cid
+                    break
+    by_identifier, _by_id = build_canonical_resolver(graph + seeded)
     return lambda idv: by_identifier.get(_normalize_identifier(idv))
 
 

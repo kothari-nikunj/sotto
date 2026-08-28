@@ -83,6 +83,7 @@ def test_correct_supersedes_via_the_chat_path(tmp_path):
     assert new.type == "milestone"            # inherits the corrected fact's memory_type
     assert new.first == TODAY and new.last == TODAY
     assert p.facts["f_other"].status == "active"   # untouched
+    assert p.updated_by == "user_edit"        # the file stamp names the real writer
 
 
 def test_correct_dissimilar_text_still_archives_the_target(tmp_path):
@@ -318,6 +319,21 @@ def test_merge_dismiss_forgets_the_pair_without_touching_either_file(tmp_path):
     left = json.load(open(path, encoding="utf-8"))["suggestions"]
     assert [(s["from"], s["into"]) for s in left] == [("c_x", "c_y")]
     assert os.path.exists(other) and len(_person().facts) == 2
+
+
+def test_merge_dismiss_tombstones_the_pair(tmp_path):
+    """A dismissal is a decision, not a filter: it is written to `dismissed`, so the next
+    suggest_name_merges() — which recomputes from the files on disk — cannot re-ask."""
+    _setup(tmp_path)
+    _write_other(name="Sarah", identifiers=["+14155551234"])
+    path = os.path.join(str(tmp_path), "knowledge", "merge_suggestions.json")
+    ke.op_merge_dismiss(OTHER, CID, NOW)
+    data = json.load(open(path, encoding="utf-8"))
+    assert [(d["from"], d["into"]) for d in data["dismissed"]] == [(OTHER, CID)]
+    assert data["dismissed"][0]["at"] == TODAY
+    # A confirmed merge needs no tombstone — one of the two files is gone.
+    ke.op_merge(OTHER, CID, NOW)
+    assert len(json.load(open(path, encoding="utf-8"))["dismissed"]) == 1
 
 
 def test_merge_dismiss_validates_slugs(tmp_path):

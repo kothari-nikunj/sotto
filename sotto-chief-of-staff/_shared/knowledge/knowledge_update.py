@@ -22,7 +22,8 @@ asymmetric pieces — because the two dupe shapes have opposite risk profiles:
      knowledge/merge_suggestions.json (deduped, capped) for a human to confirm via
      `knowledge_edit.py --op merge`. Names never auto-merge: name-slug keying is the ORIGINAL
      identity bug (two different John Smiths in one file), and conflicting identifiers — two
-     emails, or two phones, with nothing in common — suppress the suggestion entirely.
+     emails, or two phones, with nothing in common — suppress the suggestion entirely. A pair the
+     user dismissed is tombstoned in the same file's `dismissed` list and never suggested again.
   3. COMPANIES GET PREVENTION, NOT REPAIR. Company files are keyed by name-slug with aliases and a
      domain stored but never consulted, so "YC" and "Y Combinator" became two files. Resolution now
      consults both (alias-slug and domain) before minting a new file, every company_name seen is
@@ -67,6 +68,7 @@ import jsonstore  # noqa: E402 — THE lock for the volume (see apply)
 # Dedup-lite tuning. Kept small and boring: the suggestion list is a human's to-do list, not a
 # report, and the pairwise scan must never become the Learn step's cost centre.
 MERGE_SUGGESTIONS_MAX = 10          # the file holds at most this many open suggestions
+MERGE_DISMISSED_MAX = 100           # tombstoned pairs kept, newest first
 MERGE_SUGGEST_MAX_FILES = 300       # above this the O(n²) name scan is skipped entirely
 MERGE_SUGGEST_MAX_BUCKET = 40       # a name-prefix shared by more people than this is noise
 NAME_SIMILARITY_MIN = 0.9           # difflib ratio over name slugs, when neither contains the other
@@ -398,13 +400,35 @@ def load_merge_suggestions() -> list:
         return []
 
 
-def _write_merge_suggestions(items: list, iso: str) -> None:
+def load_merge_dismissed() -> list:
+    """The tombstoned pairs — [{from, into, at}, …] — or [] (a missing/corrupt file is "none").
+    Mirrors learn_preferences' `suppressed`: a list the user's "no" is written into, so a refresh
+    that recomputes from scratch cannot resurrect what they already answered."""
+    try:
+        with open(_suggestions_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+        items = data.get("dismissed")
+        return [d for d in items if isinstance(d, dict)] if isinstance(items, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _pair_key(d: dict) -> frozenset:
+    """A merge pair identifies two people, not a direction — match order-insensitively."""
+    return frozenset((_s(d.get("from")), _s(d.get("into"))))
+
+
+def _write_merge_suggestions(items: list, iso: str, dismissed: list | None = None) -> None:
+    """The ONE writer of merge_suggestions.json. `dismissed` defaults to whatever is already on
+    disk, so a suggestions refresh can never drop the tombstones it must obey."""
     path = _suggestions_path()
+    tombs = load_merge_dismissed() if dismissed is None else dismissed
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"updated_at": iso, "suggestions": items[:MERGE_SUGGESTIONS_MAX]}, f, indent=1)
+            json.dump({"updated_at": iso, "suggestions": items[:MERGE_SUGGESTIONS_MAX],
+                       "dismissed": tombs[:MERGE_DISMISSED_MAX]}, f, indent=1)
         os.replace(tmp, path)
     except OSError:
         pass
@@ -418,10 +442,15 @@ def suggest_name_merges(now: datetime | None = None) -> list:
     with a positive identifier contradiction (the two-John-Smiths shape) is dropped, so the
     suggestion list can never reinforce the name-slug bug it exists to clean up. Stale entries
     (either file gone — usually because the merge happened) are pruned on every pass, and
-    first_seen survives so the dashboard can age them."""
+    first_seen survives so the dashboard can age them.
+
+    A pair the user dismissed is tombstoned in the same file and never suggested again — this
+    recomputes from the people on disk every apply, so without the tombstone "these really are two
+    people" would be re-asked tomorrow."""
     now = now or datetime.now(timezone.utc)
     people = _load_people()
     prior = {(_s(x.get("from")), _s(x.get("into"))): x for x in load_merge_suggestions()}
+    tombstoned = {_pair_key(d) for d in load_merge_dismissed()}
     items: list = []
     if len(people) <= MERGE_SUGGEST_MAX_FILES:
         slugs = {path: kg.safe_slug(p.name or "") for path, p in people.items()}
@@ -434,7 +463,7 @@ def suggest_name_merges(now: datetime | None = None) -> list:
             # from = the sparser file (the one that disappears), into = the richer one.
             src, dst = sorted((pa, pb), key=lambda pp: _merge_rank(people[pp], pp))[::-1]
             key = (_stem(src), _stem(dst))
-            if key in seen:
+            if key in seen or frozenset(key) in tombstoned:
                 continue
             seen.add(key)
             items.append({
@@ -449,10 +478,24 @@ def suggest_name_merges(now: datetime | None = None) -> list:
 
 
 def drop_merge_suggestion(src_slug: str, dst_slug: str, now: datetime | None = None) -> None:
-    """Forget a suggestion once it has been acted on (either direction). Best-effort."""
+    """Forget a suggestion once it has been acted on (either direction). Best-effort. A CONFIRMED
+    merge needs no tombstone — one of the two files is gone, so the pair can never be suggested
+    again; only a dismissal does (`dismiss_merge_suggestion`)."""
     pair = {(src_slug, dst_slug), (dst_slug, src_slug)}
     kept = [s for s in load_merge_suggestions() if (_s(s.get("from")), _s(s.get("into"))) not in pair]
     _write_merge_suggestions(kept, kg.now_iso(now or datetime.now(timezone.utc)))
+
+
+def dismiss_merge_suggestion(src_slug: str, dst_slug: str, now: datetime | None = None) -> None:
+    """"These really are two people" — drop the suggestion AND tombstone the pair, so the next
+    suggest_name_merges() (which recomputes from the files on disk) does not re-ask tomorrow."""
+    now = now or datetime.now(timezone.utc)
+    pair = {(src_slug, dst_slug), (dst_slug, src_slug)}
+    kept = [s for s in load_merge_suggestions() if (_s(s.get("from")), _s(s.get("into"))) not in pair]
+    key = frozenset((src_slug, dst_slug))
+    tombs = [d for d in load_merge_dismissed() if _pair_key(d) != key]
+    tombs.insert(0, {"from": src_slug, "into": dst_slug, "at": kg.today_str(now)})
+    _write_merge_suggestions(kept, kg.now_iso(now), tombs)
 
 
 def _s(v) -> str:
@@ -725,6 +768,15 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
 
         if ident and ident not in p.identifiers:
             p.identifiers.append(ident)
+        # `identifiers` — every OTHER way to reach the same human (a Contacts card carries three
+        # emails and two phones). Deterministic writers pass it; the extraction schema does not,
+        # because a model listing identifiers is a model inventing them. Storing them all is what
+        # lets a message from the second phone resolve to this file instead of forking a new one.
+        for extra in upd.get("identifiers") or []:
+            e = _s(extra).strip()
+            e = e.lower() if "@" in e else e
+            if e and e not in p.identifiers:
+                p.identifiers.append(e)
         # A real name upgrades a placeholder (cid-as-name) but never overwrites an existing one.
         if name and (not p.name or p.name == p.canonical_id):
             p.name = name
@@ -753,15 +805,17 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
         counts["pruned"] += sum(1 for f in p.facts.values() if f.status == "archived") - before_archived
 
         p.updated_at = iso
-        p.updated_by = "brief_extraction"
+        # Honor the writer's own name, as the company lane already does — a user edit or a research
+        # sweep must not masquerade as a brief extraction in the file's provenance stamp.
+        p.updated_by = _s(upd.get("updated_by")).strip() or "brief_extraction"
         with open(path, "w", encoding="utf-8") as f:
             f.write(kg.serialize_person_file(p, now))
         person_files.append(os.path.basename(path))
         # Keep the in-run index current so a later update in this same batch (other channel,
         # other name form) resolves to the file we just wrote instead of creating a duplicate.
         index["by_cid"][p.canonical_id] = path
-        if ident:
-            k = kg.normalize_identifier(ident)
+        for known in p.identifiers:      # every identifier on the file, not just today's
+            k = kg.normalize_identifier(known)
             if k:
                 index["by_identifier"][k] = path
         s = _slug_for(p.name)
@@ -847,6 +901,11 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
         # decide whether their `about` is an upgrade (persist_prep asks company_knowledge first);
         # this writer just does what it's told, exactly like profile_patch on a person.
         new_about = _s(upd.get("about")).strip()
+        # …with ONE floor under it: a `user_edit` About is a correction the user made by hand, and a
+        # pipeline never overwrites it. An empty About, or one owned by any pipeline, is fair game.
+        if new_about and about and existing_by == "user_edit" \
+                and _s(upd.get("updated_by")).strip() != "user_edit":
+            new_about = ""
         if new_about:
             about = new_about[:kg.MAX_COMPANY_CONTEXT_CHARS]
         # `updated_by` on a company names WHO OWNS THE ABOUT — because `about` is the only field a
