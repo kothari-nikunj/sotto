@@ -48,14 +48,17 @@ def test_set_then_get_returns_the_question_as_delivered(tmp_path, monkeypatch):
     assert got["detail"] == "12:00 PM, Sightglass"
 
 
-def test_the_stored_shape_is_exactly_the_six_ephemeral_fields(tmp_path, monkeypatch):
+def test_the_stored_shape_is_exactly_the_seven_ephemeral_fields(tmp_path, monkeypatch):
     """Ephemeral state, not memory: nothing here could be used by a brief three months from now,
-    so nothing beyond the question and its clock is allowed to accumulate."""
+    so nothing beyond the question, its clock and the hash of what it offered is allowed to
+    accumulate."""
     path = _data(tmp_path, monkeypatch)
     po.set_offer("chase", "any word on the deck?", person="Maya")
     with open(path, encoding="utf-8") as f:
         stored = json.load(f)
-    assert set(stored) == {"ts", "kind", "question", "person", "detail", "expires_at"}
+    assert set(stored) == {"ts", "kind", "question", "person", "detail", "payload_sha256",
+                           "expires_at"}
+    assert stored["payload_sha256"] == ""       # an offer with no real effect binds to nothing
 
 
 def test_get_on_a_missing_file_is_an_empty_object(tmp_path, monkeypatch):
@@ -104,6 +107,60 @@ def test_a_corrupt_or_questionless_file_reads_as_empty(tmp_path, monkeypatch):
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"kind": "meeting_prep"}, f)
     assert po.get_offer() == {}
+
+
+# ── binding a yes to the bytes it was given ─────────────────────────────────────────────────────
+
+DRAFT = "hey — any word on the deck? no rush if not."
+
+
+def test_a_payload_file_stores_only_its_hash(tmp_path, monkeypatch):
+    """The offer names WHICH bytes the user is being asked about; it never keeps them. Storing the
+    draft here would put a second copy of everything Sotto offers on the volume, for a file whose
+    whole point is that it is ephemeral."""
+    path = _data(tmp_path, monkeypatch)
+    payload = tmp_path / "draft.txt"
+    payload.write_text(DRAFT, encoding="utf-8")
+
+    digest = po.payload_hash(payload.read_bytes())
+    po.set_offer("chase", "Want this in your Gmail drafts?", person="Maya",
+                 payload_sha256=digest)
+
+    raw = open(path, encoding="utf-8").read()
+    assert digest in raw
+    assert DRAFT not in raw and "deck" not in raw          # the hash, never the draft
+    assert po.get_offer()["payload_sha256"] == digest      # and the acting side reads it back
+
+
+def test_the_hash_is_over_the_exact_bytes(tmp_path):
+    """The offering lane hashes a file and the acting verb hashes a string — they must land on the
+    same digest or `--offer-bound` refuses everything it should allow."""
+    assert po.payload_hash(DRAFT.encode("utf-8")) == po.payload_hash(DRAFT.encode("utf-8"))
+    assert po.payload_hash(DRAFT.encode("utf-8")) != po.payload_hash((DRAFT + " ").encode("utf-8"))
+    assert len(po.payload_hash(b"")) == 64
+
+
+def test_an_expired_bound_offer_still_reads_as_empty(tmp_path, monkeypatch):
+    """Binding does not extend the window: a yes outside it has no offer to match against."""
+    _data(tmp_path, monkeypatch)
+    po.set_offer("chase", "Want this in your Gmail drafts?", ttl_min=-1,
+                 payload_sha256=po.payload_hash(DRAFT.encode("utf-8")))
+    assert po.get_offer() == {}
+
+
+def test_cli_payload_file_round_trips(tmp_path):
+    payload = tmp_path / "body.txt"
+    payload.write_text(DRAFT, encoding="utf-8")
+    _cli(tmp_path, "set", "--kind", "chase", "--question", "Want this in your Gmail drafts?",
+         "--payload-file", str(payload))
+    got = json.loads(_cli(tmp_path, "get"))
+    assert got["payload_sha256"] == po.payload_hash(DRAFT.encode("utf-8"))
+
+
+def test_cli_set_without_a_payload_file_binds_to_nothing(tmp_path):
+    """"Want me to pull prep?" has no bytes to bind — no ceremony where there is no payload."""
+    _cli(tmp_path, "set", "--kind", "meeting_prep", "--question", QUESTION, "--person", "Shivani")
+    assert json.loads(_cli(tmp_path, "get"))["payload_sha256"] == ""
 
 
 # ── one offer at a time ─────────────────────────────────────────────────────────────────────────
@@ -171,7 +228,8 @@ _RACER = textwrap.dedent("""
         else:
             got = po.get_offer()
             if got:
-                assert set(got) == {{"ts", "kind", "question", "person", "detail", "expires_at"}}, got
+                assert set(got) == {{"ts", "kind", "question", "person", "detail",
+                                     "payload_sha256", "expires_at"}}, got
                 assert got["question"] == "q" + got["person"][1:], got   # one whole write, not two halves
         time.sleep(0.001)
 """)
@@ -215,6 +273,7 @@ def test_the_proactive_skill_tells_the_model_to_record_the_question(tmp_path):
            "--kind meeting_prep --person" in skill
     assert "--question" in skill
     assert "different session" in skill or "never saw your question" in skill
+    assert "--payload-file" in skill and "--offer-bound" in skill
 
 
 def test_the_gateway_carries_the_standing_instruction(tmp_path):
@@ -227,6 +286,7 @@ def test_the_gateway_carries_the_standing_instruction(tmp_path):
         assert affirmative in persona
     assert "clear" in persona
     assert "sotto-meeting-prep" in persona
+    assert "payload_sha256" in persona and "--offer-bound" in persona
 
     with open(os.path.join(HERMES, "adapters", "hermes", "start.sh"), encoding="utf-8") as f:
         start = f.read()

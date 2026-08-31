@@ -23,11 +23,13 @@ Two modes, one replay:
 Days replay IN ORDER into ONE sandbox, so the continuity ledger and the interrupt budget accumulate
 exactly as they would across a real week — that's the flywheel time-travel the plan asks for.
 
-Two standing rules:
+Three standing rules:
   · A corpus is real user data. It never leaves the owner's infrastructure — gitignored, deleted by
     tools/prepare-public-repo.sh, and guarded there (CORPUS GUARD).
   · Unreviewed labels are not a baseline. This harness refuses to score against a labels.yaml that
     still says `reviewed: false` unless you pass --allow-unreviewed.
+  · A gate without a baseline is unarmed. Until --update-baseline records one, every run ends
+    RESULT: NO BASELINE (exit 2) — never PASS.
 """
 from __future__ import annotations
 
@@ -439,8 +441,14 @@ def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bo
             if live and judge:
                 j = judge_day(res, day, base)
                 if j and "error" not in j:
-                    day_rows.append(("judge", {k: j.get(k) for k in ("fabrication", "voice", "triage")},
-                                     textutil._s(j.get("notes"))))
+                    # One SCALAR row per dimension, normalized 0-1 so --threshold means the same
+                    # thing on every metric. (These were once a nested dict that aggregate()
+                    # silently dropped — a scored dimension that never reached the baseline.)
+                    for k in ("fabrication", "voice", "triage"):
+                        if isinstance(j.get(k), (int, float)):
+                            day_rows.append((f"judge_{k}", round(float(j[k]) / 10, 3),
+                                             textutil._s(j.get("notes")) if k == "fabrication"
+                                             else f"judge's {k} score, 0-1"))
             print(f"\n{day['name']}  ({day.get('description', '')})")
             for metric, value, detail in day_rows:
                 print(f"  {metric:<18} {json.dumps(value)}   — {detail}")
@@ -456,17 +464,24 @@ def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bo
     scores = aggregate(rows)
     print("\n" + "=" * 72)
     print("AGGREGATE: " + json.dumps(scores, sort_keys=True))
-    return _baseline_gate(version, scores, update, threshold)
+    run_sig = {"mode": ("live+judge" if live and judge else "live" if live else "dry"),
+               "sample": sample}
+    return _baseline_gate(version, scores, update, threshold, run_sig)
 
 
 def aggregate(rows: list) -> dict:
-    """Corpus-level numbers: means of the scalar metrics, micro-averaged F1 of the PRF ones."""
+    """Corpus-level numbers: means of the scalar metrics, micro-averaged F1 of the PRF ones.
+    A dict value without "f1" is a shape this function cannot score — it raises rather than
+    silently dropping a metric out of the baseline."""
     out, prf = {}, {}
     for _day, metric, value, _detail in rows:
         if isinstance(value, dict) and "f1" in value:
             acc = prf.setdefault(metric, {"tp": 0, "expected": 0, "actual": 0})
             for k in acc:
                 acc[k] += value[k]
+        elif isinstance(value, dict):
+            raise ValueError(f"unaggregatable metric {metric!r}: a dict without 'f1' — "
+                             f"emit one scalar row per dimension instead")
         elif isinstance(value, (int, float)):
             out.setdefault(metric, []).append(float(value))
     agg = {m: round(sum(v) / len(v), 3) for m, v in out.items() if v}
@@ -481,26 +496,41 @@ def _baseline_path(version: str) -> str:
     return os.path.join(ev._baselines_dir(), f"golden-{version}.json")
 
 
-def _baseline_gate(version: str, scores: dict, update: bool, threshold: float) -> int:
+def _baseline_gate(version: str, scores: dict, update: bool, threshold: float,
+                   run_sig: dict) -> int:
+    """PASS only against a recorded baseline. No baseline is NO BASELINE (exit 2, the same family
+    as a missing corpus) — a gate that passes because it has nothing to compare against is unarmed.
+    The comparison walks the BASELINE's metrics, so a metric that vanishes from the current run
+    (the exact shape of the judge-dict bug) fails instead of slipping out of the comparison."""
     path = _baseline_path(version)
     if update:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"scores": scores, "date": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+            json.dump({"scores": scores, "run": run_sig,
+                       "date": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
                       f, indent=2, sort_keys=True)
         print(f"Baseline rewritten → {path}")
         return 0
     if not os.path.exists(path):
-        print("No golden baseline yet — run with --update-baseline to record one.\nRESULT: PASS")
-        return 0
+        print("No golden baseline yet — this run gated NOTHING. Record one with --update-baseline "
+              "after the labeling hour.\nRESULT: NO BASELINE")
+        return 2
     with open(path, encoding="utf-8") as f:
-        prev = (json.load(f) or {}).get("scores") or {}
-    regressions = [(m, prev[m], scores[m]) for m in scores
-                   if m in prev and (prev[m] - scores[m]) > threshold]
+        doc = json.load(f) or {}
+    prev, prev_run = doc.get("scores") or {}, doc.get("run") or {}
+    missing = sorted(m for m in prev if m not in scores)
+    regressions = [(m, prev[m], scores[m]) for m in sorted(prev)
+                   if m in scores and (prev[m] - scores[m]) > threshold]
+    if missing:
+        print(f"MISSING — in the baseline but absent from this run: {', '.join(missing)}")
+        if prev_run and prev_run != run_sig:
+            print(f"  baseline was recorded as {json.dumps(prev_run, sort_keys=True)}; this run is "
+                  f"{json.dumps(run_sig, sort_keys=True)} — match it, or --update-baseline")
     if regressions:
         print(f"REGRESSIONS beyond {threshold}:")
         for m, a, b in regressions:
             print(f"  - {m}: {a} → {b}")
+    if missing or regressions:
         print("RESULT: FAIL")
         return 1
     print("RESULT: PASS")

@@ -14,19 +14,36 @@ Subcommands (each prints the CLI's JSON, or {status:"error", error}):
   calendar-delete --event-id ID
   calendar-rsvp   --event-id ID --response accepted|declined|tentative [--calendar C] [--comment TEXT]
 
-`gmail-draft` is the ONE subcommand that is not an outbound act: it puts the text in the user's own
-Gmail drafts, where they review and press send. That is why the offer surfaces prefer it to a
-percent-encoded `mailto:` — but it still runs only after the user says yes (approval-tiers.md →
+Every verb above except `gmail-draft` carries `--offer-bound` (see THE APPROVAL BINDING below —
+the offer lane regenerates draft text in the acting session, so binding the draft verb would refuse
+every legitimate yes).
+
+`gmail-draft` is not an outbound act — it puts the text in the user's own Gmail drafts, where they
+review and press send, which is why the offer surfaces prefer it to a percent-encoded `mailto:`. It
+is still a WRITE to the user's account, so it sits behind the same unattended wall as every other
+verb in REAL_EFFECT: created only after the user says yes in that conversation (approval-tiers.md →
 `review`), never from a cron.
 
-⚠️ THE SEND GATE — "Sotto drafts, you send" is enforced here, not asked for. The attended chat lane
-gates a send on the user's yes in the conversation. The unattended lanes (cron briefs, the proactive
-watcher, event triage) run with approvals auto-bypassed, so prompt text is not a gate: the receiver
-sets `SOTTO_UNATTENDED=1` in the environment of every skill it spawns, and with it set `gmail-send`
-and `gmail-reply` are REFUSED here before any network call (`fallback: "gmail-draft"`, exit 2).
-`gmail-draft`, the calendar verbs and every read verb are unaffected — a draft never leaves the
-house, and a calendar write is the user's own in-chat instruction. Every send/reply attempt, allowed
-or refused, leaves one metadata-only line in `$SOTTO_DATA/events/sends.jsonl`.
+⚠️ THE UNATTENDED GATE — "Sotto drafts, you send" is enforced here, not asked for. The attended chat
+lane gates a real effect on the user's yes in the conversation. The unattended lanes (cron briefs,
+the proactive watcher, event triage) run with approvals auto-bypassed, so prompt text is not a gate:
+the receiver sets `SOTTO_UNATTENDED=1` in the environment of every skill it spawns, and with it set
+every verb in `REAL_EFFECT` — the outbound gmail verbs, the calendar writes, and `gmail-draft` — is
+REFUSED here before any network call (exit 2, with a `fallback` naming the one safe alternative).
+Read verbs are unaffected. Every attempt at a real effect, allowed or refused, leaves one
+metadata-only line in `$SOTTO_DATA/events/sends.jsonl`.
+
+⚠️ THE APPROVAL BINDING — a receipt names the bytes, and `--offer-bound` requires them. Each receipt
+carries `payload_sha256`, the hash of the exact content about to leave, so "what did Sotto send?"
+can be checked against what the user was shown without the ledger holding a word of it. `--offer-bound`
+turns that from a record into a gate: the verb reads the cross-process offer (`pending_offer.py`),
+requires a FRESH one whose `payload_sha256` equals this invocation's, refuses with exit 2 and a named
+reason on absence, expiry or mismatch, and clears the offer only after the act succeeds. That is what
+makes a "sure" arriving three processes later bind to the bytes it was given, instead of to whatever
+the acting session regenerated. Its limit is stated where it is claimed
+(`_shared/references/approval-tiers.md`): in-session approval cannot be machined this way, because
+the same agent computes both sides — there the hash makes a receipt disputable, not the act
+prevented.
 
 WHY IT DOESN'T GO THROUGH THE HOST CLI: the Hermes `google-workspace` `google_api.py` has no
 `gmail draft` verb (its gmail actions are search/get/send/reply/labels/modify), and that CLI is
@@ -53,19 +70,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gather_google import _find_google_api, _gmail_service, _token_path  # noqa: E402,F401
 
 
-# ── The send gate ────────────────────────────────────────────────────────────────────────────────
-# It covers the two verbs that put mail in someone else's inbox — `gmail-send` and `gmail-reply`
-# (see main()). Everything else here either stays in the user's own account (gmail-draft) or is a
-# calendar write they asked for in chat.
+# ── The gate on real effects ─────────────────────────────────────────────────────────────────────
+# It covers every verb that writes the user's Google account: the two that put mail in someone
+# else's inbox, the three that write the calendar, and `gmail-draft` — a draft never LEAVES the
+# house, but approval-tiers.md is unambiguous that no cron or proactive tick may create one ("a
+# drafts folder filling itself up while the user sleeps is busywork theater"), and until Aug 31 the
+# code said otherwise while claiming to enforce policy (external review). The unattended fallback
+# for every verb is the same: propose it in the brief.
 #
 # Set by the trigger receiver in the environment of every skill it spawns for a cron / proactive /
 # event-triage run — the lanes where `hermes -z` auto-bypasses approvals. Any non-empty value counts
 # (fail closed: an unparseable value means unattended, never attended).
 UNATTENDED_ENV = "SOTTO_UNATTENDED"
 
-REFUSAL = {"status": "error",
-           "error": "refused: unattended run — Sotto drafts, you send. Use gmail-draft instead.",
-           "fallback": "gmail-draft"}
+SEND_REFUSAL = {"status": "error",
+                "error": "refused: unattended run — Sotto drafts, you send. Propose the reply in "
+                         "the brief instead.",
+                "fallback": "propose_in_brief"}
+
+DRAFT_REFUSAL = {"status": "error",
+                 "error": "refused: unattended run — a Gmail draft is created only when the user "
+                          "says yes in that conversation. Propose it in the brief instead.",
+                 "fallback": "propose_in_brief"}
+
+CALENDAR_REFUSAL = {"status": "error",
+                    "error": "refused: unattended run — a calendar write happens only when the user "
+                             "asks for it in that conversation. Propose the event in the brief instead.",
+                    "fallback": "propose_in_brief"}
+
+# verb → (its refusal when unattended, the word its receipt uses when the act succeeded).
+REAL_EFFECT = {
+    "gmail-draft":     (DRAFT_REFUSAL, "drafted"),
+    "gmail-send":      (SEND_REFUSAL, "sent"),
+    "gmail-reply":     (SEND_REFUSAL, "sent"),
+    "calendar-create": (CALENDAR_REFUSAL, "written"),
+    "calendar-delete": (CALENDAR_REFUSAL, "written"),
+    "calendar-rsvp":   (CALENDAR_REFUSAL, "written"),
+}
 
 SENDS_MAX_BYTES = 4 * 1024 * 1024   # same bound as the other $SOTTO_DATA/events ledgers
 SENDS_KEEP_LINES = 4000
@@ -80,13 +121,46 @@ def _sends_path() -> str:
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "sends.jsonl")
 
 
-def _record_send(verb: str, ident: dict, unattended: bool, result: str) -> None:
-    """One JSONL line per send/reply ATTEMPT — allowed or refused — so "what did Sotto send?" has an
-    answer that isn't a prompt's promise: {ts, verb, to|message_id, unattended, result}.
+def _pending_offer():
+    """The cross-process offer store, imported from this same directory like `action_links`."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import pending_offer  # noqa: PLC0415
+    return pending_offer
 
-    METADATA ONLY. The subject and the body are never written here: the receipt proves an outbound
-    act happened, it is not a copy of the mail. Best-effort and bounded — an unwritable /data volume
-    must never change what the verb itself returns."""
+
+def _payload_hash(payload: str) -> str:
+    """The hash of the exact content this verb is about to act on. `pending_offer.payload_hash` is
+    the one hasher — the offering lane and the acting verb must agree byte-for-byte."""
+    return _pending_offer().payload_hash((payload or "").encode("utf-8"))
+
+
+def _canonical(fields: dict) -> str:
+    """The bytes that identify an act with more than one field: sorted keys, no whitespace, so the
+    same act hashes the same however the caller assembled it."""
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
+def _event_payload(summary: str, start: str, end: str, attendees: str,
+                   location: str, description: str) -> str:
+    """A calendar event as its whole content — guests normalized and sorted, so a reordered guest
+    list is the same invite while an added guest is not."""
+    return _canonical({
+        "summary": summary or "", "start": start or "", "end": end or "",
+        "attendees": sorted({x.strip().lower() for x in (attendees or "").split(",") if x.strip()}),
+        "location": location or "", "description": description or "",
+    })
+
+
+def _record_send(verb: str, ident: dict, unattended: bool, result: str,
+                 payload: str, offer_bound: bool) -> None:
+    """One JSONL line per real-effect ATTEMPT — allowed or refused — so "what did Sotto do?" has an
+    answer that isn't a prompt's promise:
+    {ts, verb, to|message_id|event_id, unattended, result, payload_sha256, offer_bound}.
+
+    METADATA ONLY. The subject, the body and the event's text are never written here: the hash names
+    WHICH bytes left without keeping any of them, so a receipt can be checked against what the user
+    was shown and still reads as nothing. Best-effort and bounded — an unwritable /data volume must
+    never change what the verb itself returns."""
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
         from sotto_log import bounded_append  # noqa: PLC0415
@@ -96,24 +170,58 @@ def _record_send(verb: str, ident: dict, unattended: bool, result: str) -> None:
             **ident,
             "unattended": unattended,
             "result": result,
+            "payload_sha256": _payload_hash(payload),
+            "offer_bound": offer_bound,
         })
         bounded_append(_sends_path(), line, SENDS_MAX_BYTES, SENDS_KEEP_LINES)
     except Exception:  # noqa: BLE001
         pass
 
 
-def _gated_send(verb: str, ident: dict, cli_args: list) -> tuple[dict, bool]:
-    """Run one of the two outbound verbs, or refuse it. Returns (result, refused).
+def _offer_binding_failure(payload: str) -> str:
+    """Why this `--offer-bound` invocation may NOT proceed, or "" when the user's yes really was for
+    these bytes: a fresh offer must be on file and its `payload_sha256` must equal this payload's.
 
-    Unattended → refuse BEFORE `_run` (i.e. before the CLI, before the network); the caller exits 2
-    so a bypassed-approval agent sees a hard failure, and `fallback: "gmail-draft"` tells it the one
-    thing it may do instead. `ident` is the recipient (send) or the message id (reply)."""
+    Absent or expired → the yes has no question behind it. Mismatched → the content changed between
+    the question and the act, which is the one thing an approval can never cover."""
+    try:
+        offer = _pending_offer().get_offer()
+    except Exception as e:  # noqa: BLE001
+        return f"the pending offer could not be read ({e})"
+    if not offer:
+        return "no fresh offer on file — the approval this would bind to is absent or expired"
+    approved = str(offer.get("payload_sha256") or "")
+    if not approved:
+        return "the offer carried no payload to bind to — re-offer with the content in view"
+    if approved != _payload_hash(payload):
+        return "payload does not match what the user approved — the content changed after the offer"
+    return ""
+
+
+def _gated(verb: str, ident: dict, payload: str, act, offer_bound: bool) -> tuple[dict, bool]:
+    """Run one real-effect verb, or refuse it. Returns (result, refused).
+
+    Both refusals land BEFORE `act` — before the CLI, before the network — and the caller exits 2 so
+    a bypassed-approval agent sees a hard failure it cannot read past. `payload` is the content about
+    to leave; only its hash is ever written. A bound offer is cleared once, after the act succeeds:
+    a refused or failed attempt leaves the user's yes unspent."""
+    refusal, ok_result = REAL_EFFECT[verb]
     if _unattended():
-        _record_send(verb, ident, True, "refused")
-        return dict(REFUSAL), True
-    out = _run(cli_args)
+        _record_send(verb, ident, True, "refused", payload, offer_bound)
+        return dict(refusal), True
+    if offer_bound:
+        reason = _offer_binding_failure(payload)
+        if reason:
+            _record_send(verb, ident, False, "refused", payload, True)
+            return {"status": "error", "error": f"refused: {reason}", "fallback": "re_offer"}, True
+    out = act()
     ok = isinstance(out, dict) and out.get("status") != "error"
-    _record_send(verb, ident, False, "sent" if ok else "error")
+    _record_send(verb, ident, False, ok_result if ok else "error", payload, offer_bound)
+    if ok and offer_bound:
+        try:
+            _pending_offer().clear_offer()
+        except Exception:  # noqa: BLE001
+            pass
     return out, False
 
 
@@ -315,6 +423,60 @@ def _gmail_draft(to: str, body: str, subject: str = "", thread_id: str = "") -> 
             "to": to, "subject": subject}
 
 
+def _calendar_create(summary: str, start: str, end: str, attendees: str = "",
+                     location: str = "", description: str = "") -> dict:
+    """Create the event, with the two honesty repairs the host CLI forces on us."""
+    base = ["calendar", "create", "--summary", summary, "--start", start, "--end", end]
+    self_email, self_added, listed = "", False, set()
+    if attendees:
+        # An invite Sotto sends must look exactly like one the user sent themselves: the native
+        # Calendar UI always adds the creator as a self-accepted attendee, while API-created
+        # events list only the attendees passed — leaving the organizer OFF the guest list
+        # ("1 guest, 1 awaiting" with no organizer row). Append the user's own address when we
+        # know it (env override → the address the Google connect derived) and it isn't already
+        # there; when we don't know it at all, behavior is unchanged.
+        self_email = _settings_email()
+        listed = {x.strip().lower() for x in attendees.split(",") if x.strip()}
+        self_added = bool(self_email) and self_email.lower() not in listed
+        if self_added:
+            attendees = f"{attendees},{self_email}"
+        base += ["--attendees", attendees]
+    extras = []
+    if location:
+        extras += ["--location", location]
+    if description:
+        extras += ["--description", description]
+    out = _run(base + extras)
+    if extras and isinstance(out, dict) and out.get("status") == "error" \
+            and _looks_unsupported_subcommand(out.get("error", "")):
+        # Host CLI predates --location/--description (argparse rejects unknown flags with a
+        # usage dump): create bare, then best-effort patch the fields on. The event must never
+        # be lost to a cosmetic flag.
+        out = _run(base)
+        if isinstance(out, dict) and out.get("id") and out.get("status") != "error":
+            p = _run(["calendar", "patch", str(out["id"])] + extras)
+            if isinstance(p, dict) and p.get("status") == "error":
+                out["location_attached"] = False
+                out["note"] = ("host google_api.py lacks location/description support — the "
+                               "invite carries no location; mention the place in your confirmation")
+            else:
+                out["location_attached"] = True
+    elif extras and isinstance(out, dict) and out.get("status") != "error":
+        out["location_attached"] = True
+    # Honest guest-list telemetry: a silent miss here is how "1 guest, 1 awaiting" invites ship.
+    # The skill surfaces organizer_listed=false to the user so an unknown address (Google not
+    # connected yet, or a typo'd SOTTO_USER_EMAIL) is caught on the FIRST invite, not discovered
+    # in the Calendar app later.
+    if attendees and isinstance(out, dict) and out.get("status") != "error":
+        out["organizer_listed"] = self_added or (bool(self_email) and self_email.lower() in listed)
+        if self_added:
+            out["organizer_email"] = self_email
+        elif not self_email:
+            out["note"] = ("Sotto doesn't know your address yet — connect Google (or set "
+                           "SOTTO_USER_EMAIL) so you appear in the invite's guest list")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -327,73 +489,45 @@ def main():
     rv = sub.add_parser("calendar-rsvp"); rv.add_argument("--event-id", required=True)
     rv.add_argument("--response", required=True, choices=list(RSVP_RESPONSES))
     rv.add_argument("--calendar", default="primary"); rv.add_argument("--comment", default="")
+    for p in (r, s, c, d, rv):
+        p.add_argument("--offer-bound", action="store_true",
+                       help="require a fresh pending offer whose payload hash matches this content")
     a = ap.parse_args()
 
+    bound = bool(getattr(a, "offer_bound", False))
     refused = False
     if a.cmd == "gmail-draft":
-        out = _gmail_draft(a.to, a.body, a.subject, a.thread_id)
+        out, refused = _gated("gmail-draft", {"to": a.to}, a.body,
+                              lambda: _gmail_draft(a.to, a.body, a.subject, a.thread_id), False)
     elif a.cmd == "gmail-reply":
-        out, refused = _gated_send("gmail-reply", {"message_id": a.message_id},
-                                   ["gmail", "reply", a.message_id, "--body", a.body])
+        out, refused = _gated("gmail-reply", {"message_id": a.message_id}, a.body,
+                              lambda: _run(["gmail", "reply", a.message_id, "--body", a.body]), bound)
     elif a.cmd == "gmail-send":
         args = ["gmail", "send", "--to", a.to, "--body", a.body]
         if a.subject:
             args += ["--subject", a.subject]
-        out, refused = _gated_send("gmail-send", {"to": a.to}, args)
+        out, refused = _gated("gmail-send", {"to": a.to}, a.body, lambda: _run(args), bound)
     elif a.cmd == "calendar-create":
-        base = ["calendar", "create", "--summary", a.summary, "--start", a.start, "--end", a.end]
-        if a.attendees:
-            # An invite Sotto sends must look exactly like one the user sent themselves: the native
-            # Calendar UI always adds the creator as a self-accepted attendee, while API-created
-            # events list only the attendees passed — leaving the organizer OFF the guest list
-            # ("1 guest, 1 awaiting" with no organizer row). Append the user's own address when we
-            # know it (env override → the address the Google connect derived) and it isn't already
-            # there; when we don't know it at all, behavior is unchanged.
-            attendees = a.attendees
-            self_email = _settings_email()
-            listed = {x.strip().lower() for x in attendees.split(",") if x.strip()}
-            self_added = bool(self_email) and self_email.lower() not in listed
-            if self_added:
-                attendees = f"{attendees},{self_email}"
-            base += ["--attendees", attendees]
-        extras = []
-        if a.location:
-            extras += ["--location", a.location]
-        if a.description:
-            extras += ["--description", a.description]
-        out = _run(base + extras)
-        if extras and isinstance(out, dict) and out.get("status") == "error" \
-                and _looks_unsupported_subcommand(out.get("error", "")):
-            # Host CLI predates --location/--description (argparse rejects unknown flags with a
-            # usage dump): create bare, then best-effort patch the fields on. The event must never
-            # be lost to a cosmetic flag.
-            out = _run(base)
-            if isinstance(out, dict) and out.get("id") and out.get("status") != "error":
-                patch = ["calendar", "patch", str(out["id"])] + extras
-                p = _run(patch)
-                if isinstance(p, dict) and p.get("status") == "error":
-                    out["location_attached"] = False
-                    out["note"] = ("host google_api.py lacks location/description support — the "
-                                   "invite carries no location; mention the place in your confirmation")
-                else:
-                    out["location_attached"] = True
-        elif extras and isinstance(out, dict) and out.get("status") != "error":
-            out["location_attached"] = True
-        # Honest guest-list telemetry: a silent miss here is how "1 guest, 1 awaiting" invites ship.
-        # The skill surfaces organizer_listed=false to the user so an unknown address (Google not
-        # connected yet, or a typo'd SOTTO_USER_EMAIL) is caught on the FIRST invite, not discovered
-        # in the Calendar app later.
-        if a.attendees and isinstance(out, dict) and out.get("status") != "error":
-            out["organizer_listed"] = self_added or (bool(self_email) and self_email.lower() in listed)
-            if self_added:
-                out["organizer_email"] = self_email
-            elif not self_email:
-                out["note"] = ("Sotto doesn't know your address yet — connect Google (or set "
-                               "SOTTO_USER_EMAIL) so you appear in the invite's guest list")
+        # No event id exists yet, so the receipt's target is the guest count — a number, never the
+        # addresses; the hash covers what the invite actually says.
+        out, refused = _gated(
+            "calendar-create",
+            {"attendee_count": len([x for x in a.attendees.split(",") if x.strip()])},
+            _event_payload(a.summary, a.start, a.end, a.attendees, a.location, a.description),
+            lambda: _calendar_create(a.summary, a.start, a.end, a.attendees, a.location, a.description),
+            bound)
     elif a.cmd == "calendar-delete":
-        out = _run(["calendar", "delete", a.event_id])
+        # A delete has no content — the event id is the whole act, so it is what the hash covers,
+        # and the field stays uniformly present across every receipt.
+        out, refused = _gated("calendar-delete", {"event_id": a.event_id}, a.event_id,
+                              lambda: _run(["calendar", "delete", a.event_id]), bound)
     elif a.cmd == "calendar-rsvp":
-        out = _rsvp(a.event_id, a.response, a.calendar, a.comment)
+        # The response is half the act — an offer to decline must not bind an accept — so the hash
+        # covers it and the note that rides along to the organizer, not the event id alone.
+        out, refused = _gated("calendar-rsvp", {"event_id": a.event_id},
+                              _canonical({"event_id": a.event_id, "response": a.response,
+                                          "comment": a.comment or ""}),
+                              lambda: _rsvp(a.event_id, a.response, a.calendar, a.comment), bound)
     else:  # pragma: no cover
         out = {"status": "error", "error": f"unknown cmd {a.cmd}"}
 

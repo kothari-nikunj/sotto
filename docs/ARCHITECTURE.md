@@ -23,7 +23,7 @@ owns each of them, and you can enter the system at any stage:
 | **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. |
 | **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Deterministic checks reject a malformed or hallucinated brief, and back the still-open appendix, before you ever see it. |
-| **deliver** | [`_shared/scripts/brief_marker.py`](../sotto-chief-of-staff/_shared/scripts/brief_marker.py) (the deliver-once claim; the host's gateway sends) | Exactly one process wins the claim and delivers; the loser discards its draft. |
+| **deliver** | [`_shared/scripts/brief_marker.py`](../sotto-chief-of-staff/_shared/scripts/brief_marker.py) (the deliver-once claim; the host's gateway sends) | Exactly one process wins the claim and delivers; the loser discards its draft. On the receiver lane the claim is no longer taken on trust — `outbox.py` claims the marker at the send seam, so a run that skipped its own claim is superseded rather than sent. |
 | **learn** | [`_shared/knowledge/knowledge_update.py`](../sotto-chief-of-staff/_shared/knowledge/knowledge_update.py) (+ `continuity_resolve.py`, `learn_preferences.py`, `style_extract.py`, `granola_graph.py`, `prewarm_graph.py --sync-contacts`) | What the brief found is written back into memory, so tomorrow starts from today. |
 
 **The LLM writes prose — it never decides *whether* to interrupt you.** That decision is the
@@ -75,33 +75,35 @@ so an ordinary reply, an old creation date, or the user's own chase cannot silen
 
 ## The two processes
 
-Two processes run side by side: **Hermes** (the agent loop, the chat gateway, the cron scheduler)
-and the **trigger receiver** (a stdlib HTTP server on `$PORT`). `adapters/hermes/start.sh` starts
+Two processes run side by side: **Hermes** (the agent loop, the chat gateway, and the scheduler for
+the pulse, the watcher and the digest) and the **trigger receiver** (a stdlib HTTP server on
+`$PORT`, which schedules and delivers the two briefs itself). `adapters/hermes/start.sh` starts
 the receiver first so Railway's `/health` answers within seconds, then boots Hermes. They share
 exactly one thing: the `$SOTTO_DATA` volume.
 
 ## The six modules
 
-All under `runtime/trigger-receiver/`, all stdlib-only. `receiver.py` loads the other five with
+All under `runtime/trigger-receiver/`, all stdlib-only. `receiver.py` loads the other six with
 `importlib` and injects `HOOKS` — late-bound lambdas over its own globals — so no module ever
 imports the receiver back.
 
 | Module | Owns |
 |---|---|
-| `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
+| `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the brief schedule (`crons.json`'s `runner: receiver` jobs), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
 | `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
 | `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel) |
-| `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_json`, the one atomic-write helper the whole image uses** |
+| `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_text`/`write_json`, the one atomic-write helper the whole image uses** |
 | `outbox.py` | The durable delivery outbox — `events/outbox.json`, the idempotency key, the retry backoff, the per-kind expiry, and the drain heartbeat. **Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn instead of dying.** |
+| `retention.py` | THE table of what the volume keeps and for how long — every TTL, the three policies that apply them, and the guard that keeps the graph, the ledger and the corpus off every rule. It owns no clock: `receiver._retention_tick` fires it once a local day from the cron thread. **Retention is machinery, not an instruction a run can decline.** |
 | `relay.py` | The reverse-MCP relay: the Mac long-polls `/bridge/poll`, Hermes calls `/mcp` locally, no tunnel |
 
-A seventh file sits in that directory and is **not** a module: `keys.py` is a byte-identical vendored
+An eighth file sits in that directory and is **not** a module: `keys.py` is a byte-identical vendored
 copy of `_shared/lib/keys.py`. The two runtimes must compute the same ids (`queue_key`,
 `sample_hash`) for "nudge me now" and the Voice card to address the right row, and the receiver
 image has to render those surfaces with no skills tree on the box — so it copies rather than
 imports, and `tests/test_docs_drift.py` fails the suite the moment the copies diverge.
 
-## The five daemon threads
+## The six daemon threads
 
 Every one is a `daemon=True` loop that swallows its own exceptions — a thread must never die and
 never take the server with it.
@@ -110,6 +112,7 @@ never take the server with it.
 |---|---|---|
 | Gmail poll (`receiver.start_gmail_poll_thread`) | `SOTTO_EMAIL_POLL_SECS`, default 90s | Claims nothing while polling; feeds new mail through the same funnel as Bridge events, then acknowledges ids only after the receiver durably accepts them |
 | Release valve (`receiver.start_valve_thread`) | `receiver.VALVE_INTERVAL_SECS_DEFAULT` = 900s | Forks `triage_event.py --valve` so a nudge held during cooldown/quiet/catchup can still get out |
+| Sotto cron (`receiver.start_cron_thread`) | `receiver.CRON_TICK_SECS` = 60s | Fires every `crons.json` job marked `"runner": "receiver"` — the morning and evening briefs — when its minute arrives, down the same spawn → outbox path every other lane takes. One fire per job per local day in memory; the deliver-once marker is what actually guarantees one brief. Fixed daily `M H * * *` schedules only; the zone is re-read every tick, so a timezone change needs no re-registration. **The same tick also runs the daily retention sweep** (`retention.SWEEP_LOCAL` = 3:30 AM local, the same fired-today stamp, one thread) |
 | Delivery outbox drain (`outbox.start_drain_thread`) | `outbox.DRAIN_INTERVAL_SECS` = 60s | Retries every message the channel hasn't acknowledged — backoff doubling from 60s to a 900s cap, then `failed` (a brief, loudly, when its local day ends) or `expired` (a nudge past 240 min, the same window the valve refuses to promote in). `SOTTO_OUTBOX=0` turns the heartbeat off; nothing is ever sent unrecorded either way |
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
@@ -129,12 +132,14 @@ tree, resolved once per script name.
 | `receiver._poll_gmail_once` | `event-triage/scripts/poll_gmail.py` | event list on stdout, 180s |
 | `dashboard._run_skill_cli` | `_shared/knowledge/knowledge_edit.py` · `preferences.py` · `style_extract.py --confirm` · `event-triage/scripts/triage_event.py --promote` (via `receiver.run_promote`) | `{"ok": …}` on stdout, 30s — ONE subprocess policy for the whole write surface, so every dashboard edit rides the identical code path the same instruction typed in chat would |
 | `calcache._run_calendar_gather` | `_shared/scripts/gather_google.py --skip-gmail` | writes a temp JSON file, 60s |
-| `receiver._seed_snapshot_from` | `_shared/scripts/compose_brief.py --seed-snapshot` | daemon thread, 120s — a wake-push that arrives after the day's brief already delivered composes nothing; its payload is folded into the local snapshot by the brief's own snapshot writer, and the funnel surfaces the catch-up |
+| `receiver._seed_snapshot_from` | `_shared/scripts/compose_brief.py --seed-snapshot` | daemon thread, 120s — a wake-push that arrives after the day's brief already delivered, or within `receiver.BRIEF_CRON_WINDOW_MIN` (10) minutes of its cron while that run is still composing, composes nothing; its payload is folded into the local snapshot by the brief's own snapshot writer, and the funnel surfaces the catch-up |
 
 A seventh boundary is different in kind: every lane that runs a SKILL goes through
 `receiver._spawn_and_deliver` — `$SOTTO_RUN_SKILL` (`hermes -z "<prompt>"`) on a daemon thread,
 whose final text is then piped to `hermes send --to $SOTTO_CRON_DELIVER`, the same home channel
-the crons are registered with. It used to be fire-and-forget on the belief that the skill
+Hermes' own crons deliver to. Since the briefs moved onto the receiver's clock, EVERY scheduled
+thing Sotto says goes through this one seam — there is no second lane that composes and delivers a
+brief on its own. It used to be fire-and-forget on the belief that the skill
 delivered itself; `-z` prints to stdout, so five of the six nudge producers were writing to a
 sink (Aug 2026). Starting it is synchronous — a missing runner still raises, because
 `handle_trigger` releases its brief claim on that — and only the outcome is asynchronous, which
@@ -142,7 +147,11 @@ is why it leaves a receipt in `events/delivery.jsonl`. That send is the ONE path
 also where the outbox sits: `receiver._deliver_text` writes the row and its idempotency key BEFORE
 the first attempt and flips it to `delivered` only on the channel's ack (`hermes send` exiting 0 —
 the strongest ack this seam has; `receiver._send_via_channel` is the one function a channel with a
-real receipt would strengthen). A failed send is now queued, not lost. Silence is a token, not a hope: a spawned
+real receipt would strengthen). A failed send is now queued, not lost. It is also where deliver-once
+stopped being a prompt: a brief-kind row proves it owns `briefs/<date>.<kind>.delivered` before the
+channel is asked — no marker and the row claims it with its own run id, another run's id and the row
+goes `superseded`, receipted and never sent (Aug 30, 2026: the evening brief went out twice because
+the skill's own claim step was skipped). Silence is a token, not a hope: a spawned
 run with nothing to deliver replies the `NO_NUDGES` sentinel, which the seam records as an empty
 run instead of sending — "say nothing and end the turn" was an instruction models reliably
 ignored, and three "all clear" messages in one evening proved it (Aug 2026).
@@ -150,8 +159,11 @@ The Hermes `google-workspace` skill's `setup.py` is an eighth, forked for Google
 
 **Adapter/plumbing variables** (script-to-script, never a user setting — they are deliberately
 absent from RAILWAY.md's table): `SOTTO_DATA` (the volume path, `/data` in the image),
-`SOTTO_RUN_SKILL` and `SOTTO_SKILLS_ROOT` (above), `SOTTO_UNATTENDED` (set to `1` on every skill run the receiver spawns — the seam `google_action.py`'s send gate reads; the interactive gateway never carries it), `SOTTO_MCP_TOKEN` (the reverse-MCP relay bearer,
-which `start.sh` sets from `BRIDGE_TOKEN`), `SOTTO_TRIGGER_PORT` / `SOTTO_TRIGGER_BIND` (the
+`SOTTO_RUN_SKILL` and `SOTTO_SKILLS_ROOT` (above), `SOTTO_UNATTENDED` (set to `1` on every skill run the receiver spawns — the seam `google_action.py`'s send gate reads; the interactive gateway never carries it), `SOTTO_MCP_TOKEN` (the ROOT bearer,
+which `start.sh` sets from `BRIDGE_TOKEN`; the Bridge's lanes — relay dial-in, event ingestion,
+wake-push — and the operator surfaces take the root, while `/mcp` takes only
+`receiver.derive_mcp_token(root)`, the one-way HMAC bearer `configure_mcp.py --derive-mcp` hands
+Hermes at boot, so the prompt-injectable agent never holds the trust anchor), `SOTTO_TRIGGER_PORT` / `SOTTO_TRIGGER_BIND` (the
 receiver's port and bind address, used only when Railway's `PORT` is absent — local runs get `8787`
 on `127.0.0.1`), and `SOTTO_BRIDGE_BIN` (read once by `adapters/hermes/install.sh`: an explicit path
 to a `sotto-bridged` engine, overriding both locations it probes for local mode — the built binary
@@ -169,7 +181,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 |---|---|---|
 | `setup_code` | receiver (boot) | receiver, `start.sh` |
 | `config/settings.json` | receiver (`/setup/timezone`) | receiver, dashboard, `start.sh`, skills (`timeutil`) |
-| `briefs/<date>.<kind>.claim` · `briefs/<date>.<kind>.delivered` | receiver | receiver (trigger dedup) |
+| `briefs/<date>.<kind>.claim` · `briefs/<date>.<kind>.delivered` | receiver (the `.claim`; and the `.delivered` when the send seam's gate claims it), skills (`brief_marker.py --claim`) | receiver (trigger dedup, the cron-window fold, and the outbox's deliver-once gate — the `.delivered` file's CONTENT is the claiming run's id), skills (`proactive_scan.py`) |
 | `briefs/<date>.<kind>.payload.json` | receiver | skills (`compose_brief.py`) |
 | `briefs/<date>_<kind>.json` | skills | dashboard |
 | `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
@@ -183,7 +195,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage` and correlated `decision_ids` |
 | `events/outbox.json` | `outbox.py` (the ONE writer) | receiver (the retry drain), dashboard (`/api/runs` — the pending/failed line) — one row per message Sotto composed, written BEFORE the first send attempt and flipped to `delivered` only on the channel's ack |
 | `events/delivery-effects-<run>.json` | skills (`proactive_scan.py`, one receiver-scoped run) | receiver — ephemeral chase/handoff effects, carried on the outbox row and applied only once the message is acknowledged, then deleted |
-| `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per send/reply **attempt**, allowed or refused, so "what did Sotto send?" isn't answered by a prompt's promise |
+| `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` so "what did Sotto send?" isn't answered by a prompt's promise |
 | `cache/calendar_today.json` | calcache | skills (`triage_event.py` in-meeting hold) |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
 | `cache/research_<date>.json` | skills (`research_attendees.py`) | dashboard (`/api/research` cards), skills (`compose_brief.py` joins it) |
@@ -204,7 +216,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `proactive/<date>.json` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the once-per-day nudge dedup; a read-modify-write, so both producers take `triage_event._locked` on it |
 | `proactive/wake_run.last` | receiver (`handle_proactive_wake`) | receiver — its *mtime* is the sleep→wake throttle, nothing is read from inside it |
 | `proactive/retune_offer.last` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the retune-offer cooldown stamp |
-| `proactive/pending_offer.json` | skills (`pending_offer.py set` — the ONE writer, called by the proactive lane right after it delivers a push that ENDED in a question) | the gateway (`pending_offer.py get`, then `clear`) — a nudge is delivered by a detached run, so the user's bare "sure" lands in a session that never saw the question; this file is where it is written down. One offer at a time, newest wins, expires after 180 min at read |
+| `proactive/pending_offer.json` | skills (`pending_offer.py set` — the ONE writer, called by the proactive lane right after it delivers a push that ENDED in a question) | the gateway (`pending_offer.py get`, then `clear`) — a nudge is delivered by a detached run, so the user's bare "sure" lands in a session that never saw the question; this file is where it is written down. One offer at a time, newest wins, expires after 180 min at read. When a yes to it would send or write, it also carries `payload_sha256` — the hash of the offered content, which `google_action.py --offer-bound` must match before acting |
 | `intentions.jsonl` | skills (`schedule_wakeup.py`) | skills (`proactive_scan.py`), dashboard (`/api/cadence`) — append-only one-shot recipes, folded by id; an optional loop anchor cancels the recipe when the loop closes |
 | `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
@@ -263,6 +275,18 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 
 Reading is unrestricted; writing is not. One writer per file is what lets two processes share the
 volume with no lock.
+
+**An interrupted graph update finishes the next time anything touches the graph.** Every write under
+`knowledge/` goes through one temp-then-`os.replace` primitive (`knowledge.write_text_atomic`), so a
+crash can never leave a person file truncated — `open(path, "w")` truncates first, and that window is
+somebody's whole memory. Single files are only half of it: a relation is stored on BOTH people, a
+merge writes the survivor and deletes the loser and repoints everyone who pointed at it, and a
+re-key renames a file every other file's edges name. Those batches write their op list to
+`knowledge/.journal.json` before touching the first file and remove it after the last;
+`knowledge_update.graph_lock()` — the critical section every writer entry point opens with — replays
+whatever it finds there first. Every journaled op is idempotent, so replaying a batch that already
+finished changes no bytes, and a journal nobody can parse is logged and cleared rather than left to
+block every future write. Nothing is said unless a repair actually happens.
 
 ### The research loop — what a spent token has to leave behind
 
@@ -329,3 +353,11 @@ from the files on disk on every apply and would otherwise ask again tomorrow.
 the receiver's live timezone change both call that reconciler; it replaces Sotto system jobs by
 parsed job id and always fences `user-*` routines. The install adapters consume the same declaration
 for their host-specific setup. See [adapters/README.md](../adapters/README.md) for its field contract.
+
+**Who runs a job is a field, not a second file.** A row marked `"runner": "receiver"` — today the
+morning and evening briefs — is never registered with Hermes; `receiver._cron_tick` fires it on the
+60s heartbeat instead, so a brief is composed and delivered down the receiver's one lane (spawn →
+outbox → deliver-once gate) and inherits its retries and receipts. Hermes' scheduler still runs the
+pulse, the watcher and the digest. The reconciler still lists the receiver-run rows among its
+REMOVAL markers, which is how an already-deployed box sheds its old Hermes brief crons on the next
+boot — the migration needs no manual step.

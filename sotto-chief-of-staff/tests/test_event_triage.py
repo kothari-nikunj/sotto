@@ -2090,3 +2090,43 @@ def test_vip_family_is_the_typed_relation_not_a_word_grep(tmp_path, monkeypatch)
         encoding="utf-8")
     assert te._is_vip("Mara Chen", "mara@kin.test", {}, {}) is True
     assert te._is_vip("Vik Rao", "vik@fund.test", {}, {}) is False
+
+
+def test_a_missed_call_keeps_its_longer_leash_past_the_message_bar(tmp_path, monkeypatch):
+    """2h old — far past EVENT_MAX_AGE_MIN, well under the missed-call ceiling → still a buzz."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    _no_llm(monkeypatch)
+    two_h_later = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    out = te.triage({"events": [_call()]}, now_local=DAY, now_utc=two_h_later)
+    assert out["verdict"] == "agent"
+    assert out["bundle"]["events"][0]["class"] == "missed_call"
+
+
+def test_a_missed_call_past_its_ceiling_queues_for_the_brief(tmp_path, monkeypatch):
+    """5h old (an overnight Mac sync): told in the digest/next brief, never rung as 'just called' —
+    the Arjun case (owner, Aug 29). held_class keeps what it was so the queue remembers."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    _no_llm(monkeypatch)
+    five_h_later = datetime(2026, 8, 6, 15, 0, tzinfo=timezone.utc)
+    out = te.triage({"events": [_call()]}, now_local=DAY, now_utc=five_h_later)
+    assert out["verdict"] != "agent"
+    q = _queue_entries(tmp_path)
+    assert q and q[0]["verdict_class"] == "stale" and q[0].get("held_class") == "missed_call"
+
+
+def test_a_fresh_missed_call_in_a_catchup_batch_still_rings(tmp_path, monkeypatch):
+    """The Mac slept through a 30-min meeting; the call 5 min ago arrives in a catchup batch —
+    catchup queues messages, but a FRESH missed call is exactly what should still ring."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    _no_llm(monkeypatch)
+    out = te.triage({"events": [_call()], "catchup": True}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "agent"
+    assert out["bundle"]["events"][0]["class"] == "missed_call"
+
+
+def test_the_missed_call_ceiling_shares_the_valve_clock():
+    """One clock: a held nudge and a stale call age out together — the doctrine the docs state."""
+    assert te.MISSED_CALL_MAX_AGE_MIN == te.VALVE_MAX_AGE_MIN

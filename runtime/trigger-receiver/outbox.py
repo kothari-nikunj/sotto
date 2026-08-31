@@ -43,6 +43,17 @@ again. The attempt is charged BEFORE the send precisely so that window is bounde
 failure this module exists to end. Every non-crash path is exactly-once: the transitions run inside
 `json_transaction`'s locked read-modify-write, so two drains cannot both deliver one row.
 
+THE DELIVER-ONCE GATE IS MACHINERY HERE, NOT A PROMPT (Aug 30, 2026). The evening brief went out
+twice — the cron lane claimed `briefs/<day>.evening.delivered` at 17:34 and delivered, and the
+wake-push lane's text still left through this outbox at 17:35, a full minute after that marker
+existed. The claim lived only in the brief SKILL.md's step 6 ("if it prints `already`, STOP"), and
+the run did not honour it. So every brief-kind row now proves OWNERSHIP of today's marker at this
+seam, right before `HOOKS["send"]`: no marker, this row atomically creates one carrying its own run
+id and sends; the marker already holds this row's run id (the run claimed, obediently), it sends;
+the marker holds anyone else's id, the row goes STATUS_SUPERSEDED — receipted, payload dropped,
+never retried, never sent. `HOOKS["brief_gate"]` is the receiver's, because the marker's path and
+which labels even have one are already its to own.
+
 EXPIRY IS PER KIND, AND REUSES THE FRESHNESS DOCTRINE THE FUNNEL ALREADY HAS — nothing new is
 invented here:
 
@@ -107,6 +118,11 @@ HOOKS = {
     "record": lambda *a, **k: None,             # receiver._record_delivery — the receipt line
     "on_delivered": lambda payload: None,       # receiver: finalize the run's chase/handoff effects
     "local_today": lambda: time.strftime("%Y-%m-%d"),   # ONE tz resolution per process
+    # (label, day, run_id) -> "send" | "superseded". THE deliver-once gate for the day's brief, asked
+    # once per attempt, right before the channel is. receiver._brief_delivery_gate: it owns the
+    # marker's path AND which labels have one (the pulse and the digest do not, and it answers
+    # "send" for them), because that path already has exactly one owner and it is not this module.
+    "brief_gate": _unwired("brief_gate"),
 }
 
 # ── The constants (this module is their one writer) ──────────────────────────────────────────────
@@ -119,8 +135,17 @@ STATUS_PENDING = "pending"
 STATUS_DELIVERED = "delivered"
 STATUS_FAILED = "failed"
 STATUS_EXPIRED = "expired"
+# The other lane already sent today's brief, so this copy never will — terminal on the first
+# attempt, never retried. Distinct from `expired` (which is about time) and from `failed` (which is
+# about the channel): nothing went wrong here, another run simply got there first.
+STATUS_SUPERSEDED = "superseded"
 
-TERMINAL = (STATUS_DELIVERED, STATUS_FAILED, STATUS_EXPIRED)
+TERMINAL = (STATUS_DELIVERED, STATUS_FAILED, STATUS_EXPIRED, STATUS_SUPERSEDED)
+
+GATE_SEND = "send"
+GATE_SUPERSEDED = "superseded"
+SUPERSEDED_DETAIL = ("today's brief was already delivered by the other lane — this copy was "
+                     "not sent")
 
 BACKOFF_BASE_SECS = 60        # first retry a minute later: a gateway restart is the common outage
 BACKOFF_MAX_SECS = 900        # …doubling, capped at the */15 cadence every other heartbeat uses
@@ -258,7 +283,7 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
 def _claim(key: str, now: float, today: str):
     """Charge one attempt and hand back what to send, or say why not. One transaction, three
     answers: `None` (nothing to do — terminal, or not due yet), `aged` (it timed out — terminal),
-    `send` (go).
+    `send` (go, with `(attempts, day)` — the brief gate needs the row's own day, not the clock's).
 
     The attempt is charged BEFORE the send, under the lock: a crash mid-send then looks exactly like
     a failed attempt (backoff already set, budget already spent) instead of an unbounded replay."""
@@ -276,7 +301,21 @@ def _claim(key: str, now: float, today: str):
             return None
         row["attempts"] = int(row.get("attempts") or 0) + 1
         row["next_at"] = now + backoff_secs(row["attempts"])
-        return ("send", dict(row.get("payload") or {}), row["attempts"])
+        return ("send", dict(row.get("payload") or {}),
+                (row["attempts"], str(row.get("day") or "")))
+
+
+def _supersede(key: str, detail: str):
+    """Close a row whose brief the other lane already delivered. Terminal like every other ending —
+    the payload leaves the file and no drain will ever claim it again."""
+    with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
+        rows = _rows(doc)
+        doc["rows"] = rows
+        row = _find(rows, key)
+        if row is None or row.get("status") != STATUS_PENDING:
+            return None
+        row["status"], row["last_error"] = STATUS_SUPERSEDED, detail[:300]
+        return _close(row)
 
 
 def _settle(key: str, ok: bool, detail: str, attempts: int):
@@ -318,7 +357,24 @@ def _attempt(key: str) -> bool:
         if state == "aged":
             _payload_receipt(payload, extra[0], extra[1])
             return False
-        attempts = extra
+        attempts, day = extra
+        label = str(payload.get("label") or "")
+        # THE DELIVER-ONCE GATE, asked before the channel is (Aug 30: the evening brief went out
+        # twice, a full minute after the winning lane's marker existed, because the gate was an
+        # INSTRUCTION in the skill and the run did not honour it). A brief-kind row now proves at
+        # this seam that it owns today's marker; one that doesn't is superseded, not sent.
+        if kind_for(label) == KIND_BRIEF:
+            # A row whose lane did not name a run falls back to its OWN id: the gate's whole
+            # question is "did this copy claim the marker?", and the row id answers it just as
+            # durably across retries as a run id would.
+            gate = str(HOOKS["brief_gate"](label, day, str(payload.get("run_id") or "") or key)
+                       or GATE_SEND)
+            if gate == GATE_SUPERSEDED:
+                closed = _supersede(key, SUPERSEDED_DETAIL)
+                if closed is not None:
+                    print(f"[sotto] {label}: superseded — {SUPERSEDED_DETAIL}", flush=True)
+                    _payload_receipt(closed, STATUS_SUPERSEDED, SUPERSEDED_DETAIL)
+                return False
         try:
             ok, detail = HOOKS["send"](payload.get("body") or "", payload.get("target") or "")
         except Exception as e:  # noqa: BLE001 — a send that raises is a send that failed
@@ -339,8 +395,7 @@ def _attempt(key: str) -> bool:
         # then not delivered is the thing this whole seam is here to make impossible to miss. What
         # is NEW is the second half of the sentence — the receipt now says whether this failure is
         # final or merely the latest attempt, so the Record can't read "failed" as "gone".
-        label = payload.get("label") or "?"
-        print(f"[sotto] {label}: delivery FAILED to {payload.get('target')} — {detail[:300]}",
+        print(f"[sotto] {label or '?'}: delivery FAILED to {payload.get('target')} — {detail[:300]}",
               flush=True)
         if state == "gave_up":
             _payload_receipt(payload, STATUS_FAILED,
@@ -360,8 +415,10 @@ def deliver(payload: dict) -> bool:
     """Enqueue this message, then try to send it. True iff the channel acknowledged it NOW; False
     means it is on file and the drain owns it from here — never that it was lost.
 
-    `payload` is {label, body, target, decision_ids, usage, effects}: everything a retry needs, so
-    the drain never has to re-run anything to deliver what was already composed."""
+    `payload` is {label, body, target, decision_ids, usage, effects, run_id}: everything a retry
+    needs, so the drain never has to re-run anything to deliver what was already composed. `run_id`
+    is the spawning run's identity — the same one its child env carries as SOTTO_DELIVERY_RUN_ID —
+    and it is what the brief gate compares against the marker."""
     label, body = str(payload.get("label") or ""), str(payload.get("body") or "")
     key = message_key(label, body)
     now, today = time.time(), str(HOOKS["local_today"]() or "")

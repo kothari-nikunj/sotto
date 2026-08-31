@@ -145,11 +145,11 @@ def _pending_dir() -> str:
     return os.path.join(_connectors_dir(), ".pending")
 
 
-def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> None:
-    """THE atomic JSON write for the whole receiver image (receiver.py, dashboard.py and calcache.py
-    reach it as CONNECTORS.write_json / HOOKS["write_json"]): tmp file at `mode`, then os.replace —
-    a crash mid-write can't corrupt the destination, and the default 0600 means the volume never
-    holds a world-readable file. Callers that want a human-diffable file pass indent=2."""
+def write_text(path: str, text: str, mode: int = 0o600) -> None:
+    """THE atomic write for the whole receiver image: tmp file at `mode`, then os.replace — a crash
+    mid-write can't corrupt the destination, and the default 0600 means the volume never holds a
+    world-readable file. write_json below is this plus a serializer; retention.py reaches it as
+    HOOKS["write_text"] to rewrite a JSONL ledger, which is lines and not a document."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # PROCESS-UNIQUE temp. `path + ".tmp"` was itself a shared mutable resource: two writers opened
     # the same scratch file, and whoever renamed first pulled it out from under the other — one of
@@ -158,7 +158,7 @@ def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> 
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=indent)
+            f.write(text)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -168,19 +168,24 @@ def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> 
         raise
 
 
+def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> None:
+    """THE atomic JSON write for the whole receiver image (receiver.py, dashboard.py and calcache.py
+    reach it as CONNECTORS.write_json / HOOKS["write_json"]). Callers that want a human-diffable
+    file pass indent=2."""
+    write_text(path, json.dumps(obj, indent=indent), mode)
+
+
 LOCK_SUFFIX = ".lock"   # MUST match _shared/lib/jsonstore.LOCK_SUFFIX — asserted by test_docs_drift
 LOCK_TIMEOUT_SECS = 10
 
 
 @contextlib.contextmanager
-def json_transaction(path: str, default=None, mode: int = 0o600, indent: int | None = None):
-    """The receiver's half of the read-modify-write lock. The skills tree owns the canonical
-    implementation (`_shared/lib/jsonstore.py`); this image cannot import it, so the protocol —
-    an advisory flock on `<path>.lock` — is what the two share. flock is an OS primitive, so two
-    implementations interoperate as long as they name the same file, and a drift test asserts they
-    do. Same copy-plus-guard posture as keys.py.
-
-    Used for `preferences.json`, the one file two processes both write."""
+def file_lock(path: str):
+    """The advisory flock on `<path>.lock` — the protocol this image shares with the skills tree's
+    `_shared/lib/jsonstore.py` (flock is an OS primitive, so the two implementations interoperate
+    as long as they name the same file; a drift test asserts they do). Held by json_transaction,
+    and by everything that appends to or rewrites a shared JSONL ledger — the retention sweep's
+    read-then-replace could otherwise swallow a line appended in between (external review, Aug 31)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lf = os.open(path + LOCK_SUFFIX, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -193,16 +198,25 @@ def json_transaction(path: str, default=None, mode: int = 0o600, indent: int | N
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"could not lock {path} within {LOCK_TIMEOUT_SECS}s")
                 time.sleep(0.02)
-        data = _read_json(path)
-        if data is None:
-            data = default if default is not None else {}
-        yield data
-        write_json(path, data, mode, indent)
+        yield
     finally:
         try:
             fcntl.flock(lf, fcntl.LOCK_UN)
         finally:
             os.close(lf)
+
+
+@contextlib.contextmanager
+def json_transaction(path: str, default=None, mode: int = 0o600, indent: int | None = None):
+    """The receiver's half of the read-modify-write lock, on the file_lock protocol above. Same
+    copy-plus-guard posture as keys.py. Used for `preferences.json` and friends — any JSON file two
+    processes both write."""
+    with file_lock(path):
+        data = _read_json(path)
+        if data is None:
+            data = default if default is not None else {}
+        yield data
+        write_json(path, data, mode, indent)
 
 
 def _read_json(path: str) -> dict | None:

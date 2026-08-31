@@ -3314,9 +3314,9 @@
   }
 
   /* receiver.py delivery.jsonl vocabulary — status: spawned | delivered | empty |
-     failed | skipped | expired, with the outbox's detail saying whether a failure
-     is the latest attempt or the last one. Deciding to send and sending are two
-     facts; this is the second one, in the words a person would use. */
+     failed | skipped | expired | superseded, with the outbox's detail saying whether
+     a failure is the latest attempt or the last one. Deciding to send and sending are
+     two facts; this is the second one, in the words a person would use. */
 
   var DELIVERY_THING = {
     brief: "your brief", digest: "the midday digest",
@@ -3336,6 +3336,8 @@
       case "empty": return "Nothing worth saying — " + thing + " stayed silent";
       case "skipped": return "Skipped " + thing + (why ? " — " + why : "");
       case "expired": return "Dropped " + thing + (why ? " — " + why : "");
+      case "superseded": return "Didn't send a second copy of " + thing +
+        (why ? " — " + why : "");
       case "failed":
         return (why.indexOf("gave up") !== -1 ? "Gave up on " : "Couldn't deliver ") +
           thing + (why ? " — " + why : "");

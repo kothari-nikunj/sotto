@@ -59,28 +59,47 @@ All of it lives under `$SOTTO_DATA` on the volume you own. Delete the directory 
 memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); this is the
 **retention** view.
 
+Two things enforce it. `forget.py` (below) deletes a named category **when you ask**. A **daily
+sweep at 3:30 AM local** — `runtime/trigger-receiver/retention.py`, fired from the receiver's own
+clock — ages out the exhaust **without being asked**, which is why the "Retention" column below is a
+number and not a hope. The sweep's table is the single source for that column; anything it does not
+name is either aged by its own writer (said so in the row) or never auto-deleted at all.
+
 | File | Contains | Retention |
 |---|---|---|
-| `knowledge/last_local_snapshot.json` | **The complete raw Bridge payload** — every message, call, note, reminder, file and contact from the last pull | **Overwritten each brief, never deleted.** The 24h TTL only stops it being *reused*, not *stored*. Delete it by hand or with `forget.py --snapshot` (below). |
-| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance | Indefinite by design — this is the memory. Superseded facts are archived, not deleted |
-| `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | Indefinite by design — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
-| `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days |
-| `briefs/*.json` · `*.payload.json` | Delivered briefs and the payload each was built from | Indefinite |
-| `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines |
-| `events/delivery.jsonl` | Whether each nudge actually landed | Rotates with the above |
+| `knowledge/last_local_snapshot.json` | **The complete raw Bridge payload** — every message, call, note, reminder, file and contact from the last pull | **Overwritten each brief, never auto-deleted.** The 24h TTL only stops it being *reused*, not *stored*. Delete it by hand or with `forget.py --snapshot` (below). |
+| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted |
+| `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
+| `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
+| `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
+| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `.claim` · `.delivered` | Delivered briefs, which loops each named, and the per-day markers | **60 days** |
+| `briefs/<date>.<kind>.payload.json` | The staged wake payload a brief was built from | **7 days** |
+| `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines, **and lines older than 90 days are dropped** |
+| `events/delivery.jsonl` | Whether each nudge actually landed | **90 days** |
+| `events/sends.jsonl` | One metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` — the hash of the exact bytes that left, never the bytes | **180 days** — the authorization trail, kept twice as long on purpose |
+| `events/drafts.jsonl` | Every draft Sotto offered you, **including its text** | **30 days** |
 | `events/outbox.json` | One row per message Sotto composed, **carrying its text only while that text might still have to be sent** | The words are dropped the moment the row closes (delivered, gave up, or aged out); the closed row — id, kind, attempts, reason — is pruned after 7 days |
-| `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; leftovers after a crash are never reused |
-| `style.json` | Verbatim samples of things **you** wrote | Per-bucket TTL, 30–90 days |
-| `outcomes.jsonl` | What you did with drafts | Indefinite |
-| `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB |
-| `cache/research_<date>.json` | Attendee research render cache | 7 days |
-| `connectors/*.json` | OAuth tokens for connected services | Until you disconnect |
-| `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, kept until you delete the files |
-| `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them |
-| `proactive/*` (incl. `pending_offer.json`) | The watcher's dedup stamps, and the one standing question Sotto last asked you (it can name a person) | Overwritten in place; the offer clears when answered |
-| `briefs/<date>.<kind>.named.json` | Which open loops that brief NAMED (so a chase isn't a double-tell) | Overwritten per brief |
+| `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; a crashed run's leftover goes at **7 days** |
+| `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
+| `style.json` | Verbatim samples of things **you** wrote | Per-bucket TTL, 30–90 days; never swept |
+| `outcomes.jsonl` | What you did with drafts | **Never auto-deleted** — the learning signal |
+| `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB, and the sweep truncates it to its **last 5 MB** — one writer bypasses the rotation, so the sweep is the ceiling that always holds |
+| `cache/research_<date>.json` | Attendee research render cache | 7 days, pruned by the research run |
+| `connectors/*.json` | OAuth tokens for connected services | Until you disconnect; never swept |
+| `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |
+| `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them; never swept |
+| `proactive/<date>.json` | The watcher's once-per-day nudge dedup stamps | **30 days** |
+| `proactive/pending_offer.json` | The one standing question Sotto last asked you (it can name a person), plus `payload_sha256` when a yes to it would send or write — the hash of the offered content, never the content | Expires 180 min after it is written, at read |
 | `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
-| `dashboard_sessions.json` · `dashboard_audit.jsonl` | Dashboard login sessions, and one line per dashboard write | Sessions expire; the audit log rotates |
+| `dashboard_sessions.json` | Dashboard login sessions | Expire on idle; pruned on every read |
+| `dashboard_audit.jsonl` | One line per dashboard write | **90 days** |
+
+**What the sweep will never delete:** `knowledge/` (the graph, `master.md`, style, outcomes, the
+continuity ledger), `corpus/`, `decks/`, `connectors/`, `config/`, `preferences.json`,
+`intentions.jsonl` and `setup_code`. That guard is checked per path, below every rule in the table,
+so a future mistake in the table still cannot reach your memory. A missed sweep — a restart, a box
+that was down — costs nothing: every rule is an age, so the next day's sweep removes exactly what
+the missed one would have.
 
 ## Deleting it — `forget.py`
 
@@ -104,6 +123,12 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 the memory — who someone is, what a company builds, what you still owe whom. Deleting *that* is a
 decision you make about your own graph, not hygiene a script performs, so it stays with the graph's
 own editor rather than a bulk tool. Nothing to delete exits 0: already clean is a success.
+
+`forget.py` and the daily sweep are two views of one answer: every family a verb above deletes is
+either swept automatically or listed in `retention.py` with the reason nothing has to (`--caches`
+and `--snapshot` are the latter — the research cache prunes its own older siblings, and the snapshot
+is overwritten by every brief). A test binds the two, so a verb that grows a new target without a
+retention answer fails the suite.
 
 **The snapshot is the one to know about.** It is the rawest, widest file Sotto keeps, it holds
 material from sources you may have since turned off, and until Aug 2026 it was absent from the

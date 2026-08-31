@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
@@ -10,6 +11,14 @@ HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("receiver", os.path.join(HERE, "receiver.py"))
 rec = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rec)
+
+
+@pytest.fixture(autouse=True)
+def _clock_outside_the_cron_windows(monkeypatch):
+    """Pin the wall clock away from both brief crons. handle_trigger now FOLDS a wake that lands
+    inside a cron's compose window instead of spawning, and a suite that passes or fails depending
+    on what time of day it is run is not a suite — the window's own tests set the hour they mean."""
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 10, 0))
 
 
 def test_unknown_type_400(tmp_path):
@@ -40,6 +49,7 @@ def test_enqueue_failure_leaves_no_delivered_flag(tmp_path, monkeypatch):
 def test_pairing_link_carries_scheme_host_token_and_setup_code(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "SETUP_CODE", "sc456")
     link = rec.pairing_link()
     assert link.startswith("sotto-bridge://pair?")
@@ -168,8 +178,10 @@ class _CronCLI:
 
 def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     """Root fix for first-night UTC briefs: boot registered the crons under UTC; when the wizard's
-    tz lands (config set succeeds, zone changed), the shared reconciler recreates every Sotto cron
-    with exactly crons.json's schedule/skill/deliver under the new zone."""
+    tz lands (config set succeeds, zone changed), the shared reconciler recreates every Hermes-run
+    Sotto cron with exactly crons.json's schedule/skill/deliver under the new zone. The two briefs
+    are NOT among them — they are receiver-run, and the tick reads the zone fresh every minute, so
+    there is nothing to re-register for them."""
     monkeypatch.setattr(rec, "SETTINGS_FILE", os.path.join(str(tmp_path), "config", "settings.json"))
     for k in ("SOTTO_TIMEZONE", "SOTTO_PROACTIVE", "SOTTO_DIGEST", "SOTTO_PROACTIVE_CRON",
               "SOTTO_CRON_DELIVER"):
@@ -179,14 +191,11 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     ok, val = rec.set_timezone("America/Los_Angeles")
     assert ok and val == "America/Los_Angeles"
     assert ["hermes", "config", "set", "timezone", "America/Los_Angeles"] in cli.calls
-    names = {"sotto-morning-brief", "sotto-evening-brief", "sotto-relationship-pulse",
-             "sotto-proactive", "sotto-midday-digest"}
+    names = {"sotto-relationship-pulse", "sotto-proactive", "sotto-midday-digest"}
     assert ["hermes", "cron", "list"] in cli.calls
     creates = {c[c.index("--name") + 1]: c for c in cli.cron("create")}
     assert set(creates) == names
     # schedules + skills mirror start.sh step 3 exactly; deliver defaults to whatsapp
-    assert creates["sotto-morning-brief"][3] == "30 6 * * *"
-    assert creates["sotto-evening-brief"][3] == "30 17 * * *"
     assert creates["sotto-relationship-pulse"][3] == "0 9 * * 1"
     assert creates["sotto-proactive"][3] == "*/15 * * * *"
     assert creates["sotto-midday-digest"][3] == "30 12 * * *"
@@ -348,6 +357,7 @@ def test_setup_status_shape(tmp_path, monkeypatch):
 def test_setup_page_renders(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "google_connected", lambda: (False, "nope"))
     page = rec._setup_page()
     assert "What Sotto connects to" in page and "sotto-bridge://pair?" in page
@@ -361,6 +371,7 @@ def test_setup_page_shares_the_app_shell(monkeypatch):
     Integrations marked current), and carries no inline <style> blocks or style= attributes."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "google_connected", lambda: (False, "nope"))
     page = rec._setup_page("abc")
     # both stylesheets, app.css first
@@ -392,6 +403,7 @@ def test_setup_page_pairing_not_ready_without_domain_or_token(monkeypatch):
     # domain missing, token present → only the domain half is named
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     page = rec._setup_page()
     assert "sotto-bridge://pair" not in page
     assert "Pairing isn't ready" in page and "RAILWAY.md" in page
@@ -399,6 +411,7 @@ def test_setup_page_pairing_not_ready_without_domain_or_token(monkeypatch):
     # token missing, domain present → BRIDGE_TOKEN is named
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "")
     page = rec._setup_page()
     assert "sotto-bridge://pair" not in page and "BRIDGE_TOKEN" in page
     # both missing → both named
@@ -408,6 +421,7 @@ def test_setup_page_pairing_not_ready_without_domain_or_token(monkeypatch):
     # both present → the real pairing link is back, no warning
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     page = rec._setup_page()
     assert "sotto-bridge://pair?" in page and "Pairing isn't ready" not in page
 
@@ -418,6 +432,7 @@ def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
     WhatsApp. Tile 5 (optional services) never gates it."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     st = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
           "google_client_present": True, "timezone": "America/Los_Angeles", "whatsapp": "linked"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
@@ -444,6 +459,7 @@ def test_setup_page_completion_follows_the_delivery_channel(monkeypatch):
     Telegram user's wizard can finish without ever scanning a QR."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     st = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
           "google_client_present": True, "timezone": "America/Los_Angeles", "whatsapp": "unknown"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
@@ -477,6 +493,7 @@ def test_setup_page_whatsapp_tile_states(monkeypatch):
     QR button and the 'to do' state (it must not read as finished)."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     st = {"bridge_connected": False, "google_connected": False, "google_detail": "nope",
           "google_client_present": False, "timezone": "", "whatsapp": "linked"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
@@ -496,6 +513,7 @@ def test_setup_page_google_box_has_the_full_recipe(monkeypatch):
     fresh Google Cloud project at 'Save client' with a client that can't authorize."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "setup_status", lambda: {
         "bridge_connected": False, "google_connected": False, "google_detail": "nope",
         "google_client_present": False, "timezone": "", "whatsapp": "unknown"})
@@ -609,6 +627,92 @@ def test_wake_after_delivered_folds_payload_into_snapshot(tmp_path, monkeypatch)
     assert len(seeded) == 1
 
 
+# ── the cron-compose window (Aug 30: the wake-push burned a duplicate compose) ───────────────────
+# The Mac woke at 17:31, one minute into the 17:30 evening cron's compose. No `.delivered` marker
+# existed yet (the cron claims just before it SENDS), so the trigger spawned a second full brief —
+# three to five minutes and real tokens for words that must never be sent. A wake this close behind
+# the cron now presumes that run is in flight and folds into the snapshot instead.
+
+def _wake_fixture(tmp_path, monkeypatch):
+    """The trigger's spawn + seed seams, both recorded; the seed runs inline so nothing races."""
+    rec.DATA = str(tmp_path)
+    calls, seeded = [], []
+    monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
+    monkeypatch.setattr(rec, "_seed_snapshot_from", lambda p: seeded.append(p))
+
+    class SyncThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self._target, self._args = target, args
+        def start(self):
+            self._target(*self._args)
+    monkeypatch.setattr(rec.threading, "Thread", SyncThread)
+    return calls, seeded
+
+
+_WAKE = {"type": "evening_ready", "date": "2026-08-30",
+         "local_data": {"contacts": [{"name": "Ali Panju"}]}}
+
+
+def test_a_wake_inside_the_cron_window_folds_instead_of_composing_again(tmp_path, monkeypatch):
+    """Three minutes past 17:30 with no marker yet: the cron run is composing, so this wake stages
+    and folds its payload exactly like an already-delivered day and spawns nothing."""
+    calls, seeded = _wake_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 17, 33))
+    code, r = rec.handle_trigger(dict(_WAKE))
+    assert (code, r["status"], r.get("snapshot")) == (200, "cron_window", "seeding")
+    assert calls == [], "a second compose is exactly what the window exists to prevent"
+    payload = os.path.join(str(tmp_path), "briefs", "2026-08-30.evening_ready.payload.json")
+    assert seeded == [payload]
+    with open(payload, encoding="utf-8") as f:
+        assert json.load(f)["contacts"][0]["name"] == "Ali Panju"
+    rows = [x for x in _delivery_rows(tmp_path) if x["label"].startswith("brief:")]
+    assert [x["status"] for x in rows] == ["skipped"]
+    assert "still composing" in rows[0]["detail"]
+    # …and the day's claim was never taken, so a later wake outside the window can still retry
+    assert not os.path.exists(os.path.join(str(tmp_path), "briefs", "2026-08-30.evening.claim"))
+
+
+def test_a_wake_outside_the_cron_window_spawns_exactly_as_today(tmp_path, monkeypatch):
+    """Fifteen minutes past 17:30 with no marker is a cron that did NOT deliver — the wake-push is
+    the whole reason the brief still arrives, so nothing about it changes."""
+    calls, seeded = _wake_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 17, 45))
+    code, r = rec.handle_trigger(dict(_WAKE))
+    assert (code, r["status"]) == (202, "enqueued")
+    assert [s for s, _ in calls] == ["sotto-evening-brief"] and seeded == []
+
+
+def test_an_unreadable_schedule_leaves_the_window_guard_out_of_the_way(tmp_path, monkeypatch):
+    """Fail-open, the posture every gate in this file takes: if we cannot read when the cron fires,
+    we cannot presume it is running, so the wake spawns exactly as it did before the guard existed."""
+    calls, _ = _wake_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 17, 33))
+    monkeypatch.setenv("SOTTO_CRONS_JSON", str(tmp_path / "nope.json"))
+    assert rec._in_brief_cron_window("sotto-evening-brief") is False
+    code, r = rec.handle_trigger(dict(_WAKE))
+    assert (code, r["status"]) == (202, "enqueued") and len(calls) == 1
+
+
+def test_the_window_reads_the_one_schedule_source(tmp_path, monkeypatch):
+    """crons.json IS the schedule (CLAUDE.md) — the window is measured from the file, never from a
+    time written down twice, and only for the fixed daily shape those brief entries use."""
+    spec_path = tmp_path / "crons.json"
+    with open(spec_path, "w", encoding="utf-8") as f:
+        json.dump([{"name": "sotto-evening-brief", "schedule": "45 20 * * *",
+                    "prompt": "p", "skill": "sotto-evening-brief"},
+                   {"name": "sotto-morning-brief", "schedule": "*/15 * * * *",
+                    "prompt": "p", "skill": "sotto-morning-brief"}], f)
+    monkeypatch.setenv("SOTTO_CRONS_JSON", str(spec_path))
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 48))
+    assert rec._in_brief_cron_window("sotto-evening-brief") is True
+    assert rec._in_brief_cron_window("sotto-morning-brief") is False   # not the daily shape
+    edge = rec.BRIEF_CRON_WINDOW_MIN
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 45 + edge))
+    assert rec._in_brief_cron_window("sotto-evening-brief") is False   # the window is half-open
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 44))
+    assert rec._in_brief_cron_window("sotto-evening-brief") is False   # before it fired
+
+
 def test_seed_snapshot_from_wire_format(tmp_path, monkeypatch):
     """_seed_snapshot_from's subprocess line is a wire format: THIS interpreter, compose_brief.py's
     real path, --seed-snapshot <payload>, SOTTO_DATA pointing at the receiver's volume. Pin it so a
@@ -652,6 +756,7 @@ def test_setup_code_generated_and_persisted(tmp_path, monkeypatch):
 def test_setup_pages_carry_the_code_between_wizard_pages(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     # client present but not yet authorized → the wizard shows the /google/auth link
     monkeypatch.setattr(rec, "setup_status", lambda: {
         "bridge_connected": False, "google_connected": False, "google_detail": "nope",
@@ -685,7 +790,7 @@ def test_setup_surface_gating_over_http(tmp_path, monkeypatch):
     r2.DATA = str(tmp_path)
     r2.SETTINGS_FILE = os.path.join(str(tmp_path), "config", "settings.json")
     r2.SETUP_CODE = "sekrit-code-123"
-    r2.MCP_TOKEN = "bearer-tok"
+    r2.MCP_TOKEN = r2.RELAY_TOKEN = "bearer-tok"
     r2.TOKEN = "bearer-tok"
     r2.RAILWAY_DOMAIN = "myapp.up.railway.app"
 
@@ -788,7 +893,7 @@ def test_the_setup_surface_is_defended_like_the_dashboard(tmp_path, monkeypatch)
     r2.DATA = str(tmp_path)
     r2.SETTINGS_FILE = os.path.join(str(tmp_path), "config", "settings.json")
     r2.SETUP_CODE = "sekrit-code-123"
-    r2.MCP_TOKEN = r2.TOKEN = "bearer-tok"
+    r2.MCP_TOKEN = r2.RELAY_TOKEN = r2.TOKEN = "bearer-tok"
     r2.RAILWAY_DOMAIN = "myapp.up.railway.app"
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), r2.Handler)
@@ -871,12 +976,14 @@ def test_trigger_token_falls_back_to_bridge_token(monkeypatch):
     # Wake-push is on by default and authenticates with the Bridge token, so with only
     # SOTTO_MCP_TOKEN (= BRIDGE_TOKEN) set, /sotto/trigger must accept it — no silent 401s.
     m = _fresh_module(monkeypatch, {"SOTTO_MCP_TOKEN": "bridge-tok"})
-    assert m.TOKEN == "bridge-tok" and m.MCP_TOKEN == "bridge-tok"
+    assert m.TOKEN == "bridge-tok" and m.RELAY_TOKEN == "bridge-tok"
+    # /mcp takes the DERIVED bearer, never the root — Hermes must not hold the trust anchor.
+    assert m.MCP_TOKEN == m.derive_mcp_token("bridge-tok") and m.MCP_TOKEN != "bridge-tok"
 
 
 def test_dedicated_trigger_token_still_wins(monkeypatch):
     m = _fresh_module(monkeypatch, {"SOTTO_MCP_TOKEN": "bridge-tok", "SOTTO_TRIGGER_TOKEN": "trig-tok"})
-    assert m.TOKEN == "trig-tok" and m.MCP_TOKEN == "bridge-tok"
+    assert m.TOKEN == "trig-tok" and m.RELAY_TOKEN == "bridge-tok"
 
 
 # ── Event-driven proactive wake (Phase 2b) ───────────────────────────────────────────────────────
@@ -977,7 +1084,7 @@ def test_proactive_wake_requires_the_trigger_token(tmp_path, monkeypatch):
     spec2.loader.exec_module(r2)
     r2.DATA = str(tmp_path)
     r2.TOKEN = "trig-tok"
-    r2.MCP_TOKEN = "trig-tok"
+    r2.MCP_TOKEN = r2.RELAY_TOKEN = "trig-tok"
     spawned = []
     r2.run_proactive_skill = lambda: spawned.append(1)
 
@@ -1180,7 +1287,7 @@ def test_bridge_events_requires_mcp_bearer_and_rejects_bad_json(tmp_path):
     r2 = _il.module_from_spec(spec2)
     spec2.loader.exec_module(r2)
     r2.DATA = str(tmp_path)
-    r2.MCP_TOKEN = "ev-tok"
+    r2.MCP_TOKEN = r2.RELAY_TOKEN = "ev-tok"
     r2.TOKEN = "trig-tok"
     triaged = []
     r2.run_triage = lambda evs, c: (triaged.append(evs), {"verdict": "queue", "reason": "r", "bundle": {}})[1]
@@ -1283,6 +1390,7 @@ def test_setup_page_shows_last_event_only_when_bridge_connected(tmp_path, monkey
     rec.DATA = str(tmp_path)
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     st = {"bridge_connected": True, "google_connected": False, "google_detail": "nope",
           "google_client_present": False, "timezone": "", "whatsapp": "unknown"}
     monkeypatch.setattr(rec, "setup_status", lambda: st)
@@ -1299,6 +1407,7 @@ def test_setup_page_connector_tile_downgrades_to_reconnect(tmp_path, monkeypatch
     rec.DATA = str(tmp_path)
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "setup_status", lambda: {
         "bridge_connected": False, "google_connected": False, "google_detail": "nope",
         "google_client_present": False, "timezone": "", "whatsapp": "unknown"})
@@ -1324,6 +1433,7 @@ def test_connector_expired_without_refresh_downgrades(tmp_path, monkeypatch):
     rec.DATA = str(tmp_path)
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "x.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     monkeypatch.setattr(rec, "setup_status", lambda: {
         "bridge_connected": False, "google_connected": False, "google_detail": "nope",
         "google_client_present": False, "timezone": "", "whatsapp": "unknown"})
@@ -1366,7 +1476,7 @@ def test_root_page_and_favicon(tmp_path):
     spec2.loader.exec_module(r2)
     r2.DATA = str(tmp_path)
     r2.SETUP_CODE = "sekrit-root-1"
-    r2.MCP_TOKEN = "tok"
+    r2.MCP_TOKEN = r2.RELAY_TOKEN = "tok"
     r2.TOKEN = "tok"
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), r2.Handler)
@@ -2139,6 +2249,7 @@ def test_setup_page_flags_an_available_update_and_the_hermes_pair(monkeypatch):
     page, in the existing type tokens, pointing at RAILWAY.md § Staying updated."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     base = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
             "google_client_present": True, "timezone": "Europe/Paris", "whatsapp": "linked"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(
@@ -2237,6 +2348,210 @@ def test_run_dashboard_job_fires_the_crons_json_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DIGEST", "0")
     assert rec._run_dashboard_job("sotto-midday-digest")["error"] == "unknown"
     assert len(calls) == 1
+
+
+# ── The receiver's own cron: ONE delivery lane for the briefs ─────────────────────────────────────
+
+def _cron_spec(tmp_path, monkeypatch, rows):
+    """Point the receiver at a crons.json of our own, with the tick's process memory wiped."""
+    path = tmp_path / "crons.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    monkeypatch.setenv("SOTTO_CRONS_JSON", str(path))
+    monkeypatch.setattr(rec, "_CRON_FIRED", {})
+    monkeypatch.setattr(rec, "_CRON_UNPARSED", set())
+
+
+def _cron_fires(monkeypatch):
+    """Record what the tick spawns, at the one seam a skill is ever started from."""
+    fired = []
+    monkeypatch.setattr(rec, "_spawn_and_deliver",
+                        lambda runner, prompt, label: fired.append((label, prompt)))
+    return fired
+
+
+BRIEF_ROW = {"name": "sotto-morning-brief", "schedule": "30 6 * * *",
+             "prompt": "Run my morning brief", "skill": "sotto-morning-brief",
+             "runner": "receiver"}
+HERMES_ROW = {"name": "sotto-relationship-pulse", "schedule": "30 6 * * 1",
+              "prompt": "Run my relationship pulse", "skill": "sotto-relationship-pulse"}
+
+
+def test_the_cron_tick_fires_a_receiver_run_job_at_its_minute(tmp_path, monkeypatch):
+    """The single delivery lane: crons.json still owns the schedule, but a `runner: receiver` job
+    fires HERE — through the same spawn seam every other lane uses, so it lands in the outbox with
+    retries and a receipt instead of being delivered in-Hermes with neither."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW, HERMES_ROW])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 29))
+    rec._cron_tick()
+    assert fired == [], "a minute early is not the minute"
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
+    rec._cron_tick()
+    assert fired == [("cron:sotto-morning-brief", "Run my morning brief")]
+    # the pulse is Hermes' job even when its minute matches: the receiver fires only its own rows
+    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+
+
+def test_the_cron_tick_fires_once_a_day_however_often_it_ticks(tmp_path, monkeypatch):
+    """The window is minutes wide and the heartbeat is a minute long, so the in-memory map is the
+    first line: one fire per job per local day. The deliver-once marker is the real guarantee — a
+    restart mid-window re-fires and the gate supersedes that copy — but nothing should NEED it."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
+    fired = _cron_fires(monkeypatch)
+    for minute in range(30, 40):
+        monkeypatch.setattr(rec, "_local_now", lambda m=minute: datetime(2026, 8, 31, 6, m))
+        rec._cron_tick()
+    assert len(fired) == 1
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 1, 6, 30))
+    rec._cron_tick()
+    assert len(fired) == 2, "tomorrow is a new brief"
+
+
+def test_the_cron_tick_never_fires_outside_the_window(tmp_path, monkeypatch):
+    """A boot at noon must not deliver the 6:30 brief. The catch-up window is the SAME one a
+    wake-push folds into (BRIEF_CRON_WINDOW_MIN), so a restart inside it still gets the day's brief
+    out and a restart hours later leaves it to the wake-push lane."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
+    fired = _cron_fires(monkeypatch)
+    for at in (datetime(2026, 8, 31, 6, 40), datetime(2026, 8, 31, 12, 0),
+               datetime(2026, 8, 31, 6, 20)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._cron_tick()
+    assert fired == []
+    # …and the window guard the wake-push consults is that same statement, one parser
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 39))
+    assert rec._in_brief_cron_window("sotto-morning-brief") is True
+    assert rec._fires_now("30 6 * * *") is True
+
+
+def test_the_cron_tick_honors_the_gate_and_the_schedule_override(tmp_path, monkeypatch):
+    """Same env keys as every other registrar, because it is the same reader: a gated-off job is not
+    in the list at all, and `schedule_env` moves the minute the tick fires at."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [
+        {**BRIEF_ROW, "gate": "SOTTO_MORNING", "schedule_env": "SOTTO_MORNING_CRON"}])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setenv("SOTTO_MORNING", "0")
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
+    rec._cron_tick()
+    assert fired == [], "a job this deploy turned off must never fire"
+    monkeypatch.setenv("SOTTO_MORNING", "1")
+    monkeypatch.setenv("SOTTO_MORNING_CRON", "15 7 * * *")
+    rec._cron_tick()
+    assert fired == [], "6:30 is no longer this job's minute"
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 7, 15))
+    rec._cron_tick()
+    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+
+
+def test_a_schedule_the_tick_cannot_read_is_skipped_and_said_once(tmp_path, monkeypatch, capsys):
+    """The receiver runs fixed daily jobs only. Anything else is left unfired with ONE log line —
+    not a crash that would take the heartbeat, and not a line every minute forever."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [{**BRIEF_ROW, "schedule": "*/15 * * * *"}])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
+    rec._cron_tick()
+    rec._cron_tick()
+    assert fired == []
+    said = [line for line in capsys.readouterr().out.splitlines() if "sotto-morning-brief" in line]
+    assert len(said) == 1 and "fixed daily" in said[0]
+
+
+def test_a_cron_fired_brief_is_gated_exactly_like_every_other_brief(tmp_path, monkeypatch):
+    """The label names the lane honestly and the gate still recognises the brief: `cron:` is parsed
+    by the same last-segment rule `brief:` and `run-now:` are, so the day's marker is shared and a
+    cron fire can never double-deliver alongside a wake-push."""
+    rec.DATA = str(tmp_path)
+    assert rec.OUTBOX.kind_for("cron:sotto-morning-brief") == rec.OUTBOX.KIND_BRIEF
+    day = rec.DASHBOARD._local_today()
+    assert rec._brief_delivery_gate("cron:sotto-morning-brief", day, "cron-run") \
+        == rec.OUTBOX.GATE_SEND
+    assert _marker(tmp_path, "morning") == "cron-run"
+    assert rec._brief_delivery_gate("brief:sotto-morning-brief", day, "wake-run") \
+        == rec.OUTBOX.GATE_SUPERSEDED
+
+
+# ── the retention sweep rides the same clock (external review finding #5) ────────────────────────
+
+def _sweeps(monkeypatch):
+    """Record each sweep instead of touching the volume — this is the SCHEDULER's test; what the
+    sweep does to files is test_retention.py's."""
+    ran = []
+    monkeypatch.setattr(rec.RETENTION, "sweep",
+                        lambda *a, **k: ran.append(1) or {"count": 0, "errors": []})
+    return ran
+
+
+def test_the_retention_sweep_fires_once_per_local_day(tmp_path, monkeypatch):
+    """Same fired-today stamp the cron tick uses, so a minute-resolution heartbeat inside the
+    window sweeps once, not sixty times."""
+    rec.DATA = str(tmp_path)
+    rec._RETENTION_FIRED.clear()
+    ran = _sweeps(monkeypatch)
+    hour, minute = rec.RETENTION.SWEEP_LOCAL
+    for at in (datetime(2026, 8, 31, hour, minute), datetime(2026, 8, 31, hour, minute + 1),
+               datetime(2026, 8, 31, hour, minute + 2)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._retention_tick()
+    assert len(ran) == 1
+    # …and tomorrow it sweeps again
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 1, hour, minute))
+    rec._retention_tick()
+    assert len(ran) == 2
+
+
+def test_the_retention_sweep_never_fires_outside_its_minute(tmp_path, monkeypatch):
+    """A box that is up all day sweeps at retention.SWEEP_LOCAL and at no other hour."""
+    rec.DATA = str(tmp_path)
+    rec._RETENTION_FIRED.clear()
+    ran = _sweeps(monkeypatch)
+    hour, minute = rec.RETENTION.SWEEP_LOCAL
+    for at in (datetime(2026, 8, 31, 6, 30), datetime(2026, 8, 31, 12, 0),
+               datetime(2026, 8, 31, hour - 1, minute), datetime(2026, 8, 31, hour, minute - 1)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._retention_tick()
+    assert ran == []
+
+
+def test_a_missed_sweep_day_self_heals(tmp_path, monkeypatch):
+    """A box that was down through the window loses nothing: every policy is an AGE, so the next
+    day's sweep removes what that day's would have plus one more day's worth."""
+    rec.DATA = str(tmp_path)
+    rec._RETENTION_FIRED.clear()
+    hour, minute = rec.RETENTION.SWEEP_LOCAL
+    old = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 300 * 86400))
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    marker = os.path.join(str(tmp_path), "briefs", f"{old}.morning.delivered")
+    open(marker, "w").close()
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, hour, minute))
+    rec._retention_tick()
+    assert not os.path.exists(marker)
+
+
+def test_a_failing_sweep_never_takes_the_cron_thread(tmp_path, monkeypatch, capsys):
+    """The tick's own try in start_cron_thread is the backstop; the sweep's per-entry posture is
+    the first one. Retention must never cost a brief."""
+    rec.DATA = str(tmp_path)
+    rec._RETENTION_FIRED.clear()
+    monkeypatch.setattr(rec.RETENTION, "sweep",
+                        lambda *a, **k: {"count": 0, "errors": [{"path": "events/x.jsonl",
+                                                                 "error": "OSError: nope"}]})
+    hour, minute = rec.RETENTION.SWEEP_LOCAL
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, hour, minute))
+    rec._retention_tick()
+    assert "events/x.jsonl" in capsys.readouterr().out
+
+
+def test_retention_hooks_are_wired_to_the_receivers_own_writers():
+    """retention.py never imports the receiver: the volume root and the atomic write arrive as
+    HOOKS, exactly like the outbox's."""
+    assert rec.RETENTION.HOOKS["data_root"]() == rec.DATA
+    assert rec.RETENTION.HOOKS["write_text"] is not None
+    assert rec.CONNECTORS.write_text is not None
 
 
 def test_run_dashboard_job_reports_a_failed_spawn(tmp_path, monkeypatch):
@@ -2531,8 +2846,7 @@ def test_spawn_argv_survives_a_real_argparse_hermes(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_SPAWN_TOOLSETS", "sotto-local")
     delivered = []
     monkeypatch.setattr(rec, "_deliver_text",
-                        lambda text, label, usage=None, decision_ids=None, effects=None:
-                        (delivered.append(text), True)[1])
+                        lambda text, label, **kw: (delivered.append(text), True)[1])
     _run_oneshot(rec, [fake, "-z"])
     rows = _delivery_rows(tmp_path)
     assert [r["status"] for r in rows] == ["spawned"], rows   # delivery stubbed → only the spawn row
@@ -2889,6 +3203,7 @@ def test_every_lane_lands_under_the_kind_that_governs_its_expiry(tmp_path):
     """The label the seam already carries is what decides which clock a message waits on."""
     for label, kind in (("brief:sotto-morning-brief", "brief"),
                         ("brief:sotto-evening-brief", "brief"),
+                        ("cron:sotto-morning-brief", "brief"),
                         ("run-now:sotto-relationship-pulse", "brief"),
                         ("run-now:sotto-midday-digest", "digest"),
                         ("event", "nudge"), ("proactive", "nudge"),
@@ -2963,3 +3278,244 @@ def test_terminal_rows_are_pruned_but_pending_ones_never_are(tmp_path, monkeypat
     kept = _outbox_rows(tmp_path)
     assert [r["status"] for r in kept] == ["pending"]
     assert kept[0]["payload"]["body"] == "still trying"
+
+
+def test_machine_markers_never_leave_the_box(monkeypatch):
+    """The composer emits <!--id:…--> / <!--meeting:…--> plumbing for the dashboard and tap links,
+    and to_chat strips it — but the spawned run chooses which artifact it prints, and one Hermes
+    upgrade was enough for a run to print the marker-laden markdown (Aug 28: an evening brief
+    arrived with every id inline). The send seam enforces the strip regardless of what was printed."""
+    sent = _channel(monkeypatch)
+    text = ("Alex Cohen<!--id:195@lid|ch:whatsapp--> - asked about the round.\n\n"
+            "<!--meeting:event_id:abc|title:Sync|start:2026-08-29T12:30:00-07:00-->\n\n"
+            "Tomorrow: 12:30 PM - Sync")
+    assert rec._deliver_text(text, "brief:sotto-evening-brief") is True
+    body = sent[0]["body"]
+    assert "<!--" not in body and "-->" not in body
+    assert "Alex Cohen - asked about the round." in body
+    assert "Tomorrow: 12:30 PM - Sync" in body
+    assert "\n\n\n" not in body  # removed marker lines don't leave triple blanks behind
+
+
+def test_a_text_that_was_only_markers_is_an_empty_run(monkeypatch):
+    """All plumbing, no words: the honest receipt is 'empty', never a delivered blank."""
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("<!--meeting:event_id:abc|title:X-->\n<!--id:a@b|ch:email-->", "event") is False
+    assert sent == []
+
+
+# ── the deliver-once gate AT THE SEND SEAM (Aug 30: the evening brief went out twice) ────────────
+# The 17:30 cron run claimed briefs/2026-08-30.evening.delivered at 17:34 and delivered in-Hermes;
+# the wake-push run spawned at 17:31 sent its own composition through this outbox at 17:35 — a full
+# minute AFTER that marker existed. The gate was an instruction in the skill's step 6 ("if it prints
+# `already`, STOP") and the run did not honour it. Deliver-once is therefore machinery here now: a
+# brief-kind row proves it owns today's marker before the channel is ever asked.
+
+def _marker(tmp_path, kind, content=None):
+    """The day's deliver-once marker, read or planted — the same path brief_marker.py writes."""
+    path = os.path.join(str(tmp_path), "briefs",
+                        f"{rec.DASHBOARD._local_today()}.{kind}.delivered")
+    if content is None:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+
+def test_the_send_seam_claims_the_marker_when_no_lane_did(tmp_path, monkeypatch):
+    """A run that forgot its own claim is not trusted to have one: the seam claims for it, stamping
+    the run's id, and only then sends. The claim is atomic (O_EXCL), so it is a real claim."""
+    rec.DATA = str(tmp_path)
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("your evening brief", "brief:sotto-evening-brief",
+                             run_id="run-a") is True
+    assert [s["body"] for s in sent] == ["your evening brief"]
+    assert _marker(tmp_path, "evening") == "run-a"
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["delivered"]
+
+
+def test_a_run_that_claimed_properly_still_sends(tmp_path, monkeypatch):
+    """The obedient path is untouched: the run claimed in step 6, the marker carries ITS id, and the
+    seam recognises its own and gets out of the way."""
+    rec.DATA = str(tmp_path)
+    _marker(tmp_path, "morning", "run-b")
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("your morning brief", "brief:sotto-morning-brief",
+                             run_id="run-b") is True
+    assert len(sent) == 1
+    assert [r["status"] for r in _outbox_rows(tmp_path)] == ["delivered"]
+
+
+def test_a_brief_the_other_lane_already_delivered_is_superseded_never_sent(tmp_path, monkeypatch):
+    """THE incident, in one assertion: the marker is held by another run, so this composition never
+    reaches the channel. It is receipted in plain English, stripped of its words, and terminal —
+    no drain will ever pick it up again."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    _marker(tmp_path, "evening", "the-cron-run")
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("a second evening brief", "brief:sotto-evening-brief",
+                             run_id="the-wake-run") is False
+    assert sent == [], "the seam let a duplicate brief through"
+    (row,) = _outbox_rows(tmp_path)
+    assert row["status"] == "superseded"
+    assert row["payload"] == {"label": "brief:sotto-evening-brief"}   # the words are gone
+    assert "already delivered by the other lane" in row["last_error"]
+    receipt = _delivery_rows(tmp_path)[-1]
+    assert receipt["status"] == "superseded"
+    assert "was not sent" in receipt["detail"]
+    # terminal means terminal: however many drains run over it, nothing is ever attempted
+    assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0}
+    assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0} and sent == []
+    assert _marker(tmp_path, "evening") == "the-cron-run", "the winner's claim is never overwritten"
+
+
+def test_the_incident_replay_two_compositions_one_delivery(tmp_path, monkeypatch):
+    """Two runs, one day, one kind, two different texts — 17:34 and 17:35:31. Whichever reaches the
+    seam first claims and sends; the other is superseded. Exactly one brief leaves the box."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("the 17:34 brief", "brief:sotto-evening-brief",
+                             run_id="cron-run") is True
+    assert rec._deliver_text("a different 17:35 brief", "brief:sotto-evening-brief",
+                             run_id="wake-run") is False
+    assert [s["body"] for s in sent] == ["the 17:34 brief"]
+    assert sorted(r["status"] for r in _outbox_rows(tmp_path)) == ["delivered", "superseded"]
+    assert _marker(tmp_path, "evening") == "cron-run"
+
+
+def test_the_gate_only_governs_the_two_briefs_that_have_a_marker(tmp_path, monkeypatch):
+    """The weekly pulse and the midday digest are brief-kind for EXPIRY but have no deliver-once
+    marker, and nudges never touch it — none of them may be gated by one, or a Monday pulse would
+    vanish behind Monday's morning brief."""
+    rec.DATA = str(tmp_path)
+    _marker(tmp_path, "morning", "someone-else")
+    _marker(tmp_path, "evening", "someone-else")
+    sent = _channel(monkeypatch)
+    for label in ("run-now:sotto-relationship-pulse", "run-now:sotto-midday-digest",
+                  "event", "proactive"):
+        assert rec._deliver_text(f"{label} body", label) is True, label
+    assert len(sent) == 4
+    assert all(r["status"] == "delivered" for r in _outbox_rows(tmp_path))
+    # …and the dashboard's run-now and the receiver's own cron ARE the same brief, so both ARE gated
+    assert rec._deliver_text("run it now", "run-now:sotto-evening-brief") is False
+    assert rec._deliver_text("the 17:30 brief", "cron:sotto-evening-brief") is False
+    assert len(sent) == 4
+
+
+def test_the_gate_fails_open_when_the_marker_cannot_be_read(tmp_path, monkeypatch):
+    """Same posture as brief_marker.claim itself: a volume that won't answer must never silence the
+    day's brief. A rare duplicate beats a missing one."""
+    rec.DATA = str(tmp_path)
+    open(os.path.join(str(tmp_path), "briefs"), "w").close()   # briefs/ can never be created
+    sent = _channel(monkeypatch)
+    assert rec._deliver_text("your evening brief", "brief:sotto-evening-brief",
+                             run_id="run-c") is True
+    assert len(sent) == 1
+
+
+# ── The Bridge trust boundary: root and derived bearers do not cross lanes ────────────────────────
+
+def test_the_mcp_lane_and_the_bridge_lanes_take_different_bearers(tmp_path):
+    """Hermes talks to prompt-injectable content, so it holds only HMAC(root, "sotto-mcp") — good
+    for /mcp and nothing else. The root (what the pairing link hands the Mac) works the Bridge
+    lanes and is REFUSED on /mcp, which is what makes the boundary real."""
+    import urllib.error as _ue
+    import urllib.request as _u
+    from http.server import ThreadingHTTPServer
+
+    import importlib.util as _il
+    spec2 = _il.spec_from_file_location("receiver_tb", os.path.join(HERE, "receiver.py"))
+    r2 = _il.module_from_spec(spec2)
+    spec2.loader.exec_module(r2)
+    r2.DATA = str(tmp_path)
+    r2.RELAY_TOKEN = "root-tok"
+    r2.MCP_TOKEN = r2.derive_mcp_token("root-tok")
+    r2.TOKEN = "root-tok"
+    r2.run_triage = lambda evs, c: {"verdict": "drop", "reason": "r", "bundle": {}}
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), r2.Handler)
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def post(path, token):
+        req = _u.Request(base + path, data=b"{}",
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": f"Bearer {token}"}, method="POST")
+        try:
+            with _u.urlopen(req, timeout=10) as resp:
+                return resp.status
+        except _ue.HTTPError as e:
+            return e.code
+    try:
+        assert post("/mcp", "root-tok") == 401              # the root must NOT work where Hermes talks
+        assert post("/mcp", r2.MCP_TOKEN) != 401            # the derived bearer is what /mcp accepts
+        assert post("/bridge/events", r2.MCP_TOKEN) == 401  # …and it cannot act as the Bridge
+        assert post("/bridge/events", "root-tok") != 401
+    finally:
+        srv.shutdown()
+
+
+def test_mcp_token_derivation_matches_configure_mcp():
+    """One derivation, two languages' worth of callers: receiver.derive_mcp_token (what /mcp
+    accepts) and configure_mcp.derive_mcp_token (what Hermes is handed) must agree byte for byte."""
+    import importlib.util as _il
+    spec = _il.spec_from_file_location(
+        "configure_mcp", os.path.join(HERE, "..", "..", "adapters", "hermes", "configure_mcp.py"))
+    cm = _il.module_from_spec(spec)
+    spec.loader.exec_module(cm)
+    assert rec.derive_mcp_token("s3cret") == cm.derive_mcp_token("s3cret")
+    assert rec.derive_mcp_token("s3cret") != "s3cret"       # one-way: never the root itself
+    assert rec.derive_mcp_token("") == ""                   # unset stays unset — routes stay closed
+
+
+# ── The second reviewer's boundary misses (Aug 31) ────────────────────────────────────────────────
+
+def test_a_failed_spawn_does_not_burn_the_whole_day(tmp_path, monkeypatch):
+    """A spawn that fails must retry on the next tick — the window bounds that to a handful of
+    attempts. Stamping the day on a failure silenced the brief until tomorrow."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 31))
+    boom = {"on": True}
+
+    def _spawn(runner, prompt, label):
+        if boom["on"]:
+            raise OSError("hermes not found")
+
+    monkeypatch.setattr(rec, "_spawn_and_deliver", _spawn)
+    rec._cron_tick()
+    assert rec._CRON_FIRED == {}, "a failed spawn is not a fire"
+    boom["on"] = False
+    rec._cron_tick()
+    assert rec._CRON_FIRED == {"sotto-morning-brief": "2026-08-31"}
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_the_cron_thread_ticks_before_it_first_sleeps(monkeypatch):
+    """The fire window is BRIEF_CRON_WINDOW_MIN wide; a boot in its last minute that slept first
+    would fall off the edge and miss the day's brief. (The SystemExit from the sleep stub is this
+    test's kill switch for the loop, hence the filtered warning.)"""
+    order = []
+    monkeypatch.setattr(rec, "_cron_tick", lambda: order.append("tick"))
+    monkeypatch.setattr(rec.time, "sleep",
+                        lambda _s: order.append("sleep") or (_ for _ in ()).throw(SystemExit))
+    t = rec.start_cron_thread()
+    t.join(timeout=5)
+    assert order[:2] == ["tick", "sleep"]
+
+
+def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatch):
+    """The deliver-once claim moved to the send seam for receiver runs — and the claim's second
+    half, the digest stamp, moved with it: only the claim that WINS (and therefore delivers)
+    stamps; a superseded copy does not."""
+    rec.DATA = str(tmp_path)
+    stamped = []
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: stamped.append(1))
+    assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-a") == "send"
+    assert stamped == [1]
+    assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-b") == "superseded"
+    assert stamped == [1], "a superseded copy is not the delivery — it must not stamp"

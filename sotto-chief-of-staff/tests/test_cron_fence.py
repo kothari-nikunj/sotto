@@ -97,7 +97,23 @@ def test_reconciler_replaces_system_jobs_and_retired_jobs(tmp_path):
         "remove a1b2c3d4e5f6", "remove b1b2c3d4e5f6", "remove c1b2c3d4e5f6"}
     assert "sotto-morning-brief" not in remaining and "sotto-followup" not in remaining
     created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
-    assert created == {row["name"] for row in json.load(open(CRONS_JSON))}
+    assert created == {row["name"] for row in json.load(open(CRONS_JSON))
+                       if row.get("runner") != "receiver"}
+
+
+def test_receiver_run_jobs_are_removed_from_hermes_but_never_created(tmp_path):
+    """The briefs are `runner: receiver` jobs: the trigger receiver schedules and delivers them, so
+    Hermes must never hold a registration for one. They stay in the REMOVAL markers, which is what
+    strips an existing deployment's stale Hermes brief crons on the next boot — no manual step."""
+    spec = json.load(open(CRONS_JSON))
+    receiver_run = {row["name"] for row in spec if row.get("runner") == "receiver"}
+    assert receiver_run == {"sotto-morning-brief", "sotto-evening-brief"}
+    _, calls, remaining = _run_reconcile(tmp_path)
+    created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
+    assert not (created & receiver_run)
+    # the fixture's two stale sotto-morning-brief registrations were removed anyway
+    assert "sotto-morning-brief" not in remaining
+    assert {"remove a1b2c3d4e5f6", "remove b1b2c3d4e5f6"} <= set(calls)
 
 
 def test_reconciler_honors_gates_and_schedule_source(tmp_path):

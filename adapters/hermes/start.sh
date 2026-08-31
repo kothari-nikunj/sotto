@@ -170,8 +170,10 @@ hermes_set_if_supported() {
 #    (/bridge/poll); Hermes points at the always-up local endpoint, so it never 530s. Tunnel-free —
 #    just set BRIDGE_TOKEN (the shared bearer). No BRIDGE_URL, no Cloudflare.
 if [ -n "${BRIDGE_TOKEN:-}" ]; then
+  # --derive-mcp: Hermes is handed HMAC(root, "sotto-mcp"), never the root — the agent talks to
+  # prompt-injectable content, and with only the derived bearer it cannot act as the Bridge.
   python3 /app/adapters/hermes/configure_mcp.py --url "http://127.0.0.1:${PORT:-8787}/mcp" \
-    --token "$BRIDGE_TOKEN" --config "$HOME/.hermes/config.yaml"
+    --token "$BRIDGE_TOKEN" --derive-mcp --config "$HOME/.hermes/config.yaml"
   echo "[sotto] sotto-local → reverse relay (tunnel-free); the Mac dials out to /bridge/poll."
 fi
 

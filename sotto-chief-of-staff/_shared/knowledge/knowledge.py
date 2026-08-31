@@ -11,6 +11,7 @@ No external deps beyond PyYAML (yaml). Pure functions over (inputs, exhaust dir)
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -480,6 +481,37 @@ def companies_dir() -> str:
     return os.path.join(data_root(), "knowledge", "companies")
 
 
+# ── Atomic file writes ────────────────────────────────────────────────────────
+def write_text_atomic(path: str, text: str) -> None:
+    """THE graph's file writer: a process-unique temp, then `os.replace`.
+
+    `open(path, "w")` truncates before it writes anything, and a crash in that window leaves a
+    person file EMPTY — everything Sotto remembers about someone, gone, with no error anywhere.
+    Every write under `knowledge/` goes through here so that failure mode cannot exist. The temp
+    name carries the pid because a fixed `<path>.tmp` is itself a shared mutable resource (the
+    jsonstore bug: two writers open the same temp, one renames it out from under the other)."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_person_file(path: str, p: "PersonFile", now: Optional[datetime] = None) -> None:
+    """Serialize + write one person file atomically. The ONE way a person file reaches disk."""
+    write_text_atomic(path, serialize_person_file(p, now))
+
+
 # ── Person-file identity resolution (canonical_id-keyed store) ────────────────
 # People files are keyed by canonical_id ({cid}.md), NOT by name slug. Name-slug keying was the
 # identity-fragmentation root cause: two different "John Smith"s merged into one file, while one
@@ -598,19 +630,53 @@ def repoint_relations(src_slug: str, dst_slug: str, dst_name: str,
         if not touched:
             continue
         other.relations = kept
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(serialize_person_file(other, now))
+        write_person_file(path, other, now)
         repointed += 1
     return repointed
+
+
+def read_or_stub_person(slug: str, name_hint: str = "", iso: str = "", updated_by: str = ""):
+    """(path, PersonFile) for an existing slug — or a stub AT that exact slug when the file is
+    missing, so an edge can never name a slug with nothing behind it. Returns (None, None) for a
+    slug that is not a canonical_id: every person file is keyed by one (migrate_people_dir enforces
+    it at every entry point), and a stub that isn't would be born already needing migration.
+
+    Lives here, not in the relation writer, because the journal's `edge` op has to be able to
+    materialize the same stub when it finishes an interrupted link — one implementation."""
+    try:
+        path = safe_path(people_dir(), slug)
+    except ValueError:
+        return (None, None)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return path, parse_person_file(f.read())
+    if not valid_canonical_id(slug):
+        return (None, None)
+    return path, PersonFile(canonical_id=slug, name=name_hint or slug,
+                            updated_at=iso, updated_by=updated_by)
 
 
 def absorb_person_file(dst_path: str, src_path: str, now: Optional[datetime] = None) -> bool:
     """Union src INTO dst, delete src, and leave nobody pointing at the file that vanished.
     THE merge: migrate_people_dir (two legacy files, one canonical_id) and
     knowledge_update.merge_person_files (dedup-lite, and the user's confirmed merge) are the same
-    operation and share this one implementation. Returns False for a no-op self-merge."""
+    operation and share this one implementation. Both files live in `knowledge/people/`.
+
+    One merge is three writes across N files, so it is journaled as ONE op: a crash after the
+    survivor is written but before the loser is deleted used to leave two files for one person and
+    a set of edges pointing at a slug that no longer exists. Returns False for a self-merge or a
+    merge whose loser is already gone (which is what a finished merge looks like)."""
     if os.path.realpath(dst_path) == os.path.realpath(src_path):
         return False
+    if not (os.path.exists(dst_path) and os.path.exists(src_path)):
+        return False
+    run_journaled([merge_op(_stem(dst_path), _stem(src_path))], now)
+    return True
+
+
+def _absorb_now(dst_path: str, src_path: str, now: Optional[datetime] = None) -> bool:
+    """absorb_person_file's body, WITHOUT the journal — it is the `merge` op's applier, and an
+    applier that journals would journal itself forever."""
     with open(dst_path, encoding="utf-8") as f:
         dst = parse_person_file(f.read())
     with open(src_path, encoding="utf-8") as f:
@@ -620,11 +686,216 @@ def absorb_person_file(dst_path: str, src_path: str, now: Optional[datetime] = N
     # The survivor cannot point at the file that's about to vanish, nor at itself: both ends of
     # those edges are now one person.
     dst.relations = [r for r in dst.relations if r.slug not in (src_slug, dst_slug)]
-    with open(dst_path, "w", encoding="utf-8") as f:
-        f.write(serialize_person_file(dst, now))
+    write_person_file(dst_path, dst, now)
     os.remove(src_path)
     repoint_relations(src_slug, dst_slug, dst.name, now)
     return True
+
+
+# ── The interrupted-update journal ────────────────────────────────────────────
+# ONE sentence: an interrupted graph update finishes the next time anything touches the graph.
+#
+# write_text_atomic covers ONE file. Some graph operations are not one file: a relation is stored on
+# BOTH people, and a merge writes the survivor, deletes the loser and repoints everyone who pointed
+# at it. A crash between those files left a one-sided edge or a dangling slug, and nothing noticed
+# or repaired it (external review finding #6, Aug 31). So a multi-file batch writes its op list to
+# `knowledge/.journal.json` BEFORE it touches the first file and removes it after the last; every
+# writer entry point replays what it finds (knowledge_update.graph_lock).
+#
+# Format: {"ts": <iso>, "ops": [{"op": <kind>, …}]} — small on purpose; it names operations, it does
+# not copy files. Every op is IDEMPOTENT (re-running a finished batch writes no bytes), which is
+# what lets replay simply re-run the whole list without knowing how far the crash got.
+JOURNAL_FILE = ".journal.json"
+
+
+def journal_path() -> str:
+    return os.path.join(data_root(), "knowledge", JOURNAL_FILE)
+
+
+def edge_op(slug: str, name: str, rel: "Relation") -> dict:
+    """"put this edge on this person file" — one file's half of a relation write."""
+    return {"op": "edge", "slug": slug, "name": name, "rel": rel.to_yaml_dict()}
+
+
+def unedge_op(slug: str, other: str, rel_type: str = "") -> dict:
+    """"drop this person's edge(s) to `other`" — an empty type means every edge between them."""
+    return {"op": "unedge", "slug": slug, "other": other, "type": rel_type or ""}
+
+
+def merge_op(dst_slug: str, src_slug: str) -> dict:
+    return {"op": "merge", "dst": dst_slug, "src": src_slug}
+
+
+def rekey_op(src_slug: str, dst_slug: str, name: str) -> dict:
+    """"this person file changed filename" — the move plus the repointing every edge owes it."""
+    return {"op": "rekey", "src": src_slug, "dst": dst_slug, "name": name}
+
+
+def run_journaled(ops: list, now: Optional[datetime] = None) -> None:
+    """Write the ops down, apply them in order, remove the journal.
+
+    An exception leaves the journal on disk ON PURPOSE: the batch is half-applied, and the next
+    thing to touch the graph is what finishes it."""
+    if not ops:
+        return
+    write_text_atomic(journal_path(), json.dumps({"ts": now_iso(now), "ops": ops}))
+    for op in ops:
+        _apply_journal_op(op, now)
+    _clear_journal()
+
+
+# An op that RAISES is retried on later replays, but not forever: a permanently broken op (bad
+# disk, poisoned file) must eventually stop taxing every graph write. Five attempts spans days of
+# real use before the give-up line prints.
+JOURNAL_MAX_ATTEMPTS = 5
+
+
+def replay_journal(now: Optional[datetime] = None) -> int:
+    """Finish an interrupted multi-file update. Returns how many ops actually changed something;
+    silent when there is nothing to finish.
+
+    An op that applies cleanly (or has nothing left to do) is done. An op that RAISES is kept for
+    the next replay — clearing it would declare victory over a half-applied graph (the external
+    reviewer's exact objection, Aug 31) — until JOURNAL_MAX_ATTEMPTS, when it is dropped with a
+    line. A journal that cannot be PARSED is cleared: it names nothing anyone can retry, and it
+    must not brick every future graph write."""
+    try:
+        with open(journal_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        ops = data.get("ops") if isinstance(data, dict) else None
+        ops = ops if isinstance(ops, list) else []
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        _clear_journal()
+        _journal_log("[sotto] knowledge journal: unreadable — cleared, nothing to finish")
+        return 0
+    done, retry = [], []
+    for op in ops:
+        try:
+            if _apply_journal_op(op, now):
+                done.append(str(op.get("op") or "?") if isinstance(op, dict) else "?")
+        except Exception:  # noqa: BLE001 — one broken op must not strand the rest of the batch
+            if isinstance(op, dict):
+                op["attempts"] = int(op.get("attempts") or 0) + 1
+                if op["attempts"] < JOURNAL_MAX_ATTEMPTS:
+                    retry.append(op)
+                else:
+                    _journal_log(f"[sotto] knowledge journal: gave up on a {op.get('op') or '?'} "
+                                 f"op after {JOURNAL_MAX_ATTEMPTS} attempts")
+    if retry:
+        write_text_atomic(journal_path(), json.dumps({"ts": now_iso(now), "ops": retry}))
+    else:
+        _clear_journal()
+    if done:
+        _journal_log(f"[sotto] knowledge journal: finished {len(done)} interrupted op(s) "
+                     f"({', '.join(done)})")
+    return len(done)
+
+
+def _clear_journal() -> None:
+    try:
+        os.remove(journal_path())
+    except OSError:
+        pass
+
+
+def _journal_log(msg: str) -> None:
+    """A repair is the one thing here worth a line; everything else fails toward silence."""
+    try:
+        from sotto_log import diag
+        diag(msg)
+    except Exception:  # noqa: BLE001 — knowledge.py is importable without _shared/lib on the path
+        import sys
+        print(msg, file=sys.stderr)
+
+
+def _op_edge(op: dict, now: Optional[datetime]) -> bool:
+    rel = Relation.from_yaml_dict(op.get("rel") or {})
+    if rel.type not in RELATION_INVERSE or not rel.slug:
+        return False
+    path, p = read_or_stub_person(str(op.get("slug") or ""), str(op.get("name") or ""),
+                                  now_iso(now), rel.source)
+    if p is None:
+        return False
+    if any(r.key() == rel.key() for r in p.relations):
+        return False                    # already on file: the same edge twice writes no bytes
+    p.relations.append(rel)
+    write_person_file(path, p, now)
+    return True
+
+
+def _op_unedge(op: dict, now: Optional[datetime]) -> bool:
+    slug, other = str(op.get("slug") or ""), str(op.get("other") or "")
+    want = str(op.get("type") or "")
+    if not slug or not other:
+        return False
+    try:
+        path = safe_path(people_dir(), slug)
+    except ValueError:
+        return False
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        p = parse_person_file(f.read())
+    keep = [r for r in p.relations if not (r.slug == other and (not want or r.type == want))]
+    if len(keep) == len(p.relations):
+        return False                    # already removed
+    p.relations = keep
+    write_person_file(path, p, now)
+    return True
+
+
+def _op_merge(op: dict, now: Optional[datetime]) -> bool:
+    src_slug, dst_slug = str(op.get("src") or ""), str(op.get("dst") or "")
+    try:
+        dst = safe_path(people_dir(), dst_slug)
+        src = safe_path(people_dir(), src_slug)
+    except ValueError:
+        return False
+    if dst == src or not os.path.exists(dst):
+        return False                    # no survivor: nothing this op can finish
+    if os.path.exists(src):
+        return _absorb_now(dst, src, now)
+    # The loser is gone — but a crash can land BETWEEN its delete and the repointing, and "the
+    # loser is gone" used to read as "this merge finished", leaving edges naming a deleted slug
+    # forever (external reviewer's repro, Aug 31). Repointing is idempotent: a merge that truly
+    # finished has nothing left naming src and this writes no bytes.
+    with open(dst, encoding="utf-8") as f:
+        dst_name = parse_person_file(f.read()).name
+    return bool(repoint_relations(src_slug, dst_slug, dst_name, now))
+
+
+def _op_rekey(op: dict, now: Optional[datetime]) -> bool:
+    """Move a person file to its canonical_id name, then repoint every edge that names the old
+    slug. Both halves no-op once done, and a crash that left BOTH names on disk is a merge."""
+    src_slug, dst_slug = str(op.get("src") or ""), str(op.get("dst") or "")
+    if not src_slug or not dst_slug or src_slug == dst_slug:
+        return False
+    try:
+        src = safe_path(people_dir(), src_slug)
+        dst = safe_path(people_dir(), dst_slug)
+    except ValueError:
+        return False
+    moved = False
+    if os.path.exists(src):
+        if os.path.exists(dst):
+            _absorb_now(dst, src, now)
+        else:
+            os.replace(src, dst)
+        moved = True
+    repointed = repoint_relations(src_slug, dst_slug, str(op.get("name") or ""), now)
+    return moved or bool(repointed)
+
+
+_JOURNAL_OPS = {"edge": _op_edge, "unedge": _op_unedge, "merge": _op_merge, "rekey": _op_rekey}
+
+
+def _apply_journal_op(op, now: Optional[datetime]) -> bool:
+    if not isinstance(op, dict):
+        return False
+    fn = _JOURNAL_OPS.get(op.get("op"))
+    return bool(fn(op, now)) if fn else False
 
 
 def migrate_people_dir(now: Optional[datetime] = None) -> dict:
@@ -649,22 +920,18 @@ def migrate_people_dir(now: Optional[datetime] = None) -> dict:
             target = safe_path(d, p.canonical_id)
             if os.path.realpath(path) == target:
                 if changed:
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(serialize_person_file(p, now))
+                    write_person_file(path, p, now)
                 continue
             if os.path.exists(target):
                 absorb_person_file(target, path, now)
                 merged += 1
             else:
                 if changed:
-                    with open(target, "w", encoding="utf-8") as f:
-                        f.write(serialize_person_file(p, now))
-                    os.remove(path)
-                else:
-                    os.replace(path, target)
-                # The file just changed identity: anyone holding an edge to its old name-slug now
-                # holds one to a filename that doesn't exist. Repoint before anything reads them.
-                repoint_relations(_stem(path), _stem(target), p.name, now)
+                    write_person_file(path, p, now)   # normalize in place, then move
+                # The file is about to change identity: anyone holding an edge to its old name-slug
+                # would hold one to a filename that doesn't exist, so the move and the repointing
+                # are ONE journaled op rather than two things a crash can separate.
+                run_journaled([rekey_op(_stem(path), _stem(target), p.name)], now)
                 moved += 1
         except Exception:  # noqa: BLE001 — one unreadable file must not block the store
             continue

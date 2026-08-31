@@ -209,8 +209,7 @@ def op_correct(slug: str, fact_id: str, text: str, now: datetime | None = None) 
                                     first=today, last=today)
         changed = True
     if changed:
-        with open(path2, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(p2, now))
+        kg.write_person_file(path2, p2, now)
     return _result(path2, p2)
 
 
@@ -224,8 +223,7 @@ def op_archive(slug: str, fact_id: str, now: datetime | None = None) -> dict:
     if fact.status != "archived":       # already archived → idempotent no-op rewrite-free
         fact.status = "archived"
         fact.archived_text = fact.text  # mirror SUPERSEDE's history-keeping
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(p, now))
+        kg.write_person_file(path, p, now)
     return _result(path, p)
 
 

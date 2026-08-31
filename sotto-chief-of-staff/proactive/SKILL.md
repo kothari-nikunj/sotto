@@ -114,6 +114,10 @@ cron already sent.
    Same for the other kinds (`--kind commitment|chase|handoff|retune_offer|intention`), with the question
    exactly as you sent it. It overwrites — one pending question at a time, newest wins.
    **If the tick delivered nothing, or the push asked nothing, record nothing.**
+   **If a yes to that question would send something or write the calendar**, write the exact content
+   to a file and pass `--payload-file <path>`: only its hash is stored, and the acting session must
+   pass `--offer-bound` so the user's "sure" binds to those bytes and nothing else. An offer whose
+   yes only runs a read — prep, a cleanup, a standing rule — has nothing to hash; pass no file.
 
 ## Notes
 - The meeting lead window (default 45 min) and the once-per-day dedup are in `proactive_scan.py`;

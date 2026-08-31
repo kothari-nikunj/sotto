@@ -33,34 +33,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Hermes (Nous Research's official installer — also pulls Python/Node into its own runtime).
 # No account/license needed; it just needs an LLM key at runtime (we pass GOOGLE_AI_API_KEY).
 #
-# HERMES_REFRESH is a pure cache-bust knob: Docker reuses this layer (and its baked Hermes) as long
-# as the RUN line is byte-identical, so a routine code push does NOT upgrade Hermes. To pull the
-# latest Hermes, bump the value to any new string (e.g. today's date) and redeploy — that invalidates
-# the layer and re-runs the installer. See RAILWAY.md § Staying updated.
-# BUMPING IT MEANS RE-CHECKING THE HASH: a refresh fetches whatever install.sh upstream serves that
-# day, so recompute HERMES_INSTALL_SHA256 in the same edit (or clear it and accept the warning) —
-# a stale hash is a build that fails loudly, which is the correct failure but a confusing one if you
-# forgot why.
-ARG HERMES_REFRESH=2026-08-28.2
-# Integrity pin for the installer script. The script is fetched to a FILE, checked, and only then
-# executed — never `curl | bash`, so a MITM or a compromised host cannot stream a different script
-# into a shell that is already running it.
+# The installer is VENDORED at adapters/hermes/hermes-install.sh — the build never fetches
+# https://hermes-agent.nousresearch.com/install.sh. Upstream serves that URL MUTABLY and replaced
+# the script in place three times in Aug 2026: twice between our review and the build (the sha pin
+# we used then failed those builds closed, correctly), and once more after a cache eviction turned
+# the stale pin into every build failing until someone re-verified. Vendoring ends the recurrence:
+# the bytes that run are the bytes reviewed in git, and a build needs no network to stay honest.
 #
-# The default is the exact installer fetched and reviewed when HERMES_REFRESH was bumped above.
-# Upstream serves a mutable URL, so every refresh must update this hash in the same commit. Empty or
-# stale hashes fail the build closed; bypassing verification is never a supported build mode.
-# (2026-08-28.2: fetched with the build's exact curl -A string minutes before merging; the diff
-# against the 08-23 script was reviewed — a Node support-line gate (22.22+/24.11+/26+) and an
-# isolated `uv sync` helper for uv 0.12+, no new download hosts. Adopts Hermes v0.20.6. The first
-# 08-28 attempt is history: upstream replaced the script between verification and build — the pin
-# failed the build closed, as designed.)
-ARG HERMES_INSTALL_SHA256="e6c7f2b516b2888ab740fd36cbceb5fd4e1db68d2ebc29f7306c6313c835b7d9"
-RUN echo "hermes refresh: ${HERMES_REFRESH}" \
- && test -n "${HERMES_INSTALL_SHA256}" \
- && curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
-      -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh \
- && echo "${HERMES_INSTALL_SHA256}  /tmp/hermes-install.sh" | sha256sum -c - \
- && bash /tmp/hermes-install.sh \
+# To upgrade Hermes, fetch the script fresh, review the diff, and commit it:
+#   curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+#     -o adapters/hermes/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
+# (the -A string matters — the host serves different bytes to unknown user agents), or run
+# tools/ship.sh --refresh-hermes, which does exactly that. The COPY below busts the Docker cache
+# precisely when the file changes: a routine code push never re-runs the installer, a committed
+# upgrade always does. The Hermes version an image actually carries is recorded at build time in
+# /app/hermes-image-version.txt (see below).
+# (Vendored 2026-08-31, sha256 2076946edc23b3aed4a82ccb2e6b38ab593575626206dbdd192384e375b6d57c.)
+COPY adapters/hermes/hermes-install.sh /tmp/hermes-install.sh
+RUN bash /tmp/hermes-install.sh \
  && rm -f /tmp/hermes-install.sh
 # The installer puts `hermes` on PATH for the install user; make common locations explicit for start.sh.
 ENV PATH="/root/.local/bin:/root/.hermes/bin:${PATH}"

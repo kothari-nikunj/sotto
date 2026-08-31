@@ -571,7 +571,9 @@ def run_live(threshold: float, update: bool) -> int:
         print("RESULT: FAIL")
         return 1
     if not baseline:
-        print("No baseline yet — run with --update-baseline to record one.")
+        print("No baseline yet — this run gated NOTHING. Record one with --update-baseline.")
+        print("RESULT: NO BASELINE")
+        return 2
     print("RESULT: PASS")
     return 0
 

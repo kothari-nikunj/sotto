@@ -42,6 +42,12 @@ looking for more events, and do not re-triage.
      Thursday"): one message total, one interrupt spent, never one message per event. (The funnel
      charges the budget the same way — one unit per bundle, not one per event.) Draft for the event
      you led with; the others are context unless the user asks.
+   - **The same human on two channels is ONE item.** Match senders across the bundle's events by
+     name, handle, and email (the identifiers the bundle carries, plus what the knowledge graph
+     told you): if Ali texted AND emailed, present Ali once — "Ali replied over iMessage and also
+     emailed" — and offer ONE reply on whichever channel fits the ask, never two entries with two
+     drafts for one person. Two drafts to the same human about the same day's thread is the
+     double-tell this funnel exists to prevent (it happened, Aug 28: one bundle, Ali twice).
    - **Every event in a bundle came from a person.** The watcher's own nudges (`source:
      "proactive"`) do pass through the same funnel, but their bundle goes back to `sotto-proactive`
      in process — the receiver never stages one for you, and the release valve refuses to promote
@@ -62,7 +68,9 @@ looking for more events, and do not re-triage.
 3. **Compose ONE nudge as Sotto** — who / what / why-now in **≤ 2 sentences** (the nudge format in
    `_shared/references/voice.md` — calm, specific, no warning icons). Lead with the ask
    ("Dhruv just asked if you can move tomorrow's 10am — you still owe him the deck too"), not with
-   "you received a message". A missed call nudge is "X just called (no answer)" + the callback draft.
+   "you received a message". A missed call nudge states WHEN, honestly: "X just called (no answer)"
+   only if it rang minutes ago — past that, give the time ("X called at 9:40 last night, no
+   answer"); the bundle's `ts`/`why` carries the age. Either way, + the callback draft.
 3a. **Class `scheduling_ask` — offer times, not just words** (the sender is asking to find time:
    "can we do coffee Thursday?", "got 30 min next week?"). The nudge must propose real slots:
    - Read the calendar **deterministically** — `execute_code` →

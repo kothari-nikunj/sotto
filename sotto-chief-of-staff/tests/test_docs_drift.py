@@ -66,6 +66,8 @@ lp = _load("dd_learn_prefs", PACK, "approval-tiers", "scripts", "learn_preferenc
 rec = _load("dd_receiver", HERMES, "runtime", "trigger-receiver", "receiver.py")
 cal = _load("dd_calcache", HERMES, "runtime", "trigger-receiver", "calcache.py")
 ob = _load("dd_outbox", HERMES, "runtime", "trigger-receiver", "outbox.py")
+rt = _load("dd_retention", HERMES, "runtime", "trigger-receiver", "retention.py")
+fg = _load("dd_forget", PACK, "tools", "forget.py")
 dsh = _load("dd_dashboard", HERMES, "runtime", "trigger-receiver", "dashboard.py")
 att = _load("dd_attachments", PACK, "_shared", "lib", "attachments.py")
 
@@ -175,6 +177,12 @@ def test_cooldown_escalation_and_freshness():
     _same("escalation.window_min", R["escalation"]["window_min"], te.ESCALATION_WINDOW_MIN_DEFAULT)
     _same("freshness.event_max_age_min", R["freshness"]["event_max_age_min"],
           te.EVENT_MAX_AGE_MIN)
+    _same("freshness.missed_call_max_age_min", R["freshness"]["missed_call_max_age_min"],
+          te.MISSED_CALL_MAX_AGE_MIN)
+    # One clock, stated in the docs: the missed-call ceiling IS the valve's age cap — a held nudge
+    # and a stale call age out together. If either constant moves alone, the doctrine broke.
+    assert te.MISSED_CALL_MAX_AGE_MIN == te.VALVE_MAX_AGE_MIN, RULE
+    _anchor(f"a missed call buzzes up to {te.MISSED_CALL_MAX_AGE_MIN // 60} hours after the ring")
 
 
 def test_quiet_hours_and_vip_floor():
@@ -224,6 +232,10 @@ def test_delivery_outbox():
     _anchor("retries every minute")
     _anchor("doubling to a fifteen-minute cap")
     _anchor("older than 240 minutes")
+    # deliver-once is MACHINERY at the send seam, not an instruction in a skill (Aug 30)
+    _same("outbox.superseded (the terminal the gate writes)", ob.STATUS_SUPERSEDED, "superseded")
+    _anchor("the send seam itself claims the deliver-once marker")
+    _anchor(f"receipted `{ob.STATUS_SUPERSEDED}`, never sent")
 
 
 def test_calendar_cache_and_staleness():
@@ -366,6 +378,105 @@ def test_the_attachment_caps_have_no_second_declaration():
             f"{'/'.join(rel)} declares its own attachment cap — attachments.py is the one owner.\n{RULE}")
 
 
+# ── the retention sweep ─────────────────────────────────────────────────────────────────────────
+
+def test_retention_ttls():
+    """`retention.py` holds THE table of what the volume keeps; the island and DATA-FLOW.md are its
+    two renderings. Every number here is a promise made to a reader about their own data."""
+    _same("retention.sweep_hour", R["retention"]["sweep_hour"], rt.SWEEP_LOCAL[0])
+    _same("retention.sweep_minute", R["retention"]["sweep_minute"], rt.SWEEP_LOCAL[1])
+    _same("retention.delivery_receipt_days", R["retention"]["delivery_receipt_days"],
+          rt.DELIVERY_RECEIPT_DAYS)
+    _same("retention.send_receipt_days", R["retention"]["send_receipt_days"], rt.SEND_RECEIPT_DAYS)
+    _same("retention.triage_verdict_days", R["retention"]["triage_verdict_days"],
+          rt.TRIAGE_VERDICT_DAYS)
+    _same("retention.dashboard_audit_days", R["retention"]["dashboard_audit_days"],
+          rt.DASHBOARD_AUDIT_DAYS)
+    _same("retention.draft_ledger_days", R["retention"]["draft_ledger_days"], rt.DRAFT_LEDGER_DAYS)
+    _same("retention.brief_archive_days", R["retention"]["brief_archive_days"],
+          rt.BRIEF_ARCHIVE_DAYS)
+    _same("retention.staged_days", R["retention"]["staged_days"], rt.STAGED_DAYS)
+    _same("retention.proactive_stamp_days", R["retention"]["proactive_stamp_days"],
+          rt.PROACTIVE_STAMP_DAYS)
+    _same("retention.log_tail_mb", R["retention"]["log_tail_mb"],
+          rt.LOG_TAIL_MAX_BYTES // (1024 * 1024))
+    _anchor(f"**{rt.SEND_RECEIPT_DAYS} days**")
+    _anchor(f"**{rt.DRAFT_LEDGER_DAYS} days**")
+    _anchor(f"daily sweep at {rt.SWEEP_LOCAL[0]}:{rt.SWEEP_LOCAL[1]:02d} AM local")
+
+
+def test_the_families_the_sweep_leaves_alone_are_the_ones_it_may_never_delete():
+    """The graph, the ledger and the corpus are exempt AND protected — two independent statements,
+    because the exemption is a design decision and the guard is what survives a typo in the table."""
+    for family in ("knowledge", "corpus"):
+        assert isinstance(rt.accounts_for(f"{family}/anything.md"), rt.Exempt), family
+        assert rt.protected(f"{family}/anything.md"), family
+    for rule in rt.SWEEP:
+        assert not rt.protected(rule.pattern.split("*")[0].rstrip("/")), rule
+
+
+# ── retention.py and forget.py are two views of ONE answer ──────────────────────────────────────
+#
+# `forget.py` is what a person runs; `retention.py` is what the daemon runs. They answer the same
+# question — "what does Sotto keep?" — from opposite ends, and a family that one names and the other
+# has never heard of is the drift that makes the docs' retention column a guess. The bind is
+# mechanical: forget.py's OWN target patterns, read out of its source, must each be accounted for by
+# the retention table (swept by a rule, or exempt with a reason).
+
+_FORGET_VERB_RE = re.compile(r'if\s+"(\w+)"\s+in\s+verbs:')
+_FORGET_ADD_RE = re.compile(r'add\(\s*"([^"]+)"')
+
+
+def _forget_targets():
+    """{verb: [pattern]} straight out of `forget._targets`. Read from source, not from a fixture
+    volume, because a verb whose files don't happen to exist must still be covered."""
+    verb, out = None, {}
+    for line in inspect.getsource(fg._targets).splitlines():
+        found = _FORGET_VERB_RE.search(line)
+        if found:
+            verb = found.group(1)
+            out.setdefault(verb, [])
+            continue
+        added = _FORGET_ADD_RE.search(line)
+        if added and verb:
+            out[verb].append(added.group(1))
+    return out
+
+
+def test_every_forget_verb_is_accounted_for_by_the_retention_table():
+    targets = _forget_targets()
+    assert set(targets) == set(fg.VERBS), (
+        f"forget.py's verbs are {sorted(fg.VERBS)} but its targets cover {sorted(targets)} — a verb "
+        f"with no readable target list makes this guard vacuous.\n{RULE}")
+    missing = {}
+    for verb, patterns in targets.items():
+        assert patterns, f"forget.py --{verb} names no files"
+        for pattern in patterns:
+            if rt.accounts_for(pattern) is None:
+                missing.setdefault(verb, []).append(pattern)
+    assert not missing, (
+        "retention drift — forget.py deletes families that retention.py's table does not name:\n"
+        + "\n".join(f"  --{v}: {', '.join(p)}" for v, p in sorted(missing.items()))
+        + "\nAdd a SWEEP rule, or an EXEMPT entry saying who ages it instead (or why nothing has "
+        f"to).\n{RULE}")
+
+
+def test_the_forget_guard_is_not_satisfied_by_exemptions_alone():
+    """An all-exempt answer would be a table that explains nothing. At least one thing a person can
+    delete by hand is also aged automatically — that is the whole point of finding #5."""
+    entries = [rt.accounts_for(p) for ps in _forget_targets().values() for p in ps]
+    assert any(isinstance(e, rt.Rule) for e in entries)
+
+
+def test_what_forget_refuses_to_touch_the_sweep_refuses_too():
+    """`forget.PROTECTED` and `retention.NEVER` are two spellings of the same line between memory and
+    exhaust. The sweep's list is wider (it also spares your settings and credentials); it may never
+    be narrower."""
+    for family in fg.PROTECTED:
+        assert rt.protected(f"{family}/x.md"), (
+            f"forget.py refuses to delete {family} but the retention sweep does not.\n{RULE}")
+
+
 # ── the schedule ────────────────────────────────────────────────────────────────────────────────
 
 def test_cron_line_matches_crons_json():
@@ -390,6 +501,10 @@ def test_cron_line_matches_crons_json():
     # the valve heartbeat rides the same */15 cadence the proactive cron does
     _same("cron.proactive_min (valve heartbeat)", R["cron"]["proactive_min"] * 60,
           rec.VALVE_INTERVAL_SECS_DEFAULT)
+    # the wake-push's cron-compose window: a wake this soon after a brief's scheduled time folds
+    # into the snapshot instead of racing the run that is still composing it
+    _same("cron.brief_window_min", R["cron"]["brief_window_min"], rec.BRIEF_CRON_WINDOW_MIN)
+    _anchor(f"within **{rec.BRIEF_CRON_WINDOW_MIN} minutes** of a brief's scheduled time")
 
 
 # ── the prose doc ───────────────────────────────────────────────────────────────────────────────
@@ -704,3 +819,14 @@ def test_both_runtimes_lock_preferences_on_the_same_sidecar():
         f"{conn.LOCK_SUFFIX!r}. Two writers taking DIFFERENT locks is the same as no lock.\n{RULE}")
     probe = "/tmp/x/preferences.json"
     assert js.lock_path(probe) == probe + conn.LOCK_SUFFIX
+
+
+def test_receiver_marker_strip_matches_chatfmt():
+    """The receiver's send-seam marker strip is a VENDORED copy of chatfmt._MARKER_RE (its owner) —
+    the same two-runtimes contract keys.py lives under. If the owner's pattern ever changes, this
+    fails until the vendored copy moves with it."""
+    cf = _load("dd_chatfmt", PACK, "_shared", "lib", "chatfmt.py")
+    assert rec._MARKER_RE.pattern == cf._MARKER_RE.pattern, (
+        f"receiver._MARKER_RE ({rec._MARKER_RE.pattern!r}) drifted from its owner "
+        f"chatfmt._MARKER_RE ({cf._MARKER_RE.pattern!r}).\n{RULE}")
+    assert rec._MARKER_RE.flags == cf._MARKER_RE.flags

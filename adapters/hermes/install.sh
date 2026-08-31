@@ -135,10 +135,11 @@ fi
 if [ -n "$BRIDGE_TOKEN" ]; then
   note "register sotto-local MCP (reverse relay) in $HERMES_HOME/config.yaml"
   if [ "$DRY_RUN" -eq 0 ]; then
+    # --derive-mcp: Hermes gets the derived bearer, never the root (same rule as the cloud boot).
     python3 "$HERE/configure_mcp.py" --url "http://127.0.0.1:$RELAY_PORT/mcp" --token "$BRIDGE_TOKEN" \
-      --config "$HERMES_HOME/config.yaml"
+      --derive-mcp --config "$HERMES_HOME/config.yaml"
   else
-    echo "+ python3 adapters/hermes/configure_mcp.py --url http://127.0.0.1:$RELAY_PORT/mcp --token *** --config $HERMES_HOME/config.yaml"
+    echo "+ python3 adapters/hermes/configure_mcp.py --url http://127.0.0.1:$RELAY_PORT/mcp --token *** --derive-mcp --config $HERMES_HOME/config.yaml"
   fi
 else
   # LOCAL mode: Hermes spawns the engine as a stdio child, so the installer has to hand it an
@@ -187,11 +188,16 @@ note "connect Google: 'hermes setup' (CLI) OR register a Gmail/Calendar MCP — 
 # 7) Trigger receiver (host-neutral; loopback only). The adapter sets SOTTO_RUN_SKILL.
 note "run: SOTTO_RUN_SKILL='hermes -z' SOTTO_TRIGGER_TOKEN=... SOTTO_DATA=/data python3 $ROOT/runtime/trigger-receiver/receiver.py"
 
-# 8) Cron windows (fallback path; the Bridge push fires the real brief — SPEC §4.1). Idempotent: skip
+# 8) Cron windows (fallback path; the Bridge push fires the real brief — SPEC §4.1). A LOCAL install
+#    may run no trigger receiver, so unlike the cloud reconciler this one still registers the two
+#    `"runner": "receiver"` brief jobs — otherwise a laptop-only Sotto would have no scheduled brief
+#    at all. Run the receiver here too (step 7) and the deliver-once gate keeps it to one brief a day.
+#    Idempotent: skip
 #    a job that's already registered (by name OR prompt) so re-running the installer never piles up
 #    duplicates. Stable --name makes them addressable for later edit/remove (parity with the cloud boot).
 #    --deliver matters: without it the brief lands in the default "local" sink and never reaches the
-#    user — the exact bug the cloud boot fixed. Same default as start.sh; SOTTO_CRON_DELIVER overrides.
+#    user — the exact bug the cloud boot fixed. Same default as start.sh; SOTTO_CRON_DELIVER overrides,
+#    and the receiver sends its own scheduled output to that same channel.
 #    The job list itself comes from crons.json — the ONE source every registrar reads (start.sh, this
 #    installer, the OpenClaw installer, receiver._sotto_cron_jobs). Gates: SOTTO_PROACTIVE=0 drops the
 #    mostly-silent ~15-min nudge watcher, SOTTO_DIGEST=0 drops the adaptive 12:30 catch-up digest.

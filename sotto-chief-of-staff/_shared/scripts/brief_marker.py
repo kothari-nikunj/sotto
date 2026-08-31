@@ -13,6 +13,16 @@ never suppresses the day's brief — only a successful run that's about to deliv
 The winning claim also advances the midday-digest window (digest_check.advance_stamp) — see
 _stamp_digest_window below: the brief that DELIVERS is the one the 12:30 digest must not repeat.
 Flag file: $SOTTO_DATA/briefs/<YYYY-MM-DD>.<kind>.delivered  (<kind> = morning|evening), tz from SOTTO_TIMEZONE.
+
+THE MARKER'S CONTENT IS *WHO* CLAIMED IT — and WHO WRITES IT depends on the lane. A receiver-spawned
+run (`$SOTTO_DELIVERY_RUN_ID` set) never writes here: its output travels through the receiver's
+durable outbox, and THAT send seam claims the marker (writing the run id) plus the digest stamp at
+the moment of actual delivery — claiming any earlier left a crash window where the day read as
+delivered with nothing queued to deliver it (external review, Aug 31). For those runs `--claim` only
+answers: absent/ours → "claimed", another lane's → "already". An install whose own scheduler runs
+this skill in-agent still claims HERE (writing `unlabeled` — it cannot name itself), because there
+this claim is the only gate there is. Empty or `unlabeled` reads as ANOTHER LANE to anyone comparing
+ids. `--check` is unchanged — presence alone is still the read-only peek.
 """
 from __future__ import annotations
 
@@ -47,12 +57,35 @@ def _stamp_digest_window() -> None:
         pass
 
 
+UNLABELED = "unlabeled"   # a claimer with no run id: nobody can later prove the marker is theirs
+
+
 def claim(kind: str) -> bool:
-    """Atomically claim today's <kind> brief. True = you won (deliver); False = already delivered (stop)."""
+    """Atomically claim today's <kind> brief, writing WHO claimed it. True = you won (deliver);
+    False = already delivered (stop).
+
+    RECEIVER-SPAWNED runs (SOTTO_DELIVERY_RUN_ID set) do not write here. Their words leave the box
+    through the receiver's durable outbox, whose send seam claims this same marker — with the digest
+    stamp — at the moment of actual delivery. Writing it HERE too opened a hole (external review,
+    Aug 31): a run that claimed and then died before its output reached the outbox left the day
+    marked delivered with no row to retry — a silenced brief. So under the receiver this call only
+    ANSWERS: marker absent or already ours → "claimed" (compose on, the seam will gate); another
+    lane's → "already" (stop; the seam would supersede this copy anyway). The write below remains
+    for installs whose own scheduler runs this skill in-agent — there this claim is the only gate
+    there is."""
     p = _path(kind)
+    run_id = os.environ.get("SOTTO_DELIVERY_RUN_ID", "")
+    if run_id:
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip() == run_id
+        except OSError:
+            return True   # no marker yet (the normal case): deliver — the seam claims durably
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(UNLABELED)
     except FileExistsError:
         return False
     except OSError:

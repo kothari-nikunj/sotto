@@ -3,13 +3,15 @@
     "name": "sotto-morning-brief",
     "schedule": "30 6 * * *",
     "prompt": "Run my morning brief",
-    "skill": "sotto-morning-brief"
+    "skill": "sotto-morning-brief",
+    "runner": "receiver"
   },
   {
     "name": "sotto-evening-brief",
     "schedule": "30 17 * * *",
     "prompt": "Run my evening brief",
-    "skill": "sotto-evening-brief"
+    "skill": "sotto-evening-brief",
+    "runner": "receiver"
   },
   {
     "name": "sotto-relationship-pulse",

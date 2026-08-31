@@ -46,8 +46,14 @@ def test_refuses_to_score_against_an_unreviewed_draft(corpus, capsys):
     assert "reviewed: false" in capsys.readouterr().out
 
 
-def test_allow_unreviewed_is_an_explicit_opt_in(corpus):
-    assert rg.run("corpus-v1", 0, False, False, True, False, 0.05, corpus["out"]) == 0
+def test_allow_unreviewed_is_an_explicit_opt_in(corpus, capsys):
+    """The opt-in gets past the review refusal — and then, with no baseline recorded, the gate
+    reports itself unarmed rather than inventing a PASS."""
+    rc = rg.run("corpus-v1", 0, False, False, True, False, 0.05, corpus["out"])
+    out = capsys.readouterr().out
+    assert "reviewed: false" not in out
+    assert rc == 2
+    assert "RESULT: NO BASELINE" in out
 
 
 def test_a_missing_corpus_says_how_to_build_one(tmp_path, capsys):
@@ -64,8 +70,11 @@ def test_live_without_a_key_aborts(corpus, monkeypatch):
 
 # ── The replay ────────────────────────────────────────────────────────────────────────────────────
 
-def test_dry_replay_scores_the_deterministic_half(corpus, capsys):
+def test_dry_replay_scores_the_deterministic_half(corpus, tmp_path, monkeypatch, capsys):
     _review(corpus["out"])
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path / "vol"))
+    assert rg.run("corpus-v1", 0, False, False, False, True, 0.05, corpus["out"]) == 0
+    capsys.readouterr()                                       # the recording run's output
     rc = rg.run("corpus-v1", 0, False, False, False, False, 0.05, corpus["out"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -166,7 +175,7 @@ def test_run_evals_golden_forwards_everything_after_the_flag(corpus, monkeypatch
     _ev.loader.exec_module(ev)
     monkeypatch.setattr("sys.argv", ["run_evals.py", "--golden", "--corpus-dir", corpus["out"],
                                      "--allow-unreviewed", "--sample", "1"])
-    assert ev.main() == 0
+    assert ev.main() == 2                                  # forwarded fine; no baseline recorded
     assert "GOLDEN" in capsys.readouterr().out
 
 
@@ -177,6 +186,64 @@ def test_plain_run_evals_still_runs_the_fixture_scorecard(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["run_evals.py"])
     assert ev.main() == 0
     assert "SCORECARD" in capsys.readouterr().out
+
+
+# ── The gate is armed, or it says so (external review #7) ─────────────────────────────────────────
+
+def test_the_judges_scores_reach_the_aggregate_and_the_baseline(corpus, tmp_path, monkeypatch, capsys):
+    """Regression: the judge's verdict rode a nested dict that aggregate() silently dropped —
+    fabrication/voice/triage never reached the baseline. They land as 0-1 judge_* scalars now,
+    and the baseline records the run's shape beside them."""
+    _review(corpus["out"])
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path / "vol"))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "offline-stub")
+    import gemini as gem
+    monkeypatch.setattr(gem, "model_once", lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError("offline test — no network")))
+    monkeypatch.setattr(rg, "gemini_call", lambda _p, _i: json.dumps(
+        {"brief_markdown": "morning.", "actions": [], "extracted_knowledge": {}}))
+    monkeypatch.setattr(rg, "judge_day", lambda _r, _d, _b: {
+        "fabrication": 8, "voice": 9, "triage": 7, "notes": "solid"})
+    assert rg.run("corpus-v1", 0, True, True, False, True, 0.05, corpus["out"]) == 0
+    out = capsys.readouterr().out
+    agg = json.loads(out.split("AGGREGATE: ")[1].splitlines()[0])
+    assert (agg["judge_fabrication"], agg["judge_voice"], agg["judge_triage"]) == (0.8, 0.9, 0.7)
+    with open(tmp_path / "vol" / "evals" / "baselines" / "golden-corpus-v1.json",
+              encoding="utf-8") as f:
+        doc = json.load(f)
+    assert doc["scores"]["judge_voice"] == 0.9
+    assert doc["run"] == {"mode": "live+judge", "sample": 0}
+
+
+def test_aggregate_refuses_a_shape_it_cannot_score():
+    """A dict without 'f1' used to fall through both branches and vanish. Vanishing is the bug;
+    now it is a loud error at the seam."""
+    with pytest.raises(ValueError, match="unaggregatable"):
+        rg.aggregate([("day-00", "judge", {"fabrication": 8}, "")])
+
+
+def test_a_metric_that_vanishes_from_the_run_fails_the_gate(tmp_path, monkeypatch, capsys):
+    """The comparison walks the BASELINE's metrics: a dimension the baseline holds that this run
+    didn't produce is a FAIL with the recorded run shape in the hint — not a silent skip."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path / "vol"))
+    assert rg._baseline_gate("corpus-v1", {"funnel_agreement": 0.9, "judge_fabrication": 0.8},
+                             True, 0.05, {"mode": "live+judge", "sample": 5}) == 0
+    capsys.readouterr()
+    rc = rg._baseline_gate("corpus-v1", {"funnel_agreement": 0.9}, False, 0.05,
+                           {"mode": "dry", "sample": 0})
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "judge_fabrication" in out and "live+judge" in out
+    assert "RESULT: FAIL" in out
+
+
+def test_a_matching_run_with_no_regressions_still_passes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path / "vol"))
+    sig = {"mode": "dry", "sample": 0}
+    assert rg._baseline_gate("corpus-v1", {"funnel_agreement": 0.9}, True, 0.05, sig) == 0
+    capsys.readouterr()
+    assert rg._baseline_gate("corpus-v1", {"funnel_agreement": 0.88}, False, 0.05, sig) == 0
+    assert "RESULT: PASS" in capsys.readouterr().out
 
 
 # ── Labels contract ───────────────────────────────────────────────────────────────────────────────

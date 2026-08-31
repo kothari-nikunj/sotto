@@ -562,10 +562,22 @@ def _audit(event: str, **fields) -> None:
     """Append {ts, event, **fields} to $SOTTO_DATA/dashboard_audit.jsonl (best-effort, never
     raises). Writes use _audit("write", endpoint=…, target=…, op=…) per the plan's audit rail."""
     try:
+        import fcntl
         path = os.path.join(_root(), "dashboard_audit.jsonl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": _iso(), "event": event, **fields}) + "\n")
+        # flock on `<path>.lock` — the protocol every appender/rewriter of these ledgers shares
+        # (connectors.file_lock, jsonstore.lock, the retention sweep): without it the sweep's
+        # read-then-replace could swallow a line appended in between.
+        lf = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": _iso(), "event": event, **fields}) + "\n")
+        finally:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            finally:
+                os.close(lf)
     except OSError:
         pass
 

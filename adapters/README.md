@@ -44,12 +44,28 @@ host-specific lives here:
 | installer | one command to wire it all | `adapters/hermes/install.sh` | `adapters/openclaw/install.sh` (validated end to end against a live OpenClaw, Aug 2026 — the short "Still unverified" list is in [openclaw/README.md](openclaw/README.md)) |
 
 **The cron schedule has ONE source: `adapters/hermes/crons.json`** (host-neutral despite living under
-`hermes/`). It is an array of `{name, schedule, prompt, skill}` plus two optional keys — `gate`, the
-env var that must not be `0` for the job to register (`SOTTO_PROACTIVE`, `SOTTO_DIGEST`), and
-`schedule_env`, an env var that overrides the schedule (`SOTTO_PROACTIVE_CRON`). Delivery is *not*
+`hermes/`). It is an array of `{name, schedule, prompt, skill}` plus three optional keys — `gate`, the
+env var that must not be `0` for the job to register (`SOTTO_PROACTIVE`, `SOTTO_DIGEST`),
+`schedule_env`, an env var that overrides the schedule (`SOTTO_PROACTIVE_CRON`), and `runner`, which
+says WHO fires the job: `"receiver"` means the trigger receiver schedules and delivers it through
+its outbox, absent means the host agent's scheduler runs it. Delivery is *not*
 per job: `SOTTO_CRON_DELIVER` is the one target for all of them. Four registrars read this file —
 `adapters/hermes/start.sh` (cloud boot), both `install.sh`s, and `receiver._sotto_cron_jobs` (the
 timezone re-registration) — so a schedule can never drift between them.
+
+**`"runner": "receiver"` — the briefs.** The morning and evening briefs carry it, so no registrar
+hands them to a host scheduler; `receiver._cron_tick` fires them on the receiver's own 60-second
+heartbeat, which means a scheduled brief takes the identical spawn → outbox → deliver-once path a
+wake-push brief takes (retries, a receipt, one brief per day) instead of being delivered by the
+agent with none of that. It supports fixed daily `M H * * *` schedules only, and reads the
+configured zone every tick, so a timezone change moves the next fire with nothing to re-register.
+The reconciler still lists these rows among its removal markers, which is what strips an existing
+deployment's stale host registrations on the next boot.
+
+*The one exception, and why:* both `install.sh`s still print/create these jobs for the host
+scheduler, because a laptop-only install may run no receiver at all and would otherwise have no
+scheduled brief. Where both run, the deliver-once marker keeps the day to one brief — the second
+composition is receipted `superseded` and never sent.
 
 **The `user-` namespace is reserved and off-limits to every registrar.** Crons named `user-<slug>`
 are the owner's personal routines (the `sotto-routines` skill); they never appear in `crons.json`,

@@ -9,6 +9,11 @@ drop-in across Hermes versions. Idempotent.
   # HTTP transport (e.g. the Sotto Bridge over a tunnel):
   configure_mcp.py --url https://<tunnel> --token <bearer> [--name sotto-local] [--config …]
 
+  # HTTP transport for the receiver's /mcp: pass the ROOT secret plus --derive-mcp, and Hermes is
+  # handed the derived bearer instead — the agent never holds the root (receiver.derive_mcp_token
+  # is the same derivation; a parity test pins the two):
+  configure_mcp.py --url http://127.0.0.1:8787/mcp --token "$BRIDGE_TOKEN" --derive-mcp
+
   # stdio transport (e.g. a Granola MCP server):
   configure_mcp.py --name granola --command uvx --arg some-granola-mcp \
       --env GRANOLA_API_TOKEN=xxx --env GRANOLA_DOCUMENT_SOURCE=remote [--config …]
@@ -16,9 +21,17 @@ drop-in across Hermes versions. Idempotent.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import os
 
 import yaml
+
+
+def derive_mcp_token(secret: str) -> str:
+    """HMAC-SHA256(root, "sotto-mcp"), hex — what the receiver's /mcp route accepts, and the ONLY
+    thing it accepts. Must stay byte-identical to receiver.derive_mcp_token (parity-tested)."""
+    return hmac.new(secret.encode(), b"sotto-mcp", hashlib.sha256).hexdigest() if secret else ""
 
 
 def main():
@@ -28,6 +41,8 @@ def main():
     # HTTP transport
     ap.add_argument("--url")
     ap.add_argument("--token")
+    ap.add_argument("--derive-mcp", dest="derive_mcp", action="store_true",
+                    help="hand Hermes derive_mcp_token(--token) instead of --token itself")
     # stdio transport
     ap.add_argument("--command")
     ap.add_argument("--arg", action="append", default=[], help="repeatable; one per arg")
@@ -53,9 +68,10 @@ def main():
             entry["env"] = env
         cfg["mcp_servers"][args.name] = entry
     elif args.url and args.token:
+        bearer = derive_mcp_token(args.token) if args.derive_mcp else args.token
         cfg["mcp_servers"][args.name] = {
             "url": args.url,
-            "headers": {"Authorization": f"Bearer {args.token}"},
+            "headers": {"Authorization": f"Bearer {bearer}"},
         }
     else:
         ap.error("provide either --url and --token (HTTP), or --command (stdio)")

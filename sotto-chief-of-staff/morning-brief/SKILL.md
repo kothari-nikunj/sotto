@@ -121,9 +121,16 @@ Produce the user's morning brief: what needs attention, what you've already hand
    - **Deliver-once (cron ↔ wake-push coordination):** right before sending, run `execute_code` →
      `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/brief_marker.py" --claim morning` (evening brief:
      `--claim evening`). If it prints **`already`**, STOP — today's brief was already delivered by the
-     other path (the cloud cron and the Mac wake-push both run this skill; the gate ensures exactly one
+     other path (the schedule and the Mac wake-push both run this skill; the gate ensures exactly one
      delivers). Only when it prints `claimed` do you send. (Wake-push is ON by default —
      `SOTTO_WAKE_PUSH=0` disables it — so this gate is what keeps the two paths from double-delivering.)
+     **This step is still yours to run.** Wherever the receiver started the run — the schedule, the
+     wake-push, the dashboard's button; on the cloud that is every lane — it enforces the same gate in
+     machinery at the send seam (it claims the marker itself before the message leaves the box), so a
+     run that forgets this step can no longer double-deliver: its copy is receipted `superseded` and
+     never sent. A local install whose own scheduler runs this skill from inside the agent sends past
+     every gate the receiver owns, and there this claim is the only one there is. Claim anyway: a run
+     that skips it is throwing away a composed brief on a coin flip.
    - Send **`brief_text`** (step 3.3), never `brief_markdown`, never your own re-formatting of either.
    - **Tap-to-act DOES work on chat.** Each action in `actions[]` carries a **`tap_link`** — a real tappable URL (`https://wa.me/…`, `mailto:…`, `tel:…`, `sms:…`, or the meeting link). WhatsApp/Telegram/iMessage render these as one-tap links. For the top 2–3 actions, attach the link to the person's name or add a short tappable line — e.g. "→ [Message Dhruv](https://wa.me/15551234567)". Use the `tap_link` **verbatim**; don't invent URLs.
      - **Email is the exception, and it is the same rule as everywhere else: email asks, every other channel links.** Don't paste an action's `mailto:` into the brief — a percent-encoded URL is most of the line, and on a phone it opens whatever mail app the OS picks. Name the action and let the offer line carry it ("say *draft Dhruv*"): a yes runs `sotto-draft-reply`, which puts the real thing in the user's Gmail drafts.

@@ -23,18 +23,15 @@ import urllib.request
 def _diag(msg: str) -> None:
     """Diagnostics that must be VISIBLE to the operator. compose_brief runs inside Hermes' execute_code
     sandbox, which captures the script's stdout/stderr and returns it to the AGENT — it does NOT reach
-    Railway's container logs. So besides stderr, append to a log file on the /data volume that the
-    receiver serves at GET /debug/brief-log. Best-effort; never breaks a brief."""
-    print(msg, file=sys.stderr)
+    Railway's container logs — so sotto_log.diag also appends to the /data log the receiver serves at
+    GET /debug/brief-log. Delegated, not copied: this function used to carry its own unbounded
+    `open(..., "a")` beside sotto_log's rotating one, and that second writer was the reason the log
+    could grow past every bound (found in the Aug 2026 retention survey)."""
     try:
-        import datetime as _dt
-        logdir = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "logs")
-        os.makedirs(logdir, exist_ok=True)
-        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(os.path.join(logdir, "compose_brief.log"), "a", encoding="utf-8") as f:
-            f.write(f"{ts} {msg}\n")
-    except Exception:
-        pass
+        import sotto_log  # noqa: PLC0415 — lazy: _shared/lib is on every caller's sys.path, but a
+        sotto_log.diag(msg)  # missing module must cost the log line, never the brief
+    except Exception:  # noqa: BLE001
+        print(msg, file=sys.stderr)
 
 
 

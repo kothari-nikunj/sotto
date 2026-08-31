@@ -62,9 +62,10 @@ an `unavailable` source makes it exit non-zero too — read the per-source lines
 a non-zero exit can simply mean an app you don't use isn't installed, **not** that Full Disk Access is
 broken. Only a `needs Full Disk Access` line points at the grant.
 
-**2. Install Hermes** (skip if you already run it):
+**2. Install Hermes** (skip if you already run it). The repo vendors the reviewed installer — the
+same bytes the container image builds with:
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+bash adapters/hermes/hermes-install.sh
 ```
 
 **3. Secrets + exhaust dir** — do this BEFORE the installer (step 4 reads the key from here):

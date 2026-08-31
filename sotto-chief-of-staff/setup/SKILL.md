@@ -91,18 +91,22 @@ skip everything, say "no problem — tell me anytime" and move on; never block s
 
 **4. Schedule the briefs — dedup first, ALWAYS.** Run every `hermes cron …` command in this step
 through the **`terminal` tool**, verbatim (`execute_code` is for the Python scripts, not host CLIs —
-the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check which of the five jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers all five at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
-   The five jobs, their schedules and their skills live in **`adapters/hermes/crons.json`** — the one
-   source `start.sh` and the installers read; if a schedule here ever disagrees with it, `crons.json`
-   is right. Always pass **`--name`** (so boot-time dedup recognizes the job) and
+the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check which of the host-scheduled jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers them at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
+   All five jobs, their schedules, their skills and who runs each one live in
+   **`adapters/hermes/crons.json`** — the one source `start.sh`, the installers and the receiver read;
+   if a schedule here ever disagrees with it, `crons.json` is right. Always pass **`--name`** (so boot-time dedup recognizes the job) and
    **`--deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`** — without `--deliver` the brief goes to the
    default `local` sink and never reaches the user:
-   - Morning brief — `hermes cron create "30 6 * * *" "Run my morning brief" --skill sotto-morning-brief --name sotto-morning-brief --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`
-   - Evening brief (includes the post-meeting followup content) — `hermes cron create "30 17 * * *" "Run my evening brief" --skill sotto-evening-brief --name sotto-evening-brief --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`
+   - Morning and evening briefs — **do NOT create these**. They are `"runner": "receiver"` jobs: the
+     trigger receiver fires them off `crons.json` on its own clock so a brief has one delivery lane
+     (its outbox, with retries and the deliver-once gate). If `hermes cron list` still shows a
+     `sotto-morning-brief` or `sotto-evening-brief` job, leave it alone — the next boot removes it.
+     Only where NO receiver runs (a laptop-only install) does the host scheduler carry them, and the
+     local installer already registered them there.
    - Weekly relationship pulse — `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`
    - Proactive check (mostly-silent watcher) — `hermes cron create "*/15 * * * *" "Run my proactive check" --skill sotto-proactive --name sotto-proactive --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"` (skip if the user disabled it via `SOTTO_PROACTIVE=0`)
    - Midday catch-up digest — `hermes cron create "30 12 * * *" "Run my midday digest" --skill sotto-event --name sotto-midday-digest --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"` (adaptive: delivers only on a heavy day, else silent; skip if disabled via `SOTTO_DIGEST=0`)
-   **On a non-Hermes host, register the same five jobs with that host's scheduler** — OpenClaw is `openclaw cron add "<cron>" "<prompt> (use the <skill> skill)" --name <name> --declaration-key sotto:<name> --announce --channel "${SOTTO_CRON_DELIVER:-whatsapp}"` (no `--skill` flag, and without `--declaration-key` a re-run silently creates a duplicate).
+   **On a non-Hermes host, register the same host-scheduled jobs with that host's scheduler** — OpenClaw is `openclaw cron add "<cron>" "<prompt> (use the <skill> skill)" --name <name> --declaration-key sotto:<name> --announce --channel "${SOTTO_CRON_DELIVER:-whatsapp}"` (no `--skill` flag, and without `--declaration-key` a re-run silently creates a duplicate).
    `SOTTO_CRON_DELIVER` is the whole channel choice and it is ONE target for every job — never pass a different `--deliver` per job, and never hard-code `whatsapp` in place of the variable.
    Tell the user the times and that they can change them ("want different times? just tell me").
 

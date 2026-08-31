@@ -871,3 +871,32 @@ def test_company_about_is_written_and_a_user_edit_is_never_overwritten(tmp_path)
                                    "updated_by": "web_research"}]}, NOW)
     body = open(path).read()
     assert "Builds CI tooling. Bootstrapped." in body and "Builds dev tools." not in body
+
+
+def test_the_cli_run_as_a_script_writes_relations(tmp_path):
+    """Production invokes this file as __main__ — and the guard once sat ABOVE the locked
+    relation/merge wrappers, so script-mode main() ran before link_relation existed and every
+    relation in a brief's Learn step was silently lost (exit 0, "relations": 0 — external review,
+    Aug 31). Tests import the module, which executes the whole file first, so 1300+ green tests
+    never saw it. This one runs the CLI exactly the way production does."""
+    import subprocess
+    import sys
+    env = dict(os.environ, SOTTO_DATA=str(tmp_path))
+    script = os.path.join(SCRIPTS, "knowledge_update.py")
+
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"person_updates": [
+        {"person_name": "Vishnu Sharma", "identifier": "v@x.com"},
+        {"person_name": "Priya Patel", "identifier": "p@y.com"}]}))
+    r = subprocess.run([sys.executable, script, str(seed)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+
+    upd = tmp_path / "rel.json"
+    upd.write_text(json.dumps(_intro(date="2026-05-14")))
+    r = subprocess.run([sys.executable, script, str(upd)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["applied"]["relations"] == 1, out
+    # and the relation really landed on disk, both ends
+    blobs = " ".join(p.read_text() for p in (tmp_path / "knowledge" / "people").glob("*.md"))
+    assert "introduced_by" in blobs and "introduced" in blobs

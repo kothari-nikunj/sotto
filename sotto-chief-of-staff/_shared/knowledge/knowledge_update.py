@@ -48,6 +48,11 @@ forward edge and its inverse together, unlink_relation removes both, and merge_p
 repoints every back-reference to a merged-away slug. Extraction feeds it via
 `person_updates[].relations`; an `other_person_name` that resolves to nobody becomes a plain
 "(unlinked)" fact rather than a guessed slug.
+
+CRASH SAFETY, one sentence: an interrupted graph update finishes the next time anything touches the
+graph. Every write lands atomically (`kg.write_person_file`), and the operations that span FILES —
+a relation is on both people, a merge writes the survivor and deletes the loser — go through
+`kg.run_journaled`, whose op list every entry point here replays first (`graph_lock`).
 """
 from __future__ import annotations
 
@@ -56,6 +61,7 @@ import glob
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import yaml
@@ -239,28 +245,11 @@ def new_person_stub(name: str, ident: str, iso: str, cid: str = "",
                           updated_at=iso, updated_by=updated_by))
 
 
-def _read_or_stub(slug: str, name_hint: str, iso: str, updated_by: str):
-    """(path, PersonFile) for an existing slug — or a stub written at that exact slug when the file
-    is missing, so an edge can never name a slug with nothing behind it. Returns (None, None) for a
-    slug that is not a canonical_id: every person file is keyed by one (migrate_people_dir enforces
-    it at every entry point), and a stub that isn't would be born already needing migration."""
-    path = _person_path(slug)
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return path, kg.parse_person_file(f.read())
-    if not kg.valid_canonical_id(slug):
-        return (None, None)
-    return path, kg.PersonFile(canonical_id=slug, name=name_hint or slug,
-                               updated_at=iso, updated_by=updated_by)
-
-
-def _put_edge(p: "kg.PersonFile", rel: "kg.Relation") -> bool:
-    """Append one edge if it isn't already there. Idempotent by (type, other end) — the same edge
-    twice is a no-op, and re-stating it never rewrites the date or confidence already on file."""
-    if any(r.key() == rel.key() for r in p.relations):
-        return False
-    p.relations.append(rel)
-    return True
+def _needs_edge(p: "kg.PersonFile", rel: "kg.Relation") -> bool:
+    """False when this exact edge is already on file. Edge identity is (type, other end), so
+    re-stating one never rewrites the date or confidence already there — which is also what makes
+    replaying a finished link write no bytes."""
+    return not any(r.key() == rel.key() for r in p.relations)
 
 
 def _link_relation_unlocked(slug_a: str, slug_b: str, rel_type: str, name_a: str = "", name_b: str = "",
@@ -268,27 +257,31 @@ def _link_relation_unlocked(slug_a: str, slug_b: str, rel_type: str, name_a: str
                   now: datetime | None = None) -> bool:
     """Write ONE typed edge on BOTH person files: `rel_type` from A to B, and its inverse from B to
     A. Returns True when anything changed. Refuses a type outside the closed vocabulary, a
-    self-edge, and a side whose slug can't hold a file (see _read_or_stub)."""
+    self-edge, and a side whose slug can't hold a file (see kg.read_or_stub_person)."""
     inverse = kg.RELATION_INVERSE.get(rel_type or "")
     if not inverse or not slug_a or not slug_b or slug_a == slug_b:
         return False
     now = now or datetime.now(timezone.utc)
     iso = kg.now_iso(now)
-    path_a, a = _read_or_stub(slug_a, name_a, iso, source)
-    path_b, b = _read_or_stub(slug_b, name_b, iso, source)
+    _path_a, a = kg.read_or_stub_person(slug_a, name_a, iso, source)
+    _path_b, b = kg.read_or_stub_person(slug_b, name_b, iso, source)
     if a is None or b is None:
         return False
     conf = max(0.0, min(float(confidence), 1.0))
-    changed_a = _put_edge(a, kg.Relation(type=rel_type, slug=slug_b, name=name_b or b.name,
-                                         date=date or None, source=source, confidence=conf))
-    changed_b = _put_edge(b, kg.Relation(type=inverse, slug=slug_a, name=name_a or a.name,
-                                         date=date or None, source=source, confidence=conf))
-    if not (changed_a or changed_b):
+    rel_ab = kg.Relation(type=rel_type, slug=slug_b, name=name_b or b.name,
+                         date=date or None, source=source, confidence=conf)
+    rel_ba = kg.Relation(type=inverse, slug=slug_a, name=name_a or a.name,
+                         date=date or None, source=source, confidence=conf)
+    ops = []
+    if _needs_edge(a, rel_ab):
+        ops.append(kg.edge_op(slug_a, name_a or a.name, rel_ab))
+    if _needs_edge(b, rel_ba):
+        ops.append(kg.edge_op(slug_b, name_b or b.name, rel_ba))
+    if not ops:
         return False
-    for path, person in ((path_a, a), (path_b, b)):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(person, now))
+    # An edge is ONE fact about TWO people, so the two file writes are one journaled batch: a crash
+    # between them used to leave a relation only one side of it knew about.
+    kg.run_journaled(ops, now)
     return True
 
 
@@ -300,21 +293,20 @@ def _unlink_relation_unlocked(slug_a: str, slug_b: str, rel_type: str = "",
         return 0
     now = now or datetime.now(timezone.utc)
     inverse = kg.RELATION_INVERSE.get(rel_type or "") if rel_type else ""
-    dropped = 0
+    ops, dropped = [], 0
     for slug, other, want in ((slug_a, slug_b, rel_type), (slug_b, slug_a, inverse)):
         path = _person_path(slug)
         if not os.path.exists(path):
             continue
         with open(path, encoding="utf-8") as f:
             p = kg.parse_person_file(f.read())
-        keep = [r for r in p.relations
-                if not (r.slug == other and (not want or r.type == want))]
-        if len(keep) == len(p.relations):
+        n = sum(1 for r in p.relations if r.slug == other and (not want or r.type == want))
+        if not n:
             continue
-        dropped += len(p.relations) - len(keep)
-        p.relations = keep
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(p, now))
+        dropped += n
+        ops.append(kg.unedge_op(slug, other, want))
+    if ops:
+        kg.run_journaled(ops, now)     # both ends or neither, exactly like the link
     return dropped
 
 
@@ -424,12 +416,9 @@ def _write_merge_suggestions(items: list, iso: str, dismissed: list | None = Non
     path = _suggestions_path()
     tombs = load_merge_dismissed() if dismissed is None else dismissed
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"updated_at": iso, "suggestions": items[:MERGE_SUGGESTIONS_MAX],
-                       "dismissed": tombs[:MERGE_DISMISSED_MAX]}, f, indent=1)
-        os.replace(tmp, path)
+        kg.write_text_atomic(path, json.dumps(
+            {"updated_at": iso, "suggestions": items[:MERGE_SUGGESTIONS_MAX],
+             "dismissed": tombs[:MERGE_DISMISSED_MAX]}, indent=1))
     except OSError:
         pass
 
@@ -654,8 +643,7 @@ def _apply_relations(pending: list, index: dict, counts: dict, dropped: list,
                 # An identifier is not a coincidence (the auto-merge's rule): it is enough identity
                 # to mint the person. A bare NAME out of prose is not.
                 path, stub = new_person_stub(other_name or other_ident, other_ident, iso)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(kg.serialize_person_file(stub, now))
+                kg.write_person_file(path, stub, now)
                 index["by_cid"][stub.canonical_id] = path
                 k = kg.normalize_identifier(other_ident)
                 if k:
@@ -685,14 +673,27 @@ def _apply_relations(pending: list, index: dict, counts: dict, dropped: list,
             p = kg.parse_person_file(f.read())
         for fu in fallbacks:
             _apply_fact(p, cid, fu, today, counts)
-        with open(subject_path, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(p, now))
+        kg.write_person_file(subject_path, p, now)
 
 
 def apply_lock_target() -> str:
     """What `apply()` locks: `$SOTTO_DATA/knowledge/.apply` → the sidecar `.apply.lock`. Named once
     so a second caller can take THE graph lock rather than invent a second one."""
     return os.path.join(kg.data_root(), "knowledge", ".apply")
+
+
+@contextmanager
+def graph_lock():
+    """THE graph's critical section: take the one lock, then finish any interrupted multi-file
+    update before reading a single file.
+
+    Every writer entry point in this module opens with it, which is what makes the rule true —
+    *an interrupted graph update finishes the next time anything touches the graph*. Replay is
+    silent unless it repairs something, and jsonstore.lock is reentrant, so the nested entry points
+    (apply → auto-merge → link) pay for the lock and the replay check once."""
+    with jsonstore.lock(apply_lock_target()):
+        kg.replay_journal()
+        yield
 
 
 def apply(extracted: dict, now: datetime | None = None) -> dict:
@@ -706,7 +707,7 @@ def apply(extracted: dict, now: datetime | None = None) -> dict:
     the suggestion refresh — because those steps read each other's output.
 
     jsonstore.lock is reentrant within a process, so the locked merge/relation entry points nest here for free."""
-    with jsonstore.lock(apply_lock_target()):
+    with graph_lock():
         return _apply(extracted, now)
 
 
@@ -808,8 +809,7 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
         # Honor the writer's own name, as the company lane already does — a user edit or a research
         # sweep must not masquerade as a brief extraction in the file's provenance stamp.
         p.updated_by = _s(upd.get("updated_by")).strip() or "brief_extraction"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(kg.serialize_person_file(p, now))
+        kg.write_person_file(path, p, now)
         person_files.append(os.path.basename(path))
         # Keep the in-run index current so a later update in this same batch (other channel,
         # other name form) resolves to the file we just wrote instead of creating a duplicate.
@@ -977,8 +977,8 @@ def _write_company(path, slug, aliases, about, news, context, iso, domain=None,
         body.append("\n## News\n" + "".join(f"- {n}\n" for n in news))
     if context:
         body.append("\n## Context\n" + context + "\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"---\n{_y.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n" + "".join(body))
+    kg.write_text_atomic(
+        path, f"---\n{_y.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n" + "".join(body))
 
 
 def main():
@@ -1007,24 +1007,30 @@ def main():
     print(json.dumps(result))
 
 
-if __name__ == "__main__":
-    main()
-
-
 def merge_person_files(dst_path: str, src_path: str, now: datetime | None = None) -> bool:
     """The locked entry point — a human-confirmed merge (knowledge_edit --op merge) must not race a
     brief's apply() over the same person files. jsonstore.lock is reentrant within a process, so
     apply()'s own auto_merge path, which arrives here already holding the lock, nests for free."""
-    with jsonstore.lock(apply_lock_target()):
+    with graph_lock():
         return _merge_person_files_unlocked(dst_path, src_path, now)
 
 
 def link_relation(*a, **k):
     """Locked for the same reason as merge_person_files — relations write BOTH people's files."""
-    with jsonstore.lock(apply_lock_target()):
+    with graph_lock():
         return _link_relation_unlocked(*a, **k)
 
 
 def unlink_relation(*a, **k):
-    with jsonstore.lock(apply_lock_target()):
+    with graph_lock():
         return _unlink_relation_unlocked(*a, **k)
+
+
+# The LAST lines of this file, on purpose. This guard once sat above the three locked wrappers —
+# fine for every test (imports execute the whole file before calling anything) and broken for
+# PRODUCTION, where the CLI runs as __main__ and main() executed before merge_person_files /
+# link_relation existed: every relation and auto-merge in a brief's Learn step was silently lost
+# (caught by an external review, Aug 31 — the silent kind, exit 0, "relations: 0"). Any def added
+# below this guard recreates that bug; the CLI regression test runs this file AS A SCRIPT to pin it.
+if __name__ == "__main__":
+    main()

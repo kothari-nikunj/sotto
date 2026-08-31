@@ -3,6 +3,10 @@
 
 Both container boot and live timezone changes call this file. Personal ``user-*`` routines are a
 separate namespace and are never removed, matched, or recreated here.
+
+A row marked ``"runner": "receiver"`` is scheduled by the trigger receiver, not by Hermes: it is
+never registered here, but it IS in the removal markers, so an existing deployment's Hermes copy of
+that job is stripped on the next boot.
 """
 from __future__ import annotations
 
@@ -14,6 +18,11 @@ import subprocess
 
 USER_PREFIX = "user-"
 RETIRED_MARKERS = ("sotto-followup", "Run my followup")
+# crons.json's optional `runner`. "receiver" = the trigger receiver schedules AND delivers this job
+# through its outbox (retries, the deliver-once gate); absent = Hermes runs it. The briefs are
+# receiver-run so a brief has ONE delivery lane.
+HERMES_RUNNER = "hermes"
+RECEIVER_RUNNER = "receiver"
 ID = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{12,})\b")
 USER_FENCE = re.compile(r"(?<![A-Za-z0-9_-])user-[a-z0-9]")
 
@@ -26,11 +35,19 @@ def _spec(path: str) -> list[dict]:
     return [row for row in value if isinstance(row, dict)]
 
 
-def active_jobs(path: str) -> list[tuple[str, str, str, str]]:
+def active_jobs(path: str, runner: str | None = None) -> list[tuple[str, str, str, str]]:
+    """The enabled system jobs as (name, schedule, prompt, skill), honoring `gate`/`schedule_env`.
+
+    `runner` selects which half of the spec you want: None = every enabled job (the receiver's
+    read-only views), HERMES_RUNNER = the jobs Hermes registers, RECEIVER_RUNNER = the jobs the
+    trigger receiver fires on its own clock. This is the ONE gate/override implementation — every
+    consumer filters the same list rather than re-reading the file its own way."""
     jobs = []
     for row in _spec(path):
         name = str(row.get("name") or "")
         if not name or name.startswith(USER_PREFIX):
+            continue
+        if runner and (str(row.get("runner") or "").strip() or HERMES_RUNNER) != runner:
             continue
         gate = row.get("gate")
         if gate and os.environ.get(str(gate), "1") != "1":
@@ -60,6 +77,9 @@ def reconcile(path: str, deliver: str = "whatsapp") -> bool:
         print(f"[sotto] cron reconcile skipped: `hermes cron list` exited {listed.returncode}", flush=True)
         return False
 
+    # Markers come from EVERY non-user row, including the receiver-run ones this reconciler will
+    # not register: leaving them here is what removes an existing deployment's stale Hermes brief
+    # crons on the next boot, so the migration to the single delivery lane needs no manual step.
     markers = [*RETIRED_MARKERS]
     for row in rows:
         name, prompt = str(row.get("name") or ""), str(row.get("prompt") or "")
@@ -87,7 +107,7 @@ def reconcile(path: str, deliver: str = "whatsapp") -> bool:
             return False
 
     ok = True
-    for name, schedule, prompt, skill in active_jobs(path):
+    for name, schedule, prompt, skill in active_jobs(path, HERMES_RUNNER):
         try:
             created = subprocess.run(
                 ["hermes", "cron", "create", schedule, prompt, "--skill", skill,

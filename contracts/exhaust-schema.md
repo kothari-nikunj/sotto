@@ -89,7 +89,10 @@ Sentences read from the USER's vantage. The one writer is
 `merge_person_files`, which repoints every back-reference when two files become one); a type
 outside the table is dropped on read and refused on write. `knowledge_query.py` packs them as the
 `&` line of a person block; the dashboard's `GET /api/people/<slug>` returns them as
-`[{type, slug, name, sentence}]`.
+`[{type, slug, name, sentence}]`. Because an edge is one fact stored on two files, that write is
+journaled: see the graph's crash-safety paragraph in
+[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) — an interrupted graph update finishes the next
+time anything touches the graph.
 
 ## company `<slug>.md`
 ```yaml

@@ -45,6 +45,8 @@ Turn "find time with Dhruv" into real, conflict-free options and a booked event 
 
 ## Notes
 - **Approval first, always** (`_shared/references/approval-tiers.md`). Creating/deleting an event is a real action — never do it without an explicit go-ahead. `review` → show the proposed event and let the user adjust before you create it.
+- **The calendar verbs are gated in code, not just here.** In a scheduled, proactive or event-triage run they refuse before any network call (`{status:"error", error:"refused: unattended run …", fallback:"propose_in_brief"}`, non-zero exit): **do not retry it and do not work around it** — propose the event in the brief and let the user ask for it in conversation. Every attempt, allowed or refused, leaves one metadata-only line in `$SOTTO_DATA/events/sends.jsonl` with the hash of the event's own content — never its text.
+- **If the go-ahead came from a nudge Sotto delivered in another session** (a bare "sure" resolved through `pending_offer.py get`, and that offer carries a `payload_sha256`), add `--offer-bound` to the verb: it re-checks the hash of what you are about to write against what the user approved and refuses on a mismatch. Nothing to add for an in-session yes.
 - **ISO 8601 with timezone offset** for `--start`/`--end` (e.g. `2026-06-27T14:00:00-07:00`), or UTC `Z`. A bare local time will be rejected.
 - **RSVP is `one_tap`**: reversible and low-risk, but still a calendar write — never fire it without the user's explicit in-chat go-ahead, and **never** in an unattended/proactive context. In-place reschedule of someone else's event is still create+delete (see step 4); `calendar-rsvp` only changes YOUR responseStatus.
 - External attendees get a Google invite automatically when you pass `--attendees`.

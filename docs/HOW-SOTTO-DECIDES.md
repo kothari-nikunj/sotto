@@ -189,7 +189,11 @@ to connect!" never earns an interrupt.
   linked before dispatching; on any other delivery channel there is nothing to probe and they just
   run.
 - **Reconnect grace** — a message older than 30 min (`triage_event.EVENT_MAX_AGE_MIN`), or anything
-  in a catch-up batch after your Mac was asleep, never nudges in real time. Missed calls are exempt.
+  in a catch-up batch after your Mac was asleep, never nudges in real time. Missed calls keep a
+  longer leash, not a free pass: a missed call buzzes up to 4 hours after the ring
+  (`MISSED_CALL_MAX_AGE_MIN` — the same clock as the valve's age cap, so a held nudge and a stale
+  call age out together); past that it's told in the digest or the next brief, never rung as
+  "just called" the morning after.
 - **An open loop is a DEBT, not everything that mentions you** — something a person is waiting on
   from you, or something you promised: a specific thing owed, by or to a specific person, with a
   request or a promise behind it. A benefits-enrollment notice, a receipt reminder, a cold pitch, a
@@ -255,8 +259,9 @@ to connect!" never earns an interrupt.
 | Proactive nudges | a meeting starting in ~45 min you haven't prepped, a commitment due today, one chase for something you're owed, a birthday (`SOTTO_BIRTHDAY_LEAD_DAYS`, default 3, days out and on the day — unless a brief already delivered today), a plain question about an ask nobody answered twice, an offer to tidy a heavy pile | the same thing — and the whole push spends **one** unit of the same daily budget, queues to the same digest when it's gone, waits out the same mutes and in-meeting hold, and lands in the same ledger |
 
 The digest window is anchored to the brief that actually *delivered* — the deliver-once claim
-(`brief_marker.py`) advances the stamp when it wins — so the 12:30 digest can never repeat what the
-morning brief just covered. Briefs and nudges are always **drafts**; Sotto never sends for you — a
+advances the stamp when it wins (`brief_marker.py` on a local install; the receiver's send seam on
+the cloud, where the claim happens at the moment of delivery) — so the 12:30 digest can never
+repeat what the morning brief just covered. Briefs and nudges are always **drafts**; Sotto never sends for you — a
 Gmail draft is the most literal version of that promise, since it sits in your own drafts folder
 until you press send.
 
@@ -266,6 +271,28 @@ until you press send.
 instead of dying.** Deciding to send and actually sending are two facts, and the second one used to
 be a hope: a gateway that was down for ninety seconds threw away the words, the interrupt budget
 and the tokens that produced them, and left an honest "failed" receipt in place of the message.
+
+The send seam also strips machine markers (`<!--id:…-->` / `<!--meeting:…-->`) from every outgoing
+message: they are dashboard-and-tap-link plumbing the composer keeps in its archive artifact, and
+no run's choice of what to print can leak them to a phone.
+
+**A brief is sent once: the send seam itself claims the deliver-once marker, so a run that forgets
+its claim can no longer double-deliver; the second copy is receipted `superseded`, never sent.** Two
+paths compose your morning and evening brief — the schedule and the Mac's wake-push — and the day
+belongs to whichever of them gets to the marker first. **Both are the same lane now:** the schedule
+lives where it always did (`crons.json`), but the receiver fires it on its own clock rather than the
+agent's, so a scheduled brief is written down before the first send attempt and retried like
+everything else — the 6:30 brief no longer disappears because the channel was down at 6:30.
+That marker used to be claimed only because
+the skill was told to; on August 30 a run wasn't listening and the evening brief arrived twice, so
+the claim now lives in the machinery every message passes through rather than in an instruction.
+And it is claimed **at delivery, not before**: a run that claimed early and then died before its
+words reached the outbox used to leave the day marked delivered with nothing queued to deliver it —
+so on the cloud only the send seam writes the marker, and the skill's own claim just answers.
+The wake-push also stops composing a brief it would only have to throw away: a wake that lands
+within **10 minutes** of a brief's scheduled time presumes that run is still writing (a compose
+takes three to five), and folds its fresh data into the local snapshot instead of starting a second
+one. A wake outside that window still composes, because then the scheduled brief really is missing.
 
 So every message Sotto composes is written down — with its own id — **before** the first send
 attempt, and only the channel's acknowledgement moves it to delivered. Anything else waits and is
@@ -283,6 +310,54 @@ Waiting is not forever, and how long depends on what it is:
 
 Nothing is thrown away quietly: every failure and every expiry is a row in the Record with its
 reason, and the Briefs page carries a line whenever anything is still waiting or has given up.
+
+### What Sotto did on your behalf — the receipt
+
+Delivery is about messages Sotto sends *you*. A send, a reply, an invite, an RSVP or a deleted event
+is different: it reaches someone else, and it should leave proof you can check rather than a promise
+you have to take. One sentence each:
+
+- **Every real effect leaves a receipt**, allowed or refused, in `events/sends.jsonl` — the verb, who
+  it was aimed at, whether the run was unattended, and how it ended.
+- **The receipt names the bytes without keeping them**: it carries `payload_sha256`, the hash of the
+  exact text that left, so what was sent can be checked against what you were shown while the ledger
+  holds not one readable word of it.
+- **A scheduled run cannot send mail or touch your calendar at all** — the refusal is in the code,
+  before anything reaches Google, and it is recorded like any other attempt.
+- **When Sotto asked in one place and you answered in another, your yes is bound to the exact
+  content it was given**: the acting verb recomputes that hash and refuses on a mismatch, so text
+  that changed after you approved it never goes out.
+- **In the same conversation, that binding is a record rather than a wall** — when you say yes and
+  Sotto acts on the spot, Sotto computes both halves, so the hash lets you *prove* afterwards what
+  was sent; it does not pretend to prevent it. Saying so is the point: an overclaimed guarantee is
+  worse than a stated gap.
+
+## Retention — what ages out, and when
+
+Sotto's volume used to only ever grow: `forget.py` deleted what you asked it to, and everything you
+never asked about stayed forever. Since Aug 2026 a **daily sweep at 3:30 AM local**, on the same
+receiver clock that fires your briefs, ages out the exhaust. It is machinery, not an instruction —
+the same reason the deliver-once claim moved into the send seam.
+
+One sentence per family:
+
+| What | Kept | Why that long |
+|---|---|---|
+| What Sotto **sent** on your behalf (`events/sends.jsonl`) | **180 days** | the authorization trail for outbound acts, kept twice as long as anything else on purpose |
+| Delivery receipts, triage verdicts, dashboard writes | **90 days** | "did it land?" and "why wasn't I nudged?" are questions about last week, not last year |
+| Drafts Sotto offered you | **30 days** | matched to what you sent within a day; a month is learning, longer would be an archive of things you didn't say |
+| Delivered briefs and their per-day markers | **60 days** | the same clock as the snapshot each was built from |
+| Staged payloads and a crashed run's leftovers | **7 days** | read by the run they were staged for; a week collects the ones whose run died |
+| The nudge-dedup stamps | **30 days** | only today's is ever read |
+| The brief log | **last 5 MB** | truncated in place, because a running brief holds it open |
+
+**Nothing in your memory is ever auto-deleted.** The graph (people, companies, `master.md`), the
+continuity ledger, your style profile, your preferences, the golden corpus, your credentials and any
+deck you asked Sotto to read are never a sweep target — the guard is checked per path, below every
+rule, so a future mistake in the table still cannot reach them. Deleting *that* is a decision you
+make about your own graph, which is why it belongs to the graph's editor and to `forget.py`, not to
+a daemon. A missed sweep costs nothing: every rule is stated as an age, so the next day's sweep
+removes exactly what the missed one would have.
 
 ## Where to see what happened
 

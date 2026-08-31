@@ -107,7 +107,10 @@ python3 evals/run_golden.py --live --judge --sample 5        # real briefs + the
 python3 evals/run_golden.py --live --judge --update-baseline # record the baseline you'll defend
 ```
 
-Then "run the golden evals" before any judgment-touching merge.
+Then "run the golden evals" before any judgment-touching merge. Until the baseline is recorded,
+every run ends `RESULT: NO BASELINE` — the gate never passes on nothing to compare against. Later
+runs must match the baseline's shape (mode and `--sample`): a metric the baseline holds that a run
+didn't produce is a FAIL, not a skip.
 
 ## What ages
 

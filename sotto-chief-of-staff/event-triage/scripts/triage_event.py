@@ -233,8 +233,15 @@ VALVE_MAX_PER_HOUR = 2
 # an ask Sotto itself held.
 VALVE_MAX_AGE_MIN = 240
 # Reconnect grace: an event older than this (or any message in a Bridge catch-up batch) never nudges
-# in real time — it queues for the digest/next brief. Missed calls are exempt.
+# in real time — it queues for the digest/next brief. Missed calls get a LONGER leash instead of a
+# free pass (below).
 EVENT_MAX_AGE_MIN = 30
+# The missed-call ceiling: rare and high-signal, so a missed call is still worth a buzz HOURS after
+# the ring — but not forever. A Mac that slept overnight syncs last night's call log at 7am, and
+# "Arjun just called" twelve hours after the ring is a lie the user caught (owner, Aug 29). Past
+# this it queues for the digest/next brief — told, never rung. Same clock as the valve's age cap,
+# on purpose: a held nudge and a stale call age out together.
+MISSED_CALL_MAX_AGE_MIN = VALVE_MAX_AGE_MIN
 # The attention-queue priority at which a contact counts as a VIP — VIPs are the only senders whose
 # missed call clears quiet hours. A stated vip_people entry or a family_of relation also qualifies.
 VIP_PRIORITY_MIN = 10
@@ -1499,13 +1506,15 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         # bursts. A real-time nudge only makes sense for a real-time event — a stale message was
         # probably already handled on another device, so anything older than max_age (or any
         # message in an explicit catchup batch) goes to the queue and surfaces in the digest/next
-        # brief instead of a barrage of nudges. Missed calls stay exempt: rare, high-signal, and
-        # still worth surfacing hours later.
-        if verdict == "agent" and cls != "missed_call":
-            if catchup:
+        # brief instead of a barrage of nudges. Missed calls get a longer leash, not a free pass:
+        # they skip the catchup queue and the 30-min bar, but past MISSED_CALL_MAX_AGE_MIN they
+        # queue too — an overnight sync must not ring "just called" twelve hours after the ring.
+        if verdict == "agent":
+            cls_max = MISSED_CALL_MAX_AGE_MIN if cls == "missed_call" else max_age
+            if catchup and cls != "missed_call":
                 held_class = cls
                 verdict, cls, reason = "queue", "stale", f"catchup batch → queued ({name})"
-            elif age is not None and age > max_age:
+            elif age is not None and age > cls_max:
                 held_class = cls
                 verdict, cls, reason = "queue", "stale", f"{int(age)}m old → queued ({name})"
         if verdict == "agent":

@@ -215,7 +215,12 @@ def main():
     now = datetime.now()
 
     try:  # legacy name-slug files → canonical_id keying (idempotent; reads work pre-first-update)
-        kg.migrate_people_dir(now)
+        # Under THE graph lock: this is a read path, but migrate re-keys and merges FILES — the one
+        # writer that used to run outside the lock, able to race a locked writer or overwrite its
+        # in-flight journal. graph_lock also replays an interrupted batch before we read anything.
+        import knowledge_update as ku  # noqa: PLC0415 — lazy: a query must never break on import
+        with ku.graph_lock():
+            kg.migrate_people_dir(now)
     except Exception:  # noqa: BLE001
         pass
 

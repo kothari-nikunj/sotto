@@ -25,9 +25,16 @@ they meant, not guessed at — and the newer question is the one on their screen
 Expiry is checked at READ (`expires_at`, default 180 min): nothing daemonic, no sweeper, and a
 stale file simply never answers. "Sure" three hours after the meeting started is not a yes to it.
 
-Ephemeral by construction: `{ts, kind, question, person, detail, expires_at}` and nothing else.
-This is not memory — a question the user answered (or didn't) three months ago could not be used
-by any brief or prep, so nothing here is ever promoted to the graph.
+WHEN THE YES CAUSES A REAL EFFECT, BIND IT TO THE BYTES. An offer that ends in an outbound send or
+a calendar write takes `--payload-file PATH`, whose exact bytes are the content being offered; only
+`payload_sha256` is stored, never the payload. The acting verb (`google_action.py --offer-bound`)
+recomputes that hash over what it is about to do and refuses when it differs, so an approval covers
+the content the user actually saw and nothing else. Offers whose yes only runs a read — "want me to
+pull prep?" — have nothing to hash and pass no payload file.
+
+Ephemeral by construction: `{ts, kind, question, person, detail, payload_sha256, expires_at}` and
+nothing else. This is not memory — a question the user answered (or didn't) three months ago could
+not be used by any brief or prep, so nothing here is ever promoted to the graph.
 
 State: `$SOTTO_DATA/proactive/pending_offer.json`, read/written under jsonstore's lock because the
 writer (proactive lane) and the reader (gateway) are different processes.
@@ -35,6 +42,7 @@ writer (proactive lane) and the reader (gateway) are different processes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -63,9 +71,20 @@ def _parse(ts: str):
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
+def payload_hash(payload: bytes) -> str:
+    """sha256 hex of the exact bytes an offer covers — THE hasher, imported by the acting verb
+    rather than reimplemented there, because the lane that offers and the verb that acts must agree
+    byte-for-byte or the binding is theater. A hash is not content: it names which bytes without
+    keeping any of them."""
+    return hashlib.sha256(payload).hexdigest()
+
+
 def set_offer(kind: str, question: str, person: str = "", detail: str = "",
-              ttl_min: int = DEFAULT_TTL_MIN) -> dict:
-    """Record the question just delivered. Overwrites: newest wins, one offer at a time."""
+              ttl_min: int = DEFAULT_TTL_MIN, payload_sha256: str = "") -> dict:
+    """Record the question just delivered. Overwrites: newest wins, one offer at a time.
+
+    `payload_sha256` is set only when the yes causes a real effect; the payload itself is never
+    stored, here or in the receipt the acting verb writes."""
     now = _now()
     offer = {
         "ts": now.isoformat(),
@@ -73,6 +92,7 @@ def set_offer(kind: str, question: str, person: str = "", detail: str = "",
         "question": question,
         "person": person or "",
         "detail": detail or "",
+        "payload_sha256": payload_sha256 or "",
         "expires_at": (now + timedelta(minutes=ttl_min)).isoformat(),
     }
     path = _path()
@@ -118,13 +138,20 @@ def main() -> None:
     s.add_argument("--person", default="", help="who the offer is about, if it names someone")
     s.add_argument("--detail", default="", help="free text the acting session may need")
     s.add_argument("--ttl-min", type=int, default=DEFAULT_TTL_MIN)
+    s.add_argument("--payload-file", default="",
+                   help="file holding the EXACT bytes offered (a draft body, a canonical event); "
+                        "only its sha256 is stored, and the acting verb must match it")
 
     sub.add_parser("get", help="print the fresh offer, or {}")
     sub.add_parser("clear", help="remove the offer")
 
     a = ap.parse_args()
     if a.cmd == "set":
-        print(json.dumps(set_offer(a.kind, a.question, a.person, a.detail, a.ttl_min)))
+        digest = ""
+        if a.payload_file:
+            with open(a.payload_file, "rb") as f:
+                digest = payload_hash(f.read())
+        print(json.dumps(set_offer(a.kind, a.question, a.person, a.detail, a.ttl_min, digest)))
     elif a.cmd == "get":
         print(json.dumps(get_offer()))
     else:

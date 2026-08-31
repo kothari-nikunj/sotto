@@ -24,7 +24,8 @@ CLI (all output JSON):
     master_file.py remove  --section N                # delete a section
 
 Writes hold the jsonstore sidecar lock (a gateway edit and a brief's read can overlap) and land
-atomically. A write that would push the file past MASTER_CHAR_CAP fails — with per-section sizes,
+atomically, through the same `knowledge.write_text_atomic` every other file under `knowledge/` is
+written with. A write that would push the file past MASTER_CHAR_CAP fails — with per-section sizes,
 so the caller trims deliberately rather than the file silently outgrowing every prompt it rides in.
 Deleting the file is the user's right: absent file = empty context, everything still runs.
 """
@@ -36,10 +37,13 @@ import os
 import re
 import sys
 
-_LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")
-if _LIB not in sys.path:
-    sys.path.insert(0, _LIB)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LIB = os.path.join(_HERE, "..", "lib")
+for _p in (_LIB, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import jsonstore  # noqa: E402  (the ONE lock implementation)
+import knowledge as kg  # noqa: E402  (the ONE atomic-write implementation for knowledge/)
 
 MASTER_CHAR_CAP = 8000   # the file rides in EVERY brief/prep prompt — small enough to never matter
 
@@ -89,22 +93,6 @@ def _join(preamble: str, sections: list) -> str:
     return out.strip("\n") + "\n" if (out.strip() or sections) else ""
 
 
-def _write_text_atomic(p: str, text: str) -> None:
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = f"{p}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, p)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 class OverCap(Exception):
     """The write would exceed MASTER_CHAR_CAP. Carries {section: chars} so the caller can trim."""
 
@@ -123,7 +111,7 @@ def _mutate(fn) -> dict:
         text = _join(preamble, sections)
         if len(text) > MASTER_CHAR_CAP:
             raise OverCap({name: len(body) for name, body in sections})
-        _write_text_atomic(p, text)
+        kg.write_text_atomic(p, text)
     return {"ok": True, "chars": len(text),
             "sections": {name: len(body.strip("\n")) for name, body in sections}}
 
