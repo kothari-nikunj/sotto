@@ -122,6 +122,10 @@ def upcoming_attendees(calendar) -> list:
                 email, name = _s(raw).strip().lower(), ""
             if not email and not name:
                 continue
+            # A meeting room is not a person: Google books resources as attendees with their own
+            # calendar addresses, and looking one up is a wasted call at best.
+            if email.endswith("@resource.calendar.google.com"):
+                continue
             if owner and email == owner:
                 continue
             domain = email.split("@", 1)[1] if "@" in email else ""
@@ -131,7 +135,12 @@ def upcoming_attendees(calendar) -> list:
             if not key or key in seen:
                 continue
             seen.add(key)
-            out.append({"email": email, "name": name or (email.split("@", 1)[0] if email else "")})
+            # NEVER fabricate a name from the local part. It reads as a name to everything
+            # downstream: `distinctive_email_handle` then sees the candidate handle sitting in the
+            # "name" and refuses it as a bare first name — which silently rejected every attendee
+            # whose invite carries no display name, including the long single-token local parts the
+            # ladder was built from. Empty is honest; the graph supplies the real name.
+            out.append({"email": email, "name": name})
             if len(out) >= MAX_ATTENDEES:
                 return out
     return out
@@ -494,6 +503,10 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
         snapshots = [(attendee, *_graph_person(attendee, index)) for attendee in attendees]
 
     for attendee, person_path, person in snapshots:
+        # The invite had no display name but the graph knows them: use the name we actually have,
+        # so agreement is judged against a person rather than an email stem.
+        if not _s(attendee.get("name")).strip() and person and _s(person.name).strip():
+            attendee = dict(attendee, name=_s(person.name).strip())
         if person and person.x_user_id:
             resolved.append((attendee, person))
             continue

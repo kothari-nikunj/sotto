@@ -373,3 +373,37 @@ def test_two_alexes_at_one_firm_are_never_conflated(tmp_path, monkeypatch):
     assert kg.find_person_file(identifier="alex.smith@northwind.com") is None
     doc = json.loads((tmp_path / "knowledge" / "x_link_suggestions.json").read_text())
     assert doc["suggestions"][0]["x_user_id"] == "911"     # a suggestion, never a link
+
+
+# ── what a real calendar actually looks like (found live, Sep 1) ─────────────────────────────────
+
+def test_an_invite_with_no_display_name_still_resolves(tmp_path, monkeypatch):
+    """Google invites usually carry only an address, and the resolver used to fill `name` from the
+    local part — which `distinctive_email_handle` then read as a bare first name and refused. That
+    silently rejected EVERY nameless attendee, including the long single-token local parts the
+    ladder was built from: a live run made zero lookups for thirteen real attendees."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    cal = [{"summary": "Coffee", "attendees": [{"email": "taylorwexford@example.com"}]}]
+    assert xc.upcoming_attendees(cal) == [{"email": "taylorwexford@example.com", "name": ""}]
+    assert xc.distinctive_email_handle("", "taylorwexford@example.com") == "taylorwexford"
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
+        "taylorwexford": {"id": "555", "username": "TaylorWexford", "name": "Taylor Wexford",
+                           "description": "building Interlace"}}))
+    ku.apply({"person_updates": [{"person_name": "Taylor Wexford",
+                                  "identifier": "taylorwexford@example.com",
+                                  "profile_patch": {"company": "Interlace"}}]},
+             datetime(2026, 8, 31, tzinfo=timezone.utc))
+    out = xc.gather(cal, now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+    # the graph's name is what agreement is judged against, and the company in the bio confirms it
+    assert out["attendees"][0]["x_user_id"] == "555"
+    assert out["usage"]["user_lookup_requests"] == 1
+
+
+def test_a_meeting_room_is_not_a_person(tmp_path, monkeypatch):
+    """Google books resources as attendees; looking one up is a wasted call at best."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    cal = [{"summary": "Board", "attendees": [
+        {"email": "c_1882ukfqe2uqij@resource.calendar.google.com",
+         "displayName": "HQ-Suite 800-Board Room (10)"},
+        {"email": "alex@pantograph.example"}]}]
+    assert [a["email"] for a in xc.upcoming_attendees(cal)] == ["alex@pantograph.example"]
