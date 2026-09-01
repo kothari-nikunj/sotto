@@ -55,7 +55,10 @@ from textutil import (  # noqa: E402
 )
 from timeutil import _parse_ts, _user_local_date, _user_tz_offset  # noqa: E402
 from gemini import call_gemini  # noqa: E402
-from render_local import RESEARCH_HORIZON_HOURS, resolve_contact_names  # noqa: E402
+from render_local import (  # noqa: E402
+    RESEARCH_HORIZON_HOURS, _format_source_availability, _format_x_context,
+    resolve_contact_names,
+)
 import ledger_io  # noqa: E402  (continuity ledger read — per-attendee open loops)
 import research_attendees as ra  # noqa: E402  (is_filler_point — shared anti-fabrication filter)
 from chatfmt import to_chat  # noqa: E402
@@ -345,6 +348,8 @@ def _upcoming(inputs: dict) -> list:
     google = _obj(inputs, "google")
     user_email = _s(google.get("userEmail")).lower()
     user_domain = user_email.split("@")[1] if "@" in user_email else ""
+    if user_domain in ra.FREEMAIL_DOMAINS:
+        user_domain = ""
     now = datetime.now(timezone.utc)
     upcoming = []
     for e in _arr(google, "events"):
@@ -502,7 +507,14 @@ def build_context(inputs: dict) -> tuple[str, list]:
         meetings_out.append({"event_id": _s(e.get("id")), "title": title,
                              "start": start, "attendees": att_struct, "talking_points": []})
 
-    return "\n\n".join(([focus_note] if focus_note else []) + blocks), meetings_out
+    context = "\n\n".join(([focus_note] if focus_note else []) + blocks)
+    x_context = _format_x_context(inputs).strip()
+    if x_context:
+        context += "\n\n" + x_context
+    raw_x = inputs.get("x_context") if isinstance(inputs, dict) else None
+    if isinstance(raw_x, dict) and raw_x.get("warnings"):
+        context += "\n\n" + _format_source_availability({"x": "unavailable"})
+    return context, meetings_out
 
 
 def _master_context() -> str:
@@ -573,6 +585,7 @@ def main():
     ap.add_argument("--calendar", help="Calendar JSON: an array, or {events:[...]}/{items:[...]}")
     ap.add_argument("--local", help="read_local output JSON (contacts + granola + knowledge-graph notes)")
     ap.add_argument("--attendee-research", dest="attendee_research", help="attendee research JSON array")
+    ap.add_argument("--x-context", dest="x_context", help="ephemeral upcoming-attendee X context")
     ap.add_argument("--attendee-comms", dest="attendee_comms",
                     help="per-attendee Gmail threads JSON ({email:[{date,subject,snippet,from_me}]}"
                          " — gather_google.py --attendee-comms output)")
@@ -586,8 +599,8 @@ def main():
                          "variant); no match on the calendar ahead degrades to the normal sweep")
     args = ap.parse_args()
 
-    using_files = any([args.calendar, args.local, args.attendee_research, args.attendee_comms,
-                       args.knowledge, args.granola])
+    using_files = any([args.calendar, args.local, args.attendee_research, args.x_context,
+                       args.attendee_comms, args.knowledge, args.granola])
     if not using_files:
         raw = open(args.inputs).read() if args.inputs else sys.stdin.read()
         inputs = json.loads(raw) if raw.strip() else {}
@@ -628,6 +641,7 @@ def main():
         "google": google,
         "local": local,
         "attendee_research": load(args.attendee_research, []),
+        "x_context": load(args.x_context, {}),
         "attendee_comms": load(args.attendee_comms, {}),
         "prior_knowledge": load(args.knowledge, {}),
         "focus": args.focus,

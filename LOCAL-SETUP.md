@@ -110,8 +110,8 @@ it names — do step 1 (option A is the quick one) and re-run the installer.
 hermes setup            # connect Google Workspace — interactive OAuth via the google-workspace CLI
                         # (Granola locally: set GRANOLA_API_KEY, or GRANOLA_MCP_CMD for a stdio
                         #  MCP — RAILWAY.md § Granola fallbacks; the /setup wizard tile is cloud-only)
-hermes gateway setup    # WhatsApp (scan a QR) or Telegram (bot token) — for scheduled-brief delivery
-                        # WhatsApp is only the default; the choice is in CHANNELS.md
+hermes gateway setup    # Telegram (bot token) or WhatsApp (scan a QR) — for scheduled-brief delivery
+                        # Telegram is only the default; the choice is in CHANNELS.md
 hermes                  # then: "Sotto, set up"  →  "Sotto, morning brief"
 ```
 
@@ -123,8 +123,9 @@ from the Mac.
 
 ## How briefs reach you locally
 - **Interactive** — always works, no channel: run `hermes` and ask ("Sotto, morning brief").
-- **Scheduled** — the installer's crons are created with `--deliver whatsapp` (same as the cloud;
-  `SOTTO_CRON_DELIVER` overrides). They reach you only while `hermes gateway` is running on the Mac with
+- **Scheduled** — the installer's crons are created with `--deliver whatsapp` (a local Hermes pairs
+  WhatsApp interactively, so that stays the laptop default — the cloud boot resolves its own channel;
+  `SOTTO_CRON_DELIVER` overrides either way). They reach you only while `hermes gateway` is running on the Mac with
   that channel connected (step 6). Set `SOTTO_CRON_DELIVER=local` before running the installer only if
   you deliberately want cron briefs kept in the CLI session instead.
 

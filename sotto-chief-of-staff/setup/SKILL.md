@@ -31,10 +31,12 @@ Do NOT explore the filesystem / packages / Hermes internals or run `hermes tools
    - **Google** — REQUIRED to verify, don't just ask. Run `execute_code`:
      `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py" --ensure-deps` first — it heals the Google client library NOW (one-time; **can take up to ~4 minutes on first run** — say "checking your Google connection — first time takes a few minutes" while it installs). Then probe with ONE tiny fetch:
      `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py" --max 1 --bodies 0` and read its `[gather_google] N emails, M events` line (or, if this host reaches Google via a Gmail/Calendar MCP instead of the CLI, call the host's Gmail tool for 1 result). Any successful fetch (even 0 results with no WARNING) = **connected**; a WARNING/failure = **not connected** → "Google isn't linked yet — open the `/setup` link from your deploy logs to connect Gmail + Calendar."
-   - **Delivery channel** — WhatsApp is the DEFAULT, not the only one; never assume it. Run `execute_code`:
-     `echo "${SOTTO_CRON_DELIVER:-whatsapp}"` — that value is where every scheduled brief and nudge lands.
+   - **Delivery channel** — Telegram is the DEFAULT, not the only one; never assume any of them. The
+     cloud boot resolves the channel and exports it, so read it, don't guess. Run `execute_code`:
+     `echo "$SOTTO_CRON_DELIVER"` — that value is where every scheduled brief and nudge lands, and an empty answer means this host never resolved a channel, which you report rather than fill in.
+     - `telegram` → probe the link: `test -s "${SOTTO_DATA:-/data}/telegram-link.json" && echo linked || echo not-linked` (or `TELEGRAM_ALLOWED_USERS` being set counts as linked too) — `not-linked` = ✗ → "Your bot has no chat id yet — tap the pairing link in your deploy logs, then restart the deploy; boot captures it."
      - `whatsapp` → probe the link: `ls "${SOTTO_DATA:-/data}/hermes/platforms/whatsapp/session/creds.json" "$HOME/.hermes/platforms/whatsapp/session/creds.json" 2>/dev/null | head -1` — a path printed = **linked**; nothing = ✗ → "WhatsApp isn't linked yet — open the `/setup` link from your deploy logs and scan the QR (tile ③)."
-     - anything else (`telegram`, `local`, a BlueBubbles channel name) → there is nothing on this side to probe; report the channel by name and move on. Do **not** send them to the WhatsApp QR, and do not treat the wizard's grey "Link WhatsApp" tile as a problem.
+     - anything else (`local`, a BlueBubbles channel name) → there is nothing on this side to probe; report the channel by name and move on. Do **not** send them to another channel's link step, and do not treat the wizard's tile ③ for a channel they don't use as a problem.
    - **Granola** — OPTIONAL. Probe the **connector file**, not your toolset (Granola links via the `/setup` wizard's Connected-services tile, which stores an OAuth token on the volume). Run `execute_code`:
      `test -f "${SOTTO_DATA:-/data}/connectors/granola.json" && echo linked || echo not-linked`
      - `linked` → verify with one tiny gather: `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_granola.py"` and read its summary line — JSON out with no WARNING = **connected**; a WARNING/failure = ✗ → "Granola is linked but the fetch failed — reconnect it on your `/setup` page (Connected services)."
@@ -95,7 +97,7 @@ the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check 
    All five jobs, their schedules, their skills and who runs each one live in
    **`adapters/hermes/crons.json`** — the one source `start.sh`, the installers and the receiver read;
    if a schedule here ever disagrees with it, `crons.json` is right. Always pass **`--name`** (so boot-time dedup recognizes the job) and
-   **`--deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`** — without `--deliver` the brief goes to the
+   **`--deliver "$SOTTO_CRON_DELIVER"`** — without `--deliver` the brief goes to the
    default `local` sink and never reaches the user:
    - Morning and evening briefs — **do NOT create these**. They are `"runner": "receiver"` jobs: the
      trigger receiver fires them off `crons.json` on its own clock so a brief has one delivery lane
@@ -103,18 +105,18 @@ the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check 
      `sotto-morning-brief` or `sotto-evening-brief` job, leave it alone — the next boot removes it.
      Only where NO receiver runs (a laptop-only install) does the host scheduler carry them, and the
      local installer already registered them there.
-   - Weekly relationship pulse — `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"`
-   - Proactive check (mostly-silent watcher) — `hermes cron create "*/15 * * * *" "Run my proactive check" --skill sotto-proactive --name sotto-proactive --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"` (skip if the user disabled it via `SOTTO_PROACTIVE=0`)
-   - Midday catch-up digest — `hermes cron create "30 12 * * *" "Run my midday digest" --skill sotto-event --name sotto-midday-digest --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"` (adaptive: delivers only on a heavy day, else silent; skip if disabled via `SOTTO_DIGEST=0`)
-   **On a non-Hermes host, register the same host-scheduled jobs with that host's scheduler** — OpenClaw is `openclaw cron add "<cron>" "<prompt> (use the <skill> skill)" --name <name> --declaration-key sotto:<name> --announce --channel "${SOTTO_CRON_DELIVER:-whatsapp}"` (no `--skill` flag, and without `--declaration-key` a re-run silently creates a duplicate).
-   `SOTTO_CRON_DELIVER` is the whole channel choice and it is ONE target for every job — never pass a different `--deliver` per job, and never hard-code `whatsapp` in place of the variable.
+   - Weekly relationship pulse — `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "$SOTTO_CRON_DELIVER"`
+   - Proactive check (mostly-silent watcher) — `hermes cron create "*/15 * * * *" "Run my proactive check" --skill sotto-proactive --name sotto-proactive --deliver "$SOTTO_CRON_DELIVER"` (skip if the user disabled it via `SOTTO_PROACTIVE=0`)
+   - Midday catch-up digest — `hermes cron create "30 12 * * *" "Run my midday digest" --skill sotto-event --name sotto-midday-digest --deliver "$SOTTO_CRON_DELIVER"` (adaptive: delivers only on a heavy day, else silent; skip if disabled via `SOTTO_DIGEST=0`)
+   **On a non-Hermes host, register the same host-scheduled jobs with that host's scheduler** — OpenClaw is `openclaw cron add "<cron>" "<prompt> (use the <skill> skill)" --name <name> --declaration-key sotto:<name> --announce --channel "$SOTTO_CRON_DELIVER"` (no `--skill` flag, and without `--declaration-key` a re-run silently creates a duplicate).
+   `SOTTO_CRON_DELIVER` is the whole channel choice and it is ONE target for every job — never pass a different `--deliver` per job, and never substitute a channel name for the variable. Boot exports it (start.sh step 0.4 is the one place the channel is decided); if it is empty, say so and stop rather than guessing, because a guessed channel delivers the user's briefs somewhere they never set up.
    Tell the user the times and that they can change them ("want different times? just tell me").
 
 **5. Close with an HONEST per-connection checklist** — one line per connection, using what step 2 actually verified (✓ = probed OK, ✗ = failed + the one-line fix, – = optional and skipped). Never print a blanket "all set" over a red row. The shape:
    > Here's where you stand:
    > - **Bridge** (Mac: messages, calls, contacts) — ✓ connected *(or ✗ — open the Sotto Bridge menu bar app on your Mac; it dials out — no tunnel)*
    > - **Google** (Gmail + Calendar) — ✓ connected *(or ✗ — open the `/setup` link from your deploy logs to connect)*
-   > - **Delivery** (where briefs land) — ✓ WhatsApp, linked *(or ✗ WhatsApp, not linked yet — scan the QR on your `/setup` page; or, on another channel, just name it: "✓ Telegram")*
+   > - **Delivery** (where briefs land) — ✓ Telegram, linked *(or ✗ Telegram, not linked yet — tap the pairing link in your deploy logs, then restart; on WhatsApp, scan the QR on your `/setup` page; on any other channel, just name it)*
    > - **Granola** (meeting notes) — ✓ connected *(or – optional, skipped)*
    > Briefs are scheduled for 6:30am and 5:30pm.
    **Then say the posture out loud — three plain lines, once, right here** (this is the only moment
@@ -132,7 +134,7 @@ the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check 
    Then offer the first brief: if Bridge AND Google are ✓ → "You're all set ✅ — want your first brief right now? Just say *good morning*. Otherwise I'll have it ready at 6:30am." If anything required is ✗ → "Once that's fixed, say *set up Sotto* again and I'll re-check — you can still say *good morning* for a partial brief from what I can see." If they say yes → run `sotto-morning-brief`.
 
 ## Notes
-- **WhatsApp and Gemini are defaults, not requirements.** If they ask about Telegram, iMessage, or a non-Gemini model, don't improvise — point them at the project's **CHANNELS.md** ("Choosing your channel and model") on GitHub, in the repo they deployed from (it isn't installed locally); it carries the tradeoffs, the exact steps, and how tested each one is. One line, then move on.
+- **Telegram and Gemini are the defaults, not requirements.** If they ask about WhatsApp, iMessage, or a non-Gemini model, don't improvise — point them at the project's **CHANNELS.md** ("Choosing your channel and model") on GitHub, in the repo they deployed from (it isn't installed locally); it carries the tradeoffs, the exact steps, and how tested each one is. One line, then move on.
 - Keep it to ~5 short exchanges total. During step 2, don't narrate every green check one by one — the step-5 checklist is the summary; only surface a check mid-flow when it's red and needs the user.
 - Never assume a grant; always verify via `health()`. Never retry a failed tool call in a loop.
 - If they come back later with "is Sotto working?", just run steps 2 + (if green) 5.

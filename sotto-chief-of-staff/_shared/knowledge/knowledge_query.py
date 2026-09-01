@@ -76,6 +76,11 @@ def pack_person(p: kg.PersonFile, expanded: bool, now: datetime) -> str:
     email = next((i for i in p.identifiers if "@" in i), None)
     if email:
         identity += f" | {email}"
+    if p.x_handles:
+        handle = kg.normalize_x_handle(p.x_handles[-1].get("handle")) \
+            if isinstance(p.x_handles[-1], dict) else ""
+        if handle:
+            identity += f" | X @{handle}"
     lines.append(identity)
 
     # Relations, as sentences, right under the identity line — so every consumer of a packed person
@@ -254,8 +259,15 @@ def main():
         if p.canonical_id and identifiers:
             # confidence "medium": graph identifiers unify identity (canonical_id attach, known-person
             # rescue) but never override a name Apple Contacts resolved (those seed as "high").
-            contact_index.append({"canonical_id": p.canonical_id, "display_name": p.name,
-                                  "identifiers": identifiers, "confidence": "medium"})
+            entry = {"canonical_id": p.canonical_id, "display_name": p.name,
+                     "identifiers": identifiers, "confidence": "medium"}
+            if p.x_user_id:
+                entry["x_user_id"] = p.x_user_id
+            handles = [kg.normalize_x_handle(h.get("handle")) for h in p.x_handles
+                       if isinstance(h, dict) and kg.normalize_x_handle(h.get("handle"))]
+            if handles:
+                entry["x_handles"] = handles
+            contact_index.append(entry)
         if not any(i.strip().lower() in today_emails for i in identifiers):
             if inputs_gate:
                 continue

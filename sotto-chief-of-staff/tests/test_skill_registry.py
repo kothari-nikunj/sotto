@@ -54,7 +54,9 @@ def test_routines_skill_states_the_fence():
     assert 'hermes cron create "<cron>" "<prompt>" --name user-<slug> --deliver' in text
     assert "hermes cron remove" in text and "Remove only `user-` jobs." in text
     assert "Cap: 10 routines" in text
-    assert '"${SOTTO_CRON_DELIVER:-whatsapp}"' in text          # never the silent `local` sink
+    assert '"$SOTTO_CRON_DELIVER"' in text                      # never the silent `local` sink
+    # and never a channel name standing in for it: the channel is resolved ONCE, by boot.
+    assert ":-whatsapp" not in text and ":-telegram" not in text
     # drafts-never-send and no-recursion are inherited guards, stated here too
     assert "No routine schedules a routine." in text
     assert "Drafts, never sends" in text

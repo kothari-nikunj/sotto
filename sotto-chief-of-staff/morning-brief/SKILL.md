@@ -62,6 +62,14 @@ Produce the user's morning brief: what needs attention, what you've already hand
      --research /tmp/sotto_research.json --attendees /tmp/sotto_research_in.json
    ```
    (writes each researched attendee's title/company/summary into the graph as clearly-sourced, LOW-confidence "Per web search: …" facts plus the `last_researched` stamp the filter above reads — grounded in the research output only, never invented. Idempotent; a no-op when research was empty.) **One rule, now global: an external attendee is researched at most once per 30 days, and every research run feeds the graph.**
+   Finally run the bounded X attendee lane:
+   `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/x_connectivity.py" --calendar /tmp/sotto_cal.json --research /tmp/sotto_research.json --out /tmp/sotto_x_context.json`
+   It is read-only, exact-lookup-only, capped at the same 25 attendees, and degrades to an empty
+   payload when X is not connected. WRITING an X identity down needs their full name plus the
+   profile agreeing about their company/domain — nothing weaker is ever remembered. A handle the web
+   pass says a page published for them rides ONE prep marked UNCONFIRMED (a page nobody fetched is a
+   claim, not proof), and everything else is a confirmation suggestion. Public Post/bookmark text remains temporary; only verified X
+   identity and sourced profile facts enter the person graph.
 3. **Extract — this step IS the brief. Run ONE command; do not write the brief yourself.**
    **First, close what's already closed** (one command, before composing — so the brief reasons about
    today's open loops, not last night's). Write `{ "today": "<YYYY-MM-DD>", "signals": { "replied_thread_ids": [<ids you replied to today>] }, "local": <the read_local JSON from /tmp/sotto_local.json>, "emails": <emails from /tmp/sotto_gmail.json>, "events": <calendar events from /tmp/sotto_cal.json> }` to `/tmp/sotto_cont.json`, then:
@@ -74,12 +82,13 @@ Produce the user's morning brief: what needs attention, what you've already hand
    1. Write each gathered source to a temp file (skip any you don't have — only `--local` is required):
       - `read_local` result → `/tmp/sotto_local.json`  ← **REQUIRED** (your iMessage/WhatsApp/calls/notes/etc.; omitting it = a Google-only brief, the exact failure). **Write the tool result AS-IS** — `compose_brief` unwraps the MCP wrapper itself, so do NOT reshape it with an inline `python3 -c` (that trips the dangerous-command gate and silently kills headless/cron runs).
       - Gmail (last 24h) → `/tmp/sotto_gmail.json`  ·  Calendar (next 3d) → `/tmp/sotto_cal.json`
-      - Granola → `/tmp/sotto_granola.json` (already written by `gather_granola.py` in step 1 — pass it as-is)  ·  `knowledge_query.py --calendar /tmp/sotto_cal.json --gmail /tmp/sotto_gmail.json` output → `/tmp/sotto_know.json`  ·  attendee research (step 2) → `/tmp/sotto_research.json`
+      - Granola → `/tmp/sotto_granola.json` (already written by `gather_granola.py` in step 1 — pass it as-is)  ·  `knowledge_query.py --calendar /tmp/sotto_cal.json --gmail /tmp/sotto_gmail.json` output → `/tmp/sotto_know.json`  ·  attendee research (step 2) → `/tmp/sotto_research.json`  ·  X attendee context → `/tmp/sotto_x_context.json`
    2. Run the script via `execute_code` (use the **absolute path** — relative paths won't resolve):
       ```bash
       python3 "$HOME/.hermes/skills/sotto/_shared/scripts/compose_brief.py" --type morning \
         --local /tmp/sotto_local.json --gmail /tmp/sotto_gmail.json --calendar /tmp/sotto_cal.json \
-        --granola /tmp/sotto_granola.json --knowledge /tmp/sotto_know.json --attendee-research /tmp/sotto_research.json
+        --granola /tmp/sotto_granola.json --knowledge /tmp/sotto_know.json \
+        --attendee-research /tmp/sotto_research.json --x-context /tmp/sotto_x_context.json
       ```
       (Interactive runs need `execute_code` approved once — `/approve always`. **Cron/scheduled runs
       hard-block `execute_code`** (no user present; upstream hermes-agent#38585) — there, run the

@@ -39,6 +39,12 @@ _WRITER = textwrap.dedent("""
     spec = importlib.util.spec_from_file_location("knowledge_update", os.path.join({know!r}, "knowledge_update.py"))
     ku = importlib.util.module_from_spec(spec); spec.loader.exec_module(ku)
     import knowledge as kg
+    import jsonstore
+    # This test measures EXCLUSION, not patience. jsonstore's production ceiling is short on purpose
+    # (a stuck writer must not wedge a brief), but on a loaded box — several suites in parallel, which
+    # is how CI runs — a correct lock can legitimately hold longer than that and the waiter would
+    # raise, failing a test about correctness for a reason that is about scheduling.
+    jsonstore.LOCK_TIMEOUT_SECS = 120
     name, fact, delay, hold = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
     if hold:
         # Widen the read→write window from the INSIDE, deterministically: serialization is the last

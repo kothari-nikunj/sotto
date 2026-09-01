@@ -13,7 +13,10 @@ mcp_servers:
       GRANOLA_API_TOKEN: "<token>"
 # Google Workspace: enable via Hermes' native integration (`hermes` setup), not an MCP block.
 
-gateways: [whatsapp]                          # default. or telegram / slack / signal / bluebubbles (iMessage)
+gateways: [telegram]                          # the DEFAULT channel — keep this the same channel as
+                                              # SOTTO_CRON_DELIVER below, or briefs are registered to
+                                              # a gateway this Hermes doesn't run. whatsapp / slack /
+                                              # signal / bluebubbles (iMessage) all work here.
 
 # NOTE: Hermes v0.20+ no longer recognizes the next two keys and logs a harmless "unrecognized key"
 # warning (the scheduler is always on there). Keep them on older Hermes — scheduler.enabled is
@@ -35,6 +38,6 @@ cron:
 # hand? ALWAYS pass --name (boot dedup) and --deliver (without it output goes to the `local` sink
 # and never reaches you):
 #   hermes cron create "30 6 * * *" "Run my morning brief" --skill sotto-morning-brief \
-#     --name sotto-morning-brief --deliver "${SOTTO_CRON_DELIVER:-whatsapp}" 
+#     --name sotto-morning-brief --deliver "${SOTTO_CRON_DELIVER:-telegram}"
 
 storage: /data                                # Railway volume → $SOTTO_DATA (knowledge/*, briefs/, style.json, …)

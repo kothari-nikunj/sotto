@@ -116,6 +116,8 @@ def _person_head(path: str) -> "kg.PersonFile":
         return kg.PersonFile()
     return kg.PersonFile(canonical_id=fm.get("canonical_id", ""), name=fm.get("name", ""),
                          identifiers=[str(i) for i in (fm.get("identifiers") or [])],
+                         x_user_id=(str(fm.get("x_user_id") or "").strip() or None),
+                         x_handles=[h for h in (fm.get("x_handles") or []) if isinstance(h, dict)],
                          updated_at=fm.get("updated_at", ""))
 
 
@@ -173,6 +175,8 @@ def identifiers_conflict(a: "kg.PersonFile", b: "kg.PersonFile") -> bool:
     for kind in ("email", "phone"):
         if ka[kind] and kb[kind] and not (ka[kind] & kb[kind]):
             return True
+    if a.x_user_id and b.x_user_id and str(a.x_user_id) != str(b.x_user_id):
+        return True
     return False
 
 
@@ -207,6 +211,10 @@ def auto_merge_by_identifier(now: datetime | None = None) -> list:
         ranked = sorted(paths, key=lambda pp: _merge_rank(people[pp], pp))
         dst = ranked[0]
         for src in ranked[1:]:
+            # Exact email/phone normally proves identity, but two different immutable X ids are a
+            # positive contradiction caused by a bad prior link. Preserve both files for repair.
+            if identifiers_conflict(people[dst], people[src]):
+                continue
             try:
                 if not merge_person_files(dst, src, now):
                     continue
@@ -792,6 +800,15 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
                 p.company = patch["company"]
         if patch.get("linkedin"):
             p.linkedin = patch["linkedin"]
+        # Deterministic connector writers only: X's immutable id is typed identity, and handles
+        # are observations with history. They never enter the generic email/phone identifier list.
+        x_user_id = str(patch.get("x_user_id") or "").strip()
+        if x_user_id and x_user_id.isdigit() and (not p.x_user_id or p.x_user_id == x_user_id):
+            p.x_user_id = x_user_id
+        if patch.get("x_handle"):
+            kg.observe_x_handle(p, patch["x_handle"], today)
+        if isinstance(patch.get("x_resolution"), dict):
+            p.x_resolution = dict(patch["x_resolution"])
         # Research writers (persist_prep / prewarm_graph) stamp when they actually researched this
         # person; persist_prep.profile_is_fresh keys ONLY off this (file mtime is bumped by every
         # brief rewrite and says nothing about research recency).
@@ -818,6 +835,12 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
             k = kg.normalize_identifier(known)
             if k:
                 index["by_identifier"][k] = path
+        if p.x_user_id:
+            index.setdefault("by_x_user_id", {})[str(p.x_user_id)] = path
+        for item in p.x_handles:
+            handle = kg.normalize_x_handle(item.get("handle")) if isinstance(item, dict) else ""
+            if handle:
+                index.setdefault("by_x_handle", {})[handle] = path
         s = _slug_for(p.name)
         if s:
             index["by_name"][s] = path

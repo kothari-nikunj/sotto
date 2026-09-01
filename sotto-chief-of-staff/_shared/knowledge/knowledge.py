@@ -252,6 +252,13 @@ class PersonFile:
     company: Optional[str] = None
     title: Optional[str] = None
     identifiers: list = field(default_factory=list)
+    # X identity is typed, never mixed into `identifiers`: `@alice` looks email-like to the
+    # generic normalizer, while an X user id is the immutable anchor and handles are mutable
+    # aliases. `x_resolution` is the bounded negative/suggestion cache used by the attendee-prep
+    # resolver, not a fact about the person.
+    x_user_id: Optional[str] = None
+    x_handles: list = field(default_factory=list)  # [{handle, first_seen, last_seen}]
+    x_resolution: Optional[dict] = None
     linkedin: Optional[str] = None
     last_researched: Optional[str] = None
     updated_at: str = ""
@@ -415,6 +422,10 @@ def parse_person_file(content: str) -> PersonFile:
         company=fm.get("company"),
         title=fm.get("title"),
         identifiers=list(fm.get("identifiers") or []),
+        x_user_id=(str(fm.get("x_user_id")).strip() or None) if fm.get("x_user_id") is not None else None,
+        x_handles=[h for h in (fm.get("x_handles") or []) if isinstance(h, dict)],
+        x_resolution=(dict(fm.get("x_resolution"))
+                      if isinstance(fm.get("x_resolution"), dict) else None),
         linkedin=fm.get("linkedin"),
         last_researched=fm.get("last_researched"),
         updated_at=fm.get("updated_at", ""),
@@ -436,6 +447,12 @@ def _person_frontmatter_dict(p: PersonFile) -> dict:
     if p.title is not None:
         d["title"] = p.title
     d["identifiers"] = p.identifiers
+    if p.x_user_id is not None:
+        d["x_user_id"] = p.x_user_id
+    if p.x_handles:
+        d["x_handles"] = p.x_handles
+    if p.x_resolution:
+        d["x_resolution"] = p.x_resolution
     if p.linkedin is not None:
         d["linkedin"] = p.linkedin
     if p.last_researched is not None:
@@ -534,6 +551,33 @@ def normalize_identifier(idv: str) -> str:
     return trimmed
 
 
+def normalize_x_handle(handle: str) -> str:
+    """A bare X handle, or "" when it cannot be one. X handles are 1-15 ASCII word chars."""
+    value = str(handle or "").strip().lower().lstrip("@")
+    return value if re.fullmatch(r"[a-z0-9_]{1,15}", value) else ""
+
+
+def observe_x_handle(p: "PersonFile", handle: str, today: str) -> bool:
+    """Record one observed handle without erasing history. Returns whether the file changed."""
+    value = normalize_x_handle(handle)
+    if not value:
+        return False
+    for idx, item in enumerate(p.x_handles):
+        if not isinstance(item, dict) or normalize_x_handle(item.get("handle")) != value:
+            continue
+        current = idx == len(p.x_handles) - 1
+        if str(item.get("last_seen") or "") == today and current:
+            return False
+        item["last_seen"] = today
+        # List order means alias chronology; moving a re-observed old handle to the end records a
+        # change-back and keeps every reader's "last handle is current" rule true.
+        if not current:
+            p.x_handles.append(p.x_handles.pop(idx))
+        return True
+    p.x_handles.append({"handle": value, "first_seen": today, "last_seen": today})
+    return True
+
+
 def valid_canonical_id(cid: str) -> bool:
     """A usable canonical_id ('c_' + hex). LLM/extraction-supplied ids that don't match are treated
     as absent — they'd otherwise become filenames."""
@@ -554,6 +598,39 @@ def merge_person(dst: "PersonFile", src: "PersonFile") -> "PersonFile":
     for i in src.identifiers:
         if i and i not in dst.identifiers:
             dst.identifiers.append(i)
+    if not dst.x_user_id:
+        dst.x_user_id = src.x_user_id
+    # Alias history unions by normalized handle. The earliest first_seen and latest last_seen win.
+    by_handle = {str(h.get("handle") or "").strip().lower(): h for h in dst.x_handles
+                 if isinstance(h, dict) and str(h.get("handle") or "").strip()}
+    for raw in src.x_handles:
+        if not isinstance(raw, dict):
+            continue
+        handle = str(raw.get("handle") or "").strip().lower().lstrip("@")
+        if not handle:
+            continue
+        if handle not in by_handle:
+            item = dict(raw)
+            item["handle"] = handle
+            dst.x_handles.append(item)
+            by_handle[handle] = item
+        else:
+            cur = by_handle[handle]
+            first = min(x for x in (str(cur.get("first_seen") or ""),
+                                    str(raw.get("first_seen") or "")) if x) \
+                if (cur.get("first_seen") or raw.get("first_seen")) else ""
+            last = max(str(cur.get("last_seen") or ""), str(raw.get("last_seen") or ""))
+            if first:
+                cur["first_seen"] = first
+            if last:
+                cur["last_seen"] = last
+    src_checked = str((src.x_resolution or {}).get("checked_at") or "")
+    dst_checked = str((dst.x_resolution or {}).get("checked_at") or "")
+    if src_checked > dst_checked:
+        dst.x_resolution = src.x_resolution
+    dst.x_handles.sort(key=lambda h: (str(h.get("last_seen") or ""),
+                                      str(h.get("first_seen") or ""),
+                                      str(h.get("handle") or "")))
     for fid, f in src.facts.items():
         if fid not in dst.facts:
             dst.facts[fid] = f
@@ -946,6 +1023,8 @@ def build_people_index() -> dict:
     by_cid: dict = {}
     by_identifier: dict = {}
     by_name: dict = {}
+    by_x_user_id: dict = {}
+    by_x_handle: dict = {}
     name_mtime: dict = {}
     for path in _glob.glob(os.path.join(people_dir(), "*.md")):
         try:
@@ -959,6 +1038,13 @@ def build_people_index() -> dict:
             k = normalize_identifier(str(i))
             if k:
                 by_identifier[k] = path
+        if p.x_user_id:
+            by_x_user_id[str(p.x_user_id)] = path
+        for h in p.x_handles:
+            handle = str(h.get("handle") or "").strip().lower().lstrip("@") \
+                if isinstance(h, dict) else ""
+            if handle:
+                by_x_handle[handle] = path
         s = safe_slug(p.name or "")
         if s:
             try:
@@ -968,16 +1054,23 @@ def build_people_index() -> dict:
             if s not in by_name or mt > name_mtime.get(s, 0.0):
                 by_name[s] = path
                 name_mtime[s] = mt
-    return {"by_cid": by_cid, "by_identifier": by_identifier, "by_name": by_name}
+    return {"by_cid": by_cid, "by_identifier": by_identifier, "by_name": by_name,
+            "by_x_user_id": by_x_user_id, "by_x_handle": by_x_handle}
 
 
 def find_person_file(name: str = "", identifier: str = "", cid: str = "",
-                     index: Optional[dict] = None) -> Optional[str]:
+                     index: Optional[dict] = None, x_user_id: str = "",
+                     x_handle: str = "") -> Optional[str]:
     """Resolve a person to their .md path: canonical_id → identifier (email/phone) → name slug.
     Pass a prebuilt `index` (build_people_index) when resolving many people in one run."""
     idx = index if index is not None else build_people_index()
     if cid and idx["by_cid"].get(cid):
         return idx["by_cid"][cid]
+    if x_user_id and idx.get("by_x_user_id", {}).get(str(x_user_id)):
+        return idx["by_x_user_id"][str(x_user_id)]
+    handle = str(x_handle or "").strip().lower().lstrip("@")
+    if handle and idx.get("by_x_handle", {}).get(handle):
+        return idx["by_x_handle"][handle]
     if identifier:
         k = normalize_identifier(identifier)
         if k and idx["by_identifier"].get(k):

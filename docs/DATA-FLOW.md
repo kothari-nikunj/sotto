@@ -24,6 +24,10 @@ link, that link's URL (the provider fetches the page on your behalf) — never y
 ladder, for pages the crawler rungs can't render): their hosted browser sees the URL you asked
 about and the rendered page. It is never given credentials or your message content, and without the
 key that rung simply doesn't exist.
+**X** is optional and read-only in Phase 1. With your own X credentials, Sotto sends exact handles
+for confirmation, then requests recent public Posts only for upcoming attendees. If you also grant
+`bookmark.read`, X returns the newest bookmarks so Sotto can retain only those authored by an
+upcoming attendee. It never calls X people-search, reads Chat content, mirrors a feed, or sends.
 **Granola** sees nothing new — Sotto reads *from* it. **DocSend** is its own case: asking Sotto to
 read a deck submits **your own email** to the deck's gate, and the sender sees the view (your email,
 the timestamp, per-page time) in their DocSend analytics — which is why deck-reading only works when
@@ -45,6 +49,7 @@ material into one prompt and posts it. That prompt contains, for the window the 
 - **Apple Notes and Reminders** in the window (last 7 days / next 3)
 - recent **file names** and **browser history titles**, when those sources are enabled
 - the **facts already in your knowledge graph** about the people involved
+- recent public X Posts and your matching bookmarks for upcoming attendees, only when you connected X
 
 It is sent under your API key, to your provider, and is subject to that provider's retention and
 training terms — not ours. Check them. For Google AI Studio keys in particular, free-tier and paid
@@ -55,9 +60,9 @@ identical. Fully local would need a local model, which Sotto does not ship — s
 
 ## Everything written to disk, and for how long
 
-All of it lives under `$SOTTO_DATA` on the volume you own. Delete the directory and Sotto has no
-memory. The full writer/reader map is in [ARCHITECTURE.md](ARCHITECTURE.md); this is the
-**retention** view.
+All durable state lives under `$SOTTO_DATA` on the volume you own; the one X prep handoff in
+`/tmp` is called out below. Delete `$SOTTO_DATA` and Sotto has no memory. The full writer/reader map
+is in [ARCHITECTURE.md](ARCHITECTURE.md); this is the **retention** view.
 
 Two things enforce it. `forget.py` (below) deletes a named category **when you ask**. A **daily
 sweep at 3:30 AM local** — `runtime/trigger-receiver/retention.py`, fired from the receiver's own
@@ -68,7 +73,8 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | File | Contains | Retention |
 |---|---|---|
 | `knowledge/last_local_snapshot.json` | **The complete raw Bridge payload** — every message, call, note, reminder, file and contact from the last pull | **Overwritten each brief, never auto-deleted.** The 24h TTL only stops it being *reused*, not *stored*. Delete it by hand or with `forget.py --snapshot` (below). |
-| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted |
+| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted |
+| `knowledge/x_link_suggestions.json` | The X resolver's own notes about people the graph has no file for: metadata-only identity candidates too weak (or too conflicted) to link, and the negative results that stop tomorrow's brief re-asking X the same question | **Never auto-deleted** — bounded to 100 suggestions, and negatives self-prune at 90 days on each write. A negative never creates a person file; confirmation UI is a later phase |
 | `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
 | `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
@@ -93,6 +99,12 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
 | `dashboard_sessions.json` | Dashboard login sessions | Expire on idle; pruned on every read |
 | `dashboard_audit.jsonl` | One line per dashboard write | **90 days** |
+
+One situational handoff lives outside `$SOTTO_DATA`: `/tmp/sotto_x_context.json` contains recent
+Posts and matching bookmarks for the current upcoming-attendee prep. It is mode 0600, overwritten
+on every run, and subject to the host OS/container's temporary-file lifetime. Its contents never
+enter the graph, caches, event ledgers, briefs archive, or relationship state; a new prep fetches
+them again.
 
 **What the sweep will never delete:** `knowledge/` (the graph, `master.md`, style, outcomes, the
 continuity ledger), `corpus/`, `decks/`, `connectors/`, `config/`, `preferences.json`,

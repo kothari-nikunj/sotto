@@ -654,7 +654,11 @@ def test_api_overview_shape(tmp_path):
         assert ov["loops_active"] == 2       # resolved + meeting_prep/meeting-info excluded
         assert ov["last_event_at"] is None                  # no event stamp yet
         assert ov["bridge_connected"] is False
-        assert ov["services"] == {"google": True, "whatsapp": True, "granola": "ok"}
+        # The delivery channel is NAMED (with its own link state), never assumed to be WhatsApp:
+        # this fixture has no session creds and no captured Telegram chat, so it is not linked —
+        # and channel_ok says so rather than flattering a channel that cannot deliver.
+        assert ov["services"] == {"google": True, "channel": "telegram", "channel_ok": False,
+                                  "granola": "ok"}
         # a gather-written error file downgrades granola to reconnect; no token file → absent
         _write(os.path.join(str(tmp_path), "connectors", "granola.error"), "401 upstream")
         ov = json.loads(_get(base, "/api/overview", headers=cookie)[1])
@@ -1874,7 +1878,7 @@ def test_api_cadence_reads_the_funnel_s_own_state_files(tmp_path):
         assert data["snooze"] == {"until": "2099-01-01T07:00", "active": True}
         assert data["quiet"] == {"start": 21, "end": 7}
         assert data["vip_people"] == ["Sarah Chen"]
-        assert data["delivery"]["channel"] == "whatsapp"
+        assert data["delivery"]["channel"] == "telegram"   # no WhatsApp session on this volume
         assert data["intentions"][0]["action"] == "Review the deck"
         assert data["routines"][0]["name"] == "user-friday-loops"
         # the waiting room: newest first, with the funnel's own class vocabulary

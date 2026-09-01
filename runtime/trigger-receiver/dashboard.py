@@ -91,7 +91,6 @@ HOOKS = {
     "bridge_connected": lambda: False,
     "last_event_at": lambda: None,
     "google_ok": lambda: False,
-    "whatsapp_ok": lambda: False,
     "connector_status": lambda: [],
     "connector_error": lambda service: None,
     "connector_has_refresh": lambda service: True,
@@ -115,10 +114,11 @@ HOOKS = {
     "job_names": lambda: [],
     "personal_routines": lambda: [],
     # Delivery honesty for the Cadence panel — which channel briefs and nudges leave by, and
-    # whether it is live right now (the existing _whatsapp_status wording: "linked (ever)").
-    "delivery_channel": lambda: "whatsapp",
+    # whether it is live right now (the channel's own probe: WhatsApp's "linked (ever)" session
+    # creds, Telegram's captured chat id).
+    "delivery_channel": lambda: "telegram",
     "delivery_ready": lambda: False,
-    "whatsapp_status": lambda: "pairing",
+    "channel_status": lambda: "unknown",
     # {pending, failed} from the delivery outbox (outbox.counts) — what Sotto has said but the
     # channel has not yet acknowledged, and what it eventually gave up on. Unwired → zeroes, which
     # render as nothing at all: a quiet outbox is the normal state and deserves no furniture.
@@ -982,9 +982,12 @@ def api_overview() -> dict:
         "loops_active": len(api_loops()["loops"]),
         "last_event_at": last_event,
         "bridge_connected": _hook_bool("bridge_connected"),
+        # One row per thing that can be disconnected. The delivery channel is named, not assumed:
+        # "WhatsApp isn't linked" was a lie on a Telegram deploy.
         "services": {
             "google": _hook_bool("google_ok"),
-            "whatsapp": _hook_bool("whatsapp_ok"),
+            "channel": _s(_hook_str("delivery_channel")),
+            "channel_ok": _hook_bool("delivery_ready"),
             "granola": _granola_state(),
         },
         # Housekeeping, not an alert: one subdued line on Today when a newer Sotto is published.
@@ -1485,9 +1488,9 @@ def api_cadence() -> dict:
     ex = _explicit_prefs()
     waiting, waiting_total = _waiting_room(time.time())
     try:
-        channel = _s(HOOKS["delivery_channel"]()) or "whatsapp"
+        channel = _s(HOOKS["delivery_channel"]()) or "telegram"
     except Exception:  # noqa: BLE001
-        channel = "whatsapp"
+        channel = "telegram"
     intentions = []
     latest = {}
     try:
@@ -1516,7 +1519,7 @@ def api_cadence() -> dict:
                   "end": _int_env("SOTTO_QUIET_END", 7)},
         "delivery": {"channel": channel,
                      "ready": _hook_bool("delivery_ready"),
-                     "whatsapp": _s(_hook_str("whatsapp_status"))},
+                     "status": _s(_hook_str("channel_status"))},
         "meeting_until": _meeting_hold_hint(),
         "vip_people": [x for x in (ex.get("vip_people") or []) if isinstance(x, str)],
         "waiting": waiting,
@@ -1673,7 +1676,7 @@ def api_runs() -> dict:
         else:
             job["at"] = _digest_window_at()
         jobs.append(job)
-    return {"jobs": jobs, "channel": _s(_hook_str("delivery_channel")) or "whatsapp",
+    return {"jobs": jobs, "channel": _s(_hook_str("delivery_channel")) or "telegram",
             "outbox": _outbox_counts()}
 
 

@@ -683,7 +683,7 @@
     }
     var svc = (data.services && typeof data.services === "object") ? data.services : {};
     if (svc.google !== true) trouble.push("Google needs connecting");
-    if (svc.whatsapp !== true) trouble.push("WhatsApp isn't linked");
+    if (svc.channel_ok !== true) trouble.push(humanChannel(svc.channel) + " isn't linked");
     if (svc.granola === "reconnect") trouble.push("Granola needs a reconnect");
     if (trouble.length) parts.push(clause(trouble.join(", "), "/setup", true));
 
@@ -1254,13 +1254,12 @@
   }
 
   function deliveryRule(delivery) {
-    if (str(delivery.channel) !== "whatsapp") {
+    var name = humanChannel(delivery.channel);
+    if (str(delivery.status) === "unknown") {
       return "Briefs and nudges arrive on this channel; there's nothing to link.";
     }
-    if (delivery.ready === true) return "WhatsApp is linked, so nudges can leave.";
-    return str(delivery.whatsapp) === "linked"
-      ? "WhatsApp was linked here once — nudges will try it."
-      : "WhatsApp isn't linked, so nudges are held until it is.";
+    if (delivery.ready === true) return name + " is linked, so nudges can leave.";
+    return name + " isn't linked, so nudges are held until it is.";
   }
 
   /* The snooze row: current state in the folio, [rest of today / 3 days / until…]
@@ -3286,9 +3285,12 @@
     return row;
   }
 
+  /* The display name of a channel — a source on a Record row, or the one Sotto delivers to. */
   function humanChannel(v) {
     var map = { imessage: "iMessage", whatsapp: "WhatsApp", gmail: "Gmail",
-                email: "email", sms: "SMS", calendar: "calendar" };
+                email: "email", sms: "SMS", calendar: "calendar",
+                telegram: "Telegram", discord: "Discord", slack: "Slack",
+                signal: "Signal", bluebubbles: "iMessage", local: "the CLI" };
     var k = str(v).toLowerCase();
     return map[k] || str(v);
   }

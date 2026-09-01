@@ -196,14 +196,31 @@ note "run: SOTTO_RUN_SKILL='hermes -z' SOTTO_TRIGGER_TOKEN=... SOTTO_DATA=/data 
 #    a job that's already registered (by name OR prompt) so re-running the installer never piles up
 #    duplicates. Stable --name makes them addressable for later edit/remove (parity with the cloud boot).
 #    --deliver matters: without it the brief lands in the default "local" sink and never reaches the
-#    user — the exact bug the cloud boot fixed. Same default as start.sh; SOTTO_CRON_DELIVER overrides,
-#    and the receiver sends its own scheduled output to that same channel.
+#    user — the exact bug the cloud boot fixed. The LAPTOP's default is whatsapp, deliberately not the
+#    cloud's telegram: a local Hermes pairs WhatsApp interactively and has no boot-time chat-id
+#    capture (LOCAL-SETUP.md § How briefs reach you locally). SOTTO_CRON_DELIVER overrides, and the
+#    receiver sends its own scheduled output to that same channel.
 #    The job list itself comes from crons.json — the ONE source every registrar reads (start.sh, this
 #    installer, the OpenClaw installer, receiver._sotto_cron_jobs). Gates: SOTTO_PROACTIVE=0 drops the
 #    mostly-silent ~15-min nudge watcher, SOTTO_DIGEST=0 drops the adaptive 12:30 catch-up digest.
 #    No follow-up cron: post-meeting follow-ups run inside the 17:30 evening brief (Sprint 0); the
 #    sotto-followup skill stays installed for on-demand use.
+# Resolution order, and re-running this installer must not undo a choice: what you exported now,
+# else what a previous run persisted, else the laptop default. Without the middle step a plain
+# re-run silently moved a Telegram laptop back to WhatsApp (external review, Sep 1).
+SOTTO_CRON_DELIVER="${SOTTO_CRON_DELIVER:-$(env_file_get SOTTO_CRON_DELIVER)}"
 SOTTO_CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"   # platform-only → uses the gateway home channel
+# …and PERSIST it, because this shell ends. A local Hermes has no start.sh to export the channel, and
+# the skills that register or re-register a routine now read $SOTTO_CRON_DELIVER with no fallback of
+# their own (one resolver, no second guess) — so without this line a later `--deliver ""` would send
+# the brief to the local sink nobody reads (external review, Sep 1). ~/.hermes/.env is the same file
+# this installer already writes the Gemini key into, and it is what a Hermes-spawned skill inherits.
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$HERMES_HOME" && touch "$ENVF"
+  upsert_env SOTTO_CRON_DELIVER "$SOTTO_CRON_DELIVER"
+else
+  echo "+ upsert_env SOTTO_CRON_DELIVER $SOTTO_CRON_DELIVER  → $ENVF"
+fi
 cron_rows() {   # name<TAB>schedule<TAB>prompt<TAB>skill for each job whose env gate is ON
   python3 -c 'import json, os, sys
 for j in json.load(open(sys.argv[1])):

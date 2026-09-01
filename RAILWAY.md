@@ -1,46 +1,47 @@
 # Deploying Sotto to Railway — click-by-click
 
-This is the exact Railway setup for the cloud Sotto host (Hermes + skills + trigger receiver). **Use the
-manual GitHub deploy below — it is the working path today.** The **one-click Deploy button**
-([jump to it](#one-click-deploy-railway-template)) would set up build + `/data` volume +
-`BRIDGE_TOKEN` and prompt for just two values (Gemini key, WhatsApp number), but **no Railway template
-is published for this repo yet, so that button 404s**. The Mac side (Bridge) is tunnel-free —
+This is the exact Railway setup for the cloud Sotto host (Hermes + skills + trigger receiver). Two
+ways in, same result: the **[one-click Deploy link](#one-click-deploy-railway)** — it sets up the
+build, the `/data` volume and `BRIDGE_TOKEN`, and prompts for just two values (your Gemini key and
+your Telegram bot token) — or the manual GitHub deploy below, click by click. The Mac side (Bridge)
+is tunnel-free —
 [download the signed app from GitHub Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
 then see §8.
 
 > **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the friendly fresh-cloud walkthrough.
-> This page is the click-by-click reference behind it. Honest budget for the manual deploy: **~35
-> minutes the first time** (only ~15 of it active — four Railway settings, four variables, then the
-> one-page `/setup` wizard: paste your Google client JSON + auth code, scan one WhatsApp QR; the
-> rest is waiting on builds). *Once* a one-click template exists it would cut the active part to ~5
-> (two prompts + the wizard) — ~20 end to end — but none is published for this repo yet.
+> This page is the click-by-click reference behind it. Honest budget for the manual deploy: **~30
+> minutes the first time** (only ~15 of it active — four Railway settings, three variables, then the
+> one-page `/setup` wizard: paste your Google client JSON + auth code; the rest is waiting on
+> builds). The one-click link cuts the active part to ~5 (two prompts + the wizard).
 
 ## 0. Before you start (prerequisites)
 
 - **A Railway account on a paid (or verified) plan.** Volumes and always-on services are not
-  available on the free/trial tier, and Sotto needs both — the `/data` volume keeps your WhatsApp
-  session + memory, and the 6:30/17:30 cron briefs need the container running around the clock.
+  available on the free/trial tier, and Sotto needs both — the `/data` volume keeps your channel link
+  + memory, and the 6:30/17:30 cron briefs need the container running around the clock.
 - **A Gemini API key** ([aistudio.google.com](https://aistudio.google.com) → Get API key).
+- **A Telegram bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`, about a minute. (Or
+  the WhatsApp variables in step 5 instead; the channel is a choice, not a requirement.)
 - **This repo on your GitHub** (fork or push it) so Railway can deploy from it.
 
 ## Manual-deploy checklist — 4 REQUIRED settings, in order
 
-The one-click template automates exactly these; on a manual deploy **you** do them, and each one
+The one-click link automates exactly these; on a manual deploy **you** do them, and each one
 fails *quietly* if skipped:
 
 1. **Root Directory: leave blank** (the Dockerfile is at the repo root) — Settings ▸
    Build ▸ Builder. Details: [step 2](#2-builder--build-context-critical).
 2. **Variables** — Settings ▸ Variables ([step 5](#5-variables)):
    - `GOOGLE_AI_API_KEY` = your Gemini key
-   - `WHATSAPP_ALLOWED_USERS` = your number, country code, no `+` (e.g. `15551234567`)
-   - `WHATSAPP_HOME_CHANNEL` = same number
+   - `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) gave you — then text your
+     bot once while the deploy boots and your chat id is captured for you (WhatsApp instead? step 5)
    - `SOTTO_USER_EMAIL` = your primary email — **optional; auto-derived after you connect Google**
      on the `/setup` wizard. Set it only to force a different address than the account you connect.
    - `BRIDGE_TOKEN` = a long random secret — generate one: `openssl rand -hex 24`. **Not optional.**
      Without it the Mac pairing link on `/setup` carries an **empty token** — the app looks paired
      but pairing **silently fails**. Set it *before* you first open the setup link.
 3. **Volume mounted at `/data`** — [step 3](#3-add-a-volume-persistent-storage--required). Without
-   it every redeploy wipes the WhatsApp login, Google token, and all of Sotto's memory.
+   it every redeploy wipes the channel link, Google token, and all of Sotto's memory.
 4. **Generate the public domain BEFORE opening the setup link** —
    [step 4](#4-generate-a-public-domain-so-the-mac-can-reach-it). Without a domain, the setup link
    printed in the deploy logs **falls back to `http://localhost:…`** (useless), and the Mac pairing
@@ -94,9 +95,13 @@ The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container 
 ## 5. Variables
 **Settings ▸ Variables:**
 - `GOOGLE_AI_API_KEY` = your Gemini key (any 1M-context model).
-- `WHATSAPP_ALLOWED_USERS` = your number with country code, no `+` (e.g. `15551234567`). Hermes
-  **denies all users until this is set** — without it the brief can't reach you.
-- `WHATSAPP_HOME_CHANNEL` = same number — where the brief is delivered proactively.
+- `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) replies with (`/newbot`).
+  **The only channel variable you need:** the boot log prints a one-tap link
+  (`https://t.me/<your-bot>?start=<this deploy's setup code>`); tap it within five minutes and your
+  chat id is written into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` for you
+  (remembered on the `/data` volume, so it happens once). A message that doesn't carry the code is
+  ignored — a bot's username is discoverable, so an unauthenticated capture would hand your briefs
+  to whoever messaged first. Set `TELEGRAM_ALLOWED_USERS` yourself and the capture never runs.
 - `SOTTO_USER_EMAIL` = your primary email — **optional; auto-derived after you connect Google.**
   It's how Sotto recognizes YOU — skips researching you as a meeting attendee, keeps the
   post-meeting tap from naming you as your own guest, and adds you to the guest list on invites it
@@ -104,47 +109,53 @@ The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container 
   it from the account you authorize (persisted to `/data/config/settings.json`). Set this variable
   only to override that with a different address.
 - `BRIDGE_TOKEN` = the Mac↔cloud shared bearer — **required on a manual deploy**; generate it with
-  `openssl rand -hex 24` (a future template deploy auto-generates it). Plainly: without it the
+  `openssl rand -hex 24` (a one-click deploy auto-generates it). Plainly: without it the
   pairing link the `/setup` wizard renders carries an **empty token**, so Mac pairing **silently
   fails** — set it before you open the setup link. No `BRIDGE_URL` exists anymore — the Mac dials
   *out* to this host's relay.
   *(The wake-push authenticates with `BRIDGE_TOKEN` too — `SOTTO_TRIGGER_TOKEN` exists only if you want a separate bearer for it.)*
 
-> `start.sh` writes these (plus `WHATSAPP_ENABLED=true`) into `~/.hermes/.env` on boot — Hermes reads
-> messaging-platform settings from `.env`, not `config.yaml`. For quick testing you can instead set
-> `GATEWAY_ALLOW_ALL_USERS=true` (open access — anyone who messages the linked WhatsApp can use it).
+> `start.sh` writes these into `~/.hermes/.env` on boot — Hermes reads messaging-platform settings
+> from `.env`, not `config.yaml`. For quick testing you can instead set `GATEWAY_ALLOW_ALL_USERS=true`
+> (open access — anyone who messages the linked bot can use it).
 
-**Not using WhatsApp?** It is the default, not a requirement. Two variables move **Sotto's** half:
+**Which channel?** One sentence decides it, and the boot log says which and why: *Sotto delivers to
+Telegram unless this volume already holds a paired WhatsApp session and no `TELEGRAM_BOT_TOKEN` is
+set.* So a fresh deploy is Telegram, an instance that was set up on WhatsApp keeps WhatsApp across
+redeploys with nothing to set, and `SOTTO_CRON_DELIVER` overrides both.
 
-- `SOTTO_CRON_DELIVER` = `telegram` (or `local`, or whatever name `hermes gateway setup` registered
-  for BlueBubbles/iMessage) — the **one** delivery target for the briefs, the midday digest, the
-  weekly pulse, the proactive watcher and your personal `user-` routines.
-- `WHATSAPP_ENABLED` = `false` — skips the boot-time QR pairing step entirely (otherwise first boot
-  waits up to 15 minutes for a scan that never comes).
+**Want WhatsApp instead?** Three variables, and nothing about it was removed — the container still
+pairs it for you and serves the QR at `/whatsapp/qr`:
 
-…and your channel still needs its **own** sign-in variables on top of those two. For Telegram that's
-three more (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_HOME_CHANNEL`) — **four
-variables in total**, and one command inside your deployed container works out all four for you.
-Do it *after* the first deploy: **[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup)**.
+- `WHATSAPP_ENABLED` = `true` — runs the boot-time pairing step and the WhatsApp gateway.
+- `WHATSAPP_ALLOWED_USERS` = your number with country code, no `+` (e.g. `15551234567`). Hermes
+  **denies all users until this is set**.
+- `WHATSAPP_HOME_CHANNEL` = same number — where the brief is delivered proactively.
+- …plus `SOTTO_CRON_DELIVER` = `whatsapp` to move the briefs there (`local`, or whatever name
+  `hermes gateway setup` registered for BlueBubbles/iMessage, work the same way).
 
-Your channel's own variables (`TELEGRAM_*`, `BLUEBUBBLES_*`, `SIGNAL_*`, `DISCORD_*`, `SLACK_*`) are
-forwarded into `~/.hermes/.env` on every boot by prefix, exactly like the WhatsApp keys — the boot log
-prints `[sotto] gateway variable forwarded to Hermes: <NAME>` for each. Which names your Hermes wants,
-how tested each channel is, and the five-step Telegram walkthrough:
+Every channel variable (`WHATSAPP_*`, `TELEGRAM_*`, `BLUEBUBBLES_*`, `SIGNAL_*`, `DISCORD_*`,
+`SLACK_*`) is forwarded into `~/.hermes/.env` on every boot **by prefix** — these names belong to
+Hermes, not Sotto, and the boot log prints `[sotto] gateway variable forwarded to Hermes: <NAME>` for
+each. Which names your Hermes wants, how tested each channel is, and the per-channel walkthroughs:
 **[CHANNELS.md](CHANNELS.md)**.
 
-## 6. Deploy + pair WhatsApp
-*(Delivering to Telegram or iMessage instead? Skip the pairing half of this section — with
-`WHATSAPP_ENABLED=false` there is no QR at all. [CHANNELS.md](CHANNELS.md) has your five steps.)*
+## 6. Deploy + link your channel
+*(On Telegram — the default — there is no QR: the deploy log prints a one-tap
+`https://t.me/…?start=…` link, you tap it, and the log reads `[sotto] telegram linked ✓`. The
+pairing half of this section is the WhatsApp path, which runs only with `WHATSAPP_ENABLED=true`.)*
 
 - **Deploy.** Watch the **Deploy logs** — Hermes installs here (a failure is loud by design). Grab the
   **setup link** they print (the line starting **`[sotto] Setup link`**): the setup pages (`/setup`,
   `/whatsapp/qr`, `/google/*`, `/debug/google`) are gated behind that link's access code. Open it once
   and a cookie covers the rest; lost it? it reprints on every boot (or read `/data/setup_code`).
   `SOTTO_SETUP_CODE` optionally pins the code. Old bare bookmarks (no `?code=`) now return 403.
-- On first boot `start.sh` runs `hermes whatsapp` (the pairing step — the gateway itself won't pair) and
-  prints a QR. **Scan it from the clean web page, not the deploy logs** (Railway's log viewer distorts the
-  terminal QR):
+- On the Telegram path there is nothing to open: boot runs the chat-id capture and the log reads
+  `[sotto] telegram linked ✓ — briefs and nudges deliver to chat …`. (`telegram NOT linked yet` means
+  your message missed the five-minute window — text the bot and restart the deploy.)
+- With `WHATSAPP_ENABLED=true`, first boot instead runs `hermes whatsapp` (the pairing step — the
+  gateway itself won't pair) and prints a QR. **Scan it from the clean web page, not the deploy logs**
+  (Railway's log viewer distorts the terminal QR):
   - open **`/whatsapp/qr`** via the logged setup link (or from the `/setup` wizard — the code rides along),
   - WhatsApp ▸ **Linked Devices** ▸ Link a Device ▸ scan.
   `creds.json` persists on `/data`, so later boots skip pairing and go straight to the gateway.
@@ -199,17 +210,20 @@ Fallbacks, only if you want them:
 Granola is optional — fine to skip and ship Gmail + Calendar + the Bridge first.
 
 ## 7. Talk to Sotto
-Sotto defaults to **personal number / self-chat** (`SOTTO_WHATSAPP_MODE=2` — the installer answers this for you), so *your own WhatsApp is the bot* —
-you talk to Sotto by **messaging yourself**:
-- WhatsApp ▸ new chat ▸ **"Message Yourself"** (your name with "(You)"), or search your own number.
-- Send **"hi"** → the agent replies, prefixed ***Sotto*** (so you can tell its messages from yours —
-  `start.sh` sets `whatsapp.reply_prefix`; set `SOTTO_HIDE_AGENT_NAME=1` for no prefix at all).
-- A reply confirms the full round-trip (WhatsApp → Hermes → Gemini). A real brief also needs Google
+On **Telegram** (the default) you talk to Sotto in the chat with your bot:
+- Send **"hi"** → the agent replies, and reacts to your message as status (👀 working · ✅ replied ·
+  ❌ error; `SOTTO_REACTIONS=0` turns the tapbacks off).
+- A reply confirms the full round-trip (Telegram → Hermes → Gemini). A real brief also needs Google
   connected (step 6) and the Mac **Bridge** (step 8 below; friendly walkthrough:
   [ONBOARDING.md](ONBOARDING.md) §3 tile ① *Link your Mac*) for local data.
 
-*(Prefer a dedicated bot number instead of self-chat? Set `SOTTO_WHATSAPP_MODE=1` and pair a second
-WhatsApp number — then people message that number directly.)*
+On **WhatsApp**, Sotto defaults to **personal number / self-chat** (`SOTTO_WHATSAPP_MODE=2` — the
+installer answers this for you), so *your own WhatsApp is the bot* and you talk to Sotto by
+**messaging yourself**: WhatsApp ▸ new chat ▸ **"Message Yourself"** (your name with "(You)"), or
+search your own number. Its replies are prefixed ***Sotto*** so you can tell them from yours
+(`start.sh` sets `whatsapp.reply_prefix`; `SOTTO_HIDE_AGENT_NAME=1` drops it). *(Prefer a dedicated
+bot number instead of self-chat? Set `SOTTO_WHATSAPP_MODE=1` and pair a second WhatsApp number — then
+people message that number directly.)*
 
 ## 8. Connect the Mac Bridge (local iMessage/SMS/calls)
 Gmail + Calendar come from Google; your **local** signals come from the Sotto Bridge on your Mac. It
@@ -246,39 +260,38 @@ Cloudflare, no domain, no inbound port. How the reverse link works end to end: *
 > the brief degrades to the last cached snapshot. And if a triggered brief dies mid-run, its claim goes
 > stale after **30 minutes** and the next trigger retries it — no silently lost briefs.
 
-## One-click deploy (Railway template)
+## One-click deploy (Railway)
 
 The button below collapses the whole manual checklist above — build, `/data` volume, and
-`BRIDGE_TOKEN` — into one click, leaving just two prompts (your Gemini key and your WhatsApp number). Your email isn't one of them: Sotto learns it from the Google account you connect in the wizard. Once
-the template is published it's the fastest path; until then, the manual checklist above is the way in.
+`BRIDGE_TOKEN` — into one click, leaving just two prompts: your Gemini key and your Telegram bot
+token. Your email isn't one of them (Sotto learns it from the Google account you connect in the
+wizard), and neither is your chat id — you tap the link the boot log prints and the capture does the
+rest.
 
-<!-- The publish pipeline injects the published Railway template URL here; until a template is
-     published this button is a placeholder and the manual checklist above is the path. -->
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
 
-*(Button 404s? The template isn't published for this repo yet — use the manual checklist above.)*
-
-**(Repo owner only)** To (re)publish the template: Railway dashboard ▸ **Settings → Templates → New
-Template** ▸ add this repo, then in the template's **Variables** pre-declare these so the friend types
-as little as possible:
+**(Repo owner only)** The link is a Railway **template** shared by URL, not a marketplace listing. To
+(re)create it: Railway dashboard ▸ **Settings → Templates → New Template** ▸ add this repo, then in
+the template's **Variables** pre-declare these so the friend types as little as possible:
 
 | Variable | Template setting |
 |---|---|
 | `BRIDGE_TOKEN` | **default = generated secret**, e.g. `${{ secret(48) }}` — so it's auto-created, never typed |
 | `GOOGLE_AI_API_KEY` | prompt (their Gemini key) |
-| `WHATSAPP_ALLOWED_USERS` | prompt (their number) |
-| `WHATSAPP_HOME_CHANNEL` | prompt (their number) |
+| `TELEGRAM_BOT_TOKEN` | prompt (their @BotFather token) |
+| `SOTTO_CRON_DELIVER` | fixed `telegram` |
+| `WHATSAPP_ENABLED` | fixed `false` |
 | `GOOGLE_OAUTH_CLIENT_JSON` | **no longer needed** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy) |
 
-The two prompts encode the two **defaults** — WhatsApp for delivery, Gemini for the brief. Either can
-be changed after deploy without touching the template: `SOTTO_CRON_DELIVER` moves the channel and
-`WHATSAPP_ENABLED=false` drops the QR step ([CHANNELS.md](CHANNELS.md)).
+The two prompts encode the two **defaults** — Telegram for delivery, Gemini for the brief. Either can
+be changed after deploy without touching the template: `SOTTO_CRON_DELIVER` moves the channel, and
+WhatsApp is `WHATSAPP_ENABLED=true` plus its two number variables ([CHANNELS.md](CHANNELS.md)).
 
 The template also bundles the **Dockerfile build** + the **`/data` volume** (mount `/data`) so those
 aren't manual steps. After deploy, the friend generates a domain, then opens the **setup link from
 the deploy logs** (the line starting `[sotto] Setup link` — it's the `/setup` wizard plus its access
 code): one page that links the Mac, connects Google (paste client → authorize → paste code, all
-live — and Sotto learns your own address from the account you authorize), shows the WhatsApp QR,
+live — and Sotto learns your own address from the account you authorize), reports the channel link,
 and auto-detects the timezone.
 
 ## The dashboard
@@ -302,7 +315,7 @@ removes one. The `sotto-routines` skill owns this.
 |---|---|
 | **Every personal routine is named `user-<slug>`** — that prefix is the FENCE | Boot (`start.sh`) wipes Sotto's own five jobs on every deploy to kill duplicate crons and re-creates the three the agent runs (the two briefs are fired by the trigger receiver instead, so they are removed and never re-created here); it skips `user-` jobs entirely, so a redeploy never eats your routine. Sotto also never *removes* a job without that prefix, and never creates one with it that shadows a system job. The five system jobs live in `adapters/hermes/crons.json` — the one schedule source — and are changed via *set up Sotto*, not here. |
 | **Cap: 10 routines** | The 11th asks which one to drop rather than growing an unread schedule. |
-| **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your WhatsApp home channel) — same target as the briefs. Boot disables Hermes' generic `Cronjob Response` envelope, so briefs, nudges, and routines arrive as their clean user-facing copy rather than with a job id and scheduler footer. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
+| **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your Telegram chat) — same target as the briefs. Boot disables Hermes' generic `Cronjob Response` envelope, so briefs, nudges, and routines arrive as their clean user-facing copy rather than with a job id and scheduler footer. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
 | **Timezone changes don't move existing routines (v1)** | Hermes captures the zone when a job is created. Changing your timezone re-registers Sotto's own agent-run jobs (the briefs need no re-registration — the receiver reads the zone every minute) — your personal routines keep firing on the **old** clock until you recreate them (ask Sotto to; it's one line each). |
 
 ## Environment variables — full reference
@@ -316,12 +329,13 @@ research caps — are named constants in the code that owns them, not variables 
 |---|---|---|
 | `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface) | never |
 | `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for the briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
-| `WHATSAPP_ALLOWED_USERS` | who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | **required** |
-| `WHATSAPP_HOME_CHANNEL` | where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | **required** (delivery) |
+| `TELEGRAM_BOT_TOKEN` | your bot's token from [@BotFather](https://t.me/BotFather) — **the one channel variable on the default path**. Boot validates it, prints a one-tap `https://t.me/<bot>?start=<setup code>` link, waits up to five minutes for a message carrying that code (anything else is ignored, so a stranger who finds your bot can't claim it), and writes the chat id into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` (remembered on `/data`, so it happens once; a timeout just retries next boot). | **required** (default channel) |
+| `WHATSAPP_ALLOWED_USERS` | WhatsApp path only: who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | optional (channel) |
+| `WHATSAPP_HOME_CHANNEL` | WhatsApp path only: where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery there:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | optional (channel) |
 | `SOTTO_TIMEZONE` | IANA zone (e.g. `America/Los_Angeles`) for the **6:30 morning / 17:30 evening** briefs + time injection. **Now optional** — the `/setup` wizard auto-detects your zone from the browser and persists it to `/data/config/settings.json`; the briefs move to the new zone on the next minute (the receiver's scheduler reads it every tick) and the agent's own crons are re-registered on the spot, no redeploy. Set this only to override the auto-detected zone. | optional |
-| `SOTTO_CRON_DELIVER` | **THE channel choice.** Where everything scheduled is delivered — briefs, midday digest, weekly pulse, proactive watcher, and your personal `user-` routines; there is no per-job override by design. Defaults to `whatsapp` (the WhatsApp home channel); set `telegram`, `local`, or whatever name `hermes gateway setup` registered. It is also the nudge delivery-gate: the "WhatsApp must be linked" check applies **only** while this is `whatsapp`, so a Telegram deploy is never denied the release valve or the post-meeting tap. See [CHANNELS.md](CHANNELS.md). | optional |
-| `WHATSAPP_ENABLED` | `true` (default) runs the boot-time WhatsApp pairing step and the WhatsApp gateway. Set `false` when you deliver somewhere else — otherwise first boot waits up to 15 minutes for a QR scan that never comes. | optional (channel) |
-| `TELEGRAM_*` · `BLUEBUBBLES_*` · `SIGNAL_*` · `DISCORD_*` · `SLACK_*` | **your channel's own variables** — these names belong to Hermes, not Sotto (run `hermes gateway setup` once to see the ones your version wants). Every variable you set with one of these prefixes is forwarded into `~/.hermes/.env` on boot, the same way the `WHATSAPP_*` keys are; the boot log names each one it forwarded. Set none and nothing happens. | optional (channel) |
+| `SOTTO_CRON_DELIVER` | **THE channel choice.** Where everything scheduled is delivered — briefs, midday digest, weekly pulse, proactive watcher, and your personal `user-` routines; there is no per-job override by design. Defaults to **`telegram`**, except on a volume that already holds a paired WhatsApp session with no `TELEGRAM_BOT_TOKEN` set, which stays `whatsapp` (so an existing deploy never loses its channel); set `whatsapp`, `local`, or whatever name `hermes gateway setup` registered to choose. It is also the nudge delivery-gate — a channel Sotto can probe (Telegram's captured chat id, WhatsApp's session) must be linked, and a channel with no probe at all never holds a nudge. An unlinked Telegram also keeps the gateway down, so your pairing message survives for the next boot. The boot log states the channel and why. See [CHANNELS.md](CHANNELS.md). | optional |
+| `WHATSAPP_ENABLED` | `true` runs the boot-time WhatsApp pairing step and the WhatsApp gateway. **Defaults to `false`**, except when WhatsApp is the resolved delivery channel (then `true`) — so nobody waits 15 minutes for a QR scan they never intended. | optional (channel) |
+| `WHATSAPP_*` · `TELEGRAM_*` · `BLUEBUBBLES_*` · `SIGNAL_*` · `DISCORD_*` · `SLACK_*` | **your channel's own variables** — these names belong to Hermes, not Sotto (run `hermes gateway setup` once to see the ones your version wants). Every variable you set with one of these prefixes is forwarded into `~/.hermes/.env` on boot, by prefix and with no channel special-cased; the boot log names each one it forwarded. Set none and nothing happens. | optional (channel) |
 | `SOTTO_USER_EMAIL` | your own email address; used to exclude yourself from attendee research and post-meeting taps, and to list you as a guest on invites Sotto creates. **Optional override — derived automatically from your Google account when you connect it** (the `From` of your own sent mail, persisted as `google_account_email` in `/data/config/settings.json`); set this only to force a different address. | optional |
 | `SOTTO_GEMINI_MODEL` | override the Gemini model (default `gemini-3.7-flash`) — the compose default, and always the model for the gemini-only lanes (search grounding, url_context, DocSend vision). Must be 1M-context. | optional |
 | `SOTTO_BRIEF_MODEL` | run the compose calls on another family: `openai/<model>` or `anthropic/<model>` (bare names mean gemini). Needs that family's key below; the model must clear the brief's 400K-token context floor. Gemini stays the default — set this only to bring the family you already pay for. | optional (model family) |
@@ -362,7 +376,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_WAKE_EVENING_MIN` / `SOTTO_WAKE_EVENING_CUTOFF` | **Bridge-side** evening wake-push window (defaults `1050` / `1380` = **17:30 – 23:00**). | optional (Bridge) |
 | `SOTTO_TTS` / `SOTTO_TTS_PROVIDER` / `SOTTO_TTS_VOICE` | voice (read + listen). `SOTTO_TTS=1` (default) enables Hermes TTS; provider `edge` (default, free, no key) or `gemini` (uses your Google key); voice id override. `SOTTO_TTS=0` for text-only. | optional |
 | `SOTTO_WHATSAPP_MODE` | `2` self-chat (default) · `1` dedicated bot number (needs a 2nd WhatsApp number). | optional |
-| `SOTTO_WHATSAPP_PAIR_TIMEOUT` | how long the boot-time QR pairing step stays open, in seconds (default `900` = 15 min) — both the pairer and boot's wait derive from this one var, so raising it really buys more scan time. Miss the window and a redeploy reopens pairing anyway. | optional |
+| `SOTTO_WHATSAPP_PAIR_TIMEOUT` | how long the boot-time **WhatsApp** QR pairing step stays open, in seconds (default `900` = 15 min) — both the pairer and boot's wait derive from this one var, so raising it really buys more scan time. Miss the window and a redeploy reopens pairing anyway. (Telegram's capture has no variable: its five-minute wait is a named constant in `telegram_link.py`, and a miss costs nothing but the next boot.) | optional |
 | `SOTTO_HIDE_AGENT_NAME` | `1` drops the ***Sotto*** reply prefix on WhatsApp messages entirely (default: prefixed, so you can tell its messages from yours in self-chat). | optional |
 | `SOTTO_TOOL_PROGRESS` | what streams into chat while Sotto works: `off` (default — nothing mid-turn; the typing indicator and the periodic "⏳ Working" heartbeat cover the wait) · `new` (plain-language narration + one edit-in-place tool bubble, cleaned up on delivery) · `all`/`verbose` (debugging). | optional (UX) |
 | `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Telegram only (Hermes has no bot reactions on WhatsApp). | optional (UX) |
@@ -374,10 +388,13 @@ research caps — are named constants in the code that owns them, not variables 
 | `EXA_API_KEY` | web-research key ([exa.ai](https://exa.ai)). Present = Sotto searches with Exa instead of Gemini grounding, and uses it for deep research when Parallel isn't set. **Shown on the Connections page** alongside Granola, connected or not. | optional (research) |
 | `BROWSER_USE_API_KEY` | optional [Browser Use Cloud](https://cloud.browser-use.com) key: when set, a link that neither Exa nor Gemini can read (JS-heavy, bot-walled) escalates to their hosted browser — the LAST rung, because a browser session costs their credits and 10-60s — **read-only by fence**: one page per task, never your logins, never a synced profile, session stopped when the read ends. Their cloud sees the URL and the rendered page. | optional (link reading) |
 | `PARALLEL_API_KEY` | deep-research key ([parallel.ai](https://parallel.ai)). Present = attendee/company research runs as a Parallel task run. **Shown on the Connections page.** | optional (research) |
+| `X_BEARER_TOKEN` | the owner's X app bearer token. Enables Phase-1 exact handle confirmation and recent public Posts for upcoming attendees. Read-only; X people-search is never used by an ambient lane. | optional (X) |
+| `X_USER_ACCESS_TOKEN` | OAuth2 user access token with `bookmark.read`. Adds the owner's newest bookmarks to prep only when their author is an upcoming attendee. Without it, identity + public Posts still work from `X_BEARER_TOKEN`. | optional (X bookmarks) |
+| `X_OWNER_USER_ID` | the owner's numeric X user id, required with `X_USER_ACCESS_TOKEN` for bookmarks. Supplying it avoids a repeated `/users/me` resource read. | optional (X bookmarks) |
 | `GRANOLA_API_TOKEN` + `GRANOLA_MCP_CMD` | legacy custom stdio Granola MCP (step 6c fallbacks) — token + a remote-capable server command. | optional (legacy) |
 | `BRIDGE_TOKEN` | the ONE secret behind Mac↔cloud auth: the Bridge and the relay use it directly, while Hermes is handed a one-way **derived** bearer (`HMAC(BRIDGE_TOKEN, "sotto-mcp")`) at boot — the agent never holds the root, so a compromised chat session can't act as your Mac. Still one value to set. Manual deploys: pick a long random secret (`openssl rand -hex 24`) **before opening the setup link** — unset, the pairing link carries an empty token and pairing silently fails. (A template deploy will auto-generate it, `${{ secret(48) }}`.) You never type it into the Mac app — the `/setup` pairing link carries it. | **required** for the Bridge |
 | `SOTTO_TRIGGER_TOKEN` | separate bearer for the Bridge → cloud wake-push. Unset = the wake-push authenticates with `BRIDGE_TOKEN` (one shared bearer; wake-push is on by default in the Mac app). | optional |
-| `SOTTO_SETUP_CODE` | pin the access code gating the setup surface (`/setup`, `/pair`, `/whatsapp/qr`, `/google/*`, `/debug/google`). Unset = auto-generated once and persisted on `/data`; the full setup link prints in every boot's deploy logs. | optional |
+| `SOTTO_SETUP_CODE` | pin the access code gating the setup surface (`/setup`, `/pair`, `/whatsapp/qr`, `/google/*`, `/debug/google`). It is also the **Telegram pairing phrase**: boot's chat-id capture only accepts a message carrying it, so a stranger who guesses your bot's @username cannot claim the deploy. Unset = auto-generated once and persisted on `/data`; the full setup link and the pairing link both print in every boot's deploy logs. | optional |
 | *(do not set)* `PORT` | injected by Railway; the receiver binds it. | — |
 | *(do not set)* `RAILWAY_PUBLIC_DOMAIN` | set by Railway once you **Generate Domain** (step 4) — the setup/Google/QR links in the deploy logs are built from it. If it's absent (no domain yet), those links fall back to `http://localhost:…`. | — |
 
@@ -420,10 +437,9 @@ version and never again. A new version is housekeeping, so it never arrives as i
 never spends your daily interrupt budget, and it never repeats. `SOTTO_UPDATE_CHECK=0` turns the
 daily check off and, with it, all three notices — there is no separate switch to find.
 
-**1. If you deployed with the one-click button (Railway template).** When the template's repo is
+**1. If you deployed with the one-click link (Railway template).** When the template's repo is
 updated, Railway opens a **pull request** on your copy of the repo with the new code. Merge it and
-Railway redeploys automatically — that's the whole update. (This path only exists once the template
-is published for this repo; until then the Deploy button 404s and you're on the manual path below.)
+Railway redeploys automatically — that's the whole update.
 
 **2. If you deployed manually, from a fork or your own copy.** On GitHub, open your repo → **Sync
 fork** → **Update branch**. That lands the new code on your `main`, and Railway — which redeploys on
@@ -470,7 +486,7 @@ Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and 
 | Build: `Dockerfile does not exist` | Clear the Dockerfile Path so Railway auto-detects `./Dockerfile` at the repo root. |
 | `hermes: command not found` at boot | Hermes install/PATH in the image — capture the build-log line. |
 | Deploy log: `No messaging platforms enabled` | `start.sh` enables WhatsApp via `~/.hermes/.env`; redeploy on the latest `main`. |
-| Deploy log: `No user allowlists configured` | Set `WHATSAPP_ALLOWED_USERS` (step 5), or `GATEWAY_ALLOW_ALL_USERS=true` to test. |
+| Deploy log: `No user allowlists configured` | Your channel has no allowlist yet — text your bot so boot can capture the id (Telegram), or set `WHATSAPP_ALLOWED_USERS` (step 5); `GATEWAY_ALLOW_ALL_USERS=true` opens it up for a test. |
 | Deploy log: `WhatsApp enabled but not paired` | First boot — `start.sh` runs `hermes whatsapp`; scan the QR in the deploy logs within ~15 min. |
 | Setup link in the logs says `localhost` | No public domain yet — the logged link falls back to `http://localhost:…`. **Settings ▸ Networking ▸ Generate Domain** (step 4), redeploy, use the freshly printed link. |
 | Missed the ~15-min QR window | Not fatal — the container recycles and pairing reopens on the next boot. Redeploy (or restart) and scan the fresh QR at `/whatsapp/qr`. A transient "No pairing in progress" on that page just means the pairing step hasn't (re)started yet — wait for the boot to reach it. |
@@ -479,8 +495,8 @@ Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and 
 | Google disconnects after ~a week (day 8) | OAuth consent screen left in **Testing** — its refresh tokens expire after ~7 days. Publish the app to **In production** (§6b — no Google verification needed for your own data), then reconnect once. |
 | `/setup` (or `/whatsapp/qr`, `/google/*`) returns **403 Forbidden** | The setup surface needs its access code — open the full link from the deploy logs (`[sotto] Setup link`); a cookie then covers the other pages. Old bare bookmarks 403 by design. |
 | Lost the setup link | It reprints on **every boot** (redeploy and check the logs), or read `/data/setup_code` on the volume. `SOTTO_SETUP_CODE` pins it. |
-| The **Deploy on Railway** button 404s | Expected — no template is published for this repo yet. Use the manual checklist at the top of this page; it is the same result. |
-| Telegram bot never replies | `TELEGRAM_ALLOWED_USERS` must be your **numeric** Telegram user id, not your @username — Hermes denies everyone until it matches. The linker in [CHANNELS.md](CHANNELS.md#telegram-setup) captures the right one. Also check the boot log named each `TELEGRAM_*` you set: `[sotto] gateway variable forwarded to Hermes: …`. |
+| Boot log says `telegram NOT linked yet` | Your first message hadn't reached the bot inside the five-minute capture window. Text the bot, then **restart the deploy** — the capture runs at boot. Nothing else is affected; briefs still compose. |
+| Telegram bot never replies | `TELEGRAM_ALLOWED_USERS` must be your **numeric** chat id, not your @username — Hermes denies everyone until it matches. Boot captures the right one ([CHANNELS.md](CHANNELS.md#telegram-setup-default)); a hand-typed value is where this goes wrong. Also check the boot log named each `TELEGRAM_*` you set: `[sotto] gateway variable forwarded to Hermes: …`. |
 | The Bridge's **"Meeting notes (Granola) & more → Open…"** button opens a **403** page | You paired with an older Bridge or an older host: newer pairing links carry the setup code, and the button then opens `/setup` correctly. Meanwhile: open the `[sotto] Setup link` from your deploy logs once in the same browser — the cookie then covers it. Re-pairing (paste the current setup page's link into the Bridge) also fixes it for good. |
 | Briefs fire at the wrong hour | The boot log states the zone: `tz=…` on the `[sotto] cron scheduler:` line. `tz=UTC` means neither `SOTTO_TIMEZONE`/`TZ` nor a wizard zone was found. Open `/setup` — tile ④ detects your browser's zone; the briefs pick it up on the next minute (the receiver schedules them and re-reads the zone every tick), no redeploy. (Personal `user-` routines keep their old clock; recreate those.) |
 | WhatsApp QR re-prompts every deploy | Volume not mounted at `/data` (step 3), or `start.sh` state-persist step failed. |

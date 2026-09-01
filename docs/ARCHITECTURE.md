@@ -77,9 +77,18 @@ so an ordinary reply, an old creation date, or the user's own chase cannot silen
 
 Two processes run side by side: **Hermes** (the agent loop, the chat gateway, and the scheduler for
 the pulse, the watcher and the digest) and the **trigger receiver** (a stdlib HTTP server on
-`$PORT`, which schedules and delivers the two briefs itself). `adapters/hermes/start.sh` starts
-the receiver first so Railway's `/health` answers within seconds, then boots Hermes. They share
-exactly one thing: the `$SOTTO_DATA` volume.
+`$PORT`, which schedules and delivers the two briefs itself). `adapters/hermes/start.sh` resolves the
+**delivery channel** first and exports it — *Telegram, unless the volume already holds a paired
+WhatsApp session and no `TELEGRAM_BOT_TOKEN` is set* — so the receiver, the cron reconciler and the
+gateway can never disagree about where a brief goes; then it starts the receiver (so Railway's
+`/health` answers within seconds) and boots Hermes. Before the gateway comes up it links that
+channel: the Telegram chat-id capture (`telegram_link.py --boot`, bounded by that module's own
+five-minute constant, and accepting only a message carrying this deploy's setup code — a bot's
+username is discoverable, so an unauthenticated capture would link a stranger) or, with
+`WHATSAPP_ENABLED=true`, the QR pairing (`wa_pair.py`). Both waits are non-fatal — a boot that can't
+link still composes briefs — but an unlinked Telegram does **not** start `hermes gateway`: it could
+not deliver anyway, and its `getUpdates` poll would consume the pairing message the next boot's
+capture needs. The two processes share exactly one thing: the `$SOTTO_DATA` volume.
 
 ## The six modules
 
@@ -218,9 +227,9 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `proactive/retune_offer.last` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the retune-offer cooldown stamp |
 | `proactive/pending_offer.json` | skills (`pending_offer.py set` — the ONE writer, called by the proactive lane right after it delivers a push that ENDED in a question) | the gateway (`pending_offer.py get`, then `clear`) — a nudge is delivered by a detached run, so the user's bare "sure" lands in a session that never saw the question; this file is where it is written down. One offer at a time, newest wins, expires after 180 min at read. When a yes to it would send or write, it also carries `payload_sha256` — the hash of the offered content, which `google_action.py --offer-bound` must match before acting |
 | `intentions.jsonl` | skills (`schedule_wakeup.py`) | skills (`proactive_scan.py`), dashboard (`/api/cadence`) — append-only one-shot recipes, folded by id; an optional loop anchor cancels the recipe when the loop closes |
-| `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe |
+| `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe; `start.sh` (the same file decides whether a redeploy keeps WhatsApp as the channel) |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
-| `telegram-link.json` | `telegram_link.py` (the Telegram setup CLI, run by hand — [CHANNELS.md](../CHANNELS.md) § Telegram setup) | **nobody yet** — the handoff for the planned `/setup` Telegram tile (ROADMAP § Front Door). It holds the bot token, so 0600; `start.sh` configures the gateway from the Railway variables, never from this file |
+| `telegram-link.json` | `telegram_link.py` (the ONE owner of the Telegram handshake — run by `start.sh` at boot, or by hand: [CHANNELS.md](../CHANNELS.md) § Telegram setup) | `start.sh` (`--boot` reuses the captured id for this token, else captures it, and forwards it to Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL`), receiver (`_telegram_status` — the "this chat is linked" probe behind the wizard tile and the nudge gate). It holds the bot token, so 0600 |
 | **`preferences.json`** | **skills *and* dashboard** | skills, dashboard |
 
 Every row but the last is **one-way**: exactly one writer, and readers that never write. That is the
@@ -261,6 +270,8 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 |---|---|---|
 | The people/company graph | `knowledge/*.md` | `_shared/knowledge/knowledge_update.py` (`knowledge.py` is its model + serializer) |
 | Grounded research (people **and** companies) | same files | `meeting-prep/scripts/persist_prep.py` and `_shared/scripts/prewarm_graph.py` — both *through* `knowledge_update.apply()`; there is no second writer for either file type |
+| Verified X identity + public-profile provenance | person files above | `_shared/scripts/x_connectivity.py` — exact handle lookup only, then *through* `knowledge_update.apply()`; immutable `x_user_id`, handle alias history, and the 90-day negative cache are durable, while Posts/bookmarks stay in the run's temporary prep payload |
+| Ambiguous X identity suggestions | `knowledge/x_link_suggestions.json` | `_shared/scripts/x_connectivity.py`; a weak or already-owned match is proposed here instead of being silently attached |
 | Meeting attendance + Apple Contacts identity | same files | `_shared/scripts/granola_graph.py` (who you sat with) and `_shared/scripts/prewarm_graph.py --sync-contacts` (every email/phone as an identifier, the card's notes + birthday) — both *through* `knowledge_update.apply()` |
 | User-initiated graph edits | same files | `_shared/knowledge/knowledge_edit.py` — which routes *through* `knowledge_update.apply()`, so a dashboard edit and a texted correction are byte-identical |
 | Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` owns the locked, atomic write API; brief extraction, `apply_commitments.py`, and user edits in `knowledge_edit.py` all write through it (`ledger_io.py` is the shared read side) |
@@ -332,6 +343,9 @@ Two things deliberately do NOT persist, and both are correct:
   advice costs output tokens and restates the fact it points at.
 - **`$SOTTO_DATA/cache/research_<date>.json`** — a 7-day render cache for the dashboard's research
   cards. The durable half of that same output already went to the graph.
+- **Recent X Posts and matching owner bookmarks** — fetched only for upcoming attendees and handed
+  to the current brief/prep through mode-0600 `/tmp/sotto_x_context.json`. They never enter the
+  graph, research cache, relationship state, or event ledger; the next run overwrites the handoff.
 
 **Correctability** is the constraint that keeps the loop honest. A person fact is corrected with
 `knowledge_edit.py --op correct`, and the one thing research can never learn — that an unsaved phone

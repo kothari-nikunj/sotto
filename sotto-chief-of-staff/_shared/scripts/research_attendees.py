@@ -210,6 +210,15 @@ SCHEMA = {
                     "relevance": {"type": "array", "items": {"type": "string"}},
                     "summary": {"type": "string"},
                     "company_summary": {"type": "string", "nullable": True},
+                    # A grounded web pass may already find the person's public X profile. The X
+                    # connector uses this only as an exact lookup hint and still verifies the
+                    # returned profile against name/company before linking.
+                    "x_handle": {"type": "string", "nullable": True},
+                    "x_profile_url": {"type": "string", "nullable": True},
+                    # WHERE the handle was published. A page that names both the person and the
+                    # handle is the second identity signal the X linker needs; without it a hint is
+                    # only as good as a guess, and links only when the profile shows their company.
+                    "x_handle_source": {"type": "string", "nullable": True},
                 },
                 "required": ["email", "company", "summary"],
             },
@@ -404,6 +413,12 @@ def _build_prompt(batch: list, context_summary: str, comms_by_email: dict | None
         "from searching the company name / email domain. ALWAYS attempt this for a corporate "
         "domain — even when the person themselves has no public profile, the company almost always "
         "does. Null only for freemail addresses or when the company search also finds nothing.\n"
+        "- x_handle and x_profile_url: only when a public source clearly identifies this exact "
+        "person's X account. Use the bare handle and canonical https://x.com/<handle> URL. Null "
+        "when uncertain — never infer it from a common first name or company name.\n"
+        "- x_handle_source: the URL of the page that ATTRIBUTED that handle to this person (their "
+        "own site, a YC/company bio, a profile piece) — never the x.com URL itself, and never a "
+        "search results page. Null if you inferred the handle rather than reading it somewhere.\n"
         "Degrade person → company → nothing: a found company with an unfindable person is "
         "summary=\"No public profile found.\" PLUS a filled company/company_summary — reserve a "
         "fully empty entry for freemail addresses with unsearchable names.\n"

@@ -34,7 +34,7 @@ goes, what is written to disk, and how long it stays.
 Two pieces:
 
 ```
-you ⇄ WhatsApp / Telegram / iMessage
+you ⇄ Telegram / WhatsApp / iMessage
          │
    Sotto agent  — a container YOU deploy (Railway). Runs the brains: briefs, memory,
          │        drafts, schedules. Connects natively to Gmail + Google Calendar.
@@ -54,13 +54,12 @@ catches up quietly — old messages go to the digest, never a barrage of stale p
 About **35 minutes** the first time — only ~15 of it active; the rest is waiting on builds. Full
 walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. The shape:
 
-1. **Deploy the agent** on Railway from your own copy of this repo — four settings and four
+1. **Deploy the agent** on Railway from your own copy of this repo — four settings and three
    variables, all listed in [ONBOARDING.md § 1](ONBOARDING.md) (a
-   [Gemini API key](https://aistudio.google.com/apikey) is the only key Sotto needs, plus your
-   WhatsApp number, a `/data` volume and a public domain). *A one-click Deploy button is in there
-   too, but no Railway template is published for this repo yet, so it 404s — the manual path is the
-   working one.* *WhatsApp and Gemini are the **defaults**, not requirements — Telegram and
-   iMessage delivery, and other models, are a variable each:*
+   [Gemini API key](https://aistudio.google.com/apikey) is the only key Sotto needs, plus a
+   [@BotFather](https://t.me/BotFather) bot token, a `/data` volume and a public domain). *One-click
+   Deploy is in there too — same result, two prompts.* *Telegram and Gemini are the **defaults**, not
+   requirements — WhatsApp and iMessage delivery, and other models, are a variable each:*
    **[Choosing your channel and model](CHANNELS.md)**.
 2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
    drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
@@ -73,7 +72,8 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
    [Issues](https://github.com/kothari-nikunj/sotto/issues) link is where you ask for a code.
    A 3-step wizard in the app then covers **disk access → connect → privacy toggles**, in that
    order, and nothing is read or sent until you press **Save & Connect** at the end. Connect Google
-   + scan the WhatsApp QR on the same setup page.
+   on the same setup page — which also reports your channel's link (and shows the WhatsApp QR if
+   that's your channel).
 3. **Say "set up Sotto"** in chat. It verifies every connection honestly, seeds its memory and your
    writing voice from ~6 weeks of history, and offers your first brief on the spot.
 
@@ -114,6 +114,10 @@ Gemini is the **default**, and it is what the brief pipeline calls today. The ho
   caveat on the cloud container, stated in [CHANNELS.md](CHANNELS.md#switching-the-chat-model).
 - **Web research** — independent of both: set `EXA_API_KEY` and/or `PARALLEL_API_KEY` and attendee
   research stops going through Gemini at all.
+- **X attendee context** — optional and read-only: the owner's `X_BEARER_TOKEN` lets meeting prep
+  confirm exact handles and pull recent public Posts only for upcoming attendees; an OAuth2
+  `X_USER_ACCESS_TOKEN` + `X_OWNER_USER_ID` also folds in the owner's matching bookmarks. No feed
+  mirror, people-search, Chat decryption, or API sends.
 
 Every call site, the measured prompt sizes and a five-model comparison: [docs/MODELS.md](docs/MODELS.md).
 
@@ -139,7 +143,7 @@ local material, and the escape hatch) plus how to add a service:
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the six modules, five daemon threads, six subprocess boundaries, and every shared file on the volume |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
 | [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
-| **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — WhatsApp (default) · Telegram · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |
+| **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — Telegram (default) · WhatsApp · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |
 | [INTEGRATIONS.md](INTEGRATIONS.md) | Connecting services (Granola, …): the one-click Connect tiles + the four-lane doctrine |
 | [docs/BLUEBUBBLES.md](docs/BLUEBUBBLES.md) | Optional: give Sotto its own iMessage identity |
 | [ONBOARDING.md §If something's off](ONBOARDING.md#if-somethings-off) | Troubleshooting, and removing the Mac app cleanly |

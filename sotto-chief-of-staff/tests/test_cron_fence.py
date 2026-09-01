@@ -77,7 +77,9 @@ def _run_reconcile(tmp_path, listing=CRON_LIST_FIXTURE, extra_env=None):
     env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
                FAKE_CRON_STATE=str(state), FAKE_CRON_LOG=str(log))
     env.update(extra_env or {})
-    proc = subprocess.run([sys.executable, RECONCILER, "--spec", CRONS_JSON],
+    # --deliver is required, never defaulted: the channel is resolved once by the caller (start.sh
+    # step 0.4 / receiver._deliver_target), so the reconciler has no channel name of its own.
+    proc = subprocess.run([sys.executable, RECONCILER, "--spec", CRONS_JSON, "--deliver", "telegram"],
                           capture_output=True, text=True, env=env, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return proc.stdout, log.read_text().splitlines(), state.read_text()

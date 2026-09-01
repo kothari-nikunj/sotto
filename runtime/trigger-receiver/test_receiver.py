@@ -181,11 +181,17 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     tz lands (config set succeeds, zone changed), the shared reconciler recreates every Hermes-run
     Sotto cron with exactly crons.json's schedule/skill/deliver under the new zone. The two briefs
     are NOT among them — they are receiver-run, and the tick reads the zone fresh every minute, so
-    there is nothing to re-register for them."""
+    there is nothing to re-register for them.
+
+    `--deliver` comes from the ONE channel resolver (_deliver_target), never a literal: with nothing
+    configured and no WhatsApp session on the volume, that resolves to telegram exactly as start.sh
+    step 0.4 does — a `whatsapp` fallback here would have re-registered the crons onto a channel the
+    deploy never chose."""
     monkeypatch.setattr(rec, "SETTINGS_FILE", os.path.join(str(tmp_path), "config", "settings.json"))
     for k in ("SOTTO_TIMEZONE", "SOTTO_PROACTIVE", "SOTTO_DIGEST", "SOTTO_PROACTIVE_CRON",
-              "SOTTO_CRON_DELIVER"):
+              "SOTTO_CRON_DELIVER", "TELEGRAM_BOT_TOKEN"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(rec, "_wa_creds_paths", lambda: [])
     cli = _CronCLI()
     monkeypatch.setattr(rec.subprocess, "run", cli)
     ok, val = rec.set_timezone("America/Los_Angeles")
@@ -195,13 +201,13 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     assert ["hermes", "cron", "list"] in cli.calls
     creates = {c[c.index("--name") + 1]: c for c in cli.cron("create")}
     assert set(creates) == names
-    # schedules + skills mirror start.sh step 3 exactly; deliver defaults to whatsapp
+    # schedules + skills mirror start.sh step 3 exactly
     assert creates["sotto-relationship-pulse"][3] == "0 9 * * 1"
     assert creates["sotto-proactive"][3] == "*/15 * * * *"
     assert creates["sotto-midday-digest"][3] == "30 12 * * *"
     assert creates["sotto-midday-digest"][creates["sotto-midday-digest"].index("--skill") + 1] == "sotto-event"
     for c in creates.values():
-        assert c[c.index("--deliver") + 1] == "whatsapp"
+        assert c[c.index("--deliver") + 1] == rec._deliver_target() == "telegram"
     # Existing registrations are removed by parsed job id; that path is exercised against a real
     # list-shaped fixture in test_cron_fence.py. This fake reports an empty scheduler.
     assert cli.cron("remove") == []
@@ -428,23 +434,25 @@ def test_setup_page_pairing_not_ready_without_domain_or_token(monkeypatch):
 
 def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
     """The wizard→app handoff: .hero-cta (and the connected footer) render iff Mac + Google + timezone are
-    done and WhatsApp is POSITIVELY linked — never over a never-scanned ("unknown") or mid-pairing
-    WhatsApp. Tile 5 (optional services) never gates it."""
+    done and the delivery channel is POSITIVELY linked — never over a never-scanned ("unknown") or
+    mid-pairing WhatsApp. Tile 5 (optional services) never gates it."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
     monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     st = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
-          "google_client_present": True, "timezone": "America/Los_Angeles", "whatsapp": "linked"}
+          "google_client_present": True, "timezone": "America/Los_Angeles",
+          "channel": "whatsapp", "channel_status": "linked", "whatsapp": "linked"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
     page = rec._setup_page("abc")
     assert "class='hero-cta' href='/app'" in page and "Open your dashboard" in page
     assert "You're connected" in page
     # WhatsApp never linked ("unknown" — no session creds on disk) → NO celebration
-    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, whatsapp="unknown"))
+    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, channel_status="unknown"))
     page = rec._setup_page("abc")
     assert "hero-cta" not in page and "You're connected" not in page
     # WhatsApp mid-pairing → no handoff yet
-    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, whatsapp="pairing"))
+    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, channel_status="pairing"))
     assert "hero-cta" not in rec._setup_page("abc")
     # any of steps 1-3 missing → no handoff either
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st, google_connected=False))
@@ -454,19 +462,29 @@ def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
 
 
 def test_setup_page_completion_follows_the_delivery_channel(monkeypatch):
-    """The wizard's done-gate uses the SAME rule the valve and the meeting tap use
-    (_delivery_ready): WhatsApp must be linked only when SOTTO_CRON_DELIVER *is* whatsapp — a
-    Telegram user's wizard can finish without ever scanning a QR."""
+    """The wizard's done-gate uses the SAME rule the valve and the meeting tap use (_delivery_ready):
+    the ACTIVE channel must be linked, so a Telegram user's wizard never finishes over an unlinked
+    bot (nor is shown a QR), a WhatsApp user's never finishes over an unscanned QR, and a channel
+    with no probe never blocks the handoff."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
     monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
     st = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
           "google_client_present": True, "timezone": "America/Los_Angeles", "whatsapp": "unknown"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
     monkeypatch.setenv("SOTTO_CRON_DELIVER", "telegram")
+    assert "hero-cta" not in rec._setup_page("abc")     # nothing linked is not a finished wizard
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "8675309")
+    assert "hero-cta" not in rec._setup_page("abc")    # a recipient with no bot is half a setup
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<bot-token>")
     assert "hero-cta" in rec._setup_page("abc")
     monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
+    monkeypatch.setattr(rec, "_whatsapp_status", lambda: "unknown")
     assert "hero-cta" not in rec._setup_page("abc")
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "discord")  # no probe → never blocks the handoff
+    assert "hero-cta" in rec._setup_page("abc")
 
 
 def test_whatsapp_status_positive_probe(tmp_path, monkeypatch):
@@ -494,16 +512,104 @@ def test_setup_page_whatsapp_tile_states(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
     monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     st = {"bridge_connected": False, "google_connected": False, "google_detail": "nope",
-          "google_client_present": False, "timezone": "", "whatsapp": "linked"}
+          "google_client_present": False, "timezone": "",
+          "channel": "whatsapp", "channel_status": "linked", "whatsapp": "linked"}
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
     page = rec._setup_page("abc")
     assert "WhatsApp is linked" in page
     assert page.count("data-state='done'") == 1   # only the WhatsApp tile (everything else is todo)
-    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, whatsapp="unknown"))
+    monkeypatch.setattr(rec, "setup_status",
+                        lambda: dict(st, channel_status="unknown", whatsapp="unknown"))
     page = rec._setup_page("abc")
     assert "WhatsApp is linked" not in page and "Show WhatsApp QR" in page
     assert page.count("data-state='done'") == 0
+
+
+def test_telegram_status_reads_the_one_link_file(tmp_path, monkeypatch):
+    """Telegram's probe is the file telegram_link.py writes (or an explicit allowlist): a captured
+    chat id is "linked", a bot token with nobody having texted it is "pairing", and a deploy this
+    process can see no token for is "unknown" — the state that never gates delivery."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    assert rec._telegram_status() == "unknown"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<bot-token>")
+    assert rec._telegram_status() == "pairing"
+    with open(os.path.join(str(tmp_path), "telegram-link.json"), "w", encoding="utf-8") as f:
+        json.dump({"bot_token": "<bot-token>", "allowed_user": 8675309,
+                   "bot_username": "sotto_brief_bot"}, f)
+    assert rec._telegram_status() == "linked"
+    assert rec._telegram_link() == {"user_id": 8675309, "bot": "sotto_brief_bot"}
+    # a hand-set allowlist links it just as well — that deployer never runs the capture
+    os.remove(os.path.join(str(tmp_path), "telegram-link.json"))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "8675309")
+    assert rec._telegram_status() == "linked"
+    # …but a recipient with NO bot is half a configuration that delivers nothing, so it is held,
+    # never "linked" (external review, Sep 1). The token is looked for in ~/.hermes/.env too, so a
+    # laptop that keeps it there is still probeable; with neither, an empty deploy is "unknown".
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    monkeypatch.setattr(rec.os.path, "expanduser", lambda p: str(tmp_path / "nohome"))
+    assert rec._telegram_status() == "pairing"
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS")
+    assert rec._telegram_status() == "unknown"
+    with open(os.path.join(str(tmp_path), "hermes.env"), "w", encoding="utf-8") as f:
+        f.write("TELEGRAM_BOT_TOKEN=<from-hermes-env>\n")
+    monkeypatch.setattr(rec.os.path, "expanduser", lambda p: str(tmp_path / "hermes.env"))
+    assert rec._telegram_bot_token() == "<from-hermes-env>"
+
+
+def test_delivery_ready_holds_an_unlinked_telegram_and_only_frees_unprobeable_channels(
+        tmp_path, monkeypatch):
+    """THE rule, both halves: a channel Sotto CAN probe must be "linked", and only a channel with no
+    probe at all counts as linked. Telegram's "unknown" — a fresh deploy with no token and nothing
+    linked — used to read as ready, so the wizard looked finished and nudges were spent into a
+    channel that could not deliver. It holds now, same bar as WhatsApp."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, "_wa_creds_paths", lambda: [])
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "telegram")
+    assert rec._channel_status() == "unknown"
+    assert rec._delivery_ready() is False                 # nothing linked is not "nothing to probe"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<bot-token>")
+    assert rec._delivery_ready() is False                 # token set, nobody paired → held
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "8675309")
+    assert rec._delivery_ready() is True
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
+    monkeypatch.setattr(rec, "_whatsapp_status", lambda: "unknown")
+    assert rec._delivery_ready() is False                 # WhatsApp's probe is complete
+    for channel in ("bluebubbles", "discord", "slack", "signal", "local"):
+        monkeypatch.setenv("SOTTO_CRON_DELIVER", channel)
+        assert rec._delivery_ready() is True              # no probe exists for it
+
+
+def test_setup_page_tile_three_follows_the_channel(tmp_path, monkeypatch):
+    """Tile 3 is the ACTIVE channel's tile: a Telegram deploy is never shown a WhatsApp QR, and it
+    reads "waiting for your first message" until boot captures the chat id."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
+    monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
+    monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "telegram")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<bot-token>")
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    st = {"bridge_connected": True, "google_connected": True, "google_detail": "ok",
+          "google_client_present": True, "timezone": "America/Los_Angeles", "whatsapp": "unknown"}
+    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, channel=rec._deliver_target(),
+                                                          channel_status=rec._channel_status()))
+    page = rec._setup_page("abc")
+    assert "Link Telegram" in page and "Show WhatsApp QR" not in page
+    assert "Waiting for your first message" in page
+    assert "hero-cta" not in page                  # an un-texted bot is not a finished wizard
+    # boot captured the id → the tile is done, the bot is named, and the wizard can hand off
+    with open(os.path.join(str(tmp_path), "telegram-link.json"), "w", encoding="utf-8") as f:
+        json.dump({"bot_token": "<bot-token>", "allowed_user": 8675309,
+                   "bot_username": "sotto_brief_bot"}, f)
+    page = rec._setup_page("abc")
+    assert "Telegram is linked" in page and "hero-cta" in page
+    assert "Message your bot on Telegram" in page
 
 
 def test_setup_page_google_box_has_the_full_recipe(monkeypatch):
@@ -757,6 +863,7 @@ def test_setup_pages_carry_the_code_between_wizard_pages(monkeypatch):
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
     monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")   # the QR link is the WhatsApp tile's
     # client present but not yet authorized → the wizard shows the /google/auth link
     monkeypatch.setattr(rec, "setup_status", lambda: {
         "bridge_connected": False, "google_connected": False, "google_detail": "nope",
@@ -1559,6 +1666,7 @@ def test_valve_tick_stages_bundle_and_spawns_like_a_fresh_agent_verdict(tmp_path
     under $SOTTO_DATA/events/, sotto-event spawned with that path."""
     rec.DATA = str(tmp_path)
     bundle = {"promoted": True, "events": [{"sender": "Sarah Chen", "class": "urgent"}]}
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "linked")
     monkeypatch.setattr(rec, "run_valve",
                         lambda: {"verdict": "agent", "reason": "promoted", "bundle": bundle})
@@ -1578,6 +1686,7 @@ def test_valve_tick_checks_channel_health_before_spending_a_promotion(tmp_path, 
     """No positive WhatsApp probe → the valve is never even run (a promotion must not be burned on
     an undeliverable nudge)."""
     rec.DATA = str(tmp_path)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     ran = []
     monkeypatch.setattr(rec, "run_valve", lambda: (ran.append(1), {"verdict": "drop"})[1])
     for status in ("unknown", "pairing"):
@@ -1589,24 +1698,35 @@ def test_valve_tick_checks_channel_health_before_spending_a_promotion(tmp_path, 
     assert ran == [1]
 
 
-def test_delivery_gate_applies_only_to_the_whatsapp_delivery_channel(tmp_path, monkeypatch, capsys):
-    """The gate asks "can this be delivered?", not "is WhatsApp linked?". On a non-WhatsApp
-    SOTTO_CRON_DELIVER there is nothing to probe, so the valve and the tap must not be silently
-    dead forever. And a shut gate logs on the state CHANGE, not on every tick."""
+def test_delivery_gate_applies_to_every_probeable_channel_and_logs_once(tmp_path, monkeypatch, capsys):
+    """The gate asks "can this be delivered?", not "is WhatsApp linked?" — so a channel with NO probe
+    (local, Discord…) must not be silently dead forever, while WhatsApp and Telegram are both held
+    until they are actually linked — for Telegram that means a bot token AND a recipient, since
+    either half alone delivers nothing. And a shut gate logs on the state CHANGE, not per tick."""
     rec.DATA = str(tmp_path)
     rec._DELIVERY_GATE_STATE.clear()
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "unknown")
-    monkeypatch.setenv("SOTTO_CRON_DELIVER", "telegram")
-    assert rec._delivery_channel_ready("valve") is True       # other channel → no WhatsApp gate
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "local")
+    assert rec._delivery_channel_ready("valve") is True        # no probe → never gated
     monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     assert rec._delivery_channel_ready("valve") is False
     assert rec._delivery_channel_ready("valve") is False
     assert capsys.readouterr().out.count("whatsapp not linked") == 1   # once, not per tick
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "linked")
     assert rec._delivery_channel_ready("valve") is True
-    monkeypatch.delenv("SOTTO_CRON_DELIVER")                  # unset ⇒ whatsapp (the default)
+    # unset ⇒ the same rule start.sh applies: this volume has no WhatsApp session, so telegram —
+    # and with nothing linked there, a nudge is held rather than spent on a dead channel.
+    monkeypatch.delenv("SOTTO_CRON_DELIVER")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "pairing")
+    assert rec._deliver_target() == "telegram"
     assert rec._delivery_channel_ready("valve") is False
+    assert "telegram not linked" in capsys.readouterr().out
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "8675309")
+    assert rec._delivery_channel_ready("valve") is False       # a recipient with no bot delivers nothing
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<bot-token>")
+    assert rec._delivery_channel_ready("valve") is True
 
 
 def test_valve_and_tap_run_when_delivery_is_not_whatsapp(tmp_path, monkeypatch):
@@ -2037,6 +2157,7 @@ def test_dispatch_meeting_tap_runs_the_ordinary_funnel_and_spawns_on_agent(tmp_p
     """The relay: one synthetic event through run_triage (catchup False), and an agent verdict
     rides the IDENTICAL stage-bundle → sotto-event spawn path a fresh event takes."""
     rec.DATA = str(tmp_path)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "linked")
     seen, bundle = [], {"events": [{"sender": "Sarah Chen", "class": "post_meeting"}]}
     monkeypatch.setattr(rec, "run_triage", lambda evs, c: (seen.append((evs, c)),
@@ -2057,6 +2178,7 @@ def test_dispatch_meeting_tap_held_verdict_counts_but_never_spawns(tmp_path, mon
     """A tap the funnel HELD (budget spent, in the next meeting, quiet hours) still used up its
     chance to fire — it is recorded as handled, and its queue entry is the valve's to promote."""
     rec.DATA = str(tmp_path)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "linked")
     monkeypatch.setattr(rec, "run_triage",
                         lambda evs, c: {"verdict": "queue", "reason": "meeting_hold", "bundle": {}})
@@ -2072,6 +2194,7 @@ def test_dispatch_meeting_tap_gates_on_channel_health_and_survives_a_broken_tria
     that can't be delivered. Both refusals return False, so the end stays unhandled and the next
     tick retries it."""
     rec.DATA = str(tmp_path)
+    monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     ran = []
     monkeypatch.setattr(rec, "run_triage", lambda evs, c: (ran.append(1), {"verdict": "drop"})[1])
     for status in ("unknown", "pairing"):
@@ -2567,7 +2690,7 @@ def test_run_dashboard_job_reports_a_failed_spawn(tmp_path, monkeypatch):
 def test_dashboard_hooks_are_wired_for_the_new_surface():
     """The dashboard module never spawns or reads env by itself — it asks through HOOKS."""
     for name in ("promote_queued", "run_job", "job_names", "delivery_channel", "delivery_ready",
-                 "whatsapp_status"):
+                 "channel_status"):
         assert name in rec.DASHBOARD.HOOKS, name
     assert "sotto-morning-brief" in rec.DASHBOARD.HOOKS["job_names"]()
 
@@ -2643,7 +2766,9 @@ def test_the_delivery_target_is_the_same_channel_the_crons_use(tmp_path, monkeyp
     rec._deliver_text("hi", "event")
     assert sends[0]["argv"][:4] == ["hermes", "send", "--to", "telegram"]
     monkeypatch.delenv("SOTTO_CRON_DELIVER")
-    assert rec._deliver_target() == "whatsapp"      # the documented default, not an empty target
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setattr(rec, "_wa_creds_paths", lambda: [])
+    assert rec._deliver_target() == "telegram"      # the documented default, not an empty target
 
 
 def test_an_empty_run_is_recorded_and_never_sent(tmp_path, monkeypatch):
@@ -3519,3 +3644,20 @@ def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatc
     assert stamped == [1]
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-b") == "superseded"
     assert stamped == [1], "a superseded copy is not the delivery — it must not stamp"
+
+
+def test_a_link_captured_by_a_previous_bot_token_is_not_a_link(tmp_path, monkeypatch):
+    """Rotate the bot and the old capture stops counting: it is evidence the PREVIOUS bot could
+    reach that chat, not this one. Reading it as linked started a gateway that then swallowed the
+    pairing message the next boot was waiting for (external review, Sep 1)."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    with open(os.path.join(str(tmp_path), "telegram-link.json"), "w", encoding="utf-8") as f:
+        json.dump({"bot_token": "<old-token>", "allowed_user": 8675309,
+                   "bot_username": "sotto_brief_bot"}, f)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<new-token>")
+    assert rec._telegram_status() == "pairing"          # re-link, don't inherit
+    assert rec._telegram_link("<new-token>") == {}
+    assert rec._delivery_ready() is False or rec._deliver_target() != "telegram"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<old-token>")
+    assert rec._telegram_status() == "linked"           # the token that captured it still counts

@@ -1,15 +1,14 @@
 # Set up Sotto — step by step (cloud)
 
-The friendliest path: an always-on Sotto in the cloud + the read-only Mac Bridge. Budget **~35 minutes
-the first time** — only ~15 of it active (four Railway settings, four variables, then one wizard page);
-the rest is waiting on builds. You'll finish with a morning brief in WhatsApp and a Mac link that
-survives sleep, redeploys, and laptop lids. (WhatsApp is the **default**, not a requirement — see the
-choice in §0 below.)
+The friendliest path: an always-on Sotto in the cloud + the read-only Mac Bridge. Budget **~30 minutes
+the first time** — only ~15 of it active (a few Railway settings, three variables, then one wizard
+page); the rest is waiting on builds. You'll finish with a morning brief in Telegram and a Mac link
+that survives sleep, redeploys, and laptop lids. (Telegram is the **default**, not a requirement —
+WhatsApp is the appendix at the end of this page.)
 
-> **One honest note before you start:** the one-click Deploy button below is a **placeholder** — the
-> Railway template for this repo isn't published yet, so the button 404s. **Step 1 below is the
-> manual path, and it is the working path today.** It is four settings and four variables; nothing
-> about the rest of this guide changes.
+> **The one-click Deploy link** at the end of step 1 sets up the build, the `/data` volume and
+> `BRIDGE_TOKEN` for you and prompts for exactly two values: your Gemini key and your Telegram bot
+> token. The manual path below is the same result, click by click — do either.
 
 > **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
 > fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
@@ -21,11 +20,11 @@ choice in §0 below.)
 |---|---|---|
 | A **Railway** account (**paid/verified plan** — volumes + always-on need it) | hosts the agent + storage | — |
 | A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the LLM (only key Sotto needs) | once, into Railway |
-| Your **WhatsApp number** *(default channel — or a Telegram bot token instead)* | where briefs are delivered | once, into Railway |
+| A **Telegram bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`, ~1 min *(default channel — WhatsApp instead? the appendix)* | where briefs are delivered | once, into Railway |
 | A **Google OAuth client** (5-minute console task, step 3②) | Gmail + Calendar | pasted in the wizard |
 | The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) | reads your Mac | drag to /Applications |
 
-Everything else — linking your Mac, connecting Google, the WhatsApp QR, your timezone, and optional
+Everything else — linking your Mac, connecting Google, your channel, your timezone, and optional
 extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
 
 **Two defaults you can change, if you want to — decide now, it's a variable each.** Full detail (and
@@ -33,13 +32,17 @@ how tested each one is) in **[CHANNELS.md — Choosing your channel and model](C
 
 | Your channel | | Your model |
 |---|---|---|
-| **WhatsApp** — default. No bot account, no token; scan one QR. The path this guide follows. | | **Gemini** — default, and what the brief pipeline calls today. One key covers everything. |
-| **Telegram** — a bot token from @BotFather, no phone pairing. Right call when WhatsApp pairing is painful. ~5 min and **four variables** (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_HOME_CHANNEL`, `SOTTO_CRON_DELIVER=telegram`) — one command inside your container works out all four for you. Less tested than WhatsApp. | | **Anthropic / OpenAI / Kimi / DeepSeek** — for the **chat** layer only (Ask Sotto, nudge replies). The briefs still need a Gemini key. |
+| **Telegram** — default. **One variable** (`TELEGRAM_BOT_TOKEN`): you tap the pairing link boot prints and it captures your chat id — no id hunting, no phone pairing. The path this guide follows. | | **Gemini** — default, and what the brief pipeline calls today. One key covers everything. |
+| **WhatsApp** — a real contact instead of a bot, at the price of a QR scan. Three variables (`WHATSAPP_ENABLED=true`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`) plus `SOTTO_CRON_DELIVER=whatsapp` — the **[appendix](#appendix--whatsapp-instead-of-telegram)** at the end of this page. | | **Anthropic / OpenAI / Kimi / DeepSeek** — for the **chat** layer only (Ask Sotto, nudge replies). The briefs still need a Gemini key. |
 | **iMessage (BlueBubbles)** — blue bubbles, but an always-on Mac + Firebase + a tunnel. Hand-wired recipe, hours not minutes. | | **Exa / Parallel** — web research only, and independent of the rest: set the key and research stops going through Gemini. |
 
 ## 1 · Deploy the backend on Railway
 
-**The working path today is manual — four settings, in this order.** Get this repo where Railway can
+**First, make your bot** (~1 min): in Telegram, message [@BotFather](https://t.me/BotFather) →
+`/newbot` → name it → it replies with a **bot token**. That token is the only channel setting you
+need; your chat id is captured for you on the first message you send the bot.
+
+**Then the manual path — four settings, in this order.** Get this repo where Railway can
 see it: **Fork** it on GitHub (recommended — that's what **Sync fork** later updates), or point
 Railway straight at the public repo. Then in [Railway](https://railway.app): **New Project → Deploy
 from GitHub repo** → pick it. Set **all four** before the first deploy finishes; each one fails
@@ -48,30 +51,30 @@ from GitHub repo** → pick it. Set **all four** before the first deploy finishe
 1. **Settings → Root Directory**: leave blank — the Dockerfile is at the repo root (leave *Dockerfile Path* blank too; both are auto-detected).
    *Get this wrong and the build dies with `COPY … not found` — the Dockerfile's `COPY` paths are
    relative to the build context this setting picks.*
-2. **Variables → New Variable** — add four:
+2. **Variables → New Variable** — add three:
    - `GOOGLE_AI_API_KEY` = your Gemini key
-   - `WHATSAPP_ALLOWED_USERS` = your number, country code, no `+` (e.g. `15551234567`)
-   - `WHATSAPP_HOME_CHANNEL` = the same number
+   - `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you
    - `BRIDGE_TOKEN` = a long random secret — run `openssl rand -hex 24` and paste the output.
      *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
-   *(Delivering to Telegram instead? Set `GOOGLE_AI_API_KEY` + `BRIDGE_TOKEN` now and
-   `WHATSAPP_ENABLED=false` in place of the two `WHATSAPP_*` lines, finish this step, then do
-   **[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup)** — its one command runs **inside**
-   your deployed container, so it has to come after the first deploy, and it prints the four
-   `TELEGRAM_*` / `SOTTO_CRON_DELIVER` lines for you to paste back here.)*
-3. **⌘K → Add Volume**, mount path `/data` (your knowledge graph + WhatsApp session live here).
-   *No volume = every redeploy wipes your WhatsApp login, Google token and memory.*
+   *(WhatsApp instead? [The appendix](#appendix--whatsapp-instead-of-telegram) — three variables, one
+   QR, nothing else about this guide changes.)*
+3. **⌘K → Add Volume**, mount path `/data` (your knowledge graph, your channel link and Google token
+   live here). *No volume = every redeploy wipes your login and memory.*
 4. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2,
    then redeploy once. Without a domain the logged link falls back to a dead `localhost` URL.
 
-Deploy and wait for the build (the container installs Hermes + Sotto automatically). **Success signal
-in the deploy logs:** a line reading `[sotto] Gemini key OK (model … available)`. A
-`[sotto] WARNING: Gemini key/model check failed` there instead means the key is wrong or out of
-quota — fix it before going further, because every brief depends on it.
+Deploy and wait for the build (the container installs Hermes + Sotto automatically), and **while it
+boots, tap the pairing link in the logs** — the `[sotto] telegram: ➜ TAP THIS TO LINK YOUR CHAT:`
+line. It opens your bot and sends a one-time code, which is how the deploy knows the chat is *yours*
+and not a stranger's who guessed the bot's name. Two success signals in the deploy logs:
+`[sotto] Gemini key OK (model … available)` and `[sotto] telegram linked ✓ — briefs and nudges
+deliver to chat …`. A `[sotto] WARNING: Gemini key/model check failed` means the key is wrong or out
+of quota — fix it before going further, because every brief depends on it. A
+`[sotto] telegram NOT linked yet` just means you hadn't tapped within the five-minute window: tap the
+link and restart the deploy, and it links then. Nothing else is lost either way.
 
-**Later: the one-click button.** Once a Railway template is published for this repo, the button below
-does all four of the above and prompts only for your Gemini key and WhatsApp number. **It is a
-placeholder right now and will 404** — the manual path above is the whole story until then.
+**Or one click.** The button below does all four settings above and prompts for exactly two values —
+your Gemini key and your bot token:
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
 
@@ -79,7 +82,7 @@ placeholder right now and will 404** — the manual path above is the whole stor
 
 Railway → your service → **Deployments → View logs** → find the line starting **`[sotto] Setup link`**
 and open it. That's your `/setup` wizard plus its private access code — only someone with this link can
-see your pairing token or WhatsApp QR. Open it once and your browser is remembered for the rest of the
+see your pairing token or your channel's QR. Open it once and your browser is remembered for the rest of the
 wizard; lose it and it reprints on every boot (it's also on the volume at `/data/setup_code`).
 - *Link says `localhost`?* You have no public domain yet — go back and do step 1.4, redeploy, and use
   the freshly printed link. *A bare `https://<your-domain>/setup` with no `?code=` returns **403** by
@@ -152,18 +155,18 @@ wall — it's your own data):
    for a fresh URL and use that one's code. Never do this step through chat — the agent mints a new
    link each time, which is exactly what breaks it.*
 
-**③ Link WhatsApp** — click **Show WhatsApp QR →** → on your phone: WhatsApp → **Linked Devices → Link a
-Device** → scan. **Success signal:** reload `/setup` and tile ③ reads "WhatsApp is linked".
-*Missed the ~15-minute window, or the page says "No pairing in progress"? Neither is fatal — redeploy
-and pairing reopens on the next boot with a fresh QR.*
-> **On Telegram instead?** Don't scan anything — do
-> **[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup)** now (five steps, ~5 minutes: make a
-> bot with @BotFather, run one command in your container, paste the four variables it prints into
-> Railway, redeploy). Come back here afterwards: with `SOTTO_CRON_DELIVER=telegram` set, this tile
-> stays **TO DO** forever and that is correct — it does **not** block the wizard from completing, and
-> your dashboard hero link appears once tiles ①②④ are done. **On iMessage/BlueBubbles?** Same: skip
-> this tile, [CHANNELS.md § iMessage via BlueBubbles](CHANNELS.md#imessage-via-bluebubbles) is a
-> hand-wired recipe measured in hours, not minutes.
+**③ Link Telegram** — nothing to click: this tile reports the handshake your deploy already did. It
+reads **"Waiting for your first message to @yourbot"** until you tap the pairing link in the deploy
+logs, and **"Telegram is linked"** once boot has captured your chat id (reload to see it flip).
+*Still waiting after you tapped it?* The capture runs at **boot** — restart the deploy (Railway ▸
+Deployments ▸ ⋮ ▸ Restart) and it links within seconds; your message is still waiting on Telegram's
+servers, because an unlinked deploy leaves its gateway down rather than consuming it. Details and the by-hand fallback:
+**[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup-default)**.
+> **On WhatsApp instead?** This tile becomes **Link WhatsApp** with a **Show WhatsApp QR** button —
+> see the [appendix](#appendix--whatsapp-instead-of-telegram). **On iMessage/BlueBubbles?** The tile
+> says there is nothing to link and never blocks the wizard;
+> [CHANNELS.md § iMessage via BlueBubbles](CHANNELS.md#imessage-via-bluebubbles) is a hand-wired
+> recipe measured in hours, not minutes.
 
 **④ Timezone** — auto-detected from your browser when the page loads; the tile reads "Timezone set to
 &lt;your zone&gt;" and the page reloads itself. Nothing to click.
@@ -179,8 +182,8 @@ everything else works without it. More lanes + adding other services:
 
 ## 4 · Say hello
 
-Message yourself on WhatsApp (self-chat mode — you are the bot): **"set up Sotto."** *(On Telegram,
-message your bot instead — same words.)*
+Message your bot on Telegram: **"set up Sotto."** *(On WhatsApp, message yourself in self-chat —
+same words.)*
 
 **One-time approval:** the first time Sotto runs its pipeline it asks permission to run code
 (`execute_code`). Approve with **always** (reply `/approve always`) so it never re-asks. This is a
@@ -261,15 +264,16 @@ never auto-sends**:
   when there's nothing to send.
 - **Relationship pulse** — Mondays at 9am (who you're losing touch with).
 
-All of it lands on **one** channel — `SOTTO_CRON_DELIVER`, which defaults to `whatsapp` (your
-`WHATSAPP_HOME_CHANNEL`). Point it at `telegram` and every line above moves with it; there is no
+All of it lands on **one** channel — `SOTTO_CRON_DELIVER`, which defaults to `telegram` (the chat
+your bot captured). Point it at `whatsapp` and every line above moves with it; there is no
 per-job override by design. Tune or disable any of them with the `SOTTO_PROACTIVE*` variables in
 [RAILWAY.md](RAILWAY.md).
 
 ## If something's off
 
 The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: setup link says
-`localhost` (generate a domain), no reply in self-chat (allowlist number must match exactly), briefs
+`localhost` (generate a domain), no reply from your bot (the allowlist must be the numeric chat id —
+the boot capture gets it right), briefs
 never arrive (check the boot key-check line + `/debug/brief-log`), Google dying after a week (consent
 screen left in Testing — step 3②.3). **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
 icon, drag `/Applications/Sotto Bridge.app` to the Trash, and remove its Full Disk Access entry in
@@ -286,12 +290,49 @@ per-binary approval dies at the next auto-update; a certificate rule covers ever
 **Staying current:** Sotto's skills update themselves on every redeploy, and your server tells you
 when a newer Sotto is published — one quiet line at the foot of your `/setup` (Integrations) page.
 On GitHub hit **Sync fork → Update branch** on your copy; Railway redeploys on the push, and that
-redeploy *is* the update. (Deployed with the one-click template instead? Railway opens the update as
-a pull request on your repo and merging it does the same thing — but that path only exists once the
-template is published, which it isn't yet.) The Bridge
+redeploy *is* the update. (Deployed with the one-click link instead? Railway opens the update as
+a pull request on your repo — merging it does the same thing.) The Bridge
 flags updates in its own menu and installs them itself after verifying the signature (pairing +
 permissions persist). The full picture — including upgrading the underlying Hermes runtime — is
 **RAILWAY.md § Staying updated**.
+
+---
+
+## Appendix · WhatsApp instead of Telegram
+
+WhatsApp is still first-class — the container pairs it for you, serves a clean QR, and holds a nudge
+until the link is live. It is simply no longer the default. Take it when you'd rather Sotto reached
+you as a **contact** than as a bot, and you don't mind scanning a QR.
+
+**Three variables in step 1.2 instead of `TELEGRAM_BOT_TOKEN`:**
+
+| Variable | Value |
+|---|---|
+| `WHATSAPP_ENABLED` | `true` — turns the boot-time pairing step and the WhatsApp gateway back on |
+| `WHATSAPP_ALLOWED_USERS` | your number, country code, no `+` (e.g. `15551234567`). Hermes **denies everyone** until it matches |
+| `WHATSAPP_HOME_CHANNEL` | the same number — where briefs and nudges are delivered |
+
+…plus `SOTTO_CRON_DELIVER=whatsapp`, which moves the briefs, the midday digest, the weekly pulse, the
+proactive watcher and your own routines together. (`WHATSAPP_ENABLED=true` alone would pair WhatsApp
+for *chat* while the briefs still went to Telegram.)
+
+**Then scan the QR.** Tile ③ of the `/setup` wizard becomes **Link WhatsApp**: click
+**Show WhatsApp QR →**, then on your phone: WhatsApp → **Linked Devices → Link a Device** → scan.
+**Success signal:** reload `/setup` and tile ③ reads "WhatsApp is linked". *Missed the ~15-minute
+window, or the page says "No pairing in progress"? Neither is fatal — redeploy and pairing reopens on
+the next boot with a fresh QR.* Scan from the web page rather than the deploy logs; Railway's log
+viewer distorts the terminal QR.
+
+Everything else in this guide is identical, except that you message **yourself** on WhatsApp
+(self-chat mode — you are the bot) where it says to message your bot. Two WhatsApp-only knobs:
+`SOTTO_WHATSAPP_MODE=1` uses a second, dedicated number instead of self-chat, and
+`SOTTO_HIDE_AGENT_NAME=1` drops the ***Sotto*** prefix on its replies. Tapbacks (👀 ✅ ❌) are
+Telegram-only — Hermes has no bot reactions on WhatsApp.
+
+**Already on WhatsApp from an earlier deploy?** Nothing to do, and nothing to fear on the next
+redeploy: *the channel is Telegram unless this volume already holds a paired WhatsApp session and no
+`TELEGRAM_BOT_TOKEN` is set.* Your paired session speaks for you; the boot log names the channel it
+chose and why.
 
 ---
 

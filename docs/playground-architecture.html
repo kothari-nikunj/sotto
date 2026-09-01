@@ -382,9 +382,9 @@ const N = [
   {id:'d-send', l:'hermes send', s:'--to $SOTTO_CRON_DELIVER', x:242, w:172, layer:'delivery',
    k:'Delivery', file:'adapters/hermes/start.sh',
    d:'<p>Pipes text to whichever platform Hermes is already configured for, targeting the home channel — <strong>the same variable every scheduled job delivers to</strong>, so a nudge and a brief can never land in different places.</p><p>An empty run is recorded and never sent. Silence is the correct, common output for every one of these skills.</p>'},
-  {id:'d-chan', l:'Your channel', s:'WhatsApp · Telegram · …', x:430, w:164, layer:'delivery',
+  {id:'d-chan', l:'Your channel', s:'Telegram · WhatsApp · …', x:430, w:164, layer:'delivery',
    k:'Delivery', file:'RAILWAY.md',
-   d:'<p>WhatsApp by default, but nothing about Sotto assumes it — Telegram, Discord, Slack and Signal are the same one variable. A nudge waits for a WhatsApp link only when WhatsApp is the channel; on any other there is nothing to probe, so a Telegram user is never silently denied the valve or the tap.</p>'},
+   d:'<p>Telegram by default — WhatsApp keeps a volume that is already paired with it — but nothing about Sotto assumes either: Discord, Slack and Signal are the same one variable. A nudge waits for the channel Sotto can actually probe to be linked (Telegram\'s captured chat id, WhatsApp\'s session), and a channel with no probe at all never holds one.</p>'},
   {id:'d-receipt', l:'delivery.jsonl', s:'spawned · delivered · empty · failed', x:610, w:204, layer:'delivery',
    k:'Delivery · the receipt', file:'$SOTTO_DATA/events/delivery.jsonl',
    d:'<p>The fact that was missing. <em>Deciding</em> and <em>delivering</em> are separate rows joined by <code>decision_id</code>.</p><p>Only a delivered receipt is allowed back into the next brief as “already nudged”; failed and empty runs remain diagnostic facts, not user-visible outcomes.</p>'}
@@ -517,9 +517,9 @@ const SHARED_FILES = [
   ["proactive/retune_offer.last", "skills (proactive_scan.py)", "skills — the retune-offer cooldown stamp"],
   ["proactive/pending_offer.json", "skills (pending_offer.py set — the ONE writer, the proactive lane after a push that asked something)", "the gateway (get, then clear) — the bare &quot;sure&quot; lands in a session that never saw the question; one offer, newest wins, 180 min"],
   ["intentions.jsonl", "skills (schedule_wakeup.py)", "skills (proactive_scan.py), dashboard (/api/cadence) — one-shot recipes, optionally tied to an open loop"],
-  ["hermes/platforms/whatsapp/session/creds.json", "the Hermes gateway (not Sotto)", "receiver (_whatsapp_status) — the positive linked probe"],
+  ["hermes/platforms/whatsapp/session/creds.json", "the Hermes gateway (not Sotto)", "receiver (_whatsapp_status) — the positive linked probe; start.sh — whether a redeploy keeps WhatsApp as the channel"],
   ["whatsapp-pairing.txt · google-auth-url.txt", "pairing / start.sh", "receiver"],
-  ["telegram-link.json", "telegram_link.py (the Telegram setup CLI, run by hand)", "nobody yet — the handoff for the planned /setup Telegram tile; holds the bot token, so 0600, and start.sh still configures the gateway from the Railway variables"]
+  ["telegram-link.json", "telegram_link.py (the ONE owner of the Telegram handshake — start.sh runs it at boot)", "start.sh (--boot: reuse or capture the chat id, then forward it to Hermes), receiver (_telegram_status — the linked probe behind the wizard tile and the nudge gate); holds the bot token, so 0600"]
 ];
 
 const SHARED_WRITE_ROW = ["preferences.json", "skills <em>and</em> dashboard", "skills, dashboard"];

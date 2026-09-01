@@ -135,6 +135,29 @@ if [ -z "${SOTTO_USER_EMAIL:-}" ] \
   echo "[sotto]       learns it (or set SOTTO_USER_EMAIL in Railway to override). See RAILWAY.md."
 fi
 
+# 0.4) The delivery channel, decided ONCE and exported to everything below.
+# One sentence: Sotto delivers to Telegram unless this volume already holds a paired WhatsApp session
+# and no TELEGRAM_BOT_TOKEN is set — so a deploy that was WhatsApp-first never loses its channel on a
+# redeploy, and everyone else gets the one-variable path. SOTTO_CRON_DELIVER set in Railway always
+# wins. Exported because the receiver (started below), reconcile_crons.py, `hermes cron create
+# --deliver` and the gateway must all agree: the channel has ONE decider, and the log line says which.
+# WhatsApp costs a boot-time QR wait, so its gateway is enabled only when it IS the channel.
+WA_CREDS="$HOME/.hermes/platforms/whatsapp/session/creds.json"
+if [ -n "${SOTTO_CRON_DELIVER:-}" ]; then
+  CHANNEL_WHY="SOTTO_CRON_DELIVER is set"
+elif [ -f "$WA_CREDS" ] && [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  SOTTO_CRON_DELIVER="whatsapp"; CHANNEL_WHY="this volume is already paired with WhatsApp"
+else
+  SOTTO_CRON_DELIVER="telegram"; CHANNEL_WHY="the default"
+fi
+export SOTTO_CRON_DELIVER
+if [ "$SOTTO_CRON_DELIVER" = "whatsapp" ]; then
+  export WHATSAPP_ENABLED="${WHATSAPP_ENABLED:-true}"
+else
+  export WHATSAPP_ENABLED="${WHATSAPP_ENABLED:-false}"
+fi
+echo "[sotto] delivery channel: $SOTTO_CRON_DELIVER ($CHANNEL_WHY); whatsapp gateway: $WHATSAPP_ENABLED"
+
 # 0.5) Start the trigger receiver IMMEDIATELY so Railway's /health healthcheck passes within seconds —
 #      before the slower boot steps below (Google auth makes network calls). Otherwise a slow first boot
 #      can time out the healthcheck and Railway marks the deploy crashed. The receiver only needs $PORT
@@ -147,11 +170,20 @@ SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" python3 /app/tri
 # The receiver gates its whole setup surface (/setup, /whatsapp/qr, /google/auth, /debug/google…)
 # behind a per-deploy setup code — a bare URL now 403s. Any setup link WE print must carry
 # ?code=<code> (env override, else the code the receiver persists to the volume at boot).
-setup_qs() {
+# That code is resolved HERE and nowhere else, because step 5a passes it to the Telegram linker as
+# the pairing phrase: a per-deploy secret only whoever reads the deploy log has, which is exactly who
+# is allowed to own this deploy.
+setup_code() {
   local code="${SOTTO_SETUP_CODE:-}"
   if [ -z "$code" ]; then
     code="$(cat "${SOTTO_DATA:-/data}/setup_code" 2>/dev/null | tr -d '[:space:]' || true)"
   fi
+  printf '%s' "$code"
+  return 0
+}
+setup_qs() {
+  local code
+  code="$(setup_code)"
   if [ -n "$code" ]; then printf '?code=%s' "$code"; fi
   return 0
 }
@@ -395,16 +427,15 @@ fi
 # fired at 6:30/17:30 simultaneously, hammering Gemini → HTTP 429 RESOURCE_EXHAUSTED → briefs never
 # delivered for days. The old `case` guard only stopped NEW dupes; it never removed the historical
 # pile. So we now FIRST remove every existing sotto job by id, then recreate exactly one of each —
-# fully idempotent + self-healing. Recreation also sets a stable --name and --deliver target so the
-# briefs go to the WhatsApp home channel instead of the default "local" (which never reaches the user).
+# fully idempotent + self-healing. Recreation also sets a stable --name and the resolved channel's
+# --deliver target instead of the default "local" (which never reaches the user).
 #
 # ONE SOURCE: the job list lives in adapters/hermes/crons.json (name/schedule/prompt/skill, plus an
 # optional `gate` env var and `schedule_env` override). Every registrar reads that file — this boot,
 # receiver.py's _sotto_cron_jobs (the timezone re-registration) and both adapters' install.sh — so a
-# schedule can never drift between them again. `--deliver` is NOT per job: SOTTO_CRON_DELIVER below
-# is the one delivery target for all of them.
+# schedule can never drift between them again. `--deliver` is NOT per job: SOTTO_CRON_DELIVER (step
+# 0.4 resolved it) is the one delivery target for all of them.
 CRONS_JSON="${SOTTO_CRONS_JSON:-/app/adapters/hermes/crons.json}"
-SOTTO_CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"
 # One reconciler owns boot convergence and live timezone changes. It removes only crons.json system
 # jobs (plus retired Sotto markers), fences every user-* routine, and recreates the enabled spec.
 python3 /app/adapters/hermes/reconcile_crons.py \
@@ -417,11 +448,12 @@ python3 /app/adapters/hermes/reconcile_crons.py \
 echo "[sotto] cron scheduler: $(hermes cron status 2>/dev/null | head -1 || echo '?') tz=${SOTTO_TIMEZONE:-UTC} deliver=${SOTTO_CRON_DELIVER}; registered crons:"
 hermes cron list 2>&1 | head -40 | sed 's/^/[sotto]   /' || echo "[sotto]   (hermes cron list failed)"
 
-# 3.5) Enable the WhatsApp gateway NON-INTERACTIVELY. Hermes reads messaging-platform settings from
+# 3.5) Configure the gateway NON-INTERACTIVELY. Hermes reads messaging-platform settings from
 #      ~/.hermes/.env (NOT config.yaml), and denies all users until an allowlist is set — without this
 #      the gateway logs "No messaging platforms enabled". We upsert the keys from Railway env each boot
-#      so Railway stays the source of truth. Set WHATSAPP_ALLOWED_USERS (and WHATSAPP_HOME_CHANNEL for
-#      proactive brief delivery) to your number, e.g. 15551234567, in Railway → Variables.
+#      so Railway stays the source of truth. Telegram needs only TELEGRAM_BOT_TOKEN (step 5 captures
+#      the chat id); WhatsApp needs WHATSAPP_ALLOWED_USERS + WHATSAPP_HOME_CHANNEL, your number, e.g.
+#      15551234567. Every gateway variable travels the one prefix loop below — none is special-cased.
 ENVF="$HOME/.hermes/.env"
 touch "$ENVF"
 upsert_env() {  # replace any existing KEY= line, then append the new value
@@ -429,7 +461,10 @@ upsert_env() {  # replace any existing KEY= line, then append the new value
   mv "$ENVF.tmp" "$ENVF"
   printf '%s=%s\n' "$1" "$2" >> "$ENVF"
 }
-upsert_env WHATSAPP_ENABLED "${WHATSAPP_ENABLED:-true}"
+drop_env() {    # remove any existing KEY= line, leaving nothing behind
+  grep -v "^$1=" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
+  mv "$ENVF.tmp" "$ENVF"
+}
 # The Gemini key: Sotto's brief reads GOOGLE_AI_API_KEY, but Hermes' gemini provider reads
 # GEMINI_API_KEY / GOOGLE_API_KEY. Map whichever the user set in Railway to all three.
 GKEY="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-${GOOGLE_AI_API_KEY:-}}}"
@@ -454,23 +489,18 @@ if [ -n "$GKEY" ]; then
 else
   echo "[sotto] WARNING: Gemini key/model check failed (HTTP 000, no key set) — briefs will fail; check GOOGLE_AI_API_KEY and SOTTO_GEMINI_MODEL"
 fi
-[ -n "${WHATSAPP_ALLOWED_USERS:-}" ] && upsert_env WHATSAPP_ALLOWED_USERS "$WHATSAPP_ALLOWED_USERS"
-[ -n "${WHATSAPP_HOME_CHANNEL:-}" ]  && upsert_env WHATSAPP_HOME_CHANNEL "$WHATSAPP_HOME_CHANNEL"
 [ -n "${GATEWAY_ALLOW_ALL_USERS:-}" ] && upsert_env GATEWAY_ALLOW_ALL_USERS "$GATEWAY_ALLOW_ALL_USERS"
-# WhatsApp is the DEFAULT channel, not the only one — but until now it was the only one whose
-# settings reached Hermes: every other gateway's variables sat in the Railway environment and were
-# never written to ~/.hermes/.env, which is where Hermes reads messaging-platform settings from. So
-# forward the rest the same way, BY PREFIX rather than by name — Hermes owns these names
-# (TELEGRAM_*, DISCORD_*, SIGNAL_*, SLACK_*, BLUEBUBBLES_*), and forwarding by prefix means a
-# Telegram deployer never waits on this script to learn a new key name. This adds no Sotto variable
-# and changes nothing for a WhatsApp deploy: set none of them and the loop does nothing. Pair it
-# with SOTTO_CRON_DELIVER=<channel> (where the briefs go) and, if you don't want the WhatsApp
-# pairing step at all, WHATSAPP_ENABLED=false. See CHANNELS.md.
+# Every gateway's settings reach Hermes the same way: BY PREFIX, not by name. Hermes owns these names
+# (WHATSAPP_*, TELEGRAM_*, DISCORD_*, SIGNAL_*, SLACK_*, BLUEBUBBLES_*), so forwarding by prefix means
+# no deployer waits on this script to learn a new key name — and no channel is special-cased here.
+# WHATSAPP_ENABLED rides the same loop because step 0.4 exported it. This adds no Sotto variable: set
+# none of them and the loop does nothing. Pair it with SOTTO_CRON_DELIVER=<channel> (where the briefs
+# go). See CHANNELS.md.
 while IFS='=' read -r gwk gwv; do
   [ -n "$gwk" ] || continue
   upsert_env "$gwk" "$gwv"
   echo "[sotto] gateway variable forwarded to Hermes: $gwk"
-done < <(env | grep -E '^(TELEGRAM|DISCORD|SIGNAL|SLACK|BLUEBUBBLES)_[A-Za-z0-9_]*=' || true)
+done < <(env | grep -E '^(WHATSAPP|TELEGRAM|DISCORD|SIGNAL|SLACK|BLUEBUBBLES)_[A-Za-z0-9_]*=' || true)
 
 # 3.7) Google Workspace auth — DETERMINISTIC + headless. Doing this through the agent breaks: every
 #      `--auth-url` mints a NEW PKCE verifier, so a re-run invalidates a code you got from an earlier URL
@@ -540,12 +570,51 @@ fi
 
 # 4) (Trigger receiver already started in step 0.5 so /health is up immediately.)
 
-# 5) Pair WhatsApp BEFORE the gateway. `hermes gateway` refuses to start unpaired ("WhatsApp enabled but
+# 5) Link the delivery channel BEFORE the gateway — both channels need their identity in
+#    ~/.hermes/.env before `hermes gateway` starts, and both are bounded waits that boot survives.
+#
+# 5a) Telegram: you paste a bot token, tap the pairing link the linker prints, and this captures the
+#     chat id. The handshake has ONE owner — trigger-receiver/telegram_link.py (`--boot` = reuse the
+#     id on the volume, else capture and persist it); nothing about the Bot API is re-implemented
+#     here. Skipped when you set TELEGRAM_ALLOWED_USERS yourself (explicit configuration wins) and
+#     after the first capture. The wait is the linker's own LINK_TIMEOUT_SECS — one named timeout, no
+#     second env var — and a timeout is NOT fatal: boot carries on, the brief still composes, and the
+#     next boot tries again.
+#     A bot's @username is discoverable, so the capture only accepts a message carrying this deploy's
+#     SETUP CODE — the one secret that already gates /setup, passed in explicitly so the linker never
+#     has to reach into the receiver. No code resolved yet, no capture: linking a stranger is worse
+#     than not linking at all.
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_ALLOWED_USERS:-}" ]; then
+  # Before anything else, including the reason we might not link at all: an id the PREVIOUS token
+  # captured may not survive a boot that fails to re-link, or it reads as linked and starts a gateway
+  # that eats the next pairing message. Re-added below only on success.
+  drop_env TELEGRAM_ALLOWED_USERS
+  drop_env TELEGRAM_HOME_CHANNEL
+  TG_PHRASE="$(setup_code)"
+  if [ -z "$TG_PHRASE" ]; then
+    echo "[sotto] telegram NOT linked — no setup code resolved yet, and pairing without one would"
+    echo "[sotto]   hand your briefs to whoever finds the bot first. Set SOTTO_SETUP_CODE, redeploy."
+  else
+    echo "[sotto] telegram: linking your chat — tap the link below (nothing to paste back)."
+    TG_ID="$(python3 /app/trigger-receiver/telegram_link.py --token "$TELEGRAM_BOT_TOKEN" \
+      --phrase "$TG_PHRASE" --boot || true)"
+    if [ -n "$TG_ID" ]; then
+      upsert_env TELEGRAM_ALLOWED_USERS "$TG_ID"
+      upsert_env TELEGRAM_HOME_CHANNEL "$TG_ID"
+      echo "[sotto] telegram linked ✓ — briefs and nudges deliver to chat $TG_ID"
+    else
+      echo "[sotto] telegram NOT linked yet — tap the pairing link above, then restart this deploy."
+    fi
+  fi
+fi
+
+# 5b) Pair WhatsApp. `hermes gateway` refuses to start unpaired ("WhatsApp enabled but
 #    not paired") and exits — pairing is a SEPARATE command (`hermes whatsapp`) that prints a QR. On first
 #    boot (no creds.json) we run it; scan the QR from the deploy logs (WhatsApp ▸ Linked Devices ▸ Link a
 #    Device). creds.json lands in the /data-backed session dir, so later boots skip straight to the gateway.
-WA_CREDS="$HOME/.hermes/platforms/whatsapp/session/creds.json"
-if [ "${WHATSAPP_ENABLED:-true}" = "true" ] && [ ! -f "$WA_CREDS" ]; then
+#    Runs only when WHATSAPP_ENABLED is true (step 0.4: when WhatsApp is the channel, or you asked for it) —
+#    it is the only way to pair WhatsApp on Railway, where there is no interactive shell.
+if [ "$WHATSAPP_ENABLED" = "true" ] && [ ! -f "$WA_CREDS" ]; then
   echo "[sotto] WhatsApp not paired — starting pairing."
   if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
     QRQS="$(setup_qs)"
@@ -593,6 +662,28 @@ fi
 GW_PID=""
 term() { [ -n "$GW_PID" ] && kill -TERM "$GW_PID" 2>/dev/null || true; exit 0; }
 trap term TERM INT
+
+# The gateway does not start for an unlinked Telegram. One sentence: an unlinked channel cannot
+# deliver anything, and a running gateway long-polls getUpdates with the SAME bot token — so it would
+# swallow the pairing message the next boot's capture is waiting for, and "tap the link, then
+# restart" could never work. Telegram counts as linked once a chat id reached ~/.hermes/.env: the
+# allowlist you set (step 3.5 forwards it), the id step 5a just captured, or one a previous boot
+# wrote there — AND a bot token beside it, because a recipient with no bot delivers nothing. Every
+# other channel starts the gateway as before.
+START_GATEWAY=1
+if [ "$SOTTO_CRON_DELIVER" = "telegram" ] \
+   && { ! grep -q '^TELEGRAM_ALLOWED_USERS=.' "$ENVF" 2>/dev/null \
+        || ! grep -q '^TELEGRAM_BOT_TOKEN=.' "$ENVF" 2>/dev/null; }; then
+  START_GATEWAY=0
+  echo "[sotto] telegram gateway NOT started — no chat is linked, so nothing can be delivered."
+  echo "[sotto]   Your pairing message waits on Telegram's servers while it stays down: tap the"
+  echo "[sotto]   pairing link above, then restart this deploy and the capture picks it up."
+fi
+# No gateway to supervise: hold the container open so /health, /setup and the briefs keep working.
+if [ "$START_GATEWAY" != "1" ]; then
+  wait || true          # the receiver (step 0.5) is the only background job; the trap ends the boot
+  exit 0
+fi
 gw_tries=0
 while :; do
   hermes gateway & GW_PID=$!

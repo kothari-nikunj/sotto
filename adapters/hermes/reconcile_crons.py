@@ -64,8 +64,12 @@ def blocks(text: str):
         yield match.group(1), text[match.start():end]
 
 
-def reconcile(path: str, deliver: str = "whatsapp") -> bool:
-    """Remove all managed/retired registrations, then recreate the enabled spec exactly once."""
+def reconcile(path: str, deliver: str) -> bool:
+    """Remove all managed/retired registrations, then recreate the enabled spec exactly once.
+
+    `deliver` has no default on purpose: the channel is resolved ONCE (start.sh step 0.4, mirrored by
+    receiver._deliver_target) and passed in, so a fallback here could only ever be a second, wrong
+    answer to a question already decided."""
     try:
         rows = _spec(path)
         listed = subprocess.run(["hermes", "cron", "list"], capture_output=True, text=True,
@@ -128,7 +132,8 @@ def reconcile(path: str, deliver: str = "whatsapp") -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True)
-    parser.add_argument("--deliver", default=os.environ.get("SOTTO_CRON_DELIVER", "whatsapp"))
+    # Required, not defaulted: boot exports the resolved channel and passes it here explicitly.
+    parser.add_argument("--deliver", required=True)
     args = parser.parse_args()
     return 0 if reconcile(args.spec, args.deliver) else 1
 

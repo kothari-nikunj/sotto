@@ -71,7 +71,7 @@ from render_local import (  # noqa: E402
     _thread_needs_response, _thread_is_known_person,
     _format_threads_as_text, _trim_email, _format_emails, _format_calendar,
     MAX_ATTENDEES_TO_RESEARCH, RESEARCH_HORIZON_HOURS,
-    _known_identities, _format_attendee_research, _format_reminders,
+    _known_identities, _format_attendee_research, _format_x_context, _format_reminders,
     _format_birthdays, _format_missed_calls, _format_recent_calls, _stale_local_note,
     _format_source_availability, _format_deferred_unread, _format_stale_threads,
     _format_past_commitments, _format_action_ledger, _format_attention_queue,
@@ -863,6 +863,15 @@ def _normalize_local(inputs: dict) -> dict:
         if isinstance(avail, dict):
             avail.setdefault("attendee_research", "unavailable")
 
+    # X, same rule again: warnings mean the API broke mid-run (rate limit, outage), and a prep built
+    # without the context it was promised must say so. `connected: False` is NOT a warning — an
+    # unconfigured source reports nothing.
+    x_ctx = inputs.get("x_context")
+    if isinstance(x_ctx, dict) and x_ctx.get("warnings"):
+        avail = local.setdefault("_source_availability", {})
+        if isinstance(avail, dict):
+            avail.setdefault("x", "unavailable")
+
     # Surface the weekly relationship pulse (relationship_pulse.py writes it to the volume) so the
     # daily brief's attention-queue / relationship-insights sections aren't inert.
     if not local.get("attention_queue") and not local.get("relationship_insights"):
@@ -1200,7 +1209,10 @@ def build_prompt(template: str, inputs: dict) -> str:
         "imessage_handled": _format_threads_as_text(im_handled, "imessage", sa.get("imessage")),
         "whatsapp_handled": _format_threads_as_text(wa_handled, "whatsapp", sa.get("whatsapp")),
         "gmail": _format_emails(trimmed_emails),
-        "attendee_research": opt(_format_attendee_research(inputs)),
+        # X is a research source inside the existing meeting-prep action lane, never a new brief
+        # surface. Appending it to this field keeps the prompt contract and action budget unchanged.
+        "attendee_research": (opt(_format_attendee_research(inputs))
+                              + opt(_format_x_context(inputs))),
         "calendar": _format_calendar(events, contact_lookup),
         "reminders": _format_reminders(_arr(local, "reminders"), sa.get("reminders"), _brief_now(inputs)),
         "birthdays": opt(_format_birthdays(local)),
@@ -2655,6 +2667,7 @@ def main():
     ap.add_argument("--granola", help="Granola JSON: an array, or {meetings:[...]}")
     ap.add_argument("--knowledge", help="prior knowledge JSON (knowledge_query.py output)")
     ap.add_argument("--attendee-research", dest="attendee_research", help="attendee research JSON array")
+    ap.add_argument("--x-context", dest="x_context", help="ephemeral upcoming-attendee X context")
     ap.add_argument("--user-email", dest="user_email")
     ap.add_argument("--user-timezone", dest="user_timezone")
     ap.add_argument("--window-hours", dest="window_hours", type=int, default=24)
@@ -2692,7 +2705,8 @@ def main():
     # Critic on by default for real runs; auto-off under the test stub (it can't return critic JSON).
     use_critic = not args.no_critic and not os.environ.get("SOTTO_LLM_STUB")
 
-    using_files = any([args.local, args.gmail, args.calendar, args.granola, args.knowledge, args.attendee_research])
+    using_files = any([args.local, args.gmail, args.calendar, args.granola, args.knowledge,
+                       args.attendee_research, args.x_context])
     if not using_files:
         # Back-compat: a single assembled inputs object from a file arg or stdin.
         raw = open(args.inputs).read() if args.inputs else sys.stdin.read()
@@ -2774,6 +2788,7 @@ def main():
         # VERBATIM (same as granola above), because compose() is the single place that flattens the
         # envelope and keeps its warnings; normalizing here as well would drop them.
         "attendee_research": load(args.attendee_research, []),
+        "x_context": load(args.x_context, {}),
     }
     # The two sources the `inputs:` line above CAN'T report — they aren't part of `local`, they are
     # their own gathers, and their absence is invisible from that line. Granola in particular sat

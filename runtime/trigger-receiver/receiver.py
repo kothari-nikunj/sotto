@@ -137,7 +137,6 @@ DASHBOARD.HOOKS.update({
     "bridge_connected": lambda: RELAY.bridge_connected(),
     "last_event_at": lambda: _last_event_at(),
     "google_ok": lambda: google_connected()[0],
-    "whatsapp_ok": lambda: _whatsapp_status() != "pairing",
     "connector_status": lambda: CONNECTORS.service_status(),
     "connector_error": lambda s: _connector_error(s),
     "connector_has_refresh": lambda s: _connector_has_refresh(s),
@@ -157,9 +156,9 @@ DASHBOARD.HOOKS.update({
     "job_names": lambda: [j[0] for j in _sotto_cron_jobs()],
     "personal_routines": lambda: _personal_routines(),
     # Delivery honesty for the Cadence panel — the channel and whether it's live right now.
-    "delivery_channel": lambda: (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip(),
+    "delivery_channel": lambda: _deliver_target(),
     "delivery_ready": lambda: _delivery_ready(),
-    "whatsapp_status": lambda: _whatsapp_status(),
+    "channel_status": lambda: _channel_status(),
     # "A newer Sotto is published" — the freshness-gated half of the daily check (update_notice),
     # so /api/overview can carry the Today banner without a second checker or a second cache.
     "update_notice": lambda: update_notice(),
@@ -351,8 +350,18 @@ def _is_silence(body: str) -> bool:
 
 def _deliver_target() -> str:
     """The platform `hermes send --to` addresses, i.e. the home channel — the SAME variable the
-    crons are registered with, so a nudge and a brief can never land in different places."""
-    return (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip()
+    crons are registered with, so a nudge and a brief can never land in different places.
+
+    Unset (a local Hermes, or any host that isn't start.sh) resolves by start.sh's own rule, in the
+    same one sentence: Telegram, unless this volume already holds a paired WhatsApp session and no
+    bot token is set. A cloud boot exports the resolved value before this process starts, so the
+    fallback is what keeps a laptop install and its installer agreeing about the channel."""
+    channel = (os.environ.get("SOTTO_CRON_DELIVER") or "").strip()
+    if channel:
+        return channel
+    paired = any(os.path.exists(p) for p in _wa_creds_paths())
+    return "whatsapp" if paired and not (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip() \
+        else "telegram"
 
 
 def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None,
@@ -1336,39 +1345,47 @@ def start_gmail_poll_thread():
 # Gmail poll — a timer, not per-batch, because the defining failure is "the hold lifted and no fresh
 # event arrived to trigger reconsideration") and the CHANNEL-HEALTH gate: a promotion is only spent
 # when the DELIVERY channel is healthy (_delivery_channel_ready — the ROADMAP amendment, never burn
-# budget on an undeliverable nudge; for a non-WhatsApp SOTTO_CRON_DELIVER there is nothing to probe,
+# budget on an undeliverable nudge; for a SOTTO_CRON_DELIVER with no probe there is nothing to check,
 # so the valve just runs). An agent verdict from the valve rides the IDENTICAL stage-bundle → spawn path
 # a fresh agent verdict takes.
 
 VALVE_INTERVAL_SECS_DEFAULT = 900   # the same */15 cadence as the proactive heartbeat
 
-# One sentence: when Sotto delivers over WhatsApp, a nudge waits for WhatsApp to be linked; on any
-# other delivery channel there is nothing to wait for. SOTTO_CRON_DELIVER (the same var start.sh
-# passes to `hermes cron create --deliver`) names the channel, so a Telegram/local user is no longer
-# silently denied the valve and the post-meeting tap forever.
+# One sentence: a nudge waits for the ACTIVE channel to be linked, and a channel with no probe counts
+# as linked. SOTTO_CRON_DELIVER (the same var start.sh resolves and passes to `hermes cron create
+# --deliver`) names the channel, so a Discord/Slack/local user is never silently denied the valve and
+# the post-meeting tap — while a WhatsApp or Telegram deploy that has not finished linking is held
+# rather than spending a nudge on nothing.
 _DELIVERY_GATE_STATE: dict = {}     # label → last logged state, so a shut gate logs once, not per tick
 
 
-def _delivery_ready(whatsapp_status: str | None = None) -> bool:
-    """THE delivery rule, in one sentence: when Sotto delivers over WhatsApp the link must be live;
-    on any other SOTTO_CRON_DELIVER there is nothing to probe. Silent — callers that run on a timer
-    use _delivery_channel_ready below; the setup wizard's completion gate calls this directly,
-    passing the WhatsApp state it already rendered from rather than re-probing."""
-    if (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip() != "whatsapp":
-        return True
-    return (whatsapp_status or _whatsapp_status()) == "linked"
+def _delivery_ready(status: str | None = None) -> bool:
+    """THE delivery rule, in one sentence: a channel Sotto CAN probe must be linked, and a channel
+    with no probe at all counts as linked. WhatsApp and Telegram both have complete probes (session
+    creds on the volume; a captured chat id or a configured allowlist), so anything but "linked"
+    holds — including Telegram's "unknown", which on a fresh deploy means no token, nothing linked
+    and no way to deliver, not "a setup we cannot see". Discord, Slack, Signal, BlueBubbles and local
+    have no probe and may not be denied for a setup this process cannot see. Silent — callers that
+    run on a timer use _delivery_channel_ready below; the setup wizard's completion gate calls this
+    directly, passing the channel state it already rendered from rather than re-probing."""
+    channel = _deliver_target()
+    if channel in ("whatsapp", "telegram"):
+        return (status or _channel_status(channel)) == "linked"
+    return True
 
 
 def _delivery_channel_ready(label: str) -> bool:
     """_delivery_ready, plus one log line per state change (never per tick) so 'why did my nudges
     stop?' is answerable from the deploy log."""
-    if (os.environ.get("SOTTO_CRON_DELIVER") or "whatsapp").strip() != "whatsapp":
+    channel = _deliver_target()
+    state = _channel_status(channel)
+    ok = _delivery_ready(state)
+    if ok and state == "unknown":
         return True   # nothing to probe, and nothing worth logging every tick
-    ok = _delivery_ready()
     if _DELIVERY_GATE_STATE.get(label) != ok:
         _DELIVERY_GATE_STATE[label] = ok
-        print(f"[sotto] {label}: {'whatsapp linked — dispatching' if ok else 'skipped, whatsapp not linked'}",
-              flush=True)
+        print(f"[sotto] {label}: {channel} linked — dispatching" if ok else
+              f"[sotto] {label}: skipped, {channel} not linked", flush=True)
     return ok
 
 
@@ -1441,8 +1458,7 @@ def _promote_queued(key: str) -> dict:
     Returns {"ok": True, "reason"} or {"ok": False, "error": <code>, "reason": <sentence>}."""
     if not _delivery_ready():
         return {"ok": False, "error": "channel",
-                "reason": f"{(os.environ.get('SOTTO_CRON_DELIVER') or 'whatsapp').strip()} "
-                          "isn't linked — the nudge would go nowhere"}
+                "reason": f"{_deliver_target()} isn't linked — the nudge would go nowhere"}
     try:
         out = run_promote(key)
     except Exception as e:  # noqa: BLE001
@@ -2063,7 +2079,7 @@ def _reregister_sotto_crons(tz: str) -> None:
     if reconciler is None:
         print("[sotto] cron reconciler not found; timezone cron refresh skipped", flush=True)
         return
-    ok = reconciler.reconcile(_crons_file(), os.environ.get("SOTTO_CRON_DELIVER", "whatsapp"))
+    ok = reconciler.reconcile(_crons_file(), _deliver_target())
     state = "re-registered" if ok else "could not re-register"
     print(f"[sotto] {state} sotto crons for timezone {tz}", flush=True)
 
@@ -2177,6 +2193,77 @@ def _wa_creds_paths() -> list:
         os.path.join(DATA, "hermes", "platforms", "whatsapp", "session", "creds.json"),
         os.path.expanduser("~/.hermes/platforms/whatsapp/session/creds.json"),
     ]
+
+
+def _telegram_link(token: str = "") -> dict:
+    """What telegram_link.py captured on this volume FOR THIS BOT TOKEN: {"user_id", "bot"} or {}.
+    That file is the ONE record of the Telegram handshake — start.sh writes it at boot and forwards
+    the id to Hermes; this is a read of the same fact, never a second capture.
+
+    The token binding is the point: a rotated bot must RE-LINK, and a record captured by the old one
+    is not evidence that the new one can reach anybody (external review, Sep 1 — a stale record read
+    as "linked", which started a gateway that then ate the next pairing message)."""
+    try:
+        with open(os.path.join(DATA, "telegram-link.json"), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    if token and str(record.get("bot_token") or "") != token:
+        return {}
+    user_id = record.get("allowed_user")
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        return {}
+    return {"user_id": user_id, "bot": str(record.get("bot_username") or "")}
+
+
+def _telegram_bot_token() -> str:
+    """The bot token this deploy actually has, from either place one lives: our own environment
+    (Railway sets it; step 3.5 forwards it), or `~/.hermes/.env`, which is where both that forward
+    and a local `hermes gateway setup` persist it. Looking in only the first would call a working
+    laptop unprobeable — and looking in neither is how a recipient with no bot passed for linked."""
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if token:
+        return token
+    try:
+        with open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _telegram_status() -> str:
+    """Telegram linked-state, and a bot token is the price of admission to any of it: "linked" when
+    a token is configured AND you named the recipient yourself (TELEGRAM_ALLOWED_USERS) or this
+    volume holds a capture BY THAT SAME TOKEN; "pairing" while a token is set
+    and no such capture exists; "unknown" when this process can see no token at all — which is also
+    how a gateway configured outside our env (a local `hermes gateway setup`) reads, and why unknown
+    never gates delivery. A capture by a previous token is not a link: rotating the bot means
+    re-linking, and reading the stale record as linked is what let a gateway start and swallow the
+    next pairing message."""
+    token = _telegram_bot_token()
+    if not token:
+        # A recipient with no bot is half a configuration that delivers nothing (external review,
+        # Sep 1), so this is "pairing" — held, not ready — rather than the "linked" it used to read.
+        return "pairing" if (os.environ.get("TELEGRAM_ALLOWED_USERS") or "").strip() else "unknown"
+    if (os.environ.get("TELEGRAM_ALLOWED_USERS") or "").strip():
+        return "linked"
+    return "linked" if _telegram_link(token) else "pairing"
+
+
+def _channel_status(channel: str | None = None) -> str:
+    """The ACTIVE delivery channel's link state — "linked" | "pairing" | "unknown" — from the one
+    probe that channel has. A channel with no probe (local, BlueBubbles, Discord…) is "unknown"."""
+    channel = channel or _deliver_target()
+    if channel == "whatsapp":
+        return _whatsapp_status()
+    if channel == "telegram":
+        return _telegram_status()
+    return "unknown"
 
 
 def _whatsapp_status() -> str:
@@ -2375,6 +2462,11 @@ def setup_status() -> dict:
         "google_detail": gmsg,
         "google_client_present": client_present,
         "timezone": tz,
+        # The channel Sotto delivers to and ITS link state — the wizard, the dashboard and the
+        # completion gate all read these. `whatsapp` stays beside them because the WhatsApp tile and
+        # the QR page are about WhatsApp whatever the active channel is.
+        "channel": _deliver_target(),
+        "channel_status": _channel_status(),
         "whatsapp": _whatsapp_status(),
         "connectors": CONNECTORS.service_status(),
         "last_event_at": _last_event_at(),
@@ -2396,9 +2488,9 @@ def _tile(num: int, title: str, state: str, body: str) -> str:
 
 def _setup_page(code: str = "") -> str:
     """The Connections view of the site — same shell/nav as the /app dashboard, so the bookmarked
-    /setup entry point IS the product. Renders live status for each step (Mac · Google · WhatsApp ·
-    Timezone) and only the next action you need — no jumping between four URLs or the Railway
-    dashboard. Google loads LIVE (paste client → authorize → paste code), so Google needs zero
+    /setup entry point IS the product. Renders live status for each step (Mac · Google · your
+    delivery channel · Timezone) and only the next action you need — no jumping between four URLs or
+    the Railway dashboard. Google loads LIVE (paste client → authorize → paste code), so Google needs zero
     Railway vars and zero redeploys. Timezone auto-detects from the browser. Once steps 1–4 are all
     done, a hero CTA hands you to /app (the wizard's job is over). Gated behind the setup code (the
     pairing link on this page carries the MCP bearer); internal links re-carry `?code=` so one
@@ -2462,16 +2554,49 @@ def _setup_page(code: str = "") -> str:
         google = (f"<p><a class='btn-primary' href='/google/auth{qs}'>Authorize Gmail + Calendar →</a> "
                   "<span class='tile-hint'>(then paste the code on that page)</span></p>")
 
-    # 3 · WhatsApp — the tile turns "done" only on the POSITIVE probe (session creds on disk, see
-    # _whatsapp_status). "unknown" (never linked) keeps the QR button and stays 'to do'.
-    if st["whatsapp"] == "linked":
-        wa = "<p class='tile-status'>WhatsApp is linked — briefs deliver to your number.</p>"
-    elif st["whatsapp"] == "pairing":
-        wa = ("<p class='tile-status'>Pairing in progress — "
-              f"<a href='/whatsapp/qr{qs}'>open the QR</a> and scan with your phone.</p>")
+    # 3 · Your channel — the tile follows SOTTO_CRON_DELIVER, because a Telegram deploy asking for a
+    # WhatsApp QR is a lie the wizard used to tell. Telegram links itself at boot (start.sh runs
+    # telegram_link.py), so the tile REPORTS that handshake; WhatsApp keeps its QR button, and it
+    # turns "done" only on the POSITIVE probe (session creds on disk, see _whatsapp_status).
+    channel = st.get("channel") or _deliver_target()
+    ch_state = st.get("channel_status") or _channel_status(channel)
+    if channel == "telegram":
+        ch_title = "Link Telegram"
+        bot = _telegram_link().get("bot")
+        who = f"@{_html.escape(bot)}" if bot else "your bot"
+        if ch_state == "linked":
+            ch_body = ("<p class='tile-status'>Telegram is linked — briefs and nudges arrive in that "
+                       "chat.</p>")
+        elif ch_state == "pairing":
+            ch_body = (f"<p class='tile-status'>Waiting for your first message to {who} — tap the "
+                       "pairing link in your deploy logs, then restart (boot captures your chat "
+                       "id from it).</p>")
+        else:
+            # No token visible here, so there is nothing this page can check — say that plainly
+            # rather than calling a gateway configured elsewhere broken.
+            ch_body = ("<p class='tile-status'>Nothing to check from here — this deploy sees no bot "
+                       "token, so Telegram is configured elsewhere (or not yet).</p>"
+                       "<p class='tile-hint'>Briefs not arriving? Set <code>TELEGRAM_BOT_TOKEN</code> "
+                       "(from <a href='https://t.me/BotFather'>@BotFather</a>) in your host's "
+                       "variables and tap the pairing link boot prints — it captures your chat "
+                       "id.</p>")
+    elif channel == "whatsapp":
+        ch_title = "Link WhatsApp"
+        if ch_state == "linked":
+            ch_body = "<p class='tile-status'>WhatsApp is linked — briefs deliver to your number.</p>"
+        elif ch_state == "pairing":
+            ch_body = ("<p class='tile-status'>Pairing in progress — "
+                       f"<a href='/whatsapp/qr{qs}'>open the QR</a> and scan with your phone.</p>")
+        else:
+            ch_body = (f"<p><a class='btn-primary' href='/whatsapp/qr{qs}'>Show WhatsApp QR →</a> "
+                       "<span class='tile-hint'>(WhatsApp ▸ Linked Devices ▸ Link a Device — scan "
+                       "with your phone)</span></p>")
     else:
-        wa = (f"<p><a class='btn-primary' href='/whatsapp/qr{qs}'>Show WhatsApp QR →</a> <span class='tile-hint'>"
-              "(WhatsApp ▸ Linked Devices ▸ Link a Device — scan with your phone)</span></p>")
+        ch_title = "Your channel"
+        ch_body = (f"<p class='tile-status'>Briefs and nudges deliver to <b>{_html.escape(channel)}</b> "
+                   "— nothing to link here.</p>")
+    # "done" is the honest state whenever delivery can leave: linked, or a channel with no probe.
+    ch_done = _delivery_ready(ch_state)
 
     # 4 · Timezone (auto-detected by the browser; posted once)
     tzv = _html.escape(st["timezone"])
@@ -2560,14 +2685,15 @@ def _setup_page(code: str = "") -> str:
 
     # Steps 1–4 all done (tile 5 is optional and never gates): the wizard's job is finished, so the
     # page's FIRST affordance becomes the handoff to the dashboard. The delivery step uses the SAME
-    # rule the valve and the meeting tap use (_delivery_channel_ready): on WhatsApp it demands the
-    # POSITIVE linked state — "unknown"/never-scanned must not celebrate over a dead delivery
-    # channel — and on any other SOTTO_CRON_DELIVER there is nothing to probe, so it never blocks a
-    # Telegram user's wizard from finishing.
-    done = (st["bridge_connected"] and st["google_connected"] and bool(st["timezone"])
-            and _delivery_ready(st["whatsapp"]))
+    # rule the valve and the meeting tap use (_delivery_ready): the active channel must be linked —
+    # a never-scanned WhatsApp or an un-texted Telegram bot must not celebrate over a dead delivery
+    # channel — while a channel with no probe never blocks the wizard from finishing.
+    done = (st["bridge_connected"] and st["google_connected"] and bool(st["timezone"]) and ch_done)
     hero = "<a class='hero-cta' href='/app'>Open your dashboard →</a>" if done else ""
-    footer = ("<p class='page-sub'>You're connected. Message yourself on WhatsApp: "
+    say_where = ("Message your bot on Telegram" if channel == "telegram" else
+                 "Message yourself on WhatsApp" if channel == "whatsapp" else
+                 f"Message Sotto on {_html.escape(channel)}")
+    footer = (f"<p class='page-sub'>You're connected. {say_where}: "
               "<b>“Sotto, give me my morning brief.”</b> Briefs also fire automatically at 6:30 am / 5:30 pm.</p>"
               if done else
               "<p class='tile-hint'>Finish the steps above, then "
@@ -2608,7 +2734,7 @@ def _setup_page(code: str = "") -> str:
         f"{hero}"
         + _tile(1, "Link your Mac", "done" if st["bridge_connected"] else "todo", mac)
         + _tile(2, "Connect Google", "done" if st["google_connected"] else "todo", google)
-        + _tile(3, "Link WhatsApp", "done" if st["whatsapp"] == "linked" else "todo", wa)
+        + _tile(3, ch_title, "done" if ch_done else "todo", ch_body)
         + _tile(4, "Timezone", "done" if st["timezone"] else "todo", tz_block + tz_js)
         + _tile(5, "Connected services", "done" if svc_connected else "optional", services)
         + f"{footer}"

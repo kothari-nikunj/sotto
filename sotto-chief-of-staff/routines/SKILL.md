@@ -16,7 +16,7 @@ here is named `user-<slug>`, and nothing without that prefix is yours to touch.
 
 > Run the `hermes cron …` commands through the `terminal` tool, verbatim as written below.
 > **On a non-Hermes host, use that host's scheduler with the same values** — OpenClaw is
-> `openclaw cron add "<cron>" "<prompt>" --name user-<slug> --declaration-key sotto:user-<slug> --announce --channel "${SOTTO_CRON_DELIVER:-whatsapp}"`,
+> `openclaw cron add "<cron>" "<prompt>" --name user-<slug> --declaration-key sotto:user-<slug> --announce --channel "$SOTTO_CRON_DELIVER"`,
 > plus `openclaw cron list` / `openclaw cron remove`. The fence below is host-independent.
 
 ## The fence (read once, obey always)
@@ -71,10 +71,12 @@ here is named `user-<slug>`, and nothing without that prefix is yours to touch.
    Create **only** on a clear yes. If they tweak it, re-propose the changed line (don't re-explain).
 5. **Create it.** Slug the subject: lowercase, hyphens, ≤24 chars (`user-open-loops-friday`).
    ```
-   hermes cron create "<cron>" "<prompt>" --name user-<slug> --deliver "${SOTTO_CRON_DELIVER:-whatsapp}"
+   hermes cron create "<cron>" "<prompt>" --name user-<slug> --deliver "$SOTTO_CRON_DELIVER"
    ```
    `--deliver` is not optional: without it the job runs into the default `local` sink and the user
-   never sees it. There is no `--skill` flag here — routines are prompt-based, and the prompt names
+   never sees it. `SOTTO_CRON_DELIVER` is exported by boot (start.sh step 0.4 is the one place the
+   channel is decided) — if it is somehow empty, say so and stop rather than naming a channel
+   yourself, because a guessed channel delivers into somewhere the user never set up. There is no `--skill` flag here — routines are prompt-based, and the prompt names
    the skill.
 6. **Confirm in one line**, with the words, not the cron: "Done — *open-loops summary*, every Friday
    at 4pm, delivered here. Say *stop the Friday summary* any time."

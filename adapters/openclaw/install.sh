@@ -24,7 +24,9 @@ WORKSPACE="${OPENCLAW_WORKSPACE_DIR:-${OPENCLAW_WORKSPACE:-$STATE_DIR/workspace}
 AGENT_ID="${OPENCLAW_AGENT:-main}"                  # `openclaw agents list` default agent
 BRIDGE_TOKEN="${BRIDGE_TOKEN:-${SOTTO_BRIDGE_TOKEN:-}}"
 RELAY_PORT="${SOTTO_TRIGGER_PORT:-8787}"
-CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"      # ONE delivery target for every job (as on Hermes)
+CRON_DELIVER="${SOTTO_CRON_DELIVER:-whatsapp}"      # ONE target for every job; whatsapp is the
+                                                    # laptop default (no boot-time chat-id capture
+                                                    # here), not the cloud's telegram
 HERE="$(cd "$(dirname "$0")" && pwd)"      # adapters/openclaw
 ROOT="$(cd "$HERE/../.." && pwd)"          # project root (portable core)
 

@@ -81,14 +81,21 @@ meeting?" and never fall back to the sweep.
    **In focus mode add `--focus "<the name the user said>"`** to that same `research_attendees.py` command: it fires ONE additional grounded call for that ONE person covering what their company builds, the founder's background and origin story, traction signals, and the market landscape / why now, returned as `company_deep` on their entry. It never fans out — one person, one extra call — and `SOTTO_RESEARCH_DEEP=0` disables it along with the recency sweep.
    **Run this command even when `kept` is 0** — with an empty list it writes a fresh `{"attendees":[]}` to `/tmp/sotto_research.json`, which is what stops the afternoon prep from silently reusing the MORNING brief's research file as stale bios.
    It batches 5 attendees per Gemini Search-Grounding call (concurrent), dedupes, caps at 25, and returns `{attendees:[{email,title,company,relevance,summary}]}`, grounded in real web results — uses the Google key you already have, no extra key. If empty, pass `attendee_research: []` — known attendees still get prepped from the knowledge graph. Research only — never draft or schedule here.
+   Then fold in X through its deterministic, read-only attendee lane (a missing X token is an honest
+   no-op, not a prep failure):
+   `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/x_connectivity.py" --calendar /tmp/sotto_cal.json --research /tmp/sotto_research.json --out /tmp/sotto_x_context.json`
+   It performs exact handle lookups only (never X people-search), honors the same 25-person cap,
+   caches misses for 90 days (on the person file, or its own side file when the graph has no such person — a negative never mints one), stores only typed X identity/profile provenance,
+   and writes recent Posts/bookmarks solely to this temporary prep payload.
 3. **Compose — this step IS the prep. Run ONE command; do not write the prep yourself.** Save each source to a temp file, then run the script:
-   1. Calendar (next 3d) → `/tmp/sotto_cal.json`  ·  `read_local` → `/tmp/sotto_local.json`  ·  `knowledge_query.py` output → `/tmp/sotto_know.json`  ·  Granola → `/tmp/sotto_granola.json`  ·  attendee research (step 2) → `/tmp/sotto_research.json`  ·  attendee comms (step 2) → `/tmp/sotto_attendee_comms.json`
+   1. Calendar (next 3d) → `/tmp/sotto_cal.json`  ·  `read_local` → `/tmp/sotto_local.json`  ·  `knowledge_query.py` output → `/tmp/sotto_know.json`  ·  Granola → `/tmp/sotto_granola.json`  ·  attendee research (step 2) → `/tmp/sotto_research.json`  ·  X attendee context → `/tmp/sotto_x_context.json`  ·  attendee comms (step 2) → `/tmp/sotto_attendee_comms.json`
    2. `execute_code` (absolute path):
       ```bash
       python3 "$HOME/.hermes/skills/sotto/meeting-prep/scripts/compose_meeting_prep.py" \
         --calendar /tmp/sotto_cal.json --local /tmp/sotto_local.json \
         --knowledge /tmp/sotto_know.json --granola /tmp/sotto_granola.json \
         --attendee-research /tmp/sotto_research.json \
+        --x-context /tmp/sotto_x_context.json \
         --attendee-comms /tmp/sotto_attendee_comms.json
       ```
       **In focus mode append `--focus "<the name the user said>"`** — the composer then preps only that person's soonest upcoming meeting (ambiguity → the soonest, and the prep says so) and switches to the FOCUSED PREP prompt variant: their thread with you first, then what the company builds / the founder / traction / the space, then angles. Without the flag the sweep is byte-identical to before.

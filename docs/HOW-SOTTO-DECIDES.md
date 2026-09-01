@@ -184,10 +184,11 @@ to connect!" never earns an interrupt.
   the same budget spend, the same ledger row. The two gates it skips are the clock ones (quiet
   hours and the snooze) — those exist to stop *unprompted* interruptions, and you asked for this
   one. The room you're in and the day's budget still apply.
-- **Undeliverable nudges are never spent** — when `SOTTO_CRON_DELIVER` is `whatsapp` (the default),
-  the valve, the post-meeting tap and the proactive watcher all wait for WhatsApp to actually be
-  linked before dispatching; on any other delivery channel there is nothing to probe and they just
-  run.
+- **Undeliverable nudges are never spent** — the valve, the post-meeting tap and the proactive
+  watcher all wait for the ACTIVE channel (`SOTTO_CRON_DELIVER`, `telegram` by default) to actually
+  be linked before dispatching: WhatsApp's session creds on the volume, Telegram's captured chat id.
+  A channel this deploy cannot probe holds nothing back — nobody is denied a nudge for a setup we
+  can't see.
 - **Reconnect grace** — a message older than 30 min (`triage_event.EVENT_MAX_AGE_MIN`), or anything
   in a catch-up batch after your Mac was asleep, never nudges in real time. Missed calls keep a
   longer leash, not a free pass: a missed call buzzes up to 4 hours after the ring

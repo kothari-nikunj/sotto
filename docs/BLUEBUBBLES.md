@@ -9,7 +9,7 @@ this — it is a hand-wired recipe for one machine, yours.
 accounts get deactivated with no useful appeal path. Mitigations: use an aged Apple ID if you have
 one, warm it up manually (days of normal texting) before wiring it to Hermes, keep volume low
 (Sotto's nudges/briefs are naturally low-volume), and never mass-message. If the ID gets flagged
-anyway, nothing else in Sotto is affected — delivery falls back to WhatsApp.
+anyway, nothing else in Sotto is affected — delivery falls back to `SOTTO_CRON_DELIVER`'s channel.
 
 ## What you're building
 
@@ -42,14 +42,14 @@ account's chat.db exactly as before.
    dial-out design avoids; there's no way around it for BlueBubbles.)
 6. **Wire Hermes** (on Railway): `hermes gateway setup` → BlueBubbles → paste the tunnel URL + server
    password (see CHANNELS.md). Then allowlist yourself and optionally make it the home channel:
-   the BlueBubbles equivalents of the `upsert_env WHATSAPP_*` lines in `adapters/hermes/start.sh`
-   (the "Enable the WhatsApp gateway NON-INTERACTIVELY" block) —
-   set the allowed handle to YOUR phone/Apple ID so only you can talk to it.
+   set `BLUEBUBBLES_*` variables in Railway — `start.sh` forwards every gateway variable into
+   `~/.hermes/.env` by prefix (the "Configure the gateway NON-INTERACTIVELY" block), no channel
+   special-cased — with the allowed handle set to YOUR phone/Apple ID so only you can talk to it.
 7. **Keep both macOS users logged in** (fast user switching) — Messages only sends while its user
    session is alive. Add BlueBubbles to that user's Login Items.
 8. **Test:** text Sotto's Apple ID from your phone → the reply should come back as its own thread,
    `*Sotto*`-prefixed persona and all. Then flip `SOTTO_CRON_DELIVER=imessage` (or whatever channel
-   name `hermes gateway setup` registered) if you want briefs there instead of WhatsApp.
+   name `hermes gateway setup` registered) if you want briefs there instead of your current channel.
 
 ## When to prefer what
 

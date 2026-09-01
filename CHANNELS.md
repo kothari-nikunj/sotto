@@ -1,17 +1,17 @@
 # Choosing your channel and model
 
-Sotto ships with two **defaults**, not two requirements: briefs land in **WhatsApp**, and the brief
+Sotto ships with two **defaults**, not two requirements: briefs land in **Telegram**, and the brief
 pipeline runs on **Gemini**. Both are choices. This page is the choice, made once, in about a minute
 — and it is written for a human *or* an agent (Claude Code, or Sotto itself) setting this repo up.
 
 **Your channel** — where the brief lands and where you chat with Sotto:
 
-- **WhatsApp** — *the default.* No bot account, no token: scan one QR on the `/setup` page. The only
-  channel this repo pairs, probes and verifies for you. Pick this unless you have a reason not to.
-- **Telegram** — *a bot token from @BotFather, no phone pairing.* The right call when WhatsApp
-  pairing is painful (no phone handy, a linked-devices limit, a number you don't want linked). Costs
-  ~5 minutes and four Railway variables — one command works out all four for you. Works, but is
-  **less tested than WhatsApp** — see the honest status below.
+- **Telegram** — *the default.* One variable: a bot token from [@BotFather](https://t.me/BotFather).
+  You tap the link the boot log prints and the capture does the rest — no user-id hunting, no second
+  and third variable, no phone pairing. Pick this unless you have a reason not to.
+- **WhatsApp** — *a real contact instead of a bot, at the price of a QR.* Two variables plus
+  `WHATSAPP_ENABLED=true`, then scan a QR from the `/setup` page with your phone. The container still
+  pairs and probes it for you; it is simply no longer what you get by default.
 - **iMessage (BlueBubbles)** — *blue bubbles, at a price:* an always-on Mac, a Firebase project and a
   tunnel. Nothing here automates it; it is a hand-wired recipe. Hours, not minutes.
 
@@ -36,140 +36,123 @@ Without Google connected, email falls back to a `mailto:` link like everything e
 
 Hermes' gateway supports 20+ surfaces (`hermes gateway setup`). What *this repo* does for each:
 
-| | **WhatsApp** | **Telegram** | **iMessage (BlueBubbles)** |
+| | **Telegram** | **WhatsApp** | **iMessage (BlueBubbles)** |
 |---|---|---|---|
-| Status here | **first-class — the tested path** | **works, less tested** | **recipe only, not automated** |
+| Status here | **the default path** | **first-class, opt-in** | **recipe only, not automated** |
 | Runs fully in the cloud | ✅ | ✅ | ❌ needs an always-on Mac |
-| Setup | ~2 min, scan a QR | ~5 min, make a bot | ~30–45 min + a Firebase project |
-| Paired for you on boot | ✅ `start.sh` runs pairing, serves the QR at `/whatsapp/qr` | ❌ you set variables; no pairing needed | ❌ hand-wired |
-| A `/setup` wizard tile | ✅ tile ③ | ❌ (the wizard still shows the WhatsApp tile — ignore it; it does **not** block the wizard from completing) | ❌ |
+| Setup | ~2 min, one variable | ~3 min, two variables + a QR | ~30–45 min + a Firebase project |
+| Linked for you on boot | ✅ `start.sh` prints a one-tap pairing link; tapping it captures your chat id | ✅ `start.sh` runs pairing, serves the QR at `/whatsapp/qr` | ❌ hand-wired |
+| A `/setup` wizard tile | ✅ tile ③ | ✅ tile ③ (whichever channel is active gets the tile) | ❌ |
 | `SOTTO_CRON_DELIVER` target | ✅ default | ✅ | ✅ (whatever name `hermes gateway setup` registered) |
-| Nudge delivery-gate | probes the live WhatsApp link before spending a nudge | nothing to probe → nudges always dispatch | nothing to probe |
-| Feels like a normal contact | ✅ | ⚠️ a bot, not a contact | ✅ blue bubbles |
+| Nudge delivery-gate | holds a nudge until your chat id is linked | probes the WhatsApp link before spending a nudge | nothing to probe → nudges always dispatch |
+| Feels like a normal contact | ⚠️ a bot, not a contact | ✅ | ✅ blue bubbles |
+| Tapbacks as status (👀 ✅ ❌) | ✅ | ❌ Hermes has no bot reactions there | ❌ |
 | Cost | free | free | free, but a Mac powered 24/7 |
 
-**TL;DR:** **WhatsApp is the recommendation.** Take Telegram when WhatsApp pairing is the problem.
-Take iMessage only if blue-bubble delivery is itself the point and you'll maintain a Mac for it.
+**TL;DR:** **Telegram is the recommendation.** Take WhatsApp when you want Sotto to be a contact
+rather than a bot and don't mind the QR. Take iMessage only if blue-bubble delivery is itself the
+point and you'll maintain a Mac for it.
 
-## WhatsApp setup (default)
+## Telegram setup (default)
 
-**Pairing is automated — you run no command.** On first boot `start.sh` runs the pairing step and
-serves a clean QR on a web page. Open the `/setup` wizard from the deploy logs (`[sotto] Setup link`)
-and click **"Show WhatsApp QR"** (tile ③ — it opens `/whatsapp/qr`), then on your phone: WhatsApp ▸
-**Linked Devices** ▸ Link a Device ▸ scan. (Scan from that web page, not the deploy logs — Railway's
-log viewer distorts the terminal QR.) Done — the brief arrives as a WhatsApp message from your linked
-number. No Mac involvement, no token. The session persists on the `/data` volume, so later boots skip
-pairing.
+**One variable, and you never look up an id.** Set `TELEGRAM_BOT_TOKEN` in Railway, deploy, and tap
+the pairing link boot prints: the message that link sends writes your chat id into Hermes as
+`TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` and remembers it on the `/data` volume. No
+redeploy, no second and third variable, no @userinfobot.
 
-Variables: `WHATSAPP_ALLOWED_USERS` and `WHATSAPP_HOME_CHANNEL`, both your number with country code
-and no `+`. `SOTTO_CRON_DELIVER` can stay unset — `whatsapp` is its default.
-
-*(`hermes gateway setup` is the manual gateway wizard — for **local** Hermes or the **other**
-channels below, not for cloud WhatsApp, which the container pairs automatically.)*
-
-## Telegram setup
-
-No phone pairing, and one command does the fiddly part: **paste your bot's token, text it once, and
-Sotto tells you exactly what to set** — no hunting your numeric id through @userinfobot, no guessing
-which variable names your Hermes wants. It is still **not the path this repo exercises end to end**,
-so read the caveats at the end before you commit to it.
-
-**Do this AFTER your first deploy.** The linker in step 2 runs *inside* your running container, so
-the service has to exist first. Deploy exactly as
-[ONBOARDING.md § 1](ONBOARDING.md#1--deploy-the-backend-on-railway) says, but set
-`WHATSAPP_ENABLED=false` in place of the two `WHATSAPP_*` variables — then come back here. (Nothing
-else about the deploy changes: `GOOGLE_AI_API_KEY`, `BRIDGE_TOKEN`, the `/data` volume and the public
-domain are the same four settings.)
+**Why a link and not "text your bot":** a bot's @username is discoverable, so a capture that accepted
+whoever messaged first would hand your briefs to a stranger who guessed it. The pairing link carries
+this deploy's **setup code** — the same per-deploy secret that gates `/setup`, printed only in your
+deploy log — and a message that doesn't carry it is ignored.
 
 1. **Make the bot.** In Telegram, message [@BotFather](https://t.me/BotFather) → `/newbot` → give it a
-   name and a username → it replies with a **bot token**. Then message your new bot once (`/start`) so
-   it is allowed to message you back.
-2. **Run the linker — one command,** against your deployed service:
-
-   ```bash
-   railway ssh --service <your-service> \
-     'python3 /app/trigger-receiver/telegram_link.py --token <YOUR_BOT_TOKEN>'
-   ```
-
-   No Railway CLI? Run the inner `python3 …` half in your service ▸ the **⋮ menu ▸ Shell**, which
-   drops you inside the same running container. It asks Telegram whether the token is real and tells
-   you *which* bot you pasted, then waits (five minutes by default; `--timeout <secs>` changes it):
+   name and a username → it replies with a **bot token**.
+2. **Set `TELEGRAM_BOT_TOKEN`** in Railway → Variables (with `GOOGLE_AI_API_KEY`; see
+   [ONBOARDING.md § 1](ONBOARDING.md#1--deploy-the-backend-on-railway)) and deploy.
+3. **Tap the pairing link** in the deploy log while it boots. It opens your bot and sends
+   `/start <your setup code>`; that message is you, so your numeric id is **captured**, not looked
+   up (group messages, other bots, non-message updates, and any message without the code are
+   ignored). The deploy log says so:
 
    ```
-   [1/3] Checking the token with Telegram...
-         ok - this is @sotto_brief_bot
-   [2/3] Now text @sotto_brief_bot anything from your phone - waiting up to 5 min...
+   [sotto] delivery channel: telegram (the default); whatsapp gateway: false
+   [sotto] telegram: linking your chat — tap the link below (nothing to paste back).
+   [sotto] telegram: ➜ TAP THIS TO LINK YOUR CHAT:  https://t.me/your_bot?start=Xk2p-9fQzR7t
+   [sotto] telegram linked ✓ — briefs and nudges deliver to chat 8675309
    ```
 
-3. **Text your bot anything** from your phone. The first *private* message it receives is you — so
-   your numeric id is **captured**, not looked up (group messages, other bots and non-message updates
-   are ignored). It prints the block you paste:
+   Boot waits **five minutes**. Miss it and nothing breaks: the log says `telegram NOT linked yet`
+   with the link to tap, the brief still composes, and the Telegram gateway is deliberately left
+   **down** until you are linked — an unlinked channel can't deliver anyway, and a running gateway
+   would swallow your pairing message before the next boot could see it. Tap the link, then restart
+   the deploy and the capture picks it up.
+4. **Check it landed.** `deliver=telegram` on the `[sotto] cron scheduler:` line, and tile ③ of the
+   `/setup` wizard reads **Link Telegram · DONE**. Message your bot **"set up Sotto"** — the guided
+   setup verifies your connections and reports the delivery channel it found. The 6:30/17:30 briefs
+   then arrive as messages from your bot, and Sotto acknowledges every message you send with a
+   tapback (👀 while it works, ✅ when it's replied, ❌ on an error; `SOTTO_REACTIONS=0` turns them
+   off). Tapbacks are a Telegram perk: Hermes has no bot-reaction support on WhatsApp.
 
-   ```
-         ok - Linked to Nikunj Kothari (id 8675309)
-   [3/3] Saved /data/telegram-link.json (0600) for the future /setup tile; nothing reads it yet.
+### Linking by hand (the fallback)
 
-   Paste these into Railway -> your service -> Variables, then Redeploy:
-
-   TELEGRAM_BOT_TOKEN=8199234117:AAF-…
-   TELEGRAM_ALLOWED_USERS=8675309
-   TELEGRAM_HOME_CHANNEL=8675309
-   SOTTO_CRON_DELIVER=telegram
-   ```
-
-4. **Paste that into Railway → Variables, then Redeploy.** Add `WHATSAPP_ENABLED=false` too if you
-   want nothing to do with WhatsApp: without it, first boot still runs the WhatsApp pairing step and
-   waits up to 15 minutes for a QR scan that will never happen.
-5. **Check it landed.** The boot log should show `[sotto] gateway variable forwarded to Hermes:
-   TELEGRAM_…` for each one, and `deliver=telegram` on the `[sotto] cron scheduler:` line. Message your
-   bot **"set up Sotto"** — the guided setup verifies your connections and reports the delivery channel
-   it found. When it works, the 6:30/17:30 briefs arrive as messages from your bot — and Sotto
-   acknowledges every message you send with a tapback (👀 while it works, ✅ when it's replied,
-   ❌ on an error; `SOTTO_REACTIONS=0` turns them off). Tapbacks are a Telegram perk: Hermes has
-   no bot-reaction support on WhatsApp.
-   *No reply from the bot? `TELEGRAM_ALLOWED_USERS` must be your **numeric** id, not your @username
-   — Hermes denies everyone until it matches. The linker captures the right one; a hand-typed value
-   is where this goes wrong.*
-
-**Then go back to [ONBOARDING.md § 2](ONBOARDING.md#2--open-your-setup-link)** and finish the `/setup`
-wizard as written — link your Mac, connect Google, set the timezone. The only difference for you is
-tile ③ (**Link WhatsApp**): it stays **TO DO** forever and does **not** block the wizard, because
-`SOTTO_CRON_DELIVER=telegram` tells the completion gate there is no WhatsApp link to wait on.
-
-**What the linker is and isn't.** It is `runtime/trigger-receiver/telegram_link.py` — stdlib Python,
-two Telegram Bot API calls (`getMe`, then long-polled `getUpdates`), and it changes nothing about your
-deploy: it *reads* Telegram and *prints* variables, and you are still the one who sets them. It also
-writes `$SOTTO_DATA/telegram-link.json` (0600, it holds the token) as the handoff for a **planned**
-`/setup` wizard tile that would do all of this in the browser. **That tile does not exist yet and
-nothing reads that file today**; `start.sh` still configures the gateway purely from the Railway
-variables above. Said out loud because a file that looks like config but configures nothing is worse
-than no file at all.
-
-### By hand (the fallback)
-
-The linker is a convenience, not a dependency — set these yourself and the result is identical. The
-`TELEGRAM_*` names belong to **Hermes**, not Sotto: `start.sh` forwards *every* variable whose name
-starts with `TELEGRAM_` into `~/.hermes/.env` on boot (where Hermes reads messaging-platform settings
-from — the same mechanism the WhatsApp keys use), so a name Hermes doesn't know is simply inert. If
+The capture is a convenience, not a dependency. Set `TELEGRAM_ALLOWED_USERS` yourself and boot skips
+the capture entirely — explicit configuration always wins. The `TELEGRAM_*` names belong to
+**Hermes**, not Sotto: `start.sh` forwards *every* variable whose name starts with `TELEGRAM_` (or
+`WHATSAPP_` / `DISCORD_` / `SIGNAL_` / `SLACK_` / `BLUEBUBBLES_`) into `~/.hermes/.env` on boot, where
+Hermes reads messaging-platform settings from — so a name Hermes doesn't know is simply inert. If
 your Hermes version wants different ones, `hermes gateway setup` ▸ Telegram is the authority.
 
 | Variable | Value | Why |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | the token @BotFather replied with | how Hermes signs in as your bot |
-| `TELEGRAM_ALLOWED_USERS` | your numeric Telegram user id (ask [@userinfobot](https://t.me/userinfobot)) | who may use the bot — deny-all until set |
-| `TELEGRAM_HOME_CHANNEL` | the same id | where proactive delivery lands: the 6:30/17:30 briefs, nudges and follow-ups |
-| `SOTTO_CRON_DELIVER` | `telegram` | the one lever that moves the briefs, the midday digest, the weekly pulse, your personal `user-` routines and the proactive watcher off WhatsApp — they are all registered with `--deliver "$SOTTO_CRON_DELIVER"`, and there is no per-job override by design |
-| `WHATSAPP_ENABLED` | `false` *(optional)* | skips the first-boot WhatsApp pairing wait entirely |
+| `TELEGRAM_BOT_TOKEN` | the token @BotFather replied with | how Hermes signs in as your bot — **the only one you must set** |
+| `TELEGRAM_ALLOWED_USERS` | your numeric Telegram user id | who may use the bot — deny-all until set. **Captured for you** at boot from the pairing link; set it yourself and the capture never runs (and the gateway starts straight away) |
+| `TELEGRAM_HOME_CHANNEL` | the same id | where proactive delivery lands: the 6:30/17:30 briefs, nudges and follow-ups. Captured with the one above |
+| `SOTTO_CRON_DELIVER` | `telegram` | the one lever that moves the briefs, the midday digest, the weekly pulse, your personal `user-` routines and the proactive watcher between channels — they are all registered with `--deliver "$SOTTO_CRON_DELIVER"`, and there is no per-job override by design. **Defaults to `telegram`**, so you only set it to choose something else |
 
-**What is and isn't verified.** Sotto's *own* channel-awareness is real and unit-tested: the cron
-`--deliver` target, the nudge delivery-gate (a Telegram deployer is never denied the release valve or
-the post-meeting tap the way an unlinked WhatsApp deployer is), and the `/setup` wizard's completion
-gate, which does not block on WhatsApp when you deliver elsewhere. What has **not** been run end to
-end by this project is a live Telegram deploy — the bot token reaching Hermes, and a brief landing in
-a Telegram chat. Two known rough edges either way: the `/setup` wizard still renders a "Link WhatsApp"
-tile that a Telegram deployer should ignore, and the boot-time key check only ever validates the
-Gemini key, never the gateway. If you hit something here, it is a gap worth reporting, not a
-mystery — the delivery target is one variable and the boot log states it.
+There is also a **linker you can run by hand** —
+`python3 /app/trigger-receiver/telegram_link.py --token <YOUR_BOT_TOKEN> --phrase <ANY_PHRASE>`
+inside your container (Railway ▸ your service ▸ ⋮ ▸ Shell, or `railway ssh`). It is the same code
+boot runs: it validates the token, tells you *which* bot you pasted, prints the one-tap link for the
+phrase you chose, waits for a message carrying it, and prints the four lines above ready to paste.
+There is no default phrase — a capture without one would link whoever finds the bot first. Use it when you want to see the handshake happen, or to link a bot without a redeploy.
+
+**What is and isn't verified.** Sotto's *own* channel-awareness is real and unit-tested: the boot
+channel decision (including the migration rule below), the chat-id capture and its forwarding, the
+cron `--deliver` target, the nudge delivery-gate, and the `/setup` wizard's per-channel tile and
+completion gate. What has **not** been run end to end by this project is a live Telegram deploy — the
+bot token reaching Hermes and a brief landing in a Telegram chat. Known rough edge either way: the
+boot-time key check only ever validates the Gemini key, never the gateway. If you hit something here,
+it is a gap worth reporting, not a mystery — the delivery target is one variable and the boot log
+states it.
+
+## WhatsApp setup (opt-in)
+
+WhatsApp is not the default any more, and nothing about it was removed: the container still pairs it
+for you, serves a clean QR, and probes the link before spending a nudge.
+
+Set **three** variables in Railway → Variables:
+
+| Variable | Value |
+|---|---|
+| `WHATSAPP_ENABLED` | `true` — the boot-time pairing step (and the gateway) run only when this is on, or when WhatsApp is already your channel |
+| `WHATSAPP_ALLOWED_USERS` | your number, country code, no `+` (e.g. `15551234567`) — Hermes denies all users until it is set |
+| `WHATSAPP_HOME_CHANNEL` | the same number — where proactive delivery lands |
+
+…plus `SOTTO_CRON_DELIVER=whatsapp` to move the briefs there. Then deploy and **scan the QR**: open
+the `/setup` wizard from the deploy logs (`[sotto] Setup link`) and click **"Show WhatsApp QR"**
+(tile ③ — it opens `/whatsapp/qr`), then on your phone: WhatsApp ▸ **Linked Devices** ▸ Link a Device
+▸ scan. (Scan from that web page, not the deploy logs — Railway's log viewer distorts the terminal
+QR.) The session persists on the `/data` volume, so later boots skip pairing. Miss the ~15-minute
+window and a redeploy reopens pairing with a fresh QR.
+
+**Already delivering to WhatsApp? Nothing changes.** One sentence, and it is pinned by a test: *the
+channel is Telegram unless this volume already holds a paired WhatsApp session and no
+`TELEGRAM_BOT_TOKEN` is set.* So an instance that was set up before Telegram became the default keeps
+delivering to WhatsApp across redeploys without setting anything — and the boot log names the channel
+and the reason every time. Paste a bot token and you have chosen Telegram; that wins.
+
+*(`hermes gateway setup` is the manual gateway wizard — for **local** Hermes or the **other**
+channels below, not for the cloud, which links your channel automatically.)*
 
 ## iMessage via BlueBubbles
 
@@ -217,8 +200,9 @@ The full call-site map, measured prompt sizes and a five-model comparison:
 Everything above assumes the cloud container, but the gateway is the same on a **local** Hermes
 ([LOCAL-SETUP.md](LOCAL-SETUP.md)): run `hermes gateway setup` then `hermes gateway` on the Mac and
 scheduled briefs deliver over the same channels (the local installer's crons default to
-`--deliver whatsapp`; `SOTTO_CRON_DELIVER` overrides). Interactive CLI chat (`hermes`) needs no
-channel at all. Caveat: local delivery only runs while the Mac is awake.
+`--deliver whatsapp` — a local Hermes pairs WhatsApp interactively, so that stays the laptop default;
+`SOTTO_CRON_DELIVER` overrides, and the cloud boot resolves the channel for you instead). Interactive
+CLI chat (`hermes`) needs no channel at all. Caveat: local delivery only runs while the Mac is awake.
 
 ## Switching later
 
