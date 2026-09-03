@@ -405,6 +405,7 @@ def _chase_candidates(today: str) -> list:
                     "title": f"{_s(it.get('name'))} — {_s(it.get('what'))}",
                     "name": _s(it.get("name")),
                     "anchor_key": _s(it.get("anchor_key")),
+                    "chased_count": chased,
                     "detail": ("overdue" if it.get("overdue") else f"asked {age} days ago"
                                if age else "still open")
                               + (" · chased once already" if chased >= 1 else ""),
@@ -600,7 +601,14 @@ def scan(calendar, continuity, local, user_email, now_local,
     #     names) it delayed a nudge over a collision that could not happen. `brief_named` is the
     #     brief's own record of what it said; None means no such record, so the old window stands.
     for c in (chase_candidates or [])[:1]:
-        if (_s(c.get("anchor_key")) in brief_named) if brief_named is not None else brief_recent:
+        # A loop chased once is urgent by contract and the brief NAMES it every day from then on
+        # (a Still-open line) — so "the brief already said it" would block the second chase forever,
+        # chased_count never reached the cap, and the hand-off never came (Day-7 simulation, Sep
+        # 2026). A chase and a Still-open line are different acts: only a FIRST chase yields to
+        # the brief having named the loop.
+        first_chase = int(c.get("chased_count") or 0) == 0
+        if first_chase and ((_s(c.get("anchor_key")) in brief_named) if brief_named is not None
+                            else brief_recent):
             continue
         nudges.append({"kind": "chase", "key": _s(c.get("id")) or f"chase:{today}",
                        "title": _s(c.get("title")) or "Still waiting on this",

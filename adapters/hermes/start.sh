@@ -115,7 +115,7 @@ printf '{"running":"%s","image":"%s"}\n' \
 # Brief resilience: default an AUTOMATIC fallback model for the brief's direct Gemini call.
 # compose_brief.py's call_gemini activates the fallback when SOTTO_FALLBACK_MODEL alone is set — it
 # reuses GOOGLE_AI_API_KEY unless SOTTO_FALLBACK_API_KEY is also set — so no second key is needed:
-# a 429/5xx/timeout on gemini-3.7-flash retries on gemini-3-flash-preview (cheaper: $0.50/$3.00 vs
+# a 429/5xx/timeout on gemini-3.8-flash retries on gemini-3-flash-preview (cheaper: $0.50/$3.00 vs
 # $0.75/$3.75 per 1M tokens, and a separate per-model rate-limit bucket). Must be exported BEFORE the
 # receiver starts below so every `hermes -z` brief run inherits it. Override with your own
 # SOTTO_FALLBACK_MODEL (keep it 1M-context — the brief prompt runs 100K–140K chars).
@@ -165,6 +165,15 @@ echo "[sotto] delivery channel: $SOTTO_CRON_DELIVER ($CHANNEL_WHY); whatsapp gat
 #      one-shot the receiver uses to run a brief; there is no `hermes run`.)
 # SOTTO_MCP_TOKEN lets the receiver's reverse-MCP relay authenticate the Mac's outbound link + Hermes'
 # /mcp calls. Reuse BRIDGE_TOKEN so there's one secret to set.
+# The Gemini key under all three names, EXPORTED before the receiver starts: every brief runs in a
+# child of the receiver and reads GOOGLE_AI_API_KEY from that inherited environment, so a deploy
+# that set GEMINI_API_KEY (Google's own name for it) passed the boot probe and then failed every
+# brief with "GOOGLE_AI_API_KEY not set" — the step-3.5 fan-out below only ever reached
+# ~/.hermes/.env (Day-0 simulation, Sep 2026).
+GKEY="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-${GOOGLE_AI_API_KEY:-}}}"
+if [ -n "$GKEY" ]; then
+  export GOOGLE_AI_API_KEY="$GKEY" GEMINI_API_KEY="$GKEY" GOOGLE_API_KEY="$GKEY"
+fi
 SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" python3 /app/trigger-receiver/receiver.py &
 
 # The receiver gates its whole setup surface (/setup, /whatsapp/qr, /google/auth, /debug/google…)
@@ -176,6 +185,18 @@ SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" python3 /app/tri
 setup_code() {
   local code="${SOTTO_SETUP_CODE:-}"
   if [ -z "$code" ]; then
+    # The receiver (step 0.5, a background process) mints this file after its own imports; the
+    # first reader here used to race it and, losing, told the user to set SOTTO_SETUP_CODE and
+    # redeploy — for a race, not a misconfiguration. Wait for it, briefly.
+    # …and wait ONCE per boot: this is called three times, and on a box with no writable volume
+    # the file never appears, so three waits would be 90 s of boot for the same empty answer.
+    if [ -z "${SETUP_CODE_WAITED:-}" ]; then
+      SETUP_CODE_WAITED=1
+      local tries=0
+      while [ ! -s "${SOTTO_DATA:-/data}/setup_code" ] && [ "$tries" -lt 30 ]; do
+        sleep 1; tries=$((tries + 1))
+      done
+    fi
     code="$(cat "${SOTTO_DATA:-/data}/setup_code" 2>/dev/null | tr -d '[:space:]' || true)"
   fi
   printf '%s' "$code"
@@ -212,7 +233,7 @@ fi
 # 2) Model + scheduler (dedicated cloud instance → Gemini 1M as the driver too).
 #    Use the NATIVE Gemini model id (not the OpenRouter-style "google/…", which would route via
 #    OpenRouter and need OPENROUTER_API_KEY). The key is set as GEMINI_API_KEY/GOOGLE_API_KEY below.
-hermes config set model gemini-3.7-flash || true
+hermes config set model gemini-3.8-flash || true
 hermes_set_if_supported scheduler.enabled true
 # Sotto's scheduled output is already written as the exact user-facing message. Hermes wraps cron
 # deliveries by default with "Cronjob Response", the job id, and a management footer; that turns a
@@ -389,9 +410,11 @@ fi
 # refreshed only reaches a NEW session. Deploys are exactly when freshness matters — new code, new
 # session — so: mode none kills the daily banner, and every boot archives the gateway sessions
 # below. The next message then starts a fresh session SILENTLY (no reset event fires, so nothing
-# is broadcast) carrying this deploy's persona. Context rot stays bounded by deploy cadence plus
-# Hermes' own compaction; /new in chat remains the manual reset; /resume can still reopen an
-# archived transcript. Sotto's REAL memory never lived in the transcript anyway (graph + master
+# is broadcast) carrying this deploy's persona. Deploy cadence alone turned out not to bound the
+# transcript (a week between deploys, Sep 2026, and replies began copying delivered briefs back
+# out), so the receiver runs this same silent archive nightly too — receiver._session_archive_tick:
+# a session lasts a day or a deploy, whichever comes first. /new in chat remains the manual reset;
+# /resume can still reopen an archived transcript. Sotto's REAL memory never lived in the transcript anyway (graph + master
 # file — the persona persists feedback via sotto-feedback precisely because chat is disposable).
 hermes_set_if_supported session_reset.mode none
 # Best-effort and never fatal: ids in `sessions list` are hex/uuid tokens (the same shape the cron
@@ -399,11 +422,10 @@ hermes_set_if_supported session_reset.mode none
 # history". If the CLI shape drifts, nothing archives and the only cost is a stale persona
 # snapshot until the user types /new — which the log line below says out loud.
 if hermes sessions list >/dev/null 2>&1; then
-  archived=0
-  for sid in $(hermes sessions list 2>/dev/null | grep -oE '\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{12,})\b' | sort -u); do
-    if hermes sessions archive "$sid" >/dev/null 2>&1; then archived=$((archived + 1)); fi
-  done
-  echo "[sotto] fresh-per-deploy: archived $archived session(s) — the first message after this deploy starts a new session with the refreshed persona (silently; /resume can reopen old transcripts)"
+  # ONE implementation, shared with the receiver's nightly archive: the hex/uuid grep this loop
+  # used to run matched none of Hermes' real ids (20260903_033026_65967d, cron_…), so it archived
+  # 0 sessions at every boot for a week and no session ever reset (Sep 3, 2026).
+  python3 /app/trigger-receiver/sessions.py || echo "[sotto] fresh-per-deploy: session archive failed — persona updates reach chat only after /new"
 else
   echo "[sotto] fresh-per-deploy: sessions CLI unavailable — persona updates reach chat only after /new"
 fi
@@ -477,7 +499,7 @@ fi
 # configured model exists — a bad key/model otherwise only surfaces hours later as a silently failed
 # brief. Non-fatal by construction (`|| true` inside the substitution guards set -euo pipefail; 10s cap
 # so a network blip can't stall boot). Exactly one log line either way.
-GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.7-flash}"
+GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.8-flash}"
 if [ -n "$GKEY" ]; then
   GCHECK="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
     "https://generativelanguage.googleapis.com/v1beta/models/${GMODEL}?key=${GKEY}" 2>/dev/null || true)"
@@ -681,8 +703,13 @@ if [ "$SOTTO_CRON_DELIVER" = "telegram" ] \
 fi
 # No gateway to supervise: hold the container open so /health, /setup and the briefs keep working.
 if [ "$START_GATEWAY" != "1" ]; then
-  wait || true          # the receiver (step 0.5) is the only background job; the trap ends the boot
-  exit 0
+  # The receiver (step 0.5) is the only background job, and on this path it is the whole
+  # service: /health, /setup, the briefs. Its exit status IS the container's — `exit 0` here
+  # told Railway's ON_FAILURE policy that a dead receiver was a clean shutdown, so nothing
+  # restarted it (Day-0 simulation, Sep 2026). The TERM trap still ends a deploy cleanly.
+  rc=0; wait || rc=$?
+  echo "[sotto] receiver exited ($rc) with no gateway to hold the container — exiting $rc"
+  exit "$rc"
 fi
 gw_tries=0
 while :; do

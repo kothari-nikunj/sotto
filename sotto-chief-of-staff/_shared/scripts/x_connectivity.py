@@ -38,7 +38,9 @@ MAX_ATTENDEES = 25
 MISS_TTL_DAYS = 90
 RECENT_DAYS = 7
 API_POST_PAGE = 5             # X user-timeline endpoint minimum
-MAX_RECENT_POSTS = 3
+# X bills per post READ, and 5 is the fewest that endpoint will return — so three was paying for
+# five and throwing two away. Show what the run already bought.
+MAX_RECENT_POSTS = API_POST_PAGE
 MAX_BOOKMARKS_PER_PERSON = 2
 MAX_X_ITEMS_TOTAL = 40        # hard prompt-budget ceiling across a 25-attendee day
 MAX_BOOKMARKS_SCANNED = 25
@@ -108,7 +110,11 @@ def upcoming_attendees(calendar) -> list:
     """Unique external attendees in calendar order, capped by the existing research ceiling."""
     owner = _settings_email()
     owner_domain = owner.split("@", 1)[1] if "@" in owner else ""
-    if owner_domain in _freemail_domains():
+    # No freemail list at all (research_attendees failed to import) → no colleague filter: without
+    # the list, a gmail owner would count every other gmail attendee as a colleague and drop them.
+    # A few extra lookups beat a silently empty prep (review, Sep 3).
+    freemail = _freemail_domains()
+    if not freemail or owner_domain in freemail:
         owner_domain = ""
     out, seen = [], set()
     for event in _events(calendar):
@@ -173,11 +179,13 @@ def distinctive_email_handle(name: str, email: str, company: str = "") -> str:
 
 
 def _research_hints(research) -> dict:
-    """{email: (handle, source_url)} from the grounded web pass.
+    """{email: (handle, source_url, published_name)} from the grounded web pass.
 
     The source is the page that ATTRIBUTED the handle to this person — a YC bio, their own site, a
     profile piece. It is the whole reason a web hint is stronger evidence than an email guess (see
-    profile_agreement), so a hint that arrives without one is treated as a guess."""
+    profile_agreement), so a hint that arrives without one is treated as a guess. `published_name`
+    is the full name that pass found for the address; it is the same class of evidence as the
+    source — a model's claim — and profile_agreement lets it show a profile, never write one."""
     rows = research.get("attendees") if isinstance(research, dict) else research
     out = {}
     for row in rows if isinstance(rows, list) else []:
@@ -186,7 +194,8 @@ def _research_hints(research) -> dict:
         email = _s(row.get("email")).strip().lower()
         handle = kg.normalize_x_handle(row.get("x_handle"))
         if email and handle:
-            out[email] = (handle, _s(row.get("x_handle_source")).strip())
+            out[email] = (handle, _s(row.get("x_handle_source")).strip(),
+                          _s(row.get("full_name")).strip())
     return out
 
 
@@ -291,32 +300,56 @@ def _expanded_profile_url(user: dict) -> str:
     return _s(rows[0].get("expanded_url")).strip() if rows and isinstance(rows[0], dict) else ""
 
 
+def _is_email_stem(name: str, email) -> bool:
+    """Is this "name" just the address it came from?
+
+    A human types a space between a given and a family name. `jparkerholder`, `karunaratne.thenuka`
+    and `alex` are local parts, and they reach here because runs before Sep 2026 filled a nameless
+    invite with `email.split("@")[0]` and then wrote that onto the person file. Judging an X profile
+    against one is judging the profile against the address it was guessed from — and the dotted ones
+    tokenise into two "words", so `karunaratne.thenuka` passed a full-name check by pure accident."""
+    name = _s(name).strip()
+    stem = _s(email).split("@", 1)[0].strip()
+    return bool(name) and " " not in name and bool(stem) and name.lower() == stem.lower()
+
+
 def profile_agreement(attendee: dict, person: kg.PersonFile | None, user: dict,
-                      published_source: str = "") -> tuple[str, str]:
+                      published_source: str = "", published_name: str = "") -> tuple[str, str]:
     """(verdict, reason) — "link" | "show" | "no", the three answers this evidence can support.
 
-    LINK writes durable identity, so it needs two signals the resolver could not have produced by
-    itself: the person's full name in the profile, and the profile agreeing about their
-    company/domain. Nothing weaker is ever remembered.
+    LINK writes durable identity, so it needs the person's full name in the profile AND the profile
+    agreeing about their company/domain — but the question underneath is always the same: what ties
+    this ADDRESS to this human, independently of the handle?
 
-    SHOW is for this prep only. `published_source` is the page the grounded web pass says published
-    this handle for this person — usually right (four for four in the owner's own testing: a YC bio,
-    a personal site, a profile piece), but it is a MODEL'S CLAIM about a page nobody fetched, so it
-    cannot be allowed to mint identity: a hallucinated URL would otherwise be an authority. Paired
-    with their full name it is good enough to put labelled, unconfirmed context in front of the
-    person who can recognise it in one glance — and the graph stays clean either way.
+    A name a human wrote — the invite's display name, or the graph's — ties it by itself. Failing
+    that, `published_name` (the full name the grounded pass found for the address) ties it too, but
+    only from a CORPORATE domain: there the pass reached the person through their own company's
+    pages, and the X bio naming that same company is a third, independent voice. At a freemail
+    address there is no such thread — the pass had nothing to search but the local part, so the name
+    it returns can be a re-spacing of the very stem the handle was guessed from, and agreement is
+    then the guess congratulating itself.
+
+    SHOW is that freemail case, and anything else carrying `published_source` — the page the pass
+    says published this handle. It is a MODEL'S CLAIM about a page nobody fetched (a hallucinated
+    URL must never become an authority), so it puts labelled, unconfirmed context in one prep and
+    writes nothing. That matters because an invite with no display name is the COMMON case: it used
+    to resolve to nobody at all.
 
     A single shared token ("Alex") is not a name match on any path; that is how a stranger's posts
     reach a prep."""
-    expected_name = _s(attendee.get("name") or (person.name if person else ""))
-    expected = _tokens(expected_name)
+    email = _s(attendee.get("email")).strip().lower()
     actual = _tokens(user.get("name"))
-    exact_name = len(expected) >= 2 and expected == actual
-    full_name = len(expected) >= 2 and set((expected[0], expected[-1])).issubset(set(actual))
-    # (a single shared token is deliberately not computed: it is not a name match on any tier)
+
+    def agrees(expected_name: str) -> bool:
+        expected = _tokens(expected_name)
+        # (a single shared token is deliberately not enough: it is not a name match on any tier)
+        return len(expected) >= 2 and (expected == actual
+                                       or set((expected[0], expected[-1])).issubset(set(actual)))
+
+    owned = next((_s(c).strip() for c in (attendee.get("name"), person.name if person else "")
+                  if _s(c).strip() and not _is_email_stem(c, email)), "")
 
     company = _s(person.company if person else "").strip().lower()
-    email = _s(attendee.get("email")).strip().lower()
     domain = email.split("@", 1)[1].split(".", 1)[0] if "@" in email else ""
     haystack = " ".join((_s(user.get("description")), _expanded_profile_url(user))).lower()
     company_tokens = [t for t in _tokens(company) if len(t) > 2]
@@ -325,10 +358,17 @@ def profile_agreement(attendee: dict, person: kg.PersonFile | None, user: dict,
     # Both ends of their name, never one shared token: two Alexes at the same firm both satisfy
     # "a name token plus the company" (external review, Sep 1), and the loser of that coin flip gets
     # a stranger's identity written onto their file.
-    full = exact_name or full_name
-    if full and (company_match or domain_match):
+    agreed = company_match or domain_match
+    if agrees(owned) and agreed:
         return LINK, "profile name and company agree"
-    if full and published_source:
+    # Fail CLOSED: if the freemail list cannot be loaded, no domain counts as corporate — the list
+    # is what makes "the domain ties the address to the company" true, and without it a gmail
+    # address would be handed the corporate LINK path.
+    freemail = _freemail_domains()
+    corporate = bool(freemail) and "@" in email and email.split("@", 1)[1] not in freemail
+    if published_source and agrees(published_name) and corporate and agreed:
+        return LINK, "published name and company agree with the address' own domain"
+    if published_source and (agrees(owned) or agrees(published_name)):
         return SHOW, f"unconfirmed — {published_source} publishes this handle for them"
     return NO, "profile shows no independent name-and-company agreement"
 
@@ -504,9 +544,13 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
 
     for attendee, person_path, person in snapshots:
         # The invite had no display name but the graph knows them: use the name we actually have,
-        # so agreement is judged against a person rather than an email stem.
-        if not _s(attendee.get("name")).strip() and person and _s(person.name).strip():
-            attendee = dict(attendee, name=_s(person.name).strip())
+        # so agreement is judged against a person rather than an email stem. Unless the graph's name
+        # IS the stem — an older run wrote those, and adopting one puts the candidate handle back in
+        # the "name", where distinctive_email_handle refuses it as a bare first name.
+        graph_name = _s(person.name).strip() if person else ""
+        if (not _s(attendee.get("name")).strip() and graph_name
+                and not _is_email_stem(graph_name, attendee.get("email"))):
+            attendee = dict(attendee, name=graph_name)
         if person and person.x_user_id:
             resolved.append((attendee, person))
             continue
@@ -514,7 +558,7 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
         email = _s(attendee.get("email")).lower()
         local = distinctive_email_handle(attendee.get("name"), email,
                                           person.company if person else "")
-        web_hint, web_source = hints.get(email, ("", ""))
+        web_hint, web_source, web_name = hints.get(email, ("", "", ""))
         # (handle, method): the web hint is INDEPENDENT evidence and is tried first — a hint that
         # happens to equal the email guess is corroboration, not a guess, and is treated as such.
         candidates = [(web_hint, "web_hint")] if web_hint else []
@@ -531,11 +575,18 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
                 user = api.user_by_username(candidate)
                 if not user:
                     continue
+                web = candidate_method == "web_hint"
                 verdict, reason = profile_agreement(
                     attendee, person, user,
-                    published_source=web_source if candidate_method == "web_hint" else "")
+                    published_source=web_source if web else "",
+                    published_name=web_name if web else "")
                 if verdict == LINK:
                     matched_user = user
+                    # A published-name LINK is also the first real NAME anything has for a nameless
+                    # invite, and the X profile just corroborated it. File the person under that,
+                    # not under their email address.
+                    if web and web_name and not _s(attendee.get("name")).strip():
+                        attendee = dict(attendee, name=web_name)
                     break
                 if verdict == SHOW:
                     # Good enough to put in front of the person who can recognise it; never good
@@ -607,23 +658,26 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
                 resolution["candidate"] = candidates[0][0]
             _cache_resolution(attendee, person, resolution, now)
 
-    try:
-        bookmarks = api.bookmarks()
-    except RuntimeError as exc:
-        warnings.append(str(exc))
-        bookmarks = []
-    bookmarks_by_author: dict[str, list] = {}
-    for post in bookmarks:
-        author = _s(post.get("author_id"))
-        if author:
-            bookmarks_by_author.setdefault(author, []).append(post)
-
     # Confirmed people first: the prompt budget belongs to identity the graph stands behind, and an
     # unconfirmed row only earns what is left over.
     rows = [(a, _public_profile(p), _s(p.x_user_id), {}) for a, p in resolved]
     rows += [(r, {"x_user_id": r["x_user_id"], "handle": r["handle"],
                   "profile_url": r["profile_url"]}, r["x_user_id"],
               {"unconfirmed": True, "reason": r["reason"]}) for r in unconfirmed_rows]
+
+    # One bookmarks call scans 25 posts and X bills every one of them, so it runs only once there is
+    # somebody to match them against — nobody resolved meant buying 25 reads to attribute to no one.
+    bookmarks = []
+    if rows:
+        try:
+            bookmarks = api.bookmarks()
+        except RuntimeError as exc:
+            warnings.append(str(exc))
+    bookmarks_by_author: dict[str, list] = {}
+    for post in bookmarks:
+        author = _s(post.get("author_id"))
+        if author:
+            bookmarks_by_author.setdefault(author, []).append(post)
 
     output, remaining_items = [], MAX_X_ITEMS_TOTAL
     for attendee, profile, x_user_id, flags in rows:

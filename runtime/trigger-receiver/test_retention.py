@@ -333,3 +333,13 @@ def test_the_never_guard_holds_even_if_a_rule_reaches_past_it(_volume, monkeypat
 
     assert os.path.exists(path)
     assert out["errors"][0]["error"].startswith("protected")
+
+
+def test_the_learning_loops_outcomes_and_the_style_profile_are_in_the_table():
+    """outcomes.jsonl was append-only forever and in neither half of the table — the defining
+    symptom of a family nobody thought about — while learn_preferences re-read the whole file after
+    every brief (Day-7 simulation, Sep 2026). style.json self-caps and says so as an exemption."""
+    rule = ret.accounts_for("outcomes.jsonl")
+    assert isinstance(rule, ret.Rule) and rule.policy == ret.DROP_LINES_OLDER
+    assert rule.amount == ret.OUTCOME_DAYS == 90
+    assert isinstance(ret.accounts_for("style.json"), ret.Exempt)

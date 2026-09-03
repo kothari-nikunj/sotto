@@ -1286,6 +1286,15 @@ def _stale_local_note(local) -> str:
     """When the brief is running on a cached read_local (Bridge was unreachable), tell the model the
     local data is from an earlier capture so it frames it honestly ('your Mac was last seen …')."""
     since = _s((local or {}).get("_local_stale_since"))
+    gone = _s((local or {}).get("_local_unavailable_since"))
+    if not since and gone:
+        # The Bridge is gone AND its last capture is past the reuse window: there is no local
+        # context at all, and the brief must say that rather than read as a quiet day on iMessage.
+        return (f"## Local Context Is Unavailable\n"
+                f"The Bridge was unreachable and its last capture ({gone}) is too old to reuse, so "
+                f"this brief has NO iMessage/WhatsApp/calls/notes context. Say so in one line near "
+                f"the top (\"no local messages — your Mac has been offline since …\"), build the day "
+                f"from Gmail/Calendar, and never imply the local channels were quiet.\n\n")
     if not since:
         return ""
     return (f"## Local Context Is From An Earlier Snapshot\n"

@@ -322,3 +322,22 @@ def test_a_forever_broken_op_is_dropped_at_the_attempt_cap(data, monkeypatch, ca
         kg.replay_journal()
     assert not os.path.exists(kg.journal_path())
     assert "gave up" in capsys.readouterr().err
+
+
+def test_a_new_batch_does_not_clobber_an_op_still_retrying(data, monkeypatch):
+    """run_journaled used to overwrite the journal with its own batch, so an op a replay had kept
+    for retry was discarded after ONE attempt and the graph declared finished half-applied — the
+    exact hole JOURNAL_MAX_ATTEMPTS exists to close (Day-7 simulation, Sep 2026). The retrying op
+    rides along, untouched, and the next replay finishes it."""
+    _person(ANNA, "Anna Reyes", "anna@example.com")
+    _person(BEN, "Ben Okafor", "ben@example.com")
+    rel = kg.Relation(type="works_with", slug=BEN, name="Ben Okafor", date="2026-08-31",
+                      source="test")
+    stuck = dict(kg.edge_op(ANNA, "Anna Reyes", rel), attempts=2)
+    kg.write_text_atomic(kg.journal_path(), json.dumps(
+        {"ts": "2026-08-31T09:00:00Z", "ops": [stuck]}))
+    applied = []
+    monkeypatch.setattr(kg, "_apply_journal_op", lambda op, now: applied.append(op.get("op")) or True)
+    kg.run_journaled([{"op": "unedge", "slug": ANNA, "rel_key": "nobody"}])
+    assert applied == ["unedge"], "the new batch applies; the stuck op is replay's to retry"
+    assert _journal()["ops"] == [stuck], "the retrying op survives with its attempts intact"

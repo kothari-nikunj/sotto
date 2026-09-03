@@ -897,7 +897,7 @@ def _list_md(dirname: str):
 
 def _local_today() -> str:
     """The user's local date. CANONICAL TZ ORDER, the same chain everywhere: SOTTO_TIMEZONE → TZ →
-    $SOTTO_DATA/config/settings.json → server local. Every wall-clock feature resolves the day the
+    $SOTTO_DATA/config/settings.json → UTC. Every wall-clock feature resolves the day the
     same way — the skills tree's `timeutil.configured_tz()` is the canonical implementation, and this
     mirrors it because the receiver image can't import the skills tree (it may not be on the box at
     all); receiver._configured_tz_name() and start.sh's step 2 are the other two copies of the chain.
@@ -912,7 +912,9 @@ def _local_today() -> str:
             return datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
         except Exception:  # noqa: BLE001
             pass
-    return time.strftime("%Y-%m-%d")
+    # UTC, not server local: the last rung brief_marker.py and start.sh already use, so the outbox
+    # row's day and the deliver-once marker's day agree on a box whose clock is not UTC.
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def _brief_files():

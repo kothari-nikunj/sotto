@@ -90,7 +90,8 @@ def test_load_active_hides_a_snoozed_loop_from_every_read_view(tmp_path, monkeyp
 
 
 def test_chase_state_fields_are_named_once(tmp_path, monkeypatch):
-    """The chase's whole story on a row, listed in one place: a caller that clears four of the five
-    leaves a loop that can never be chased again or one that is never asked about twice."""
+    """The chase's whole story on a row, listed in one place: a caller that clears five of the six
+    leaves a loop that can never be chased again, one that is never asked about twice — or one
+    that stays demoted behind every other loop by a stall penalty nobody cleared."""
     assert li.CHASE_STATE_FIELDS == ("chased_count", "chase_after", "last_chased_at",
-                                     "chase_pending", "handoff_asked_at")
+                                     "chase_pending", "handoff_asked_at", "chase_stalls")

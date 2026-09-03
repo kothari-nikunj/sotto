@@ -204,6 +204,12 @@ def capture_first_sender(token: str, phrase: str, timeout_secs: int = LINK_TIMEO
                 offset = update["update_id"] + 1
             hit = _first_human_private_message(update, phrase)
             if hit:
+                # Telegram confirms an update only when a LATER getUpdates carries its offset.
+                # Returning here left the pairing message unconfirmed, so the gateway that starts
+                # minutes later received "/start <setup code>" as the user's first message and the
+                # per-deploy secret went into an LLM transcript. One zero-wait call consumes it.
+                if offset is not None:
+                    _call(token, "getUpdates", {"offset": offset, "timeout": 0})
                 return hit
         if time.monotonic() >= deadline:
             return {"ok": False, "error": "nobody sent the pairing link in time"}

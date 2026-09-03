@@ -822,6 +822,11 @@ def _clear_stale_pending(active: list, today: str):
         pending = _s(it.get("chase_pending"))[:10]
         if pending and pending < today:
             it.pop("chase_pending", None)
+            # Count the stall: the day's one stamp went to this row and nothing was delivered.
+            # _stamp_chase ranks stalled rows last, so one blocked loop (quiet hours at the tick,
+            # a snooze, a dead channel) rotates to the back instead of holding the whole chase
+            # lane every morning (Day-7 simulation, Sep 2026).
+            it["chase_stalls"] = int(it.get("chase_stalls") or 0) + 1
             _persist(it)
 
 
@@ -835,7 +840,8 @@ def _stamp_chase(active: list, today: str, ref: datetime):
            for it in active):
         return                            # already chased (or proposed a chase) today
     overdue = lambda it: bool(_s(it.get("deadline"))[:10] and _s(it.get("deadline"))[:10] < today)
-    ranked = sorted(active, key=lambda it: (not overdue(it),
+    ranked = sorted(active, key=lambda it: (int(it.get("chase_stalls") or 0),
+                                            not overdue(it),
                                             -(_days_old(it.get("created_at"), ref) or 0)))
     for it in ranked:
         if chase_due(it, today, ref):
@@ -900,6 +906,9 @@ def _finalize_chase_unlocked(anchor_key: str, now: datetime | None = None) -> di
     it["last_chased_at"] = today
     it["chase_after"] = (ref + timedelta(days=chase_after_days())).strftime("%Y-%m-%d")
     it.pop("chase_pending", None)
+    # A delivered chase ends the stall penalty: the stall was a property of the days the lane was
+    # down, not of this loop, and a row must not stay demoted after a chase actually landed.
+    it.pop("chase_stalls", None)
     _persist(it)
     return {"ok": True, "anchor_key": _s(it.get("anchor_key")) or key,
             "chased_count": it["chased_count"],

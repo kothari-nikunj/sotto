@@ -16,7 +16,9 @@ one line per step, no walls of text. Do the work; don't make them read a manual.
 
 ## Procedure
 
-**0. If the `health()` tool isn't available** (the `sotto-local` toolset isn't connected), STOP and say in one line — pick the right message:
+**0. If there is no Mac in this deploy** — `execute_code`: `test -n "$BRIDGE_TOKEN" && echo bridge || echo no-bridge` prints `no-bridge`, or `health()` answers `{"connected": false}` and the user says they have no Mac / didn't install the Bridge — the Bridge is **optional**: say so in one line ("No Mac linked — I'll brief from Gmail and Calendar; add the Sotto Bridge app any time for iMessage/WhatsApp"), skip the Bridge probe in step 2, and carry on. A self-host without a Mac is a supported deploy, not a dead end.
+
+**0b. If the `health()` tool isn't available** (the `sotto-local` toolset isn't connected) on a deploy that DOES have a Mac, STOP and say in one line — pick the right message:
 > - **If the Mac recently woke from sleep:** "Your Mac just woke up — I reconnect to the Bridge automatically within ~60 seconds. Give it a moment and ask me again." (The host binds the Bridge connection at startup; a watchdog bounces it to reconnect shortly after your Mac comes back online.)
 > - **Otherwise:** "Your Sotto Bridge isn't linked yet. Open the **Sotto Bridge** menu bar app on your Mac (it relaunches itself on login) — it dials out to me automatically, there's no tunnel to run — then say *set up Sotto* again. If it's been up a while and I still can't see it, restart the Sotto host (Railway service) once."
 Do NOT explore the filesystem / packages / Hermes internals or run `hermes tools list` — a missing tool means "not connected," nothing to discover.

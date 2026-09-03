@@ -117,6 +117,7 @@ HOOKS = {
     "send": _unwired("send"),
     "record": lambda *a, **k: None,             # receiver._record_delivery — the receipt line
     "on_delivered": lambda payload: None,       # receiver: finalize the run's chase/handoff effects
+    "on_not_a_brief": lambda payload: None,     # receiver: a brief-kind row with no composed brief
     "local_today": lambda: time.strftime("%Y-%m-%d"),   # ONE tz resolution per process
     # (label, day, run_id) -> "send" | "superseded". THE deliver-once gate for the day's brief, asked
     # once per attempt, right before the channel is. receiver._brief_delivery_gate: it owns the
@@ -144,6 +145,9 @@ TERMINAL = (STATUS_DELIVERED, STATUS_FAILED, STATUS_EXPIRED, STATUS_SUPERSEDED)
 
 GATE_SEND = "send"
 GATE_SUPERSEDED = "superseded"
+GATE_NOT_A_BRIEF = "not_a_brief"     # a brief-kind body with no composed brief behind it
+NOT_A_BRIEF_DETAIL = ("no composed brief on the volume for today — the run never ran the composer, "
+                      "so this text is not the brief and does not claim the day")
 SUPERSEDED_DETAIL = ("today's brief was already delivered by the other lane — this copy was "
                      "not sent")
 
@@ -374,6 +378,19 @@ def _attempt(key: str) -> bool:
                 if closed is not None:
                     print(f"[sotto] {label}: superseded — {SUPERSEDED_DETAIL}", flush=True)
                     _payload_receipt(closed, STATUS_SUPERSEDED, SUPERSEDED_DETAIL)
+                return False
+            if gate == GATE_NOT_A_BRIEF:
+                # Failed, loudly, on the first attempt — retrying the same non-brief cannot help,
+                # and the day stays unclaimed for the lane that can still compose one.
+                settled = _settle(key, False, NOT_A_BRIEF_DETAIL, MAX_ATTEMPTS)
+                if settled is not None:
+                    print(f"[sotto] {label}: NOT SENT — {NOT_A_BRIEF_DETAIL}", flush=True)
+                    _payload_receipt(settled[1], STATUS_FAILED, NOT_A_BRIEF_DETAIL)
+                    try:
+                        HOOKS["on_not_a_brief"](settled[1])
+                    except Exception as e:  # noqa: BLE001 — the receipt stands; the follow-up is best-effort
+                        print(f"[sotto] outbox: not-a-brief follow-up failed ({type(e).__name__}: {e})",
+                              flush=True)
                 return False
         try:
             ok, detail = HOOKS["send"](payload.get("body") or "", payload.get("target") or "")

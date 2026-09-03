@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+import types
 from datetime import datetime
 
 import pytest
@@ -2452,10 +2453,10 @@ def test_promote_queued_relays_the_funnel_s_refusal_and_never_spawns(tmp_path, m
     assert spawned == []
 
 
-def test_run_dashboard_job_fires_the_crons_json_prompt(tmp_path, monkeypatch):
-    """Run-now is not a second definition of the brief: it takes the job's own prompt out of
+def test_run_dashboard_job_fires_the_crons_json_job(tmp_path, monkeypatch):
+    """Run-now is not a second definition of the brief: it takes the job out of
     adapters/hermes/crons.json — the ONE source the boot registrars read — and fires it through the
-    same SOTTO_RUN_SKILL runner cron uses."""
+    same SOTTO_RUN_SKILL runner cron uses, with the same imperative prompt every spawn gets."""
     rec.DATA = str(tmp_path)
     calls = []
     # The seam is _spawn_and_deliver — the ONE place a skill is started and its output delivered.
@@ -2464,8 +2465,7 @@ def test_run_dashboard_job_fires_the_crons_json_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_RUN_SKILL", "fake-runner -z")
     out = rec._run_dashboard_job("sotto-morning-brief")
     assert out == {"ok": True, "skill": "sotto-morning-brief"}
-    prompts = {name: prompt for name, _, prompt, _ in rec._sotto_cron_jobs()}
-    assert calls == [["fake-runner", "-z", prompts["sotto-morning-brief"]]]
+    assert calls == [["fake-runner", "-z", rec._spawn_prompt("sotto-morning-brief")]]
     # a job that isn't registered on this box is refused, not invented
     assert rec._run_dashboard_job("sotto-nope")["error"] == "unknown"
     monkeypatch.setenv("SOTTO_DIGEST", "0")
@@ -2511,7 +2511,9 @@ def test_the_cron_tick_fires_a_receiver_run_job_at_its_minute(tmp_path, monkeypa
     assert fired == [], "a minute early is not the minute"
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
     rec._cron_tick()
-    assert fired == [("cron:sotto-morning-brief", "Run my morning brief")]
+    # NOT crons.json's "Run my morning brief": that friendly one-liner let the agent hand-write a
+    # brief, which still claimed the day and suppressed the lane that would have sent the real one.
+    assert fired == [("cron:sotto-morning-brief", rec._spawn_prompt("sotto-morning-brief"))]
     # the pulse is Hermes' job even when its minute matches: the receiver fires only its own rows
     assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
 
@@ -2589,6 +2591,7 @@ def test_a_cron_fired_brief_is_gated_exactly_like_every_other_brief(tmp_path, mo
     by the same last-segment rule `brief:` and `run-now:` are, so the day's marker is shared and a
     cron fire can never double-deliver alongside a wake-push."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     assert rec.OUTBOX.kind_for("cron:sotto-morning-brief") == rec.OUTBOX.KIND_BRIEF
     day = rec.DASHBOARD._local_today()
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", day, "cron-run") \
@@ -3208,6 +3211,7 @@ def test_an_acknowledged_message_is_delivered_exactly_once(tmp_path, monkeypatch
     """Two drains over the same volume must not produce two messages. The transition is inside the
     locked read-modify-write, so a row that is already terminal is simply not claimed again."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     _no_backoff(monkeypatch)
     sent = _channel(monkeypatch, (True, ""))
     assert rec._deliver_text("your morning brief", "brief:sotto-morning-brief") is True
@@ -3310,6 +3314,8 @@ def test_a_stale_nudge_expires_on_the_funnels_own_window(tmp_path, monkeypatch):
 def test_a_brief_fails_visibly_when_its_day_ends_and_a_digest_goes_quiet(tmp_path, monkeypatch):
     """Two kinds, two endings, one rule each. A day with no brief is something you must be told
     about; a digest whose day is over is superseded by tomorrow's, so it goes quietly."""
+    # composed briefs exist: the first attempt runs under TODAY, the aged row under 2026-08-27
+    _archive(tmp_path, "morning"); _archive(tmp_path, "morning", "2026-08-27"); _archive(tmp_path, "evening")
     sent = _plant(tmp_path, monkeypatch, "brief", "brief:sotto-morning-brief", day="2026-08-27")
     rec.OUTBOX.drain()
     (row,) = _outbox_rows(tmp_path)
@@ -3405,11 +3411,13 @@ def test_terminal_rows_are_pruned_but_pending_ones_never_are(tmp_path, monkeypat
     assert kept[0]["payload"]["body"] == "still trying"
 
 
-def test_machine_markers_never_leave_the_box(monkeypatch):
+def test_machine_markers_never_leave_the_box(tmp_path, monkeypatch):
     """The composer emits <!--id:…--> / <!--meeting:…--> plumbing for the dashboard and tap links,
     and to_chat strips it — but the spawned run chooses which artifact it prints, and one Hermes
     upgrade was enough for a run to print the marker-laden markdown (Aug 28: an evening brief
     arrived with every id inline). The send seam enforces the strip regardless of what was printed."""
+    rec.DATA = str(tmp_path)
+    _archive(tmp_path, "evening")   # a composed brief exists behind this body
     sent = _channel(monkeypatch)
     text = ("Alex Cohen<!--id:195@lid|ch:whatsapp--> - asked about the round.\n\n"
             "<!--meeting:event_id:abc|title:Sync|start:2026-08-29T12:30:00-07:00-->\n\n"
@@ -3453,6 +3461,7 @@ def test_the_send_seam_claims_the_marker_when_no_lane_did(tmp_path, monkeypatch)
     """A run that forgot its own claim is not trusted to have one: the seam claims for it, stamping
     the run's id, and only then sends. The claim is atomic (O_EXCL), so it is a real claim."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     sent = _channel(monkeypatch)
     assert rec._deliver_text("your evening brief", "brief:sotto-evening-brief",
                              run_id="run-a") is True
@@ -3465,6 +3474,7 @@ def test_a_run_that_claimed_properly_still_sends(tmp_path, monkeypatch):
     """The obedient path is untouched: the run claimed in step 6, the marker carries ITS id, and the
     seam recognises its own and gets out of the way."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     _marker(tmp_path, "morning", "run-b")
     sent = _channel(monkeypatch)
     assert rec._deliver_text("your morning brief", "brief:sotto-morning-brief",
@@ -3478,6 +3488,7 @@ def test_a_brief_the_other_lane_already_delivered_is_superseded_never_sent(tmp_p
     reaches the channel. It is receipted in plain English, stripped of its words, and terminal —
     no drain will ever pick it up again."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     _no_backoff(monkeypatch)
     _marker(tmp_path, "evening", "the-cron-run")
     sent = _channel(monkeypatch)
@@ -3501,6 +3512,7 @@ def test_the_incident_replay_two_compositions_one_delivery(tmp_path, monkeypatch
     """Two runs, one day, one kind, two different texts — 17:34 and 17:35:31. Whichever reaches the
     seam first claims and sends; the other is superseded. Exactly one brief leaves the box."""
     rec.DATA = str(tmp_path)
+    _archive(tmp_path, "morning"); _archive(tmp_path, "evening")   # a composed brief exists
     _no_backoff(monkeypatch)
     sent = _channel(monkeypatch)
     assert rec._deliver_text("the 17:34 brief", "brief:sotto-evening-brief",
@@ -3634,16 +3646,23 @@ def test_the_cron_thread_ticks_before_it_first_sleeps(monkeypatch):
 
 
 def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatch):
-    """The deliver-once claim moved to the send seam for receiver runs — and the claim's second
-    half, the digest stamp, moved with it: only the claim that WINS (and therefore delivers)
-    stamps; a superseded copy does not."""
+    """The deliver-once claim lives at the send seam — and the claim's second half, the digest
+    stamp, lives one step LATER, on the channel's ack: a claim whose send then fails for a day of
+    retries must not hide the morning from the 12:30 digest. So the gate never stamps, a
+    superseded copy never stamps, and the delivered brief stamps exactly once."""
     rec.DATA = str(tmp_path)
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    with open(os.path.join(str(tmp_path), "briefs", "2026-08-31_morning.json"), "w") as f:
+        f.write("{}")
     stamped = []
     monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: stamped.append(1))
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-a") == "send"
-    assert stamped == [1]
+    assert stamped == [], "claimed is not delivered"
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-b") == "superseded"
-    assert stamped == [1], "a superseded copy is not the delivery — it must not stamp"
+    rec._on_delivered({"label": "cron:sotto-morning-brief", "effects": []})
+    assert stamped == [1]
+    rec._on_delivered({"label": "proactive", "effects": []})
+    assert stamped == [1], "only a brief moves the digest window"
 
 
 def test_a_link_captured_by_a_previous_bot_token_is_not_a_link(tmp_path, monkeypatch):
@@ -3661,3 +3680,224 @@ def test_a_link_captured_by_a_previous_bot_token_is_not_a_link(tmp_path, monkeyp
     assert rec._delivery_ready() is False or rec._deliver_target() != "telegram"
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "<old-token>")
     assert rec._telegram_status() == "linked"           # the token that captured it still counts
+
+
+def test_every_spawned_run_gets_the_same_imperative_prompt():
+    """One job, one prompt. The wake-push lane mandated compose_brief.py and forbade hand-writing;
+    the cron lane sent "Run my morning brief" — and on Sep 2, the first morning the receiver owned
+    the schedule, that run made zero model calls, claimed the day `unlabeled`, and delivered
+    nothing, which the deliver-once marker then made permanent for the wake-push lane too."""
+    cron = rec._spawn_prompt("sotto-morning-brief")
+    push = rec._spawn_prompt("sotto-morning-brief", "/data/briefs/staged.json")
+    for text in (cron, push):
+        assert "compose_brief.py" in text and "hand-summarize" in text
+        assert "STOP and report" in text and "tap_link verbatim" in text
+    # the staged payload is the ONLY difference between the lanes
+    assert "/data/briefs/staged.json" in push and "read_local" not in cron
+    assert cron == push.replace(
+        "The Sotto Bridge just delivered its trigger; use the staged local_data payload at "
+        "/data/briefs/staged.json as the brief's local context (do NOT call read_local). ", "")
+    # a non-brief skill is held to the same bar without being told to run a composer it has none of
+    pulse = rec._spawn_prompt("sotto-relationship-pulse")
+    assert "compose_brief.py" not in pulse and "STOP and report" in pulse
+
+
+def _archives(monkeypatch):
+    ran = []
+    monkeypatch.setattr(rec, "archive_gateway_sessions", lambda: ran.append(1) or 2)
+    return ran
+
+
+def test_the_daily_session_archive_fires_once_at_the_housekeeping_minute(tmp_path, monkeypatch):
+    """A gateway session lasts a day or a deploy, whichever comes first. The Aug 26 move to
+    reset-on-deploy let a transcript grow for a week between deploys, and interactive replies
+    began copying it back out — recursively, Telegram's own (1/2)(2/2) split markers included.
+    The boundary rides the housekeeping slot and the same fired-today stamp retention uses."""
+    rec.DATA = str(tmp_path)
+    rec._RETENTION_FIRED.clear()
+    ran = _archives(monkeypatch)
+    hour, minute = rec.RETENTION.SWEEP_LOCAL
+    for at in (datetime(2026, 9, 2, 6, 30), datetime(2026, 9, 2, hour, minute - 1)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._session_archive_tick()
+    assert ran == [], "not before the minute, and never at brief time"
+    for at in (datetime(2026, 9, 2, hour, minute), datetime(2026, 9, 2, hour, minute + 1)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._session_archive_tick()
+    assert len(ran) == 1
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 3, hour, minute))
+    rec._session_archive_tick()
+    assert len(ran) == 2
+    # its stamp is its own: archiving today does not stop the retention sweep, or vice versa
+    assert rec._RETENTION_FIRED == {"sessions": "2026-09-03"}
+
+
+def test_archiving_sessions_reads_the_id_column_and_skips_cron_runs(monkeypatch):
+    """Same `hermes sessions list` → `hermes sessions archive <id>` the deploy path runs — through
+    sessions.py, the one implementation. The hex/uuid regex both callers used matched NONE of
+    Hermes' real ids, so a week of boots archived 0 sessions and no session ever reset. Cron
+    sessions (a finished one-shot every 15 minutes) are left alone."""
+    calls = []
+
+    def fake_run(argv, **_kw):
+        calls.append(argv)
+        if argv[:3] == ["hermes", "sessions", "list"]:
+            return types.SimpleNamespace(returncode=0, stdout=(
+                "Title                        Workspace   Last Active   ID\n"
+                "──────────────────────────────────────────────────────────────\n"
+                "—                            —           just now      cron_964b334424a8_20260902_203042\n"
+                "Here is #56                  /           21m ago       20260903_030638_ec5f25\n"
+                "sotto-proactive · Sep 02 2   —           29m ago       cron_6bce68cd5a58_20260902_200045\n"
+                "H #3                         /           1h ago        20260903_022841_413f39\n"))
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(rec.SESSIONS.subprocess, "run", fake_run)
+    assert rec.archive_gateway_sessions() == 2
+    archived = [a[-1] for a in calls if a[:3] == ["hermes", "sessions", "archive"]]
+    assert archived == ["20260903_030638_ec5f25", "20260903_022841_413f39"]
+    # no CLI → None, and the tick says so instead of pretending
+    monkeypatch.setattr(rec.SESSIONS.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no hermes")))
+    assert rec.archive_gateway_sessions() is None
+
+
+# ── The end-to-end simulation fixes (Sep 2026) ───────────────────────────────────────────────────
+
+def _archive(tmp_path, kind, date=None):
+    """compose_brief.py's own archive of what it composed — the proof, at the seam, that a
+    brief-kind body IS a brief."""
+    path = os.path.join(str(tmp_path), "briefs", f"{date or rec.DASHBOARD._local_today()}_{kind}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{}")
+    return path
+
+
+def test_a_body_with_no_composed_brief_behind_it_never_claims_the_day(tmp_path, monkeypatch):
+    """Sep 2: a run that never ran the composer (calls=0, no archive) still claimed the day, and
+    the lane that would have sent the real brief stood down. The seam now asks the one question a
+    prompt cannot fake — is compose_brief's archive of today's brief on the volume? — and a body
+    without one is receipted failed, loudly, with the day left open."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    sent = _channel(monkeypatch)
+    refired = []
+    monkeypatch.setattr(rec, "_retry_failed_brief", lambda label: refired.append(label))
+    assert rec._deliver_text("I could not run compose_brief.py — execute_code is unapproved.",
+                             "brief:sotto-morning-brief", run_id="improvised") is False
+    assert sent == [], "a non-brief reached the channel"
+    assert refired == ["brief:sotto-morning-brief"], "a non-brief run is a dead run: re-fire once"
+    (row,) = _outbox_rows(tmp_path)
+    assert row["status"] == "failed" and "no composed brief" in row["last_error"]
+    assert not os.path.exists(os.path.join(str(tmp_path), "briefs",
+                                           f"{rec.DASHBOARD._local_today()}.morning.delivered"))
+    # …and the lane that DID compose still owns the day
+    _archive(tmp_path, "morning")
+    assert rec._deliver_text("# Morning brief\n…", "brief:sotto-morning-brief", run_id="real") is True
+    assert [s["body"] for s in sent] == ["# Morning brief\n…"]
+    assert _marker(tmp_path, "morning") == "real"
+
+
+def test_the_digest_window_moves_when_the_channel_acks_not_when_the_day_is_claimed(tmp_path, monkeypatch):
+    """Day 0: Telegram not yet linked, the 17:30 brief composes, claims the day, and fails to send
+    for hours — and the 12:30 digest's window used to start at that claim, hiding the whole
+    morning from a digest for a brief nobody received. The window moves on the ack."""
+    rec.DATA = str(tmp_path)
+    _no_backoff(monkeypatch)
+    _archive(tmp_path, "evening")
+    stamps = []
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: stamps.append(1))
+    _channel(monkeypatch, (False, "no chat linked"), (True, ""))
+    assert rec._deliver_text("# Evening brief", "brief:sotto-evening-brief", run_id="r1") is False
+    assert _marker(tmp_path, "evening") == "r1" and stamps == [], "claimed, not delivered: no stamp"
+    assert rec.OUTBOX.drain()["delivered"] == 1
+    assert stamps == [1]
+
+
+def test_a_timezone_change_forgets_the_fired_today_stamps(tmp_path, monkeypatch):
+    """A deploy at 22:00 PDT fired the 06:30 brief at 06:30 UTC (23:30 PDT) and stamped today; after
+    the wizard set PDT the user's real 06:30 was still "today", already stamped, and no brief came
+    (Day-0 simulation, Sep 2026). The durable marker is what stops a genuine re-fire."""
+    rec.DATA = str(tmp_path)
+    rec._CRON_FIRED.clear(); rec._RETENTION_FIRED.clear(); rec._BRIEF_RETRIES.clear()
+    rec._CRON_FIRED["sotto-morning-brief"] = "2026-09-04"
+    rec._RETENTION_FIRED["sweep"] = "2026-09-04"
+    monkeypatch.setattr(rec, "_configured_tz_name", lambda: "UTC")
+    monkeypatch.setattr(rec, "write_setting", lambda *a, **k: None)
+    monkeypatch.setattr(rec, "_reregister_sotto_crons", lambda tz: None)
+    monkeypatch.setattr(rec.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert rec.set_timezone("America/Los_Angeles") == (True, "America/Los_Angeles")
+    assert rec._CRON_FIRED == {} and rec._RETENTION_FIRED == {}
+    # the same zone again is not a change, and forgets nothing
+    rec._CRON_FIRED["sotto-morning-brief"] = "2026-09-04"
+    monkeypatch.setattr(rec, "_configured_tz_name", lambda: "America/Los_Angeles")
+    rec.set_timezone("America/Los_Angeles")
+    assert rec._CRON_FIRED == {"sotto-morning-brief": "2026-09-04"}
+
+
+def test_a_cron_brief_run_that_dies_is_re_fired_once_and_only_once(tmp_path, monkeypatch):
+    """The tick stamps a job fired when its process STARTS; a compose that crashed minutes later left
+    the day stamped and the outbox empty — a brief lost with one `failed` receipt nobody reads
+    (Day-1 simulation, Sep 2026). One bounded re-fire, and never when the day has delivered."""
+    rec.DATA = str(tmp_path)
+    rec._BRIEF_RETRIES.clear()
+    fired = []
+    monkeypatch.setattr(rec, "_fire_cron_job", lambda name, label: fired.append(name) or {"ok": True})
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 3, 6, 34))
+    rec._retry_failed_brief("cron:sotto-morning-brief")
+    rec._retry_failed_brief("cron:sotto-morning-brief")
+    assert fired == ["sotto-morning-brief"], "one re-fire per job per day"
+    rec._retry_failed_brief("brief:sotto-morning-brief")      # the wake-push lane retries itself
+    rec._retry_failed_brief("cron:sotto-relationship-pulse")  # not a marked brief
+    assert fired == ["sotto-morning-brief"]
+    rec._BRIEF_RETRIES.clear()
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    with open(rec.delivered_marker("2026-09-03", "morning"), "w") as f:
+        f.write("someone")
+    rec._retry_failed_brief("cron:sotto-morning-brief")
+    assert fired == ["sotto-morning-brief"], "a delivered day is never re-fired"
+
+
+def test_a_wake_inside_the_cron_window_folds_only_while_the_cron_is_alive(tmp_path, monkeypatch):
+    """The window guard presumed the cron run was still composing. Once that run is dead with no
+    marker, the wake is the brief's last chance and must spawn — folding it into the snapshot on
+    a dead cron's behalf is how the day's brief was lost."""
+    rec._CRON_FIRED.clear(); rec._RUNS_INFLIGHT.clear()
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 3, 6, 33))
+    assert rec._cron_run_is_dead("sotto-morning-brief") is False       # not fired yet: it will
+    rec._CRON_FIRED["sotto-morning-brief"] = "2026-09-03"
+    rec._RUNS_INFLIGHT["cron:sotto-morning-brief"] = 1
+    assert rec._cron_run_is_dead("sotto-morning-brief") is False       # composing right now
+    rec._RUNS_INFLIGHT["cron:sotto-morning-brief"] = 0
+    assert rec._cron_run_is_dead("sotto-morning-brief") is True        # fired, finished, no marker
+
+
+def test_the_cron_tick_does_not_recompose_a_day_the_marker_says_delivered(tmp_path, monkeypatch):
+    """A restart inside the window forgets it fired; the durable marker remembers the day
+    DELIVERED. Composing a brief the seam would only supersede costs minutes and real tokens for
+    words nobody reads (Day-15 simulation, Sep 2026)."""
+    rec.DATA = str(tmp_path)
+    rec._CRON_FIRED.clear()
+    _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 31))
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    with open(rec.delivered_marker("2026-08-31", "morning"), "w") as f:
+        f.write("the-run-before-the-restart")
+    rec._cron_tick()
+    assert fired == [] and rec._CRON_FIRED["sotto-morning-brief"] == "2026-08-31"
+
+
+def test_a_composed_brief_is_recognised_by_recency_not_by_matching_dates(tmp_path):
+    """The archive is dated by the composer's timezone chain inside the agent sandbox, the outbox
+    row by the receiver's; a sandbox that strips SOTTO_TIMEZONE dates an evening brief tomorrow
+    (17:30 PT is 00:30 UTC), and a strict date match refused every evening brief (review, Sep 3).
+    So: any archive of this kind within 20 hours, across the row's day and its neighbours."""
+    rec.DATA = str(tmp_path)
+    assert rec._composed_brief_recently("evening", "2026-09-03") is False
+    path = _archive(tmp_path, "evening", "2026-09-04")         # dated tomorrow, written just now
+    assert rec._composed_brief_recently("evening", "2026-09-03") is True
+    os.utime(path, (time.time() - 25 * 3600, time.time() - 25 * 3600))
+    assert rec._composed_brief_recently("evening", "2026-09-03") is False, "yesterday's brief is not today's"
+    assert rec._composed_brief_recently("morning", "2026-09-04") is False, "a different kind never counts"

@@ -1274,3 +1274,35 @@ def test_keep_waiting_clears_the_whole_chase_state(tmp_path, monkeypatch):
     assert retune_apply.apply("keep", "email:waiting_on:id:maya@x.com")["ok"] is True
     kept = _all_fm(tmp_path)[0]
     assert not any(k in kept for k in ledger_io.CHASE_STATE_FIELDS)
+
+
+def test_a_stalled_chase_rotates_to_the_back_of_the_lane(tmp_path, monkeypatch):
+    """_stamp_chase gave the day's ONE stamp to the oldest eligible row and returned. A row the
+    nudge lane then declined (quiet hours at the tick, a snooze, a dead channel) took the stamp
+    again tomorrow, and every other chase-eligible loop on the volume got nothing — one stuck row
+    silenced the whole lane (Day-7 simulation, Sep 2026). A stall is counted, and stalled rows
+    rank last."""
+    _env(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOTTO_CHASE_AFTER_DAYS", "3")
+    _waiting(tmp_path, "old", created_at="2026-06-10")
+    _waiting(tmp_path, "young", created_at="2026-06-20")
+    day1 = cr.resolve({"today": "2026-06-24"}, datetime(2026, 6, 24, 9, 0, 0))["active"]
+    pending = {it["anchor_key"]: it.get("chase_pending") for it in day1}
+    assert [k for k, v in pending.items() if v] == [next(k for k in pending if "old" in k)]
+    # nobody delivered it; the next morning the stall is counted and the OTHER row gets the stamp
+    day2 = cr.resolve({"today": "2026-06-25"}, datetime(2026, 6, 25, 9, 0, 0))["active"]
+    by_key = {it["anchor_key"]: it for it in day2}
+    old = next(v for k, v in by_key.items() if "old" in k)
+    young = next(v for k, v in by_key.items() if "young" in k)
+    assert old.get("chase_stalls") == 1 and "chase_pending" not in old
+    assert young.get("chase_pending") == "2026-06-25"
+    # …and a stall is a property of the days the lane was down, not of the loop: once a chase on
+    # the stalled row actually lands, the penalty is gone (review, Sep 3)
+    day3 = cr.resolve({"today": "2026-06-26"}, datetime(2026, 6, 26, 9, 0, 0))["active"]
+    stamped = next(it for it in day3 if it.get("chase_pending") == "2026-06-26")
+    assert cr.finalize_chase(stamped["anchor_key"], datetime(2026, 6, 26, 9, 0, 0))["ok"]
+    after = {it["anchor_key"]: it for it in cr.resolve({"today": "2026-06-26"},
+                                                       datetime(2026, 6, 26, 9, 0, 0))["active"]}
+    assert "chase_stalls" not in after[stamped["anchor_key"]]
+    import ledger_io
+    assert "chase_stalls" in ledger_io.CHASE_STATE_FIELDS       # "keep waiting" clears it too

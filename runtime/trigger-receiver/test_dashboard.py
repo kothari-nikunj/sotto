@@ -17,6 +17,12 @@ import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
+# "Today" is whatever the dashboard's OWN tz chain answers — never time.strftime, which is the
+# machine's local zone. The two agree in a UTC container and disagree on a developer's Mac after
+# 5pm PDT (the chain's last rung is UTC, deliberately the same as brief_marker's and start.sh's),
+# and four tests failed on the owner's laptop the first evening that was true (Sep 3, 2026).
+import dashboard as _dash
+
 HERE = os.path.dirname(__file__)
 _seq = itertools.count()
 
@@ -139,7 +145,7 @@ def _write(path, content):
 
 
 def _fixtures(root):
-    today = time.strftime("%Y-%m-%d")
+    today = _dash._local_today()
     k = os.path.join(root, "knowledge")
     _write(os.path.join(k, "people", "sarah-chen.md"), PERSON_MD)
     _write(os.path.join(k, "companies", "acme-corp.md"), COMPANY_MD)
@@ -1845,7 +1851,7 @@ def _queue_line(sender="Sarah Chen", cls="cooldown", held="actionable", source="
 
 
 def _cadence_fixtures(root, queue_lines=None):
-    day = time.strftime("%Y-%m-%d")
+    day = _dash._local_today()
     _write(os.path.join(root, "events", "budget.json"), json.dumps({"date": day, "count": 3}))
     _write(os.path.join(root, "cache", "meeting_taps.json"),
            json.dumps({"date": day, "fired": ["k1", "k2"]}))
@@ -2123,7 +2129,7 @@ def test_post_voice_confirm_writes_through_style_extract(tmp_path):
 
 def test_api_runs_gates_on_the_deliver_once_marker(tmp_path):
     m, srv, base = _server(tmp_path)
-    day = time.strftime("%Y-%m-%d")
+    day = m.DASHBOARD._local_today()
     try:
         cookie = _login(base)
         jobs = json.loads(_get(base, "/api/runs", headers=cookie)[1])["jobs"]
@@ -2187,7 +2193,7 @@ def test_api_runs_surfaces_what_the_channel_has_not_acknowledged(tmp_path):
 
 def test_post_runs_fires_the_cron_prompt_and_refuses_what_it_reported_closed(tmp_path):
     m, srv, base = _server(tmp_path)
-    day = time.strftime("%Y-%m-%d")
+    day = m.DASHBOARD._local_today()
     spawned = []
     m.DASHBOARD.HOOKS["run_job"] = lambda name: (spawned.append(name),
                                                  {"ok": True, "skill": "sotto-evening-brief"})[1]

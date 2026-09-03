@@ -243,7 +243,8 @@ def test_a_namesake_is_never_linked_from_a_handle_guessed_off_the_name(tmp_path,
 
 def test_a_guessed_handle_links_when_the_profile_shows_their_company(tmp_path, monkeypatch):
     """The same guess, corroborated: the bio names the company behind their email domain, which a
-    name-shaped guess could not have arranged. This is the Sarv/Jack case that must keep working."""
+    name-shaped guess could not have arranged. This is the published-handle case that must keep
+    working."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
         "johnsmith": {"id": "778", "username": "johnsmith", "name": "John Smith",
@@ -407,3 +408,110 @@ def test_a_meeting_room_is_not_a_person(tmp_path, monkeypatch):
          "displayName": "HQ-Suite 800-Board Room (10)"},
         {"email": "alex@pantograph.example"}]}]
     assert [a["email"] for a in xc.upcoming_attendees(cal)] == ["alex@pantograph.example"]
+
+
+def test_a_name_that_is_only_the_address_is_not_a_name():
+    """`jparkerholder` is a local part wearing a name's clothes: an older run filled a nameless
+    invite with `email.split("@")[0]` and wrote that onto the person file. Judged against a profile
+    it agrees with nothing — and the dotted ones are worse, because `karunaratne.thenuka` tokenises
+    into two "words" and passed the full-name check by pure accident."""
+    for stem, profile_name in (("jparkerholder", "Jack Parker-Holder"),
+                               ("karunaratne.thenuka", "Thenuka Karunaratne"),
+                               ("alex", "Alex Gajewski")):
+        email = f"{stem}@example.com"
+        person = kg.PersonFile(name=stem, company="")
+        user = {"name": profile_name, "description": "co-founder at Example"}
+        verdict, _reason = xc.profile_agreement({"email": email, "name": ""}, person, user,
+                                                published_source="https://example.com/bio")
+        assert verdict == xc.NO, stem
+    # A real display name that merely resembles the address is still a name — the space is the tell.
+    assert xc.profile_agreement(
+        {"email": "thenuka.karunaratne@example.com", "name": "Thenuka Karunaratne"}, None,
+        {"name": "Thenuka Karunaratne"},
+        published_source="https://example.com/bio")[0] == xc.SHOW
+
+
+def test_a_corporate_domain_lets_the_researched_name_link(tmp_path, monkeypatch):
+    """The name is usually KNOWN — the invite just doesn't carry it, and the research pass reached
+    this person through their own company's pages. So the thread is real: the page ties handle to
+    name, the domain ties the address to the company, and X's own bio names that same company. Three
+    voices, none of them the resolver's own guess, and the identity is written down."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
+        "rsolberg": {"id": "404", "username": "rsolberg", "name": "Rhea Solberg",
+                      "description": "co-founder at Interlace"}}))
+    email = "r.solberg@interlace.example"
+    cal = [{"summary": "Intro", "attendees": [{"email": email}]}]
+    research = {"attendees": [{"email": email, "full_name": "Rhea Solberg", "x_handle": "rsolberg",
+                                "x_handle_source": "https://interlace.example/team"}]}
+    out = xc.gather(cal, research, datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["attendees"][0]["x_user_id"] == "404"
+    assert not out["attendees"][0].get("unconfirmed")
+    # …and they are filed under their NAME, which nothing had before this run.
+    _path, person = _person(email)
+    assert person.name == "Rhea Solberg" and person.x_user_id == "404"
+
+
+def test_a_freemail_address_ties_nobody_to_anything(tmp_path, monkeypatch):
+    """At a personal address the thread snaps: the research pass had nothing to search but the local
+    part, so the name it returns can be a re-spacing of the very stem the handle was guessed from,
+    and agreement is the guess congratulating itself. Even with the company sitting in the bio it
+    stays a labelled showing — the one thing the reader can settle in a glance."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
+        "niareyes": {"id": "505", "username": "niareyes", "name": "Nia Reyes-Oduya",
+                      "description": "co-founder at Interlace"}}))
+    email = "nreyes@fastmail.com"
+    cal = [{"summary": "Coffee", "attendees": [{"email": email}]}]
+    research = {"attendees": [{"email": email, "full_name": "Nia Reyes-Oduya",
+                                "x_handle": "niareyes",
+                                "x_handle_source": "https://interlace.example/team"}]}
+    out = xc.gather(cal, research, datetime(2026, 8, 31, tzinfo=timezone.utc))
+    row = out["attendees"][0]
+    assert row["x_user_id"] == "505" and row["unconfirmed"] is True
+    assert kg.find_person_file(identifier=email) is None
+    assert "unconfirmed" in _format_x_context({"x_context": out}).lower()
+
+
+def test_a_published_name_without_its_source_is_nothing(tmp_path, monkeypatch):
+    """One model claim does not corroborate another. Without the page that published the handle,
+    the name the same pass supplied is just the guess restating itself."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
+        "rsolberg": {"id": "404", "username": "rsolberg", "name": "Rhea Solberg",
+                      "description": "co-founder at Interlace"}}))
+    email = "r.solberg@interlace.example"
+    cal = [{"summary": "Intro", "attendees": [{"email": email}]}]
+    research = {"attendees": [{"email": email, "full_name": "Rhea Solberg", "x_handle": "rsolberg"}]}
+    out = xc.gather(cal, research, datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["attendees"] == []
+    assert kg.find_person_file(identifier=email) is None
+
+
+def test_bookmarks_are_not_bought_for_nobody(tmp_path, monkeypatch):
+    """One bookmarks call scans 25 posts and X bills every one of them ($0.005 each, pay-per-use
+    since Feb 2026). It used to run whether or not anyone resolved, so a day of strangers bought 25
+    reads to attribute them to no one."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={}))
+    monkeypatch.setenv("X_USER_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("X_OWNER_USER_ID", "1")
+    out = xc.gather(_calendar("Nobody Known", "nobody@interlace.example"), None,
+                    datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["attendees"] == [] and out["usage"]["bookmark_resources"] == 0
+    # …and with somebody to attribute them to, the same call is worth making.
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path))
+    out = xc.gather(_calendar(), None, datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["attendees"][0]["x_user_id"] == "101"
+    assert out["usage"]["bookmark_resources"] == 1
+
+
+def test_a_prep_shows_every_post_the_run_paid_for(tmp_path, monkeypatch):
+    """Five is the fewest X's timeline endpoint will return and every one is billed, so trimming to
+    three was buying five posts and discarding two."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    posts = [{"id": str(9000 + i), "author_id": "101", "created_at": "2026-08-30T12:00:00Z",
+              "text": f"post {i}"} for i in range(5)]
+    monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, posts_by_user_id={"101": posts}))
+    out = xc.gather(_calendar(), None, datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert len(out["attendees"][0]["recent_posts"]) == xc.API_POST_PAGE == 5

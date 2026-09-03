@@ -148,7 +148,7 @@ Produce the user's morning brief: what needs attention, what you've already hand
    - If the brief came out **thin or the user pushes back on it**, append ONE recovery sentence so it carries its own next move: "If anything here looks off: say *that's wrong about X* and I'll fix my memory, *stop surfacing newsletters* to mute a source, or *clean up stale loops*."
 
 ## Notes
-- First brief (empty graph): widen the window to 7 days — the two levers are `read_local(since_hours=168)` in step 1 and `--window-hours 168` on the `compose_brief.py` command in step 3 (everything else identical; the gathers need no flag). Day 2+: the defaults (24h) are the deltas.
+- First brief (empty graph): widen the local window to 7 days — the ONE lever is `read_local(since_hours=168)` in step 1 (everything else identical; the Google gathers need no flag, and `compose_brief.py` takes no window — it composes whatever was gathered). Day 2+: the default (24h) is the delta.
 - **The open-items contract:** an open loop earns its own line ONLY when it is **overdue, due within
   24 hours, or already chased without an answer** (`brief_validate.is_urgent` — deterministic, read
   off the ledger row, never model-judged). Every urgent one appears exactly once — as an ask carrying

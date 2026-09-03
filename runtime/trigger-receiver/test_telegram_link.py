@@ -139,7 +139,9 @@ def test_capture_ignores_channel_posts_groups_and_bots_and_takes_the_human(monke
     assert tg.capture_first_sender(TOKEN, PHRASE, timeout_secs=5) == {
         "ok": True, "user_id": 8675309, "name": "Nikunj Kothari",
         "text": f"hello sotto {PHRASE}"}
-    assert len(fake.offsets()) == 1                         # found on the first poll
+    # found on the first poll — then ONE zero-wait call at update 13's offset, so Telegram
+    # confirms the pairing message and the gateway that starts later never receives it
+    assert fake.offsets() == [None, 14]
 
 
 def test_capture_advances_the_offset_past_ignored_updates(monkeypatch):
@@ -151,7 +153,7 @@ def test_capture_advances_the_offset_past_ignored_updates(monkeypatch):
     ]}))
     got = tg.capture_first_sender(TOKEN, PHRASE, timeout_secs=5)
     assert got["user_id"] == 555 and got["name"] == "Ada Lovelace"
-    assert fake.offsets() == [None, 72]                     # first poll unoffset, then 71 + 1
+    assert fake.offsets() == [None, 72, 73]                 # unoffset, then 71 + 1, then the ack
 
 
 def test_capture_falls_back_to_username_then_id_for_the_display_name(monkeypatch):
@@ -398,3 +400,17 @@ def test_boot_mode_prints_the_deep_link_before_it_starts_waiting(tmp_path, monke
     err = capsys.readouterr().err
     assert f"TAP THIS TO LINK YOUR CHAT:  https://t.me/sotto_brief_bot?start={PHRASE}" in err
     assert err.index("TAP THIS") < err.index("linked @sotto_brief_bot")
+
+
+def test_capture_confirms_the_pairing_message_so_the_gateway_never_sees_it(monkeypatch):
+    """Telegram confirms an update only when a LATER getUpdates carries its offset. Returning on the
+    hit left "/start <setup code>" unconfirmed, so the gateway that started minutes later received
+    the per-deploy secret as the user's first message and replied to it (Day-0 simulation, Sep
+    2026). The ack is one call, zero wait, at exactly the hit's offset — the update that arrived
+    after it is left for the gateway."""
+    fake = _use(monkeypatch, FakeGet({"getUpdates": _updates(
+        _private_msg(40, 8675309, text=f"/start {PHRASE}"),
+        _private_msg(41, 8675309, text="hi sotto"),
+    )}))
+    assert tg.capture_first_sender(TOKEN, PHRASE, timeout_secs=5)["user_id"] == 8675309
+    assert fake.offsets() == [None, 41]

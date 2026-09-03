@@ -128,11 +128,14 @@ BRIEF_ARCHIVE_DAYS = 60
 STAGED_DAYS = 7
 # The once-per-day nudge dedup stamps. Only today's is ever read; a month is pure forensics.
 PROACTIVE_STAMP_DAYS = 30
-# The brief log's ceiling. sotto_log.bounded_append rotates it at 4 MB, but gemini.py appends to the
-# same file WITHOUT that helper — so the file has a writer with no bound, and this is the backstop
-# that makes one exist. Above the writer's threshold on purpose: in normal operation rotation keeps
-# the file well under this and the sweep does nothing.
+# The brief log's ceiling — defence in depth above sotto_log.bounded_append's own 4 MB rotation,
+# which every writer now routes through. Above the writer's threshold on purpose: in normal
+# operation rotation keeps the file well under this and the sweep does nothing.
 LOG_TAIL_MAX_BYTES = 5 * 1024 * 1024
+# Draft outcomes (log_outcome.py appends one line per decided draft, forever, and
+# learn_preferences.py reads the WHOLE file after every brief). A quarter is what the learning
+# loop can use; past that it is a linearly growing read for nothing.
+OUTCOME_DAYS = 90
 
 # ── Policies ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -187,6 +190,9 @@ SWEEP = (
          "enough not to be an archive of things you didn't say"),
     Rule("dashboard_audit.jsonl", DROP_LINES_OLDER, DASHBOARD_AUDIT_DAYS,
          f"one line per dashboard write, on the delivery receipts' {DASHBOARD_AUDIT_DAYS}-day clock"),
+    Rule("outcomes.jsonl", DROP_LINES_OLDER, OUTCOME_DAYS,
+         f"a draft's outcome is kept {OUTCOME_DAYS} days — the learning loop's whole memory, and "
+         "the one file it re-reads after every brief"),
     Rule("briefs/????-??-??_*.json", DELETE_OLDER, BRIEF_ARCHIVE_DAYS,
          f"a delivered brief is kept {BRIEF_ARCHIVE_DAYS} days, the same as the snapshot it was "
          "built from"),
@@ -253,7 +259,14 @@ EXEMPT = (
     Exempt("preferences.json", "your rules — mutes, VIPs, tone, the snooze"),
     Exempt("intentions.jsonl", "your own one-shot recipes, folded by id and cancelled when they run"),
     Exempt("setup_code", "the credential that gates the setup surface"),
-    Exempt("hermes/**", "the Hermes gateway's own state, including the WhatsApp session — not ours"),
+    Exempt("style.json",
+           "style_extract.py caps every bucket it writes (30/25/25 canonical, 30 recent, 500 keys); "
+           "the one uncapped bucket, `confirmed`, grows only by your own Voice-card taps"),
+    Exempt("hermes/**",
+           "the Hermes gateway's own state, including the WhatsApp session — not ours. KNOWN GAP: "
+           "hermes/sessions/ gains one archived chat transcript per day (the nightly session "
+           "archive keeps transcripts; /resume reopens them) and nothing here bounds it — whether "
+           "Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day"),
     Exempt("whatsapp-pairing.txt", "one pairing artifact, rewritten by the pairing run"),
     Exempt("google-auth-url.txt", "one setup artifact, rewritten by start.sh"),
     Exempt("telegram-link.json", "the Telegram bot token: a credential"),

@@ -844,3 +844,18 @@ def test_the_nudge_carries_the_thread_id_so_an_email_offer_can_thread(monkeypatc
         by_kind.setdefault(n["kind"], []).append(n)
     assert by_kind["commitment"][0]["thread_id"] == "T7"
     assert by_kind["chase"][0]["thread_id"] == "T9"
+
+
+def test_a_second_chase_is_not_blocked_by_the_brief_naming_the_loop(tmp_path, monkeypatch):
+    """A loop chased once is urgent by contract, so the brief names it EVERY day from then on — and
+    "the brief already said it" blocked the second chase forever: chased_count never reached the
+    cap and the hand-off never came (Day-7 simulation, Sep 2026). A chase and a Still-open line are
+    different acts; only a first chase yields to the brief."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    now, c = _at(8) + timedelta(minutes=45), dict(_chase(), chased_count=1)
+    date = now.strftime("%Y-%m-%d")
+    _touch_brief_marker(tmp_path, date, "morning", mtime=(now - timedelta(hours=2, minutes=15)).timestamp())
+    _named_record(tmp_path, date, "morning", [c["anchor_key"]])
+    out = ps.scan([], [], {}, "me@x.com", now, chase_candidates=[c],
+                  brief_named=ps._brief_named_keys(now))
+    assert [n["kind"] for n in out["nudges"]] == ["chase"]

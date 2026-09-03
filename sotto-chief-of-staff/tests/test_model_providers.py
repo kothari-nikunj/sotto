@@ -18,7 +18,7 @@ spec.loader.exec_module(gem)
 
 
 def test_parse_model_ref():
-    assert gem.parse_model_ref("gemini-3.7-flash") == ("gemini", "gemini-3.7-flash")
+    assert gem.parse_model_ref("gemini-3.8-flash") == ("gemini", "gemini-3.8-flash")
     assert gem.parse_model_ref("openai/gpt-5.2-codex") == ("openai", "gpt-5.2-codex")
     assert gem.parse_model_ref("ANTHROPIC/claude-big") == ("anthropic", "claude-big")
     assert gem.parse_model_ref("flash-thing", default_provider="openai") == ("openai", "flash-thing")
@@ -122,7 +122,7 @@ def test_default_install_is_unchanged(monkeypatch):
     monkeypatch.setattr(gem, "_gemini_once",
                         lambda model, key, prompt, label="", **kw: (seen.append((model, key)), "{}")[1])
     assert gem.call_gemini("p", {}) == "{}"
-    assert seen == [("gemini-3.7-flash", "g-key")]
+    assert seen == [("gemini-3.8-flash", "g-key")]
 
 
 def test_missing_key_names_the_right_env_var(monkeypatch):

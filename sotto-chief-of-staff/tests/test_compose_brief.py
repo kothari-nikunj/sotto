@@ -352,13 +352,26 @@ def test_no_bridge_fallback_noop_without_snapshot(tmp_path):
     del os.environ["SOTTO_DATA"]
 
 
-def test_expired_snapshot_is_dropped(tmp_path):
-    # A snapshot older than the TTL is NOT replayed — better Google-only than day(s)-old "needs reply".
+def test_expired_snapshot_is_dropped_and_the_brief_says_so(tmp_path):
+    """A snapshot older than the TTL is NOT replayed — better no local than day(s)-old "needs reply".
+    But dropping it used to hand back a bare {}, and a brief composed from that read as a complete,
+    honest day with iMessage merely quiet (a Mac asleep 37h, Sep 2026 review). A source that breaks
+    must SAY so: the sources the Mac was reporting are marked unavailable and the prompt warns."""
     os.environ["SOTTO_DATA"] = str(tmp_path)
     old = _recent_stamp(cb.LOCAL_SNAPSHOT_TTL_HOURS + 5)
-    cb._save_local_snapshot({"imessage": [{"text": "stale", "is_from_me": False, "timestamp": old}],
-                             "generated_at": old, "source_status": {"imessage": "ok"}})
-    assert cb._local_fallback({}) == {}          # expired → dropped
+    cb._save_local_snapshot({"imessage": [{"text": "expired-snapshot-marker", "is_from_me": False,
+                                           "timestamp": old}],
+                             "generated_at": old, "source_status": {"imessage": "ok", "calls": "ok"}})
+    fb = cb._local_fallback({})
+    assert not cb._arr(fb, "imessage")                       # expired → not replayed
+    assert fb["_source_availability"] == {"imessage": "unavailable", "calls": "unavailable"}
+    assert fb["_local_unavailable_since"]
+    prompt = cb.build_prompt(cb._load_prompt(), {"type": "morning", "google": {"events": []}, "local": fb})
+    assert "Local Context Is Unavailable" in prompt and "expired-snapshot-marker" not in prompt
+    assert "Unavailable on this device: iMessage, Phone Calls" in prompt
+    # …while a Bridge that was NEVER here is unconfigured, and an unconfigured source reports nothing
+    os.unlink(cb._snapshot_path())
+    assert cb._local_fallback({}) == {}
     del os.environ["SOTTO_DATA"]
 
 
@@ -747,7 +760,7 @@ def test_gemini_fallback_on_429_when_backup_configured(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     out = gemini.call_gemini("p", {})
     assert out == '{"markdown": "ok"}'
-    primary = cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
+    primary = cb.os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
     assert calls[0][0] == primary
     assert calls[1][0] == primary and calls[1][2] == " [retry]"    # bounded primary retry first
     assert calls[2][:2] == ("gemini-2.5-pro", "backup") and calls[2][2] == " [fallback]"  # then backup
@@ -911,6 +924,9 @@ def test_first_run_coverage_line_names_missing_sources(tmp_path, monkeypatch):
     assert "your calendar" in cal_only and "your email" not in cal_only
     both = cb._coverage_line({}, {}, [{"id": "ev1"}], [{"id": "m1"}])
     assert "your email and calendar" in both
+    # A Bridge that was NEVER connected reports no source_status at all — the common day-0 case,
+    # and the one this line exists to name. It used to fall through and never mention the Mac.
+    assert "iMessage" in both and "WhatsApp" in both and "full picture" in both
 
 
 def test_configured_tz_reads_volume_settings_when_env_unset(tmp_path, monkeypatch):
@@ -1073,7 +1089,7 @@ def test_default_model_is_gemini_36_flash(monkeypatch):
     for var in ("SOTTO_GEMINI_MODEL", "SOTTO_LLM_STUB", "SOTTO_FALLBACK_MODEL", "SOTTO_FALLBACK_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     gemini.call_gemini("p", {})
-    assert calls == ["gemini-3.7-flash"]
+    assert calls == ["gemini-3.8-flash"]
 
 
 # --- evening followup merge (Sprint 0 #4) --------------------------------------

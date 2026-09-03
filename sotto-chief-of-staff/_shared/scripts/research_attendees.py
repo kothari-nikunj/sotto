@@ -64,7 +64,7 @@ Output (--out file + stdout): {"attendees":[{email,title,company,relevance[],sum
 Degradation ladder per attendee: person profile → company profile (corporate domains always get a
 company_summary attempt) → truly nothing (freemail + unsearchable name only).
 Env: one of EXA_API_KEY / PARALLEL_API_KEY / GOOGLE_AI_API_KEY (no key at all = no research, said
-     out loud in the log, never invented), SOTTO_GEMINI_MODEL (default gemini-3.7-flash),
+     out loud in the log, never invented), SOTTO_GEMINI_MODEL (default gemini-3.8-flash),
      SOTTO_RESEARCH_DEEP=0 disables Pass B AND the focus pass; the recency window is the named
      constant DEFAULT_RECENCY_DAYS (90), not a knob.
 Test: SOTTO_LLM_STUB=/path/to/{"attendees":[...]}.json bypasses the network.
@@ -93,7 +93,7 @@ from timeutil import _now_local, _parse_ts, _user_local_date, configured_tz  # n
 from render_local import RESEARCH_HORIZON_HOURS  # noqa: E402
 import web_research as wr  # noqa: E402  (THE search seam: the provider ladder lives there)
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 MAX_ATTENDEES = 25
 BATCH_SIZE = 5
 PER_BATCH_TIMEOUT = 60
@@ -205,6 +205,11 @@ SCHEMA = {
                 "type": "object",
                 "properties": {
                     "email": {"type": "string"},
+                    # Most invites carry an address and no display name, so the person's real name
+                    # is often something only this grounded pass knows. The X linker treats it as
+                    # what it is — a model's claim — and lets it show an unconfirmed profile, never
+                    # write one down.
+                    "full_name": {"type": "string", "nullable": True},
                     "title": {"type": "string", "nullable": True},
                     "company": {"type": "string"},
                     "relevance": {"type": "array", "items": {"type": "string"}},
@@ -405,7 +410,10 @@ def _build_prompt(batch: list, context_summary: str, comms_by_email: dict | None
         "\"[Company name] product\". Use any \"already knows\"/\"recent comms\" lines to "
         "disambiguate WHICH person this is (right company, right city) and to sharpen relevance — "
         "never as facts to restate. Return one entry per attendee containing:\n"
-        "- email: exactly as listed above\n- title: current job title (null if not found)\n"
+        "- email: exactly as listed above\n"
+        "- full_name: their full name as PUBLISHED on the sources you found (\"Jane Okafor\"), not "
+        "the email's local part re-spaced. Null when the person themselves was not found.\n"
+        "- title: current job title (null if not found)\n"
         "- company: full company name\n- relevance: 1-2 bullets on relevance to the meeting context\n"
         "- summary: 3-4 sentence professional bio — current focus, what they do, 2-3 past roles. "
         "Do NOT include email context or how the user knows them.\n"
@@ -933,17 +941,13 @@ def _persist_research_cache(result: dict) -> None:
     produced NO attendees skip entirely, so a skipped/failed afternoon re-run can't clobber the
     morning's cache with nothing (unlike --out, which is deliberately always truncated)."""
     try:
-        if not (isinstance(result, dict) and result.get("attendees")):
-            return
         tz = configured_tz()
         date = _user_local_date(tz)
         d = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "cache")
         os.makedirs(d, exist_ok=True)
-        tmp = os.path.join(d, f".research_{date}.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({**result, "written_at":
-                       datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
-        os.replace(tmp, os.path.join(d, f"research_{date}.json"))
+        # Prune FIRST, on every invocation: retention exempts this directory on the strength of this
+        # loop, and a prune that only ran on days with attendees kept a holiday week's stale cards
+        # around until the next meeting (Day-7 simulation, Sep 2026).
         cutoff = (_now_local(tz) - timedelta(days=CACHE_KEEP_DAYS)).strftime("%Y-%m-%d")
         for n in os.listdir(d):
             m = re.match(r"\Aresearch_(\d{4}-\d{2}-\d{2})\.json\Z", n)
@@ -952,6 +956,13 @@ def _persist_research_cache(result: dict) -> None:
                     os.remove(os.path.join(d, n))
                 except OSError:
                     pass
+        if not (isinstance(result, dict) and result.get("attendees")):
+            return
+        tmp = os.path.join(d, f".research_{date}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({**result, "written_at":
+                       datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
+        os.replace(tmp, os.path.join(d, f"research_{date}.json"))
     except Exception:  # noqa: BLE001 — best-effort: an unwritable volume never fails research
         pass
 

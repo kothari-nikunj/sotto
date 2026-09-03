@@ -124,7 +124,8 @@ KEY_ENV = {"gemini": "GOOGLE_AI_API_KEY", "openai": "OPENAI_API_KEY", "anthropic
 # Known context windows (tokens). Deliberately short: only models we can vouch for. Unknown models
 # get a one-line warning and proceed — the user may know something this table doesn't.
 CONTEXT_WINDOWS = {
-    "gemini-3.7-flash": 1_000_000, "gemini-3-flash-preview": 1_000_000,
+    "gemini-3.8-flash": 1_000_000, "gemini-3.7-flash": 1_000_000,
+    "gemini-3-flash-preview": 1_000_000,
     "gemini-3.5-flash-lite": 1_000_000, "gemini-3-pro-preview": 1_000_000,
 }
 # The brief prompt has hit 170,835 input tokens in production; this floor leaves heavy-day headroom.
@@ -311,7 +312,7 @@ def call_gemini(prompt: str, inputs: dict, system: str | None = None, schema: di
     # SOTTO_GEMINI_MODEL, so every existing install behaves exactly as today. Gemini stays the
     # opinionated default — this seam exists so people can bring the family they already pay for.
     ref = (os.environ.get("SOTTO_BRIEF_MODEL") or "").strip() \
-        or os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
+        or os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
     provider, model = parse_model_ref(ref)
     key = provider_key(provider)
     if not key and not (provider == "openai" and os.environ.get("SOTTO_OPENAI_BASE_URL")):

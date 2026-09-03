@@ -178,7 +178,11 @@ per-message arrays** — the consumer groups them into threads. `granola_meeting
   ],
 
   // --- people + tasks ---
+  // Contacts: on a DAILY read (≤48h) only the cards today's messages/calls/groups touched, plus
+  // every card with a note or a birthday in the next 7 days; a wide read (first brief, weekly
+  // pulse) carries them all. `contacts_total` is the Mac's card count either way.
   "contacts": [ { "name": "Sarah Chen", "phones": ["+15551234567"], "emails": ["sarah@acme.com"], "notes": "met at conf" } ],
+  "contacts_total": 2102,
   // Reminders: incomplete only, LAST 7 DAYS ∪ NEXT 3 (see "The local-source windows" below).
   // `created_date` is set ONLY on undated ones — it is why they are here. ≤50 per store.
   "reminders": [ { "title": "Call dentist", "due_date": "2026-06-24 15:00:00" },

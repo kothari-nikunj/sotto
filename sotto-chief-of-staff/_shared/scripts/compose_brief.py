@@ -32,7 +32,7 @@ Input  (stdin or argv[1], JSON): { type, window_hours, google, granola, local, p
   local:  the LocalData payload (the 16 sources + intelligence context). Missing fields are treated as empty.
 Output (stdout, JSON): { brief_markdown, actions[], meetings_needing_prep[], extracted_knowledge }
 
-Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3.7-flash).
+Env: GOOGLE_AI_API_KEY (host's native Gemini key), SOTTO_GEMINI_MODEL (default gemini-3.8-flash).
 Test mode: set SOTTO_LLM_STUB=/path/to/response.json to bypass the network and return that file.
 """
 from __future__ import annotations
@@ -391,7 +391,10 @@ def _coverage_line(local: dict, sa: dict, events, emails, truncation_note: str =
         st = _s((sa or {}).get(sid))
         if _arr(local, sid):
             seeing.append(label)
-        elif st and st != "available":
+        elif st != "available":
+            # No status at all is a Bridge that was never connected — the common day-0 case, and
+            # the one this line exists to name. `st and …` hid the whole local half of the product
+            # from the first brief a new user ever reads (Day-0 simulation, Sep 2026).
             missing.append(label)
     if _arr(local, "granola_meetings"):
         seeing.append("your Granola meeting notes")
@@ -757,16 +760,23 @@ def _save_local_snapshot(local: dict) -> dict:
                     merged["contacts"] = prev["contacts"]
             except Exception:
                 pass
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"captured_at": stamp, "local": merged}, f)
+        # Under knowledge/, so the same tmp-then-replace every other knowledge writer uses: a crash
+        # mid-write on an `open(path, "w")` truncates first, and for snapshots/ that window is a
+        # permanently corrupt day in the corpus' only message-history source.
+        body = json.dumps({"captured_at": stamp, "local": merged})
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(path + ".tmp", path)
         # Dated archive copy — the Golden Corpus reads these for message history (its own try:
         # an archive hiccup must never cost the live snapshot, let alone the brief).
         try:
             arch_dir = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "knowledge", "snapshots")
             os.makedirs(arch_dir, exist_ok=True)
             day = _s(stamp)[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            with open(os.path.join(arch_dir, f"{day}.json"), "w", encoding="utf-8") as f:
-                json.dump({"captured_at": stamp, "local": merged}, f)
+            arch = os.path.join(arch_dir, f"{day}.json")
+            with open(arch + ".tmp", "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(arch + ".tmp", arch)
             cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_ARCHIVE_DAYS)).strftime("%Y-%m-%d")
             for old in os.listdir(arch_dir):
                 if old.endswith(".json") and old[:10] < cutoff:
@@ -795,7 +805,21 @@ def _local_fallback(local: dict) -> dict:
             return local
         age = _snapshot_age_hours(snap.get("captured_at"))
         if age is not None and age > LOCAL_SNAPSHOT_TTL_HOURS:
-            return local  # expired — don't replay day(s)-old messages as if they're current
+            # Expired — don't replay day(s)-old messages as if they're current. But the Bridge WAS
+            # here and now isn't, and a source that breaks must SAY so: returning a bare {} made the
+            # brief read as a complete, honest day with the local channels merely quiet (a Mac
+            # asleep 37h, Sep 2026 review). Mark every source the Mac was reporting as unavailable
+            # and date the last capture, so the prompt's Data Source Availability section warns.
+            # (No snapshot at all is different: a Bridge that was never here is unconfigured, and an
+            # unconfigured source reports nothing — that path above stays a no-op.)
+            out = dict(local or {})
+            avail = dict(out.get("_source_availability") or {})
+            reported = cached.get("source_status") if isinstance(cached.get("source_status"), dict) else {}
+            for sid in (reported or {"imessage": 1, "whatsapp": 1, "calls": 1}):
+                avail.setdefault(sid, "unavailable")
+            out["_source_availability"] = avail
+            out["_local_unavailable_since"] = snap.get("captured_at")
+            return out
         cached = dict(cached)
         cached["_local_stale_since"] = snap.get("captured_at")
         # Preserve any availability/knowledge the caller did pass alongside the empty local.
@@ -2670,7 +2694,11 @@ def main():
     ap.add_argument("--x-context", dest="x_context", help="ephemeral upcoming-attendee X context")
     ap.add_argument("--user-email", dest="user_email")
     ap.add_argument("--user-timezone", dest="user_timezone")
-    ap.add_argument("--window-hours", dest="window_hours", type=int, default=24)
+    # Accepted for compatibility, consumed by nothing: composing filters no window — the gathers
+    # decide what is in scope (read_local's since_hours is the first-brief lever). It rode in the
+    # SKILL.md command line as a second "lever" for a year while doing nothing (Sep 2026 review).
+    ap.add_argument("--window-hours", dest="window_hours", type=int, default=24,
+                    help="inert — kept so older SKILL.md command lines still parse")
     ap.add_argument("--no-critic", dest="no_critic", action="store_true",
                     help="skip the second-pass critic+revise quality gate "
                          "(env SOTTO_CRITIC=auto|always|off tunes it when not skipped)")
@@ -2770,7 +2798,10 @@ def main():
           f"wa {_n('whatsapp')}, calls {_n('calls')}, wa_calls {_n('whatsapp_calls')}, "
           f"reminders {_n('reminders')}, notes {_n('apple_notes')}, chrome {_n('chrome_history')}, "
           f"safari {_n('safari_history')}, files {_n('recent_files')}, screen_time {st_apps} apps, "
-          f"contacts {n_contacts}")
+          # "48/2102": the cards a daily read carried, of the cards the Mac has — a Bridge that
+          # sends the subset says so with contacts_total, so a small number is not a thin pull.
+          f"contacts {n_contacts}" + (f"/{int(local['contacts_total'])}"
+                                      if isinstance(local.get("contacts_total"), int) and local["contacts_total"] else ""))
     if local.get("imessage") and not google["emails"]:
         _diag("[compose_brief] WARNING: local messages present but 0 Gmail — brief will be local-only. "
               "If Google is connected, the agent did NOT gather Gmail before composing.")

@@ -340,6 +340,13 @@ never asked about stayed forever. Since Aug 2026 a **daily sweep at 3:30 AM loca
 receiver clock that fires your briefs, ages out the exhaust. It is machinery, not an instruction —
 the same reason the deliver-once claim moved into the send seam.
 
+The same 3:30 AM slot also **archives the chat session** (the boot path's own silent
+`hermes sessions archive` — nothing is broadcast, `/resume` reopens the transcript). One sentence:
+a gateway session lasts a day or a deploy, whichever comes first. Why: sessions reset only on
+deploy since Aug 26, and a week's transcript of delivered briefs and nudges is material the chat
+model will copy back into an unrelated reply — a persona rule against it lost to a transcript
+carrying the same authority (Sep 1–2). A same-day copy is still possible; a week-old one is not.
+
 One sentence per family:
 
 | What | Kept | Why that long |
@@ -350,6 +357,7 @@ One sentence per family:
 | Delivered briefs and their per-day markers | **60 days** | the same clock as the snapshot each was built from |
 | Staged payloads and a crashed run's leftovers | **7 days** | read by the run they were staged for; a week collects the ones whose run died |
 | The nudge-dedup stamps | **30 days** | only today's is ever read |
+| What you did with each draft (`outcomes.jsonl`) | **90 days** | the learning loop re-reads the whole file after every brief; a quarter is all it can use |
 | The brief log | **last 5 MB** | truncated in place, because a running brief holds it open |
 
 **Nothing in your memory is ever auto-deleted.** The graph (people, companies, `master.md`), the

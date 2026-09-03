@@ -151,7 +151,14 @@ The meeting-prep and morning-brief skills run `_shared/scripts/x_connectivity.py
 web research pass. Identity anchors on immutable `x_user_id`; handle observations remain alias
 history. Resolution is exact-lookup-only: a distinctive email local-part first, then a handle found
 by the web research already being performed. X people-search never runs ambiently. A profile
-auto-links only when its name/company evidence agrees with the person graph; weaker matches land in
+auto-links only when a full name agrees with the profile AND the profile agrees about their
+company — where the name is either one a *human* wrote (the invite's display name or the graph's,
+never the email's local part), or the one the research pass published for a **corporate** address.
+The corporate qualifier is the whole rule: there the pass reached the person through their own
+company's pages, so the domain ties the address to the company and the X bio naming that company is
+a third, independent voice. At a freemail address that thread snaps — the pass had nothing to search
+but the local part — so the profile is shown in that one prep marked **unconfirmed** and nothing is
+written down. Weaker matches land in
 `$SOTTO_DATA/knowledge/x_link_suggestions.json` for confirmation. Misses stay on the person file for
 90 days, so a prep does not repeatedly buy the same absence.
 

@@ -43,7 +43,9 @@ unauthenticated GET of a `VERSION` file on GitHub to see whether a newer release
 This is the part most easily misread, so concretely: `compose_brief.py` renders your gathered
 material into one prompt and posts it. That prompt contains, for the window the brief covers:
 
-- iMessage / WhatsApp **message text**, with sender names resolved from your contacts
+- iMessage / WhatsApp **message text**, with sender names resolved from your contacts — a daily
+  read carries only the cards the day touched, plus every card with a note or a birthday in the
+  next 7 days; the whole address book travels only on the first brief and the weekly pulse
 - **email bodies** (trimmed) and subjects
 - **calendar events**, titles and attendees
 - **Apple Notes and Reminders** in the window (last 7 days / next 3)
@@ -87,9 +89,10 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `events/outbox.json` | One row per message Sotto composed, **carrying its text only while that text might still have to be sent** | The words are dropped the moment the row closes (delivered, gave up, or aged out); the closed row — id, kind, attempts, reason — is pruned after 7 days |
 | `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; a crashed run's leftover goes at **7 days** |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
-| `style.json` | Verbatim samples of things **you** wrote | Per-bucket TTL, 30–90 days; never swept |
-| `outcomes.jsonl` | What you did with drafts | **Never auto-deleted** — the learning signal |
-| `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB, and the sweep truncates it to its **last 5 MB** — one writer bypasses the rotation, so the sweep is the ceiling that always holds |
+| `style.json` | Verbatim samples of things **you** wrote | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys); the sweep exempts it on that strength |
+| `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
+| `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
+| `hermes/sessions/` | Hermes' own chat transcripts — one archived per day by the nightly session archive (which keeps transcripts; `/resume` reopens them), plus one per deploy | **Known gap:** Hermes' state is exempt from the sweep, and whether Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day |
 | `cache/research_<date>.json` | Attendee research render cache | 7 days, pruned by the research run |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect; never swept |
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |

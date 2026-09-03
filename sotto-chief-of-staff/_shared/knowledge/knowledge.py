@@ -815,10 +815,29 @@ def run_journaled(ops: list, now: Optional[datetime] = None) -> None:
     thing to touch the graph is what finishes it."""
     if not ops:
         return
-    write_text_atomic(journal_path(), json.dumps({"ts": now_iso(now), "ops": ops}))
+    # Ops a previous replay left RETRYING ride along, untouched: overwriting the journal here
+    # discarded them after one attempt and declared a half-applied graph finished — the exact hole
+    # JOURNAL_MAX_ATTEMPTS exists to close (Day-7 simulation, Sep 2026). They are written down with
+    # this batch, not applied by it: replay_journal owns their attempts counter.
+    pending = _pending_journal_ops()
+    write_text_atomic(journal_path(), json.dumps({"ts": now_iso(now), "ops": pending + ops}))
     for op in ops:
         _apply_journal_op(op, now)
-    _clear_journal()
+    if pending:
+        write_text_atomic(journal_path(), json.dumps({"ts": now_iso(now), "ops": pending}))
+    else:
+        _clear_journal()
+
+
+def _pending_journal_ops() -> list:
+    """The retrying ops on disk, or [] — a journal that cannot be parsed is nobody's to retry."""
+    try:
+        with open(journal_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        ops = data.get("ops") if isinstance(data, dict) else None
+        return [op for op in ops if isinstance(op, dict)] if isinstance(ops, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 # An op that RAISES is retried on later replays, but not forever: a permanently broken op (bad

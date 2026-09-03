@@ -37,7 +37,7 @@ Usage:
   web_research.py --json '["q1","q2"]'          # batch: prints [{query,text,citations,provider}, …]
   web_research.py --url https://example.com/post   # prints {url, title, text, provider}
 Env: EXA_API_KEY / PARALLEL_API_KEY / GOOGLE_AI_API_KEY (any one is enough), SOTTO_GEMINI_MODEL
-     (default gemini-3.7-flash).
+     (default gemini-3.8-flash).
 Test: SOTTO_LLM_STUB=/path/to/response.json bypasses the network entirely (returns that file's text).
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ import sys
 import time
 import urllib.request
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 
 # Hoist _shared/lib onto sys.path ONCE at import (guarded), not per _diag() call: deep_research runs
 # on research_attendees' ThreadPool workers, so a per-call insert would mutate sys.path concurrently.

@@ -59,7 +59,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 from timeutil import configured_user_email  # noqa: E402
 
-MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.7-flash")
+MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 DOCSEND_MAX_PAGES = 30        # a seed deck is 10-20 pages; 30 covers the long tail without a book
 HTTP_TIMEOUT = 30
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
