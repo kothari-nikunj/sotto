@@ -51,7 +51,7 @@ cron already sent.
      the user, so do not reinterpret its condition, add another reminder, or turn it into a brief.
      A condition tied to an open loop has already been checked; if that loop closed, the scanner
      canceled the intention before it reached you.
-   - `meeting_prep` → optionally run `sotto-meeting-prep` for that meeting (or a 2-line who/what), and offer prep **naming the person**: "You're meeting Spencer Kim in ~40 min — want me to pull full prep on him?" (the names are in the nudge's `detail`; use the first external attendee, or the meeting title when there are several). Naming them is what makes a bare "yes" answerable: a yes runs `sotto-meeting-prep` focused on that person — one deep dive on that meeting, no list of the user's other meetings.
+   - `meeting_prep` → **carry the prep; don't ask whether to do it.** The nudge already holds it: `who` (the graph's title/company for the first external attendee, e.g. "VP Eng at Acme") and `open_loop` (the one thing you owe them, if any). Say it in two lines at most — "You're meeting Spencer Kim (VP Eng at Acme) in ~40 min. Open with him: the intro to Priya you promised." — then one short offer for the deeper dive ("say *prep Spencer* for the full read"). When `who` and `open_loop` are both empty, name the person and the time and offer the prep; never invent a title. Naming them is what makes a bare "yes" answerable: a yes runs `sotto-meeting-prep` focused on that person — one deep dive on that meeting, no list of the user's other meetings.
    - `commitment` → draft the reply/message for that open loop (use `sotto-draft-reply` style) and present it, then **ask** — never act unasked.
      - **Email → ask, don't paste a link.** Show the draft text and one plain question: *"Want this in your Gmail drafts?"* On yes, `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/google_action.py" gmail-draft --to <identifier> --body "<draft>" --thread-id <the nudge's `thread_id`>` and confirm in one line ("Drafted in Gmail — it's in your drafts, ready to send."). The nudge carries `thread_id` when the loop came from an email thread; pass it so the reply lands IN that thread. On `{status:"error", fallback:"deep_link"}` fall back to the `mailto:` link and say Gmail isn't connected.
      - **Every other channel** (iMessage/SMS/WhatsApp/call) → the one-tap link as before; ask before sending.
@@ -113,6 +113,9 @@ cron already sent.
    ```
    Same for the other kinds (`--kind commitment|chase|handoff|retune_offer|intention`), with the question
    exactly as you sent it. It overwrites — one pending question at a time, newest wins.
+   **A `chase`, `commitment` or `handoff` offer carries the nudge's `anchor_key`** —
+   `--anchor-key "<the nudge's anchor_key>"` — so that a short "done", "handled" or "let it go" in
+   the gateway resolves or drops that exact loop without you re-matching it by name.
    **If the tick delivered nothing, or the push asked nothing, record nothing.**
    **If a yes to that question would send something or write the calendar**, write the exact content
    to a file and pass `--payload-file <path>`: only its hash is stored, and the acting session must
@@ -137,8 +140,10 @@ cron already sent.
   a brief has delivered today — that brief already carried the 🎂 line and the same tap link.
 - The `retune_offer` nudge fires when ≥`RETUNE_OFFER_MIN` (6) loops are stale, at most once
   per `RETUNE_OFFER_COOLDOWN_DAYS` (7) — a periodic "want to tidy up?", never a daily nag.
-  The `handoff` question shares that same cooldown but ignores the threshold: one unanswered ask is
-  worth asking about even on a tidy day, and it is never folded into the generic offer.
+  The `handoff` question has its own clock, not that cooldown: it is asked the first tick it comes
+  due (outside the 2h post-brief window), once — its delivery stamps the row — and it ignores the
+  threshold: one unanswered ask is worth asking about even on a tidy day, and it is never folded
+  into the generic offer.
 - **The chase clock isn't yours.** `continuity_resolve.py` (the brief's Learn step) is the ONE writer of
   the chase fields: it marks at most one waiting-on per local day as chase-pending after
   `SOTTO_CHASE_AFTER_DAYS` (default 3) of silence, and stops after two chases. This skill only *delivers*

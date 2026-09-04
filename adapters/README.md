@@ -53,12 +53,14 @@ per job: `SOTTO_CRON_DELIVER` is the one target for all of them. Four registrars
 `adapters/hermes/start.sh` (cloud boot), both `install.sh`s, and `receiver._sotto_cron_jobs` (the
 timezone re-registration) — so a schedule can never drift between them.
 
-**`"runner": "receiver"` — the briefs.** The morning and evening briefs carry it, so no registrar
-hands them to a host scheduler; `receiver._cron_tick` fires them on the receiver's own 60-second
-heartbeat, which means a scheduled brief takes the identical spawn → outbox → deliver-once path a
-wake-push brief takes (retries, a receipt, one brief per day) instead of being delivered by the
-agent with none of that. It supports fixed daily `M H * * *` schedules only, and reads the
-configured zone every tick, so a timezone change moves the next fire with nothing to re-register.
+**`"runner": "receiver"` — the briefs, the watcher, the digest.** Those four rows carry it, so no
+registrar hands them to a host scheduler; `receiver._cron_tick` fires them on the receiver's own
+60-second heartbeat, which means a scheduled run takes the identical spawn → outbox → deliver-once
+path a wake-push brief takes (retries, a receipt, one brief per day, and the `NO_NUDGES` silence
+seam — a run with nothing to say is an empty receipt, not a message) instead of being delivered by
+the agent with none of that. It reads fixed daily `M H * * *` and `*/N * * * *` interval schedules,
+and reads the configured zone every tick, so a timezone change moves the next fire with nothing to
+re-register. The weekly pulse (`0 9 * * 1`) stays on the host scheduler.
 The reconciler still lists these rows among its removal markers, which is what strips an existing
 deployment's stale host registrations on the next boot.
 

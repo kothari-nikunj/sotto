@@ -31,6 +31,42 @@ def test_meeting_prep_fires_for_external_meeting_in_window():
     assert not ps.scan(cal2, [], {}, "me@x.com", now)["nudges"]
 
 
+def test_the_prep_nudge_carries_who_they_are_and_what_you_owe_them(tmp_path, monkeypatch):
+    """A chief of staff at the door says who you're meeting and what's open with them — not
+    "want me to pull prep?". The who is the graph's typed title/company; the loop is the scan's
+    own continuity input; both are "" when unknown, never invented."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    people = tmp_path / "knowledge" / "people"
+    people.mkdir(parents=True)
+    (people / "spencer-kim.md").write_text(
+        "---\nschema: 2\ncanonical_id: c_spencer\nname: Spencer Kim\ntitle: VP Eng\ncompany: Acme\n"
+        "identifiers:\n  - spencer@acme.com\n---\n")
+    now = _at(10)
+    soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    cal = [{"id": "ev1", "summary": "Pitch", "start": soon,
+            "attendees": [{"email": "me@x.com", "self": True},
+                          {"email": "spencer@acme.com", "displayName": "Spencer Kim"}]}]
+    cont = [{"id": "c1", "title": "Spencer Kim — the intro to Priya you promised", "name": "Spencer Kim",
+             "identifier": "spencer@acme.com", "deadline": (now + timedelta(days=3)).strftime("%Y-%m-%d")}]
+    n, = ps.scan(cal, cont, {}, "me@x.com", now)["nudges"]
+    assert n["kind"] == "meeting_prep" and n["person"] == "Spencer Kim"
+    assert n["who"] == "VP Eng at Acme" and n["open_loop"] == "the intro to Priya you promised"
+    assert "VP Eng at Acme" in n["detail"] and "open with them: the intro to Priya" in n["detail"]
+    # an unknown attendee carries nothing invented
+    cal2 = [{"id": "ev2", "summary": "Coffee", "start": soon,
+             "attendees": [{"email": "me@x.com", "self": True}, {"email": "stranger@else.com"}]}]
+    m, = ps.scan(cal2, [], {}, "me@x.com", now)["nudges"]
+    assert m["who"] == "" and m["open_loop"] == "" and m["person"] == "stranger"
+
+
+def test_a_declined_meeting_never_gets_a_prep_nudge():
+    now = _at(10)
+    soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    cal = [{"id": "ev1", "summary": "Pitch", "start": soon, "my_response": "declined",
+            "attendees": [{"email": "me@x.com", "self": True}, {"email": "vc@fund.com"}]}]
+    assert not ps.scan(cal, [], {}, "me@x.com", now)["nudges"]
+
+
 def test_meeting_outside_window_skipped():
     now = _at(10)
     far = (now + timedelta(minutes=120)).strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -584,7 +620,7 @@ def test_a_chased_out_loop_asks_its_own_named_question(tmp_path, monkeypatch):
     Person, thing, binary choice, and none of Sotto's own vocabulary."""
     _handoff_ledger(monkeypatch)
     now = _at(10)
-    out = ps.scan([], [], {}, "me@x.com", now, retune_offer_allowed=True,
+    out = ps.scan([], [], {}, "me@x.com", now, handoff_allowed=True,
                   handoff_candidates=ps._handoff_candidates())
     n = [x for x in out["nudges"] if x["kind"] == "handoff"]
     assert len(n) == 1 and n[0]["person"] == "Maya"
@@ -593,26 +629,36 @@ def test_a_chased_out_loop_asks_its_own_named_question(tmp_path, monkeypatch):
     assert not [x for x in out["nudges"] if x["kind"] == "retune_offer"]
 
 
-def test_the_named_question_ignores_the_pile_threshold_but_shares_its_cooldown(tmp_path, monkeypatch):
-    """One unanswered ask deserves the question even on a tidy day — but it rides the same
-    periodic cooldown, so it is never a daily nag."""
+def test_the_named_question_has_its_own_clock_not_the_tidy_ups(tmp_path, monkeypatch):
+    """One unanswered ask deserves the question even on a tidy day — and it is asked the first
+    tick it comes due, whatever the tidy-up offer's 7-day cooldown says: a generic cleanup offer on
+    day 5 used to push Maya's question to day 12 while the loop took a named line in every brief."""
     _handoff_ledger(monkeypatch)
     now = _at(10)
     kinds = lambda **kw: [n["kind"] for n in ps.scan([], [], {}, "me@x.com", now, **kw)["nudges"]]
-    assert kinds(stale_count=0, retune_offer_allowed=True,
+    assert kinds(stale_count=0, retune_offer_allowed=False, handoff_allowed=True,
                  handoff_candidates=ps._handoff_candidates()) == ["handoff"]
-    assert kinds(stale_count=0, retune_offer_allowed=False,
+    assert kinds(stale_count=0, retune_offer_allowed=True, handoff_allowed=False,
                  handoff_candidates=ps._handoff_candidates()) == []
+    # the named question still wins over the pile offer when both are due
+    assert kinds(stale_count=9, retune_offer_allowed=True, handoff_allowed=True,
+                 handoff_candidates=ps._handoff_candidates()) == ["handoff"]
     # a heavy pile with nothing chased out still gets the generic tidy-up offer
     assert kinds(stale_count=9, retune_offer_allowed=True, handoff_candidates=[]) == ["retune_offer"]
 
 
-def test_the_named_question_stamps_the_shared_cooldown(tmp_path, monkeypatch, capsys):
+def test_the_named_question_does_not_spend_the_tidy_up_cooldown(tmp_path, monkeypatch, capsys):
+    """The hand-off is owed, not offered: asking it leaves the tidy-up window untouched, and it is
+    asked once because its delivery stamps the row (`handoff_asked_at`), not a shared marker."""
     _quiet_never(monkeypatch, tmp_path)
     _handoff_ledger(monkeypatch)
     date = ps._now_local("+00:00").strftime("%Y-%m-%d")
     assert [n["kind"] for n in _run_main(monkeypatch, capsys)["nudges"]] == ["handoff"]
-    assert ps._retune_cooldown_ok(date) is False               # the window is now running
+    assert ps._retune_cooldown_ok(date) is True                # the tidy-up window is NOT running
+    # …and inside the 2h post-brief window the question waits (the brief carried the loop)
+    _handoff_ledger(monkeypatch)
+    monkeypatch.setattr(ps, "_recent_brief_delivered", lambda now_local, within_hours=2: True)
+    assert _run_main(monkeypatch, capsys)["nudges"] == []
 
 
 def test_chase_spends_the_shared_budget_and_queues_beyond_it(tmp_path, monkeypatch, capsys):
@@ -791,7 +837,7 @@ def test_the_hand_off_question_is_not_repeated_once_it_was_asked(monkeypatch):
     _handoff_ledger(monkeypatch, anchor_key="email:waiting_on:id:maya",
                     handoff_asked_at="2026-08-09")
     assert ps._handoff_candidates() == []
-    assert ps.scan([], [], {}, "me@x.com", _at(10), retune_offer_allowed=True,
+    assert ps.scan([], [], {}, "me@x.com", _at(10), handoff_allowed=True,
                    handoff_candidates=ps._handoff_candidates())["nudges"] == []
 
 

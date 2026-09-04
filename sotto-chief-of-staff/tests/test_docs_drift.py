@@ -230,6 +230,26 @@ def test_delivery_outbox():
     _same("outbox.nudge_max_age_min (the funnel's own window)", ob.NUDGE_MAX_AGE_MIN,
           te.VALVE_MAX_AGE_MIN)
     _anchor("retries every minute")
+    # The send seam's two "did this run actually do the work" checks share one window: the
+    # composed archive (a body is a brief only if compose_brief archived one) and the Learn receipt.
+    _same("outbox.composed_brief_max_age_hours", R["outbox"]["composed_brief_max_age_hours"] * 3600,
+          rec.COMPOSED_BRIEF_MAX_AGE_SECS)
+    _same("cron.brief_retries_per_day", R["cron"]["brief_retries_per_day"], rec.BRIEF_RETRIES_PER_DAY)
+    _anchor("re-fired once")
+
+
+def test_the_learn_step_is_one_command_with_a_receipt():
+    """Three loops (knowledge, preferences, style) rest on the Learn step, so the step is machinery:
+    learn_step.py runs the six writers and leaves briefs/<day>.<kind>.learned.json, the receiver
+    reads it on the ack, and retention ages it with the brief."""
+    ls = _load("dd_learn_step", PACK, "_shared", "scripts", "learn_step.py")
+    _same("learn.step_timeout_secs", R["learn"]["step_timeout_secs"], ls.STEP_TIMEOUT_SECS)
+    assert [name for name, _rel, _b in ls.STEPS] == [
+        "knowledge", "continuity", "preferences", "style", "granola", "contacts"], RULE
+    assert ls.receipt_path("2026-09-04", "morning").endswith("briefs/2026-09-04.morning.learned.json")
+    assert isinstance(rt.accounts_for("briefs/2026-09-04.morning.learned.json"), rt.Rule), RULE
+    _anchor("one command")
+    _anchor("learned.json")
     _anchor("doubling to a fifteen-minute cap")
     _anchor("older than 240 minutes")
     # deliver-once is MACHINERY at the send seam, not an instruction in a skill (Aug 30)
@@ -327,6 +347,40 @@ def test_style_ttls_and_confirmed_floor():
     # the floor is applied inline in score_sample, so probe the behaviour rather than a constant
     _same("style.confirmed_floor", R["style"]["confirmed_floor"],
           sx.score_sample({"text": "ok", "source": "confirmed"}))
+    # the one bucket the draft→outcome matcher grows automatically is capped where it grows, and
+    # the retention exemption states the same number
+    _same("style.confirmed_cap", R["style"]["confirmed_cap"], sx.CONFIRMED_CAP)
+    assert f"newest {sx.CONFIRMED_CAP}" in rt.accounts_for("style.json").why, RULE
+    _anchor(f"newest {sx.CONFIRMED_CAP}")
+
+
+def test_never_tell_you_twice_is_measured():
+    """The 'Already Nudged Today' block used to be a prompt with no measurement behind it; rule (h)
+    is the measurement, and its one number is stated on both pages."""
+    bv = _load("dd_brief_validate", PACK, "_shared", "lib", "brief_validate.py")
+    _same("surfacing.already_nudged_max_lines", R["surfacing"]["already_nudged_max_lines"],
+          bv.ALREADY_NUDGED_MAX_LINES)
+    _anchor(f"at most {bv.ALREADY_NUDGED_MAX_LINES} lines")
+
+
+def test_x_reads_a_bounded_page_of_posts():
+    xc = _load("dd_x_connectivity", PACK, "_shared", "scripts", "x_connectivity.py")
+    _same("x.max_recent_posts", R["x"]["max_recent_posts"], xc.MAX_RECENT_POSTS)
+
+
+def test_the_bridge_daily_contacts_subset():
+    """The Bridge half is Rust and does not ship in the public tree — assert against the engine
+    when we have it (same posture as test_bridge_event_tick)."""
+    readers = os.path.join(HERMES, "sotto-bridge", "core", "src", "readers.rs")
+    if not os.path.exists(readers):
+        pytest.skip("sotto-bridge/ is excluded from the distribution tree")
+    with open(readers, encoding="utf-8") as f:
+        body = f.read()
+    for field, const in (("subset_max_hours", "CONTACTS_SUBSET_MAX_HOURS"),
+                         ("birthday_lookahead_days", "BIRTHDAY_LOOKAHEAD_DAYS")):
+        m = re.search(rf"pub const {const}: i64 = (\d+);", body)
+        assert m, f"readers.rs no longer defines {const}"
+        _same(f"contacts.{field}", R["contacts"][field], int(m.group(1)))
 
 
 def test_learned_approval_default_thresholds():
@@ -355,6 +409,27 @@ def test_chase_and_birthday_cadence():
 
 
 # ── the attachment lane ─────────────────────────────────────────────────────────────────────────
+
+def test_the_stale_sent_lane_and_the_rsvp_ask():
+    """Three rules a chief of staff would not need told (Sep 2026): an email you sent that nobody
+    answered is a debt owed to you; a meeting you declined is not on your day; a meeting you haven't
+    answered is an ask. The stale lane's silence clock IS the chase clock — one number, twice."""
+    gg = _load("dd_gather_google", PACK, "_shared", "scripts", "gather_google.py")
+    cb = _load("dd_compose_brief", PACK, "_shared", "scripts", "compose_brief.py")
+    _same("stale.silent_days", R["stale"]["silent_days"], gg.STALE_SILENT_DAYS)
+    _same("stale.silent_days (the chase clock)", gg.STALE_SILENT_DAYS, cr.CHASE_AFTER_DAYS)
+    _same("stale.max_days", R["stale"]["max_days"], gg.STALE_MAX_DAYS)
+    _same("stale.max_threads", R["stale"]["max_threads"], gg.STALE_MAX_THREADS)
+    _same("calendar.rsvp_ask_hours", R["calendar"]["rsvp_ask_hours"], cb.RSVP_ASK_HOURS)
+    # "Three dismissals is Sotto asking once whether to stop bringing it up" — once a month, per person
+    _same("mute_offer.cooldown_days", R["mute_offer"]["cooldown_days"], cb.MUTE_OFFER_COOLDOWN_DAYS)
+    _anchor(f"once every {cb.MUTE_OFFER_COOLDOWN_DAYS} days")
+    _anchor(f"{gg.STALE_SILENT_DAYS} to {gg.STALE_MAX_DAYS} days ago")
+    _anchor(f"{gg.STALE_MAX_THREADS} threads at most")
+    _anchor(f"within {cb.RSVP_ASK_HOURS} hours")
+    _anchor("A meeting you declined is not on your day")
+    _anchor("They replied, they just haven't delivered")
+
 
 def test_attachment_caps():
     """The three caps of the attachment lane, whose ONE owner is `_shared/lib/attachments.py` —
@@ -400,6 +475,14 @@ def test_retention_ttls():
           rt.PROACTIVE_STAMP_DAYS)
     _same("retention.log_tail_mb", R["retention"]["log_tail_mb"],
           rt.LOG_TAIL_MAX_BYTES // (1024 * 1024))
+    _same("retention.outcome_days", R["retention"]["outcome_days"], rt.OUTCOME_DAYS)
+    # …and no DROP_LINES_OLDER rule may exist without an island field: a rule added to the SWEEP
+    # and never drawn is exactly how `outcomes.jsonl` went unstated for a week.
+    stated = {rt.DELIVERY_RECEIPT_DAYS, rt.SEND_RECEIPT_DAYS, rt.TRIAGE_VERDICT_DAYS,
+              rt.DASHBOARD_AUDIT_DAYS, rt.DRAFT_LEDGER_DAYS, rt.OUTCOME_DAYS}
+    for rule in rt.SWEEP:
+        if rule.policy == rt.DROP_LINES_OLDER:
+            assert rule.amount in stated, f"{rule.pattern}: a line-age rule the island does not state.\n{RULE}"
     _anchor(f"**{rt.SEND_RECEIPT_DAYS} days**")
     _anchor(f"**{rt.DRAFT_LEDGER_DAYS} days**")
     _anchor(f"daily sweep at {rt.SWEEP_LOCAL[0]}:{rt.SWEEP_LOCAL[1]:02d} AM local")

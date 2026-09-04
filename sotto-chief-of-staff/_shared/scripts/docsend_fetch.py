@@ -98,6 +98,41 @@ def _err(step: str, msg: str) -> dict:
     return {"status": "error", "step": step, "error": msg}
 
 
+FORM_RE = re.compile(r"<form\b[^>]*>.*?</form>", re.I | re.S)
+INPUT_RE = re.compile(r"<input\b[^>]*>", re.I)
+ATTR_RE = re.compile(r'\b(name|value|action)="([^"]*)"', re.I)
+
+
+def _gate_form(page: str) -> tuple[str, dict] | None:
+    """(action, {input name: value}) for the email-gate form, exactly as the page carries it — or
+    None when the page has no form with a `link_auth_form[email]` input. Hidden inputs ride along
+    with their default values (`_method`, `authenticity_token`, the email-sniffing fields, the
+    timezone offset), so the POST is the one a browser would make, whatever DocSend adds next."""
+    for form in FORM_RE.findall(page):
+        if 'link_auth_form[email]' not in form:
+            continue
+        attrs = dict((k.lower(), v) for k, v in ATTR_RE.findall(form.split(">", 1)[0]))
+        fields: dict = {}
+        for tag in INPUT_RE.findall(form):
+            a = dict((k.lower(), v) for k, v in ATTR_RE.findall(tag))
+            name = a.get("name")
+            if name and not name.startswith("feedback"):
+                fields[name] = a.get("value", "")
+        return attrs.get("action") or "", fields
+    return None
+
+
+def _browser_tz_offset() -> str:
+    """What the gate's JS would send: JavaScript's getTimezoneOffset — minutes BEHIND UTC (420 for
+    PDT), from the user's configured zone via THE timezone chain."""
+    try:
+        from tzchain import local_now  # noqa: PLC0415 — sibling in _shared/lib
+        offset = local_now().utcoffset()
+        return str(int(-offset.total_seconds() // 60)) if offset is not None else "0"
+    except Exception:  # noqa: BLE001
+        return "0"
+
+
 # ── The private docsend2pdf: page images → one real PDF, page text → a cache file ─────────────────
 
 def decks_dir() -> str:
@@ -224,20 +259,30 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
     title_m = TITLE_RE.search(page)
     title = (title_m.group(1).strip() if title_m else "").removesuffix("| DocSend").strip(" -|")
 
-    # The email gate, when present. authenticity_token is Rails' CSRF field; the csrf-token meta is
-    # the fallback spelling. No token AND no email field ⇒ the deck is open — skip straight to pages.
+    # The email gate, when present. The form is POSTED AS DOCSEND WROTE IT: every hidden input it
+    # carries, at the action it names, with only the email (and passcode) filled in. A hand-built
+    # field list 404'd the day DocSend added a hidden `_method` — Rails routes a form by that field,
+    # so a POST without it lands on a route that does not exist (Sep 3, 2026) — and would 404 again
+    # the next time they add one. No form but a token ⇒ the older markup; no token either ⇒ open deck.
     needs_email = 'name="link_auth_form[email]"' in page or "link_auth_form" in page
     if needs_email:
-        tok = TOKEN_RE.search(page) or CSRF_RE.search(page)
-        if not tok:
-            return _err("gate", "email gate present but no auth token found — DocSend may have "
-                                "changed their markup; open the link yourself")
-        fields = {"utf8": "✓", "authenticity_token": tok.group(1),
-                  "link_auth_form[email]": email, "commit": "Continue"}
+        parsed = _gate_form(page)
+        if parsed:
+            action, fields = parsed
+        else:
+            tok = TOKEN_RE.search(page) or CSRF_RE.search(page)
+            if not tok:
+                return _err("gate", "email gate present but no auth token found — DocSend may have "
+                                    "changed their markup; open the link yourself")
+            action, fields = view_url, {"utf8": "✓", "authenticity_token": tok.group(1),
+                                        "commit": "Continue"}
+        fields["link_auth_form[email]"] = email
         if passcode:
             fields["link_auth_form[passcode]"] = passcode
+        if "link_auth_form[timezone_offset]" in fields and not fields["link_auth_form[timezone_offset]"]:
+            fields["link_auth_form[timezone_offset]"] = _browser_tz_offset()
         try:
-            http.post_form(view_url, fields, view_url)
+            http.post_form(urllib.parse.urljoin(view_url, action), fields, view_url)
             page = http.get(view_url).decode("utf-8", "replace")
         except Exception as e:  # noqa: BLE001
             return _err("gate", f"email gate refused: {type(e).__name__}: {e}")

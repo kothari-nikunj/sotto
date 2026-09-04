@@ -30,9 +30,10 @@ _SHARED_LIB = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "li
 sys.path.insert(0, _SHARED)
 if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
-from textutil import _arr, _looks_like_phone_number, _s  # noqa: E402
+from email.utils import getaddresses  # noqa: E402
+from textutil import _arr, _is_likely_automated, _looks_like_phone_number, _s  # noqa: E402
 from timeutil import _parse_ts  # noqa: E402
-from render_local import resolve_contact_names  # noqa: E402
+from render_local import _is_sent_email, resolve_contact_names  # noqa: E402
 from chatfmt import to_chat  # noqa: E402
 
 WAITING_MIN_DAYS = 3       # relationship_analytics.rs:469
@@ -172,6 +173,26 @@ def _interactions_by_contact(local: dict) -> dict:
         # not is_outgoing — missed calls have no direction and correctly count as inbound.
         add(c.get("name"), c.get("timestamp"), c.get("direction") == "outgoing",
             "calls", c.get("canonical_id"))
+    # Email is a relationship channel. A mail you sent counts as a touch to each recipient; a mail
+    # you received counts as a touch from its sender — for people you KNOW (contacts or graph),
+    # which is the same known-contact gate the message lanes apply. Before this the pulse was
+    # blind to the half of a relationship that lives in mail, and a no-Mac deploy reported every
+    # Monday that relationships looked healthy (Sep 2026).
+    known = _email_identities(local)
+    me = _own_email()
+    for m in _arr(local, "emails"):
+        if not isinstance(m, dict):
+            continue
+        sent = _is_sent_email(m)
+        addrs = _email_addrs(m.get("to"), m.get("cc")) if sent \
+            else _email_addrs(m.get("from") or m.get("sender"))[:1]
+        for addr in addrs:
+            if not addr or addr == me or _is_likely_automated(addr):
+                continue
+            who = known.get(addr)
+            if not who:
+                continue
+            add(who["name"], m.get("date") or m.get("timestamp"), sent, "email", who["cid"])
     # A channel that resolves a name but not an id (processed calls) must not split a person in
     # two: fold each name-keyed entry into the cid-keyed entry carrying the same display name —
     # exactly what the old all-name keying did implicitly.
@@ -185,6 +206,48 @@ def _interactions_by_contact(local: dict) -> dict:
             if ch not in dst["by_channel"] or d > dst["by_channel"][ch]:
                 dst["by_channel"][ch] = d
     return people
+
+
+def _own_email() -> str:
+    try:
+        from timeutil import configured_user_email  # noqa: PLC0415
+        return configured_user_email()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _email_addrs(*fields) -> list:
+    """Lowercased addresses from one or more header fields. Empty fields are dropped BEFORE
+    parsing: a trailing empty entry makes the strict parser reject the whole header."""
+    raw = [_s(f).strip() for f in fields if _s(f).strip()]
+    return [a.lower() for _n, a in getaddresses(raw) if a] if raw else []
+
+
+def _email_identities(local: dict) -> dict:
+    """email (lower) → {name, cid} for everyone the user knows: Apple Contacts cards first, then
+    the knowledge graph's own identifier index. A stranger's mail is not a relationship."""
+    out: dict = {}
+    for c in _arr(local, "contacts"):
+        nm = _s(c.get("name")).strip()
+        if not nm:
+            continue
+        for e in _arr(c, "emails"):
+            if e:
+                out.setdefault(_s(e).lower().strip(), {"name": nm, "cid": _s(c.get("canonical_id"))})
+    kg = _knowledge()
+    if kg is not None:
+        try:
+            idx = kg.build_people_index()
+            for key, path in (idx.get("by_identifier") or {}).items():
+                if "@" not in key or key in out:
+                    continue
+                with open(path, encoding="utf-8") as f:
+                    p = kg.parse_person_file(f.read())
+                if _s(p.name).strip():
+                    out[key] = {"name": _s(p.name).strip(), "cid": _s(p.canonical_id)}
+        except Exception:  # noqa: BLE001 — the graph is a bonus here, never a failure
+            pass
+    return out
 
 
 def _cadence_trend(dates: list) -> str:
@@ -407,8 +470,25 @@ def _persist_state(result: dict):
 
 
 def main():
-    raw = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
+    argv = sys.argv[1:]
+    gmail_path = ""
+    if "--gmail" in argv:                          # the gather's 6-week Gmail file (both directions)
+        i = argv.index("--gmail")
+        gmail_path = argv[i + 1] if i + 1 < len(argv) else ""
+        del argv[i:i + 2]
+    raw = open(argv[0]).read() if argv else sys.stdin.read()
     local = json.loads(raw) if raw.strip() else {}
+    if not isinstance(local, dict):
+        local = {}
+    if gmail_path:
+        try:
+            with open(gmail_path, encoding="utf-8") as f:
+                g = json.load(f)
+            emails = g.get("emails") if isinstance(g, dict) else g
+            if isinstance(emails, list) and "emails" not in local:
+                local = {**local, "emails": emails}
+        except (OSError, ValueError):
+            pass                                   # no mail file → the message-only pulse
     result = compute(local, history=_load_history())
     _persist_state(result)
     print(json.dumps(result))

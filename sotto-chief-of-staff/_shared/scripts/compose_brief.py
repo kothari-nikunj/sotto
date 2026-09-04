@@ -50,8 +50,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from textutil import (  # noqa: E402
     _arr, _obj, _s, _names_match, _is_excluded_domain, _normalize_identifier,
     _base_domain, _sender_addr, _extract_sender_name, unwrap_tool_result,
+    _is_likely_automated,
     normalize_attendee_research as _normalize_attendee_research,
 )
+from email.utils import parseaddr  # noqa: E402
 # The deterministic brief rules — and, with them, THE fabricated-identifier test the tap-link
 # builder enforces (identifier_allowed / TAP_IDENTIFIER_FIELDS). Imported at the top like every
 # other lib: the guard that decides whether a link may be minted cannot be an optional import.
@@ -315,6 +317,8 @@ def select_attendees_for_research(inputs: dict) -> list:
 
     picked, seen = [], set()
     for e in events:
+        if _is_declined(e):
+            continue                  # a meeting you declined never spends a research call
         start = _s(e.get("start"))
         st = _parse_ts(start)
         if st is not None:
@@ -931,7 +935,131 @@ def _normalize_local(inputs: dict) -> dict:
                 local["action_ledger"] = entries
         except Exception:
             pass
+
+    # The stale-sent lane, filtered to debts: an email you sent that nobody answered is a debt owed
+    # to you — when it went to someone you know. A cold pitch to a stranger, a no-reply address, an
+    # intro you made for two other people, or a two-line "thanks" is not.
+    if not local.get("stale_threads"):
+        raw = _obj(inputs, "google").get("staleThreads")
+        if isinstance(raw, list) and raw:
+            local["stale_threads"] = _filter_stale_threads(raw, local)
     return local
+
+
+# An intro you made is theirs to answer to each other, not a debt owed to you.
+_INTRO_SUBJECT_RE = re.compile(r"^\s*(?:re:\s*|fwd?:\s*)*(?:intro(?:duction)?s?\b|connecting\b|meet\b|<>)", re.I)
+STALE_MIN_SNIPPET_WORDS = 6     # under this, the thread was a "thanks" — nothing to be owed
+
+
+def _filter_stale_threads(rows: list, local: dict) -> list:
+    """Keep the stale threads that are debts: recipient in your contacts or graph, not automated,
+    not an intro, with something substantive in what you wrote. Deterministic; one sentence each."""
+    known_emails, _names = _known_identities(local)
+    out = []
+    for t in rows:
+        if not isinstance(t, dict):
+            continue
+        email = _s(t.get("toEmail")).lower().strip()
+        if not email or email not in known_emails or _is_likely_automated(email):
+            continue
+        if _INTRO_SUBJECT_RE.search(_s(t.get("subject"))) or "<>" in _s(t.get("subject")):
+            continue
+        if len(_s(t.get("snippet")).split()) < STALE_MIN_SNIPPET_WORDS:
+            continue
+        out.append(t)
+    return out
+
+
+def _untracked_stale_threads(local: dict) -> list:
+    """The stale threads the ledger does not already hold a row for (by thread id) — the ONE
+    filter render_local's block and the deterministic writer below share."""
+    tracked = {_s(a.get("source_thread_id")).strip() for a in _arr(local, "action_ledger")
+               if _s(a.get("source_thread_id")).strip()}
+    return [t for t in _arr(local, "stale_threads") if _s(t.get("threadId")) not in tracked]
+
+
+def _stale_debt_actions(local: dict, lookup: dict | None = None) -> list:
+    """One `waiting_on` action per untracked stale thread — minted by code, not asked of the model,
+    so the debt exists whether or not the prose mentions it. `created_at` is the day the mail was
+    sent, so the chase clock is already running: the first chase ripens on the silence that already
+    happened, not three days from the brief."""
+    lookup = lookup or {}
+    out = []
+    for t in _untracked_stale_threads(local):
+        email = _s(t.get("toEmail")).lower().strip()
+        name = (lookup.get(email) if email else "") or _s(parseaddr(_s(t.get("to")))[0]) \
+            or email.split("@")[0]
+        subject = _s(t.get("subject")).strip() or "your email"
+        days = int(t.get("daysSinceSent") or 0)
+        out.append({
+            "type": "waiting_on", "channel": "gmail", "contactName": name,
+            "contactIdentifier": email, "emailReplyTo": email, "emailThreadId": _s(t.get("threadId")),
+            "emailSubject": subject, "created_at": _s(t.get("sentDate"))[:10],
+            "contextSummary": f"{name} hasn't answered \"{subject}\" — you wrote {days} days ago",
+            "contextAsk": f"a reply from {name} on \"{subject}\"",
+            "contextUrgencyReason": f"{days} days without a reply",
+            "confidence": 0.8,
+            "evidence": {"sourceType": "email", "sourceId": _s(t.get("threadId")),
+                         "snippet": _s(t.get("snippet"))[:200]},
+        })
+    return out
+
+
+# An invite you haven't answered is an ask — once it is this close.
+RSVP_ASK_HOURS = 48
+
+
+def _is_declined(e: dict) -> bool:
+    return _s(e.get("my_response")).lower() == "declined"
+
+
+def _rsvp_actions(inputs: dict, now=None) -> list:
+    """One `rsvp` action per unanswered invite starting within RSVP_ASK_HOURS that has somebody
+    else on it — minted by code. The calendar closes it: answer it, or let it pass."""
+    google = _obj(inputs, "google")
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for e in _arr(google, "events"):
+        if _s(e.get("my_response")).lower() != "needsaction" or not _s(e.get("id")):
+            continue
+        st = _parse_ts(_s(e.get("start")))
+        if st is None:
+            continue
+        if st.tzinfo is None:
+            st = st.replace(tzinfo=timezone.utc)
+        hours = (st - now).total_seconds() / 3600.0
+        if not (0 <= hours <= RSVP_ASK_HOURS):
+            continue
+        others = [a for a in _arr(e, "attendees") if not a.get("self") and _s(a.get("email"))]
+        if not others:
+            continue
+        title = _s(e.get("summary")) or "a meeting"
+        out.append({
+            "type": "rsvp", "channel": "calendar", "contactName": title,
+            "contactIdentifier": _s(e.get("id")), "meetingTime": _s(e.get("start")),
+            "contextSummary": f"You haven't answered the invite for {title} ({_s(e.get('start'))})",
+            "contextAsk": "accept or decline it", "confidence": 0.9,
+            "evidence": {"sourceType": "calendar", "sourceId": _s(e.get("id"))},
+        })
+    return out
+
+
+def _merge_deterministic_actions(model_actions: list, minted: list) -> list:
+    """The model's actions, plus the minted ones it did not already cover (same thread id, or the
+    same event id). Code's rows never displace a richer model row for the same debt."""
+    covered = set()
+    for a in model_actions or []:
+        for key in ("emailThreadId", "contactIdentifier"):
+            v = _s(a.get(key)).strip().lower()
+            if v:
+                covered.add(v)
+    out = list(model_actions or [])
+    for a in minted:
+        keys = {_s(a.get("emailThreadId")).strip().lower(), _s(a.get("contactIdentifier")).strip().lower()}
+        if keys & covered:
+            continue
+        out.append(a)
+    return out
 
 
 
@@ -1083,7 +1211,8 @@ def _format_master_context() -> str:
 def build_prompt(template: str, inputs: dict) -> str:
     brief_type = _s(inputs.get("type")) or "morning"
     google = _obj(inputs, "google")
-    events = _arr(google, "events")
+    # A meeting you declined is not on your day: it never reaches the prompt at all.
+    events = [e for e in _arr(google, "events") if not _is_declined(e)]
     emails_raw = _arr(google, "emails")
 
     local = resolve_contact_names(_normalize_local(inputs))
@@ -1131,7 +1260,12 @@ def build_prompt(template: str, inputs: dict) -> str:
                 known_canonical_ids.add(_s(item.get("canonical_id")))
 
     def _known_threads(threads):
-        return [t for t in threads if _thread_is_known_person(t, known_emails, known_names, known_canonical_ids)]
+        # A muted person is removed from the DATA, not from the instructions: their 1:1 thread never
+        # reaches the model (the funnel already drops their events at Tier 0; the brief used to keep
+        # the thread and merely ask the model not to mention them). Groups stay — a mute is a person.
+        return [t for t in threads
+                if _thread_is_known_person(t, known_emails, known_names, known_canonical_ids)
+                and (t.get("is_group_chat") or not _name_muted(t.get("name"), prefs["mute_people"]))]
 
     contact_lookup = build_contact_lookup(_arr(local, "contacts"))
     identity = build_identity_resolver(local)
@@ -1178,7 +1312,9 @@ def build_prompt(template: str, inputs: dict) -> str:
     # appended to the reconciliation/evening-accountability block (so the merge works either way,
     # never twice).
     followup_context = _s(inputs.get("_followup_context")) if brief_type == "evening" else ""
-    reconciliation = opt(_format_reconciliation(local, brief_type))
+    # The brief's OWN day, pinned or wall-clock — a replay of a day six weeks back must read that
+    # day's morning actions, not today's.
+    reconciliation = opt(_format_reconciliation(local, brief_type, _brief_day(tz, _brief_now(inputs))))
     prior_brief = _prior_brief_context(
         brief_type, _brief_now(inputs) or datetime.now(timezone.utc), tz)
     if prior_brief:
@@ -1330,12 +1466,16 @@ def _critic_mode() -> str:
 
 
 
-def _critic_decision(mode: str, payload_chars: int, n_actions: int):
-    """(run, reason) — deterministic so it's testable and the brief log explains every skip."""
+def _critic_decision(mode: str, payload_chars: int, n_actions: int, first_run: bool = False):
+    """(run, reason) — deterministic so it's testable and the brief log explains every skip. The
+    FIRST brief always gets the second pass: it is the one the user judges Sotto on, and its shape
+    (a thin payload, few actions) is exactly the shape the auto rule would skip."""
     if mode == "off":
         return False, "SOTTO_CRITIC=off"
     if mode == "always":
         return True, "SOTTO_CRITIC=always"
+    if first_run:
+        return True, "first brief — always reviewed"
     if payload_chars < CRITIC_AUTO_MIN_PAYLOAD_CHARS and n_actions <= CRITIC_AUTO_MIN_ACTIONS:
         return False, (f"auto: small brief — payload {payload_chars} < {CRITIC_AUTO_MIN_PAYLOAD_CHARS} chars "
                        f"and {n_actions} actions ≤ {CRITIC_AUTO_MIN_ACTIONS}")
@@ -1940,6 +2080,82 @@ def _append_procedure_offer(out: dict, inputs: dict) -> dict:
     return out
 
 
+# "Three dismissals is Sotto asking once whether to stop bringing it up." The learner already
+# computes the hint (deprioritization_hints) and retune_scan already turns it into a mute
+# suggestion; before this the suggestion waited for a tune-up conversation nobody starts. The
+# evening brief's one question line carries it — and asks about one person at most once a month.
+MUTE_OFFER_COOLDOWN_DAYS = 30
+
+
+def _mute_offers_path() -> str:
+    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "proactive", "mute_offers.json")
+
+
+def _pick_mute_candidate(today: str) -> str:
+    """The first person retune_scan suggests muting whom we have not asked about within the
+    cooldown, or "". Reads the stamp file; never writes it (the offer does, once it is on the brief)."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import retune_scan  # noqa: PLC0415
+        suggestions = retune_scan.scan().get("mute_suggestions") or []
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        with open(_mute_offers_path(), encoding="utf-8") as f:
+            offered = json.load(f) or {}
+    except (OSError, ValueError):
+        offered = {}
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=MUTE_OFFER_COOLDOWN_DAYS)).strftime("%Y-%m-%d")
+    for s in suggestions:
+        name = _s(s.get("name") if isinstance(s, dict) else s).strip()
+        if name and _s(offered.get(name.lower())) < cutoff:
+            return name
+    return ""
+
+
+def _stamp_mute_offer(name: str, today: str) -> None:
+    path = _mute_offers_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            offered = json.load(f) or {}
+    except (OSError, ValueError):
+        offered = {}
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=MUTE_OFFER_COOLDOWN_DAYS)).strftime("%Y-%m-%d")
+    offered = {k: v for k, v in offered.items() if _s(v) >= cutoff}     # bounded by the cooldown
+    offered[name.lower()] = today
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), ".mute_offers.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(offered, f)
+    os.replace(tmp, path)
+
+
+def _append_mute_offer(out: dict, inputs: dict, today: str = "") -> dict:
+    """Evening only, and only when the evening has no other question (one question per evening, by
+    construction — the standing-rule offer goes first). The mute itself is NEVER written here: a
+    yes in the gateway runs `preferences.py mute-person`, the one writer that block has."""
+    if (_s(inputs.get("type")) or "morning") != "evening" or _s(inputs.get("_procedure_offer")):
+        return out
+    if not os.environ.get("SOTTO_DATA"):
+        return out
+    try:
+        today = today or _brief_day(_brief_tz(inputs), _brief_now(inputs))
+        name = _pick_mute_candidate(today)
+        if not name:
+            return out
+        question = (f"You keep dismissing {name}'s items — stop bringing them up? "
+                    f"Say yes and I'll mute them.")
+        md = _s(out.get("brief_markdown"))
+        out["brief_markdown"] = (md.rstrip() + "\n\n" + question + "\n") if md.strip() else question
+        _stamp_mute_offer(name, today)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import pending_offer  # noqa: PLC0415
+        pending_offer.set_offer("mute", question, person=name)
+    except Exception as e:  # noqa: BLE001 — the brief never waits on a question
+        _diag(f"[compose_brief] mute offer skipped ({type(e).__name__}: {e})")
+    return out
+
+
 def _render_followup_context(fu: dict) -> str:
     """Deterministically render the merged followup result as an evening-brief prompt block. Empty
     string when there's nothing worth saying (no markdown, no commitments, no drafts)."""
@@ -2058,6 +2274,7 @@ def _load_surfaced_nudges(today: str, tzinfo=None) -> list:
         out.append({"time": f"{local.hour % 12 or 12}:{local.minute:02d}"
                             + ("pm" if local.hour >= 12 else "am"),
                     "sender": _s(row.get("sender")), "cls": _s(row.get("class")),
+                    "person": _s(row.get("person")),     # a proactive nudge's subject
                     "reason": _s(row.get("reason"))[:160]})
     return out[-SURFACED_NUDGE_MAX:]
 
@@ -2080,6 +2297,19 @@ def _format_already_nudged(rows: list) -> str:
         why = f" — {r['reason']}" if r["reason"] else ""
         lines.append(f"- {r['time']}: {who}{cls}{why}")
     return "\n".join(lines) + "\n"
+
+
+def _already_nudged_senders(inputs: dict) -> list:
+    """The senders of today's DELIVERED nudges, for the validator's rule (h) — the same rows the
+    prompt block above is built from, so "never tell you twice" is measured against exactly what the
+    model was told it had already said. Empty on any failure: the rule then simply doesn't run."""
+    try:
+        tz = _brief_tz(inputs)
+        rows = _load_surfaced_nudges(_brief_day(tz, _brief_now(inputs)), _resolve_tz(tz))
+        # A proactive nudge's `sender` is its prose line; the person it was about is the name.
+        return [r.get("person") or r["sender"] for r in rows if r.get("person") or r.get("sender")]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _already_nudged_block(tz: str) -> str:
@@ -2576,6 +2806,21 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
     out = _normalize_output(json.loads(raw))
 
+    # Debts code can see are minted by code, whatever the prose did with them: an email you sent
+    # that nobody answered (a `waiting_on` with the recipient as counterpart) and an invite you
+    # haven't answered that is nearly here (an `rsvp`). The model's own row for the same thread or
+    # event wins; these fill the gaps.
+    try:
+        local_now = resolve_contact_names(_normalize_local(inputs))
+        minted = (_stale_debt_actions(local_now, build_contact_lookup(_arr(local_now, "contacts")))
+                  + _rsvp_actions(inputs, _brief_now(inputs)))
+        if minted:
+            out["actions"] = _merge_deterministic_actions(out.get("actions") or [], minted)
+            _diag(f"[compose_brief] minted {len(minted)} deterministic action(s): "
+                  + ", ".join(f"{a['type']}:{a.get('contactName')}" for a in minted))
+    except Exception as e:  # noqa: BLE001 — a minting failure never costs the brief
+        _diag(f"[compose_brief] deterministic actions skipped ({type(e).__name__}: {e})")
+
     # Deterministic post-hoc validator (Sprint 1 #6). Two halves, deliberately different: the prose
     # rules are advisory (the violation list is handed to the critic so the revise pass fixes what
     # code could measure), while the fabricated-identifier verdict is ENFORCED below — a tap target
@@ -2594,7 +2839,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
         violations = brief_validate.validate(out.get("brief_markdown", ""), out.get("actions") or [], prompt,
                                              first_run=_is_first_run(inputs, {}),
                                              action_ledger=open_ledger, today=brief_day,
-                                             allowed_identifiers=allowlist)
+                                             allowed_identifiers=allowlist,
+                                             already_nudged=_already_nudged_senders(inputs))
         if violations:
             _diag(f"[brief-validate] {len(violations)} violation(s): " + " | ".join(violations[:12]))
     except Exception:  # noqa: BLE001
@@ -2602,7 +2848,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
 
     if critic:
         payload_chars = max(0, len(prompt) - len(user_template))  # the rendered source data, sans template
-        run, reason = _critic_decision(_critic_mode(), payload_chars, len(out.get("actions") or []))
+        run, reason = _critic_decision(_critic_mode(), payload_chars, len(out.get("actions") or []),
+                                       first_run=_is_first_run(inputs, {}))
         _diag(f"[compose_brief] critic {'ran' if run else 'skipped'} ({reason})")
         if run:
             out = critique_and_revise(out, inputs, llm, violations=violations)
@@ -2621,6 +2868,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     # Evening: the one "make that a standing rule?" confirmation, when tonight's transcripts showed
     # the user stating one (deterministic append + the pending-offer bridge; see the function).
     out = _append_procedure_offer(out, inputs)
+    # …or, when tonight has no standing-rule question, the one mute the learner has been suggesting.
+    out = _append_mute_offer(out, inputs, brief_day)
     # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event
     # map. LAST, so the critic's own rewrites are held to the same allowlist as the first draft.
     result = _attach_tap_links(out, event_links, allowlist)
@@ -2772,6 +3021,10 @@ def main():
     # honesty note through so the brief never presents a truncated window as the full inbox.
     if isinstance(gmail_raw, dict) and gmail_raw.get("truncated_at"):
         google["emailsTruncatedAt"] = gmail_raw["truncated_at"]
+    # …and the stale-sent lane: emails the user sent that nobody answered (gather_google's
+    # threads.get pass). _normalize_local filters them to people the user knows.
+    if isinstance(gmail_raw, dict) and isinstance(gmail_raw.get("stale_threads"), list):
+        google["staleThreads"] = gmail_raw["stale_threads"]
     if args.user_email:
         google["userEmail"] = args.user_email
     if args.user_timezone:

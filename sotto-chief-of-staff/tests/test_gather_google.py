@@ -275,6 +275,102 @@ def test_attendee_emails_accepts_both_shapes_dedupes_and_caps():
     assert gg._attendee_emails_from_file("/nonexistent/path.json") == []
 
 
+# ── the stale sent lane: an email you sent that nobody answered is a debt owed to you ────────────
+
+def _thread(tid, msgs):
+    return {"id": tid, "messages": [
+        {"id": f"{tid}-{i}", "internalDate": str(int(ts.timestamp() * 1000)),
+         "labelIds": ["SENT"] if mine else ["INBOX"], "snippet": snip,
+         "payload": {"headers": [{"name": "To", "value": to}, {"name": "Subject", "value": subj}]}}
+        for i, (ts, mine, to, subj, snip) in enumerate(msgs)]}
+
+
+def test_stale_is_the_last_word_being_yours_for_three_to_fourteen_days():
+    import datetime as dt
+    now = dt.datetime(2026, 9, 4, 12, 0, tzinfo=dt.timezone.utc)
+    d = lambda days, h=9: now - dt.timedelta(days=days, hours=12 - h)
+    threads = {
+        # yours, 4 days silent → stale
+        "t-stale": _thread("t-stale", [(d(6), False, "me@example.com", "Deck", "here you go"),
+                                       (d(4), True, "Victor Yeung <victor@acme.com>", "Re: Deck",
+                                        "sending the revised deck, let me know on allocation")]),
+        # they answered after you → not stale
+        "t-answered": _thread("t-answered", [(d(5), True, "dana@acme.com", "Q", "quick question"),
+                                             (d(2), False, "me@example.com", "Re: Q", "answer")]),
+        # yours, but only 2 days → not yet
+        "t-fresh": _thread("t-fresh", [(d(2), True, "ben@acme.com", "Thu?", "does thursday work")]),
+        # yours, 20 days → dead, not a debt
+        "t-dead": _thread("t-dead", [(d(20), True, "old@acme.com", "Ping", "any thoughts here")]),
+    }
+    cands = [{"threadId": t, "to": "x", "subject": "s", "snippet": "sn"} for t in
+             ("t-stale", "t-answered", "t-fresh", "t-dead", "t-missing")]
+    rows = gg.stale_from_threads(cands, threads, now)
+    assert [r["threadId"] for r in rows] == ["t-stale"]
+    r = rows[0]
+    assert r["toEmail"] == "victor@acme.com" and r["subject"] == "Re: Deck"
+    assert r["daysSinceSent"] == 4 and r["sentDate"].startswith("2026-08-31")
+    assert "revised deck" in r["snippet"]
+
+
+def test_gather_stale_sent_searches_once_and_reads_each_thread_once(monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 9, 4, 12, 0, tzinfo=dt.timezone.utc)
+    searches, gets = [], []
+
+    def fake_run(api, args, timeout=60):
+        searches.append(args)
+        return [{"id": "m1", "threadId": "t1", "to": "victor@acme.com", "subject": "Deck"},
+                {"id": "m2", "threadId": "t1", "to": "victor@acme.com", "subject": "Deck"},
+                {"id": "m3", "threadId": "t2", "to": "dana@acme.com", "subject": "Q"}]
+    monkeypatch.setattr(gg, "_run", fake_run)
+
+    class _Get:
+        def __init__(self, tid): self.tid = tid
+        def execute(self):
+            gets.append(self.tid)
+            if self.tid == "t2":
+                raise RuntimeError("gone")
+            return _thread("t1", [(now - dt.timedelta(days=5), True, "victor@acme.com", "Deck",
+                                   "the revised deck is attached, thoughts on allocation")])
+
+    class _Svc:
+        def users(self): return self
+        def threads(self): return self
+        def get(self, userId, id, format, metadataHeaders): return _Get(id)
+
+    rows = gg.gather_stale_sent("/fake/api.py", service=_Svc(), now=now)
+    assert len(searches) == 1 and searches[0][2] == "in:sent older_than:3d newer_than:14d -in:chats"
+    assert gets == ["t1", "t2"]                              # one read per thread, once
+    assert [r["threadId"] for r in rows] == ["t1"]           # the unreadable thread costs itself only
+
+
+def test_stale_rows_ride_the_gmail_envelope(tmp_path, monkeypatch):
+    _wire_fake_gather(monkeypatch, [{"id": "m0", "subject": "S0"}])
+    monkeypatch.setattr(gg, "gather_stale_sent", lambda api: [{"threadId": "t1", "toEmail": "v@acme.com"}])
+    g, c = tmp_path / "g.json", tmp_path / "c.json"
+    monkeypatch.setattr("sys.argv", ["gather_google.py", "--max", "3", "--bodies", "0",
+                                     "--gmail-out", str(g), "--cal-out", str(c)])
+    gg.main()
+    payload = json.load(open(g))
+    assert payload["stale_threads"] == [{"threadId": "t1", "toEmail": "v@acme.com"}]
+    assert [e["id"] for e in payload["emails"]] == ["m0"] and "truncated_at" not in payload
+    # --skip-stale, or a backfill window, never runs the lane
+    monkeypatch.setattr(gg, "gather_stale_sent", lambda api: (_ for _ in ()).throw(AssertionError("ran")))
+    monkeypatch.setattr("sys.argv", ["gather_google.py", "--max", "3", "--bodies", "0", "--skip-stale",
+                                     "--gmail-out", str(g), "--cal-out", str(c)])
+    gg.main()
+    assert isinstance(json.load(open(g)), list)
+
+
+def test_event_normalization_reads_your_own_rsvp():
+    ev = gg.normalize_event({"id": "e", "summary": "Pitch", "start": "2026-09-05T10:00:00Z",
+                             "attendees": [{"email": "vc@fund.com", "responseStatus": "accepted"},
+                                           {"email": "me@example.com", "self": True,
+                                            "responseStatus": "declined"}]})
+    assert ev["my_response"] == "declined"
+    assert gg.normalize_event({"id": "e2", "attendees": [{"email": "a@b.com"}]})["my_response"] == ""
+
+
 def test_skip_gmail_calendar_only(tmp_path, monkeypatch):
     # meeting-prep uses --skip-gmail: gmail not even attempted; both files still written.
     called = {"gmail": False, "cal": False}

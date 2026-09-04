@@ -32,10 +32,11 @@ Seven nudge kinds:
                     line and the quick-wish tap, so this would be the same nudge twice.
   - handoff       — one thing you're owed has been chased its two times and still has no answer, so
                     Sotto stops guessing and asks: "I've nudged Maya twice about the contract —
-                    nudge her again, or let it go?" Person, thing, binary choice. It shares the
-                    tidy-up cooldown below but NOT its pile threshold, and it never hides inside the
-                    generic offer — "your open-loops list is getting heavy" tells a first-time user
-                    nothing about Maya. ASKED ONCE: the delivery is stamped on the row
+                    nudge her again, or let it go?" Person, thing, binary choice. It has its OWN
+                    clock — asked the first tick it comes due, outside the 2h post-brief window —
+                    not the tidy-up cooldown below, and it ignores that offer's pile threshold; it
+                    never hides inside the generic offer — "your open-loops list is getting heavy"
+                    tells a first-time user nothing about Maya. ASKED ONCE: the delivery is stamped on the row
                     (`--finalize-handoff`), which both retires the question and ends that loop's
                     claim on a named line in every brief — it is the user's move now.
   - retune_offer  — the stale pile is getting heavy (you keep seeing items you don't act on); offer
@@ -358,6 +359,42 @@ def _research_cache_emails(date: str) -> set:
             for a in (data.get("attendees") or []) if isinstance(a, dict) and a.get("email")}
 
 
+def _prep_lines(attendee: dict, continuity) -> tuple:
+    """(who, open_loop) for the first external attendee of an imminent meeting — the prep the nudge
+    carries. `who` is the graph's typed title/company ("VP Eng at Acme"), never a guess; empty when
+    the graph has no file. `open_loop` is the one dated loop you owe them from the scan's own
+    continuity input, else "". Both degrade to "" on any failure — a nudge without prep beats no
+    nudge."""
+    email = _s(attendee.get("email")).lower().strip()
+    name = _s(attendee.get("displayName")).strip()
+    who = ""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                        "_shared", "knowledge"))
+        import knowledge as kg  # noqa: PLC0415
+        path = kg.find_person_file(name=name, identifier=email) if (name or email) else None
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                p = kg.parse_person_file(f.read())
+            bits = [b for b in (_s(p.title), _s(p.company)) if b]
+            who = " at ".join(bits) if len(bits) == 2 else (bits[0] if bits else "")
+    except Exception:  # noqa: BLE001
+        who = ""
+    loop = ""
+    try:
+        rows = continuity if isinstance(continuity, list) else _arr(continuity, "items")
+        for c in rows:
+            if not isinstance(c, dict):
+                continue
+            ident = _s(c.get("identifier")).lower().strip()
+            if (email and ident == email) or (name and _s(c.get("name")).strip().lower() == name.lower()):
+                loop = _s(c.get("title")).split(" — ", 1)[-1][:80]
+                break
+    except Exception:  # noqa: BLE001
+        loop = ""
+    return who, loop
+
+
 def _open_loops() -> list:
     """The deadline-bearing loops YOU OWE, in the shape scan() reads — straight from loops_query,
     the one sanctioned ledger read view. Deliberately ONE direction: a loop you are waiting on is
@@ -515,7 +552,7 @@ def scan(calendar, continuity, local, user_email, now_local,
          stale_count: int = 0, retune_offer_allowed: bool = False,
          prepped_emails=None, brief_recent: bool = False,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
-         brief_named=None, intentions=None) -> dict:
+         brief_named=None, intentions=None, handoff_allowed: bool = False) -> dict:
     """Pure decision (no I/O, no gates): given the inputs and the local 'now', return every nudge
     that is DUE now. Whether any of them reaches the user — the snooze, quiet hours, the mutes, the
     in-meeting hold, the daily interrupt budget — is the funnel's call, made in one place, on the
@@ -545,8 +582,8 @@ def scan(calendar, continuity, local, user_email, now_local,
     else:
         events = calendar if isinstance(calendar, list) else []
     for e in events:
-        if not isinstance(e, dict):
-            continue
+        if not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined":
+            continue                  # a meeting you declined is not a room you're walking into
         st = _parse_ts(_s(e.get("start")))
         if st is None:
             continue
@@ -567,10 +604,17 @@ def scan(calendar, continuity, local, user_email, now_local,
         # "did you prep?" question, which nothing can answer deterministically.)
         if prepped_emails and {_s(a.get("email")).lower().strip() for a in ext} & set(prepped_emails):
             continue
+        # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
+        # own title/company for the first external attendee) and the one open loop with them, if
+        # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
+        who, loop = _prep_lines(ext[0], continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{_s(e.get('id'))}",
                        "title": _s(e.get("summary")) or "Meeting",
+                       "person": _s(ext[0].get("displayName")) or _s(ext[0].get("email")).split("@")[0],
+                       "who": who, "open_loop": loop,
                        "detail": f"starts in ~{int(mins_away)} min · "
-                                 + ", ".join(_s(a.get('displayName') or a.get('email')) for a in ext[:4])})
+                                 + ", ".join(_s(a.get('displayName') or a.get('email')) for a in ext[:4])
+                                 + (f" · {who}" if who else "") + (f" · open with them: {loop}" if loop else "")})
 
     # 2) Commitments — an open loop whose deadline is today or overdue. ONE loop, ONE nudge, ONE
     #    register: a loop that came back as a chase candidate belongs to the chase branch below and
@@ -649,14 +693,21 @@ def scan(calendar, continuity, local, user_email, now_local,
                     "detail": ("send a quick note" if not days_out
                                else "enough time for a real gift — want me to pull what you know about them?")})
 
-    # 4) The tidy-up lane, throttled by main's cooldown (NOT once a day) so it is a gentle periodic
-    #    ask, never a daily nag. Two shapes, and the NAMED one wins:
+    # 4) The hand-off and the tidy-up. Two shapes, and the NAMED one wins:
     #    4a) a loop chased its two times with no answer — that is one person and one thing, so the
-    #        nudge says so and asks the binary question. It ignores the pile threshold entirely: a
-    #        single unanswered ask deserves the question even on a tidy day.
-    #    4b) otherwise, the pile itself is heavy — offer a cleanup.
+    #        nudge says so and asks the binary question. It has its OWN clock (`handoff_allowed`:
+    #        just "not inside the 2h post-brief window"), not the tidy-up's 7-day cooldown: the
+    #        question is owed, not offered, and it is asked the first tick it comes due — until it
+    #        is, `brief_validate.is_urgent` keeps that loop taking a named line in every brief. A
+    #        generic cleanup offer on day 5 used to push Maya's question to day 12 (Day-15
+    #        simulation, Sep 2026). Asked once: `handoff_asked_at` is stamped on delivery — and
+    #        while a delivery never acks (the question never reached the user), the per-day dedup
+    #        key bounds it to one attempt a day, which is the right cadence for a question nobody
+    #        has received.
+    #    4b) otherwise, the pile itself is heavy — offer a cleanup, throttled by main's multi-day
+    #        cooldown (NOT once a day) so it is a gentle periodic ask, never a daily nag.
     threshold = RETUNE_OFFER_MIN
-    if retune_offer_allowed and (handoff_candidates or []):
+    if handoff_allowed and (handoff_candidates or []):
         h = (handoff_candidates or [])[0]         # one question at a time; the rest keep their turn
         nudges.append({"kind": "handoff", "key": _s(h.get("id")) or f"handoff:{today}",
                        "title": _s(h.get("title")) or "Still no answer",
@@ -705,7 +756,7 @@ def main():
                prepped_emails=_research_cache_emails(date), brief_recent=brief_recent,
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
-               handoff_candidates=_handoff_candidates(),
+               handoff_candidates=_handoff_candidates(), handoff_allowed=not brief_recent,
                brief_named=_brief_named_keys(now_local),
                intentions=_intention_candidates(now_local))["nudges"]
 
@@ -737,8 +788,8 @@ def main():
             for n in fresh:
                 if n.get("kind") == "intention" and n.get("intention_id"):
                     _finish_intention(n["intention_id"])
-    if any(n["kind"] in ("retune_offer", "handoff") for n in fired):
-        _stamp_retune_offer(date)   # one cooldown window covers both tidy-up shapes
+    if any(n["kind"] == "retune_offer" for n in fired):
+        _stamp_retune_offer(date)   # the tidy-up's cooldown; the hand-off is asked once by its stamp
     deferred = _defer_delivery_effects(fired) if fired else False
     if not deferred:
         for n in fired:

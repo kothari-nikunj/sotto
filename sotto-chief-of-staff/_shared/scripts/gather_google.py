@@ -39,6 +39,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import getaddresses
 
 # The attachment lane's caps and its converter, imported from their OWNER in _shared/lib. The three
 # numbers are defined once, there, and read here — the fetch side and the render side sharing one
@@ -60,6 +61,15 @@ BODY_FETCH_WORKERS = 5   # concurrent full-body fetches (each its own google_api
 # Kept small on purpose: it's exhaust, not brief content, and it costs wall clock in the brief path.
 SENT_MAX = 15            # sent messages fetched per daily gather
 SENT_BODIES = 10         # of those, how many get a full-body fetch (snippets are too thin to learn voice from)
+
+# Stale sent lane (roadmap, Sep 2026): "you emailed them four days ago and got nothing" — an email
+# you sent that nobody answered is a debt owed to you. One `in:sent` search over a bounded window,
+# then one threads.get per candidate thread to ask the only question that matters: is the LAST
+# message on the thread still yours? Rows go to the gmail payload as `stale_threads`; compose_brief
+# filters them to people you know and mints the waiting_on debts deterministically.
+STALE_SILENT_DAYS = 3        # silent this long → stale (the same clock the chase lane uses)
+STALE_MAX_DAYS = 14          # …and no older: two weeks of silence is a dead thread, not a debt
+STALE_MAX_THREADS = 20       # threads.get calls per gather, newest first
 
 # --attendee-comms mode (meeting-prep): per-attendee Gmail searches, same concurrency pattern.
 ATTENDEE_COMMS_CAP = 15        # unique attendee emails searched per run
@@ -198,7 +208,19 @@ def normalize_event(e: dict) -> dict:
         "description": _pick(e, "description", "notes") or "",
         "meetingLink": _pick(e, "hangoutLink", "meetingLink", "conferenceLink", "htmlLink", "link", "url") or "",
         "attendees": _pick(e, "attendees", "participants") or [],
+        # The user's OWN answer to the invite — accepted / declined / tentative / needsAction — read
+        # off the attendee flagged `self`. A meeting you declined is not on your day; one you
+        # haven't answered is an ask. Nothing read this field before (Sep 2026).
+        "my_response": my_response(e),
     }
+
+
+def my_response(e: dict) -> str:
+    """The self attendee's responseStatus, lowercased ("" when the event carries none)."""
+    for a in (e.get("attendees") or []) if isinstance(e, dict) else []:
+        if isinstance(a, dict) and a.get("self"):
+            return str(a.get("responseStatus") or "").strip().lower()
+    return ""
 
 
 def _fetch_body(api, mid):
@@ -479,6 +501,85 @@ def merge_sent(inbox: list, sent: list) -> list:
     return out
 
 
+# ── the stale sent lane ─────────────────────────────────────────────────────────────────────────
+
+def _header(msg: dict, name: str) -> str:
+    for h in ((msg.get("payload") or {}).get("headers") or []):
+        if isinstance(h, dict) and str(h.get("name", "")).lower() == name.lower():
+            return str(h.get("value") or "")
+    return ""
+
+
+def stale_from_threads(candidates: list, threads: dict, now=None) -> list:
+    """The pure half: `candidates` are normalized sent rows (newest first), `threads` maps
+    threadId → the Gmail threads.get(format=metadata) payload. A thread is STALE when its last
+    message is still the user's (SENT label) and that message is at least STALE_SILENT_DAYS old.
+    Output rows are what compose_brief and render_local read: {threadId, to, toEmail, subject,
+    sentDate, daysSinceSent, snippet}, oldest silence first."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    out, seen = [], set()
+    for row in candidates:
+        tid = str(row.get("threadId") or "")
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        thread = threads.get(tid) or {}
+        msgs = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+        if not msgs:
+            continue
+        msgs.sort(key=lambda m: int(m.get("internalDate") or 0))
+        last = msgs[-1]
+        labels = {str(x).upper() for x in (last.get("labelIds") or [])}
+        if "SENT" not in labels:
+            continue                          # somebody answered after the user's last word
+        try:
+            sent_at = datetime.datetime.fromtimestamp(int(last.get("internalDate") or 0) / 1000.0,
+                                                      tz=datetime.timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            continue
+        days = (now - sent_at).days
+        if days < STALE_SILENT_DAYS or days > STALE_MAX_DAYS:
+            continue
+        to = _header(last, "To") or _addr_str(row.get("to"))
+        cc = _header(last, "Cc")
+        addrs = [a for _n, a in getaddresses([h for h in (to, cc) if h.strip()]) if a]
+        if not addrs:
+            continue
+        out.append({"threadId": tid, "to": to, "toEmail": addrs[0].lower(), "cc": cc,
+                    "subject": _header(last, "Subject") or str(row.get("subject") or ""),
+                    "sentDate": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "daysSinceSent": days,
+                    "snippet": str(last.get("snippet") or row.get("snippet") or "")[:300]})
+    out.sort(key=lambda r: -int(r["daysSinceSent"]))
+    return out
+
+
+def gather_stale_sent(api, service=None, now=None) -> list:
+    """The I/O half: the bounded `in:sent` search through the host CLI, then threads.get(metadata)
+    per candidate through the same Gmail client the attachment lane uses. Any failure is the
+    caller's to swallow — a stale lane that breaks costs the lane, never the brief."""
+    q = f"in:sent older_than:{STALE_SILENT_DAYS}d newer_than:{STALE_MAX_DAYS}d -in:chats"
+    items = _as_list(_run(api, ["gmail", "search", q, "--max", str(STALE_MAX_THREADS * 2)]))
+    rows = [normalize_email(it, {}) for it in items if isinstance(it, dict)]
+    tids = []
+    for r in rows:
+        tid = str(r.get("threadId") or "")
+        if tid and tid not in tids:
+            tids.append(tid)
+    tids = tids[:STALE_MAX_THREADS]
+    if not tids:
+        return []
+    svc = service or _gmail_service()
+    threads = {}
+    for tid in tids:
+        try:
+            threads[tid] = svc.users().threads().get(
+                userId="me", id=tid, format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Subject"]).execute()
+        except Exception:  # noqa: BLE001 — one unreadable thread is not a broken lane
+            continue
+    return stale_from_threads(rows, threads, now)
+
+
 def gather_calendar(api, back_days: int = 0):
     """Next 3 days, plus `back_days` of history — the daily gather looks only forward; the Golden
     Corpus backfill (--window-days) needs the meetings that already happened. History comes in
@@ -625,6 +726,8 @@ def main():
                     help=f"cap for the in:sent lane (default {SENT_MAX}; 0 disables it)")
     ap.add_argument("--skip-sent", action="store_true",
                     help="skip the in:sent lane (the email-voice/draft-diff exhaust)")
+    ap.add_argument("--skip-stale", action="store_true",
+                    help="skip the stale-sent lane (emails you sent that nobody answered)")
     # Host-agnostic MCP fallback: pass RAW dumps of the host's Gmail/Calendar MCP tool results and we
     # normalize them to the canonical shape (no CLI needed). Use these when `--check` says the CLI is
     # unavailable but the host can reach Google another way.
@@ -687,7 +790,7 @@ def main():
         return
 
     api = _find_google_api()
-    emails, sent, events, err = [], [], [], None
+    emails, sent, events, stale, err = [], [], [], [], None
     if not api:
         err = ("google_api.py not found — the google-workspace CLI isn't this host's Google path. "
                "FALLBACK: fetch Gmail (newer_than:1d), sent mail (in:sent newer_than:1d) + Calendar "
@@ -708,6 +811,13 @@ def main():
                     sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max), days=a.window_days)
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; sent: {e}") if err else f"sent: {e}"
+            # The stale-sent lane: its own try, and only on the daily window (a backfill has no
+            # "today" to be stale against).
+            if not a.skip_stale and a.window_days <= 1:
+                try:
+                    stale = gather_stale_sent(api)
+                except Exception as e:  # noqa: BLE001
+                    err = (err + f"; stale: {e}") if err else f"stale: {e}"
         if not a.skip_calendar:
             try:
                 events = gather_calendar(api, back_days=max(0, a.window_days - 1))
@@ -724,15 +834,21 @@ def main():
     truncated_at = a.max if (not a.skip_gmail and a.max > 0 and len(emails) == a.max) else None
     emails = merge_sent(emails, sent)
     n_sent = sum(1 for e in emails if e.get("isSent"))
-    gmail_payload = ({"emails": emails, "truncated_at": truncated_at,
-                      "truncation_note": f"(inbox window truncated at {truncated_at} — more arrived)"}
-                     if truncated_at else emails)
+    if truncated_at or stale:
+        gmail_payload = {"emails": emails}
+        if truncated_at:
+            gmail_payload["truncated_at"] = truncated_at
+            gmail_payload["truncation_note"] = f"(inbox window truncated at {truncated_at} — more arrived)"
+        if stale:
+            gmail_payload["stale_threads"] = stale
+    else:
+        gmail_payload = emails
     with open(a.gmail_out, "w", encoding="utf-8") as f:
         json.dump(gmail_payload, f)
     with open(a.cal_out, "w", encoding="utf-8") as f:
         json.dump(events, f)
-    msg = (f"[gather_google] {len(emails)} emails ({n_sent} sent), {len(events)} events "
-           f"→ {a.gmail_out}, {a.cal_out}")
+    msg = (f"[gather_google] {len(emails)} emails ({n_sent} sent, {len(stale)} stale sent threads), "
+           f"{len(events)} events → {a.gmail_out}, {a.cal_out}")
     if truncated_at:
         msg += f"  (inbox window truncated at {truncated_at} — more arrived)"
     if err:

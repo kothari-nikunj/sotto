@@ -46,7 +46,7 @@ from brief_validate import BANNED_PHRASES  # noqa: E402  (conftest puts _shared/
 PROMPT_REFERENCED_SECTIONS = [
     "Open Commitments (ACTION LEDGER from previous briefs)",
     "Commitment History for Key People (historical context only)",
-    "Stale Outbound Threads (PRE-COMPUTED from Gmail — trust these signals)",
+    "Emails you sent that nobody answered (PRE-COMPUTED from Gmail — authoritative)",
     "What You Know About Today's People",
     "Cross-Source Index",
     "Birthdays",

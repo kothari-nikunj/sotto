@@ -184,13 +184,19 @@ def _names_match(attendee_name: str, contact_name: str) -> bool:
 
 
 def _is_likely_automated(email_address: str) -> bool:
-    """Port of contacts.ts isLikelyAutomated — no-reply / notifications / billing senders."""
+    """Port of contacts.ts isLikelyAutomated — no-reply / notifications / billing senders.
+
+    The local part is the tell: a mailbox nobody reads is named for what it emits. `notify@`
+    joined the list on Sep 4, 2026, after Notion's `notify@mail.notion.so` — "Rahul updated a
+    page" — survived the funnel, was drafted a "Thanks, received." reply, and reached the user
+    as a nudge with a tap link to a robot."""
     email = (email_address or "").strip().lower()
     if not email or "@" not in email:
         return False
     local = email.split("@")[0]
-    if re.match(r"^(no-?reply|do-?not-?reply|donotreply|notifications?|alerts?|updates?|support|"
-                r"billing|receipts?|mailer-daemon|postmaster)([+._-]|$)", local):
+    if re.match(r"^(no-?reply|do-?not-?reply|donotreply|notif(?:y|ications?)|alerts?|updates?|"
+                r"support|billing|receipts?|mailer(?:-daemon)?|postmaster|newsletters?|digests?|"
+                r"reminders?|invitations?|bot|system)([+._-]|$)", local):
         return True
     return bool(re.search(r"\b(no-?reply|do-?not-?reply|donotreply|notification|receipt|automated)\b", email))
 

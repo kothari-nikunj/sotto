@@ -97,7 +97,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 import yaml
 
@@ -574,7 +574,34 @@ def _check_outgoing_message(identifiers: list, after: str, local: dict):
         jid = m.get("contact_jid") or ""
         if any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers):
             return ("replied", f"Outgoing WhatsApp to {jid}")
+    # Email is a channel: the gather's `in:sent` lane lands in local["emails"] flagged isSent, and a
+    # debt closes on the user's own outbound on ANY channel. Before this branch the only email path
+    # was `signals.replied_thread_ids` — a list the agent hand-assembled — so a reply sent from the
+    # phone at 11pm was still "open" at 6:30 and got a draft of the mail already sent (Day-4
+    # simulation, Sep 2026).
+    for m in (local.get("emails") or []):
+        if not _is_sent_email(m) or not _message_is_after(m.get("date") or m.get("timestamp"), after):
+            continue
+        rcpts = _email_recipients(m)
+        hit = next((r for r in rcpts if any(_handle_matches(r, i) for i in identifiers)), "")
+        if hit:
+            return ("replied", f"Outgoing email to {hit}")
     return None
+
+
+def _is_sent_email(m: dict) -> bool:
+    labels = m.get("labelIds") or m.get("labels") or []
+    return bool(m.get("isSent")) or (isinstance(labels, list)
+                                     and "SENT" in {str(v).upper() for v in labels})
+
+
+def _email_recipients(m: dict) -> list:
+    """Lowercased addresses in To/Cc — a string ("A <a@x>, b@y") or a list of either."""
+    raw = []
+    for field in ("to", "cc"):
+        v = m.get(field)
+        raw += [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
+    return [addr.lower() for _name, addr in getaddresses(raw) if addr]
 
 
 # ── Inbound delivery (the mirror of the outgoing check, for `waiting_on`) ─────
@@ -592,10 +619,11 @@ SUBSTANCE_CHARS = 40
 _DELIVERY_HINT = re.compile(
     r"https?://|www\.|\.(pdf|docx?|xlsx?|pptx?|csv|zip|png|jpe?g|key|numbers)\b", re.I)
 _PROMISE_HINT = re.compile(
-    r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b[^.?!]{0,40}\b"
+    r"\b(i'?ll|i will|we'?ll|we will|going to|gonna|will)\b[^.?!]{0,40}\b"
     r"(send|share|get|shoot|forward|email|ping|upload|revert|circle back)\b"
-    r"|\b(not yet|still working|working on it|haven'?t|sorry for the delay|"
-    r"by (eod|eow|tomorrow|end of|the end of))\b", re.I)
+    r"|\b(not yet|still working|working on it|still has it|haven'?t|sorry for the delay|"
+    r"by (eod|eow|tomorrow|end of|the end of|the \d{1,2}(st|nd|rd|th)?|next week|"
+    r"(mon|tues?|wednes|thurs?|fri|satur|sun)day))\b", re.I)
 
 
 def _is_delivery(text: str) -> bool:
@@ -652,8 +680,7 @@ def _check_inbound_delivery(identifiers: list, after: str, local: dict, thread_i
                 and _is_delivery(m.get("text"))):
             return ("delivered", f"Inbound WhatsApp from {jid}")
     for m in (local.get("emails") or []):
-        labels = m.get("labelIds") or m.get("labels") or []
-        if m.get("isSent") or (isinstance(labels, list) and "SENT" in {str(v).upper() for v in labels}):
+        if _is_sent_email(m):
             continue
         if not _message_is_after(m.get("date") or m.get("timestamp"), after):
             continue
@@ -667,6 +694,133 @@ def _check_inbound_delivery(identifiers: list, after: str, local: dict, thread_i
                 detail += f" on thread {thread_id}"
             return ("delivered", detail)
     return None
+
+
+def _check_inbound_contact(identifiers: list, after: str, local: dict, thread_id: str = ""):
+    """Did THEY reach the user at all since `after` — a message on any channel, substantive or not,
+    or a call (answered or missed)? The mirror of _check_inbound_delivery without the substance
+    gate. Returns (instant, text) of the LATEST such contact, or None. This is the third state
+    between open and delivered: "they answered, they just haven't delivered" — any inbound from
+    the counterpart restarts the chase clock; only substance closes the loop."""
+    after = _inbound_cutoff(after)
+    best = None
+
+    def _consider(ts: str, text: str):
+        nonlocal best
+        if ts and ts > (after or "") and (best is None or ts > best[0]):
+            best = (ts, text)
+
+    for m in (local.get("imessage") or []):
+        if m.get("is_from_me"):
+            continue
+        if any(_handle_matches(m.get("handle") or "", i) for i in identifiers):
+            _consider(_s(m.get("timestamp")), _s(m.get("text")))
+    for m in (local.get("whatsapp") or []):
+        if m.get("is_from_me"):
+            continue
+        jid = m.get("contact_jid") or ""
+        if any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers):
+            _consider(_s(m.get("timestamp")), _s(m.get("text")))
+    for c in (local.get("calls") or []):
+        if c.get("is_outgoing"):
+            continue
+        if any(_phone_matches(c.get("phone") or "", i) for i in identifiers):
+            _consider(_s(c.get("timestamp")), "")
+    for c in (local.get("whatsapp_calls") or []):
+        if c.get("is_outgoing"):
+            continue
+        if any(_jid_matches_phone(c.get("jid") or "", i) for i in identifiers):
+            _consider(_s(c.get("timestamp")), "")
+    for m in (local.get("emails") or []):
+        if _is_sent_email(m):
+            continue
+        sender = parseaddr(_s(m.get("from") or m.get("sender")))[1].lower()
+        if not any(_handle_matches(sender, i) for i in identifiers):
+            continue
+        if thread_id and _s(m.get("threadId") or m.get("thread_id")) != thread_id:
+            continue
+        observed = _parse_dt(m.get("date") or m.get("timestamp"))
+        if observed is None:
+            try:
+                observed = parsedate_to_datetime(_s(m.get("date") or m.get("timestamp")))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        _consider(_to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S"),
+                  _s(m.get("body") or m.get("text") or m.get("snippet")))
+    return best
+
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august",
+           "september", "october", "november", "december")
+_PROMISE_WEEKDAY_RE = re.compile(
+    r"\b(?:by|on|before|until|till|this|next)\s+(mon|tue|wed|thu|fri|sat|sun)[a-z]*\b", re.I)
+_PROMISE_MONTHDAY_RE = re.compile(
+    r"\b(?:by|on|before|until|till)\s+(?:the\s+)?(?:(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?)\b", re.I)
+
+
+def promised_date(text: str, ref: datetime):
+    """The date a reply names for delivery — "by Tuesday", "tomorrow", "on the 16th of March",
+    "end of week", "next week" — as YYYY-MM-DD, or None when the text names none. Deliberately
+    small: a promise Sotto can't read is a promise it waits the usual days on."""
+    t = _s(text).lower()
+    if not t:
+        return None
+    day = ref.date() if isinstance(ref, datetime) else ref
+    m = _PROMISE_MONTHDAY_RE.search(t)
+    if m:
+        dnum = int(m.group(1) or m.group(4))
+        mon = (m.group(2) or m.group(3))[:3]
+        month = next(i for i, name in enumerate(_MONTHS, 1) if name.startswith(mon))
+        try:
+            candidate = day.replace(month=month, day=dnum)
+        except ValueError:
+            return None
+        if candidate < day:
+            try:
+                candidate = candidate.replace(year=day.year + 1)
+            except ValueError:
+                return None
+        return candidate.strftime("%Y-%m-%d")
+    if re.search(r"\btomorrow\b", t):
+        return (day + timedelta(days=1)).strftime("%Y-%m-%d")
+    if re.search(r"\b(?:end of (?:the )?week|eow|this week)\b", t):
+        ahead = (4 - day.weekday()) % 7          # the coming Friday (today, if Friday)
+        return (day + timedelta(days=ahead)).strftime("%Y-%m-%d")
+    if re.search(r"\bnext week\b", t):
+        return (day + timedelta(days=7)).strftime("%Y-%m-%d")
+    if re.search(r"\b(?:end of (?:the )?month|eom)\b", t):
+        first_next = (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return (first_next - timedelta(days=1)).strftime("%Y-%m-%d")
+    m = _PROMISE_WEEKDAY_RE.search(t)
+    if m:
+        target = next(i for i, name in enumerate(_WEEKDAYS) if name.startswith(m.group(1).lower()))
+        ahead = (target - day.weekday()) % 7 or 7
+        return (day + timedelta(days=ahead)).strftime("%Y-%m-%d")
+    return None
+
+
+def _heard_from_them(it: dict, local: dict, today: str, ref: datetime) -> bool:
+    """A `waiting_on` the counterpart REPLIED to without delivering: push the chase clock to the
+    date they named, else `chase_after_days` out, without counting a chase — Maya saying "legal has
+    it until the 16th" must not be followed by a chase the morning after. Returns True when the
+    row changed. The instant is remembered so one reply restarts the clock exactly once."""
+    ident = it.get("contact_identifier") or ""
+    if not ident:
+        return False
+    ids = _collect_all_identifiers(ident, it.get("contact_name") or "", local)
+    after = max(_s(it.get("created_at")), _s(it.get("last_heard_at")), _s(it.get("last_chased_at")))
+    heard = _check_inbound_contact(ids, after, local, _s(it.get("source_thread_id")))
+    if not heard:
+        return False
+    ts, text = heard
+    named = promised_date(text, ref)
+    default = (ref + timedelta(days=chase_after_days())).strftime("%Y-%m-%d")
+    it["last_heard_at"] = ts
+    it["chase_after"] = named if named and named > today else default
+    it.pop("chase_pending", None)
+    return True
 
 
 def _check_calendar_event(identifiers: list, contact_name: str, local: dict, now: datetime):
@@ -1249,6 +1403,10 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         # one sync on the owner's volume.
         if action_family(a.get("action_type")) == "meeting":
             continue
+        # An unanswered INVITE is the same kind of shadow: compose_brief mints an `rsvp` ask for it
+        # and the calendar closes it — you answer, or it passes. Never a ledger row.
+        if _normalize_action_type(a.get("action_type")) == "rsvp" and normalize_channel(a.get("channel")) == "calendar":
+            continue
         why = not_a_debt(a)
         if why:
             rejected.append(f"{_s(a.get('contact_name')) or '(unnamed)'}: {why}")
@@ -1271,6 +1429,10 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 for k in ("summary", "ask", "deadline"):
                     if a.get(k):
                         it[k] = a[k]
+            if not a.get("source"):
+                # This brief carried the loop (see the new-row branch below) — the evening's
+                # accountability block is about what THIS morning flagged, carried or new.
+                it["source_brief_at"] = created_stamp
             if it.get("status") in TERMINAL:
                 # A NEW action on a TERMINAL anchor = the person came back after the loop closed
                 # (e.g. they replied again the day after resolution). Without a re-open the action
@@ -1303,6 +1465,11 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 "source": a.get("source"), "source_refs": a.get("source_refs"),
                 "resolution_mode": a.get("resolution_mode"),
             }
+            if not a.get("source"):
+                # A brief's own action (a sourced one — a Granola commitment — names its source).
+                # Stamped so the evening can ask what happened to what the morning flagged: the
+                # Evening Accountability block reads this field and had no writer (Sep 2026).
+                items[ak]["source_brief_at"] = created_stamp
             merged.append(items[ak])
 
     if rejected:
@@ -1345,6 +1512,11 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if cross:
             _terminate(it, "resolved", cross[0], today); it["resolution_evidence"] = cross[1]
             resolved.append(it); _persist(it); continue
+        # b2) they ANSWERED without delivering: the chase clock restarts (to the date they named,
+        #     else the usual days) and no chase is counted. Only substance closes the loop (b).
+        if is_waiting and not explicit and _heard_from_them(it, local_data, today, ref):
+            print(f"[continuity_resolve] heard from {_s(it.get('contact_name')) or 'them'} — "
+                  f"next chase {it.get('chase_after')}", file=sys.stderr)
         # c) contact appeared in the brief's Already-Handled section (cross-channel id match)
         if not is_waiting and not explicit and _handled_match(it, handled):
             _terminate(it, "resolved", "brief_handled", today); resolved.append(it); _persist(it); continue

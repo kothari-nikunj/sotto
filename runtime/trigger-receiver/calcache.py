@@ -51,8 +51,8 @@ Loaded by receiver.py via importlib (the relay.py/connectors.py/dashboard.py pat
 wires HOOKS — late-bound lambdas over ITS globals — so this module never imports the receiver and
 stays import-safe on its own. `local_today` is deliberately a hook rather than a second
 implementation: the ROADMAP's first-night-timezone amendment requires the wall-clock features to
-read the SAME resolved tz path the rest of the receiver does (dashboard._local_today: SOTTO_TIMEZONE
-→ config/settings.json → server local).
+read the SAME resolved tz path the rest of the receiver does (dashboard._local_today → tzchain:
+SOTTO_TIMEZONE → TZ → config/settings.json → UTC).
 
 Env: SOTTO_CALENDAR_REFRESH_SECS (default 900; 0 disables the daemon thread and the file entirely),
      SOTTO_MEETING_TAP (0 disables the post-meeting tap), SOTTO_TAP_MAX_PER_DAY (default 3).
@@ -193,6 +193,8 @@ def _norm_cal_event(e):
     link = _s(e.get("meetingLink") or e.get("hangoutLink") or e.get("htmlLink"))
     if link:
         ev["meeting_link"] = link
+    if _s(e.get("my_response")):
+        ev["_my_response"] = _s(e.get("my_response"))    # read by the gather's filter, never served
     return ev
 
 
@@ -228,7 +230,14 @@ def _run_calendar_gather():
     # is the only identity that survives a move, and attendee `responseStatus`, which is what a
     # decline IS). They live in this process and never reach a file or the browser.
     _LAST_RAW["events"] = raw
-    events = [ev for ev in map(_norm_cal_event, raw) if ev]
+    # A meeting the user DECLINED (gather_google reads the self attendee's responseStatus into
+    # `my_response`) is not on their day: it is neither served to the Today view nor a room the
+    # funnel's in-meeting hold believes they are in. The raw list above keeps it — a decline by
+    # somebody ELSE on the same event is still a change worth detecting.
+    events = [ev for ev in map(_norm_cal_event, raw)
+              if ev and _s(ev.get("_my_response")).lower() != "declined"]
+    for ev in events:
+        ev.pop("_my_response", None)
     today = HOOKS["local_today"]()
     keep = {d for d in (today, _date_shift(today, 1)) if d}
     # The gather's window is now→+3d; the Today view wants today + tomorrow. Filter on the start's

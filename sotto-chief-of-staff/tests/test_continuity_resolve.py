@@ -73,6 +73,122 @@ def test_email_loop_resolves_via_whatsapp_jid_through_contacts(tmp_path, monkeyp
     assert "WhatsApp" in out["resolved"][0]["resolution_evidence"]
 
 
+def test_a_reply_you_sent_by_email_closes_the_debt(tmp_path, monkeypatch):
+    """Email is a channel. The gather's in:sent lane lands in the payload flagged isSent; before
+    this the only email path was a thread-id list the agent hand-assembled, so the 11pm reply from
+    the phone was still "open" at 6:30 and got a draft of the mail already sent."""
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "k", channel="gmail", contact_name="Victor", contact_identifier="victor@acme.com",
+          created_at="2026-06-23 08:00:00")
+    out = cr.resolve({"today": "2026-06-24", "emails": [
+        {"from": "Me <me@mine.com>", "to": "Victor Yeung <victor@acme.com>", "cc": "",
+         "date": "2026-06-23T23:10:00-07:00", "body": "allocation is fine at 200k", "isSent": True}]}, NOW)
+    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
+    assert out["resolved"][0]["resolution_evidence"] == "Outgoing email to victor@acme.com"
+    # a sent mail to someone ELSE, an inbound mail from them, or one from BEFORE the loop: still open
+    for email in ({"from": "Me <me@mine.com>", "to": "other@acme.com", "date": "2026-06-23T23:10:00-07:00",
+                   "body": "x", "isSent": True},
+                  {"from": "Victor <victor@acme.com>", "to": "me@mine.com",
+                   "date": "2026-06-23T23:10:00-07:00", "body": "any word?"},
+                  {"from": "Me <me@mine.com>", "to": ["victor@acme.com"], "labels": ["SENT"],
+                   "date": "2026-06-23T01:00:00+00:00", "body": "earlier"}):
+        _env(tmp_path, monkeypatch)
+        for f in (tmp_path / "knowledge" / "continuity").glob("*.md"):
+            f.unlink()
+        _loop(tmp_path, "k", channel="gmail", contact_name="Victor",
+              contact_identifier="victor@acme.com", created_at="2026-06-23 08:00:00")
+        assert cr.resolve({"today": "2026-06-24", "emails": [email]}, NOW)["resolved"] == [], email
+    # …and a Cc, a list-shaped To, or the SENT label all count
+    _env(tmp_path, monkeypatch)
+    for f in (tmp_path / "knowledge" / "continuity").glob("*.md"):
+        f.unlink()
+    _loop(tmp_path, "k", channel="gmail", contact_name="Victor", contact_identifier="victor@acme.com",
+          created_at="2026-06-23 08:00:00")
+    out = cr.resolve({"today": "2026-06-24", "emails": [
+        {"from": "Me <me@mine.com>", "to": ["lp@fund.com"], "cc": ["Victor <victor@acme.com>"],
+         "labels": ["SENT"], "date": "2026-06-23T23:10:00-07:00", "body": "looping Victor"}]}, NOW)
+    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
+
+
+def test_a_briefs_own_action_is_stamped_with_the_brief_that_minted_it(tmp_path, monkeypatch):
+    """`source_brief_at` is what the evening's accountability block reads ("this morning's brief
+    flagged X — here's what happened"); it had no writer. A SOURCED action (a Granola commitment)
+    is not the brief's and is not stamped."""
+    _env(tmp_path, monkeypatch)
+    out = cr.resolve({"today": "2026-06-24", "new_actions": [
+        {"action_type": "reply", "channel": "gmail", "contactName": "Victor",
+         "contactIdentifier": "victor@acme.com", "contextSummary": "the allocation decision"},
+        {"action_type": "reply", "channel": "gmail", "contactName": "Dana",
+         "contactIdentifier": "dana@acme.com", "contextSummary": "the deck she promised",
+         "source": "followup_commitment"}]}, NOW, resolve_existing=False)
+    rows = {r["contact_name"]: r for r in _all_fm(tmp_path)}
+    assert str(rows["Victor"]["source_brief_at"]).startswith("2026-06-24 ")
+    assert "source_brief_at" not in rows["Dana"]
+    assert len(out["active"]) == 2
+
+
+def test_they_replied_without_delivering_restarts_the_chase_clock(tmp_path, monkeypatch):
+    """Day 10: Maya CALLS to say legal has it until the 16th. Day 11 must not chase her. Any
+    inbound from the counterpart restarts the clock — to the date they named, else the usual days
+    — and no chase is counted; only substance closes the loop."""
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "w", action_type="waiting_on", contact_name="Maya Chen",
+          contact_identifier="+14155552222", created_at="2026-06-15 08:00:00",
+          chased_count=1, last_chased_at="2026-06-20", chase_after="2026-06-23")
+    # a call from her — no text at all — pushes the clock the default 3 days from today
+    out = cr.resolve({"today": "2026-06-24", "local": {
+        "calls": [{"is_outgoing": False, "phone": "4155552222", "timestamp": "2026-06-23 16:00:00"}]}}, NOW)
+    row, = out["active"]
+    assert out["resolved"] == [] and row["chased_count"] == 1
+    assert row["chase_after"] == "2026-06-27" and row["last_heard_at"] == "2026-06-23 16:00:00"
+    assert not any("chase_pending" in r for r in _all_fm(tmp_path))
+    # the same call again tomorrow changes nothing (remembered); a later text naming a date does
+    out = cr.resolve({"today": "2026-06-25", "local": {
+        "calls": [{"is_outgoing": False, "phone": "4155552222", "timestamp": "2026-06-23 16:00:00"}]}},
+        datetime(2026, 6, 25, 9, 0, 0))
+    assert out["active"][0]["chase_after"] == "2026-06-27"
+    out = cr.resolve({"today": "2026-06-25", "local": {
+        "imessage": [{"is_from_me": False, "handle": "4155552222", "timestamp": "2026-06-25 08:30:00",
+                      "text": "legal still has it, will send by the 16th of July"}]}},
+        datetime(2026, 6, 25, 9, 0, 0))
+    row = out["active"][0]
+    assert row["chase_after"] == "2026-07-16" and row["last_heard_at"] == "2026-06-25 08:30:00"
+    assert out["resolved"] == []                                   # a promise is not a delivery
+    # …and the model's ledger line says so
+    import render_local as rl
+    note = rl._chase_note(row)
+    assert "they replied" in note and "next check 2026-07-16" in note
+    # a substantive delivery still closes it
+    out = cr.resolve({"today": "2026-06-26", "local": {
+        "imessage": [{"is_from_me": False, "handle": "4155552222", "timestamp": "2026-06-26 08:30:00",
+                      "text": "here it is, fully executed: https://drive.example.com/contract.pdf"}]}},
+        datetime(2026, 6, 26, 9, 0, 0))
+    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
+
+
+def test_promised_dates_are_read_from_plain_words():
+    ref = datetime(2026, 6, 24, 9, 0, 0)          # a Wednesday
+    p = cr.promised_date
+    assert p("I'll send it tomorrow", ref) == "2026-06-25"
+    assert p("should have it to you by Friday", ref) == "2026-06-26"
+    assert p("on Wednesday at the latest", ref) == "2026-07-01"          # the NEXT Wednesday
+    assert p("by end of week", ref) == "2026-06-26"
+    assert p("next week for sure", ref) == "2026-07-01"
+    assert p("before the 16th of July", ref) == "2026-07-16"
+    assert p("by Aug 3", ref) == "2026-08-03"
+    assert p("by March 2", ref) == "2027-03-02"                          # already passed → next year
+    assert p("legal has it, no date yet", ref) is None and p("", ref) is None
+
+
+def test_an_rsvp_ask_never_opens_a_ledger_row(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    out = cr.resolve({"today": "2026-06-24", "new_actions": [
+        {"type": "rsvp", "channel": "calendar", "contactName": "Coffee with Priya",
+         "contactIdentifier": "ev-unanswered", "contextSummary": "You haven't answered the invite"}]},
+        NOW, resolve_existing=False)
+    assert out["active"] == [] and _all_fm(tmp_path) == []
+
+
 def test_callback_resolves_via_whatsapp_call_jid(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     _loop(tmp_path, "k", action_type="call_back", channel="phone",

@@ -248,32 +248,21 @@ hermes_set_if_supported cron.wrap_response false
 # created → no briefs). Set SOTTO_TIMEZONE in Railway (e.g. America/Los_Angeles); defaults to UTC.
 # The setup WIZARD also captures the browser-detected zone to $SOTTO_DATA/config/settings.json, so the
 # Railway var is OPTIONAL — fall back to it here (the cron hour then self-heals on the next boot).
-# CANONICAL TZ ORDER (the same chain everywhere: receiver._configured_tz_name, dashboard._local_today,
-# the skills' timeutil.configured_tz): SOTTO_TIMEZONE → TZ → $SOTTO_DATA/config/settings.json →
-# server local. TZ used to be missing HERE, so a deploy that set only TZ registered its crons in UTC
-# while every rendered date was local.
-if [ -z "${SOTTO_TIMEZONE:-}" ] && [ -n "${TZ:-}" ]; then
-  SOTTO_TIMEZONE="$TZ"
-  echo "[sotto] timezone from TZ: $SOTTO_TIMEZONE (no SOTTO_TIMEZONE var set)"
-fi
-if [ -z "${SOTTO_TIMEZONE:-}" ]; then
-  SETTINGS_TZ="$(python3 - <<'PY' 2>/dev/null || true
-import json, os
-p = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "config", "settings.json")
-try:
-    print((json.load(open(p)) or {}).get("timezone", "") or "")
-except Exception:
-    print("")
-PY
-)"
-  if [ -n "$SETTINGS_TZ" ]; then
-    SOTTO_TIMEZONE="$SETTINGS_TZ"
-    echo "[sotto] timezone from setup wizard: $SOTTO_TIMEZONE (no SOTTO_TIMEZONE var set)"
-  else
+# THE timezone chain is one file — /app/trigger-receiver/tzchain.py, the skills tree's own copy —
+# and this shell runs it rather than carrying a chain of its own (four copies drifted on their last
+# rung, Sep 2026). It prints "<zone>\t<source>": SOTTO_TIMEZONE → TZ → the wizard's settings.json,
+# empty when none of them is set.
+TZ_RESOLVED="$(python3 /app/trigger-receiver/tzchain.py 2>/dev/null || true)"
+SOTTO_TIMEZONE="${TZ_RESOLVED%%$'\t'*}"
+TZ_SOURCE="${TZ_RESOLVED#*$'\t'}"
+case "$TZ_SOURCE" in
+  env:TZ)   echo "[sotto] timezone from TZ: $SOTTO_TIMEZONE (no SOTTO_TIMEZONE var set)" ;;
+  settings) echo "[sotto] timezone from setup wizard: $SOTTO_TIMEZONE (no SOTTO_TIMEZONE var set)" ;;
+  env:SOTTO_TIMEZONE) ;;
+  *)
     echo "[sotto] WARNING: SOTTO_TIMEZONE/TZ unset and no wizard zone yet — cron briefs fire in UTC until you"
-    echo "[sotto]          finish setup at /setup (auto-detects your zone) or set SOTTO_TIMEZONE in Railway."
-  fi
-fi
+    echo "[sotto]          finish setup at /setup (auto-detects your zone) or set SOTTO_TIMEZONE in Railway." ;;
+esac
 hermes config set timezone "${SOTTO_TIMEZONE:-UTC}" || true
 # Brief composition runs the FLEX extraction AND a critic pass inside ONE execute_code call — two
 # Gemini calls that together can exceed Hermes' default 300s code_execution timeout, getting the

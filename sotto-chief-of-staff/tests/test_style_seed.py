@@ -259,6 +259,49 @@ def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, 
     assert observed == [1, 1]
 
 
+def test_the_confirmed_bucket_is_capped_newest_first_and_quoted_newest_first(tmp_path):
+    """The bucket is TTL-immune and, since the draft→outcome matcher, fed automatically on every
+    verbatim send — so it is capped where it grows (CONFIRMED_CAP, newest kept), and the drafter
+    quotes the NEWEST four rather than the first four ever confirmed (which used to freeze the
+    'highest signal' slot on week one, forever)."""
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    se.extract(json.loads(json.dumps(SNAPSHOT)))
+    path = os.path.join(str(tmp_path), "style.json")
+    style = json.load(open(path))
+    _, sample = _some_sample(tmp_path)
+    # Pre-fill the sample's OWN bucket with CONFIRMED_CAP older confirmations (oldest first in list
+    # order), plus one confirmation in another register — the cap is per register, so a busy
+    # texting voice can never starve the email voice to nothing.
+    style["confirmed"] = [{"text": f"older sample number {i} shipped a while back", "bucket": sample["bucket"],
+                           "channel": "imessage", "source": "confirmed", "quality": 0.95,
+                           "confirmed_at": f"2026-01-{i + 1:02d}T00:00:00Z"} for i in range(se.CONFIRMED_CAP)]
+    other = "work_email" if sample["bucket"] != "work_email" else "work_message"
+    style["confirmed"].append({"text": "the one email-voice confirmation", "bucket": other,
+                               "channel": "email", "source": "confirmed", "quality": 0.95,
+                               "confirmed_at": "2025-12-01T00:00:00Z"})
+    json.dump(style, open(path, "w"))
+    out = se.confirm_sample(se.sample_hash(sample))
+    assert out["ok"] is True and out["confirmed"] == se.CONFIRMED_CAP + 1
+    confirmed = json.load(open(path))["confirmed"]
+    assert len([s for s in confirmed if s["bucket"] == sample["bucket"]]) == se.CONFIRMED_CAP
+    assert confirmed[0]["text"] == sample["text"]                       # newest first…
+    texts = {s["text"] for s in confirmed}
+    assert "older sample number 0 shipped a while back" not in texts    # …the oldest fell off
+    assert "the one email-voice confirmation" in texts                  # the other register survived
+    sa_spec = importlib.util.spec_from_file_location(
+        "style_apply_cap", os.path.join(HERE, "..", "_shared", "scripts", "style_apply.py"))
+    sa = importlib.util.module_from_spec(sa_spec)
+    sa_spec.loader.exec_module(sa)
+    channel = "email" if sample["bucket"] == "work_email" else "imessage"
+    guidance = sa.apply({"channel": channel, "recipient": "nobody@example.invalid"})["guidance"]
+    shipped = guidance.split("shipped before")[1].split("###")[0]
+    quoted = [ln for ln in shipped.splitlines() if ln.startswith("> ")]
+    assert len(quoted) == 4
+    assert "older sample number 1 " not in shipped                     # the oldest survivors aren't quoted
+    assert f"older sample number {se.CONFIRMED_CAP - 1} " in shipped   # the newest older ones are
+    assert "Learned preferences" not in guidance                       # the writer-less block is gone
+
+
 def test_confirm_cli_contract(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     se.extract(json.loads(json.dumps(SNAPSHOT)))

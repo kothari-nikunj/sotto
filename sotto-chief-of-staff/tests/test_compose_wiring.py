@@ -217,6 +217,16 @@ def test_is_likely_automated():
     assert textutil._is_likely_automated("notifications@github.com")
     assert textutil._is_likely_automated("billing@aws.amazon.com")
     assert not textutil._is_likely_automated("sarah@acme.com")
+    # Sep 4, 2026: a Notion "page updated" notice was drafted a "Thanks, received." reply and
+    # nudged to the user with a tap link to the robot — the local part names what the mailbox
+    # emits, and that is the tell
+    for robot in ("notify@mail.notion.so", "notify-1234@example.com", "newsletter@example.com",
+                  "digest@example.com", "reminders@example.com", "invitations@example.com",
+                  "bot@example.com", "system@example.com", "mailer@example.com"):
+        assert textutil._is_likely_automated(robot), robot
+    for person in ("bots.smith@example.com", "systemic@example.com", "digestion@example.com",
+                   "rahul@example.com"):
+        assert not textutil._is_likely_automated(person), person
 
 
 def test_system_messages_stripped_from_thread():

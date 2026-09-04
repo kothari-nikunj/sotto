@@ -48,17 +48,22 @@ def test_set_then_get_returns_the_question_as_delivered(tmp_path, monkeypatch):
     assert got["detail"] == "12:00 PM, Sightglass"
 
 
-def test_the_stored_shape_is_exactly_the_seven_ephemeral_fields(tmp_path, monkeypatch):
+def test_the_stored_shape_is_exactly_the_eight_ephemeral_fields(tmp_path, monkeypatch):
     """Ephemeral state, not memory: nothing here could be used by a brief three months from now,
-    so nothing beyond the question, its clock and the hash of what it offered is allowed to
-    accumulate."""
+    so nothing beyond the question, its clock, the loop it is about and the hash of what it
+    offered is allowed to accumulate."""
     path = _data(tmp_path, monkeypatch)
-    po.set_offer("chase", "any word on the deck?", person="Maya")
+    po.set_offer("chase", "any word on the deck?", person="Maya", anchor_key="email:waiting_on:id:maya")
     with open(path, encoding="utf-8") as f:
         stored = json.load(f)
     assert set(stored) == {"ts", "kind", "question", "person", "detail", "payload_sha256",
-                           "expires_at"}
+                           "expires_at", "anchor_key"}
     assert stored["payload_sha256"] == ""       # an offer with no real effect binds to nothing
+    assert stored["anchor_key"] == "email:waiting_on:id:maya"   # so "done" lands on THAT loop
+    assert po.get_offer()["anchor_key"] == "email:waiting_on:id:maya"
+    # the dismissal vocabulary is stated once, for the persona to read
+    assert "done" in po.DISMISS_RESOLVED and "let it go" in po.DISMISS_DROPPED
+    assert "mute" in po.KINDS
 
 
 def test_get_on_a_missing_file_is_an_empty_object(tmp_path, monkeypatch):
@@ -210,9 +215,9 @@ def test_cli_rejects_a_kind_no_lane_produces(tmp_path):
                         "--question", "?"], env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode != 0
     # Every kind has a producing lane: the proactive watcher's ordinary nudges + one-shot
-    # intentions, plus the evening brief's standing-rule offer.
+    # intentions, plus the evening brief's two one-line questions (a standing rule, a mute).
     assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff", "retune_offer",
-                             "procedure", "intention"}
+                             "procedure", "intention", "mute"}
 
 
 # ── the two processes, at the same moment ───────────────────────────────────────────────────────
@@ -228,7 +233,7 @@ _RACER = textwrap.dedent("""
         else:
             got = po.get_offer()
             if got:
-                assert set(got) == {{"ts", "kind", "question", "person", "detail",
+                assert set(got) == {{"ts", "kind", "question", "person", "detail", "anchor_key",
                                      "payload_sha256", "expires_at"}}, got
                 assert got["question"] == "q" + got["person"][1:], got   # one whole write, not two halves
         time.sleep(0.001)

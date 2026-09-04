@@ -191,6 +191,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 # Same cross-skill reuse pattern as proactive_scan: put _shared on sys.path and import
 # the brief's own helpers, so triage and the brief agree on "automated", "system message", "known".
@@ -863,6 +864,10 @@ def _record_surfaced(verdict: str, cls: str, reason: str, sender: str, event: di
         }
         if decision_id:
             row["decision_id"] = decision_id
+        if _s(ev.get("source")) == PROACTIVE_SOURCE and _s(ev.get("person")):
+            # A proactive nudge's `sender` is its prose line; the person it is about is what the
+            # brief's never-tell-you-twice measurement needs.
+            row["person"] = _s(ev.get("person"))
         line = json.dumps(row)
         bounded_append(_surfaced_path(), line, SURFACED_MAX_BYTES, SURFACED_KEEP_LINES)
     except Exception:  # noqa: BLE001
@@ -1568,13 +1573,82 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
 
 # ── Release valve (the deferred queue's way back to a nudge) ──────────────────────────────────────
 
-def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int):
+def _answered_threads(lines: list) -> dict:
+    """thread key → the latest instant the USER spoke on that thread, read off the queue's own
+    `signal` rows (the Bridge pushes `is_from_me` rows through the funnel; the Gmail poll's
+    `in:sent` lane does the same for mail). The valve consults this so a held ask is never promoted
+    after the user answered it themselves (Day-9 simulation, Sep 2026: Ben asked at 09:00 during a
+    board meeting, the user replied at 09:31, the valve delivered "From earlier — Ben asked 2h ago"
+    at 11:00 and spent a budget unit doing it)."""
+    out: dict = {}
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(entry, dict) or _s(entry.get("verdict_class")) != "signal":
+            continue
+        ev = entry.get("event") if isinstance(entry.get("event"), dict) else None
+        if not ev or _is_group(ev):
+            # The user speaking in a GROUP is not an answer to the mention that was held there —
+            # a busy room would otherwise kill every held ask from it, permanently.
+            continue
+        ts = _event_instant(entry, ev)
+        if ts is None:
+            continue
+        key = _thread_key(ev)
+        if key not in out or ts > out[key]:
+            out[key] = ts
+    return out
+
+
+def _event_instant(entry: dict, ev: dict):
+    """When an event happened, as an aware UTC datetime: the Bridge's ISO `timestamp`, else a mail
+    event's `date` (Gmail's RFC-2822 header, or the epoch-ms `internalDate` the poll falls back
+    to), else the instant the entry was queued. None only when nothing parses."""
+    ts = _parse_ts(_s(ev.get("timestamp")))
+    if ts is None:
+        raw = _s(ev.get("date")).strip()
+        ts = _parse_ts(raw)
+        if ts is None and raw.isdigit():
+            try:
+                ts = datetime.fromtimestamp(int(raw) / 1000.0, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                ts = None
+        if ts is None and raw:
+            try:
+                ts = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, IndexError):
+                ts = None
+    if ts is None:
+        ts = _parse_ts(_s(entry.get("ts")))
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _user_spoke_since(entry: dict, ev: dict, answered: dict) -> bool:
+    """Did the user speak on this entry's thread AFTER the entry's event? Fail toward promoting
+    (an unparseable event time is not evidence the user answered)."""
+    if not answered:
+        return False
+    spoke = answered.get(_thread_key(ev))
+    if spoke is None:
+        return False
+    ts = _event_instant(entry, ev)
+    return ts is not None and spoke > ts
+
+
+def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int,
+                     answered: dict | None = None):
     """The promotable core of ONE queue entry, or None. THE single definition of "promotable", used
     by the valve's scan and by --promote so the two can never disagree: a demoted-agent class
     (PROMOTABLE_CLASSES), a KNOWN sender, a real event, an age inside the window ("meeting_hold"
-    exempt — an ask Sotto itself held is never too old to deliver), and a clear per-thread cooldown
-    (COOLDOWN_EXEMPT_CLASSES skips that, as in triage()). Budget accounting stays with the caller:
-    the valve spends a running allowance across a tick, --promote spends exactly one."""
+    exempt — an ask Sotto itself held is never too old to deliver), a clear per-thread cooldown
+    (COOLDOWN_EXEMPT_CLASSES skips that, as in triage()), and — `answered`, from _answered_threads —
+    no later word from the user on the same thread: never promote a held ask the user has spoken
+    on since it was held. Budget accounting stays with the caller: the valve spends a running
+    allowance across a tick, --promote spends exactly one."""
     if not isinstance(entry, dict):
         return None
     cls = _s(entry.get("verdict_class"))
@@ -1601,6 +1675,8 @@ def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int
             qts = qts.replace(tzinfo=timezone.utc)
         age = max(0.0, (now_utc - qts).total_seconds() / 60.0)
     if age > max_age and cls != "meeting_hold":
+        return None
+    if _user_spoke_since(entry, ev, answered or {}):
         return None
     key = _thread_key(ev)
     if held not in COOLDOWN_EXEMPT_CLASSES and not _cooldown_ok(key, now_ts):
@@ -1693,6 +1769,7 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
         # interrupt. The first non-exempt promotion spends the day's unit (atomically); the second
         # rides it free. `budget_snapshot` is diagnostic only — the real check is the spend.
         budget_snapshot = _budget_left(day)
+        answered = _answered_threads(lines)
         promoted, promoted_idx, charged, budget_blocked = [], set(), False, False
         for i, line in enumerate(lines):     # oldest first — FIFO fairness for the longest-held ask
             if len(promoted) >= cap:
@@ -1704,9 +1781,10 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
             if not isinstance(entry, dict):
                 continue
             # PROMOTABLE_CLASSES / known sender / age window (meeting_hold exempt: an ask Sotto
-            # itself held is never too old to deliver) / per-thread cooldown — all of it in
-            # _valve_candidate, which --promote applies to the one entry the user picked.
-            cand = _valve_candidate(entry, now_utc, now_ts, max_age)
+            # itself held is never too old to deliver) / the user hasn't answered it since /
+            # per-thread cooldown — all of it in _valve_candidate, which --promote applies to the
+            # one entry the user picked.
+            cand = _valve_candidate(entry, now_utc, now_ts, max_age, answered)
             if cand is None:
                 # The one check the shared helper can't make: budget is a running allowance here.
                 if (_s(entry.get("verdict_class")) in PROMOTABLE_CLASSES and not charged
@@ -1800,6 +1878,8 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
             entry = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             entry = None
+        # No `answered` here on purpose: the valve's automatic pick skips an ask the user has
+        # spoken on since, but a user who TAPS promote has said what they want.
         cand = _valve_candidate(entry or {}, now_utc, now_ts, max_age)
         if cand is None:
             return {"ok": False, "error": "not_promotable",

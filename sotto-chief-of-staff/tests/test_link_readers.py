@@ -243,3 +243,83 @@ def test_skills_document_both_readers():
         ev = f.read()
     assert "web_research.py\" --url" in ev
     assert "Never `docsend_fetch.py`" in ev                    # chat-only, stated where agents read
+
+
+def test_a_docsend_link_routes_to_the_reader_from_the_persona_and_the_skill_description():
+    """Sep 4, 2026, live channel: asked "is DocSend working? <link>" then "can you get the pdf?",
+    the agent ran an inline `python3 -c` urllib request against docsend.com (the security scan
+    flagged it) and then reported "I can't pull the PDF directly" — while docsend_fetch.py, which
+    saves the PDF and the dashboard serves, sat unused. Two seams: the persona's hard rules name
+    the tool and ban hand-fetching a URL, and `sotto-ask`'s description mentions DocSend so the
+    skill that documents the reader is the one that loads for a deck link."""
+    persona = os.path.join(ROOT, "..", "adapters", "hermes", "sotto-persona.md")
+    with open(persona, encoding="utf-8") as f:
+        soul = f.read()
+    rule = soul[soul.index("A link is read by its reader"):]
+    rule = rule[:rule.index("Never loop on failure")]
+    assert "docsend_fetch.py\" --url" in rule and "docsend.com/view/" in rule
+    assert "/api/decks/<view_id>.pdf" in rule                # the reply carries where the PDF is
+    assert "python3 -c" in rule and "urllib" in rule and "curl" in rule   # the hand-fetch ban
+    assert "can't pull the PDF" in rule                       # the false report is named
+    assert "web_research.py --url" in rule.replace("`", "")   # every other link has a reader too
+    with open(os.path.join(ROOT, "ask", "SKILL.md"), encoding="utf-8") as f:
+        head = f.read().split("---")[1]
+    assert "docsend.com/view/" in head and "docsend_fetch.py" in head
+
+
+# DocSend's gate as served on Sep 3, 2026 (field names verbatim from the owner's container; values
+# invented). The hidden `_method` is what Rails routes the form by — a POST without it 404s.
+REAL_GATE_PAGE = (
+    '<html><head><title>Dream Deck | DocSend</title>'
+    '<meta name="csrf-token" content="meta-tok"></head><body>'
+    '<form class="js-doc-chat-form" id="feedback-form" data-type="json" '
+    'action="/view/7h2ygycypj4uw79n/feedback" method="post">'
+    '<input name="feedback[message]"><input name="feedback[sender_email]"></form>'
+    '<form class="js-email-sniffing-auth-form" id="new_link_auth_form" '
+    'action="/view/7h2ygycypj4uw79n" accept-charset="UTF-8" method="post">'
+    '<input type="hidden" name="_method" value="patch">'
+    '<input type="hidden" name="authenticity_token" value="form-tok-2026">'
+    '<input type="hidden" name="link_auth_form[email_sniffing][email_polling_id]" value="">'
+    '<input type="hidden" name="link_auth_form[email_sniffing][email_polling_start]" value="">'
+    '<input type="hidden" name="link_auth_form[email_sniffing][email_polling_complete]" value="false">'
+    '<input type="hidden" name="link_auth_form[email_sniffing][email_submitted_at]" value="">'
+    '<input type="hidden" name="link_auth_form[timezone_offset]" value="">'
+    '<input type="email" name="link_auth_form[email]" value="">'
+    '</form></body></html>')
+
+
+class RealGateHttp(FakeHttp):
+    def __init__(self):
+        super().__init__()
+        self.post_urls = []
+
+    def get(self, url, accept="text/html"):
+        if self.gated and not self.unlocked and "/page_data/" not in url and not url.startswith("https://img/"):
+            return REAL_GATE_PAGE.encode()
+        return super().get(url, accept)
+
+    def post_form(self, url, fields, referer):
+        self.post_urls.append(url)
+        return super().post_form(url, fields, referer)
+
+
+def test_docsend_gate_is_posted_as_docsend_wrote_it(monkeypatch):
+    """Sep 3, 2026: the gate 404'd because DocSend had added a hidden `_method` (and four
+    email-sniffing fields) the hand-built field list never sent. The form is now parsed and posted
+    with every hidden input it carries, at the action it names — so the next added field rides
+    along instead of breaking the reader. The feedback form on the same page is not the gate."""
+    monkeypatch.setenv("SOTTO_TIMEZONE", "America/Los_Angeles")
+    http = RealGateHttp()
+    out = df.fetch_deck("https://docsend.com/view/7h2ygycypj4uw79n", "nikunj@fpv.com", http=http,
+                        vision=lambda images, title: "SUMMARY: Dream builds X.")
+    assert out["status"] == "ok", out
+    assert http.post_urls == ["https://docsend.com/view/7h2ygycypj4uw79n"]
+    (fields,) = http.posts
+    assert fields["_method"] == "patch" and fields["authenticity_token"] == "form-tok-2026"
+    assert fields["link_auth_form[email]"] == "nikunj@fpv.com"
+    assert fields["link_auth_form[email_sniffing][email_polling_complete]"] == "false"
+    assert fields["link_auth_form[timezone_offset]"] in ("420", "480"), "what the gate's JS would send"
+    assert not any(k.startswith("feedback") for k in fields)
+    # the older markup (no <form action>, token only) still posts to the view URL
+    action, parsed = df._gate_form(GATED_PAGE)
+    assert action == "" and parsed["authenticity_token"] == "form-tok"

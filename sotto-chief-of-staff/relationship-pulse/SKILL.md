@@ -29,12 +29,19 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
 > **Script path:** use the absolute path —
 > `python3 "$HOME/.hermes/skills/sotto/relationship-pulse/scripts/relationship_pulse.py"`.
 
-1. **Gather a wide window** — call the Bridge `read_local(since_hours=1008)` (≈6 weeks). This is the
-   one input; it gives the message/call history the cadence math needs. Save it to `/tmp/sotto_local_6w.json`.
-   (If the Bridge is unreachable, say so in one line and stop — there's nothing to compute without local history.)
+1. **Gather a wide window, both halves.** Messages and calls: call the Bridge
+   `read_local(since_hours=1008)` (≈6 weeks) and save it to `/tmp/sotto_local_6w.json`. Email, the
+   other half of a relationship — `execute_code`:
+   ```bash
+   python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py" --window-days 42 \
+     --bodies 0 --max 300 --sent-max 300 --skip-stale --skip-calendar --gmail-out /tmp/sotto_pulse_gmail.json
+   ```
+   (If the Bridge is unreachable, say so in one line and run on email alone; if Google isn't
+   connected, run on messages alone. Only when BOTH are missing is there nothing to compute — say so
+   in one line and stop.)
 2. **Compute** — `execute_code`:
    ```bash
-   python3 "$HOME/.hermes/skills/sotto/relationship-pulse/scripts/relationship_pulse.py" /tmp/sotto_local_6w.json
+   python3 "$HOME/.hermes/skills/sotto/relationship-pulse/scripts/relationship_pulse.py" /tmp/sotto_local_6w.json --gmail /tmp/sotto_pulse_gmail.json
    ```
    It prints JSON: `attention_queue[]`, `relationship_insights[]`, `lapsed[]`, `pulse_markdown`. It
    also writes `$SOTTO_DATA/knowledge/relationship_state.json` so the **daily brief** can surface the same
@@ -56,7 +63,10 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
 
 ## Notes
 - **Known contacts only.** People who only ever showed up as a raw phone number / shortcode are
-  excluded (same is_known_contact filter as the brief) — this is about real relationships.
+  excluded (same is_known_contact filter as the brief) — this is about real relationships. Email
+  follows the same gate: a mail counts as a touch only when the other address is in your Contacts
+  or your people graph, never a stranger's or a no-reply address, and a mail you sent is a touch to
+  each recipient.
 - **Cadence, not just recency.** "Going quiet" means the *interval* between contacts is growing for
   someone you used to talk to regularly — not merely that it's been a few days. Someone you ping
   monthly won't be flagged at day 20.

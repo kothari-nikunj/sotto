@@ -64,8 +64,10 @@ _shared/
   lib/render_local.py                # per-source formatSourceForLLM-style renderers
   lib/sotto_log.py                   # shared diagnostics -> stderr + $SOTTO_DATA/logs/compose_brief.log
   lib/textutil.py                    # string/identifier/domain normalization primitives
-  lib/timeutil.py                    # timezone/date/timestamp helpers
+  lib/timeutil.py                    # timezone/date/timestamp helpers (delegates the zone to tzchain)
+  lib/tzchain.py                     # THE timezone chain (SOTTO_TIMEZONE → TZ → settings.json → UTC) — one file, vendored into runtime/trigger-receiver/ by the Dockerfile
   scripts/compose_brief.py           # the FLEX extraction engine + critic + tap-links + escalation (PORT: gemini-flex.ts/brief-critic.ts/generate.ts)
+  scripts/learn_step.py              # the brief's Learn step as ONE command: six memory writers in order + a receipt the receiver checks
   scripts/gather_google.py           # deterministic Gmail+Calendar gather (CLI or MCP normalize)
   scripts/gather_granola.py          # deterministic Granola gather (MCP lane + REST break-glass)
   scripts/google_action.py           # the WRITE side of google-workspace (Gmail draft/send, calendar writes)

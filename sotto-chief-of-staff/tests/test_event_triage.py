@@ -720,6 +720,66 @@ def test_valve_respects_thread_cooldown_at_promotion_time(tmp_path, monkeypatch)
     assert len(_queue_entries(tmp_path)) == 1                  # rowid 2 still queued
 
 
+def test_the_valve_never_promotes_an_ask_the_user_answered_since_it_was_held(tmp_path, monkeypatch):
+    """Day 9: Ben asks at 09:00 during a board meeting (held: meeting_hold); the user replies from
+    their phone at 09:31 and the Bridge pushes that outbound row through the funnel as a `signal`
+    on the same thread. At 11:00 the valve used to deliver "From earlier — Ben asked 2h ago" and
+    spend a budget unit on an ask the user closed 90 minutes ago. The queue's own signal rows are
+    the evidence; a later word from the user on the thread drops the candidate."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    ben, dhruv = "+14155551234", "+14155559999"
+    reply = _im("sure, Thursday works", handle=ben, rowid=9, is_from_me=True,
+                timestamp="2026-08-06T10:31:00Z")
+    _seed_queue(tmp_path, [
+        _q("meeting_hold", rowid=1, handle=ben, held="actionable"),
+        {"ts": "2026-08-06T10:31:05Z", "verdict_class": "signal", "sender": "Sarah Chen", "event": reply},
+        _q("cooldown", sender="Dhruv Patel", rowid=3, handle=dhruv),
+    ])
+    out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
+    assert out["verdict"] == "agent"
+    assert [e["event"]["rowid"] for e in out["bundle"]["events"]] == [3]   # Ben's ask never promoted
+    # the same rule for the dashboard's one-item promote
+    lines = (tmp_path / "events" / "queue.jsonl").read_text().splitlines()
+    answered = te._answered_threads(lines)
+    assert te._valve_candidate(_q("meeting_hold", rowid=1, handle=ben, held="actionable"),
+                               VALVE_NOW_UTC, VALVE_NOW_TS, 240, answered) is None
+    # a signal from BEFORE the ask is not an answer to it
+    earlier = dict(reply, timestamp="2026-08-06T09:00:00Z")
+    before = te._answered_threads([json.dumps({"ts": "2026-08-06T09:00:05Z", "verdict_class": "signal",
+                                               "sender": "Sarah Chen", "event": earlier})])
+    assert te._valve_candidate(_q("cooldown", rowid=1, handle=ben), VALVE_NOW_UTC, VALVE_NOW_TS,
+                               240, before) is not None
+    # …the dashboard's explicit promote is the user's call, and ignores the heuristic
+    assert te._valve_candidate(_q("meeting_hold", rowid=1, handle=ben, held="actionable"),
+                               VALVE_NOW_UTC, VALVE_NOW_TS, 240) is not None
+
+
+def test_an_email_you_sent_counts_as_an_answer_and_a_group_message_does_not(tmp_path):
+    """The Gmail poll's in:sent lane queues the user's own mail as a signal with Gmail's RFC-2822
+    `date` (or an epoch-ms internalDate), not the Bridge's ISO timestamp — an email answer must
+    still count. And the user talking in a GROUP is not an answer to the mention held there."""
+    inbound = {"source": "email", "rowid": "m1", "threadId": "t99", "from": "Ben <ben@acme.com>",
+               "subject": "Thursday?", "date": "Wed, 06 Aug 2026 10:00:00 -0700"}
+    sent = {"source": "email", "rowid": "m2", "threadId": "t99", "from": "Me <me@example.com>",
+            "to": "ben@acme.com", "is_from_me": True, "date": "Wed, 06 Aug 2026 10:31:00 -0700"}
+    entry = {"ts": "2026-08-06T17:00:05Z", "verdict_class": "cooldown", "sender": "Ben",
+             "event": inbound}
+    answered = te._answered_threads([json.dumps({"ts": "2026-08-06T17:31:05Z", "verdict_class": "signal",
+                                                 "sender": "Ben", "event": sent})])
+    assert set(answered) == {"email:t99"}
+    assert te._user_spoke_since(entry, inbound, answered) is True
+    # epoch-ms internalDate parses too
+    ms = dict(sent, date=str(int(datetime(2026, 8, 6, 17, 31, tzinfo=timezone.utc).timestamp() * 1000)))
+    answered_ms = te._answered_threads([json.dumps({"ts": "x", "verdict_class": "signal", "sender": "Ben",
+                                                    "event": ms})])
+    assert te._user_spoke_since(entry, inbound, answered_ms) is True
+    # a group signal is skipped entirely
+    grp = _im("on it", handle="+14155551234", rowid=5, is_from_me=True, is_group_chat=True,
+              chat_guid="g-room", timestamp="2026-08-06T10:31:00Z")
+    assert te._answered_threads([json.dumps({"ts": "2026-08-06T10:31:05Z", "verdict_class": "signal",
+                                             "sender": "Sarah Chen", "event": grp})]) == {}
+
+
 # ── Cross-thread daily interrupt budget (Editor Step 2 §1) ────────────────────────────────────────
 
 NEXT_DAY = datetime(2026, 8, 7, 11, 0)      # same wall-clock hour, one local day later

@@ -72,6 +72,9 @@ def apply(req: dict) -> dict:
         source = "per_person"
 
     if confirmed:
+        # Newest first: `confirmed` is appended to, so list order is oldest-first and the four quoted
+        # would otherwise freeze on the first four ever confirmed.
+        confirmed.sort(key=lambda s: str(s.get("confirmed_at") or ""), reverse=True)
         parts += _quote(confirmed, 4, "Drafts the user has shipped before (highest signal)")
         if source == "bucket":
             source = "confirmed"
@@ -107,10 +110,9 @@ def apply(req: dict) -> dict:
         parts.append("\n### Voice guardrails")
         parts += g
 
-    prefs = style.get("preferences") or []
-    if prefs:
-        parts.append("\n### Learned preferences (from past edits)")
-        parts += [f"- {p}" for p in prefs]
+    # (style.json's `preferences` list — "learned preferences from past edits" — is carried forward
+    # by the extractor but has NO writer; the edit-diff arc is still open. Nothing is rendered from
+    # it here: a prompt section with no producer is dead real estate on the drafter's hottest path.)
 
     if source == "bucket" and len(parts) == 1:
         # Nothing learned yet — give a minimal honest instruction.

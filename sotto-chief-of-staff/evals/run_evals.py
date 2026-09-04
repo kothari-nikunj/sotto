@@ -371,10 +371,13 @@ def chk_edge_malformed_untouched(r):
 
 def chk_edge_muted_person(r):
     p = r["prompt"]
-    ok = ("going quiet for three weeks" not in p) and ("waiting five days on the proposal" in p) \
+    # A muted person is removed from the DATA: his attention-queue reason AND his 1:1 thread are
+    # both gone before the model sees anything; the restated mute is belt-and-braces for prose.
+    ok = ("going quiet for three weeks" not in p) and ("we shipped it" not in p) \
+        and ("waiting five days on the proposal" in p) \
         and ("Do NOT surface or flag these people anywhere in the brief: Bob Vance" in p)
     return ("muted_person_suppressed", ok,
-            "Bob(reason) present OR Carol(reason) absent OR restated-mute missing")
+            "Bob(reason or thread) present OR Carol(reason) absent OR restated-mute missing")
 
 
 def chk_edge_expired_loop(r):
@@ -391,7 +394,7 @@ def chk_edge_empty_google_coverage(r):
 
 
 def chk_edge_unicode(r):
-    needles = ["🎉", "你好", "会議"]
+    needles = ["🙏", "会議", "😊"]      # (the 🎉/你好 message is Bob Vance's, and Bob is muted)
     missing = [n for n in needles if n not in r["prompt"]]
     return ("unicode_preserved", not missing, f"unicode dropped from prompt: {missing}")
 

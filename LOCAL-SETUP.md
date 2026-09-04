@@ -55,7 +55,9 @@ rebuild — the terminal grant doesn't.) Verify:
 # the installed app:
 "/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged" --doctor
 ```
-One line per source: `ok (N rows readable)` means that source works; `needs Full Disk Access` means
+One line per source: `ok (N rows readable)` means that source works — the count is rows seen in a
+fixed 6-hour probe window, not a lifetime total, so `ok (0 rows readable)` for a source you haven't
+used since lunch is still `ok`; `needs Full Disk Access` means
 the grant above didn't take (the exact fix is printed at the bottom); `unavailable` just means that
 app isn't on this Mac. The command exits 0 only when every enabled source is `ok` (or `disabled`), so
 an `unavailable` source makes it exit non-zero too — read the per-source lines before assuming trouble:

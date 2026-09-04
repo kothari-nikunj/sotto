@@ -201,8 +201,8 @@ to connect!" never earns an interrupt.
   launch announcement, a mention in a document, or someone *answering* you is news, not a debt, and
   never opens a loop. Three of those tests need no judgment and are enforced in code rather than
   asked of the model — a row with no summary, a row that names nobody, and a counterpart that is a
-  no-reply/notifications/billing address (the same "is this automated?" rule the event funnel drops
-  senders by). The rest — is this an ask or an FYI? — is the extraction prompt's job, because it is
+  no-reply/notify/notifications/newsletter/billing address (the same "is this automated?" rule the
+  event funnel drops senders by — a mailbox named for what it emits is nobody). The rest — is this an ask or an FYI? — is the extraction prompt's job, because it is
   a question about what a message *means*, and a keyword rule pretending otherwise would drop real
   asks. Rows already on your volume that name nobody are closed on the next pass for the same
   reason: they can never be resolved, chased, or told apart from each other.
@@ -235,15 +235,46 @@ to connect!" never earns an interrupt.
   when the brief's own tap marker carries that person's identifier, not when their name appears in a
   sentence. Two people share a first name; a line about one of them must never silence the other's
   overdue ask, and "Maya" in a paragraph is not proof that Maya Chen was told. The same fact governs
-  the chase: a nudge is held back only when today's brief actually named *that* loop.
+  the chase, with one exception: only a **first** chase (nothing chased yet on that loop) is held
+  back when today's brief already named it — a loop chased once is urgent by contract and the brief
+  names it every day afterwards as a still-open line, so treating that as "already told you" a
+  second time would mean the loop never reached its two chases or the hand-off question.
+- **An email you sent that nobody answered is a debt owed to you** — the gather asks Gmail, for
+  each thread you wrote on 3 to 14 days ago, whether the last word is still yours (20 threads at
+  most, the same 3-day clock the chase uses), and the composer mints a `waiting_on` for each one
+  that went to somebody in your contacts or your graph. Never for a stranger, a no-reply address,
+  an intro you made for two other people, or a two-word thanks. The row is dated the day you wrote,
+  so the first chase ripens on the silence that already happened.
+- **They replied, they just haven't delivered** — any inbound from the counterpart of something
+  you're owed (a text, an email on the thread, a call — answered or missed) restarts that loop's
+  chase clock without counting a chase: to the date they named ("by Friday", "the 16th of July",
+  "tomorrow", "end of week"), else the usual 3 days. Only substance closes the loop.
+- **A meeting you declined is not on your day; a meeting you haven't answered is an ask** — the
+  gather reads your own answer to each invite. A declined event never reaches the brief, a research
+  call, the prep nudge, or the in-meeting hold. An unanswered invite with somebody else on it
+  becomes an `rsvp` ask once it is within 48 hours — minted by code, and closed by the calendar
+  (you answer, or it passes), never a ledger row.
+- **A debt you owe closes on your own outbound, on any channel** — an outgoing iMessage, WhatsApp,
+  **email**, or call to that person, or a meeting with them now on the books, closes the loop before
+  the brief is composed; the resolver reads your sent mail off the gather's own `in:sent` lane, not
+  off a list the agent remembered to write. **Never tell you twice** is then measured, not
+  requested: a person Sotto already nudged you about today (a delivered nudge, correlated by id to
+  the channel's receipt) never opens the model's draft and takes **at most 2 lines** in it — one
+  status line, plus a Coming Up mention — and the validator hands a violation to the critic's
+  revise pass (the lines the composer itself appends afterwards, the still-open backstop and the
+  receipts, are read from the record, not written by the model, and are not counted).
 - **What you owe expires quietly; what you're owed gets chased** — an open loop you owe drops off
   after 7 silent days, but something you're *waiting on* never expires: it closes the moment they
   actually deliver (a substantive reply — a link, a file, or real text, never a bare "ok" or a
   promise to send it later), or after `SOTTO_CHASE_AFTER_DAYS` (default 3) of silence it becomes one
   short, warm chase — at most one chase nudge a day, at most 2 per item. A chase is only counted
   once it is actually delivered, so one that quiet hours or a snooze swallowed is not one of your
-  two. After the second, Sotto stops and asks you plainly, by name: *"I've nudged Maya twice about
-  the contract — nudge her again, or let it go?"* — **once**. That question is asked one time (it is
+  two — and a chase that was stamped but never delivered sends that loop to the back of the next
+  day's pick (`chase_stalls`), so one perpetually-blocked loop cannot hold the whole chase lane.
+  After the second, Sotto stops and asks you plainly, by name: *"I've nudged Maya twice about
+  the contract — nudge her again, or let it go?"* — **once**, and **on its own clock**: the question
+  is asked the first watcher tick it comes due (outside the two hours after a brief, which carried
+  the loop), never behind the tidy-up offer's weekly cooldown. That question is asked one time (it is
   stamped on the loop when it is delivered, on the same rule as the chase), and from then on the
   loop stops taking a line in every brief: you have been asked, so it waits in the count line and on
   `/app#loops` until you resolve it, drop it, or say keep waiting — which restarts its chases and
@@ -254,17 +285,30 @@ to connect!" never earns an interrupt.
 | | When | What |
 |---|---|---|
 | Morning brief | 6:30 local (or the moment your Mac wakes past 7am) | your day across messages, email, calendar, plus open loops. One per day, always: if your Mac slept through 6:30 the brief still goes out from the last saved snapshot, and when the Mac wakes later its fresh data is folded into that snapshot instead of composing a second brief — the nudges and the midday digest surface whatever the morning brief couldn't see |
-| Evening brief | 17:30 local | accountability, tomorrow, post-meeting follow-up drafts, and a **What moved today** block — chases delivered, loops closed, interruptions held, people prepped, follow-ups offered, named where the record has a name. Outcomes only; nothing moved means no block, and it will never tell you how many emails it read. Plus at most one *"make that a standing rule?"* confirmation when today's transcripts showed you stating one — your yes writes it to the master file; it is never written unconfirmed |
+| Evening brief | 17:30 local | accountability, tomorrow, post-meeting follow-up drafts, and a **What moved today** block — chases delivered, loops closed, interruptions held, people prepped, follow-ups offered, named where the record has a name. Outcomes only; nothing moved means no block, and it will never tell you how many emails it read. Plus **at most one question**: a *"make that a standing rule?"* confirmation when today's transcripts showed you stating one — your yes writes it to the master file; it is never written unconfirmed — or, on an evening with no such rule, *"you keep dismissing Bob's items — stop bringing them up?"* when the learner has seen you dismiss someone's items three times (asked about one person at most once every 30 days; your yes mutes them through the same command "mute Bob" runs) |
 | Midday digest | 12:30 local | everything queued **since the last delivered brief** — and only if there are at least `SOTTO_DIGEST_MIN` (default 8) real signals from people you know; otherwise silent. Nudges Sotto raised itself never count toward that 8 (they aren't people), though they may ride along in the message |
-| Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself), every other channel gets a one-tap link |
-| Proactive nudges | a meeting starting in ~45 min you haven't prepped, a commitment due today, one chase for something you're owed, a birthday (`SOTTO_BIRTHDAY_LEAD_DAYS`, default 3, days out and on the day — unless a brief already delivered today), a plain question about an ask nobody answered twice, an offer to tidy a heavy pile | the same thing — and the whole push spends **one** unit of the same daily budget, queues to the same digest when it's gone, waits out the same mutes and in-meeting hold, and lands in the same ledger |
+| Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself; a `mailto:` is removed at the delivery seam, so one can never reach you from a scheduled run), every other channel gets a one-tap link |
+| Proactive nudges | a meeting starting in ~45 min you haven't prepped (the nudge **carries** the prep — who they are from your graph and the one thing open with them — rather than asking whether to do it), a commitment due today, one chase for something you're owed, a birthday (`SOTTO_BIRTHDAY_LEAD_DAYS`, default 3, days out and on the day — unless a brief already delivered today), a plain question about an ask nobody answered twice, an offer to tidy a heavy pile | the same thing — and the whole push spends **one** unit of the same daily budget, queues to the same digest when it's gone, waits out the same mutes and in-meeting hold, and lands in the same ledger |
+| Weekly pulse | Mondays 9:00 local | who is waiting on you and who is going quiet, from six weeks of messages, calls **and email** (a mail you sent is a touch to each recipient, a mail you received a touch from its sender — for people in your Contacts or graph only), with the people you've fully lost touch with ranked below |
 
-The digest window is anchored to the brief that actually *delivered* — the deliver-once claim
-advances the stamp when it wins (`brief_marker.py` on a local install; the receiver's send seam on
-the cloud, where the claim happens at the moment of delivery) — so the 12:30 digest can never
-repeat what the morning brief just covered. Briefs and nudges are always **drafts**; Sotto never sends for you — a
+The digest window is anchored to the brief the channel actually *acknowledged*: on a local,
+in-agent install `brief_marker.py`'s claim also advances the stamp; on the receiver (the cloud, and
+every self-hosted deploy) the claim only decides who sends, and the stamp moves on the channel's ACK
+(`receiver._on_delivered`), because a claimed brief whose send then fails and retries into the
+afternoon must not hide the morning from the 12:30 digest — so the digest can never repeat what
+the morning brief just covered. A brief also has to have **learned**: its Learn step is **one
+command** (`learn_step.py`) that runs the six memory writers and leaves a receipt
+(`briefs/<date>.<kind>.learned.json`), and a brief that delivers without one is logged as a brief
+that did not learn. Briefs and nudges are always **drafts**; Sotto never sends for you — a
 Gmail draft is the most literal version of that promise, since it sits in your own drafts folder
 until you press send.
+
+A short reply to any of these lands on the question that was asked, not on whatever this chat last
+mentioned: the lane that asks writes the question down (`pending_offer`), and the chat session that
+receives "sure" — or "done", "handled", "let it go", "drop it" — reads it back first. A nudge about
+a loop carries that loop's anchor, so "done" resolves and "let it go" drops *that* loop by identity,
+never by matching a name against the conversation. The first brief you ever get is always given the
+critic's second pass, whatever its size — it is the one you judge Sotto on.
 
 ## Delivery — what happens after Sotto decides to say something
 
@@ -283,7 +327,9 @@ paths compose your morning and evening brief — the schedule and the Mac's wake
 belongs to whichever of them gets to the marker first. **Both are the same lane now:** the schedule
 lives where it always did (`crons.json`), but the receiver fires it on its own clock rather than the
 agent's, so a scheduled brief is written down before the first send attempt and retried like
-everything else — the 6:30 brief no longer disappears because the channel was down at 6:30.
+everything else — the 6:30 brief no longer disappears because the channel was down at 6:30. A
+scheduled run that dies mid-compose is **re-fired once** the same day; a second death stays a loud
+failed row, never a loop.
 That marker used to be claimed only because
 the skill was told to; on August 30 a run wasn't listening and the evening brief arrived twice, so
 the claim now lives in the machinery every message passes through rather than in an instruction.
@@ -354,14 +400,15 @@ One sentence per family:
 | What Sotto **sent** on your behalf (`events/sends.jsonl`) | **180 days** | the authorization trail for outbound acts, kept twice as long as anything else on purpose |
 | Delivery receipts, triage verdicts, dashboard writes | **90 days** | "did it land?" and "why wasn't I nudged?" are questions about last week, not last year |
 | Drafts Sotto offered you | **30 days** | matched to what you sent within a day; a month is learning, longer would be an archive of things you didn't say |
-| Delivered briefs and their per-day markers | **60 days** | the same clock as the snapshot each was built from |
+| Delivered briefs, their per-day markers, and each one's Learn receipt (`learned.json`) | **60 days** | the same clock as the snapshot each was built from |
 | Staged payloads and a crashed run's leftovers | **7 days** | read by the run they were staged for; a week collects the ones whose run died |
 | The nudge-dedup stamps | **30 days** | only today's is ever read |
 | What you did with each draft (`outcomes.jsonl`) | **90 days** | the learning loop re-reads the whole file after every brief; a quarter is all it can use |
 | The brief log | **last 5 MB** | truncated in place, because a running brief holds it open |
 
 **Nothing in your memory is ever auto-deleted.** The graph (people, companies, `master.md`), the
-continuity ledger, your style profile, your preferences, the golden corpus, your credentials and any
+continuity ledger, your style profile (self-capped by its writer — the drafts-you-shipped bucket
+keeps its newest 20 per register), your preferences, the golden corpus, your credentials and any
 deck you asked Sotto to read are never a sweep target — the guard is checked per path, below every
 rule, so a future mistake in the table still cannot reach them. Deleting *that* is a decision you
 make about your own graph, which is why it belongs to the graph's editor and to `forget.py`, not to

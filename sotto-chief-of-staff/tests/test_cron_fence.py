@@ -104,12 +104,20 @@ def test_reconciler_replaces_system_jobs_and_retired_jobs(tmp_path):
 
 
 def test_receiver_run_jobs_are_removed_from_hermes_but_never_created(tmp_path):
-    """The briefs are `runner: receiver` jobs: the trigger receiver schedules and delivers them, so
-    Hermes must never hold a registration for one. They stay in the REMOVAL markers, which is what
-    strips an existing deployment's stale Hermes brief crons on the next boot — no manual step."""
+    """The briefs, the proactive watcher and the midday digest are `runner: receiver` jobs: the
+    trigger receiver schedules and delivers them, so Hermes must never hold a registration for one.
+    The watcher and the digest moved here on Sep 4, 2026, the morning Hermes' scheduler delivered
+    the literal `NO_NUDGES` token — the silence seam is receiver-side, so a lane that can end with
+    nothing has to be a receiver lane. They all stay in the REMOVAL markers, which is what strips an
+    existing deployment's stale Hermes crons on the next boot — no manual step."""
     spec = json.load(open(CRONS_JSON))
     receiver_run = {row["name"] for row in spec if row.get("runner") == "receiver"}
-    assert receiver_run == {"sotto-morning-brief", "sotto-evening-brief"}
+    assert receiver_run == {"sotto-morning-brief", "sotto-evening-brief",
+                            "sotto-proactive", "sotto-midday-digest"}
+    # the only shapes the receiver's tick can read: fixed daily or a */N interval
+    for row in spec:
+        if row.get("runner") == "receiver":
+            assert re.match(r"\A(\d+ \d+|\*/\d+ \*) \* \* \*\Z", row["schedule"]), row
     _, calls, remaining = _run_reconcile(tmp_path)
     created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
     assert not (created & receiver_run)
@@ -118,12 +126,21 @@ def test_receiver_run_jobs_are_removed_from_hermes_but_never_created(tmp_path):
     assert {"remove a1b2c3d4e5f6", "remove b1b2c3d4e5f6"} <= set(calls)
 
 
-def test_reconciler_honors_gates_and_schedule_source(tmp_path):
-    _, calls, _ = _run_reconcile(tmp_path, listing="(no scheduled jobs)\n",
-                                  extra_env={"SOTTO_DIGEST": "0", "SOTTO_PROACTIVE_CRON": "*/30 * * * *"})
-    created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
-    assert "sotto-midday-digest" not in created
-    assert "sotto-proactive" in created
+def test_reconciler_honors_gates_and_schedule_source(monkeypatch):
+    """`gate` and `schedule_env` are honored by the ONE reader every registrar shares — the
+    receiver's tick, which now fires the gated jobs, reads exactly this list."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cron_fence_reconciler", RECONCILER)
+    reconciler = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reconciler)
+    monkeypatch.setenv("SOTTO_DIGEST", "0")
+    monkeypatch.setenv("SOTTO_PROACTIVE_CRON", "*/30 * * * *")
+    jobs = {name: schedule for name, schedule, _p, _s
+            in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}
+    assert "sotto-midday-digest" not in jobs
+    assert jobs["sotto-proactive"] == "*/30 * * * *"
+    assert [n for n, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER)] \
+        == ["sotto-relationship-pulse"]
 
 
 def test_start_sh_calls_the_shared_reconciler():

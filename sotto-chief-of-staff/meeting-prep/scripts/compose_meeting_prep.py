@@ -353,6 +353,8 @@ def _upcoming(inputs: dict) -> list:
     now = datetime.now(timezone.utc)
     upcoming = []
     for e in _arr(google, "events"):
+        if _s(e.get("my_response")).lower() == "declined":
+            continue                  # a meeting you declined is not one you prep for
         start = _s(e.get("start"))
         st = _parse_ts(start)
         if st is not None:

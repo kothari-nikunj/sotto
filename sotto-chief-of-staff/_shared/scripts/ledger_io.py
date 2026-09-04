@@ -70,7 +70,7 @@ SCHEDULING_TYPES = {"schedule", "reschedule", "propose_times", "rsvp"}
 # this loop's chase story over", and a list that is clipped in one caller and not the other leaves a
 # loop that can never be chased again or one that is never asked about twice.
 CHASE_STATE_FIELDS = ("chased_count", "chase_after", "last_chased_at", "chase_pending",
-                      "handoff_asked_at", "chase_stalls")
+                      "handoff_asked_at", "chase_stalls", "last_heard_at")
 
 # The OTHER row-level predicate lives one directory over, in `_shared/lib/brief_validate.is_urgent`
 # (overdue / due within 24h / already chased) — it belongs to the BRIEF's contract about which loops

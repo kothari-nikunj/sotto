@@ -180,9 +180,9 @@ class _CronCLI:
 def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     """Root fix for first-night UTC briefs: boot registered the crons under UTC; when the wizard's
     tz lands (config set succeeds, zone changed), the shared reconciler recreates every Hermes-run
-    Sotto cron with exactly crons.json's schedule/skill/deliver under the new zone. The two briefs
-    are NOT among them — they are receiver-run, and the tick reads the zone fresh every minute, so
-    there is nothing to re-register for them.
+    Sotto cron with exactly crons.json's schedule/skill/deliver under the new zone. The briefs, the
+    watcher and the digest are NOT among them — they are receiver-run, and the tick reads the zone
+    fresh every minute, so there is nothing to re-register for them.
 
     `--deliver` comes from the ONE channel resolver (_deliver_target), never a literal: with nothing
     configured and no WhatsApp session on the volume, that resolves to telegram exactly as start.sh
@@ -198,15 +198,13 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     ok, val = rec.set_timezone("America/Los_Angeles")
     assert ok and val == "America/Los_Angeles"
     assert ["hermes", "config", "set", "timezone", "America/Los_Angeles"] in cli.calls
-    names = {"sotto-relationship-pulse", "sotto-proactive", "sotto-midday-digest"}
     assert ["hermes", "cron", "list"] in cli.calls
     creates = {c[c.index("--name") + 1]: c for c in cli.cron("create")}
-    assert set(creates) == names
-    # schedules + skills mirror start.sh step 3 exactly
+    assert set(creates) == {"sotto-relationship-pulse"}
+    # schedule + skill mirror crons.json exactly
     assert creates["sotto-relationship-pulse"][3] == "0 9 * * 1"
-    assert creates["sotto-proactive"][3] == "*/15 * * * *"
-    assert creates["sotto-midday-digest"][3] == "30 12 * * *"
-    assert creates["sotto-midday-digest"][creates["sotto-midday-digest"].index("--skill") + 1] == "sotto-event"
+    assert creates["sotto-relationship-pulse"][
+        creates["sotto-relationship-pulse"].index("--skill") + 1] == "sotto-relationship-pulse"
     for c in creates.values():
         assert c[c.index("--deliver") + 1] == rec._deliver_target() == "telegram"
     # Existing registrations are removed by parsed job id; that path is exercised against a real
@@ -802,17 +800,17 @@ def test_an_unreadable_schedule_leaves_the_window_guard_out_of_the_way(tmp_path,
 
 def test_the_window_reads_the_one_schedule_source(tmp_path, monkeypatch):
     """crons.json IS the schedule (CLAUDE.md) — the window is measured from the file, never from a
-    time written down twice, and only for the fixed daily shape those brief entries use."""
+    time written down twice, and only for the shapes the tick can fire (a weekday list is not one)."""
     spec_path = tmp_path / "crons.json"
     with open(spec_path, "w", encoding="utf-8") as f:
         json.dump([{"name": "sotto-evening-brief", "schedule": "45 20 * * *",
                     "prompt": "p", "skill": "sotto-evening-brief"},
-                   {"name": "sotto-morning-brief", "schedule": "*/15 * * * *",
+                   {"name": "sotto-morning-brief", "schedule": "45 20 * * 1",
                     "prompt": "p", "skill": "sotto-morning-brief"}], f)
     monkeypatch.setenv("SOTTO_CRONS_JSON", str(spec_path))
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 48))
     assert rec._in_brief_cron_window("sotto-evening-brief") is True
-    assert rec._in_brief_cron_window("sotto-morning-brief") is False   # not the daily shape
+    assert rec._in_brief_cron_window("sotto-morning-brief") is False   # not a shape the tick reads
     edge = rec.BRIEF_CRON_WINDOW_MIN
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 45 + edge))
     assert rec._in_brief_cron_window("sotto-evening-brief") is False   # the window is half-open
@@ -1834,6 +1832,30 @@ def test_calendar_cache_hooks_resolve_to_the_receiver_s_own_state(tmp_path, monk
                                                      "calendar_today.json")
 
 
+def test_a_meeting_the_user_declined_is_not_served_but_stays_in_the_raw_diff(tmp_path, monkeypatch):
+    """gather_google reads the user's own RSVP into `my_response`; a declined event is not a room
+    they are in (the funnel's hold reads the served list) and not on the Today view — while the
+    raw wire list keeps it, so a decline by somebody ELSE on it is still a change worth seeing."""
+    cc = rec.CALCACHE
+    monkeypatch.setattr(rec, "DATA", str(tmp_path))
+    wire = [{"id": "e-declined", "summary": "Declined pitch", "start": "2026-08-17T18:00:00+00:00",
+             "end": "2026-08-17T19:00:00+00:00", "my_response": "declined",
+             "attendees": [{"email": "vc@fund.com", "displayName": "VC"}]},
+            {"id": "e-kept", "summary": "Sync", "start": "2026-08-17T20:00:00+00:00",
+             "end": "2026-08-17T21:00:00+00:00", "my_response": "accepted",
+             "attendees": [{"email": "ali@x.com", "displayName": "Ali"}]}]
+    script = tmp_path / "gather_google.py"
+    script.write_text("import json,sys\n"
+                      "out=[a for a in sys.argv if a.endswith('cal.json')][0]\n"
+                      f"json.dump({json.dumps(wire)}, open(out,'w'))\n")
+    monkeypatch.setitem(cc.HOOKS, "find_script", lambda *rel: str(script))
+    monkeypatch.setitem(cc.HOOKS, "local_today", lambda: "2026-08-17")
+    served = cc._run_calendar_gather()
+    assert [e["summary"] for e in served] == ["Sync"]
+    assert all("_my_response" not in e for e in served)
+    assert [e["id"] for e in cc._LAST_RAW["events"]] == ["e-declined", "e-kept"]
+
+
 def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
     """The diff that matters: declined / invited / moved / cancelled — and the skips (solo,
     all-day, outside the window) that keep it high-signal."""
@@ -2465,7 +2487,8 @@ def test_run_dashboard_job_fires_the_crons_json_job(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_RUN_SKILL", "fake-runner -z")
     out = rec._run_dashboard_job("sotto-morning-brief")
     assert out == {"ok": True, "skill": "sotto-morning-brief"}
-    assert calls == [["fake-runner", "-z", rec._spawn_prompt("sotto-morning-brief")]]
+    assert calls == [["fake-runner", "-z",
+                      rec._spawn_prompt("sotto-morning-brief", job_prompt="Run my morning brief")]]
     # a job that isn't registered on this box is refused, not invented
     assert rec._run_dashboard_job("sotto-nope")["error"] == "unknown"
     monkeypatch.setenv("SOTTO_DIGEST", "0")
@@ -2513,7 +2536,8 @@ def test_the_cron_tick_fires_a_receiver_run_job_at_its_minute(tmp_path, monkeypa
     rec._cron_tick()
     # NOT crons.json's "Run my morning brief": that friendly one-liner let the agent hand-write a
     # brief, which still claimed the day and suppressed the lane that would have sent the real one.
-    assert fired == [("cron:sotto-morning-brief", rec._spawn_prompt("sotto-morning-brief"))]
+    assert fired == [("cron:sotto-morning-brief",
+                      rec._spawn_prompt("sotto-morning-brief", job_prompt="Run my morning brief"))]
     # the pulse is Hermes' job even when its minute matches: the receiver fires only its own rows
     assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
 
@@ -2573,17 +2597,120 @@ def test_the_cron_tick_honors_the_gate_and_the_schedule_override(tmp_path, monke
 
 
 def test_a_schedule_the_tick_cannot_read_is_skipped_and_said_once(tmp_path, monkeypatch, capsys):
-    """The receiver runs fixed daily jobs only. Anything else is left unfired with ONE log line —
-    not a crash that would take the heartbeat, and not a line every minute forever."""
+    """The receiver runs fixed daily and `*/N` interval jobs only. Anything else (a weekday list)
+    is left unfired with ONE log line — not a crash that would take the heartbeat, and not a line
+    every minute forever."""
     rec.DATA = str(tmp_path)
-    _cron_spec(tmp_path, monkeypatch, [{**BRIEF_ROW, "schedule": "*/15 * * * *"}])
+    _cron_spec(tmp_path, monkeypatch, [{**BRIEF_ROW, "schedule": "30 6 * * 1"}])
     fired = _cron_fires(monkeypatch)
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
     rec._cron_tick()
     rec._cron_tick()
     assert fired == []
     said = [line for line in capsys.readouterr().out.splitlines() if "sotto-morning-brief" in line]
-    assert len(said) == 1 and "fixed daily" in said[0]
+    assert len(said) == 1 and "fixed daily" in said[0] and "interval" in said[0]
+
+
+WATCHER_ROW = {"name": "sotto-proactive", "schedule": "*/15 * * * *",
+               "schedule_env": "SOTTO_PROACTIVE_CRON", "prompt": "Run my proactive check",
+               "skill": "sotto-proactive", "gate": "SOTTO_PROACTIVE", "runner": "receiver"}
+DIGEST_ROW = {"name": "sotto-midday-digest", "schedule": "30 12 * * *",
+              "prompt": "Run my midday digest", "skill": "sotto-event", "gate": "SOTTO_DIGEST",
+              "runner": "receiver"}
+
+
+def test_an_interval_job_fires_once_per_boundary_through_the_silence_seam(tmp_path, monkeypatch):
+    """Sep 4, 2026, 7:02 AM: the user's Telegram showed the literal `NO_NUDGES`. The watcher ran on
+    Hermes' scheduler, whose delivery never passes _deliver_text, so the token the prompt teaches
+    was sent as a message. A `*/15` row marked `runner: receiver` now fires here — once per
+    quarter-hour boundary, however many ticks land inside it, and down the spawn → outbox seam
+    that turns the sentinel into an `empty` receipt."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [WATCHER_ROW])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: True)
+    for minute in range(0, 60):
+        monkeypatch.setattr(rec, "_local_now", lambda m=minute: datetime(2026, 9, 4, 7, m))
+        rec._cron_tick()
+    assert [label for label, _ in fired] == ["cron:sotto-proactive"] * 4
+    assert rec._CRON_FIRED["sotto-proactive"] == "2026-09-04T07:45"
+    prompt = fired[0][1]
+    assert prompt == rec._spawn_prompt("sotto-proactive", job_prompt="Run my proactive check")
+    assert rec.SILENCE_SENTINEL in prompt and "all clear" in prompt
+    assert rec.OUTBOX.kind_for("cron:sotto-proactive") == rec.OUTBOX.KIND_NUDGE
+    # the seam it lands on: the token is an empty run, never a message
+    assert rec._deliver_text("NO_NUDGES", "cron:sotto-proactive") is False
+    assert _outbox_rows(tmp_path) == []
+
+
+def test_an_interval_job_catches_up_inside_the_window_and_honors_its_override(tmp_path, monkeypatch):
+    """A boot eight minutes past the quarter still fires that quarter (the same catch-up window a
+    brief has); ten minutes past does not. `SOTTO_PROACTIVE_CRON` moves the cadence exactly as it
+    did on Hermes' scheduler, and `SOTTO_PROACTIVE=0` keeps the job off the list entirely."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [WATCHER_ROW])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: True)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 7, 8))
+    rec._cron_tick()
+    assert rec._CRON_FIRED["sotto-proactive"] == "2026-09-04T07:00"
+    rec._CRON_FIRED.clear()
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 7, 10))
+    rec._cron_tick()
+    assert len(fired) == 1, "ten minutes past the boundary is outside the catch-up window"
+    monkeypatch.setenv("SOTTO_PROACTIVE_CRON", "*/30 * * * *")
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 7, 15))
+    rec._cron_tick()
+    assert len(fired) == 1, "7:15 is not a boundary of a */30 cadence"
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 7, 30))
+    rec._cron_tick()
+    assert len(fired) == 2
+    monkeypatch.setenv("SOTTO_PROACTIVE", "0")
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 8, 0))
+    rec._cron_tick()
+    assert len(fired) == 2, "a gated-off watcher never fires"
+
+
+def test_a_nudge_lane_is_held_by_the_channel_gate_and_a_brief_is_not(tmp_path, monkeypatch):
+    """The watcher and the digest spend the day's interrupt budget against the channel they land
+    on, so an unlinked channel holds them exactly as it holds the wake-push and the valve — the
+    slot is spent unspawned, once, not retried every tick. A brief is never held: the outbox keeps
+    it until the channel comes back."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [WATCHER_ROW, DIGEST_ROW, BRIEF_ROW])
+    fired = _cron_fires(monkeypatch)
+    asked = []
+    monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: asked.append(label) or False)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 12, 30))
+    rec._cron_tick()
+    rec._cron_tick()
+    assert fired == [] and asked == ["cron:sotto-proactive", "cron:sotto-midday-digest"]
+    assert rec._CRON_FIRED == {"sotto-proactive": "2026-09-04T12:30",
+                               "sotto-midday-digest": "2026-09-04"}
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 6, 30))
+    rec._cron_tick()
+    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+
+
+def test_the_digest_fires_from_the_receiver_in_digest_mode(tmp_path, monkeypatch):
+    """`sotto-event` is a two-mode skill: a staged bundle, or the midday digest. The receiver's
+    prompt quotes the crons.json row's own words as the job's NAME — "Run my midday digest" — which
+    is what the skill's DIGEST section keys on; without it a scheduled run would wait for a bundle
+    that never comes. The digest has no deliver-once marker and is never gated by one."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [DIGEST_ROW])
+    fired = _cron_fires(monkeypatch)
+    monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: True)
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 12, 31))
+    rec._cron_tick()
+    assert [label for label, _ in fired] == ["cron:sotto-midday-digest"]
+    prompt = fired[0][1]
+    assert "sotto-event skill" in prompt and '"Run my midday digest"' in prompt and "digest" in prompt
+    assert rec.SILENCE_SENTINEL in prompt and "compose_brief.py" not in prompt
+    monkeypatch.setenv("SOTTO_DIGEST", "0")
+    rec._CRON_FIRED.clear()
+    rec._cron_tick()
+    assert len(fired) == 1, "SOTTO_DIGEST=0 keeps the digest off the receiver's list too"
 
 
 def test_a_cron_fired_brief_is_gated_exactly_like_every_other_brief(tmp_path, monkeypatch):
@@ -3430,6 +3557,32 @@ def test_machine_markers_never_leave_the_box(tmp_path, monkeypatch):
     assert "\n\n\n" not in body  # removed marker lines don't leave triple blanks behind
 
 
+def test_a_mailto_never_leaves_the_box_but_the_gmail_draft_ask_does(tmp_path, monkeypatch):
+    """Sep 4, 2026, 9:13 AM: a nudge arrived as the drafted reply, the "Want this in your Gmail
+    drafts?" ask, AND a "Tap to send: mailto:…?subject=…&body=…" line — 200 characters of
+    percent-encoding Telegram shows as plain text. Email asks, every other channel links; every run
+    delivered from here is unattended, whose email path IS the ask. The seam removes the mailto —
+    a markdown link keeps its label, a bare URL goes, a line that was only the URL goes with it —
+    and leaves every other tap link exactly as it was."""
+    rec.DATA = str(tmp_path)
+    sent = _channel(monkeypatch)
+    text = ("From earlier — Rahul updated the Revenue Team page.\n\n"
+            "Reply to Rahul: 'Thanks, received.' Want this in your Gmail drafts?\n\n"
+            "Tap to send: mailto:rahul@example.com?subject=Re%3A%20updates&body=Thanks%2C%20received.\n"
+            "→ [Message Dhruv](https://wa.me/15551234567)\n"
+            "→ [Email Sarah](mailto:sarah@example.com?body=hi) or call tel:+15551234567")
+    assert rec._deliver_text(text, "event") is True
+    body = sent[0]["body"]
+    assert "mailto:" not in body and "Tap to send" not in body
+    assert "Want this in your Gmail drafts?" in body
+    assert "→ [Message Dhruv](https://wa.me/15551234567)" in body
+    assert "→ Email Sarah or call tel:+15551234567" in body
+    assert "\n\n\n" not in body
+    # a body that was nothing but the link is an empty run, not a delivered blank
+    assert rec._deliver_text("Tap to send: <mailto:a@example.com?body=x>", "event") is False
+    assert len(sent) == 1
+
+
 def test_a_text_that_was_only_markers_is_an_empty_run(monkeypatch):
     """All plumbing, no words: the honest receipt is 'empty', never a delivered blank."""
     sent = _channel(monkeypatch)
@@ -3663,6 +3816,31 @@ def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatc
     assert stamped == [1]
     rec._on_delivered({"label": "proactive", "effects": []})
     assert stamped == [1], "only a brief moves the digest window"
+
+
+def test_a_delivered_brief_with_no_learn_receipt_is_said_out_loud(tmp_path, monkeypatch, capsys):
+    """The Learn step is one command that leaves briefs/<day>.<kind>.learned.json. Three loops rest
+    on it, and a run that skipped it used to leave every page green — so the ack seam checks for
+    the receipt and says, loudly, when a brief delivered without learning."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: None)
+    day = rec._local_now().strftime("%Y-%m-%d")
+    rec._on_delivered({"label": "cron:sotto-morning-brief", "effects": []})
+    assert "delivered with NO Learn receipt" in capsys.readouterr().out
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    path = os.path.join(str(tmp_path), "briefs", f"{day}.morning.learned.json")
+    with open(path, "w") as f:
+        f.write('{"ok": true, "steps": {"style": {"status": "ok"}}}')
+    rec._on_delivered({"label": "cron:sotto-morning-brief", "effects": []})
+    assert "Learn" not in capsys.readouterr().out
+    # a receipt that exists but says a writer failed is not green either
+    with open(path, "w") as f:
+        f.write('{"ok": false, "steps": {"style": {"status": "failed", "exit": 1}, '
+                '"knowledge": {"status": "failed", "exit": 2}, "contacts": {"status": "ok"}}}')
+    rec._on_delivered({"label": "cron:sotto-morning-brief", "effects": []})
+    assert "2 writer(s) failed: knowledge, style" in capsys.readouterr().out
+    rec._on_delivered({"label": "proactive", "effects": []})       # only a brief has a Learn step
+    assert "Learn receipt" not in capsys.readouterr().out
 
 
 def test_a_link_captured_by_a_previous_bot_token_is_not_a_link(tmp_path, monkeypatch):

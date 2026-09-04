@@ -64,7 +64,11 @@ def _tz_offset_minutes(tz: str) -> int:
 def _env_tz() -> str:
     """The user's IANA zone from the environment (SOTTO_TIMEZONE / TZ). Set on Railway so headless
     cron briefs compute 'today' in the user's local day, not UTC — the source of the off-by-one date."""
-    return (os.environ.get("SOTTO_TIMEZONE") or os.environ.get("TZ") or "").strip()
+    # The env rungs of THE chain (tzchain.py), and nothing of its own: continuity_resolve keys a
+    # cache on "the zone the environment states", which is the same two variables tzchain reads.
+    from tzchain import configured_tz_source  # noqa: PLC0415
+    zone, source = configured_tz_source()
+    return zone if source.startswith("env:") else ""
 
 
 
@@ -105,13 +109,11 @@ def configured_user_email() -> str:
 
 
 def configured_tz() -> str:
-    """User's IANA zone: explicit env (SOTTO_TIMEZONE/TZ) wins, else the wizard-detected zone on the
-    volume. Removes the off-by-one footgun when the Railway var is unset (the wizard supplies it).
-
-    This is the CANONICAL resolution — every wall-clock feature resolves the day the same way. The
-    receiver image can't import the skills tree, so `dashboard._local_today()` mirrors this order
-    (SOTTO_TIMEZONE → TZ → config/settings.json → server local); change one, change the other."""
-    return _env_tz() or _s(load_settings().get("timezone"))
+    """User's zone: explicit env (SOTTO_TIMEZONE/TZ) wins, else the wizard-detected zone on the
+    volume. THE chain lives in `tzchain.py` — the receiver, the dashboard and start.sh run that same
+    file, so there is nothing here to keep in step with anything."""
+    from tzchain import configured_tz_name  # noqa: PLC0415 — sibling on the same sys.path as textutil
+    return configured_tz_name()
 
 
 

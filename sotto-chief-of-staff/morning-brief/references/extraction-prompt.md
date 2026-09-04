@@ -252,7 +252,7 @@ Action type mapping:
 - Meetings with external attendees → "meeting_prep"
 - All other calendar meetings → "meeting_info" (every meeting must have an action item)
 - Promised follow-ups → "follow_up"
-- User sent a message 2+ days ago with no reply → "follow_up_stale" (stale thread)
+- User sent a message 2+ days ago with no reply → nothing: code already records these as "waiting_on" loops from the pre-computed stale-thread section (never emit an action for one)
 - Someone promised the user something and hasn't delivered → "waiting_on"
 - Need to find a time to meet → "propose_times" (channel: "calendar")
 - Need to schedule/create a meeting → "schedule" (channel: "calendar")
@@ -298,20 +298,7 @@ For follow_up_stale actions: contactIdentifier = RecipientEmail (the person you'
 For calendar actions: contactIdentifier = _event_id, plus meetingTime (human-readable, e.g., "Tomorrow at 9:30 AM"), meetingLocation (physical address if available), meetingLink (Zoom/Meet/Teams URL — look for zoom.us, meet.google.com, teams.microsoft.com in event description), crossChannelContext (recent interactions with attendees across email/messages).
 
 ## Stale Thread Detection
-**Primary source: the "### Stale Outbound Threads (PRE-COMPUTED from Gmail — trust these signals)" section in the data below (authoritative).**
-If that section exists, use it as the canonical source for follow_up_stale actions — emit one action per stale thread listed there.
-As fallback (when no pre-computed data), scan conversations for threads where [USER SENT] is last message 2+ days ago.
-
-**Rules for all follow_up_stale actions:**
-- contactIdentifier MUST be the recipient's email address (not a thread ID)
-- emailThreadId = the Gmail thread ID (for evidence and resolution tracking)
-- Skip trivial threads ("thanks", "ok", "sounds good")
-- contextSummary: describe what the user sent and how long ago
-- contextAsk: specific nudge ("Follow up with Sarah on Q2 numbers")
-- contextUrgencyReason: how many days stale
-- confidence: 0.7-0.9 (higher for older threads with substantive content)
-- **evidence: REQUIRED** — include sourceType + sourceId (threadId) + snippet
-- Place in "Should Handle Today" (not "Needs Attention Now" unless there's a deadline)
+**Code owns this.** The "### Emails you sent that nobody answered (PRE-COMPUTED from Gmail — authoritative)" section below lists every email the user sent 3+ days ago that nobody answered, to a person they know. Each one is ALREADY recorded as a `waiting_on` loop with the recipient as the counterpart, dated the day it was sent — so do NOT emit an action for it, and do NOT scan raw emails for stale threads. Mention one in prose only when today's data adds something (a meeting with that person tomorrow, a related thread). An invite the user hasn't answered that is nearly here is likewise minted as an `rsvp` action by code; the calendar line says "you haven't answered this invite yet".
 
 ## Commitment Detection
 **Authority: the "## Open Commitments (ACTION LEDGER from previous briefs)" section in the data below is the CANONICAL source of open loops and pre-computed commitments. The "### Commitment History for Key People (historical context only)" section is background context ONLY — never re-surface an item from it unless today's data independently supports it.**

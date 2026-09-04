@@ -1,6 +1,6 @@
 ---
 name: sotto-ask
-description: Use when the user asks Sotto a question about their world — "what do I know about X", "who do I owe a reply", "what's my day", "did Sarah ever mention …", or any /sotto query. This is "Ask Sotto".
+description: Use when the user asks Sotto a question about their world — "what do I know about X", "who do I owe a reply", "what's my day", "did Sarah ever mention …", any /sotto query — or sends a link to read, including a DocSend deck (docsend.com/view/… — "can you get the pdf?", "is DocSend working?" — run docsend_fetch.py, which saves the PDF). This is "Ask Sotto".
 metadata:
   hermes:
     tags: [chief-of-staff, sotto, qa]

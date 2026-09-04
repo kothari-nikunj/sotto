@@ -410,6 +410,31 @@ def _adapt_gmail(gmail) -> list:
 # compute the identical hash from the identical fields, and it cannot import this tree.
 
 
+# The confirmed bucket keeps the NEWEST this many PER REGISTER (work_email / work_message /
+# personal_message — style_apply reads it per bucket, so a global cap would let twenty texts starve
+# the email voice to nothing). It is TTL-immune by design, and since the draft→outcome matcher
+# started confirming every verbatim send (Aug 2026) it grows without the user lifting a finger — an
+# uncapped, never-swept list on a retention-exempt file. Your voice is the last twenty things you
+# actually shipped in each register, not the first four and not forever.
+CONFIRMED_CAP = 20
+
+
+def _newest_first(samples: list) -> list:
+    """Confirmed samples, most recently confirmed first — the order style_apply quotes them in, and
+    the order the cap keeps them in. A sample with no stamp (pre-cap file) sorts last."""
+    return sorted(samples, key=lambda s: str(s.get("confirmed_at") or ""), reverse=True)
+
+
+def _cap_confirmed(samples: list) -> list:
+    """Newest CONFIRMED_CAP per bucket, the whole list newest-first."""
+    per_bucket: dict = {}
+    for s in _newest_first(samples):
+        bucket = per_bucket.setdefault(str(s.get("bucket") or ""), [])
+        if len(bucket) < CONFIRMED_CAP:
+            bucket.append(s)
+    return _newest_first([s for kept in per_bucket.values() for s in kept])
+
+
 def confirm_sample(key: str, now=None) -> dict:
     """Move ONE observed sample into style.json's `confirmed` bucket — the deterministic seed of the
     voice loop, and the ONLY writer that bucket has ever had (style_apply.py has always read it:
@@ -420,7 +445,9 @@ def confirm_sample(key: str, now=None) -> dict:
     _evict_canonical keep it past its TTL, and style_apply quotes it first. The sample is COPIED,
     not moved: the canonical/recent pools stay exactly as extract() left them, so the next Learn run
     rebuilds them normally. Idempotent (a second confirm of the same sample is a no-op) and atomic
-    (tmp + os.replace, like every other writer on the volume)."""
+    (tmp + os.replace, like every other writer on the volume). The bucket is capped at
+    CONFIRMED_CAP per register, newest first — the one place it is trimmed, because it is the one
+    place it grows."""
     key = (key or "").strip()
     if not key:
         return {"ok": False, "error": "no sample named"}
@@ -447,9 +474,9 @@ def confirm_sample(key: str, now=None) -> dict:
             entry["quality"] = score_sample(entry)
             entry["confirmed_at"] = _iso(_now(now))
             confirmed.append(entry)
-            style["confirmed"] = confirmed
+            style["confirmed"] = _cap_confirmed(confirmed)
             jsonstore.write_atomic(path, style, indent=2)
-            return {"ok": True, "confirmed": len(confirmed), "already": False,
+            return {"ok": True, "confirmed": len(style["confirmed"]), "already": False,
                     "bucket": entry.get("bucket") or ""}
     except (OSError, jsonstore.Unreadable, ValueError):
         return {"ok": False, "error": "no style fingerprint on file yet"}

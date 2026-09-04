@@ -94,7 +94,8 @@ The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container 
 
 ## 5. Variables
 **Settings ▸ Variables:**
-- `GOOGLE_AI_API_KEY` = your Gemini key (any 1M-context model).
+- `GOOGLE_AI_API_KEY` = your Gemini key (any 1M-context model). Google's own docs sometimes call it
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY` — boot accepts any of the three names and maps it to all three.
 - `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) replies with (`/newbot`).
   **The only channel variable you need:** the boot log prints a one-tap link
   (`https://t.me/<your-bot>?start=<this deploy's setup code>`); tap it within five minutes and your
@@ -251,9 +252,11 @@ Cloudflare, no domain, no inbound port. How the reverse link works end to end: *
    missing, says so in plain words and waits for you rather than proceeding half-blind.
    *(Prefer no GUI? Run it directly: `sotto-bridged --connect https://your-app.up.railway.app --token <BRIDGE_TOKEN>`.)*
    - **Diagnose a source before connecting:** run `sotto-bridged --doctor` — a read-only, per-source
-     readout (each local source prints `ok` / `needs Full Disk Access` / `unavailable`, plus the exact
-     "grant FDA to the *right* app" fix). It writes nothing and touches no network; exit `0` means every
-     enabled source reads. See the troubleshooting table below.
+     readout (each local source prints `ok (N rows readable)` / `needs Full Disk Access` /
+     `unavailable`, plus the exact "grant FDA to the *right* app" fix). It writes nothing and touches
+     no network; exit `0` means every enabled source reads. **`ok (0 rows readable)` means nothing
+     matched in the last 6 hours** — the probe window, not a lifetime count — so a source you haven't
+     used since lunch is still `ok`. See the troubleshooting table below.
 
 > The auto wake-push (brief fires the instant your Mac wakes) is optional — the **6:30/17:30 cron**
 > fires the brief regardless, and you can ask for one anytime. If the Bridge is offline at brief time,
@@ -351,7 +354,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_PREWARM_RESEARCH` | first-run seed: background-researches your most-frequent contacts while pre-warming the knowledge graph (stored as clearly-labeled low-confidence notes). Default **on**; `=0` skips the research and seeds plain identity stubs only. | optional |
 | `SOTTO_DASHBOARD` | `0` disables the web dashboard entirely — `/app` and `/api/*` answer 404 (default: on). See *The dashboard* above. | optional |
 | `SOTTO_UPDATE_CHECK` | `0` turns off the once-a-day "a newer Sotto is published" check (default: on — one GET of the repo's `VERSION`). It is the ONE switch: off, and the `/setup` line, the dashboard banner and the once-per-version brief line all go quiet with it. See *Staying updated* below. | optional |
-| `SOTTO_PROACTIVE` | `1` (default) runs the mostly-silent proactive nudge cron (meeting-about-to-start / due commitment / something you're owed / birthday, draft-ready, never auto-send). Its whole push spends ONE unit of `SOTTO_NUDGE_BUDGET`, and it honors the same mutes, in-meeting hold and delivery-channel check the event funnel does. `0` disables it. | optional |
+| `SOTTO_PROACTIVE` | `1` (default) runs the mostly-silent proactive watcher on the receiver's own scheduler (a `crons.json` `runner: receiver` row, so a no-nudge run is an empty receipt and never a message) (meeting-about-to-start / due commitment / something you're owed / birthday, draft-ready, never auto-send). Its whole push spends ONE unit of `SOTTO_NUDGE_BUDGET`, and it honors the same mutes, in-meeting hold and delivery-channel check the event funnel does. `0` disables it. | optional |
 | `SOTTO_PROACTIVE_CRON` | proactive watcher interval (default `*/15 * * * *`). | optional |
 | `SOTTO_QUIET_START` / `SOTTO_QUIET_END` | quiet-hours window, shared by the proactive watcher AND the real-time event funnel + release valve (defaults `21` / `7` — no nudges 9pm–7am; a missed call from a VIP is the one carve-out). | optional |
 | `SOTTO_CHASE_AFTER_DAYS` | how many silent days before something you're **waiting on** becomes chase-eligible, and the gap between chases (default `3`). Something you're owed **never expires on its own — not by age, and not by its deadline** (a passed deadline just makes it chase-eligible immediately): it closes when they actually deliver, gets at most **two** chases (one nudge a day, budget applies, and only a chase that was actually DELIVERED counts), and then Sotto stops and asks you by name — *"I've nudged Maya twice about the contract — nudge her again, or let it go?"* | optional |
@@ -370,7 +373,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_OUTBOX` | `1` (default) runs the delivery outbox's retry heartbeat — a brief or nudge the channel didn't acknowledge is retried every minute, backing off to a 15-min cap, until it lands, ages out, or gives up loudly. `0` disables **only the retrying**: every message is still written down before it is sent, so nothing is ever sent unrecorded. | optional (delivery) |
 | `SOTTO_CALENDAR_REFRESH_SECS` | how often the receiver refreshes today's calendar (default `900` = 15 min). Powers the in-meeting hold, the dashboard's calendar, and post-meeting tap detection; `0` disables all three. A cache older than 2 intervals — or stamped with another day — is never used to hold a nudge. | optional (events) |
 | `SOTTO_DIGEST_MIN` | how many queued **signals from people you know** (Tier-1 `ambient`, plus anything held by cooldown/quiet hours/catch-up/budget/snooze/a meeting) it takes for the 12:30 midday digest to deliver — default `8`; below it the digest stays silent. The window starts at the last brief that actually delivered, so the digest can't repeat it. | optional (events) |
-| `SOTTO_DIGEST` | `1` (default) registers the `sotto-midday-digest` cron (12:30 local, adaptive catch-up). `0` disables it. | optional (events) |
+| `SOTTO_DIGEST` | `1` (default) runs the `sotto-midday-digest` job on the receiver's own scheduler (12:30 local, adaptive catch-up; a quiet day is an empty receipt, never a message). `0` disables it. | optional (events) |
 | `SOTTO_WAKE_PUSH` | **BRIDGE-side** (set where the Bridge runs, not Railway) — fires the brief/nudge the moment your Mac wakes. Default **on**; `=0` (or `false`) disables (the 6:30/17:30 cron still fires). The cron↔wake-push deliver-once gate makes double-delivery impossible. | optional (Bridge) |
 | `SOTTO_WAKE_MORNING_MIN` / `SOTTO_WAKE_MORNING_CUTOFF` | **Bridge-side** morning wake-push window in minutes-past-midnight — wake past this and before the cutoff triggers the morning brief (defaults `420` / `1080` = **7:00 – 18:00**). | optional (Bridge) |
 | `SOTTO_WAKE_EVENING_MIN` / `SOTTO_WAKE_EVENING_CUTOFF` | **Bridge-side** evening wake-push window (defaults `1050` / `1380` = **17:30 – 23:00**). | optional (Bridge) |

@@ -896,25 +896,32 @@ def _list_md(dirname: str):
 
 
 def _local_today() -> str:
-    """The user's local date. CANONICAL TZ ORDER, the same chain everywhere: SOTTO_TIMEZONE → TZ →
-    $SOTTO_DATA/config/settings.json → UTC. Every wall-clock feature resolves the day the
-    same way — the skills tree's `timeutil.configured_tz()` is the canonical implementation, and this
-    mirrors it because the receiver image can't import the skills tree (it may not be on the box at
-    all); receiver._configured_tz_name() and start.sh's step 2 are the other two copies of the chain.
-    Change one, change them all."""
-    tz = _s(os.environ.get("SOTTO_TIMEZONE") or os.environ.get("TZ") or "")
-    if not tz:
-        settings = _read_json_file("config", "settings.json", default={}) or {}
-        tz = _s(settings.get("timezone")) if isinstance(settings, dict) else ""
-    if tz:
-        try:
-            from zoneinfo import ZoneInfo  # noqa: PLC0415 — stdlib; imported lazily, may miss tzdata
-            return datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
-        except Exception:  # noqa: BLE001
-            pass
-    # UTC, not server local: the last rung brief_marker.py and start.sh already use, so the outbox
-    # row's day and the deliver-once marker's day agree on a box whose clock is not UTC.
-    return time.strftime("%Y-%m-%d", time.gmtime())
+    """The user's local date — tzchain's answer (SOTTO_TIMEZONE → TZ → the wizard's settings.json →
+    UTC), the same file the receiver, start.sh and the skills resolve the day from. This module
+    used to carry its own copy of that chain "because the receiver image can't import the skills
+    tree"; the image carries the file instead."""
+    return _tzchain().local_today(_root())
+
+
+_TZCHAIN = None
+
+
+def _tzchain():
+    global _TZCHAIN
+    if _TZCHAIN is None:
+        import importlib.util  # noqa: PLC0415
+        here = os.path.dirname(os.path.abspath(__file__))
+        for candidate in (os.path.join(here, "tzchain.py"),
+                          os.path.join(here, "..", "..", "sotto-chief-of-staff", "_shared", "lib", "tzchain.py")):
+            if os.path.exists(candidate):
+                spec = importlib.util.spec_from_file_location("tzchain", candidate)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _TZCHAIN = mod
+                break
+        else:
+            raise RuntimeError("tzchain.py is missing — the image must COPY it beside dashboard.py")
+    return _TZCHAIN
 
 
 def _brief_files():
@@ -1382,15 +1389,9 @@ def _snooze_state(ex: dict) -> dict:
         target = datetime.fromisoformat(stamp.replace("Z", "+00:00")).replace(tzinfo=None)
     except (TypeError, ValueError):
         return {"until": until, "active": False}   # a broken stamp never silences Sotto
-    try:
-        from zoneinfo import ZoneInfo  # noqa: PLC0415
-        tz = _s(os.environ.get("SOTTO_TIMEZONE") or os.environ.get("TZ") or "")
-        if not tz:
-            settings = _read_json_file("config", "settings.json", default={}) or {}
-            tz = _s(settings.get("timezone")) if isinstance(settings, dict) else ""
-        now_local = datetime.now(ZoneInfo(tz)).replace(tzinfo=None) if tz else datetime.now()
-    except Exception:  # noqa: BLE001
-        now_local = datetime.now()
+    # The FIFTH copy of the timezone chain lived here, found by the guard test the day the other
+    # four were collapsed (Sep 3, 2026). tzchain answers; its last rung is UTC, never the server.
+    now_local = _tzchain().local_now(_root()).replace(tzinfo=None)
     return {"until": until, "active": now_local < target}
 
 

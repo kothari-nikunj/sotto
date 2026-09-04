@@ -233,6 +233,36 @@ def test_ledger_omitted_means_rule_does_not_run():
 
 # --- robustness ----------------------------------------------------------------
 
+# --- rule (h): never tell you twice ------------------------------------------
+
+def test_an_already_nudged_person_may_not_open_the_brief_or_take_more_than_two_lines():
+    """The prompt asks for one compressed line; this is the measurement. A 3pm ask that tapped the
+    user at 3:05 is not the evening's headline, and it is not three paragraphs."""
+    opener = ("Sarah Chen is still waiting on the deck — she asked again this afternoon.\n"
+              "## Needs Attention Now\n- **Ben**<!--id:ben@x.com|ch:email--> wants Thursday\n")
+    v = bv.validate(opener, [], SRC, already_nudged=["Sarah Chen"])
+    assert [x for x in v if x.startswith("already-nudged")] == [
+        "already-nudged: 'Sarah Chen' opens the brief — Sotto already nudged the user about them "
+        "today; it compresses to one matter-of-fact line, never the opener"]
+    retold = ("Good evening.\n## Needs Attention Now\n"
+              "- **Sarah Chen**<!--id:sarah@acme.com|ch:email--> asked for the deck\n"
+              "- Sarah Chen followed with a second note about timing\n"
+              "- and Sarah Chen's board wants it Friday\n")
+    v = bv.validate(retold, [], SRC, already_nudged=["Sarah Chen"])
+    assert any(x.startswith("already-nudged: 'Sarah Chen' takes 3 lines") for x in v)
+    fine = ("Good evening.\n## Needs Attention Now\n"
+            "- nudged you at 3:05 — Sarah Chen's deck ask; still open unless you handled it\n"
+            "## Coming Up\n- 10:00 Sarah Chen — pipeline review\n")
+    assert not [x for x in bv.validate(fine, [], SRC, already_nudged=["Sarah Chen"])
+                if x.startswith("already-nudged")]
+    # full names only: a single token is a common word as often as a person
+    common = "Will send the redline.\n## Needs Attention Now\n- it will be ready\n- will do\n"
+    assert not bv.validate(common, [], SRC, already_nudged=["Will"])
+    assert not bv.validate(common, [], SRC, already_nudged=["still no word from Maya on the deck"])
+    # …and the rule is off when nothing was nudged
+    assert not [x for x in bv.validate(retold, [], SRC) if x.startswith("already-nudged")]
+
+
 def test_validate_never_raises_on_garbage():
     assert bv.validate(None, None, None) == []
     assert bv.validate(123, [{"bad": object()}], "") == []

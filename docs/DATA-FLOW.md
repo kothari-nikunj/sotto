@@ -80,7 +80,7 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
 | `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
-| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `.claim` · `.delivered` | Delivered briefs, which loops each named, and the per-day markers | **60 days** |
+| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `<date>.<kind>.learned.json` · `.claim` · `.delivered` | Delivered briefs, which loops each named, the Learn step's receipt (which memory writers ran), and the per-day markers | **60 days** |
 | `briefs/<date>.<kind>.payload.json` | The staged wake payload a brief was built from | **7 days** |
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines, **and lines older than 90 days are dropped** |
 | `events/delivery.jsonl` | Whether each nudge actually landed | **90 days** |
@@ -89,7 +89,7 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `events/outbox.json` | One row per message Sotto composed, **carrying its text only while that text might still have to be sent** | The words are dropped the moment the row closes (delivered, gave up, or aged out); the closed row — id, kind, attempts, reason — is pruned after 7 days |
 | `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; a crashed run's leftover goes at **7 days** |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
-| `style.json` | Verbatim samples of things **you** wrote | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys); the sweep exempts it on that strength |
+| `style.json` | Verbatim samples of things **you** wrote | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, and the drafts-you-shipped bucket at its newest 20 per register); the sweep exempts it on that strength |
 | `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
 | `hermes/sessions/` | Hermes' own chat transcripts — one archived per day by the nightly session archive (which keeps transcripts; `/resume` reopens them), plus one per deploy | **Known gap:** Hermes' state is exempt from the sweep, and whether Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day |
@@ -98,6 +98,7 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |
 | `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them; never swept |
 | `proactive/<date>.json` | The watcher's once-per-day nudge dedup stamps | **30 days** |
+| `proactive/mute_offers.json` | One date per person the evening brief has asked you about muting | Its writer drops entries past the 30-day cooldown; bounded by the people you keep dismissing |
 | `proactive/pending_offer.json` | The one standing question Sotto last asked you (it can name a person), plus `payload_sha256` when a yes to it would send or write — the hash of the offered content, never the content | Expires 180 min after it is written, at read |
 | `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
 | `dashboard_sessions.json` | Dashboard login sessions | Expire on idle; pruned on every read |

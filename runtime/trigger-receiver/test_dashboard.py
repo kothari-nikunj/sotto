@@ -2111,9 +2111,11 @@ def test_post_voice_confirm_writes_through_style_extract(tmp_path):
                                    headers=authed)
         assert code == 200
         confirmed = json.load(open(os.path.join(str(tmp_path), "style.json")))["confirmed"]
-        assert [c["text"] for c in confirmed] == ["sounds good, shipping today",
-                                                  "on it, will circle back"]
-        assert confirmed[-1]["source"] == "confirmed" and confirmed[-1]["quality"] >= 0.95
+        # newest first: the bucket is kept in the order the drafter quotes it (style_extract caps it
+        # at its newest CONFIRMED_CAP, so a fresh confirm lands at the front)
+        assert [c["text"] for c in confirmed] == ["on it, will circle back",
+                                                  "sounds good, shipping today"]
+        assert confirmed[0]["source"] == "confirmed" and confirmed[0]["quality"] >= 0.95
         # the candidate is gone from the offer list (it is confirmed now)
         after = json.loads(body)
         assert all(c["key"] != key for c in after["candidates"])

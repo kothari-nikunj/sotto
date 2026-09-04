@@ -968,6 +968,10 @@ def _format_calendar(events, lookup: dict | None = None) -> str:
             line += f"\n    event_id: {e.get('id')}"
             if e.get("start"):
                 line += f" | start: {e.get('start')}"
+            if _s(e.get("my_response")).lower() == "needsaction" and atts:
+                line += "\n    ⚠ you haven't answered this invite yet"
+            elif _s(e.get("my_response")).lower() == "tentative":
+                line += "\n    (you answered maybe)"
             if _missing_logistics(e):
                 line += "\n    ⚠ no video link and no address on the invite yet"
             if e.get("meetingLink"):
@@ -1388,16 +1392,12 @@ def _format_stale_threads(local) -> str:
         f"- **{t.get('to')}**: \"{t.get('subject')}\" — sent {t.get('daysSinceSent')} days ago ({_s(t.get('sentDate')).split('T')[0]})\n"
         f"  Thread ID: {t.get('threadId')}\n  {t.get('snippet')}"
         for t in visible)
-    return ("### Stale Outbound Threads (PRE-COMPUTED from Gmail — trust these signals)\n"
-            "These are emails YOU sent that received no reply and are not already tracked in continuity.\n"
-            "Use as source for new \"follow_up_stale\" actions only.\n"
-            "Do NOT re-scan raw emails to find stale threads — this filtered list is authoritative.\n\n"
-            f"{body}\n\n"
-            "For each stale thread:\n"
-            "- Emit a \"follow_up_stale\" action with evidence pointing to the threadId\n"
-            "- Set contextUrgencyReason to days since sent\n"
-            "- Set confidence 0.7-0.9 (higher for older threads with substantive content)\n"
-            "- Skip trivial threads (\"thanks\", \"sounds good\") — they don't need follow-up\n")
+    return ("### Emails you sent that nobody answered (PRE-COMPUTED from Gmail — authoritative)\n"
+            "Each is a debt owed TO the user; code already records it as a `waiting_on` loop with the\n"
+            "recipient as the counterpart, so do NOT emit an action for it and do NOT re-scan raw\n"
+            "emails for stale threads. Mention one in prose only when today's data adds something\n"
+            "(a meeting with them tomorrow, a related thread).\n\n"
+            f"{body}\n")
 
 
 
@@ -1429,10 +1429,16 @@ def _chase_note(a: dict) -> str:
         n = int(a.get("chased_count") or 0)
     except (TypeError, ValueError):
         n = 0
+    heard = _parse_ts(_s(a.get("last_heard_at")))
     if n <= 0:
-        return ""
+        # They answered without delivering: the model must not propose a chase before the date
+        # they named — the clock is theirs now, and the row says when it runs out.
+        return (f" [they replied {heard.strftime('%a')}, next check {_s(a.get('chase_after'))[:10]}]"
+                if heard and _s(a.get("chase_after")) else "")
     last = _parse_ts(_s(a.get("last_chased_at")))
-    return f" [chased ×{n}" + (f", last {last.strftime('%a')}" if last else "") + "]"
+    return (f" [chased ×{n}" + (f", last {last.strftime('%a')}" if last else "")
+            + (f"; they replied {heard.strftime('%a')}, next check {_s(a.get('chase_after'))[:10]}"
+               if heard and last and heard > last and _s(a.get("chase_after")) else "") + "]")
 
 
 def _format_action_ledger(local, now=None) -> str:
@@ -1661,7 +1667,11 @@ def _format_meeting_archive(local) -> str:
 
 
 
-def _format_reconciliation(local, brief_type) -> str:
+def _format_reconciliation(local, brief_type, today: str = "") -> str:
+    """The evening's accountability block: the ledger rows THIS MORNING's brief minted
+    (`source_brief_at`, stamped by continuity_resolve's --merge-only on a brief's own actions).
+    `today` narrows it to the morning's — without it, every stamped row ever (tests, older
+    callers)."""
     if brief_type != "evening":
         return ""
     actions = _arr(local, "action_ledger")
@@ -1670,7 +1680,8 @@ def _format_reconciliation(local, brief_type) -> str:
     body = "\n".join(
         f"- {'✅ ' if a.get('status') == 'resolved' else ''}[{a.get('action_type')}] {a.get('contact_name')} via {a.get('channel')}: "
         f"{_norm_escalation_tone(a.get('summary'))}" + (f" — {_norm_escalation_tone(a.get('ask'))}" if a.get("ask") else "")
-        for a in actions if a.get("source_brief_at"))
+        for a in actions
+        if a.get("source_brief_at") and (not today or _s(a.get("source_brief_at"))[:10] == today))
     if not body:
         return ""
     return ("## Evening Accountability (morning commitments — did you follow through?)\n"

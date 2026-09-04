@@ -35,6 +35,36 @@ def _hist(out, name):
     raise AssertionError(f"no history entry for {name}: {sorted(out['history'])}")
 
 
+def test_email_is_a_relationship_channel_for_people_you_know(tmp_path, monkeypatch):
+    """A mail you received is a touch from its sender; a mail you sent is a touch to each recipient
+    — for people in your Contacts or graph only. Before this the pulse could not see the half of a
+    relationship that lives in mail, and a no-Mac deploy said "healthy" every Monday."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@example.com")
+    people = tmp_path / "knowledge" / "people"
+    people.mkdir(parents=True)
+    (people / "priya-raman.md").write_text(
+        "---\nschema: 2\ncanonical_id: c_priya\nname: Priya Raman\nidentifiers:\n  - priya@acme.com\n---\n")
+    d = lambda days: (NOW - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    local = {"contacts": [{"name": "Dana Roe", "emails": ["dana@acme.com"], "phones": []}],
+             "emails": [
+                 {"from": "Dana Roe <dana@acme.com>", "to": "me@example.com", "date": d(5), "subject": "Q"},
+                 {"from": "Me <me@example.com>", "to": "Dana Roe <dana@acme.com>, priya@acme.com",
+                  "date": d(9), "isSent": True},
+                 {"from": "Priya Raman <priya@acme.com>", "to": "me@example.com", "date": d(4)},
+                 {"from": "Cold Pitch <cold@pitch.io>", "to": "me@example.com", "date": d(3)},
+                 {"from": "noreply@acme.com", "to": "me@example.com", "date": d(2)}]}
+    people_seen = rp._interactions_by_contact(rp.resolve_contact_names(local))
+    assert {p["name"] for p in people_seen.values()} == {"Dana Roe", "Priya Raman"}
+    dana = next(p for p in people_seen.values() if p["name"] == "Dana Roe")
+    assert len(dana["from_them"]) == 1 and len(dana["from_me"]) == 1 and "email" in dana["by_channel"]
+    priya = next(p for p in people_seen.values() if p["name"] == "Priya Raman")
+    assert priya["cid"] == "c_priya"                       # graph identity, so one row per human
+    out = rp.compute(local, NOW)
+    assert {q["display_name"] for q in out["attention_queue"] if q["queue_type"] == "waiting_on_you"} \
+        == {"Dana Roe", "Priya Raman"}                     # they wrote last, 4–5 days ago
+
+
 def test_no_history_degrades_cleanly(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW)          # no history arg at all

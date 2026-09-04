@@ -44,6 +44,24 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA = os.environ.get("SOTTO_DATA", "/data")
+
+
+def _load_tzchain():
+    """THE timezone chain, by path: the image carries a copy of the skills tree's tzchain.py beside
+    this file (Dockerfile); a repo checkout finds the original two directories up. One file, every
+    runtime — the receiver, the dashboard, start.sh and the skills all resolve the day from it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "tzchain.py"),
+                      os.path.join(here, "..", "..", "sotto-chief-of-staff", "_shared", "lib", "tzchain.py")):
+        if os.path.exists(candidate):
+            spec = importlib.util.spec_from_file_location("tzchain", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise RuntimeError("tzchain.py is missing — the image must COPY it beside receiver.py")
+
+
+TZCHAIN = _load_tzchain()
 # One shared SECRET by default: the Bridge's wake-push sends the same token it dials in with
 # (BRIDGE_TOKEN → SOTTO_MCP_TOKEN), so /sotto/trigger accepts it unless a dedicated
 # SOTTO_TRIGGER_TOKEN is set — otherwise default-on wake-push would silently 401.
@@ -293,6 +311,13 @@ def _composed_brief_recently(kind: str, day: str) -> bool:
     and the row by the receiver's, and a deploy whose sandbox strips SOTTO_TIMEZONE would date an
     evening brief tomorrow (17:30 PT is 00:30 UTC) — a strict equality then refused every evening
     brief (review, Sep 3). An unreadable briefs/ answers True: fail-open, like the marker."""
+    return _brief_file_recent(f"{{d}}_{kind}.json", day)
+
+
+def _brief_file_recent(name: str, day: str) -> bool:
+    """Is briefs/<name with {d} = the row's day or a neighbour> younger than
+    COMPOSED_BRIEF_MAX_AGE_SECS? The one mtime check behind both the composed-archive gate and
+    the Learn-receipt check. Fail-open on an unreadable directory."""
     try:
         base = datetime.strptime(day, "%Y-%m-%d")
         days = [(base + timedelta(days=d)).strftime("%Y-%m-%d") for d in (-1, 0, 1)]
@@ -300,7 +325,7 @@ def _composed_brief_recently(kind: str, day: str) -> bool:
         days = [day]
     now = time.time()
     for d in days:
-        path = os.path.join(DATA, "briefs", f"{d}_{kind}.json")
+        path = os.path.join(DATA, "briefs", name.format(d=d))
         try:
             if now - os.path.getmtime(path) < COMPOSED_BRIEF_MAX_AGE_SECS:
                 return True
@@ -311,17 +336,59 @@ def _composed_brief_recently(kind: str, day: str) -> bool:
     return False
 
 
+def _learn_receipt(kind: str, day: str):
+    """The run's Learn receipt — briefs/<day>.<kind>.learned.json, written by learn_step.py — when
+    one is recent (same window and neighbour-day tolerance as the composed-archive check), else
+    None. Returns the parsed receipt (or {} when it exists but is unreadable) so the caller can say
+    which writers failed, not only whether the step ran."""
+    if not _brief_file_recent(f"{{d}}.{kind}.learned.json", day):
+        return None
+    try:
+        base = datetime.strptime(day, "%Y-%m-%d")
+        days = [(base + timedelta(days=d)).strftime("%Y-%m-%d") for d in (0, -1, 1)]
+    except (TypeError, ValueError):
+        days = [day]
+    for d in days:
+        try:
+            with open(os.path.join(DATA, "briefs", f"{d}.{kind}.learned.json"), encoding="utf-8") as f:
+                receipt = json.load(f)
+            return receipt if isinstance(receipt, dict) else {}
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
 def _on_delivered(payload: dict) -> None:
     """The channel ACKED this row. Two follow-ups, both only now: the run's chase/hand-off effects
     (a chase is counted when the message that chased actually landed), and — for a brief — the
     midday-digest window, which starts at the brief the user RECEIVED. Advancing it at the claim
     hid the whole morning from the 12:30 digest whenever the send then failed and retried into
     the afternoon (Day-0 simulation, Sep 2026: an unlinked Telegram, a brief that composed at
-    17:30 and never landed, and a digest window that started there anyway)."""
+    17:30 and never landed, and a digest window that started there anyway).
+
+    A brief also has to have LEARNED: the skill's Learn step is one command (learn_step.py) that
+    leaves a receipt, and a delivered brief with no receipt is logged loudly here — the graph, the
+    ledger, the rules and the voice all rest on that step, and a run that skipped it used to leave
+    every page green while the memory went a day colder."""
     _finalize_delivery_effects(payload.get("effects") or [])
     label = str(payload.get("label") or "")
-    if MARKED_BRIEF_KINDS.get(label.rsplit(":", 1)[-1].strip()):
+    kind = MARKED_BRIEF_KINDS.get(label.rsplit(":", 1)[-1].strip())
+    if kind:
         _advance_digest_stamp()
+        day = _local_now().strftime("%Y-%m-%d")
+        receipt = _learn_receipt(kind, day)
+        if receipt is None:
+            print(f"[sotto] {label}: delivered with NO Learn receipt "
+                  f"(briefs/{day}.{kind}.learned.json) — the run skipped learn_step.py, so nothing "
+                  "it saw reached the graph, the ledger, the rules or the voice", flush=True)
+        else:
+            failed = sorted(name for name, step in (receipt.get("steps") or {}).items()
+                            if isinstance(step, dict) and step.get("status") == "failed")
+            if failed:
+                print(f"[sotto] {label}: delivered, but its Learn step reports "
+                      f"{len(failed)} writer(s) failed: {', '.join(failed)}", flush=True)
 
 
 def _brief_delivery_gate(label: str, day: str, run_id: str) -> str:
@@ -469,6 +536,34 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
 # pins the two patterns byte-identical, the same contract keys.py lives under.
 _MARKER_RE = re.compile(r"<!--.*?-->", re.S)
 
+# Email asks, every other channel links — one rule, stated in every skill that hands a draft over,
+# and on Sep 4, 2026 a nudge still arrived with BOTH the ask and a 200-character percent-encoded
+# `mailto:` on a "Tap to send:" line, which Telegram does not linkify (a mailto with a query is
+# plain text there) and which on a phone opens whatever mail app the OS picks. Every run this
+# process delivers is unattended, and an unattended run's email path is the Gmail-draft offer the
+# user answers in chat — so a `mailto:` has no legitimate way to reach the channel from here. The
+# seam removes it: a markdown link keeps its label, a bare URL disappears, and a line that was only
+# the URL and its "tap to send" prefix goes with it.
+_MAILTO_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*mailto:[^)]*\)")
+_MAILTO_URL_RE = re.compile(r"<?mailto:[^\s<>\]\)]+>?")
+_MAILTO_STUB_RE = re.compile(r"[\W_]*(?:tap\s+(?:to\s+send|here)|send|reply)?[\W_]*", re.I)
+
+
+def _strip_mailto(text: str) -> str:
+    """Remove every `mailto:` link from a message body, and any line that was nothing but one."""
+    if "mailto:" not in text:
+        return text
+    kept = []
+    for line in text.split("\n"):
+        if "mailto:" not in line:
+            kept.append(line)
+            continue
+        rest = _MAILTO_URL_RE.sub("", _MAILTO_MD_LINK_RE.sub(r"\1", line))
+        if _MAILTO_STUB_RE.fullmatch(rest):
+            continue
+        kept.append(rest.rstrip())
+    return "\n".join(kept)
+
 
 def _send_via_channel(body: str, target: str) -> tuple[bool, str]:
     """THE call that hands one message to the channel — and the only thing in this image that knows
@@ -511,7 +606,7 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
     # Strip BEFORE the empty check: a text that was nothing but markers is an empty run, and the
     # honest receipt for it is "empty", not a delivered blank. Removed marker lines leave doubled
     # blank lines behind — collapse those too, so the reader never sees the surgery.
-    body = _MARKER_RE.sub("", text or "")
+    body = _strip_mailto(_MARKER_RE.sub("", text or ""))
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     if not body:
         _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids)
@@ -748,15 +843,19 @@ def _retry_failed_brief(label: str) -> None:
     if not kind:
         return
     today = _local_now().strftime("%Y-%m-%d")
-    if _BRIEF_RETRIES.get(name) == today or os.path.exists(delivered_marker(today, kind)):
+    stamped_day, fired = _BRIEF_RETRIES.get(name) or ("", 0)
+    fired = fired if stamped_day == today else 0
+    if fired >= BRIEF_RETRIES_PER_DAY or os.path.exists(delivered_marker(today, kind)):
         return
-    _BRIEF_RETRIES[name] = today
+    _BRIEF_RETRIES[name] = (today, fired + 1)
     out = _fire_cron_job(name, label)
-    print(f"[sotto] {label}: run died with no brief delivered — re-fired once "
-          f"({'ok' if out.get('ok') else out.get('reason')})", flush=True)
+    print(f"[sotto] {label}: run died with no brief delivered — re-fired "
+          f"({fired + 1} of {BRIEF_RETRIES_PER_DAY} today: "
+          f"{'ok' if out.get('ok') else out.get('reason')})", flush=True)
 
 
-_BRIEF_RETRIES: dict = {}    # job name → the local date of its one same-day re-fire
+BRIEF_RETRIES_PER_DAY = 1    # a dead brief run's same-day re-fires; a second death stays a failed row
+_BRIEF_RETRIES: dict = {}    # job name → (local date, re-fires so far that day)
 
 
 def _cron_run_is_dead(skill: str) -> bool:
@@ -915,27 +1014,19 @@ def handle_proactive_wake() -> tuple[int, dict]:
 # cron tick fires inside this same window, so the two halves of the brief lane cannot disagree about
 # when "the cron is firing right now" is true.
 BRIEF_CRON_WINDOW_MIN = 10
-# The only cron shape this module reads: the fixed daily `M H * * *` both brief entries use. Anything
-# else (a */N cadence, a weekday list) means we cannot say when it fires, so no window guard and no
-# receiver-run fire at all.
+# The two cron shapes this module reads: the fixed daily `M H * * *` the briefs and the digest use,
+# and the `*/N * * * *` interval the proactive watcher uses. Anything else (a weekday list) means we
+# cannot say when it fires, so no window guard and no receiver-run fire at all.
 _FIXED_DAILY_CRON_RE = re.compile(r"\A(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*\Z")
+_INTERVAL_CRON_RE = re.compile(r"\A\*/(\d{1,2})\s+\*\s+\*\s+\*\s+\*\Z")
 
 
 def _local_now():
-    """Now in the user's zone, through _configured_tz_name — THIS module's one tz chain, so the cron
-    window and `_local_today` can never disagree about what time it is here. UTC when no zone is
-    configured or tzdata can't resolve it: the same last rung brief_marker.py ("+00:00") and
-    start.sh ("UTC") already use, so the day a brief is filed under is the same day the marker is
-    filed under on a box whose system clock is not UTC. (Server local used to be the fallback
-    here; on Railway that IS UTC, so nothing observable changes there.)"""
-    tz = _configured_tz_name()
-    if tz:
-        try:
-            from zoneinfo import ZoneInfo  # noqa: PLC0415 — stdlib; lazy, and tzdata may be absent
-            return datetime.now(ZoneInfo(tz))
-        except Exception:  # noqa: BLE001
-            pass
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    """Now in the user's zone, through tzchain — THE chain, so the cron window, the dashboard's
+    `_local_today`, the marker and the skills can never disagree about what day it is. Aware in
+    the configured zone; naive UTC when none is configured (the shape every caller here expects)."""
+    tz = TZCHAIN.resolve(_configured_tz_name())
+    return datetime.now(tz) if tz else datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _fixed_daily_minute(schedule) -> tuple[int, int] | None:
@@ -949,16 +1040,44 @@ def _fixed_daily_minute(schedule) -> tuple[int, int] | None:
     return (hour, minute) if 0 <= hour < 24 and 0 <= minute < 60 else None
 
 
-def _fires_now(schedule) -> bool:
-    """True when this schedule's minute arrived less than BRIEF_CRON_WINDOW_MIN minutes ago, in the
-    user's zone. It is both "the cron is firing right now" (the wake-push guard) and "fire it now"
-    (the receiver's tick) — one statement, because the receiver is the thing that fires."""
-    at = _fixed_daily_minute(schedule)
-    if at is None:
-        return False
+def _interval_minutes(schedule) -> int | None:
+    """N for a `*/N * * * *` interval schedule (1–59), else None."""
+    match = _INTERVAL_CRON_RE.match(str(schedule or "").strip())
+    if not match:
+        return None
+    every = int(match.group(1))
+    return every if 0 < every < 60 else None
+
+
+def _cron_slot(schedule) -> str | None:
+    """The slot this schedule is firing in RIGHT NOW, or None outside one. A slot is the identity
+    of one scheduled fire: the local date for a fixed daily job, the date plus the boundary minute
+    for an interval job — so "already fired this slot" means the same thing for both shapes, and
+    a `*/15` job fires once per quarter-hour, not once per day and not ten times per window.
+
+    Fixed daily: the minute arrived less than BRIEF_CRON_WINDOW_MIN minutes ago. Interval: the most
+    recent multiple of N minutes, inside that same window (a boot eight minutes past the quarter
+    still fires it; a `*/5` cadence is shorter than the window and simply owns each boundary)."""
     now = _local_now()
-    since = (now - now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)).total_seconds()
-    return 0 <= since < BRIEF_CRON_WINDOW_MIN * 60
+    at = _fixed_daily_minute(schedule)
+    if at is not None:
+        since = (now - now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)).total_seconds()
+        return now.strftime("%Y-%m-%d") if 0 <= since < BRIEF_CRON_WINDOW_MIN * 60 else None
+    every = _interval_minutes(schedule)
+    if every is None:
+        return None
+    minute_of_day = now.hour * 60 + now.minute
+    boundary = minute_of_day - (minute_of_day % every)
+    if minute_of_day - boundary >= min(every, BRIEF_CRON_WINDOW_MIN):
+        return None
+    return f"{now.strftime('%Y-%m-%d')}T{boundary // 60:02d}:{boundary % 60:02d}"
+
+
+def _fires_now(schedule) -> bool:
+    """True when this schedule is inside a fire window right now, in the user's zone. It is both
+    "the cron is firing right now" (the wake-push guard) and "fire it now" (the receiver's tick) —
+    one statement, because the receiver is the thing that fires."""
+    return _cron_slot(schedule) is not None
 
 
 def _in_brief_cron_window(skill: str) -> bool:
@@ -1583,7 +1702,7 @@ def _promote_queued(key: str) -> dict:
 # simply isn't in the list, so neither caller can offer what the box won't run. No staged payload:
 # the brief skill falls back to its own snapshot when the Bridge hasn't pushed one.
 
-def _spawn_prompt(skill: str, payload_path: str = "") -> str:
+def _spawn_prompt(skill: str, payload_path: str = "", job_prompt: str = "") -> str:
     """The ONE prompt every spawned skill run gets, from either lane.
 
     Imperative + fail-loud. A friendly one-liner — crons.json's "Run my morning brief" — lets the
@@ -1595,18 +1714,30 @@ def _spawn_prompt(skill: str, payload_path: str = "") -> str:
 
     The wake-push lane had this prompt and the cron lane had the one-liner: one job, two prompts,
     and only one of them safe. `payload_path` is the only real difference between the two — a
-    Bridge-triggered run reads the staged local_data instead of gathering it."""
+    Bridge-triggered run reads the staged local_data instead of gathering it. `job_prompt` is the
+    crons.json row's own words, quoted as the job's NAME (never as the instruction): it is what
+    tells a multi-mode skill which mode this is — `sotto-event`'s "Run my midday digest" is how
+    that skill knows to run its digest procedure rather than wait for a bundle.
+
+    A skill that can legitimately end with nothing (a scan, a digest, a pulse) is told the silence
+    sentinel: the seam can only swallow what the prompt teaches, and Hermes' own scheduler proved
+    on Sep 4 that an untaught lane delivers the literal token."""
     staged = (f"The Sotto Bridge just delivered its trigger; use the staged local_data payload at "
               f"{payload_path} as the brief's local context (do NOT call read_local). "
               if payload_path else "")
+    named = f"This is the scheduled job \"{job_prompt}\". " if job_prompt else ""
     composer = ("You MUST generate the brief by running the skill's compose_brief.py via "
                 "execute_code and delivering its brief_markdown VERBATIM. Do NOT write the brief "
                 "yourself and do NOT hand-summarize the calendar/inbox. "
                 if skill in MARKED_BRIEF_KINDS else
                 "You MUST produce its output by running the skill's own scripts via execute_code "
-                "and delivering what they return VERBATIM — never hand-written in their place. ")
+                "and delivering what they return VERBATIM — never hand-written in their place. "
+                f"If the procedure ends with nothing to deliver, your ENTIRE reply must be the "
+                f"single token {SILENCE_SENTINEL} — the delivery seam turns that into silence; "
+                "never send 'all clear', 'scan complete', or any nothing-to-report message. ")
     return (
-        f"Run the {skill} skill now, following its SKILL.md procedure EXACTLY. {staged}{composer}"
+        f"Run the {skill} skill now, following its SKILL.md procedure EXACTLY. {named}{staged}"
+        f"{composer}"
         f"Use each action's tap_link verbatim — never invent sms:/wa.me links or deep-link a group "
         f"chat. If you cannot run the skill's scripts (e.g. execute_code is unavailable or "
         f"unapproved), STOP and report that you could not — do NOT improvise the output. Deliver as "
@@ -1619,13 +1750,13 @@ def _fire_cron_job(name: str, label: str) -> dict:
     job = next((j for j in _sotto_cron_jobs() if j[0] == name), None)
     if job is None:
         return {"ok": False, "error": "unknown", "reason": "that job isn't registered on this box"}
-    _, _, _prompt, skill = job
+    _, _, prompt, skill = job
     try:
         runner = shlex.split(os.environ.get("SOTTO_RUN_SKILL", "hermes -z"))
         # crons.json's `prompt` is what HERMES registers for the jobs it runs. A run spawned HERE
-        # gets the one imperative prompt instead — see _spawn_prompt for why a friendly one-liner
-        # loses briefs.
-        _spawn_and_deliver(runner, _spawn_prompt(skill), label)
+        # gets the one imperative prompt instead, with the row's words quoted only as the job's
+        # name — see _spawn_prompt for why a friendly one-liner on its own loses briefs.
+        _spawn_and_deliver(runner, _spawn_prompt(skill, job_prompt=prompt), label)
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] {label} spawn failed: {e}", flush=True)
         return {"ok": False, "error": "spawn", "reason": "that run couldn't be started"}
@@ -1640,13 +1771,16 @@ def _run_dashboard_job(name: str) -> dict:
     return out
 
 
-# ── The receiver's own cron: a brief is scheduled AND delivered here ──────────────────────────────
-# ONE delivery lane for the briefs. Hermes' scheduler used to fire "Run my morning brief" itself and
-# deliver in-Hermes — outside the outbox, so a channel that was down at 6:30 lost the brief with no
-# retry and no receipt, and the deliver-once gate had a second lane to referee. crons.json rows
-# marked `"runner": "receiver"` are therefore never registered with Hermes; this heartbeat fires them
-# down the same path the dashboard's button uses, so a scheduled brief inherits the outbox's retries,
-# its receipt, and the deliver-once gate that already governs these labels.
+# ── The receiver's own cron: a scheduled run is scheduled AND delivered here ──────────────────────
+# ONE delivery lane for everything scheduled. Hermes' scheduler used to fire "Run my morning brief"
+# itself and deliver in-Hermes — outside the outbox, so a channel that was down at 6:30 lost the
+# brief with no retry and no receipt, and the deliver-once gate had a second lane to referee. Then
+# the proactive watcher, still on Hermes' clock, delivered the literal `NO_NUDGES` token at 7:02
+# one morning (Sep 4, 2026): the silence seam lives in _deliver_text, and a run Hermes delivers never
+# passes through it. crons.json rows marked `"runner": "receiver"` are therefore never registered
+# with Hermes; this heartbeat fires them down the same path the dashboard's button uses, so a
+# scheduled run inherits the outbox's retries, its receipt, the silence seam, and — for a brief —
+# the deliver-once gate that already governs these labels.
 #
 # Dedupe is two layers, deliberately: the in-memory map stops the ticks inside one window from firing
 # the same job ten times, and the brief claim plus the deliver-once marker are what actually
@@ -1657,40 +1791,48 @@ def _run_dashboard_job(name: str) -> dict:
 # is no registration anywhere to re-register.
 CRON_TICK_SECS = 60          # the schedule's resolution is one minute; slower would skip a job
 
-_CRON_FIRED: dict = {}       # job name → the local date it last fired, this process
+_CRON_FIRED: dict = {}       # job name → the slot it last fired in (_cron_slot), this process
 _CRON_UNPARSED: set = set()  # names logged once for a schedule this side can't read — never per tick
 
 
 def _cron_tick() -> None:
-    """One heartbeat: fire every receiver-run job whose minute has arrived and that hasn't fired
-    today. Best-effort per job — an unreadable schedule or a failed spawn is one log line."""
+    """One heartbeat: fire every receiver-run job whose slot has arrived and that hasn't fired in
+    it. Best-effort per job — an unreadable schedule or a failed spawn is one log line."""
     reconciler = _cron_reconciler()
     if reconciler is None:
         return   # no adapter tree on this box; _sotto_cron_jobs has already said so
     today = _local_now().strftime("%Y-%m-%d")
     for name, schedule, _prompt, _skill in _sotto_cron_jobs(reconciler.RECEIVER_RUNNER):
-        if _fixed_daily_minute(schedule) is None:
+        if _fixed_daily_minute(schedule) is None and _interval_minutes(schedule) is None:
             if name not in _CRON_UNPARSED:
                 _CRON_UNPARSED.add(name)
-                print(f"[sotto] cron {name}: {schedule!r} is not a fixed daily `M H * * *` schedule "
-                      "— the receiver leaves it unfired", flush=True)
+                print(f"[sotto] cron {name}: {schedule!r} is neither a fixed daily `M H * * *` nor "
+                      "a `*/N * * * *` interval schedule — the receiver leaves it unfired", flush=True)
             continue
-        if _CRON_FIRED.get(name) == today or not _fires_now(schedule):
+        slot = _cron_slot(schedule)
+        if slot is None or _CRON_FIRED.get(name) == slot:
             continue
         # A restart inside the window forgets it fired; the durable marker remembers whether the
         # day DELIVERED. Composing a second brief the send seam would only supersede costs minutes
         # and real tokens for words nobody reads (Day-15 simulation, Sep 2026).
         kind = MARKED_BRIEF_KINDS.get(name)
         if kind and os.path.exists(delivered_marker(today, kind)):
-            _CRON_FIRED[name] = today
+            _CRON_FIRED[name] = slot
             print(f"[sotto] cron {name}: today's brief is already delivered — not re-fired", flush=True)
+            continue
+        # A nudge lane (the watcher, the digest) spends the day's interrupt budget against the
+        # channel it lands on, so it is held exactly as the wake-push and the valve hold it: an
+        # unlinked channel means the slot is spent unspawned, not retried every tick. A brief is
+        # never held here — the outbox keeps it until the channel comes back.
+        if not kind and not _delivery_channel_ready(f"cron:{name}"):
+            _CRON_FIRED[name] = slot
             continue
         out = _fire_cron_job(name, f"cron:{name}")
         # Stamped only on a spawn that STARTED: a failed spawn retries on the next tick — the
         # BRIEF_CRON_WINDOW_MIN window bounds that to a handful of attempts, and stamping the whole
         # day on a failure silenced the brief until tomorrow (external review, Aug 31).
         if out.get("ok"):
-            _CRON_FIRED[name] = today
+            _CRON_FIRED[name] = slot
         print(f"[sotto] cron {name}: {'fired' if out.get('ok') else out.get('reason')}", flush=True)
 
 
@@ -2162,13 +2304,10 @@ _IANA_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_+./-]{0,63}\Z")
 
 
 def _configured_tz_name() -> str:
-    """The user's configured zone, or "" when nothing is set. CANONICAL ORDER, and the only copy of
-    it in this module: SOTTO_TIMEZONE → TZ → $SOTTO_DATA/config/settings.json → (caller's fallback:
-    UTC, the same last rung as brief_marker.py and start.sh). The same chain lives in start.sh's
-    step 2, dashboard._local_today and the skills' timeutil.configured_tz — change one, change them
-    all."""
-    return (os.environ.get("SOTTO_TIMEZONE") or os.environ.get("TZ")
-            or read_settings().get("timezone") or "").strip()
+    """The user's configured zone, or "" when nothing is set — tzchain's answer, nobody else's.
+    The root is the one SETTINGS_FILE lives under, so the wizard's write and this read can never
+    be two different files (tests repoint SETTINGS_FILE; the chain must follow it)."""
+    return TZCHAIN.configured_tz_name(os.path.dirname(os.path.dirname(SETTINGS_FILE)))
 
 
 def _crons_file() -> str:
@@ -2655,7 +2794,7 @@ def start_update_check_thread():
 def setup_status() -> dict:
     gok, gmsg = google_connected()
     client_present = os.path.exists(os.path.expanduser("~/.hermes/google_client_secret.json"))
-    tz = _configured_tz_name()   # SOTTO_TIMEZONE → TZ → settings.json (→ server local)
+    tz = _configured_tz_name()   # tzchain: SOTTO_TIMEZONE → TZ → settings.json (→ UTC)
     return {
         "bridge_connected": RELAY.bridge_connected(),
         "google_connected": gok,

@@ -51,8 +51,15 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402
 
-KINDS = ("meeting_prep", "commitment", "chase", "handoff", "retune_offer", "procedure", "intention")
+KINDS = ("meeting_prep", "commitment", "chase", "handoff", "retune_offer", "procedure", "intention",
+         "mute")
 DEFAULT_TTL_MIN = 180   # a question goes stale in three hours; a named constant, not a knob
+
+# Short replies that DISMISS what was offered — "done", "handled", "let it go". A dismissal to an
+# offer about a loop resolves or drops that loop by its anchor, so the user never has to name it
+# again; a dismissal to any other offer just clears it. Stated once, here, for the persona to read.
+DISMISS_RESOLVED = ("done", "handled", "already handled", "sorted", "taken care of")
+DISMISS_DROPPED = ("let it go", "drop it", "skip it", "skip", "no", "nah", "leave it", "forget it")
 
 
 def _path() -> str:
@@ -80,11 +87,13 @@ def payload_hash(payload: bytes) -> str:
 
 
 def set_offer(kind: str, question: str, person: str = "", detail: str = "",
-              ttl_min: int = DEFAULT_TTL_MIN, payload_sha256: str = "") -> dict:
+              ttl_min: int = DEFAULT_TTL_MIN, payload_sha256: str = "", anchor_key: str = "") -> dict:
     """Record the question just delivered. Overwrites: newest wins, one offer at a time.
 
     `payload_sha256` is set only when the yes causes a real effect; the payload itself is never
-    stored, here or in the receipt the acting verb writes."""
+    stored, here or in the receipt the acting verb writes. `anchor_key` names the ledger loop the
+    offer is about (a chase, a commitment, a hand-off), so "done" or "let it go" lands on that row
+    without re-matching by name."""
     now = _now()
     offer = {
         "ts": now.isoformat(),
@@ -92,6 +101,7 @@ def set_offer(kind: str, question: str, person: str = "", detail: str = "",
         "question": question,
         "person": person or "",
         "detail": detail or "",
+        "anchor_key": anchor_key or "",
         "payload_sha256": payload_sha256 or "",
         "expires_at": (now + timedelta(minutes=ttl_min)).isoformat(),
     }
@@ -137,6 +147,9 @@ def main() -> None:
     s.add_argument("--question", required=True, help="the sentence as delivered, verbatim")
     s.add_argument("--person", default="", help="who the offer is about, if it names someone")
     s.add_argument("--detail", default="", help="free text the acting session may need")
+    s.add_argument("--anchor-key", default="",
+                   help="the ledger loop this offer is about (chase / commitment / handoff), so a "
+                        "'done' or 'let it go' resolves or drops that exact row")
     s.add_argument("--ttl-min", type=int, default=DEFAULT_TTL_MIN)
     s.add_argument("--payload-file", default="",
                    help="file holding the EXACT bytes offered (a draft body, a canonical event); "
@@ -151,7 +164,8 @@ def main() -> None:
         if a.payload_file:
             with open(a.payload_file, "rb") as f:
                 digest = payload_hash(f.read())
-        print(json.dumps(set_offer(a.kind, a.question, a.person, a.detail, a.ttl_min, digest)))
+        print(json.dumps(set_offer(a.kind, a.question, a.person, a.detail, a.ttl_min, digest,
+                                   a.anchor_key)))
     elif a.cmd == "get":
         print(json.dumps(get_offer()))
     else:

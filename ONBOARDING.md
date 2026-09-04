@@ -22,7 +22,7 @@ WhatsApp is the appendix at the end of this page.)
 | A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the LLM (only key Sotto needs) | once, into Railway |
 | A **Telegram bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`, ~1 min *(default channel — WhatsApp instead? the appendix)* | where briefs are delivered | once, into Railway |
 | A **Google OAuth client** (5-minute console task, step 3②) | Gmail + Calendar | pasted in the wizard |
-| The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) | reads your Mac | drag to /Applications |
+| *(optional)* The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) — if you have a Mac and want iMessage, WhatsApp, calls, Notes and Contacts in your briefs; without it Sotto runs on Gmail + Calendar alone, a supported deploy | reads your Mac | drag to /Applications |
 
 Everything else — linking your Mac, connecting Google, your channel, your timezone, and optional
 extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
@@ -52,7 +52,8 @@ from GitHub repo** → pick it. Set **all four** before the first deploy finishe
    *Get this wrong and the build dies with `COPY … not found` — the Dockerfile's `COPY` paths are
    relative to the build context this setting picks.*
 2. **Variables → New Variable** — add three:
-   - `GOOGLE_AI_API_KEY` = your Gemini key
+   - `GOOGLE_AI_API_KEY` = your Gemini key *(Google's own docs sometimes call it `GEMINI_API_KEY` or
+     `GOOGLE_API_KEY` — Sotto accepts any of the three names, so paste it under whichever you copied)*
    - `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you
    - `BRIDGE_TOKEN` = a long random secret — run `openssl rand -hex 24` and paste the output.
      *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
@@ -275,7 +276,9 @@ The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: s
 `localhost` (generate a domain), no reply from your bot (the allowlist must be the numeric chat id —
 the boot capture gets it right), briefs
 never arrive (check the boot key-check line + `/debug/brief-log`), Google dying after a week (consent
-screen left in Testing — step 3②.3). **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
+screen left in Testing — step 3②.3). **Replies feel stale, or Sotto starts echoing a delivered brief
+back at you:** send **`/new`** in the chat — it starts a fresh session on the latest persona.
+Sessions also reset nightly and on every redeploy; `/new` is the one you control. **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
 icon, drag `/Applications/Sotto Bridge.app` to the Trash, and remove its Full Disk Access entry in
 System Settings → Privacy & Security. That's everything — it keeps no other state on the Mac.
 

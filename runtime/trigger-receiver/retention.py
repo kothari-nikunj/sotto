@@ -198,6 +198,8 @@ SWEEP = (
          "built from"),
     Rule("briefs/????-??-??.*.named.json", DELETE_OLDER, BRIEF_ARCHIVE_DAYS,
          "which loops a brief named ages with that brief"),
+    Rule("briefs/????-??-??.*.learned.json", DELETE_OLDER, BRIEF_ARCHIVE_DAYS,
+         "the Learn step's receipt — which memory writers ran for that brief — ages with it"),
     Rule("briefs/????-??-??.*.claim", DELETE_OLDER, BRIEF_ARCHIVE_DAYS,
          "a day's brief markers age with that day's brief"),
     Rule("briefs/????-??-??.*.delivered", DELETE_OLDER, BRIEF_ARCHIVE_DAYS,
@@ -245,6 +247,9 @@ EXEMPT = (
     Exempt("events/last_digest.txt", "one window stamp, rewritten in place"),
     Exempt("proactive/wake_run.last", "one throttle stamp; its mtime IS the value"),
     Exempt("proactive/retune_offer.last", "one cooldown stamp, rewritten in place"),
+    Exempt("proactive/mute_offers.json",
+           "one date per person Sotto has asked to mute; its writer drops entries past the 30-day "
+           "cooldown on every write, so it is bounded by the people you keep dismissing"),
     Exempt("knowledge/**",
            "the memory — people, companies, master.md, style, outcomes, the continuity ledger "
            "(which resolves its own terminal items after 30 days). Deleting it is a decision you "
@@ -260,8 +265,9 @@ EXEMPT = (
     Exempt("intentions.jsonl", "your own one-shot recipes, folded by id and cancelled when they run"),
     Exempt("setup_code", "the credential that gates the setup surface"),
     Exempt("style.json",
-           "style_extract.py caps every bucket it writes (30/25/25 canonical, 30 recent, 500 keys); "
-           "the one uncapped bucket, `confirmed`, grows only by your own Voice-card taps"),
+           "style_extract.py caps every bucket it writes (30/25/25 canonical, 30 recent, 500 keys, "
+           "and `confirmed` at its newest 20 per register — the bucket the draft→outcome matcher "
+           "feeds on every verbatim send, so it is capped where it grows)"),
     Exempt("hermes/**",
            "the Hermes gateway's own state, including the WhatsApp session — not ours. KNOWN GAP: "
            "hermes/sessions/ gains one archived chat transcript per day (the nightly session "

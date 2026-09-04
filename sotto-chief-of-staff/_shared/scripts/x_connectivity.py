@@ -118,8 +118,8 @@ def upcoming_attendees(calendar) -> list:
         owner_domain = ""
     out, seen = [], set()
     for event in _events(calendar):
-        if not isinstance(event, dict):
-            continue
+        if not isinstance(event, dict) or _s(event.get("my_response")).lower() == "declined":
+            continue                  # a meeting you declined never spends an X lookup
         for raw in event.get("attendees") or []:
             if isinstance(raw, dict):
                 email = _s(raw.get("email")).strip().lower()

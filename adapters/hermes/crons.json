@@ -25,13 +25,15 @@
     "schedule_env": "SOTTO_PROACTIVE_CRON",
     "prompt": "Run my proactive check",
     "skill": "sotto-proactive",
-    "gate": "SOTTO_PROACTIVE"
+    "gate": "SOTTO_PROACTIVE",
+    "runner": "receiver"
   },
   {
     "name": "sotto-midday-digest",
     "schedule": "30 12 * * *",
     "prompt": "Run my midday digest",
     "skill": "sotto-event",
-    "gate": "SOTTO_DIGEST"
+    "gate": "SOTTO_DIGEST",
+    "runner": "receiver"
   }
 ]

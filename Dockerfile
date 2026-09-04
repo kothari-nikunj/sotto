@@ -87,6 +87,9 @@ RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles
 COPY sotto-chief-of-staff/ /root/.hermes/skills/sotto/
 COPY adapters/hermes/sotto.bundle.yaml /root/.hermes/skill-bundles/sotto.yaml
 COPY runtime/trigger-receiver/ /app/trigger-receiver/
+# THE timezone chain — one file in the skills tree, carried beside the receiver so the receiver, the
+# dashboard and start.sh run the same code the skills do (no import across trees, and no copy in git).
+COPY sotto-chief-of-staff/_shared/lib/tzchain.py /app/trigger-receiver/tzchain.py
 COPY adapters/hermes/ /app/adapters/hermes/
 # The two interactive playgrounds live in docs/ (one source of truth) and are SERVED from
 # /static/* — so they are copied in beside the frontend assets at build time. That keeps

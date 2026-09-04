@@ -30,6 +30,9 @@ Rules implemented (each returns a one-line violation string):
      token-overlap ratio > 0.8 fails — "one fact stated three ways").
   g. every URGENT open/waiting action_ledger entry is NAMED somewhere in the brief, and the brief
      does not INVENTORY the rest — the open-items contract, restated (see `is_urgent`).
+  h. a person Sotto already nudged the user about today (a DELIVERED nudge — compose_brief reads
+     them off surfaced.jsonl ∩ delivery.jsonl) never leads the brief and takes at most
+     ALREADY_NUDGED_MAX_LINES lines — "never tell you twice", measured rather than requested.
 
 Pure: no I/O and no environment reads, so validate() is deterministic and unit-testable. Its one
 import is textutil's identifier normalizer — the same one the rest of the pipeline keys identities
@@ -455,16 +458,57 @@ def _check_no_open_loop_inventory(markdown: str) -> list:
             for s, n in counts.items() if n > _INVENTORY_MAX_LINES]
 
 
+# Rule (h) — "never tell you twice". The prompt asks the model to compress an already-delivered
+# nudge to ONE matter-of-fact line and never to open with it; this is the measurement behind that
+# ask. Two lines, not one, because the same person may legitimately also appear in Coming Up.
+ALREADY_NUDGED_MAX_LINES = 2
+
+
+def _content_lines(markdown: str) -> list:
+    return [line for line, _section, _cu in _split_lines_with_sections(markdown)
+            if line.strip() and not _HEADING_RE.match(line)]
+
+
+def _check_already_nudged(markdown: str, nudged_senders) -> list:
+    # Full names only: a single token is a common word as often as a person ("Will send the
+    # redline", "Grace period", "Mark as read"), and rule (g) already learned that lesson.
+    senders = []
+    for s in (nudged_senders or []):
+        s = str(s or "").strip()
+        if len(s.split()) >= 2 and is_name_shaped(s) and s not in senders:
+            senders.append(s)
+    content = _content_lines(markdown)
+    if not senders or not content:
+        return []
+    violations = []
+    lead = content[0].lower()
+    for s in senders:
+        if _token_present(s, lead):
+            violations.append(
+                f"already-nudged: '{s}' opens the brief — Sotto already nudged the user about them "
+                f"today; it compresses to one matter-of-fact line, never the opener")
+            continue
+        n = sum(1 for line in content if _token_present(s, line.lower()))
+        if n > ALREADY_NUDGED_MAX_LINES:
+            violations.append(
+                f"already-nudged: '{s}' takes {n} lines — Sotto already nudged the user about them "
+                f"today; at most {ALREADY_NUDGED_MAX_LINES} (one status line, plus a Coming Up "
+                f"mention), never re-told as news")
+    return violations
+
+
 def validate(brief_markdown: str, action_items: list, rendered_source_text: str,
              first_run: bool = False, action_ledger: list | None = None,
-             today: str = "", allowed_identifiers=None) -> list:
+             today: str = "", allowed_identifiers=None, already_nudged=None) -> list:
     """Pure: run every machine-checkable brief rule; return a list of one-line violation strings
     (empty = clean). Never raises on malformed input — a validator crash must not cost a brief.
     `first_run` marks the one-time onboarding brief, whose mandated trailing offer line is allowed
     past the Coming Up cap (see _check_coming_up_length). `action_ledger` is the open-loop ledger the
     brief was built from (rule g); omit it and that rule simply doesn't run. `today` is the brief's
     user-local date, which is what makes a deadline urgent or not. `allowed_identifiers` is the
-    compose-time tap-target allowlist (rule e2); omit it and that rule doesn't run either."""
+    compose-time tap-target allowlist (rule e2); omit it and that rule doesn't run either.
+    `already_nudged` is the list of sender names Sotto nudged the user about today (rule h); omit
+    it and that rule doesn't run."""
     violations = []
     try:
         violations += _check_bold_markers_and_duplicates(brief_markdown, rendered_source_text)
@@ -475,6 +519,7 @@ def validate(brief_markdown: str, action_items: list, rendered_source_text: str,
         violations += _check_action_field_distinctness(action_items)
         violations += _check_open_ledger_coverage(brief_markdown, action_ledger, today)
         violations += _check_no_open_loop_inventory(brief_markdown)
+        violations += _check_already_nudged(brief_markdown, already_nudged)
     except Exception:  # noqa: BLE001 — defensive: garbage in, no crash out
         pass
     return violations

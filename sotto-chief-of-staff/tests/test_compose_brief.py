@@ -521,6 +521,9 @@ def test_critic_decision_matrix():
     assert run is False and "small brief" in reason
     # either side of the AND flips it back to running
     assert cb._critic_decision("auto", cb.CRITIC_AUTO_MIN_PAYLOAD_CHARS, 0)[0] is True       # big payload
+    # the first brief is always reviewed — its thin shape is exactly what "auto" would skip
+    assert cb._critic_decision("auto", 0, 0, first_run=True) == (True, "first brief — always reviewed")
+    assert cb._critic_decision("off", 0, 0, first_run=True)[0] is False
     assert cb._critic_decision("auto", 0, cb.CRITIC_AUTO_MIN_ACTIONS + 1)[0] is True         # many actions
     # unknown mode string falls back to auto
     import os as _os
@@ -531,8 +534,12 @@ def test_critic_decision_matrix():
         del _os.environ["SOTTO_CRITIC"]
 
 
-def test_critic_auto_skips_small_brief(monkeypatch):
+def test_critic_auto_skips_small_brief(monkeypatch, tmp_path):
     monkeypatch.delenv("SOTTO_CRITIC", raising=False)          # default = auto
+    # …on an ordinary day: the FIRST brief is always reviewed, so plant a delivered marker
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    (tmp_path / "briefs").mkdir()
+    (tmp_path / "briefs" / "2026-06-01.morning.delivered").write_text("")
     fake_llm, calls = _one_call_llm()
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
     assert calls["n"] == 1                                     # extraction only — no critic/revise calls
@@ -890,6 +897,146 @@ def test_muted_person_removed_from_attention_queue(tmp_path, monkeypatch):
     assert "waiting 4 days" in p and "going quiet" not in p
     assert "Do NOT surface or flag these people anywhere in the brief: Bob" in p
     assert "keep it terse" in p                 # tone note surfaced to the model
+
+
+def test_a_muted_persons_thread_never_reaches_the_model(tmp_path, monkeypatch):
+    """"Mute Bob" was machinery for email and prose for iMessage: his texts still reached the model,
+    which was merely asked not to mention him. A muted person is removed from the data. Groups he
+    is in stay — a mute is a person, not a room."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _write_prefs(tmp_path, {"mute_senders": [], "mute_people": ["Bob Lee"],
+                            "mute_sections": [], "tone_notes": []})
+    local = {"contacts": [{"name": "Bob Lee", "phones": ["+14155550001"]},
+                          {"name": "Maria Ruiz", "phones": ["+14155550002"]}],
+             "imessage": [
+                 {"handle": "+14155550001", "is_from_me": False, "timestamp": "2026-06-24 08:00:00",
+                  "text": "can you look at the bob-only thread today?", "is_group_chat": False},
+                 {"handle": "+14155550002", "is_from_me": False, "timestamp": "2026-06-24 08:05:00",
+                  "text": "maria here — the venue moved to thursday", "is_group_chat": False},
+                 {"handle": "+14155550001", "is_from_me": False, "timestamp": "2026-06-24 08:10:00",
+                  "text": "group note from bob about the offsite", "is_group_chat": True,
+                  "chat_guid": "g-offsite", "group_name": "Offsite crew"}]}
+    p = cb.build_prompt(cb._load_prompt(), {"type": "morning", "first_run": False,
+                                            "google": {"events": []}, "local": local})
+    assert "bob-only thread" not in p and "venue moved to thursday" in p
+    assert "group note from bob" in p                    # the group thread is not his to mute
+
+
+# ── debts code can see are minted by code ────────────────────────────────────────────────────────
+
+def _stale(tid="t-victor", to="Victor Yeung <victor@acme.com>", email="victor@acme.com",
+           subject="Re: allocation", days=4, snippet="sending the revised deck — thoughts on the allocation?"):
+    return {"threadId": tid, "to": to, "toEmail": email, "subject": subject, "daysSinceSent": days,
+            "sentDate": f"2026-08-{31 - days:02d}T09:00:00Z", "snippet": snippet}
+
+
+def test_stale_sent_threads_become_waiting_on_debts_for_people_you_know(tmp_path, monkeypatch):
+    """An email you sent that nobody answered is a debt owed to you — when it went to someone you
+    know. A stranger, a no-reply address, an intro you made, or a two-word "thanks" is not."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    local = {"contacts": [{"name": "Victor Yeung", "emails": ["victor@acme.com"], "phones": []},
+                          {"name": "Dana Roe", "emails": ["dana@acme.com"], "phones": []},
+                          {"name": "Ops", "emails": ["noreply@acme.com"], "phones": []}]}
+    inputs = {"type": "morning", "local": local, "google": {"events": [], "staleThreads": [
+        _stale(),
+        _stale(tid="t-stranger", to="cold@pitch.io", email="cold@pitch.io"),
+        _stale(tid="t-noreply", to="noreply@acme.com", email="noreply@acme.com"),
+        _stale(tid="t-intro", to="Dana Roe <dana@acme.com>", email="dana@acme.com",
+               subject="Intro: Dana <> Priya"),
+        _stale(tid="t-thanks", to="Dana Roe <dana@acme.com>", email="dana@acme.com", snippet="thanks!"),
+    ]}}
+    norm = cb._normalize_local(inputs)
+    assert [t["threadId"] for t in norm["stale_threads"]] == ["t-victor"]
+    actions = cb._stale_debt_actions(norm, cb.build_contact_lookup(local["contacts"]))
+    a, = actions
+    assert a["type"] == "waiting_on" and a["channel"] == "gmail"
+    assert a["contactName"] == "Victor Yeung" and a["contactIdentifier"] == "victor@acme.com"
+    assert a["emailThreadId"] == "t-victor" and a["created_at"] == "2026-08-27"
+    assert "hasn't answered" in a["contextSummary"] and "4 days" in a["contextSummary"]
+    # …and the prompt names it as already-tracked information, not as a job for the model
+    p = cb.build_prompt(cb._load_prompt(), inputs)
+    assert "Emails you sent that nobody answered" in p and "do NOT emit an action" in p
+    # a thread the ledger already tracks is neither minted nor rendered
+    tracked = dict(norm, action_ledger=[{"status": "waiting", "action_type": "waiting_on",
+                                         "contact_name": "Victor Yeung", "source_thread_id": "t-victor",
+                                         "created_at": "2026-08-27", "summary": "the allocation"}])
+    assert cb._stale_debt_actions(tracked) == []
+    assert "Emails you sent that nobody answered" not in cb._format_stale_threads(tracked)
+
+
+def test_minted_actions_never_displace_the_models_row_for_the_same_debt():
+    model = [{"type": "reply", "channel": "gmail", "contactName": "Victor", "emailThreadId": "t-victor",
+              "contactIdentifier": "victor@acme.com"}]
+    minted = [{"type": "waiting_on", "emailThreadId": "t-victor", "contactIdentifier": "victor@acme.com"},
+              {"type": "waiting_on", "emailThreadId": "t-dana", "contactIdentifier": "dana@acme.com"},
+              {"type": "rsvp", "contactIdentifier": "ev9", "emailThreadId": ""}]
+    out = cb._merge_deterministic_actions(model, minted)
+    assert [a.get("emailThreadId") or a["contactIdentifier"] for a in out] == ["t-victor", "t-dana", "ev9"]
+    assert out[0]["type"] == "reply"
+
+
+def test_a_meeting_you_declined_is_not_on_your_day_and_an_unanswered_invite_is_an_ask(monkeypatch):
+    """Declined: gone from the calendar the model sees, from research, and from the prep nudge.
+    Unanswered within 48h with somebody else on it: an `rsvp` ask, minted by code."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    soon = (now + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    later = (now + timedelta(hours=80)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    me = {"email": "me@example.com", "self": True}
+    events = [
+        {"id": "ev-declined", "summary": "Declined pitch", "start": soon, "my_response": "declined",
+         "attendees": [dict(me, responseStatus="declined"), {"email": "vc@fund.com", "displayName": "VC"}]},
+        {"id": "ev-unanswered", "summary": "Coffee with Priya", "start": soon, "my_response": "needsaction",
+         "attendees": [dict(me, responseStatus="needsAction"), {"email": "priya@acme.com"}]},
+        {"id": "ev-far", "summary": "Far invite", "start": later, "my_response": "needsaction",
+         "attendees": [dict(me, responseStatus="needsAction"), {"email": "x@acme.com"}]},
+        {"id": "ev-solo", "summary": "Focus block", "start": soon, "my_response": "needsaction",
+         "attendees": [dict(me, responseStatus="needsAction")]},
+        {"id": "ev-ok", "summary": "Accepted sync", "start": soon, "my_response": "accepted",
+         "attendees": [dict(me, responseStatus="accepted"), {"email": "y@acme.com"}]},
+    ]
+    inputs = {"type": "morning", "local": {}, "google": {"events": events, "userEmail": "me@example.com"}}
+    p = cb.build_prompt(cb._load_prompt(), inputs)
+    assert "Declined pitch" not in p and "Coffee with Priya" in p
+    assert "you haven't answered this invite yet" in p
+    rsvp = cb._rsvp_actions(inputs, now)
+    assert [a["contactIdentifier"] for a in rsvp] == ["ev-unanswered"]
+    assert rsvp[0]["type"] == "rsvp" and rsvp[0]["channel"] == "calendar"
+    assert "haven't answered the invite for Coffee with Priya" in rsvp[0]["contextSummary"]
+
+    class _Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 4, 9, 0, tzinfo=tz)
+    monkeypatch.setattr(cb, "datetime", _Fixed)
+    assert "vc@fund.com" not in [x["email"] for x in cb.select_attendees_for_research(inputs)]
+
+
+def test_the_evening_asks_once_a_month_whether_to_mute_the_person_you_keep_dismissing(tmp_path, monkeypatch):
+    """Three dismissals is Sotto asking once whether to stop bringing it up. The learner's hint
+    used to wait for a tune-up conversation nobody starts; the evening's one question line carries
+    it, records the pending offer (a yes in the gateway runs preferences.py mute-person), and
+    never asks about the same person twice in a month."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    import retune_scan
+    monkeypatch.setattr(retune_scan, "scan", lambda: {"mute_suggestions": [
+        {"name": "Bob Lee", "reason": "you keep dismissing their items"}]})
+    out = cb._append_mute_offer({"brief_markdown": "# Evening\nquiet."},
+                                {"type": "evening", "google": {"userTimezone": "+00:00"}}, "2026-09-04")
+    assert "You keep dismissing Bob Lee's items — stop bringing them up?" in out["brief_markdown"]
+    import pending_offer
+    offer = pending_offer.get_offer()
+    assert offer["kind"] == "mute" and offer["person"] == "Bob Lee"
+    assert json.load(open(tmp_path / "proactive" / "mute_offers.json")) == {"bob lee": "2026-09-04"}
+    # the same person is not asked about again inside the cooldown — nor in the morning, nor when
+    # the evening already carries a standing-rule question
+    again = cb._append_mute_offer({"brief_markdown": "# Evening"}, {"type": "evening"}, "2026-09-20")
+    assert "stop bringing them up" not in again["brief_markdown"]
+    later = cb._append_mute_offer({"brief_markdown": "# Evening"}, {"type": "evening"}, "2026-10-10")
+    assert "stop bringing them up" in later["brief_markdown"]
+    assert "stop bringing" not in cb._append_mute_offer({"brief_markdown": "x"}, {"type": "morning"}, "2026-12-01")["brief_markdown"]
+    assert "stop bringing" not in cb._append_mute_offer(
+        {"brief_markdown": "x"}, {"type": "evening", "_procedure_offer": "never book Fridays"}, "2026-12-01")["brief_markdown"]
 
 
 def test_first_run_note_only_on_first_brief(tmp_path, monkeypatch):
@@ -1282,6 +1429,17 @@ def test_already_nudged_reads_the_writers_real_rows(monkeypatch, tmp_path):
     rows = cb._load_surfaced_nudges(cb._user_local_date("+00:00"), cb._resolve_tz("+00:00"))
     assert [(r["sender"], r["cls"]) for r in rows] == [("Sarah Chen", "urgent")]
     assert "waiting on the deck" in rows[0]["reason"]
+    # a proactive nudge's sender is its prose line; the row carries the PERSON it was about, and
+    # that is the name the validator's never-tell-you-twice rule measures
+    chase = {"source": "proactive", "kind": "chase", "person": "Maya Chen",
+             "text": "still no word from Maya Chen on the contract"}
+    te._record_surfaced("agent", "chase", "still no word from Maya Chen on the contract",
+                        "still no word from Maya Chen on the contract", chase, decision_id="chase-maya")
+    with open(tmp_path / "events" / "delivery.jsonl", "a") as f:
+        f.write(json.dumps({"ts": _today_at("12:10"), "status": "delivered",
+                            "decision_ids": ["chase-maya"]}) + "\n")
+    assert cb._already_nudged_senders({"type": "evening", "google": {"userTimezone": "+00:00"},
+                                       "local": {}}) == ["Sarah Chen", "Maya Chen"]
 
 
 def test_failed_delivery_is_never_reported_as_already_nudged(monkeypatch, tmp_path):
@@ -1549,6 +1707,9 @@ def test_continuity_ledger_populates_action_ledger(tmp_path, monkeypatch):
     # ...and it reaches the sections that were inert before
     assert "Sarah Chen" in cb._format_action_ledger(local)
     assert "Sarah Chen" in cb._format_reconciliation(local, "evening")
+    # the evening block is THIS morning's actions: a `today` narrows it to rows stamped that day
+    assert "Sarah Chen" in cb._format_reconciliation(local, "evening", "2026-06-23")
+    assert cb._format_reconciliation(local, "evening", "2026-06-24") == ""
     # an explicitly-supplied action_ledger still wins
     local2 = cb._normalize_local({"local": {"action_ledger": [{"status": "open", "contact_name": "X"}]}})
     assert [a["contact_name"] for a in local2["action_ledger"]] == ["X"]
