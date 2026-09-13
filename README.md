@@ -176,11 +176,13 @@ separately. Source consent applies to cached context as well as live reads, and 
 recheck whether the underlying item is still current. See [the runtime map](docs/ARCHITECTURE.md)
 and [storage/retention](docs/DATA-FLOW.md) for the exact boundaries and recovery limits.
 
-**Running the shared verification.** Python 3.11+ and the pinned development dependencies:
+**Running the shared verification.** Python 3.12 (the image's version) and the pinned development
+dependencies, in a virtualenv next to this tree — Homebrew's Python refuses system-wide installs, and
+`tools/ship.sh` uses `.venv` when it exists:
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
-python3 sotto-chief-of-staff/tools/verify.py
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python sotto-chief-of-staff/tools/verify.py
 ```
 
 CI, the public distribution and the release script use that command. It runs Ruff, skill validation,

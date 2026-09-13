@@ -33,3 +33,4 @@ sotto-bridge/.notary-profile
 # volume ($SOTTO_DATA/corpus-keys/), outside any checkout, and is never needed to run evals.
 sotto-chief-of-staff/evals/corpus/
 *.map.json
+\n\n# The local test tooling (README § Running the shared verification); ship.sh prefers it.\n.venv/\n

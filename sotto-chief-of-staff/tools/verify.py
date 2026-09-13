@@ -4,10 +4,27 @@
 Run with the interpreter whose dependencies were installed from requirements-dev.txt.
 Bridge compilation/tests remain an explicit platform step; no deployment is performed.
 """
+from importlib.util import find_spec
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+
+# What the gate imports before it can say anything useful, and where to get it. Checked up front so
+# a Mac whose Homebrew Python has none of it reads one line — not a CalledProcessError traceback out
+# of the first subprocess (ship.sh, Sep 13).
+TOOLING = (('pytest', 'pytest'), ('ruff', 'ruff'), ('yaml', 'pyyaml'))
+
+
+def preflight(python=None):
+    python = python or sys.executable
+    missing = [package for module, package in TOOLING if find_spec(module) is None]
+    if missing:
+        raise SystemExit(
+            f"verify: {python} is missing {', '.join(missing)}.\n"
+            "Install the pinned test tooling into a virtualenv next to this tree (Homebrew's Python "
+            "refuses system-wide pip installs) and re-run — ship.sh picks .venv up by itself:\n"
+            "  python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt")
 
 
 def commands(root):
@@ -27,6 +44,7 @@ def commands(root):
 
 
 def main():
+    preflight()
     root = Path(__file__).resolve().parents[2]
     for cwd, argv in commands(root):
         print('[verify] ' + ' '.join(argv[1:]), flush=True)
