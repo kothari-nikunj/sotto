@@ -202,14 +202,14 @@ def test_notes_and_birthday_become_sourced_facts(tmp_path, monkeypatch):
     assert p.updated_by == "apple_contacts"                          # honest provenance
 
 
-def test_resync_bumps_and_never_duplicates(tmp_path, monkeypatch):
+def test_same_contact_resync_does_not_strengthen_or_duplicate(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _snapshot(tmp_path, {"contacts": [_card(notes="Met at YC.", birthday="06-26")]})
     pw.sync_contacts(pw._snapshot_local())
     pw.sync_contacts(pw._snapshot_local())
     p = kg.parse_person_file(open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read())
     facts = [f for _fid, f in kg.sorted_active_facts(p.facts)]
-    assert len(facts) == 2 and all(f.seen == 2 for f in facts)
+    assert len(facts) == 2 and all(f.seen == 1 for f in facts)
 
 
 def test_nameless_and_emailless_card_is_never_a_file(tmp_path, monkeypatch):

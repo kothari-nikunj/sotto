@@ -1,7 +1,9 @@
 """digest_check.py — the adaptive midday digest gate: threshold, dedup/order/cap, stamp window."""
+import hashlib
 import importlib.util
 import json
 import os
+import pytest
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(__file__)
@@ -18,8 +20,19 @@ NOW = datetime(2026, 8, 6, 12, 30, tzinfo=timezone.utc)
 def _entry(i, sender="Sarah Chen", cls="ambient", minutes_ago=0, text=None):
     ts = (NOW - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"ts": ts, "verdict_class": cls, "sender": sender,
-            "event": {"source": "imessage", "rowid": i, "handle": "+14155551234",
+            "event": {"source": "imessage", "rowid": i, "handle": "+1" + str(int(hashlib.sha256(sender.encode()).hexdigest()[:10], 16))[-10:],
                       "text": text or f"message {i}"}}
+
+
+@pytest.fixture(autouse=True)
+def offline_review(monkeypatch):
+    """Only machinery in this suite: semantic accuracy is measured by run_relevance --live."""
+    def review(conversations):
+        return [{"id": c["id"],
+                 "class": "actionable" if any(m["prior_class"] in dc.ACTIONABLE_CLASSES
+                                               for m in c["messages"]) else "ambient",
+                 "why": "fixture's already-established relevance"} for c in conversations]
+    monkeypatch.setattr(dc, "review_conversations", review)
 
 
 def _write_queue(tmp_path, entries):
@@ -127,7 +140,7 @@ def test_unknown_named_senders_do_not_count_even_when_ambient(tmp_path, monkeypa
     monkeypatch.setenv("SOTTO_DIGEST_MIN", "3")
     entries = [_entry(i, sender=f"+1415555{1000 + i}", cls="ambient") for i in range(5)]
     entries += [_entry(50, sender="Unknown", cls="ambient"), _entry(51, sender="Unknown", cls="ambient")]
-    entries += [_entry(60, sender="Sarah Chen", cls="ambient"), _entry(61, sender="Dhruv", cls="quiet")]
+    entries += [_entry(60, sender="Sarah Chen", cls="ambient"), _entry(61, sender="Dhruv", cls="ambient")]
     _write_queue(tmp_path, entries)
     assert dc.check(dc.entries_since(dc.read_stamp())) == {"deliver": False}   # 2 known < 3
 
@@ -189,13 +202,15 @@ def test_silent_run_still_stamps_the_window(tmp_path, monkeypatch):
     assert dc.entries_since(dc.read_stamp()) == []
 
 
-def test_delivering_run_stamps_too(tmp_path, monkeypatch):
+def test_delivering_run_waits_for_transport_acceptance(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_DIGEST_MIN", "2")
     _write_queue(tmp_path, [_entry(1, sender="A", minutes_ago=10), _entry(2, sender="B", minutes_ago=5)])
     out = dc.run_check(NOW)
     assert out["deliver"] is True
-    assert dc.read_stamp() == NOW
+    assert dc.read_stamp() is None
+    assert dc._parse_iso(out["coverage_until"]) == NOW
+    dc.advance_stamp(dc._parse_iso(out["coverage_until"]))
     assert dc.run_check(NOW) == {"deliver": False}                 # same entries never re-digested
 
 
@@ -374,3 +389,113 @@ def test_compose_without_a_claim_never_stamps(tmp_path, monkeypatch):
     cb._archive_brief({"brief_text": "good morning"}, "morning")
     assert dc.read_stamp() is None                               # composing is not delivering
     assert dc.check(dc.entries_since(dc.read_stamp()))["deliver"] is True
+
+
+def test_relevance_precedes_delivery_cap_and_can_choose_silence(monkeypatch):
+    entries = [_entry(i, sender=f"Person {i}", minutes_ago=i) for i in range(12)]
+    seen = []
+    def review(conversations):
+        seen.extend(conversations)
+        return [{"id": c["id"], "class": "actionable" if c["sender"] == "Person 0" else "ignore",
+                 "why": "Only this invitation remains unanswered"} for c in conversations]
+    monkeypatch.setattr(dc, "review_conversations", review)
+    out = dc.check(entries)
+    assert len(seen) == 12  # the old six-item cap must not discard candidates before judgment
+    assert [i["sender"] for i in out["items"]] == ["Person 0"]
+    monkeypatch.setattr(dc, "review_conversations", lambda cs: [
+        {"id": c["id"], "class": "ignore", "why": "no change for user"} for c in cs])
+    assert dc.check(entries) == {"deliver": False}
+
+
+def test_later_reply_and_earlier_ask_both_reach_review(monkeypatch):
+    entries = [_entry(1, text="Please finish the school waiver", cls="stale", minutes_ago=20),
+               _entry(2, text="Hi", minutes_ago=10),
+               _entry(3, text="Done, submitted the waiver", cls="signal")]
+    def review(cs):
+        assert [m["text"] for m in cs[0]["messages"]] == [
+            "Please finish the school waiver", "Hi", "Done, submitted the waiver"]
+        assert cs[0]["messages"][-1]["is_from_me"] is True
+        return [{"id": 0, "class": "ignore", "why": "The user completed the waiver"}]
+    monkeypatch.setattr(dc, "review_conversations", review)
+    assert dc.check(entries, min_n=1) == {"deliver": False}
+
+
+def test_held_digest_carries_identity_and_only_newer_reply_supersedes_it(tmp_path, monkeypatch):
+    import delivery_effects
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ask = _entry(1, cls='actionable', minutes_ago=20, text='Please finish the waiver')
+    partial = _entry(2, cls='signal', minutes_ago=10, text='I will do it after lunch')
+    _write_queue(tmp_path, [ask, partial])
+    out = dc.check([ask, partial])
+    assert out['deliver'] and out['effects']
+    assert delivery_effects.valid(out['effects'], NOW.timestamp())
+    answered = _entry(3, cls='signal', text='Done')
+    _write_queue(tmp_path, [ask, partial, answered])
+    assert not delivery_effects.valid(out['effects'], NOW.timestamp())
+    assert dc.read_stamp() is None
+
+
+@pytest.mark.parametrize("reply", [[], [{"id": 9, "class": "ambient", "why": "x"}],
+    [{"id": 0, "class": "ignore", "why": "x"}] * 2,
+    [{"id": 0, "class": "ambient", "why": ""}], None])
+def test_bad_relevance_review_never_leaks_queue_items(monkeypatch, reply):
+    monkeypatch.setattr(dc, "review_conversations", lambda cs: reply)
+    result = dc.check([_entry(1)], min_n=1)
+    assert result["deliver"] is False and result["retryable"] is True
+
+
+def test_provider_failure_goes_silent_and_below_gate_makes_no_call(monkeypatch):
+    def fail(cs):
+        raise RuntimeError("provider unavailable")
+    monkeypatch.setattr(dc, "review_conversations", fail)
+    result = dc.check([_entry(1)], min_n=1)
+    assert result["deliver"] is False and result["retryable"] is True
+    def should_not_run(cs):
+        pytest.fail("quiet day must not spend a review call")
+    monkeypatch.setattr(dc, "review_conversations", should_not_run)
+    assert dc.check([_entry(1)]) == {"deliver": False}
+
+
+def test_reviewed_urgency_precedes_recency_at_the_cap(monkeypatch):
+    entries = [_entry(i, sender=f"Person {i}") for i in range(8)]
+    monkeypatch.setattr(dc, "review_conversations", lambda cs: [
+        {"id": c["id"], "class": "urgent" if c["sender"] == "Person 0" else "actionable",
+         "why": "current consequence"} for c in cs])
+    out = dc.check(entries)
+    assert len(out["items"]) == 6
+    assert out["items"][0]["sender"] == "Person 0"  # oldest must not lose to six newer routine asks
+
+
+def test_one_outstanding_obligation_does_not_need_seven_padding_messages(monkeypatch):
+    out = dc.check([_entry(1, cls='actionable', text='Please complete the preschool waiver.')])
+    assert out['deliver'] and len(out['items']) == 1
+
+
+def test_same_display_name_and_matching_time_do_not_merge_distinct_threads(monkeypatch):
+    a, b = _entry(1, sender='Alex', cls='actionable'), _entry(2, sender='Alex', cls='actionable')
+    a['event']['chat_guid'], b['event']['chat_guid'] = 'group-one', 'group-two'
+    seen = []
+    def review(conversations):
+        seen.extend(conversations)
+        return [{'id': c['id'], 'class': 'actionable', 'why': 'separate unanswered invitation'} for c in conversations]
+    monkeypatch.setattr(dc, 'review_conversations', review)
+    assert len(dc.check([a, b])['items']) == 2
+    assert len(seen) == 2 and all(len(c['messages']) == 1 for c in seen)
+
+
+def test_provider_failure_preserves_review_window_and_success_can_ack_exact_cutoff(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _write_queue(tmp_path, [_entry(1, cls='actionable', minutes_ago=1)])
+    before = NOW - timedelta(hours=1)
+    dc.write_stamp(before)
+    def broken(conversations):
+        raise RuntimeError('synthetic temporary provider outage')
+    monkeypatch.setattr(dc, 'review_conversations', broken)
+    assert dc.run_check(NOW)['retryable'] is True
+    assert dc.read_stamp() == before and len(dc.entries_since(before)) == 1
+    monkeypatch.setattr(dc, 'review_conversations', lambda cs: [
+        {'id': c['id'], 'class': 'actionable', 'why': 'outstanding waiver'} for c in cs])
+    success = dc.run_check(NOW)
+    assert success['deliver'] and dc.read_stamp() == before
+    dc.advance_stamp(dc._parse_iso(success['coverage_until']))
+    assert dc.read_stamp() == NOW and dc.entries_since(dc.read_stamp()) == []

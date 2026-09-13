@@ -71,6 +71,13 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+try:
+    from calendar_context import human_attendees, user_participates, meeting_events
+except ModuleNotFoundError:  # source checkout; the image copies the same module beside us
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
+                                   'sotto-chief-of-staff', '_shared', 'lib'))
+    from calendar_context import human_attendees, user_participates, meeting_events
+
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
 def _unwired_write_json(*_a, **_k):
@@ -176,10 +183,10 @@ def _norm_cal_attendee(a):
 def _norm_cal_event(e):
     """One gather_google cal-out event ({id, summary, start, end, location, description,
     meetingLink, attendees}) → the Today-view shape: {summary, start, end, attendees[{name,email}]}
-    plus location/meeting_link only when present. description and id are dropped server-side."""
+    plus location/meeting_link only when present. Description is dropped; opaque _id is internal."""
     if not isinstance(e, dict):
         return None
-    raw_att = e.get("attendees")
+    raw_att = human_attendees(e, include_self=True)
     ev = {
         "summary": _s(e.get("summary") or e.get("title")),
         "start": _s(e.get("start")),
@@ -187,6 +194,8 @@ def _norm_cal_event(e):
         "attendees": [a for a in ((_norm_cal_attendee(x) for x in raw_att)
                                   if isinstance(raw_att, list) else ()) if a],
     }
+    if _s(e.get("id")):
+        ev["_id"] = _s(e["id"])  # internal identity survives moves; stripped from dashboard projection
     loc = _s(e.get("location"))
     if loc:
         ev["location"] = loc
@@ -199,49 +208,61 @@ def _norm_cal_event(e):
 
 
 def _run_calendar_gather():
-    """Fork the skills tree's gather_google.py --skip-gmail into a private temp dir and return the
-    normalized today+tomorrow events, sorted by start. None ⇒ the skills tree is absent on this
-    box. The gather itself fails-empty by design (exit 0 + empty file); a crash/timeout here
-    degrades to [] the same way — the Today view never 500s over Google, and the refresh thread
-    just leaves yesterday's file alone rather than writing an empty belief."""
+    """Read data plus an explicit source receipt; failure never becomes a fresh empty calendar."""
     try:
         script = HOOKS["find_script"]("_shared", "scripts", "gather_google.py")
     except Exception:  # noqa: BLE001
         script = None
     if not script:
+        _LAST_RAW["valid"] = False
         return None
+    observation = {"status": "unavailable", "complete": False, "observed_at": _iso()}
     raw = []
     with tempfile.TemporaryDirectory(prefix="sotto-cal-") as td:
         cal_out = os.path.join(td, "cal.json")
+        result_out = os.path.join(td, "sources.json")
         try:
-            subprocess.run([sys.executable, script, "--skip-gmail", "--cal-out", cal_out,
-                            "--gmail-out", os.path.join(td, "gmail.json")],
+            completed = subprocess.run([sys.executable, script, "--skip-gmail", "--cal-out", cal_out,
+                            "--gmail-out", os.path.join(td, "gmail.json"),
+                            "--source-results-out", result_out],
                            capture_output=True, text=True, timeout=GATHER_TIMEOUT_SECS,
                            env={**os.environ, "SOTTO_DATA": _root()})
+            if completed.returncode:
+                raise ValueError("calendar gather failed")
             with open(cal_out, encoding="utf-8") as f:
                 raw = json.load(f)
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError, ValueError):
+            with open(result_out, encoding="utf-8") as f:
+                observation = json.load(f)["calendar"]
+            if not isinstance(observation, dict) or observation.get("status") not in (
+                    "ok", "partial", "unavailable", "disabled", "skipped"):
+                raise ValueError("invalid calendar source receipt")
+            if isinstance(raw, dict):
+                raw = raw.get("events")
+            if not isinstance(raw, list) or any(not isinstance(e, dict) for e in raw):
+                raise ValueError("invalid calendar data")
+        except (subprocess.TimeoutExpired, OSError, ValueError, KeyError, TypeError):
+            observation = {"status": "unavailable", "complete": False, "observed_at": _iso()}
             raw = []
-    if isinstance(raw, dict):                      # tolerate an {events: […]} envelope
-        raw = raw.get("events") or []
-    raw = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
-    # The RAW wire events, in memory only — the calendar-diff detector needs the two fields
-    # normalization deliberately strips from everything served or written (the Calendar `id`, which
-    # is the only identity that survives a move, and attendee `responseStatus`, which is what a
-    # decline IS). They live in this process and never reach a file or the browser.
-    _LAST_RAW["events"] = raw
-    # A meeting the user DECLINED (gather_google reads the self attendee's responseStatus into
-    # `my_response`) is not on their day: it is neither served to the Today view nor a room the
-    # funnel's in-meeting hold believes they are in. The raw list above keeps it — a decline by
-    # somebody ELSE on the same event is still a change worth detecting.
+    raw = meeting_events(raw)
+    _LAST_GATHER.clear()
+    _LAST_GATHER.update(observation)
+    valid = observation.get("status") == "ok" and observation.get("complete") is True
+    _LAST_RAW["valid"] = valid
+    if valid:
+        # RAW IDs and RSVPs remain in memory only; a partial or failed observation never
+        # advances the comparable baseline from which absence could imply cancellation.
+        _LAST_RAW["events"] = raw
+        _LAST_RAW["coverage"] = observation.get("coverage") or {}
+        _LAST_RAW['observed_at'] = observation.get('observed_at')
+    elif observation.get("status") == "disabled":
+        _LAST_RAW.update(events=None, coverage={})
+        _CHANGE_BASELINE["events"] = None
     events = [ev for ev in map(_norm_cal_event, raw)
               if ev and _s(ev.get("_my_response")).lower() != "declined"]
     for ev in events:
         ev.pop("_my_response", None)
     today = HOOKS["local_today"]()
     keep = {d for d in (today, _date_shift(today, 1)) if d}
-    # The gather's window is now→+3d; the Today view wants today + tomorrow. Filter on the start's
-    # date prefix (the event's own wall-clock date); a non-date start stays in (tolerant).
     events = [ev for ev in events if not DATE_RE.match(ev["start"][:10]) or ev["start"][:10] in keep]
     events.sort(key=lambda ev: ev["start"])
     return events
@@ -251,6 +272,7 @@ def _run_calendar_gather():
 
 _CAL_LOCK = threading.RLock()
 _CAL_CACHE: dict = {"ts": 0.0, "value": None}
+_LAST_GATHER: dict = {}
 _LAST_RAW: dict = {"events": None}         # the latest gather's RAW events (see _run_calendar_gather)
 _CHANGE_BASELINE: dict = {"events": None}  # the previous change-tick's raw events — the diff's left side
 
@@ -270,7 +292,23 @@ def snapshot() -> dict | None:
         events = _run_calendar_gather()
         if events is None:
             return None
-        val = {"events": events, "generated_at": _iso()}
+        status = _LAST_GATHER.get("status", "unavailable")
+        valid = status == "ok" and _LAST_GATHER.get("complete") is True
+        if status == "ok" and not valid:
+            status = "partial"
+        if valid:
+            val = {"events": events, "generated_at": _LAST_GATHER.get("observed_at") or _iso(),
+                   "status": "ok", "complete": True}
+        elif status == "disabled":
+            val = {"events": [], "generated_at": _LAST_GATHER.get("observed_at") or _iso(),
+                   "status": "disabled", "complete": False, "unavailable": True}
+        else:
+            # Memoize failure attempts to avoid a fork storm, while the last valid observation
+            # keeps its actual age and data. An outage is not an empty-calendar assertion.
+            val = {"events": (val or {}).get("events", []),
+                   "generated_at": (val or {}).get("generated_at", ""),
+                   "status": status, "complete": False, "unavailable": True,
+                   "last_attempt_at": _iso()}
         _CAL_CACHE["ts"] = time.time()
         _CAL_CACHE["value"] = val
         return {**val, "cached": False}
@@ -357,6 +395,7 @@ def today_rows(events, today: str = "") -> list:
             "end": _s(ev.get("end")),
             "attendees": _other_attendees(ev, self_email),
             "all_day": bool(DATE_RE.match(start)),
+            **({"id": ev["_id"]} if ev.get("_id") else {}),
         })
     return rows
 
@@ -383,14 +422,17 @@ def refresh_once() -> bool:
     travels with the file so the reader can derive its own staleness bound from the writer's real
     cadence instead of guessing."""
     snap = snapshot()
-    if snap is None:
+    if snap is None or snap.get("status", "ok") not in ("ok", "disabled"):
         return False
     today = HOOKS["local_today"]()
     payload = {
         "generated_at": _s(snap.get("generated_at")) or _iso(),
         "date": today,
+        "projection": "day",
         "refresh_secs": refresh_secs(),
         "events": today_rows(snap.get("events") or [], today),
+        "status": snap.get("status", "ok"),
+        "complete": snap.get("complete") is True,
     }
     try:
         HOOKS["write_json"](cache_path(), payload)   # THE atomic write (connectors.write_json)
@@ -508,7 +550,8 @@ def ended_meetings(events, now_utc: datetime, today: str = "") -> list:
             continue
         out.append({"key": _tap_key(ev), "summary": summary, "start": start, "end": end,
                     "attendees": others, "meeting_link": _s(ev.get("meeting_link")),
-                    "location": _s(ev.get("location"))})
+                    "location": _s(ev.get("location")),
+                    **({"calendar_event_id": ev['_id']} if ev.get('_id') else {})})
     out.sort(key=lambda c: c["end"])
     return out
 
@@ -551,6 +594,8 @@ def tap_event(cand: dict) -> dict:
         "location": cand.get("location") or "",
         "is_from_me": False,
         "text": "",
+        **({"calendar_event_id": cand['calendar_event_id']} if cand.get('calendar_event_id') else {}),
+        **({"calendar_observed_at": cand['calendar_observed_at']} if cand.get('calendar_observed_at') else {}),
     }
 
 
@@ -564,8 +609,8 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     if cap <= 0:
         return 0
     snap = snapshot()
-    if snap is None:
-        return 0                      # no skills tree on this box — nothing to detect
+    if snap is None or snap.get("status", "ok") != "ok":
+        return 0                      # no valid current observation on this box — nothing to detect
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     today = HOOKS["local_today"]()
     cands = ended_meetings(snap.get("events") or [], now_utc, today)
@@ -574,6 +619,7 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     fired = _load_tap_state(today)
     dispatched = 0
     for cand in cands:
+        cand['calendar_observed_at'] = snap.get('generated_at')
         if len(fired) >= cap:
             break                     # the day's tap allowance is spent; the budget is safe
         if cand["key"] in fired:
@@ -606,20 +652,8 @@ def calendar_nudges_enabled() -> bool:
 def _raw_others(ev: dict, self_email: str) -> list:
     """The OTHER humans on a RAW wire event as {name, email, status} — same self/room skips as
     _other_attendee_rows, plus the responseStatus a decline is detected from."""
-    rows = []
-    for a in (ev.get("attendees") or []):
-        if isinstance(a, str):
-            a = {"email": a}
-        if not isinstance(a, dict):
-            continue
-        em = _s(a.get("email") or a.get("address")).lower()
-        if em and (em == self_email or ROOM_MARKER in em):
-            continue
-        if not em and not _s(a.get("displayName") or a.get("name")):
-            continue
-        rows.append({"name": _s(a.get("displayName") or a.get("name")), "email": em,
-                     "status": _s(a.get("responseStatus")).lower()})
-    return rows
+    return [{k: row[k] for k in ('name', 'email', 'status')}
+            for row in human_attendees(ev, self_email)]
 
 
 def _hours_until(start: str, now_utc: datetime):
@@ -645,11 +679,12 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
     """The diff that matters, as candidate dicts — pure, so it tests like ended_meetings.
     Four kinds, each one sentence: a NEW event with another human starting within
     INVITE_SOON_HOURS is a last-minute invite (a next-day invite is scheduling, not an
-    interrupt); an attendee whose responseStatus turned
-    "declined" on a meeting within DECLINE_WINDOW_HOURS is a decline; a changed start on a
+    interrupt); the other person declining the user's one-to-one meeting within
+    DECLINE_WINDOW_HOURS is a decline (group RSVPs stay quiet); a changed start on a
     meeting within the window is a move; an event that vanished (or turned status=cancelled)
     within the window is a cancellation. Skipped, silently: all-day events, solo blocks,
     internal-only standups (the tap's own rule), and anything already past."""
+    baseline, current = meeting_events(baseline), meeting_events(current)
     old_by_id = {_s(e.get("id")): e for e in baseline if _s(e.get("id"))}
     new_by_id = {_s(e.get("id")): e for e in current if _s(e.get("id"))}
     out = []
@@ -675,6 +710,7 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         if old is None:
             if _relevant(ev, INVITE_SOON_HOURS, allow_started_min=INVITE_GRACE_MIN):
                 out.append({"kind": "invited", "key": f"{eid}:invited:{start}",
+                            "calendar_event_id": eid,
                             "summary": summary, "start": start, "old_start": "",
                             "who": "", "attendees": others})
             continue
@@ -683,14 +719,20 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
                 _relevant(ev, CHANGE_WINDOW_HOURS) or
                 _relevant(old, CHANGE_WINDOW_HOURS)):
             out.append({"kind": "moved", "key": f"{eid}:moved:{start}",
+                        "calendar_event_id": eid,
                         "summary": summary, "start": start, "old_start": old_start,
                         "who": "", "attendees": others})
-        if _relevant(ev, DECLINE_WINDOW_HOURS):
+        # A decline changes the owner's plans only for their one-to-one meeting.
+        # Group RSVPs and meetings merely visible on a shared calendar stay quiet.
+        if (user_participates(ev, self_email) and len(others) == 1
+                and len(_raw_others(old, self_email)) == 1
+                and _relevant(ev, DECLINE_WINDOW_HOURS)):
             old_status = {r["email"]: r["status"] for r in _raw_others(old, self_email) if r["email"]}
             for r in others:
                 if (r["email"] and r["status"] == "declined"
                         and old_status.get(r["email"], "") != "declined"):
                     out.append({"kind": "declined", "key": f"{eid}:declined:{r['email']}",
+                                "calendar_event_id": eid,
                                 "summary": summary, "start": start, "old_start": "",
                                 "who": r["name"] or r["email"], "attendees": others})
     for eid, old in old_by_id.items():
@@ -736,6 +778,10 @@ def change_event(cand: dict) -> dict:
         "attendees": cand["attendees"],
         "is_from_me": False,
         "text": text,
+        **({"calendar_event_id": cand['calendar_event_id'], "calendar_start": cand['start']}
+           if kind != 'cancelled' and cand.get('calendar_event_id') else {}),
+        **({"calendar_observed_at": cand['calendar_observed_at']}
+           if kind != 'cancelled' and cand.get('calendar_observed_at') else {}),
     }
 
 
@@ -745,6 +791,8 @@ def change_tick(now_utc: datetime | None = None) -> int:
     if not calendar_nudges_enabled():
         return 0
     current = _LAST_RAW["events"]
+    if _LAST_RAW.get("valid") is False:
+        return 0
     if current is None:
         return 0                              # no gather has run yet this process
     baseline = _CHANGE_BASELINE["events"]
@@ -754,8 +802,14 @@ def change_tick(now_utc: datetime | None = None) -> int:
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     self_email = _self_email([e for e in map(_norm_cal_event, current) if e])
     cands = calendar_changes(baseline, current, now_utc, self_email)
+    coverage = _LAST_RAW.get("coverage") or {}
+    since, until = _parse_aware(coverage.get("since")), _parse_aware(coverage.get("until"))
+    cands = [c for c in cands if c["kind"] != "cancelled" or
+             (since is not None and until is not None and _parse_aware(c["start"]) is not None
+              and since <= _parse_aware(c["start"]) < until)]
     dispatched, all_ok = 0, True
     for cand in cands:
+        cand['calendar_observed_at'] = _LAST_RAW.get('observed_at')
         try:
             ok = bool(HOOKS["calendar_change"](change_event(cand)))
         except Exception as e:  # noqa: BLE001 — a broken dispatch must never kill the refresh thread

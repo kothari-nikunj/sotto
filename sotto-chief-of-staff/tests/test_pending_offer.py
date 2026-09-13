@@ -18,6 +18,9 @@ import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
 
+import pytest
+import yaml
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 HERMES = os.path.dirname(ROOT)
@@ -48,7 +51,7 @@ def test_set_then_get_returns_the_question_as_delivered(tmp_path, monkeypatch):
     assert got["detail"] == "12:00 PM, Sightglass"
 
 
-def test_the_stored_shape_is_exactly_the_eight_ephemeral_fields(tmp_path, monkeypatch):
+def test_the_stored_shape_is_exactly_the_ten_ephemeral_fields(tmp_path, monkeypatch):
     """Ephemeral state, not memory: nothing here could be used by a brief three months from now,
     so nothing beyond the question, its clock, the loop it is about and the hash of what it
     offered is allowed to accumulate."""
@@ -57,13 +60,13 @@ def test_the_stored_shape_is_exactly_the_eight_ephemeral_fields(tmp_path, monkey
     with open(path, encoding="utf-8") as f:
         stored = json.load(f)
     assert set(stored) == {"ts", "kind", "question", "person", "detail", "payload_sha256",
-                           "expires_at", "anchor_key"}
+                           "expires_at", "anchor_key", "action", "offer_id"}
     assert stored["payload_sha256"] == ""       # an offer with no real effect binds to nothing
     assert stored["anchor_key"] == "email:waiting_on:id:maya"   # so "done" lands on THAT loop
     assert po.get_offer()["anchor_key"] == "email:waiting_on:id:maya"
     # the dismissal vocabulary is stated once, for the persona to read
     assert "done" in po.DISMISS_RESOLVED and "let it go" in po.DISMISS_DROPPED
-    assert "mute" in po.KINDS
+    assert "mute" not in po.KINDS
 
 
 def test_get_on_a_missing_file_is_an_empty_object(tmp_path, monkeypatch):
@@ -209,15 +212,172 @@ def test_cli_set_get_clear(tmp_path):
     assert json.loads(_cli(tmp_path, "get")) == {}
 
 
+def _tracked_loop(tmp_path):
+    path = tmp_path / "knowledge" / "continuity" / "maya.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    anchor = "waiting_on:id:maya@example.test"
+    path.write_text("---\n" + yaml.safe_dump({
+        "anchor_key": anchor, "status": "open", "contact_name": "Maya",
+        "contact_identifier": "maya@example.test", "action_type": "waiting_on",
+        "summary": "The signed contract", "created_at": "2026-09-04",
+    }) + "---\n")
+    return path, anchor
+
+
+@pytest.mark.parametrize("kind", ["chase", "commitment", "handoff"])
+@pytest.mark.parametrize("reply", ["no", "No!", "no .", "no thanks", "not yet", "skip it", "forget it"])
+def test_negative_reply_declines_offer_without_changing_obligation(tmp_path, kind, reply):
+    path, anchor = _tracked_loop(tmp_path)
+    before = path.read_bytes()
+    _cli(tmp_path, "set", "--kind", kind, "--question", "Is this done?",
+         "--person", "Maya", "--anchor-key", anchor)
+    result = json.loads(_cli(tmp_path, "dismiss-reply", "--text", reply))
+    assert result["action"] == "declined" and result["loop_changed"] is False
+    assert path.read_bytes() == before
+    assert json.loads(_cli(tmp_path, "get")) == {}
+
+
+@pytest.mark.parametrize("reply,status", [("Done!", "resolved"), ("Done…", "resolved"),
+                                          ("drop it", "dismissed")])
+def test_explicit_reply_changes_only_the_anchored_loop(tmp_path, reply, status):
+    path, anchor = _tracked_loop(tmp_path)
+    other = path.with_name("other.md")
+    other.write_text(path.read_text().replace("maya@example.test", "other@example.test"))
+    before = other.read_bytes()
+    _cli(tmp_path, "set", "--kind", "handoff", "--question", "Keep waiting or drop it?",
+         "--anchor-key", anchor)
+    result = json.loads(_cli(tmp_path, "dismiss-reply", "--text", reply))
+    assert result["action"] == status and result["loop_changed"] is True
+    assert yaml.safe_load(path.read_text().split("---")[1])["status"] == status
+    assert other.read_bytes() == before
+    assert json.loads(_cli(tmp_path, "get")) == {}
+
+
+@pytest.mark.parametrize("reply", ["no, it is not done", "yes", "done with the draft",
+                                   "drop it tomorrow", "done?", "drop it?"])
+def test_ambiguous_reply_preserves_offer_and_obligation(tmp_path, reply):
+    path, anchor = _tracked_loop(tmp_path)
+    before = path.read_bytes()
+    _cli(tmp_path, "set", "--kind", "commitment", "--question", "Is this done?",
+         "--anchor-key", anchor)
+    result = json.loads(_cli(tmp_path, "dismiss-reply", "--text", reply))
+    assert result["action"] == "clarify" and result["loop_changed"] is False
+    assert path.read_bytes() == before
+    assert json.loads(_cli(tmp_path, "get"))["anchor_key"] == anchor
+
+
+def test_completion_without_an_anchor_does_not_clear_the_offer(tmp_path):
+    _cli(tmp_path, "set", "--kind", "commitment", "--question", "Is this done?")
+    assert json.loads(_cli(tmp_path, "dismiss-reply", "--text", "done"))["action"] == "clarify"
+    assert json.loads(_cli(tmp_path, "get"))["question"] == "Is this done?"
+
+
+def test_completion_to_expired_offer_does_not_change_loop(tmp_path):
+    path, anchor = _tracked_loop(tmp_path)
+    before = path.read_bytes()
+    _cli(tmp_path, "set", "--kind", "commitment", "--question", "Is this done?",
+         "--anchor-key", anchor, "--ttl-min", "-1")
+    assert json.loads(_cli(tmp_path, "dismiss-reply", "--text", "done"))["action"] == "no_offer"
+    assert path.read_bytes() == before
+
+
+def test_negative_to_non_loop_offer_only_clears_offer(tmp_path):
+    _cli(tmp_path, "set", "--kind", "procedure", "--question", "Save this rule?")
+    assert json.loads(_cli(tmp_path, "dismiss-reply", "--text", "no"))["action"] == "declined"
+    assert json.loads(_cli(tmp_path, "get")) == {}
+    assert not (tmp_path / "knowledge").exists()
+
+
+def test_legacy_mute_offer_cannot_supply_a_fresh_approval(tmp_path):
+    _cli(tmp_path, "set", "--kind", "procedure", "--question", "Mute Maya?", "--person", "Maya")
+    path = tmp_path / "proactive" / "pending_offer.json"
+    old = json.loads(path.read_text())
+    path.write_text(json.dumps({**old, "kind": "mute"}))
+    assert json.loads(_cli(tmp_path, "get")) == {}
+    result = json.loads(_cli(tmp_path, "dismiss-reply", "--text", "done"))
+    assert result["action"] == "no_offer" and result["loop_changed"] is False
+    assert not (tmp_path / "preferences.json").exists()
+
+
 def test_cli_rejects_a_kind_no_lane_produces(tmp_path):
     env = dict(os.environ, SOTTO_DATA=str(tmp_path))
     p = subprocess.run([sys.executable, SCRIPT, "set", "--kind", "birthday",
                         "--question", "?"], env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode != 0
-    # Every kind has a producing lane: the proactive watcher's ordinary nudges + one-shot
-    # intentions, plus the evening brief's two one-line questions (a standing rule, a mute).
+    # Only active producers can set an offer. Legacy mute files are handled on read.
     assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff", "retune_offer",
-                             "procedure", "intention", "mute"}
+                             "procedure", "intention"}
+
+
+@pytest.mark.parametrize("reply", ["no", "done", "skip it"])
+def test_no_pending_offer_routes_back_to_the_visible_conversation(tmp_path, reply):
+    result = json.loads(_cli(tmp_path, "dismiss-reply", "--text", reply))
+    assert result["action"] == "no_offer" and result["loop_changed"] is False
+    assert not (tmp_path / "knowledge").exists()
+
+
+@pytest.mark.parametrize("failure", [OSError("disk unavailable"), yaml.YAMLError("bad sibling")])
+def test_loop_write_failure_returns_json_and_preserves_offer(tmp_path, monkeypatch, capsys, failure):
+    _data(tmp_path, monkeypatch)
+    path, anchor = _tracked_loop(tmp_path)
+    before = path.read_bytes()
+    po.set_offer("commitment", "Done?", anchor_key=anchor)
+    sys.path.insert(0, os.path.join(ROOT, "_shared", "knowledge"))
+    import knowledge_edit
+
+    def fail(*args):
+        raise failure
+
+    monkeypatch.setattr(knowledge_edit, "op_loop", fail)
+    monkeypatch.setattr(sys, "argv", [SCRIPT, "dismiss-reply", "--text", "done"])
+    po.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["action"] == "clarify" and result["loop_changed"] is None
+    assert result["anchor_key"] == anchor
+    assert path.read_bytes() == before
+    assert po.get_offer()["anchor_key"] == anchor
+
+
+def test_a_new_offer_can_be_written_during_loop_write_and_is_not_cleared(tmp_path, monkeypatch):
+    """A real second process must be able to acquire the offer lock inside the ledger write.
+    This reproduces the old nested-lock stall and also checks conditional cleanup afterwards.
+    """
+    _data(tmp_path, monkeypatch)
+    path, anchor = _tracked_loop(tmp_path)
+    po.set_offer("commitment", "Done?", anchor_key=anchor)
+    sys.path.insert(0, os.path.join(ROOT, "_shared", "knowledge"))
+    import knowledge_edit
+    original = knowledge_edit.op_loop
+
+    def write_while_a_new_question_arrives(anchor, target):
+        p = subprocess.run([sys.executable, SCRIPT, "set", "--kind", "procedure",
+                            "--question", "Save this newer rule?"], env=os.environ,
+                           capture_output=True, text=True, timeout=5)
+        assert p.returncode == 0, p.stderr
+        return original(anchor, target)
+
+    monkeypatch.setattr(knowledge_edit, "op_loop", write_while_a_new_question_arrives)
+    result = po.dismiss_reply("done")
+    assert result["action"] == "resolved" and result["loop_changed"] is True
+    assert result["offer_cleared"] is False
+    assert yaml.safe_load(path.read_text().split("---")[1])["status"] == "resolved"
+    assert po.get_offer()["question"] == "Save this newer rule?"
+
+
+def test_cleanup_failure_does_not_hide_a_successful_loop_write(tmp_path, monkeypatch):
+    _data(tmp_path, monkeypatch)
+    path, anchor = _tracked_loop(tmp_path)
+    po.set_offer("commitment", "Done?", anchor_key=anchor)
+
+    def fail_remove(*args):
+        raise OSError("cannot remove offer")
+
+    monkeypatch.setattr(po.os, "remove", fail_remove)
+    result = po.dismiss_reply("done")
+    assert result["action"] == "resolved" and result["loop_changed"] is True
+    assert result["offer_cleared"] is False
+    assert yaml.safe_load(path.read_text().split("---")[1])["status"] == "resolved"
+    assert po.get_offer()["anchor_key"] == anchor
 
 
 # ── the two processes, at the same moment ───────────────────────────────────────────────────────
@@ -234,7 +394,7 @@ _RACER = textwrap.dedent("""
             got = po.get_offer()
             if got:
                 assert set(got) == {{"ts", "kind", "question", "person", "detail", "anchor_key",
-                                     "payload_sha256", "expires_at"}}, got
+                                     "payload_sha256", "expires_at", "action", "offer_id"}}, got
                 assert got["question"] == "q" + got["person"][1:], got   # one whole write, not two halves
         time.sleep(0.001)
 """)
@@ -279,6 +439,8 @@ def test_the_proactive_skill_tells_the_model_to_record_the_question(tmp_path):
     assert "--question" in skill
     assert "different session" in skill or "never saw your question" in skill
     assert "--payload-file" in skill and "--offer-bound" in skill
+    assert 'pending_offer.py dismiss-reply --text "<actual user reply>"' in skill
+    assert 'run **`sotto-loops`** §B `dismiss`' not in skill
 
 
 def test_the_gateway_carries_the_standing_instruction(tmp_path):
@@ -292,6 +454,10 @@ def test_the_gateway_carries_the_standing_instruction(tmp_path):
     assert "clear" in persona
     assert "sotto-meeting-prep" in persona
     assert "payload_sha256" in persona and "--offer-bound" in persona
+    assert 'dismiss-reply --text "<actual user reply>"' in persona
+    assert "Never bypass this handler" in persona
+    assert '`no_offer` uses the existing **`{}` fallback above**' in persona
+    assert 'inspect the anchored loop before any retry' in persona
 
     with open(os.path.join(HERMES, "adapters", "hermes", "start.sh"), encoding="utf-8") as f:
         start = f.read()

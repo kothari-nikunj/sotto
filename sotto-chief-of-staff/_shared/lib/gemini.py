@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import urllib.request
+import gemini_transport
 
 
 def _diag(msg: str) -> None:
@@ -61,7 +62,6 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
                approach research_attendees.py already uses) to pin the response contract.
     """
     import time as _time
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     gen: dict = {"response_mime_type": "application/json", "temperature": 0.4}
     if schema is not None:
         gen["responseSchema"] = schema
@@ -71,8 +71,7 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                headers={"Content-Type": "application/json"}, method="POST")
+    req = gemini_transport.request(model, body, key)
     t0 = _time.monotonic()
     with urllib.request.urlopen(req, timeout=300) as resp:  # 5-min ceiling
         data = json.loads(resp.read())
@@ -146,6 +145,13 @@ def parse_model_ref(ref: str, default_provider: str = "gemini") -> tuple[str, st
 
 
 def provider_key(provider: str) -> str:
+    if (gemini_transport.managed() or gemini_transport.background_proxy_required()) and provider != "gemini":
+        if gemini_transport.background_proxy_required():
+            raise gemini_transport.BackgroundModelHeldError(
+                "background_provider_unsupported", "Metered background learning requires provider gemini")
+        raise RuntimeError("Proxy-routed pipeline requires provider gemini")
+    if provider == "gemini":
+        return gemini_transport.credential()
     return (os.environ.get(KEY_ENV[provider]) or "").strip()
 
 

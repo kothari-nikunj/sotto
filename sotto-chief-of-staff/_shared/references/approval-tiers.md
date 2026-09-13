@@ -15,22 +15,21 @@ say-so.**
 
 Default an action to its tier above. When in doubt, escalate — treat it as `review`.
 
-**Learned overrides.** Every brief's Learn step runs `approval-tiers/scripts/learn_preferences.py`,
-which tallies `$SOTTO_DATA/outcomes.jsonl` into `preferences.json` → `approval_defaults` (keyed
-`contact|action_type`, emitted only after ≥3 accepted outcomes at ≥80% acceptance). Honor them
-narrowly: a learned default may relax `review` → `one_tap` for that exact contact + action_type and
-nothing else. It never relaxes anything into `auto`, never overrides `forbidden`, and never
-overrides the user's own stated preferences (the reserved `explicit` block in `preferences.json` —
-user's word wins). When a learned default is *stricter* than the table, take the stricter one.
+**Draft usage does not grant permission.** Apply the fixed defaults above and the user's explicit
+instructions. Historical `approval_defaults` in `preferences.json` are ignored; the behavioral
+learner has been removed because accepted drafts are not consent to future actions.
 
-**A decline is `review` forever.** When a draft says *no* on the user's behalf
-(`sotto-draft-reply`'s no-draft rule), no amount of learning may relax it: not after 3 accepted
-declines, not after 30. Sending an unread "no" is the one outcome you cannot walk back. The guard
-lives in code — `learn_preferences.py`'s `NEVER_RELAX = {"decline"}`, matched per word against the
-`action_type` half of the key, so `decline`, `decline_reply` and `reply_decline` all pin to
-`review` whatever tier the user accepted at. So **log a no with `action_type: "decline"`** — that
-token is the entire mechanism, and a decline logged as a plain `reply` walks straight out of the
-guard. Any future outbound class that is equally unrecoverable joins the set; nothing leaves it.
+**A decline is `review` forever.** Show its full text for review every time. No amount of previous
+acceptance relaxes that rule. Log it with `action_type: "decline"` so its outcome remains identifiable.
+
+**Attention is not a decision.** An unanswered invitation, pitch, funding request or favor does
+not tell you whether the user wants to accept or decline. A relevance score, a due date, or a
+pattern of previous passes does not choose this answer. When the direction is still open, ask
+which way they want to go; if supplying drafts, label both alternatives as `Accept:` and `Decline:`
+as specified in `sotto-draft-reply`. Never present an unsolicited pass as the selected reply or
+invent a reason such as "not investing in this space." A single directional draft requires the
+user's instruction or a clear commitment in the supplied conversation; factual replies remain
+grounded in their evidence. This applies equally to briefs, digests, nudges and attended chat.
 
 **A Gmail draft is not a send — and still not automatic.** `gmail-draft` writes to the user's own
 drafts folder, so it can never leave the house without them pressing send; that is why an email
@@ -74,11 +73,14 @@ still holds not one readable word of anyone's mail.
 **When a yes crosses a process boundary, bind it to those bytes.** A nudge delivered by a detached
 run asks the question; the gateway session that receives "sure" three processes later never saw it.
 There, the offering lane writes the payload's hash into the pending offer
-(`pending_offer.py set --payload-file <file holding the exact bytes>`) and the acting session passes
-`--offer-bound` to the verb. The verb then requires a **fresh** offer whose `payload_sha256` equals
+(`google_action.py <verb and args> --print-payload > payload.json`, then
+`pending_offer.py set --action <verb> --payload-file payload.json`)
+and the acting session passes `--offer-bound --offer-id <id>` to the verb. The verb then requires
+that exact **fresh** offer, its named action, and a `payload_sha256` equal to
 what it is about to do, refuses with exit 2 and a named reason on absence, expiry or mismatch,
-records the refusal in the receipt, and clears the offer only after the act succeeds — a refused or
-failed attempt leaves the user's yes unspent. Approve-then-mutate hits a wall instead of a prompt.
+records the refusal in the receipt, and atomically consumes the offer before the effect begins.
+A payload mismatch leaves it unspent; once the effect starts, success, failure, timeout and crash
+all require fresh approval because the provider outcome may be uncertain. Approve-then-mutate hits a wall.
 Offers whose yes only runs a read ("want me to pull prep?") carry no payload and pass no file;
 binding is for offers whose yes causes an outbound send or a calendar write.
 
@@ -89,3 +91,13 @@ worse than the gap. What the hash buys in that lane is **disputability, not prev
 you can prove which bytes were sent against the draft that was shown, and a mismatch is visible
 rather than deniable. The preventive property exists exactly where the approval and the act live in
 different processes.
+
+### Google inbox, event updates and address book
+
+`gmail-modify`, `calendar-update`, `contacts-create`, `contacts-update` and `contacts-delete`
+are account writes and use the same unattended refusal and optional `--offer-bound` contract.
+A Google read/write grant is a capability, not approval for an individual change. The user must
+request the change in conversation, with the exact message, event or contact resolved first.
+Contact deletion requires an explicit request to delete that contact. Scheduled jobs may propose
+these changes but cannot perform them. These are Google Contacts operations; Bridge's Mac Contacts
+reader and Sotto's relationship graph remain separate.

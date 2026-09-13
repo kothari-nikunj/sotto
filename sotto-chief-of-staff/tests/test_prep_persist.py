@@ -68,8 +68,8 @@ def test_persist_is_idempotent(tmp_path, monkeypatch):
     pp.persist(RESEARCH, ATTENDEES_IN)
     pp.persist(RESEARCH, ATTENDEES_IN)                          # same research twice
     _, p = _person(tmp_path)
-    assert len(p.facts) == 1                                    # deduped (bumped), not duplicated
-    assert all(f.seen == 2 for f in p.facts.values())
+    assert len(p.facts) == 1                                    # deduped without strengthening
+    assert all(f.seen == 1 for f in p.facts.values())
 
 
 def test_filter_fresh_skips_recently_persisted_person(tmp_path, monkeypatch):

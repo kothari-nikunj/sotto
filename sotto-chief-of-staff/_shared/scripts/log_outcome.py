@@ -3,11 +3,11 @@
 log_outcome.py — record action outcomes + analytics to the exhaust (parity C2).
 
 PORT SOURCE: app/src/hooks/useActionExecution.ts outcomes + api/src/services/execution-ledger.ts
-Appends to $SOTTO_DATA/outcomes.jsonl. Feeds learn_preferences.py.
+Appends to $SOTTO_DATA/outcomes.jsonl. Read by draft grading and outcome inspection.
 
 Usage: log_outcome.py '{"action_id":"...","outcome":"edited_and_sent","channel":"imessage",
                         "contact":"sarah","action_type":"reply","tier":"one_tap","edits":"..."}'
-Outcomes: draft_created|opened|copied|dismissed|executed|viewed|edited_and_sent
+Outcomes: draft_created|opened|copied|dismissed|executed|viewed|edited_and_sent|useful|not_useful
 """
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ import os
 import sys
 from datetime import datetime, timezone
 
-VALID = {"draft_created", "opened", "copied", "dismissed", "executed", "viewed", "edited_and_sent"}
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+import jsonstore  # noqa: E402
+
+VALID = {"draft_created", "opened", "copied", "dismissed", "executed", "viewed", "edited_and_sent",
+         "useful", "not_useful"}
 
 
 def _path():
@@ -29,8 +33,9 @@ def log(rec: dict) -> dict:
     if rec.get("outcome") not in VALID:
         raise ValueError(f"invalid outcome: {rec.get('outcome')}")
     os.makedirs(os.path.dirname(_path()), exist_ok=True)
-    with open(_path(), "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec) + "\n")
+    with jsonstore.lock(_path()):
+        with open(_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
     return {"logged": True, "outcome": rec["outcome"]}
 
 

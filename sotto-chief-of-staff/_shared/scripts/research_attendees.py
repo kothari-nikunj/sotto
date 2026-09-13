@@ -91,6 +91,7 @@ if _LIB not in sys.path:
 from textutil import _s  # noqa: E402  (shared helpers, from the modules that own them)
 from timeutil import _now_local, _parse_ts, _user_local_date, configured_tz  # noqa: E402
 from render_local import RESEARCH_HORIZON_HOURS  # noqa: E402
+import gemini_transport
 import web_research as wr  # noqa: E402  (THE search seam: the provider ladder lives there)
 
 MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
@@ -586,15 +587,13 @@ def _build_focus_prompt(a: dict, context_summary: str, known: str,
 
 def _gemini_grounded(prompt: str, key: str, use_schema: bool, schema: dict = SCHEMA,
                      timeout: int = PER_BATCH_TIMEOUT, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}"
     gen = {"maxOutputTokens": max_tokens}
     if use_schema:
         gen["responseMimeType"] = "application/json"
         gen["responseSchema"] = schema
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "tools": [{"google_search": {}}], "generationConfig": gen}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+    req = gemini_transport.request(MODEL, body, key)
     import time as _time
     t0 = _time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -813,7 +812,7 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
             return _fin({"attendees": []})
     # Any ONE of the deep_research providers is enough (web_research.provider_chain is the single
     # place that knows the order); `key` only feeds the Gemini rung.
-    key = os.environ.get("GOOGLE_AI_API_KEY", "")
+    key = gemini_transport.credential()
     if not wr.provider_chain("deep_research") or not attendees:
         if attendees:
             # Honest degrade, and LOUDLY: there were people to research and nothing could be asked.

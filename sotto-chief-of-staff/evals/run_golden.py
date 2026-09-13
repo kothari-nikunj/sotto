@@ -146,9 +146,10 @@ def funnel_events(day: dict) -> list:
 # ── The replay ────────────────────────────────────────────────────────────────────────────────────
 
 def _stub_llm(_prompt, _inputs):
-    """Offline extraction: structurally valid, deliberately empty. Dry mode scores the deterministic
-    half of the pipeline; inventing brief prose here would only score the stub."""
-    return json.dumps({"brief_markdown": "", "actions": [], "extracted_knowledge": {}})
+    """A valid placeholder, never scored as prose. Empty text is a failed extraction in production;
+    dry mode still exercises the deterministic half without pretending to generate a brief."""
+    return json.dumps({"brief_markdown": "Offline replay: prose generation disabled.",
+                       "actions": [], "extracted_knowledge": {}})
 
 
 def oldest_base(corpus: dict, frozen: datetime) -> datetime:

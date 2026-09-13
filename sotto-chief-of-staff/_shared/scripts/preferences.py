@@ -2,12 +2,9 @@
 """
 preferences.py — the EXPLICIT side of Sotto's preference memory.
 
-The repo already learns preferences from BEHAVIOR (approval-tiers/learn_preferences.py tallies
-outcomes.jsonl → preferences.json). What was missing is the explicit channel: the user saying "stop
-surfacing newsletters", "don't flag Bob", "keep it terse". Those are precious — they must never be
-wiped by the behavioral learner, which rewrites preferences.json wholesale. So we keep them in the
-SAME file under a reserved `explicit` block, and learn_preferences.py carries that block forward
-untouched on every run.
+The user states mutes, tone, VIPs and cadence here. Chat and dashboard use this one writer.
+The `explicit` block retains its existing format; legacy inferred fields elsewhere in the file
+are preserved but ignored. Draft usage does not change preferences.
 
 `compose_brief` reads these to suppress muted senders / people / sections and to honor tone notes.
 The `sotto-feedback` skill writes them via this CLI. Pure stdlib; never raises on read.
@@ -15,12 +12,12 @@ The `sotto-feedback` skill writes them via this CLI. Pure stdlib; never raises o
 Cadence lives here too: `nudge_snooze_until` (a single ISO local wall-clock stamp, not a list) is
 the user's "be quieter" lever — while it is in the future the event funnel (triage_event.py Tier 0)
 and the proactive watcher (proactive_scan.py) hold every nudge. It is a *scalar* in the same
-explicit block, written through the same path, and preserved by the behavioral learner identically.
+explicit block, written through the same path, without changing other preferences.
 
 VIP lives here too: `vip_people` is the user's STATED list of people whose missed calls clear the
 quiet-hours bar (triage_event._is_vip checks it before the two heuristics — a top-of-queue
 relationship-pulse priority, or a "family" mention in their graph file). It is a plain explicit
-list, so the behavioral learner carries it forward like every other one, and saying "Sarah is a VIP"
+list, and saying "Sarah is a VIP"
 in chat and toggling VIP in the dashboard are the same write.
 
 CLI:
@@ -33,6 +30,7 @@ CLI:
   preferences.py unmute-sender <v> | unmute-person "<v>" | unmute-section <v> | clear-tone
   preferences.py unvip "<display name>"
   preferences.py snooze-nudges tomorrow | "+2h" | 15:00 | 3pm | 2026-08-08T06:00
+  preferences.py remove-tone "keep it terse"          # remove just this note
   preferences.py unsnooze-nudges                     # "back to normal"
   preferences.py brief-audio off|morning|evening|both  # standing voice-note briefs (text always sent too)
 """
@@ -45,12 +43,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 # _shared/lib holds the shared primitives; this module is invoked as a bare script from chat, the
-# dashboard and the learner, so the path is set up here rather than assumed.
+# dashboard, so the path is set up here rather than assumed.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402 — THE read-modify-write lock for the volume
 
 LISTS = ("mute_senders", "mute_people", "mute_sections", "tone_notes", "vip_people")
-# Scalar (single-value) explicit preferences. Same block, same writer, same learner protection.
+# Scalar (single-value) explicit preferences. Same block, same writer, same persistence path.
 SCALARS = ("nudge_snooze_until", "brief_audio")
 BRIEF_AUDIO_VALUES = ("off", "morning", "evening", "both")   # standing voice-note preference for the cron briefs
 SNOOZE_FMT = "%Y-%m-%dT%H:%M"    # minute precision, local wall clock (no offset — see snooze_active)
@@ -293,7 +291,7 @@ _CLI = {
     "mute-sender": ("mute_senders", add), "unmute-sender": ("mute_senders", remove),
     "mute-person": ("mute_people", add), "unmute-person": ("mute_people", remove),
     "mute-section": ("mute_sections", add), "unmute-section": ("mute_sections", remove),
-    "tone": ("tone_notes", add),
+    "tone": ("tone_notes", add), "remove-tone": ("tone_notes", remove),
     "vip": ("vip_people", add), "unvip": ("vip_people", remove),
 }
 

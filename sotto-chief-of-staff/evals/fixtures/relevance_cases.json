@@ -1,0 +1,187 @@
+[
+  {
+    "id": "outstanding_waiver",
+    "sender": "School Reminder",
+    "context": "The user has two children, Riley and Avery at different preschools. Riley starts preschool tomorrow; Riley's waiver is still outstanding. Avery's completed paperwork is unrelated.",
+    "messages": [
+      {
+        "text": "Riley starts preschool tomorrow at 9 AM. Riley's sunscreen waiver is still outstanding; please complete it before arrival."
+      }
+    ],
+    "expected": [
+      "urgent",
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "donation_blast",
+    "sender": "Campaign Outreach",
+    "context": "Unsolicited mass fundraising text; no user pledge or active interest is known.",
+    "messages": [
+      {
+        "text": "We must win this election! Make a matched Senate campaign donation before midnight. Reply STOP to unsubscribe."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "vip_social_chatter",
+    "sender": "Alex Harper",
+    "context": "Close friend and activity-backed VIP. No pending ask in this exchange.",
+    "messages": [
+      {
+        "text": "Hi friends!"
+      },
+      {
+        "text": "Haha, good one."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "unanswered_invitation",
+    "sender": "Maya Chen",
+    "context": "A friend personally invited the user; they have not replied. It is 3:30 PM today.",
+    "messages": [
+      {
+        "text": "Can you join our dinner tonight at 7? Please confirm by 5 so I can reserve your seat."
+      }
+    ],
+    "expected": [
+      "urgent",
+      "scheduling_ask",
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "completed_waiver",
+    "sender": "Preschool Office",
+    "context": "A separate obligation for the user's other child, Avery, at a different preschool. Avery's waiver was completed; this does not cover Riley.",
+    "messages": [
+      {
+        "text": "Please complete Avery's sunscreen waiver before preschool tomorrow."
+      },
+      {
+        "text": "I've submitted the waiver for Avery. All done.",
+        "is_from_me": true
+      },
+      {
+        "text": "Received it, thank you! No more forms needed."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "answered_invitation",
+    "sender": "Sam Rivera",
+    "context": "The invitation is settled; no calendar conflict or missing preparation is known.",
+    "messages": [
+      {
+        "text": "Join us for dinner tonight at 7? Please confirm by 5."
+      },
+      {
+        "text": "Yes, see you at 7!",
+        "is_from_me": true
+      },
+      {
+        "text": "Great, your seat is booked."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "vague_social_ping",
+    "sender": "Jamie Reed",
+    "context": "Friendly acquaintance; no concrete invitation, prior promise, or decision.",
+    "messages": [
+      {
+        "text": "We should grab a drink sometime!"
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "personal_fundraising_commitment",
+    "sender": "Jordan Blake",
+    "context": "The user explicitly promised to sponsor a community fundraiser. It is 3:30 PM and the agreed deadline is 4 PM today.",
+    "messages": [
+      {
+        "text": "I'll donate $50 toward the community event by 4 today.",
+        "is_from_me": true
+      },
+      {
+        "text": "Thank you for pledging. Can you complete your promised donation before we finalize the order at 4?"
+      }
+    ],
+    "expected": [
+      "urgent",
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "accepted_lunch_later_venue_pending",
+    "sender": "Jordan Vale",
+    "context": "A friend planning lunch this Thursday. The user agreed to the day, but the subsequent venue proposal is unanswered. Only venue confirmation remains, not accepting the invitation again.",
+    "messages": [
+      {
+        "text": "Lunch in SF this Thursday?"
+      },
+      {
+        "text": "Yes, I can step out for lunch.",
+        "is_from_me": true
+      },
+      {
+        "text": "Can we do lunch at the Harbor office? Please confirm the venue so I can arrange guest access."
+      }
+    ],
+    "expected": [
+      "scheduling_ask",
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "accepted_lunch_venue_confirmed",
+    "sender": "Casey Rowan",
+    "context": "A separate friend and lunch plan. Both date and venue were confirmed. No task remains.",
+    "messages": [
+      {
+        "text": "Lunch Thursday?"
+      },
+      {
+        "text": "Yes, works for me.",
+        "is_from_me": true
+      },
+      {
+        "text": "Can we do lunch at the Bay office?"
+      },
+      {
+        "text": "Bay office works, see you there!",
+        "is_from_me": true
+      }
+    ],
+    "expected": [
+      "ignore",
+      "ambient"
+    ],
+    "brief_action": false
+  }
+]

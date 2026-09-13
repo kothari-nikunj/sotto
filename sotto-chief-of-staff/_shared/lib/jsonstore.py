@@ -3,20 +3,9 @@
 jsonstore.py — read-modify-write a JSON file on the volume without losing somebody else's write.
 
 THE BUG THIS EXISTS FOR (Aug 2026, found by an external reviewer and then reproduced): three
-processes update `preferences.json` — `preferences.py` (your stated rules), `learn_preferences.py`
-(the rebuilt behavioural lists, which runs in EVERY brief), and the dashboard's learned-rule delete.
-All three did `read → modify → write` with no lock, and all three wrote through the same FIXED
-temp path (`preferences.json.tmp`). Two of them at once produced three distinct failures, measured
-over 100 trials of the mildest version (two concurrent mutes):
-
-    7%  a preference silently vanished   — B read before A wrote, then B's write won
-    7%  a writer exited non-zero         — its temp file was renamed away by the other process
-    2%  preferences.json left unreadable — both wrote the same temp, one read it half-written
-
-The real collision is wider than that test: it is you muting someone at 6:31am while the morning
-brief's Learn step rebuilds the lists, and the learner's window spans reading all of
-`outcomes.jsonl`. `os.replace` makes the final rename atomic; it does nothing about the read that
-happened before it, which is where the update is lost.
+processes can update a shared JSON file at once. Atomic rename alone cannot protect a
+read-modify-write operation: a writer that read an older copy can still erase a newer change.
+Chat and dashboard preference commands, for example, must serialize their whole mutation.
 
 So the unit is a TRANSACTION, not a write:
 
@@ -54,8 +43,8 @@ LOCK_TIMEOUT_SECS = 10         # a preference write is milliseconds; 10s means s
 
 class Unreadable(Exception):
     """The file exists but does not parse. Raised INSTEAD of silently returning {} so a caller can
-    decide — `learn_preferences.py` aborts rather than mint a fresh file over a corrupt one, which
-    would drop the user's explicit block and every `suppressed` tombstone with it."""
+    decide — a strict caller can abort rather than mint a fresh file over a corrupt one, which
+    would drop the user's explicit block with it."""
 
 
 def lock_path(path: str) -> str:
@@ -180,7 +169,7 @@ def transaction(path: str, default=None, mode: int = 0o600, indent: int | None =
     Yields the parsed value (or `default`). Mutate it in place; on a clean exit it is written back
     atomically, under the same lock that produced the read — which is what makes the update safe.
     To abort without touching the file, raise. `strict=True` turns a corrupt file into `Unreadable`
-    BEFORE the block runs, which is how learn_preferences refuses to mint a fresh file over one it
+    BEFORE the block runs, so a strict caller cannot mint a fresh file over one it
     couldn't parse. Built ON `lock()` — one flock implementation, and the reentrancy comes along."""
     with lock(path):
         data = read(path, default, strict=strict)

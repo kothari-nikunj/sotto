@@ -316,9 +316,19 @@ def test_the_shipped_ci_workflow_names_no_credential():
             ci = f.read()
         for forbidden in ("secrets.", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"):
             assert forbidden not in ci, f"the shipped ci.yml mentions {forbidden!r}"
-        # …and it is the green baseline: the two suites plus the validator, on the image's Python.
-        assert "pytest tests" in ci and "validate_skills.py" in ci
-        assert "pytest runtime/trigger-receiver" in ci
+        # The generated workflow and private/local callers share one shipped verification command.
+        assert "python3 sotto-chief-of-staff/tools/verify.py" in ci
+        import importlib.util
+        verifier = os.path.join(target, "sotto-chief-of-staff", "tools", "verify.py")
+        spec = importlib.util.spec_from_file_location("published_verification", verifier)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        from pathlib import Path
+        commands = [argv[1:] for _cwd, argv in module.commands(Path(target))]
+        for suite in ("tests", "runtime/trigger-receiver", "adapters/hermes", "cloud/model-proxy", "cloud/accounts"):
+            assert ["-m", "pytest", suite, "-q"] in commands
+        assert ["tools/validate_skills.py"] in commands
+        assert ["-m", "ruff", "check", "."] in commands
         assert "requirements-dev.txt" in ci
         assert os.path.isfile(os.path.join(target, "requirements-dev.txt")), \
             "ci.yml installs from a file the generator never copies"

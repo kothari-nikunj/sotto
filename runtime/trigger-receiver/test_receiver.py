@@ -7,6 +7,7 @@ import types
 from datetime import datetime
 
 import pytest
+from pathlib import Path
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("receiver", os.path.join(HERE, "receiver.py"))
@@ -199,16 +200,9 @@ def test_set_timezone_reregisters_crons_on_change(tmp_path, monkeypatch):
     assert ok and val == "America/Los_Angeles"
     assert ["hermes", "config", "set", "timezone", "America/Los_Angeles"] in cli.calls
     assert ["hermes", "cron", "list"] in cli.calls
-    creates = {c[c.index("--name") + 1]: c for c in cli.cron("create")}
-    assert set(creates) == {"sotto-relationship-pulse"}
-    # schedule + skill mirror crons.json exactly
-    assert creates["sotto-relationship-pulse"][3] == "0 9 * * 1"
-    assert creates["sotto-relationship-pulse"][
-        creates["sotto-relationship-pulse"].index("--skill") + 1] == "sotto-relationship-pulse"
-    for c in creates.values():
-        assert c[c.index("--deliver") + 1] == rec._deliver_target() == "telegram"
-    # Existing registrations are removed by parsed job id; that path is exercised against a real
-    # list-shaped fixture in test_cron_fence.py. This fake reports an empty scheduler.
+    # Every built-in job is receiver-owned in both supported deployment modes. Reconciliation
+    # still lists/removes stale system registrations; user-* fence has its real fixture elsewhere.
+    assert cli.cron("create") == []
     assert cli.cron("remove") == []
 
 
@@ -810,7 +804,7 @@ def test_the_window_reads_the_one_schedule_source(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_CRONS_JSON", str(spec_path))
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 48))
     assert rec._in_brief_cron_window("sotto-evening-brief") is True
-    assert rec._in_brief_cron_window("sotto-morning-brief") is False   # not a shape the tick reads
+    assert rec._in_brief_cron_window("sotto-morning-brief") is False   # Sunday, not Monday
     edge = rec.BRIEF_CRON_WINDOW_MIN
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 30, 20, 45 + edge))
     assert rec._in_brief_cron_window("sotto-evening-brief") is False   # the window is half-open
@@ -1847,7 +1841,9 @@ def test_a_meeting_the_user_declined_is_not_served_but_stays_in_the_raw_diff(tmp
     script = tmp_path / "gather_google.py"
     script.write_text("import json,sys\n"
                       "out=[a for a in sys.argv if a.endswith('cal.json')][0]\n"
-                      f"json.dump({json.dumps(wire)}, open(out,'w'))\n")
+                      f"json.dump({json.dumps(wire)}, open(out,'w'))\n"
+                      "source_out=sys.argv[sys.argv.index('--source-results-out')+1]\n"
+                      "json.dump({'calendar':{'status':'ok','complete':True}},open(source_out,'w'))\n")
     monkeypatch.setitem(cc.HOOKS, "find_script", lambda *rel: str(script))
     monkeypatch.setitem(cc.HOOKS, "local_today", lambda: "2026-08-17")
     served = cc._run_calendar_gather()
@@ -1896,6 +1892,40 @@ def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
     e = cc.change_event(d)
     assert e["source"] == "calendar_change" and e["rowid"] == "e1:declined:ali@x.com"
     assert "Ali Panju" in e["text"] and "declined" in e["text"]
+
+
+def test_declines_only_nudge_for_the_users_one_to_one_meeting():
+    from copy import deepcopy
+    from datetime import datetime, timezone
+    cc = rec.CALCACHE
+    now = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
+    owner = {'email': 'me@example.com', 'self': True, 'responseStatus': 'accepted'}
+    guest = {'email': 'guest@example.net', 'responseStatus': 'accepted'}
+    room = {'email': 'conference@example.com', 'displayName': 'Board Room', 'resource': True}
+
+    def changes(attendees, **extra):
+        before = {'id': 'coffee', 'summary': 'Coffee', 'start': '2026-08-17T18:00:00Z',
+                  'attendees': attendees, **extra}
+        after = deepcopy(before)
+        next(a for a in after['attendees'] if a['email'] == guest['email'])['responseStatus'] = 'declined'
+        return cc.calendar_changes([before], [after], now, owner['email'])
+
+    assert [r['kind'] for r in changes([owner, guest, room])] == ['declined']
+    assert changes([owner, guest, {'email': 'third@example.net'}]) == []
+    assert changes([guest, {'email': 'third@example.net'}]) == []  # shared calendar, not attending
+    assert changes([guest]) == []  # no evidence the owner participates
+    assert changes([{**owner, 'responseStatus': 'declined'}, guest]) == []
+    assert changes([owner, guest], my_response='declined') == []
+    assert [r['kind'] for r in changes([guest], organizer=owner)] == ['declined']
+    assert [r['kind'] for r in changes([{**owner, 'email': 'alias@example.com'}, guest])] == ['declined']
+
+
+def test_calendar_normalization_excludes_resources_before_the_docket_counts_people():
+    event = {'summary': 'Solo work', 'attendees': [
+        {'email': 'me@example.com', 'self': True},
+        {'email': 'boardroom@example.com', 'resource': True},
+        {'email': 'room@resource.calendar.google.com'}]}
+    assert rec.CALCACHE._norm_cal_event(event)['attendees'] == [{'name': '', 'email': 'me@example.com'}]
 
 
 def test_change_tick_baselines_first_dispatches_then_settles(monkeypatch):
@@ -2511,7 +2541,7 @@ def _cron_fires(monkeypatch):
     """Record what the tick spawns, at the one seam a skill is ever started from."""
     fired = []
     monkeypatch.setattr(rec, "_spawn_and_deliver",
-                        lambda runner, prompt, label: fired.append((label, prompt)))
+                        lambda runner, prompt, label, **kwargs: fired.append((label, prompt, kwargs)))
     return fired
 
 
@@ -2531,15 +2561,19 @@ def test_the_cron_tick_fires_a_receiver_run_job_at_its_minute(tmp_path, monkeypa
     fired = _cron_fires(monkeypatch)
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 29))
     rec._cron_tick()
-    assert fired == [], "a minute early is not the minute"
+    assert len(fired) == 1, 'preparation starts early'
+    assert json.loads(fired[0][1])['deliver_not_before'] == datetime(2026, 8, 31, 6, 30).timestamp()
+    assert fired[0][2]['work_not_before'] == datetime(2026, 8, 31, 6, 28).timestamp()
+    fired.clear()
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
     rec._cron_tick()
     # NOT crons.json's "Run my morning brief": that friendly one-liner let the agent hand-write a
     # brief, which still claimed the day and suppressed the lane that would have sent the real one.
-    assert fired == [("cron:sotto-morning-brief",
-                      rec._spawn_prompt("sotto-morning-brief", job_prompt="Run my morning brief"))]
+    assert fired[0][0] == 'cron:sotto-morning-brief'
+    assert json.loads(fired[0][1])['kind'] == 'morning'
+    assert json.loads(fired[0][1])['work_key'].startswith('2026-08-31:morning:')
     # the pulse is Hermes' job even when its minute matches: the receiver fires only its own rows
-    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+    assert [label for label, _, _ in fired] == ["cron:sotto-morning-brief"]
 
 
 def test_the_cron_tick_fires_once_a_day_however_often_it_ticks(tmp_path, monkeypatch):
@@ -2565,8 +2599,8 @@ def test_the_cron_tick_never_fires_outside_the_window(tmp_path, monkeypatch):
     rec.DATA = str(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
     fired = _cron_fires(monkeypatch)
-    for at in (datetime(2026, 8, 31, 6, 40), datetime(2026, 8, 31, 12, 0),
-               datetime(2026, 8, 31, 6, 20)):
+    for at in (datetime(2026, 8, 31, 10, 30), datetime(2026, 8, 31, 12, 0),
+               datetime(2026, 8, 31, 6, 19)):
         monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
         rec._cron_tick()
     assert fired == []
@@ -2593,15 +2627,15 @@ def test_the_cron_tick_honors_the_gate_and_the_schedule_override(tmp_path, monke
     assert fired == [], "6:30 is no longer this job's minute"
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 7, 15))
     rec._cron_tick()
-    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+    assert [label for label, _, _ in fired] == ["cron:sotto-morning-brief"]
 
 
 def test_a_schedule_the_tick_cannot_read_is_skipped_and_said_once(tmp_path, monkeypatch, capsys):
-    """The receiver runs fixed daily and `*/N` interval jobs only. Anything else (a weekday list)
+    """The receiver runs fixed daily, single-weekday and interval jobs. Other forms (a weekday list)
     is left unfired with ONE log line — not a crash that would take the heartbeat, and not a line
     every minute forever."""
     rec.DATA = str(tmp_path)
-    _cron_spec(tmp_path, monkeypatch, [{**BRIEF_ROW, "schedule": "30 6 * * 1"}])
+    _cron_spec(tmp_path, monkeypatch, [{**BRIEF_ROW, "schedule": "30 6 * * 1,3"}])
     fired = _cron_fires(monkeypatch)
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 30))
     rec._cron_tick()
@@ -2609,6 +2643,40 @@ def test_a_schedule_the_tick_cannot_read_is_skipped_and_said_once(tmp_path, monk
     assert fired == []
     said = [line for line in capsys.readouterr().out.splitlines() if "sotto-morning-brief" in line]
     assert len(said) == 1 and "fixed daily" in said[0] and "interval" in said[0]
+
+
+def test_weekly_pulse_fires_only_in_its_local_weekday_window(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, '_delivery_channel_ready', lambda *a: True)
+    _cron_spec(tmp_path, monkeypatch, [{
+        'name': 'sotto-relationship-pulse', 'schedule': '0 9 * * 1',
+        'prompt': 'Run my relationship pulse', 'skill': 'sotto-relationship-pulse',
+        'runner': 'receiver'}])
+    fired = _cron_fires(monkeypatch)
+    for now in (datetime(2026, 9, 6, 9), datetime(2026, 9, 7, 8, 59)):
+        monkeypatch.setattr(rec, '_local_now', lambda: now)
+        rec._cron_tick()
+    assert fired == []
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 9, 7, 9))
+    rec._cron_tick()
+    rec._cron_tick()
+    assert len(fired) == 1 and fired[0][0] == 'cron:sotto-relationship-pulse'
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 9, 8, 9))
+    rec._cron_tick()
+    assert len(fired) == 1
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 9, 14, 9))
+    rec._cron_tick()
+    assert len(fired) == 2
+
+
+@pytest.mark.parametrize('schedule', ['0 9 * * 0', '0 9 * * 7'])
+def test_weekly_cron_sunday_aliases_and_window_end(monkeypatch, schedule):
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 9, 6, 9))
+    assert rec._cron_slot(schedule) == '2026-09-06'
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 9, 6, 9, rec.BRIEF_CRON_WINDOW_MIN))
+    assert rec._cron_slot(schedule) is None
+    assert rec._cron_slot('0 24 * * 0') is None
+    assert rec._cron_slot('60 9 * * 0') is None
 
 
 WATCHER_ROW = {"name": "sotto-proactive", "schedule": "*/15 * * * *",
@@ -2632,7 +2700,7 @@ def test_an_interval_job_fires_once_per_boundary_through_the_silence_seam(tmp_pa
     for minute in range(0, 60):
         monkeypatch.setattr(rec, "_local_now", lambda m=minute: datetime(2026, 9, 4, 7, m))
         rec._cron_tick()
-    assert [label for label, _ in fired] == ["cron:sotto-proactive"] * 4
+    assert [label for label, _, _ in fired] == ["cron:sotto-proactive"] * 4
     assert rec._CRON_FIRED["sotto-proactive"] == "2026-09-04T07:45"
     prompt = fired[0][1]
     assert prompt == rec._spawn_prompt("sotto-proactive", job_prompt="Run my proactive check")
@@ -2689,7 +2757,7 @@ def test_a_nudge_lane_is_held_by_the_channel_gate_and_a_brief_is_not(tmp_path, m
                                "sotto-midday-digest": "2026-09-04"}
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 6, 30))
     rec._cron_tick()
-    assert [label for label, _ in fired] == ["cron:sotto-morning-brief"]
+    assert [label for label, _, _ in fired] == ["cron:sotto-morning-brief"]
 
 
 def test_the_digest_fires_from_the_receiver_in_digest_mode(tmp_path, monkeypatch):
@@ -2703,10 +2771,10 @@ def test_the_digest_fires_from_the_receiver_in_digest_mode(tmp_path, monkeypatch
     monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: True)
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 12, 31))
     rec._cron_tick()
-    assert [label for label, _ in fired] == ["cron:sotto-midday-digest"]
+    assert [label for label, _, _ in fired] == ["cron:sotto-midday-digest"]
     prompt = fired[0][1]
-    assert "sotto-event skill" in prompt and '"Run my midday digest"' in prompt and "digest" in prompt
-    assert rec.SILENCE_SENTINEL in prompt and "compose_brief.py" not in prompt
+    assert json.loads(prompt)['kind'] == 'digest'
+    assert 'compose_brief.py' not in prompt
     monkeypatch.setenv("SOTTO_DIGEST", "0")
     rec._CRON_FIRED.clear()
     rec._cron_tick()
@@ -2812,7 +2880,7 @@ def test_run_dashboard_job_reports_a_failed_spawn(tmp_path, monkeypatch):
 
     def boom(*a, **k):
         raise FileNotFoundError("hermes missing")
-    monkeypatch.setattr(rec.subprocess, "Popen", boom)
+    monkeypatch.setattr(rec.WORK_QUEUE, "enqueue", boom)
     out = rec._run_dashboard_job("sotto-evening-brief")
     assert out["ok"] is False and out["error"] == "spawn"
 
@@ -2850,17 +2918,37 @@ class _FakeRun:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
+def _stub_process(monkeypatch, rec_mod, run):
+    """Stub process IO, retaining the real durable claim/worker/handoff code."""
+    class Process:
+        pid = 99999999
+
+        def __init__(self, argv, **kw):
+            self.result = run(argv, **kw)
+            self.returncode = self.result.returncode
+
+        def communicate(self, timeout=None):
+            return self.result.stdout, self.result.stderr
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(rec_mod.subprocess, "Popen", Process)
+
+
 def _capture_sends(monkeypatch, rec_mod, oneshot_out="a nudge", send_rc=0):
-    """Stub the two subprocess calls the seam makes: the skill one-shot, then `hermes send`."""
+    """Stub model IO and structured transport acceptance, preserving worker and outbox."""
     sends = []
 
     def fake_run(argv, **kw):
         if argv[:2] == ["hermes", "send"]:
             sends.append({"argv": argv, "input": kw.get("input")})
-            return _FakeRun(send_rc, "", "boom" if send_rc else "")
+            return _FakeRun(send_rc, json.dumps({"success": True, "message_id": "fixture-send"}),
+                            "boom" if send_rc else "")
         return _FakeRun(0, oneshot_out)
 
     monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
+    _stub_process(monkeypatch, rec_mod, fake_run)
     monkeypatch.setattr(rec_mod.shutil, "which", lambda b: "/usr/bin/" + b)
     return sends
 
@@ -2877,15 +2965,12 @@ def test_a_skills_output_is_actually_sent_to_the_home_channel(tmp_path, monkeypa
     rec.DATA = str(tmp_path)
     monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     sends = _capture_sends(monkeypatch, rec, oneshot_out="You're meeting Ashton in ~14 min")
-    t = rec._spawn_and_deliver(["fake", "-z"], "run it", "event")
-    for th in threading.enumerate():
-        if th.name == "deliver-event":
-            th.join(timeout=5)
+    t = _run_oneshot(rec, ["fake", "-z"])
     assert len(sends) == 1, "the skill's output was never handed to `hermes send`"
     assert sends[0]["argv"][:4] == ["hermes", "send", "--to", "whatsapp"]
     assert sends[0]["input"] == "You're meeting Ashton in ~14 min"
     assert [r["status"] for r in _delivery_rows(tmp_path)] == ["spawned", "delivered"]
-    assert t is None
+    assert rec.WORK_QUEUE.get(tmp_path, t)["status"] == "done"
 
 
 def test_the_delivery_target_is_the_same_channel_the_crons_use(tmp_path, monkeypatch):
@@ -2919,7 +3004,7 @@ def test_a_failed_delivery_is_loud_and_recorded(tmp_path, monkeypatch, capsys):
     rec._deliver_text("a real ask from Alberto", "event")
     rows = _delivery_rows(tmp_path)
     assert [r["status"] for r in rows] == ["failed"]
-    assert rows[0]["target"] == "whatsapp" and "boom" in rows[0]["detail"]
+    assert rows[0]["target"] == "whatsapp" and "exited 1" in rows[0]["detail"]
     assert "delivery FAILED" in capsys.readouterr().out
 
 
@@ -2932,7 +3017,7 @@ def test_delivery_receipt_correlates_the_decision_and_only_then_finalizes_effect
 
     def fake_run(argv, **kw):
         if argv[:2] == ["hermes", "send"]:
-            return _FakeRun(0, "", "")
+            return _FakeRun(0, json.dumps({"success": True, "message_id": "fixture-send"}), "")
         run_id = kw["env"]["SOTTO_DELIVERY_RUN_ID"]
         os.makedirs(rec._events_dir(), exist_ok=True)
         with open(rec._delivery_effects_path(run_id), "w", encoding="utf-8") as f:
@@ -2941,11 +3026,8 @@ def test_delivery_receipt_correlates_the_decision_and_only_then_finalizes_effect
         return _FakeRun(0, "a nudge", "")
 
     monkeypatch.setattr(rec.subprocess, "run", fake_run)
-    rec._spawn_and_deliver(["fake", "-z"], "run it", "correlated",
-                           decision_ids=["event-decision"])
-    for th in threading.enumerate():
-        if th.name == "deliver-correlated":
-            th.join(timeout=5)
+    _stub_process(monkeypatch, rec, fake_run)
+    _run_oneshot(rec, ["fake", "-z"], "correlated", decision_ids=["event-decision"])
     rows = _delivery_rows(tmp_path)
     assert rows[-1]["status"] == "delivered"
     assert rows[-1]["decision_ids"] == ["event-decision", "proactive-decision"]
@@ -2970,10 +3052,8 @@ def test_failed_send_does_not_finalize_deferred_loop_effects(tmp_path, monkeypat
         return _FakeRun(0, "a nudge", "")
 
     monkeypatch.setattr(rec.subprocess, "run", fake_run)
-    rec._spawn_and_deliver(["fake", "-z"], "run it", "failed-effects")
-    for th in threading.enumerate():
-        if th.name == "deliver-failed-effects":
-            th.join(timeout=5)
+    _stub_process(monkeypatch, rec, fake_run)
+    _run_oneshot(rec, ["fake", "-z"], "failed-effects")
     assert _delivery_rows(tmp_path)[-1]["status"] == "failed"
     assert finalized == []
 
@@ -3033,22 +3113,24 @@ def _capture_oneshot(monkeypatch, rec_mod, usage=None, rc=0, out="a nudge"):
     def fake_run(argv, **kw):
         runs.append({"argv": argv, "env": kw.get("env")})
         if argv[:2] == ["hermes", "send"]:
-            return _FakeRun(0, "", "")
+            return _FakeRun(0, json.dumps({"success": True, "message_id": "fixture-send"}), "")
         if usage is not None and "--usage-file" in argv:
             with open(argv[argv.index("--usage-file") + 1], "w", encoding="utf-8") as f:
                 f.write(usage)
         return _FakeRun(rc, out, "" if rc == 0 else "boom")
 
     monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
+    _stub_process(monkeypatch, rec_mod, fake_run)
     monkeypatch.setattr(rec_mod.shutil, "which", lambda b: "/usr/bin/" + b)
     return runs
 
 
-def _run_oneshot(rec_mod, runner, label="event"):
-    rec_mod._spawn_and_deliver(runner, "run it", label)
-    for th in threading.enumerate():
-        if th.name == f"deliver-{label}":
-            th.join(timeout=5)
+def _run_oneshot(rec_mod, runner, label="event", **kw):
+    identity = rec_mod._spawn_and_deliver(runner, "run it", label, **kw)
+    job = rec_mod.WORK_QUEUE.claim(rec_mod.DATA, rec_mod._WORK_OWNER)
+    assert job is not None and job["id"] == identity
+    rec_mod._work_one(job)
+    return identity
 
 
 def test_a_spawned_run_is_marked_unattended(tmp_path, monkeypatch):
@@ -3121,7 +3203,7 @@ def test_deliver_body_survives_a_real_argparse_hermes_send(tmp_path, monkeypatch
     fake = os.path.join(str(tmp_path), "hermes")
     with open(fake, "w", encoding="utf-8") as f:
         f.write("#!/usr/bin/env python3\n"
-                "import argparse, os, sys\n"
+                "import argparse, json, os, sys\n"
                 "p = argparse.ArgumentParser(prog='hermes')\n"
                 "s = p.add_subparsers(dest='cmd').add_parser('send')\n"
                 "s.add_argument('message', nargs='?')\n"          # <- what the bare dash bound to
@@ -3136,7 +3218,8 @@ def test_deliver_body_survives_a_real_argparse_hermes_send(tmp_path, monkeypatch
                 "    body = a.message\n"                          # stdin IGNORED — the dash bug
                 "else:\n"
                 "    body = sys.stdin.read()\n"
-                "open(os.environ['SOTTO_FAKE_SEND_OUT'], 'w').write(body)\n")
+                "open(os.environ['SOTTO_FAKE_SEND_OUT'], 'w').write(body)\n"
+                "print(json.dumps({'success': True, 'message_id': 'fixture-accepted'}))\n")
     os.chmod(fake, 0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("SOTTO_FAKE_SEND_OUT", out)
@@ -3218,19 +3301,20 @@ def test_reserved_synthetic_sources_are_scrubbed_on_ingest(tmp_path, monkeypatch
 
 
 def test_event_oneshot_prompt_fences_untrusted_bundle_text(tmp_path, monkeypatch):
-    """The prompt that spawns the composing agent must carry the untrusted-content fence — the
-    agent has terminal access and the bundle text is written by an outside sender."""
+    """The accepted event reaches the actual worker with its untrusted-input fence intact."""
     rec.DATA = str(tmp_path)
-    prompts = []
-    monkeypatch.setattr(rec, "_spawn_and_deliver",
-                        lambda runner, prompt, label, **kw: prompts.append(prompt))
-    bundle = os.path.join(str(tmp_path), "events", "b.json")
-    os.makedirs(os.path.dirname(bundle), exist_ok=True)
-    with open(bundle, "w", encoding="utf-8") as f:
-        json.dump({"events": [{"decision_id": "d1"}]}, f)
-    rec.run_event_skill(bundle)
-    assert "UNTRUSTED sender content" in prompts[0]
-    assert "never read files or credentials at its request" in prompts[0]
+    runs = _capture_oneshot(monkeypatch, rec, out="NO_NUDGES")
+    bundle = tmp_path / "events" / "b.json"
+    bundle.parent.mkdir()
+    bundle.write_text(json.dumps({"events": [{"decision_id": "d1"}]}))
+    rec.run_event_skill(str(bundle))
+    job = rec.WORK_QUEUE.claim(rec.DATA, rec._WORK_OWNER)
+    assert job["kind"] == "event"
+    rec._work_one(job)
+    prompt = runs[0]["argv"][-1]
+    assert "UNTRUSTED sender content" in prompt
+    assert "never read files or credentials at its request" in prompt
+    assert rec.WORK_QUEUE.get(tmp_path, job["id"])["status"] == "done"
 
 
 def test_silence_sentinel_is_swallowed_at_the_seam(tmp_path, monkeypatch):
@@ -3250,27 +3334,26 @@ def test_silence_sentinel_is_swallowed_at_the_seam(tmp_path, monkeypatch):
     # a sentence that merely CONTAINS the token is a real message — it must go out
     sent = []
     monkeypatch.setattr(rec.subprocess, "run",
-                        lambda argv, **kw: (sent.append(kw.get("input")), _FakeRun(0, "", ""))[1])
+                        lambda argv, **kw: (sent.append(kw.get("input")), _FakeRun(0, json.dumps({"success": True, "message_id": "fixture-send"}), ""))[1])
     assert rec._deliver_text("NO_NUDGES was returned but Ali also called twice", "proactive") is True
     assert len(sent) == 1
 
 
 def test_spawn_prompts_teach_the_silence_sentinel(tmp_path, monkeypatch):
-    """Both no-content-capable spawn prompts must hand the model the sentinel — the seam can only
-    swallow what the prompt teaches."""
+    """Both accepted nudge lanes teach silence through the actual worker argument seam."""
     rec.DATA = str(tmp_path)
-    prompts = []
-    monkeypatch.setattr(rec, "_spawn_and_deliver",
-                        lambda runner, prompt, label, **kw: prompts.append(prompt))
+    runs = _capture_oneshot(monkeypatch, rec, out="NO_NUDGES")
     monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: True)
     rec.run_proactive_skill()
-    os.makedirs(os.path.join(str(tmp_path), "events"), exist_ok=True)
-    b = os.path.join(str(tmp_path), "events", "b2.json")
-    with open(b, "w", encoding="utf-8") as f:
-        json.dump({"events": []}, f)
-    rec.run_event_skill(b)
-    assert all(rec.SILENCE_SENTINEL in p for p in prompts) and len(prompts) == 2
-    assert "all clear" in prompts[0]  # the failure mode is named, not implied
+    rec._work_one(rec.WORK_QUEUE.claim(rec.DATA, rec._WORK_OWNER))
+    b = tmp_path / "events" / "b2.json"
+    b.write_text(json.dumps({"events": []}))
+    rec.run_event_skill(str(b))
+    rec._work_one(rec.WORK_QUEUE.claim(rec.DATA, rec._WORK_OWNER))
+    prompts = [row["argv"][-1] for row in runs]
+    assert len(prompts) == 2 and all(rec.SILENCE_SENTINEL in p for p in prompts)
+    assert "all clear" in prompts[0]
+    assert all(row["status"] != "delivered" for row in _delivery_rows(tmp_path))
 
 
 # ── the durable delivery outbox (ROADMAP § Reliability P0 item 2) ────────────────────────────────
@@ -3387,7 +3470,7 @@ def test_max_attempts_gives_up_loudly_and_the_dashboard_can_see_it(tmp_path, mon
     monkeypatch.setattr(rec.OUTBOX, "MAX_ATTEMPTS", 3)
     sent = _channel(monkeypatch, (False, "no route to host"))
     rec._deliver_text("Ali called twice", "event")
-    assert rec.OUTBOX.counts() == {"pending": 1, "failed": 0}
+    assert rec.OUTBOX.counts() == {"pending": 1, "failed": 0, "effects_pending": 0, "effects_failed": 0}
     rec.OUTBOX.drain()
     rec.OUTBOX.drain()
     assert len(sent) == 3
@@ -3395,7 +3478,7 @@ def test_max_attempts_gives_up_loudly_and_the_dashboard_can_see_it(tmp_path, mon
     assert row["status"] == "failed" and row["attempts"] == 3
     assert "gave up after 3 attempts" in _delivery_rows(tmp_path)[-1]["detail"]
     assert "delivery FAILED" in capsys.readouterr().out
-    assert rec.OUTBOX.counts() == {"pending": 0, "failed": 1}
+    assert rec.OUTBOX.counts() == {"pending": 0, "failed": 1, "effects_pending": 0, "effects_failed": 0}
     # a terminal row is never claimed again, however many drains run over it
     assert rec.OUTBOX.drain() == {"attempted": 0, "delivered": 0} and len(sent) == 3
 
@@ -3583,6 +3666,32 @@ def test_a_mailto_never_leaves_the_box_but_the_gmail_draft_ask_does(tmp_path, mo
     assert len(sent) == 1
 
 
+def test_a_masked_phone_link_never_leaves_the_box_but_a_real_one_does(tmp_path, monkeypatch):
+    """Sep 5, 2026, evening brief: `imessage://+141****3682?body=…` on a "Tap to send" line. No
+    code in this tree masks digits — action_links keeps only digits — so the model wrote the link
+    itself and masked the number, and the user got a link that opens nothing. A link whose number
+    is not dialable is removed like a mailto; a real tap link is untouched."""
+    rec.DATA = str(tmp_path)
+    sent = _channel(monkeypatch)
+    text = ("→ [Message Cynthia](sms:+14155553682&body=hi) · Tap to send: imessage://+141****3682?body=hi\n"
+            "Reply to Cynthia: 'Wednesday works.' Tap to send: imessage://+141****3682?body=Wednesday%20works. Ready to send?\n"
+            "→ [Call Dhruv](tel:+15551234567) · https://wa.me/15551234567?text=hey · Patel: sms:+15551234567&body=On%20my%20way\n"
+            "Tap to send: imessage://+1415***3682")
+    assert rec._deliver_text(text, "event") is True
+    body = sent[0]["body"]
+    assert "****" not in body and "***" not in body
+    # the composer's real link survives on the SAME line as the masked one the model appended, and
+    # the `sms:<number>&body=` shape action_links emits is a live link, not a dead one
+    assert body.splitlines()[0] == "→ [Message Cynthia](sms:+14155553682&body=hi) · Tap to send:"
+    assert "Reply to Cynthia: 'Wednesday works.' Tap to send:  Ready to send?".replace("  ", " ") \
+        in body.replace("  ", " ")
+    assert ("→ [Call Dhruv](tel:+15551234567) · https://wa.me/15551234567?text=hey · "
+            "Patel: sms:+15551234567&body=On%20my%20way") in body   # "Patel:" is prose, not a tel: link
+    assert body.count("\n") == 2                           # the line that was only a dead link is gone
+    assert rec._strip_mailto("Hotel:Marriott confirmed, tel:+15551234567") \
+        == "Hotel:Marriott confirmed, tel:+15551234567"
+
+
 def test_a_text_that_was_only_markers_is_an_empty_run(monkeypatch):
     """All plumbing, no words: the honest receipt is 'empty', never a delivered blank."""
     sent = _channel(monkeypatch)
@@ -3764,6 +3873,65 @@ def test_mcp_token_derivation_matches_configure_mcp():
 
 # ── The second reviewer's boundary misses (Aug 31) ────────────────────────────────────────────────
 
+def test_managed_device_capability_polls_responds_and_revocation_closes_both_lanes(tmp_path, monkeypatch):
+    """The capability returned by pairing is the credential for the complete reverse-MCP exchange."""
+    import base64
+    import cloud_pairing
+    import urllib.error as _ue
+    import urllib.request as _u
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from http.server import ThreadingHTTPServer
+
+    for key, value in {"SOTTO_DEPLOYMENT_MODE": "managed", "SOTTO_TENANT_ID": "tenant-a",
+                       "SOTTO_CONTROL_TOKEN": "control", "SOTTO_IMESSAGE_NUMBER": "+15555550123"}.items():
+        monkeypatch.setenv(key, value)
+    rec.DATA = str(tmp_path)
+    rec.RELAY = type(rec.RELAY)()
+    key = ec.generate_private_key(ec.SECP256R1())
+    public = base64.b64encode(key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)).decode()
+    challenge = "device-challenge" * 3
+    pairing = cloud_pairing.Pairing(tmp_path, types.SimpleNamespace(install_cloud_google=lambda _value: []))
+    grant = pairing.bootstrap({"tenant_id": "tenant-a", "request_id": "a" * 64, "sub": "owner",
+                               "public_key": public, "challenge": challenge, "credentials": None})
+    signature = key.sign(("sotto-cloud-pair\n" + grant["pairing_grant"] + "\n" + challenge).encode(),
+                         ec.ECDSA(hashes.SHA256()))
+    issued = pairing.redeem({"pairing_grant": grant["pairing_grant"],
+                             "signature": base64.b64encode(signature).decode()})
+    token = issued["bridge_token"]
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), rec.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = _u.Request(base + path, data=data, headers={"Authorization": "Bearer " + token,
+                         "Content-Type": "application/json"}, method="GET" if data is None else "POST")
+        try:
+            with _u.urlopen(req, timeout=10) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except _ue.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    result = []
+    caller = threading.Thread(target=lambda: result.append(rec.RELAY._forward(
+        {"jsonrpc": "2.0", "id": "external", "method": "tools/list"}, timeout=5)))
+    caller.start()
+    try:
+        code, work = request("/bridge/poll")
+        assert code == 200 and work["method"] == "tools/list"
+        assert request("/bridge/respond", {"id": work["id"], "result": {"tools": []}})[0] == 202
+        caller.join(timeout=5)
+        assert result == [{"id": "external", "result": {"tools": []}}]
+        assert pairing.revoke(issued["device_id"])
+        assert request("/bridge/poll")[0] == 401
+        assert request("/bridge/respond", {"id": work["id"], "result": {}})[0] == 401
+    finally:
+        server.shutdown()
+
+
 def test_a_failed_spawn_does_not_burn_the_whole_day(tmp_path, monkeypatch):
     """A spawn that fails must retry on the next tick — the window bounds that to a handful of
     attempts. Stamping the day on a failure silenced the brief until tomorrow."""
@@ -3772,7 +3940,7 @@ def test_a_failed_spawn_does_not_burn_the_whole_day(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 31))
     boom = {"on": True}
 
-    def _spawn(runner, prompt, label):
+    def _spawn(runner, prompt, label, **_kwargs):
         if boom["on"]:
             raise OSError("hermes not found")
 
@@ -3782,6 +3950,155 @@ def test_a_failed_spawn_does_not_burn_the_whole_day(tmp_path, monkeypatch):
     boom["on"] = False
     rec._cron_tick()
     assert rec._CRON_FIRED == {"sotto-morning-brief": "2026-08-31"}
+
+
+def test_direct_receiver_startup_fails_before_traffic_when_send_contract_is_missing(monkeypatch):
+    adapter = types.SimpleNamespace(send_capability=lambda: (False, 'install pinned Hermes'))
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda name: adapter)
+    monkeypatch.setattr(rec, 'resolve_setup_code', lambda: pytest.fail('startup continued'))
+    with pytest.raises(SystemExit, match='install pinned Hermes'):
+        rec.main()
+
+
+def test_terminal_cron_job_does_not_block_peer_or_log_again_next_minute(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    rows = [{**BRIEF_ROW}, {**BRIEF_ROW, 'name': 'sotto-evening-brief',
+                            'skill': 'sotto-evening-brief'}]
+    _cron_spec(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime(2026, 8, 31, 6, 30))
+    fired = []
+    def fire(name, label):
+        if name == 'sotto-morning-brief':
+            raise RuntimeError('work request is terminal (failed)')
+        fired.append(name)
+        return {'ok': True}
+    monkeypatch.setattr(rec, '_fire_cron_job', fire)
+    rec._cron_tick()
+    rec._cron_tick()
+    assert fired == ['sotto-evening-brief']
+    assert rec._CRON_FIRED == {'sotto-morning-brief': '2026-08-31',
+                               'sotto-evening-brief': '2026-08-31'}
+
+
+def test_delivery_effect_helper_keeps_its_sibling_dirs_on_the_path_exactly_once(monkeypatch):
+    """delivery_effects imports pending_offer / schedule_wakeup / ledger_io LAZILY from
+    `_shared/scripts`, which it puts on sys.path when it loads. Restoring the old path after the
+    load (a "no growth" fix, Sep 11) meant every offer activation and anchor-keyed nudge raised
+    ModuleNotFoundError minutes later. The helper keeps those two directories, once."""
+    import importlib
+    import sys
+    monkeypatch.delattr(rec._shared_effects, '_module', raising=False)
+    before = list(sys.path)
+    first = rec._shared_effects()
+    lib = str(Path(first.__file__).resolve().parent)
+    scripts = str(Path(first.__file__).resolve().parent.parent / 'scripts')
+    assert scripts in sys.path and lib in sys.path
+    assert set(sys.path) - set(before) <= {lib, scripts}
+    grown = list(sys.path)
+    assert rec._shared_effects() is first and sys.path == grown, "cached: no second load, no growth"
+    for name in ('pending_offer', 'schedule_wakeup', 'ledger_io'):
+        assert importlib.import_module(name).__file__.startswith(scripts)
+
+
+def test_fire_cron_job_surfaces_terminal_work_and_still_swallows_spawn_failures(tmp_path, monkeypatch):
+    """The tick stamps a slot whose work already ran out its attempts on ONE signal: the enqueue's
+    terminal RuntimeError. _fire_cron_job used to swallow it as "spawn failed", so a receiver
+    restarted after a terminal day logged that every minute of the four-hour catch-up window."""
+    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [
+        ('sotto-morning-brief', '30 6 * * *', 'Run my morning brief', 'sotto-morning-brief')])
+    monkeypatch.setattr(rec, '_managed_brief', lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('work request is terminal (failed)')))
+    with pytest.raises(RuntimeError, match='work request is terminal'):
+        rec._fire_cron_job('sotto-morning-brief', 'cron:sotto-morning-brief')
+    monkeypatch.setattr(rec, '_managed_brief', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    out = rec._fire_cron_job('sotto-morning-brief', 'cron:sotto-morning-brief')
+    assert out == {'ok': False, 'error': 'spawn', 'reason': "that run couldn't be started"}
+    # The dashboard's run-now button reports a terminal slot instead of raising through the page.
+    monkeypatch.setattr(rec, '_managed_brief', lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('work request is terminal (expired)')))
+    assert rec._run_dashboard_job('sotto-morning-brief')['error'] == 'terminal'
+
+
+def test_a_busy_marker_lock_holds_the_brief_for_the_next_pass_instead_of_sending(tmp_path, monkeypatch):
+    """connectors.file_lock raises TimeoutError (an OSError) on contention. The gate used to catch
+    OSError and answer `send` — a guess, in the one situation the gate exists for."""
+    rec.DATA = str(tmp_path)
+    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
+    with open(os.path.join(str(tmp_path), "briefs", "2026-08-31_morning.json"), "w") as f:
+        f.write("{}")
+    import contextlib
+    real_lock = rec.CONNECTORS.file_lock
+
+    @contextlib.contextmanager
+    def busy(path):
+        if path.endswith('.delivered'):   # the marker's lock only; the outbox keeps its own
+            raise TimeoutError(f"could not lock {path} within 10s")
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(rec.CONNECTORS, 'file_lock', busy)
+    assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-a") == rec.OUTBOX.GATE_RETRY
+    box = rec.OUTBOX
+    sent = []
+    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target: sent.append(body) or (True, '', {'message_id': 'x'}))
+    monkeypatch.setitem(box.HOOKS, 'record', lambda *a, **k: None)
+    monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: True)
+    monkeypatch.setitem(box.HOOKS, 'brief_gate', lambda *a: box.GATE_RETRY)
+    assert box.deliver({'label': 'cron:sotto-morning-brief', 'body': 'The brief', 'target': 'test:owner',
+                        'run_id': 'run-a'}) is False
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert sent == [] and row['status'] == 'pending' and row['attempts'] == 1
+
+
+def test_a_calendar_change_at_the_fire_minute_does_not_compose_the_day_twice(tmp_path, monkeypatch):
+    """T-10 admits the composition under one context revision; a calendar edit before T mints a new
+    key. Both used to run — a full duplicate gather+compose for the send seam to supersede. Now an
+    admitted job nobody started is replaced, and one already composing is left to deliver."""
+    from datetime import timedelta
+    rec.DATA = str(tmp_path)
+    monkeypatch.setenv('SOTTO_RUN_SKILL', 'hermes -z')
+    # Tomorrow's 06:20, so the admitted jobs' validity (their due minute plus the catch-up window,
+    # measured against the real clock) is still ahead of time.time() when the queue claims them.
+    monkeypatch.setattr(rec, '_local_now', lambda: (datetime.now() + timedelta(days=1)).replace(
+        hour=6, minute=20, second=0, microsecond=0))
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [
+        ('sotto-morning-brief', '30 6 * * *', 'Run my morning brief', 'sotto-morning-brief')])
+    monkeypatch.setattr(rec, '_find_sotto_script',
+                        lambda *a: str(Path(rec.__file__).resolve().parents[2] / 'sotto-chief-of-staff/_shared/scripts/compose_brief.py'))
+    revision = {'value': 'r1'}
+    monkeypatch.setattr(rec, '_brief_revision', lambda kind=None: revision['value'])
+    label = 'cron:sotto-morning-brief'
+
+    def jobs():
+        active = rec.WORK_QUEUE.active_job(str(tmp_path), 'run', label)
+        with rec.WORK_QUEUE._db(str(tmp_path)) as db:
+            rows = [dict(r) for r in db.execute("SELECT id,status FROM jobs")]
+        return active, rows
+
+    assert rec._managed_brief('sotto-morning-brief', label, work_not_before=0) is True
+    first, rows = jobs()
+    assert first['status'] == 'pending' and len(rows) == 1
+    revision['value'] = 'r2'
+    assert rec._managed_brief('sotto-morning-brief', label) is True
+    second, rows = jobs()
+    assert second['id'] != first['id'] and len(rows) == 1, "the unstarted admission was replaced, not doubled"
+    assert rec.WORK_QUEUE.claim(str(tmp_path), 'worker')['id'] == second['id']
+    revision['value'] = 'r3'
+    assert rec._managed_brief('sotto-morning-brief', label) is True
+    third, rows = jobs()
+    assert third['id'] == second['id'] and third['status'] == 'leased' and len(rows) == 1, \
+        "a composition already under way is left to deliver; the outbox supersedes it if stale"
+
+
+def test_managed_script_discovery_never_falls_back_to_mutable_hermes_home(monkeypatch):
+    import glob
+    rec._SCRIPT_CACHE.clear()
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_SKILLS_ROOT', '/immutable/skills')
+    monkeypatch.setattr(glob, 'glob', lambda pattern, recursive: [pattern] if pattern.startswith('/immutable/') else [])
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda *_: pytest.fail('mutable Hermes roots consulted'))
+    assert rec._find_sotto_script('_shared', 'scripts', 'compose_brief.py').startswith('/immutable/')
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
@@ -3798,6 +4115,19 @@ def test_the_cron_thread_ticks_before_it_first_sleeps(monkeypatch):
     assert order[:2] == ["tick", "sleep"]
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_model_lease_heartbeat_survives_a_failed_cron_tick(tmp_path, monkeypatch):
+    calls = []
+    lease = types.SimpleNamespace(tick=lambda data: calls.append(data))
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_cron_tick', lambda: (_ for _ in ()).throw(RuntimeError('cron failed')))
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda name: lease if name == 'model_lease' else None)
+    monkeypatch.setattr(rec.time, 'sleep', lambda _s: (_ for _ in ()).throw(SystemExit))
+    thread = rec.start_cron_thread()
+    thread.join(timeout=5)
+    assert calls == [str(tmp_path)]
+
+
 def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatch):
     """The deliver-once claim lives at the send seam — and the claim's second half, the digest
     stamp, lives one step LATER, on the channel's ack: a claim whose send then fails for a day of
@@ -3808,7 +4138,7 @@ def test_the_seams_winning_claim_advances_the_digest_window(tmp_path, monkeypatc
     with open(os.path.join(str(tmp_path), "briefs", "2026-08-31_morning.json"), "w") as f:
         f.write("{}")
     stamped = []
-    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: stamped.append(1))
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda *a: stamped.append(1) or True)
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-a") == "send"
     assert stamped == [], "claimed is not delivered"
     assert rec._brief_delivery_gate("cron:sotto-morning-brief", "2026-08-31", "run-b") == "superseded"
@@ -3823,7 +4153,7 @@ def test_a_delivered_brief_with_no_learn_receipt_is_said_out_loud(tmp_path, monk
     on it, and a run that skipped it used to leave every page green — so the ack seam checks for
     the receipt and says, loudly, when a brief delivered without learning."""
     rec.DATA = str(tmp_path)
-    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: None)
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda *a: True)
     day = rec._local_now().strftime("%Y-%m-%d")
     rec._on_delivered({"label": "cron:sotto-morning-brief", "effects": []})
     assert "delivered with NO Learn receipt" in capsys.readouterr().out
@@ -3959,12 +4289,9 @@ def test_a_body_with_no_composed_brief_behind_it_never_claims_the_day(tmp_path, 
     rec.DATA = str(tmp_path)
     _no_backoff(monkeypatch)
     sent = _channel(monkeypatch)
-    refired = []
-    monkeypatch.setattr(rec, "_retry_failed_brief", lambda label: refired.append(label))
     assert rec._deliver_text("I could not run compose_brief.py — execute_code is unapproved.",
                              "brief:sotto-morning-brief", run_id="improvised") is False
     assert sent == [], "a non-brief reached the channel"
-    assert refired == ["brief:sotto-morning-brief"], "a non-brief run is a dead run: re-fire once"
     (row,) = _outbox_rows(tmp_path)
     assert row["status"] == "failed" and "no composed brief" in row["last_error"]
     assert not os.path.exists(os.path.join(str(tmp_path), "briefs",
@@ -3984,7 +4311,7 @@ def test_the_digest_window_moves_when_the_channel_acks_not_when_the_day_is_claim
     _no_backoff(monkeypatch)
     _archive(tmp_path, "evening")
     stamps = []
-    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda: stamps.append(1))
+    monkeypatch.setattr(rec, "_advance_digest_stamp", lambda *a: stamps.append(1) or True)
     _channel(monkeypatch, (False, "no chat linked"), (True, ""))
     assert rec._deliver_text("# Evening brief", "brief:sotto-evening-brief", run_id="r1") is False
     assert _marker(tmp_path, "evening") == "r1" and stamps == [], "claimed, not delivered: no stamp"
@@ -3997,7 +4324,7 @@ def test_a_timezone_change_forgets_the_fired_today_stamps(tmp_path, monkeypatch)
     the wizard set PDT the user's real 06:30 was still "today", already stamped, and no brief came
     (Day-0 simulation, Sep 2026). The durable marker is what stops a genuine re-fire."""
     rec.DATA = str(tmp_path)
-    rec._CRON_FIRED.clear(); rec._RETENTION_FIRED.clear(); rec._BRIEF_RETRIES.clear()
+    rec._CRON_FIRED.clear(); rec._RETENTION_FIRED.clear()
     rec._CRON_FIRED["sotto-morning-brief"] = "2026-09-04"
     rec._RETENTION_FIRED["sweep"] = "2026-09-04"
     monkeypatch.setattr(rec, "_configured_tz_name", lambda: "UTC")
@@ -4014,27 +4341,50 @@ def test_a_timezone_change_forgets_the_fired_today_stamps(tmp_path, monkeypatch)
     assert rec._CRON_FIRED == {"sotto-morning-brief": "2026-09-04"}
 
 
-def test_a_cron_brief_run_that_dies_is_re_fired_once_and_only_once(tmp_path, monkeypatch):
-    """The tick stamps a job fired when its process STARTS; a compose that crashed minutes later left
-    the day stamped and the outbox empty — a brief lost with one `failed` receipt nobody reads
-    (Day-1 simulation, Sep 2026). One bounded re-fire, and never when the day has delivered."""
-    rec.DATA = str(tmp_path)
-    rec._BRIEF_RETRIES.clear()
-    fired = []
-    monkeypatch.setattr(rec, "_fire_cron_job", lambda name, label: fired.append(name) or {"ok": True})
-    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 3, 6, 34))
-    rec._retry_failed_brief("cron:sotto-morning-brief")
-    rec._retry_failed_brief("cron:sotto-morning-brief")
-    assert fired == ["sotto-morning-brief"], "one re-fire per job per day"
-    rec._retry_failed_brief("brief:sotto-morning-brief")      # the wake-push lane retries itself
-    rec._retry_failed_brief("cron:sotto-relationship-pulse")  # not a marked brief
-    assert fired == ["sotto-morning-brief"]
-    rec._BRIEF_RETRIES.clear()
-    os.makedirs(os.path.join(str(tmp_path), "briefs"), exist_ok=True)
-    with open(rec.delivered_marker("2026-09-03", "morning"), "w") as f:
-        f.write("someone")
-    rec._retry_failed_brief("cron:sotto-morning-brief")
-    assert fired == ["sotto-morning-brief"], "a delivered day is never re-fired"
+def test_a_cron_brief_failure_retains_its_durable_owner(tmp_path, monkeypatch):
+    """A dead run retries under the same ID; forgetting process-local stamps cannot duplicate it."""
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime.now())
+    monkeypatch.setattr(rec, '_brief_revision', lambda *a: 'context-v1')
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda: [('sotto-morning-brief', '*', '', '')])
+    first = rec._spawn_and_deliver(['python3', '-c', 'pass'], '{}', 'cron:sotto-morning-brief')
+    job = rec.WORK_QUEUE.claim(tmp_path, 'worker')
+    rec.WORK_QUEUE.fail(tmp_path, job['id'], 'worker', 'TimeoutError')
+    rec._CRON_FIRED.clear()
+    second = rec._spawn_and_deliver(['python3', '-c', 'pass'], '{}', 'cron:sotto-morning-brief')
+    assert first == second
+    assert rec.WORK_QUEUE.get(tmp_path, first)['status'] == 'pending'
+
+
+def test_terminal_cron_budget_is_not_reset_but_fresh_wake_ingress_gets_one_new_budget(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    # Today at 06:30, on BOTH clocks: an admitted job is valid until the next local midnight, and
+    # the queue expires it against its own time.time() — a date pinned in the past (this test was
+    # written on 2026-09-11) meant every job here expired before the first claim the day after.
+    now = datetime.now().replace(hour=6, minute=30, second=0, microsecond=0)
+    monkeypatch.setattr(rec, '_local_now', lambda: now)
+    monkeypatch.setattr(rec.WORK_QUEUE.time, 'time', lambda: now.timestamp())
+    monkeypatch.setattr(rec, '_brief_revision', lambda *a: 'context-v1')
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda: [('sotto-morning-brief', '*', '', '')])
+    argv = ['python3', '-c', 'pass']
+    job_id = rec._spawn_and_deliver(argv, '{}', 'cron:sotto-morning-brief')
+    with rec.WORK_QUEUE._db(tmp_path) as db:
+        db.execute("UPDATE jobs SET status='failed',attempts=?,finished=? WHERE id=?",
+                   (rec.WORK_QUEUE.MAX_ATTEMPTS, rec.time.time(), job_id))
+
+    with pytest.raises(RuntimeError, match='terminal'):
+        rec._spawn_and_deliver(argv, '{}', 'cron:sotto-morning-brief')
+    assert rec.WORK_QUEUE.get(tmp_path, job_id)['attempts'] == rec.WORK_QUEUE.MAX_ATTEMPTS
+
+    assert rec._spawn_and_deliver(argv, '{}', 'brief:sotto-morning-brief',
+                                  retry_terminal=True) == job_id
+    first_wake = rec.WORK_QUEUE.claim(tmp_path, 'wake-worker')
+    assert first_wake['attempts'] == 1
+    # A duplicate HTTP retry while that fresh request is in flight remains deduplicated.
+    assert rec._spawn_and_deliver(argv, '{}', 'brief:sotto-morning-brief',
+                                  retry_terminal=True) == job_id
+    assert rec.WORK_QUEUE.get(tmp_path, job_id)['attempts'] == 1
 
 
 def test_a_wake_inside_the_cron_window_folds_only_while_the_cron_is_alive(tmp_path, monkeypatch):
@@ -4079,3 +4429,95 @@ def test_a_composed_brief_is_recognised_by_recency_not_by_matching_dates(tmp_pat
     os.utime(path, (time.time() - 25 * 3600, time.time() - 25 * 3600))
     assert rec._composed_brief_recently("evening", "2026-09-03") is False, "yesterday's brief is not today's"
     assert rec._composed_brief_recently("morning", "2026-09-04") is False, "a different kind never counts"
+
+
+def test_managed_source_gate_covers_clock_and_bridge_wake(tmp_path, monkeypatch):
+    import managed
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [
+        ('sotto-morning-brief', '30 6 * * *', 'morning', 'sotto-morning-brief')])
+    spawned = []
+    monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *a, **k: spawned.append(a))
+    clock = rec._fire_cron_job('sotto-morning-brief', 'cron:sotto-morning-brief')
+    status, wake = rec.handle_trigger({'type': 'morning_ready', 'date': '2026-09-06'})
+    assert clock['error'] == 'capability' and status == 200 and wake['status'] == 'held'
+    assert spawned == []
+    root = tmp_path / 'config'
+    root.mkdir()
+    (root / 'photon-activation.json').write_text(json.dumps({
+        'tenant_id': 'pilot', 'owner': '+15555550100', 'activated': True}))
+    (root / 'managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'pilot', 'sources': {'calendar': {'consented': True, 'connected': True}}}))
+    assert managed.brief_hold(tmp_path) is None
+    assert rec._fire_cron_job('sotto-morning-brief', 'cron:sotto-morning-brief')['ok']
+    assert len(spawned) == 1
+
+
+@pytest.mark.parametrize('name', [
+    'sotto-relationship-pulse', 'sotto-proactive', 'sotto-midday-digest'])
+def test_managed_scheduled_nudges_wait_for_activation_and_sources(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [(name, '*', 'scheduled check', name)])
+    spawned = []
+    monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *a: spawned.append(a))
+    assert rec._fire_cron_job(name, 'cron:' + name)['error'] == 'capability'
+    root = tmp_path / 'config'
+    root.mkdir()
+    (root / 'photon-activation.json').write_text(json.dumps({
+        'tenant_id': 'pilot', 'owner': '+15555550100', 'activated': True}))
+    assert rec._fire_cron_job(name, 'cron:' + name)['error'] == 'capability'
+    assert spawned == []
+    (root / 'managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'pilot', 'sources': {'calendar': {'consented': True, 'connected': True}}}))
+    assert rec._fire_cron_job(name, 'cron:' + name)['ok']
+    assert len(spawned) == 1 and spawned[0][2] == 'cron:' + name
+    if name == 'sotto-proactive':
+        assert name in spawned[0][1]
+    else:
+        assert json.loads(spawned[0][1])['kind'] == ('pulse' if 'pulse' in name else 'digest')
+
+
+def test_managed_source_notice_is_a_nudge_and_persists_acceptance(tmp_path, monkeypatch):
+    import managed
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
+    root = tmp_path / 'config'
+    root.mkdir()
+    (root / 'photon-activation.json').write_text(json.dumps({
+        'tenant_id': 'pilot', 'owner': '+15555550100', 'activated': True}))
+    monkeypatch.setattr(rec, '_cron_reconciler', lambda: None)
+    sends = []
+    monkeypatch.setattr(rec, '_send_via_channel', lambda *a: (sends.append(a) is None, ''))
+    rec._cron_tick()
+    rec._cron_tick()
+    assert len(sends) == 1
+    assert rec.OUTBOX.kind_for(managed.NOTICE_LABEL) == rec.OUTBOX.KIND_NUDGE
+    assert json.loads((root / 'managed-status.json').read_text())['no_sources_sent'] is True
+
+
+def test_managed_briefs_use_direct_runner_for_wake_and_cron(monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setattr(rec, '_find_sotto_script', lambda *args: '/skills/sotto/_shared/scripts/compose_brief.py')
+    calls = []
+    monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *args, **kwargs: calls.append((args, kwargs)))
+    rec.run_skill('sotto-evening-brief', '/data/staged.json')
+    assert calls[0][0][0][-1].endswith('/brief_runner.py')
+    request = json.loads(calls[0][0][1])
+    assert {k: request[k] for k in ('kind','pack','payload_path')} == {'kind': 'evening', 'pack': '/skills/sotto', 'payload_path': '/data/staged.json'}
+    assert request['work_key'].startswith(request['day'] + ':evening:')
+    assert calls[0][1]['retry_terminal'] is True
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda: [('sotto-morning-brief', '*', 'brief', 'sotto-morning-brief')])
+    assert rec._fire_cron_job('sotto-morning-brief', 'run-now:sotto-morning-brief')['ok']
+    assert json.loads(calls[-1][0][1])['kind'] == 'morning'
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
+    assert rec._managed_brief('sotto-morning-brief', 'brief:sotto-morning-brief') is True
+    assert json.loads(calls[-1][0][1])['kind'] == 'morning'

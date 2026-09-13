@@ -65,7 +65,7 @@ def test_reviewer_reproduction_fabricated_recipient_is_never_linked(tmp_path, mo
     refusals = out.get("_refused_tap_targets") or []
     assert any(FABRICATED_PHONE in r for r in refusals), f"no refusal recorded: {refusals}"
     # Fail toward silence for the ACTION, never for the brief.
-    assert out["brief_markdown"].startswith("# Brief")
+    assert "\n\n# Brief" in out["brief_markdown"]
     assert a.get("contextSummary") == "Sarah asked about Thursday"   # the TEXT is untouched
 
 
@@ -261,7 +261,7 @@ def test_a_broken_payload_refuses_links_and_still_composes(tmp_path, monkeypatch
     out = cb.compose(_inputs(), llm=_llm_returning([
         {"id": "a1", "type": "reply", "channel": "imessage", "contactName": "Sarah Chen",
          "contactIdentifier": REAL_PHONE}]))
-    assert out["brief_markdown"].startswith("# Brief")             # the brief is still delivered
+    assert "\n\n# Brief" in out["brief_markdown"]             # the brief is still delivered
     assert not out["actions"][0].get("tap_link")
 
 

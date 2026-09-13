@@ -84,15 +84,15 @@ def test_existing_company_is_never_overwritten(tmp_path, monkeypatch):
     assert p.name == "Priya Patel"                     # and the real name survives the derived one
 
 
-def test_rerun_bumps_instead_of_duplicating(tmp_path, monkeypatch):
+def test_same_meeting_replay_does_not_strengthen_or_duplicate(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_USER_EMAIL", "me@mine.com")
     payload = {"meetings": [_meeting(["priya@acmecorp.com"], summary="Redline by Friday.")]}
     gg.run(payload)
     gg.run(payload)
     facts = [f for _fid, f in kg.sorted_active_facts(_person("priya@acmecorp.com").facts)]
-    assert len(facts) == 1                             # identical text → find_similar_fact BUMPs
-    assert facts[0].seen == 2
+    assert len(facts) == 1                             # same source reference is not independent confirmation
+    assert facts[0].seen == 1
 
 
 def test_untitled_and_idless_meeting_still_carries_provenance(tmp_path, monkeypatch):

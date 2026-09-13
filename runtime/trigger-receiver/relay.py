@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import queue
 import secrets
+import sys
 import threading
 import time
 
@@ -65,6 +66,8 @@ class Relay:
         # on Linux, so a 0.0 start read as "connected" for the first bridge_timeout seconds after boot.
         self._last_poll = float("-inf")
         self._bridge_timeout = bridge_timeout
+        self.on_response = lambda request, result: None
+        self.validate_response = lambda request, result: True
         self._tools_cache = None                    # last good tools/list result (primed on connect)
 
     # ---- status -----------------------------------------------------------
@@ -131,7 +134,7 @@ class Relay:
         ev = threading.Event()
         with self._lock:
             self._waiters[internal_id] = {"event": ev, "value": None,
-                                          "external_id": external_id}
+                                          "external_id": external_id, "request": req, "deadline": time.monotonic() + timeout}
         self._q.put((time.monotonic() + timeout, forwarded))
         if ev.wait(timeout):
             with self._lock:
@@ -166,6 +169,27 @@ class Relay:
         rid = resp.get("id")
         with self._lock:
             slot = self._waiters.get(rid)
-            if slot:
-                slot["value"] = {**resp, "id": slot["external_id"]}
-                slot["event"].set()
+            request = slot['request'] if slot else None
+        if slot is None:
+            return False
+        # Consent validation reads capability state and the ingress rules; observation writes a
+        # ledger under a file lock. Neither may run under `_lock`: every forward, poll hand-off
+        # and unrelated respond waits on it, and one slow hook stalled a different tool call by
+        # its whole duration (review, Sep 11).
+        result = resp.get('result') or {}
+        if self.validate_response(request, result) is not True:
+            return False
+        try:
+            self.on_response(request, result)
+        except Exception as error:
+            # Observation is best-effort. The authenticated Bridge response already exists;
+            # never turn a bookkeeping failure into a caller timeout and a repeated tool call.
+            print(f"[sotto] relay response observation failed: {type(error).__name__}",
+                  file=sys.stderr, flush=True)
+        with self._lock:
+            slot = self._waiters.get(rid)
+            if slot is None:
+                return False   # the caller gave up while the hooks ran; its result is nobody's
+            slot["value"] = {**resp, "id": slot["external_id"]}
+            slot["event"].set()
+            return True

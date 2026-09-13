@@ -120,9 +120,12 @@ def test_cli_separate_files_assembles_inputs(tmp_path):
     out = subprocess.run(
         [_sys.executable, script, "--type", "evening",
          "--local", str(tmp_path / "local.json"), "--calendar", str(tmp_path / "cal.json")],
-        capture_output=True, text=True, env={**os.environ, "SOTTO_LLM_STUB": str(stub)})
+        capture_output=True, text=True, env={**os.environ, "SOTTO_LLM_STUB": str(stub),
+                                            "SOTTO_DATA": str(tmp_path)})
     assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout)["brief_markdown"] == "# Real"
+    md = json.loads(out.stdout)["brief_markdown"]
+    assert md.startswith("# Good ") and md.endswith("\n\n# Real")   # the code-owned greeting, then the model's text
+    assert json.loads(out.stdout)['_source_permissions'] == ['calendar', 'imessage']
 
 
 def test_cli_local_reaches_prompt():

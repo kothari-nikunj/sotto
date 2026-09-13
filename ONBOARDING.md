@@ -96,32 +96,29 @@ it's finished and **DONE** after — reload the page (the wizard's own **recheck
 
 **① Link your Mac** — [Download Sotto Bridge.app](https://github.com/kothari-nikunj/sotto/releases/latest),
 drag it to `/Applications`, open it.
-- **First run asks for an access code** — Sotto Bridge is invite-only for now; paste the code from
+- **First run asks for an access code** — access to the distributed Bridge binary is invite-only
+  for now; self-host deployment itself is not. Paste the code from
   your invite (it's verified on your Mac, nothing is sent anywhere), and if you don't have one yet,
   ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
 - **Updating an existing Bridge to 1.2.7 or newer asks for a code too**, once, and that install stops
   streaming to your cloud until you enter one — your pairing, Full Disk Access and settings are all
   untouched, so entering the code resumes everything with nothing to re-pair. Same
   [Issues](https://github.com/kothari-nikunj/sotto/issues) link if you don't have a code yet.
-- **Then a 3-step wizard opens, in this order — Disk access → Connect → Privacy.** Nothing is read
-  and nothing is sent until you press **Save & Connect** on the last step, so it is safe to walk
-  through it before deciding anything.
-  1. **Disk access.** Click **"Open System Settings…"** — it deep-links you to the right pane; add
-     **Sotto Bridge** under Privacy & Security → Full Disk Access. **Success signal:** come back and
-     the card reads **Full Disk Access · Granted** — it updates by itself, no relaunch.
-     *Skipped it? You can grant it later from the menu-bar item's **Grant** button; the app restarts
-     its engine on its own to pick the grant up.*
-  2. **Connect.** On the `/setup` page **on this Mac**, click **"Open in Sotto Bridge →"** — the app
-     fills host + token in one click. **Success signal:** *Continue* stops being greyed out.
-     *On a different Mac from the browser? Copy the pairing link from that same tile and paste it
-     into the app's **`sotto-bridge://pair?…`** field, then click **Pair**.*
-  3. **Privacy.** Every data source the app can read (Messages, calls, contacts, browser history, …)
-     is listed with a per-source toggle, all on — **turn off anything you don't want shared, here,
-     before the first connect.** Then **Save & Connect**.
-     *At the bottom of that list — once the app knows your host — a **"Meeting notes (Granola) &
-     more"** row with an **Open…** button jumps to your `/setup` page, where cloud sources connect;
-     they are never read from this Mac. If that page says Forbidden, open the `[sotto] Setup link`
-     from your deploy logs once in the same browser first.*
+- **Choose hosting in the one Sotto setup window.** Cloud is an invite-only pilot for registered accounts. Cloud uses Google → Mac sources / Full Disk
+  Access → Messages → First brief. Google sign-in alone does not start reading this Mac.
+- **For self-host, the steps are Connect → Choose sources → Disk access.**
+  1. **Connect.** On your host's `/setup` page, click **Open in Sotto Bridge** or paste its pairing
+     link. Continue becomes available once the host and token are present.
+  2. **Choose sources.** Every supported Mac reader starts on, just like the existing Mac app.
+     Turn off anything you do not want shared before continuing. Existing users keep saved choices.
+  3. **Disk access.** Click **Enable Full Disk Access…**, add **Sotto Bridge** under System Settings
+     → Privacy & Security → Full Disk Access, then return. The live card shows **Granted**.
+     **Save & Connect** starts the selected readers. **Skip Mac sources for now** turns all readers
+     off and completes setup; enable sources later in Settings after granting access.
+- Cloud uses that same source list and disk-access card before the Messages step. Continue starts
+  selected Mac readers only after the grant; startup and reconnect cannot bypass source confirmation.
+  A source being on does not claim it is available or has already been read. Meeting-note services
+  still connect through their own authorization on the host's `/setup` page.
 - **Success signal on the cloud side:** reload `/setup` — tile ① now reads **DONE** with
   "Your Mac is linked and reachable."
 - **It keeps itself current.** The Bridge checks daily for a new signed release; when there is one

@@ -126,6 +126,7 @@ BRIEF_ARCHIVE_DAYS = 60
 # dead weight the next morning. A week is the crash margin, the same one the receiver's event
 # bundles already get.
 STAGED_DAYS = 7
+NOTES_CACHE_DAYS = 1  # raw meeting notes are a short-lived input, not the canonical graph
 # The once-per-day nudge dedup stamps. Only today's is ever read; a month is pure forensics.
 PROACTIVE_STAMP_DAYS = 30
 # The brief log's ceiling — defence in depth above sotto_log.bounded_append's own 4 MB rotation,
@@ -133,7 +134,7 @@ PROACTIVE_STAMP_DAYS = 30
 # operation rotation keeps the file well under this and the sweep does nothing.
 LOG_TAIL_MAX_BYTES = 5 * 1024 * 1024
 # Draft outcomes (log_outcome.py appends one line per decided draft, forever, and
-# learn_preferences.py reads the WHOLE file after every brief). A quarter is what the learning
+# draft_outcomes.py reads the file to avoid regrading drafts). A quarter is what the learning
 # loop can use; past that it is a linearly growing read for nothing.
 OUTCOME_DAYS = 90
 
@@ -207,6 +208,14 @@ SWEEP = (
     Rule("briefs/????-??-??.*.payload.json", DELETE_OLDER, STAGED_DAYS,
          f"a staged wake payload is read by that morning's brief and is dead weight "
          f"{STAGED_DAYS} days later"),
+    Rule("cache/brief-granola.json", DELETE_OLDER, NOTES_CACHE_DAYS,
+         "meeting notes cache is reusable for at most one day"),
+    Rule("events/work-inputs/brief-*/*.json", DELETE_OLDER, STAGED_DAYS,
+         "durable brief artifacts and manifests expire after the work retention window"),
+    Rule("events/work-inputs/brief-*/current/*.json", DELETE_OLDER, STAGED_DAYS,
+         "unfinished ancillary input expires after its work deadline"),
+    Rule("events/work-inputs/brief-*/prepared/*.json", DELETE_OLDER, STAGED_DAYS,
+         "preparation input ages with its work artifact"),
     Rule("events/delivery-effects-*.json", DELETE_OLDER, STAGED_DAYS,
          f"a run's staged effects outlive the run only when it crashed; {STAGED_DAYS} days "
          "collects those"),
@@ -218,6 +227,12 @@ SWEEP = (
 )
 
 EXEMPT = (
+    Exempt(".sotto-volume.json", "adapter managed_volume owns the tenant/volume identity receipt"),
+    Exempt(".sotto-runtime.lock", "adapter runtime_lock owns the process-lifetime writer lock"),
+    Exempt(".sotto-recovery-hold.json", "adapter recovery owns the restore hold and its release"),
+    Exempt("config/model-lease.json", "adapter model_lease owns model credential expiry metadata"),
+    Exempt("events/work.sqlite3*", "work_queue owns terminal metadata/alias pruning after seven days"),
+    Exempt("config/source-state.json", "bounded metadata for current source permissions and observations"),
     Exempt("events/outbox.json",
            "outbox.py prunes its own terminal rows after RETENTION_SECS (7 days)"),
     Exempt("events/bundle-*.json",

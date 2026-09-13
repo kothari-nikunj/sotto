@@ -47,7 +47,14 @@ def active_jobs(path: str, runner: str | None = None) -> list[tuple[str, str, st
         name = str(row.get("name") or "")
         if not name or name.startswith(USER_PREFIX):
             continue
-        if runner and (str(row.get("runner") or "").strip() or HERMES_RUNNER) != runner:
+        managed = os.environ.get('SOTTO_DEPLOYMENT_MODE') == 'managed'
+        job_runner = str((row.get('managed_runner') if managed else None)
+                         or row.get('runner') or HERMES_RUNNER).strip()
+        # Managed system jobs use the receiver's activation/source gates and outbox.
+        # A managed override preserves the existing self-host scheduler assignment.
+        if managed and job_runner != RECEIVER_RUNNER:
+            continue
+        if runner and job_runner != runner:
             continue
         gate = row.get("gate")
         if gate and os.environ.get(str(gate), "1") != "1":

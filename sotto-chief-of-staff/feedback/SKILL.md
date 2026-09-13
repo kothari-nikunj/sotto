@@ -1,6 +1,6 @@
 ---
 name: sotto-feedback
-description: Use when the user gives feedback or a correction about a brief, or asks for fewer interruptions right now — "stop surfacing newsletters" / "don't show me X anymore" / "mute Bob" / "stop flagging <person>" / "keep my briefs terse" / "that's wrong about <person>" / "<person> isn't the founder" / "you got <fact> wrong" / "quieter today" / "be quiet until 3" / "quiet for 2 hours" / "back to normal". Records the preference (so future briefs and nudges honor it) or corrects the knowledge graph. Never sends anything.
+description: Use when the user gives feedback or a correction about a brief, says an item was useful or not useful, or asks for fewer interruptions right now — "stop surfacing newsletters" / "don't show me X anymore" / "mute Bob" / "stop flagging <person>" / "keep my briefs terse" / "that's wrong about <person>" / "<person> isn't the founder" / "you got <fact> wrong" / "quieter today" / "be quiet until 3" / "quiet for 2 hours" / "back to normal". Records the preference (so future briefs and nudges honor it) or corrects the knowledge graph. Never sends anything.
 metadata:
   hermes:
     tags: [chief-of-staff, sotto, preferences, feedback]
@@ -15,12 +15,36 @@ required_environment_variables:
 # Sotto — Feedback & corrections
 
 When the user pushes back on a brief, **make it stick** — deterministically, in the volume Sotto reads
-every morning. Three kinds of feedback, three destinations: a preference, a correction, or a cadence
-change. All are write-only-to-disk; **never send a message, email, or calendar change from this
+every morning. An item rating, a preference, a correction, or a cadence change each has its own meaning. All are write-only-to-disk; **never send a message, email, or calendar change from this
 skill.** Confirm in ONE short line, as Sotto.
 
 > **CRITICAL — ground everything in what the user said.** Never invent a correction or guess a name. If
 > you're unsure which person/sender they mean, ask one short clarifying question instead of writing.
+
+## Item usefulness — “that was useful”, “the donation item was noise”
+
+Run `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/usefulness_feedback.py" list` to find the
+actual archived brief or offered draft. Match the owner's words to that output; never guess a
+reference when multiple items fit. Record the rating against that exact reference:
+
+```bash
+python3 "$HOME/.hermes/skills/sotto/_shared/scripts/usefulness_feedback.py" useful \
+  --reference "<reference from list>"
+```
+
+Use `not_useful` for the opposite. **Only the reference and the rating are stored** — one outcomes
+row; the archived brief or draft stays the source of truth, and no excerpt, reason or other prose
+is copied anywhere. `--excerpt "<verbatim excerpt>"` is optional and is only checked against the
+referenced output (a quote that isn't in it is refused, which is how a wrong match is caught);
+`--reason` is accepted and then discarded — don't collect one. Only record a rating the owner
+actually gave. A bare thumbs-up without a clear feedback referent is ambiguous; neither a reaction
+nor an item rating authorizes sending, completing a loop, muting its sender, or changing a standing
+rule. The script refuses unattended writes and invented excerpts. If the item isn't in the list,
+ask the owner to name a specific preference or correction; don't fabricate a match or claim it was
+recorded.
+
+These bounded examples reach briefs, digest/nudge relevance, and drafting. Say one short line,
+such as “Got it — that school deadline was useful.” Never ask for a rating after every message.
 
 ## A · Preferences (mute / tone) — "stop surfacing X", "keep it terse"
 
@@ -45,7 +69,8 @@ python3 "$P" show                               # read back the current preferen
 - **"<person> is important / always let them through"** → `vip "<their display name>"`. VIP is narrow
   and honest: it clears the quiet-hours bar for their **missed calls**, nothing else.
 - **Undo** ("show me Bob again") → `unmute-person "Bob Smith"` (same for `unmute-sender` /
-  `unmute-section` / `unvip` / `clear-tone`).
+  `unmute-section` / `unvip`). One tone note → `remove-tone "<the note>"`; all of them →
+  `clear-tone`.
 
 ## B · Corrections (the graph got a fact wrong) — "Peyton isn't the founder"
 
@@ -146,9 +171,7 @@ One line, as Sotto: e.g. *"Done — I'll stop surfacing newsletters from example
 fixed Peyton's record; I won't repeat that."* Nothing else; no message is sent anywhere.
 
 ## Notes
-- These are the **explicit** half of preferences; the **behavioral** half (which tiers/contacts the user
-  accepts) is learned automatically by `approval-tiers/scripts/learn_preferences.py` and lives in the same file —
-  this skill never touches that block, and the learner never touches this one.
+- Preferences are user-stated instructions. Historical inferred rules are ignored; draft usage never grants permission or mutes a person.
 - Mutes take effect on the **next brief** (the composer reads `preferences.json` each run). No restart.
 - The **snooze** takes effect immediately — the event funnel and the proactive watcher read
   `preferences.json` on every tick — and expires on its own. Nothing held during it is deleted: it

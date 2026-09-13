@@ -506,6 +506,7 @@ def test_window_days_slices_the_backfill_past_the_page_caps(monkeypatch):
     assert len(sent) == 1 and sent[0]["isSent"] is True
 
     calls.clear()
+    monkeypatch.setattr(gg, "_token_path", lambda: "")
     evs = gg.gather_calendar("api.py", back_days=41)
     assert len(calls) >= 20                            # ~2-day spans beat the 25-event page
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -731,3 +732,71 @@ def test_the_caps_have_one_owner():
     # …and nowhere does it declare one of its own
     assert not re.search(r"^MAX_ATTACHMENT\w*\s*=", src, re.M)
     assert (gg.MAX_ATTACHMENTS_PER_EMAIL, gg.MAX_ATTACHMENT_BYTES) == (3, 8_000_000)
+
+
+def test_attachment_workers_never_share_google_transport(monkeypatch):
+    import threading
+    clients = []
+    barrier = threading.Barrier(4)
+    class Client:
+        def __init__(self):
+            self.owner = threading.get_ident()
+            self.closed = False
+        def close(self):
+            self.closed = True
+    def build():
+        client = Client()
+        clients.append(client)
+        return client
+    def fetch(client, mid):
+        assert client.owner == threading.get_ident()
+        barrier.wait(timeout=3)
+        return [{'filename': mid}]
+    monkeypatch.setattr(gg, '_token_path', lambda: 'connected')
+    monkeypatch.setattr(gg, '_gmail_service', build)
+    monkeypatch.setattr(gg, '_fetch_attachments', fetch)
+    result = gg._attachments_for(['a', 'b', 'c', 'd'])
+    assert list(result) == ['a', 'b', 'c', 'd']
+    assert len(clients) == 4 and all(c.closed for c in clients)
+
+
+def test_calendar_native_pages_preserve_identity_rsvp_and_all_day(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    pages = [
+        {'items': [{'id': str(i), 'summary': 'Event'} for i in range(25)], 'nextPageToken': 'second'},
+        {'items': [{'id': 'meeting', 'summary': 'Owner / Alex',
+                    'start': {'dateTime': '2026-09-08T10:00:00-07:00'},
+                    'attendees': [{'email': 'alex@company.test', 'displayName': 'Alex Example'},
+                                  {'email': 'me@test', 'self': True, 'responseStatus': 'accepted'}]},
+                   {'id': 'ooo', 'summary': 'OOO', 'start': {'date': '2026-09-07'},
+                    'end': {'date': '2026-09-08'}},
+                   {'id': 'cancelled', 'status': 'cancelled'}, {'id': '0', 'summary': 'Event'}]}]
+    class Service:
+        def events(self): return self
+        def list(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(execute=lambda: pages.pop(0))
+    events = gg.gather_calendar('unused.py', service=Service())
+    assert len(events) == 27
+    assert calls[0]['maxResults'] == 250 and calls[1]['pageToken'] == 'second'
+    meeting = next(e for e in events if e['id'] == 'meeting')
+    assert meeting['attendees'][0]['displayName'] == 'Alex Example'
+    assert meeting['my_response'] == 'accepted'
+    assert next(e for e in events if e['id'] == 'ooo')['start'] == '2026-09-07'
+
+
+def test_calendar_native_fails_on_repeated_page_and_closes_owned_client(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    closed = []
+    class Service:
+        def events(self): return self
+        def list(self, **kwargs):
+            return SimpleNamespace(execute=lambda: {'items': [], 'nextPageToken': 'same'})
+        def close(self): closed.append(True)
+    monkeypatch.setattr(gg, '_token_path', lambda: 'connected')
+    monkeypatch.setattr(gg, '_google_service', lambda api, version: Service())
+    with pytest.raises(RuntimeError, match='repeated a page token'):
+        gg.gather_calendar('unused.py')
+    assert closed == [True]

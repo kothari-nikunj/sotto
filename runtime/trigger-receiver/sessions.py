@@ -15,54 +15,28 @@ day, and archiving them is 100 subprocess calls that change nothing the gateway 
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 import subprocess
 import sys
 
-CLI_TIMEOUT_SECS = 30
-CRON_PREFIX = "cron_"
+
+def _adapter():
+    path = Path('/app/adapters/hermes/runtime_api.py')
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / 'adapters/hermes/runtime_api.py'
+    spec = importlib.util.spec_from_file_location('sotto_hermes_session_api', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def session_ids(listing: str) -> list[str]:
-    """The ID column of `hermes sessions list`, cron sessions excluded, in listing order.
-
-    The table is `Title  Workspace  Last Active  ID` with a rule under the header; the id is the
-    LAST whitespace-separated token of a data row and always carries a digit. Titles can contain
-    anything, so the last column — not a pattern over the whole line — is what is read."""
-    out: list[str] = []
-    for line in (listing or "").splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        sid = parts[-1]
-        if sid == "ID" or not any(ch.isdigit() for ch in sid) or set(sid) <= set("─-="):
-            continue
-        if sid.startswith(CRON_PREFIX) or sid in out:
-            continue
-        out.append(sid)
-    return out
+    return _adapter().session_ids(listing)
 
 
 def archive_all(run=None) -> int | None:
-    """Archive every non-cron session. Returns how many `hermes sessions archive` calls exited 0,
-    or None when the sessions CLI is not available here. `archive` keeps the transcript (`/resume`
-    reopens it) — this is "start fresh", never "destroy history". Never raises."""
-    run = run or subprocess.run     # resolved at call time, so a patched subprocess.run is honoured
-    try:
-        listed = run(["hermes", "sessions", "list"], capture_output=True, text=True,
-                     timeout=CLI_TIMEOUT_SECS)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if listed.returncode != 0:
-        return None
-    archived = 0
-    for sid in session_ids(listed.stdout or ""):
-        try:
-            done = run(["hermes", "sessions", "archive", sid], capture_output=True, text=True,
-                       timeout=CLI_TIMEOUT_SECS)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        archived += int(done.returncode == 0)
-    return archived
+    return _adapter().archive_sessions(run or subprocess.run)
 
 
 def main() -> int:

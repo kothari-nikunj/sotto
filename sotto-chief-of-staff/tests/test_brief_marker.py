@@ -71,3 +71,11 @@ def test_a_claimer_with_no_run_id_says_so(tmp_path, monkeypatch):
     assert bm.claim("morning") is True
     with open(bm._path("morning"), encoding="utf-8") as f:
         assert f.read() == bm.UNLABELED
+
+
+def test_claim_fails_closed_when_atomic_create_cannot_be_decided(tmp_path, monkeypatch):
+    monkeypatch.delenv("SOTTO_DELIVERY_RUN_ID", raising=False)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
+    monkeypatch.setattr(bm.os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("busy")))
+    assert bm.claim("morning") is False

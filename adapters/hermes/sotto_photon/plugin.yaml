@@ -1,0 +1,5 @@
+name: photon-platform
+label: Sotto iMessage
+kind: platform
+version: 0.1.0
+description: Shared Sotto iMessage formatting and channel behavior, with owner-only policy in managed mode.

@@ -15,7 +15,8 @@ Two modes:
 Fixtures test **machinery**. The **Golden Corpus** (`run_golden.py`, below) tests **judgment** on the
 owner's real history — different instrument, same harness.
 
-Everything writes only under a temp sandbox; the harness never mutates repo files. Stdlib only.
+The offline fixture and tracking probes write only under temporary sandboxes and use the pack's
+Python dependencies.
 
 ## Layout
 
@@ -23,7 +24,8 @@ Everything writes only under a temp sandbox; the harness never mutates repo file
 evals/
   run_evals.py          the fixture harness (both modes) + the invariant checks
   run_golden.py         the Golden Corpus replay harness (§ Golden Corpus below)
-  LABELING.md           the owner's one-hour labeling runbook
+  replay_tracking.py    offline continuous month: current tracking vs the proposed contract
+  LABELING.md           optional maintainer judgment-evaluation runbook
   fixtures/
     rich_day.json       busy day: 6+ meetings, 20+ emails, messages, loops, birthday, group chat
     quiet_day.json      1 meeting, 3 routine emails — the critic-auto-skip regime
@@ -39,6 +41,7 @@ tests/
   test_evals.py         the same invariants under pytest (CI-by-default)
   test_golden_corpus.py  the pseudonymizer + builder, end to end on synthetic data
   test_run_golden.py     the replay harness + its refusals
+  test_replay_tracking.py  continuous tracking probe isolation, determinism and honest exit status
 ```
 
 ## Run it
@@ -54,6 +57,32 @@ python3 -m pytest tests/test_evals.py -q
 ```
 
 ## Fixtures — deterministic time
+
+### Continuous tracking-contract probe
+
+```bash
+python3 evals/replay_tracking.py
+python3 -m pytest tests/test_replay_tracking.py -q
+```
+
+This separate probe advances every day from 0 through 28 in one throwaway data directory per run,
+and reports persisted-state assertions at days 0, 1, 7, 15 and 28. It calls the real resolver, draft
+grader, reminder finalizer and reply handler with a fixed clock. The inputs are invented examples
+based on failure shapes from the September 4 investigation, not an exported or pseudonymized
+private corpus. It ignores inherited `SOTTO_DATA`, restores the environment and makes no network
+calls. No labeling session is needed.
+
+**Exit 1 means a proposed contract is unmet, and is currently expected.** The report lists each
+expected and observed result; it is a diagnostic, not a quality score. The pytest tests validate
+isolation/reporting, not implementation of the redesign. There is no legacy mode: seeding old rows
+without running a migration adds no migration assurance.
+The JSON report includes every expected/observed result and five persisted-state snapshots. It
+does not evaluate extraction quality, onboarding, actual brief/dashboard rendering, adapter reply
+IDs, or future migration. The reminder selection budget is bypassed to isolate the meaning of a
+delivered reminder. The full design and outstanding release gates live in the single
+[ROADMAP](../../docs/plans/ROADMAP.md#september-4-investigation-evidence-and-the-executable-baseline).
+
+### Single-day fixture clocks
 
 Fixtures never hard-code wall-clock dates. Timestamps are **relative tokens** resolved at load
 against a single base datetime (noon UTC "today", captured once), so a fixture produces the **same
@@ -177,3 +206,24 @@ absent from `RAILWAY.md`'s table (see CLAUDE.md § standing bars: *defaults matt
 | `SOTTO_LLM_STUB` | `_shared/lib/gemini.py` and every composer | Replaces the Gemini call with a canned response so the pipeline runs offline and deterministically. The whole `--deterministic` eval lane and most of `tests/` ride it. |
 | `SOTTO_JUDGE_MODEL` | `evals/run_golden.py` | Overrides the pinned LLM-judge model for a `--live` golden run. Pinning matters: judge drift is score drift. |
 | `SOTTO_CORPUS_KEY` | `tools/build_golden_corpus.py` | The hex key that pseudonymizes real identities into the corpus. Lives on the volume (`$SOTTO_DATA/corpus-keys/`), never in a checkout. |
+
+The optional browser label editor remains at `/app#labels`; it is a maintainer tool, absent from
+the main dashboard navigation. It is not setup or a recurring task for Sotto users.
+
+
+## Shared relevance judgment
+
+`python3 evals/run_relevance.py --live --output /tmp/relevance-results.json` evaluates the actual
+event classifier, digest review/selection, and native brief extraction against eight invented
+examples modeled on reported failures: an outstanding preschool waiver, a donation blast, VIP
+chatter, an unanswered invitation, and contrasting completed/accepted/vague/personal-commitment
+cases. These are authored fixtures, not an exported or pseudonymized inbox. Without `--live`, the
+command lists cases and explicitly reports that judgment was not evaluated; there is no fake
+accuracy score from stubbed responses.
+
+The probe pins the same clock for every surface and uses a temporary state directory, sends no messages, performs no learning or account
+writes, and uses the existing provider settings. It makes ten model calls (eight event judgments,
+one batched digest review, one brief extraction). It exits nonzero on any mismatch. Brief scoring
+checks the rendered attention sections, allowing substantial completed outcomes in Already Handled. The event
+counterexamples explicitly supply thread context: this tests judgment given evidence, not the
+completeness of realtime context gathering. It does not replace the broader private Golden Corpus.

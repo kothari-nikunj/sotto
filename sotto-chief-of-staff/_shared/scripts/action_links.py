@@ -17,7 +17,7 @@ URL, whatever the channel, so a decline is presented as text and approved by a h
 
 Every built link also leaves one row in $SOTTO_DATA/events/drafts.jsonl — the offered-drafts
 ledger, the left half of the draft→outcome matcher (_shared/scripts/draft_outcomes.py, which
-learn_preferences.py runs in every brief's Learn step). This module is the ONE place a draft
+runs directly in every brief's Learn step). This module is the ONE place a draft
 becomes tappable, which makes it the one honest place to record that a draft was offered. The
 ledger row is best-effort: a failed append never costs the link.
 """

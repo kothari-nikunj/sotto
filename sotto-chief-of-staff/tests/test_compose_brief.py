@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -32,7 +33,7 @@ def test_compose_with_injected_llm():
                 {"person_name": "Sarah", "facts": [{"fact": "CTO at Acme", "memory_type": "milestone", "confidence": 0.9}]}]},
         })
     out = cb.compose({"type": "morning", "window_hours": 24, "google": {}, "granola": {}, "local": {}}, llm=fake_llm)
-    assert out["brief_markdown"].startswith("# Brief")
+    assert out["brief_markdown"].startswith("# Good ") and "\n\n# Brief" in out["brief_markdown"]
     assert out["actions"][0]["contact_name"] == "Sarah"
     # contract keys always present even if the model omitted them
     assert "company_updates" in out["extracted_knowledge"]
@@ -45,7 +46,7 @@ def test_compose_with_legacy_two_arg_llm_stub():
         assert "Brief type: morning" in prompt
         return json.dumps({"brief_markdown": "# Legacy", "actions": []})
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm)
-    assert out["brief_markdown"] == "# Legacy"
+    assert _body(out["brief_markdown"]) == "# Legacy"
 
 
 # --- system/user split + maintainer-comment stripping (Sprint 1 #2) ------------
@@ -196,7 +197,7 @@ def test_cli_gmail_envelope_carries_truncation(tmp_path):
         capture_output=True, text=True,
         env={**os.environ, "SOTTO_LLM_STUB": str(stub), "SOTTO_DATA": str(tmp_path)})
     assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout)["brief_markdown"] == "# B"
+    assert _body(json.loads(out.stdout)["brief_markdown"]) == "# B"
     # the envelope was accepted: 1 email reached the pipeline (the inputs diag names it)
     assert "1 emails" in out.stderr
 
@@ -206,7 +207,7 @@ def test_stub_env_path(tmp_path, monkeypatch):
     p.write_text(json.dumps({"brief_markdown": "stubbed"}))
     monkeypatch.setenv("SOTTO_LLM_STUB", str(p))
     out = cb.compose({"type": "evening", "window_hours": 24, "google": {}, "granola": {}, "local": {}})
-    assert out["brief_markdown"] == "stubbed"
+    assert _body(out["brief_markdown"]) == "stubbed"
 
 
 # --- attendee research (Phase 3) ---------------------------------------------
@@ -475,7 +476,7 @@ def test_critic_and_revise_fixes_brief(monkeypatch):
                            "extracted_knowledge": {"person_updates": [], "company_updates": []}})
 
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
-    assert out["brief_markdown"] == "# Revised\n- Added Sarah"   # revise pass applied
+    assert _body(out["brief_markdown"]) == "# Revised\n- Added Sarah"   # revise pass applied
     assert out["_critic"]["actionable"] == 1
     assert calls["n"] == 3
 
@@ -489,7 +490,7 @@ def test_critic_passes_clean_brief_unchanged(monkeypatch):
         return json.dumps({"brief_markdown": "# Clean", "actions": []})
 
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
-    assert out["brief_markdown"] == "# Clean"        # no actionable patches → no revise
+    assert _body(out["brief_markdown"]) == "# Clean"        # no actionable patches → no revise
     assert out["_critic"]["actionable"] == 0
 
 
@@ -594,7 +595,7 @@ def test_critic_failure_never_blocks_delivery(monkeypatch):
         return json.dumps({"brief_markdown": "# Draft survives", "actions": []})
 
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
-    assert out["brief_markdown"] == "# Draft survives"
+    assert _body(out["brief_markdown"]) == "# Draft survives"
 
 
 def test_research_quality_gate_rereseaches_thin_graph_profile(monkeypatch):
@@ -944,15 +945,27 @@ def test_stale_sent_threads_become_waiting_on_debts_for_people_you_know(tmp_path
         _stale(tid="t-intro", to="Dana Roe <dana@acme.com>", email="dana@acme.com",
                subject="Intro: Dana <> Priya"),
         _stale(tid="t-thanks", to="Dana Roe <dana@acme.com>", email="dana@acme.com", snippet="thanks!"),
+        # a calendar RSVP your Gmail sent to the organizer is not a letter anybody answers
+        _stale(tid="t-rsvp", to="Team Acme <team@acme.com>", email="team@acme.com",
+               subject="Accepted: Morning Team Video Sync @ Tue Sep 8, 2026 9:30am - 10am (PDT) (Team Acme)",
+               snippet="Dana Roe has accepted this invitation. Morning Team Video Sync"),
+        _stale(tid="t-invite", to="Dana Roe <dana@acme.com>", email="dana@acme.com",
+               subject="Updated invitation: Board prep @ Wed Sep 9 (dana@acme.com)"),
+        # …but a chase the user WROTE with a calendar-looking word is still a letter
+        _stale(tid="t-reminder", to="Dana Roe <dana@acme.com>", email="dana@acme.com",
+               subject="Reminder: allocation numbers by Friday?"),
     ]}}
+    local["contacts"].append({"name": "Team Acme", "emails": ["team@acme.com"], "phones": []})
     norm = cb._normalize_local(inputs)
-    assert [t["threadId"] for t in norm["stale_threads"]] == ["t-victor"]
+    assert [t["threadId"] for t in norm["stale_threads"]] == ["t-victor", "t-reminder"]
     actions = cb._stale_debt_actions(norm, cb.build_contact_lookup(local["contacts"]))
-    a, = actions
+    assert [x["emailThreadId"] for x in actions] == ["t-victor", "t-reminder"]
+    a = actions[0]
     assert a["type"] == "waiting_on" and a["channel"] == "gmail"
     assert a["contactName"] == "Victor Yeung" and a["contactIdentifier"] == "victor@acme.com"
     assert a["emailThreadId"] == "t-victor" and a["created_at"] == "2026-08-27"
-    assert "hasn't answered" in a["contextSummary"] and "4 days" in a["contextSummary"]
+    assert a["contextSummary"] == 'Victor Yeung hasn\'t answered "Re: allocation"'
+    assert "4 days" in a["contextUrgencyReason"]       # the day count lives where it is live, not in frozen prose
     # …and the prompt names it as already-tracked information, not as a job for the model
     p = cb.build_prompt(cb._load_prompt(), inputs)
     assert "Emails you sent that nobody answered" in p and "do NOT emit an action" in p
@@ -960,8 +973,8 @@ def test_stale_sent_threads_become_waiting_on_debts_for_people_you_know(tmp_path
     tracked = dict(norm, action_ledger=[{"status": "waiting", "action_type": "waiting_on",
                                          "contact_name": "Victor Yeung", "source_thread_id": "t-victor",
                                          "created_at": "2026-08-27", "summary": "the allocation"}])
-    assert cb._stale_debt_actions(tracked) == []
-    assert "Emails you sent that nobody answered" not in cb._format_stale_threads(tracked)
+    assert [x["emailThreadId"] for x in cb._stale_debt_actions(tracked)] == ["t-reminder"]
+    assert "Re: allocation" not in cb._format_stale_threads(tracked)
 
 
 def test_minted_actions_never_displace_the_models_row_for_the_same_debt():
@@ -1012,31 +1025,9 @@ def test_a_meeting_you_declined_is_not_on_your_day_and_an_unanswered_invite_is_a
     assert "vc@fund.com" not in [x["email"] for x in cb.select_attendees_for_research(inputs)]
 
 
-def test_the_evening_asks_once_a_month_whether_to_mute_the_person_you_keep_dismissing(tmp_path, monkeypatch):
-    """Three dismissals is Sotto asking once whether to stop bringing it up. The learner's hint
-    used to wait for a tune-up conversation nobody starts; the evening's one question line carries
-    it, records the pending offer (a yes in the gateway runs preferences.py mute-person), and
-    never asks about the same person twice in a month."""
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    import retune_scan
-    monkeypatch.setattr(retune_scan, "scan", lambda: {"mute_suggestions": [
-        {"name": "Bob Lee", "reason": "you keep dismissing their items"}]})
-    out = cb._append_mute_offer({"brief_markdown": "# Evening\nquiet."},
-                                {"type": "evening", "google": {"userTimezone": "+00:00"}}, "2026-09-04")
-    assert "You keep dismissing Bob Lee's items — stop bringing them up?" in out["brief_markdown"]
-    import pending_offer
-    offer = pending_offer.get_offer()
-    assert offer["kind"] == "mute" and offer["person"] == "Bob Lee"
-    assert json.load(open(tmp_path / "proactive" / "mute_offers.json")) == {"bob lee": "2026-09-04"}
-    # the same person is not asked about again inside the cooldown — nor in the morning, nor when
-    # the evening already carries a standing-rule question
-    again = cb._append_mute_offer({"brief_markdown": "# Evening"}, {"type": "evening"}, "2026-09-20")
-    assert "stop bringing them up" not in again["brief_markdown"]
-    later = cb._append_mute_offer({"brief_markdown": "# Evening"}, {"type": "evening"}, "2026-10-10")
-    assert "stop bringing them up" in later["brief_markdown"]
-    assert "stop bringing" not in cb._append_mute_offer({"brief_markdown": "x"}, {"type": "morning"}, "2026-12-01")["brief_markdown"]
-    assert "stop bringing" not in cb._append_mute_offer(
-        {"brief_markdown": "x"}, {"type": "evening", "_procedure_offer": "never book Fridays"}, "2026-12-01")["brief_markdown"]
+
+
+
 
 
 def test_first_run_note_only_on_first_brief(tmp_path, monkeypatch):
@@ -1247,6 +1238,13 @@ def _iso_hours_ago(h):
             - datetime.timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _body(markdown: str) -> str:
+    """The brief WITHOUT its code-owned greeting line ("# Good morning — Saturday, September 6"):
+    what the model wrote, plus the code-appended blocks — which is what these tests pin."""
+    md = markdown or ""
+    return md.split("\n\n", 1)[1] if md.startswith("# Good ") and "\n\n" in md else md
+
+
 def _followup_capable_llm(seen, calls):
     def fake_llm(prompt, inputs, system=None, schema=None):
         if inputs.get("_followup"):
@@ -1279,7 +1277,7 @@ def test_evening_brief_merges_followup_context(tmp_path, monkeypatch):
     # ledger has no deadline and has never been chased, so it is NOT urgent — it is represented by
     # the one quiet count line, not by a row of its own (open-items contract — see
     # test_still_open_backstop_appends_dropped_ledger_items).
-    assert out["brief_markdown"].startswith("# Evening")
+    assert out["brief_markdown"].startswith("# Good ") and "\n\n# Evening" in out["brief_markdown"]
     assert "## Still open\n- 1 other open loop — see /app#loops" in out["brief_markdown"]
     assert "send the deck" not in out["brief_markdown"]
     p = seen["prompt"]
@@ -1315,7 +1313,7 @@ def test_evening_followup_failure_never_blocks_brief(monkeypatch, tmp_path):
               "granola": [{"title": "Sync", "date": _iso_hours_ago(1), "transcript": "t"}],
               "local": {}}
     out = cb.compose(inputs, llm=fake_llm)
-    assert out["brief_markdown"] == "# Evening survives"
+    assert _body(out["brief_markdown"]) == "# Evening survives"
 
 
 def test_evening_no_ended_meetings_adds_no_block(monkeypatch, tmp_path):
@@ -1325,7 +1323,7 @@ def test_evening_no_ended_meetings_adds_no_block(monkeypatch, tmp_path):
                      llm=_followup_capable_llm(seen, calls))
     assert calls["followup"] == 0                      # short-circuits before any LLM call
     assert "Today's Meeting Follow-Ups" not in seen["prompt"]
-    assert out["brief_markdown"] == "# Evening"
+    assert _body(out["brief_markdown"]) == "# Evening"
 
 
 # ── Already Nudged Today: the surfaced-ledger reader (root of the double-tell) ──
@@ -1508,7 +1506,7 @@ def test_validator_violations_feed_critic_and_force_revise(monkeypatch):
     assert "banned-phrase: 'reached out'" in seen["critic_prompt"]
     assert "missing-marker" in seen["critic_prompt"]
     # … and force the revise pass even though the critic itself found nothing
-    assert out["brief_markdown"] == fixed_brief
+    assert _body(out["brief_markdown"]) == fixed_brief
     assert out["_critic"]["actionable"] >= 2
 
 
@@ -1522,7 +1520,7 @@ def test_validator_never_blocks_delivery(monkeypatch):
         return json.dumps({"brief_markdown": bad_brief, "actions": []})
 
     out = cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
-    assert out["brief_markdown"] == bad_brief
+    assert _body(out["brief_markdown"]) == bad_brief
 
 
 # --- the open-items contract: critic retry, then the deterministic backstop ----
@@ -1664,7 +1662,7 @@ def test_dropped_loop_goes_to_the_critic_first(monkeypatch):
     # her stand (an identifier no source carried is refused, allowlist rule).
     out = cb.compose(_open_ledger_inputs(contact_identifier="p@x.com"), llm=fake_llm, critic=True)
     assert "dropped-open-loop" in seen["critic_prompt"] and "Priya Raman" in seen["critic_prompt"]
-    assert out["brief_markdown"] == fixed
+    assert _body(out["brief_markdown"]) == fixed
     assert "Still open" not in out["brief_markdown"]
 
 
@@ -1807,7 +1805,7 @@ def test_cli_attendee_research_envelope_accepted(tmp_path):
         capture_output=True, text=True,
         env={**os.environ, "SOTTO_LLM_STUB": str(stub), "SOTTO_DATA": str(tmp_path)})
     assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout)["brief_markdown"] == "# Real"
+    assert _body(json.loads(out.stdout)["brief_markdown"]) == "# Real"
 
 
 # ── --seed-snapshot: setup writes the sender snapshot the event funnel reads ────
@@ -2031,6 +2029,23 @@ def _receipt_llm(markdown=_RECEIPT_BRIEF):
     return fake_llm
 
 
+def test_the_brief_opens_with_the_time_of_day_and_the_date_in_your_zone():
+    """"Needs Attention Now" as the first words read cold (owner, Sep 6, 2026). The greeting is
+    code, a heading, keyed to the local HOUR: a morning brief the wake path composes after noon
+    says good afternoon, and the evening brief says good evening. The chat text carries it bold."""
+    from datetime import datetime, timezone
+    pin = lambda hour: {"type": "morning", "google": {"events": [], "userTimezone": "America/Los_Angeles"},
+                        "now": datetime(2026, 9, 6, hour, 40, tzinfo=timezone.utc).isoformat()}
+    assert cb._greeting_line(pin(14)) == "# Good morning — Sunday, September 6"      # 07:40 PDT
+    assert cb._greeting_line(pin(19)) == "# Good afternoon — Sunday, September 6"    # 12:40 PDT
+    assert cb._greeting_line(pin(1)) == "# Good evening — Saturday, September 5"     # 18:40 PDT, the day before
+    out = cb.compose(pin(14), llm=_receipt_llm())
+    assert out["brief_markdown"].startswith("# Good morning — Sunday, September 6\n\n")
+    assert out["brief_text"].startswith("*Good morning — Sunday, September 6*\n\n")
+    # idempotent: a second pass never stacks a second greeting
+    assert cb._prepend_greeting(out, pin(14))["brief_markdown"].count("# Good ") == 1
+
+
 def _evening(events=None, **extra):
     return {"type": "evening", "google": {"events": events or []}, "granola": [], "local": {}, **extra}
 
@@ -2059,13 +2074,21 @@ def test_evening_receipts_report_what_moved(monkeypatch, tmp_path):
                      llm=_receipt_llm())
     body = out["brief_markdown"]
     assert ("## What moved today\n"
-            "- Gave Maya a nudge about the contract (second ask).\n"
+            "- Reminded you to chase Maya about the contract (second reminder).\n"
             "- Closed 2 loops — Ron delivered the deck; the RSVP resolved.\n"
             "- Held 3 interruptions until a better moment.\n"
             "- Prepped 4 people for tomorrow.\n"
             "- Offered follow-ups after 2 meetings.\n") in body
-    # placement: after the Still open backstop's seam, before the Filtered section (the last one)
-    assert body.index("## Still open") < body.index("## What moved today") < body.index("## Filtered")
+    # Maya's loop was reminded today: it is reported ONCE, here — never again under Still open
+    # (the third mention of one debt in one brief, Sep 5, 2026)
+    assert "## Still open" not in body
+    # …but a MORNING brief prints no receipts, so it skips nothing: the same reminded loop still
+    # earns its Still open line there (a 06:15 chase, a 06:30 brief that forgot her)
+    morning = cb.compose({"type": "morning", "google": {"events": []}, "granola": [], "local": {}},
+                         llm=_receipt_llm())["brief_markdown"]
+    assert "## Still open" in morning and "Maya" in morning.split("## Still open", 1)[1]
+    # placement: at the Still open backstop's seam, before the Filtered section (the last one)
+    assert body.index("## What moved today") < body.index("## Filtered")
     assert "What moved today" in out["brief_text"]          # and it survives into the chat text
     # the refusal, stated as a test: no throughput anywhere in the block
     block = body.split("## What moved today")[1].split("## Filtered")[0]
@@ -2147,15 +2170,16 @@ def test_a_broken_record_costs_no_lines_and_no_brief(monkeypatch, tmp_path):
     (tmp_path / "events").mkdir()
     (tmp_path / "events" / "surfaced.jsonl").write_text("{not json\n")
     out = cb.compose(_evening(), llm=_receipt_llm())
-    assert out["brief_markdown"] == _RECEIPT_BRIEF
+    assert _body(out["brief_markdown"]) == _RECEIPT_BRIEF
     assert cb._receipt_lines(_evening(), today, "+00:00") == []
 
 
 def test_chase_ordinal_and_nameless_loops_read_as_plain_english():
+    # a delivered chase is a reminder to the user — it never says Sotto wrote to Maya
     assert cb._chase_clause({"contact_name": "Maya", "summary": "the contract.",
-                             "chased_count": 1}) == "Gave Maya a nudge about the contract (first ask)."
-    assert cb._chase_clause({"contact_name": "Maya"}) == "Gave Maya a nudge."
-    assert cb._chase_clause({"summary": "the contract"}) == "Sent a nudge about the contract."
+                             "chased_count": 1}) == "Reminded you to chase Maya about the contract (first reminder)."
+    assert cb._chase_clause({"contact_name": "Maya"}) == "Reminded you to chase Maya."
+    assert cb._chase_clause({"summary": "the contract"}) == "Reminded you about the contract."
     assert cb._chase_clause({}) == ""                       # nothing to name → no line
     assert cb._closed_clause({"summary": "the RSVP"}) == "the RSVP resolved"
     assert cb._closed_clause({"contact_name": "Ron", "resolution": "replied"}) == "you got back to Ron"
@@ -2218,7 +2242,7 @@ def test_an_up_to_date_or_unchecked_server_says_nothing(monkeypatch, tmp_path):
     _cache_file(tmp_path, "update_check.json", {"latest": "2026-08-07.bbbbbbb"})   # pre-upgrade file
     assert cb._update_notice_version() == ""
     out = cb.compose({"type": "morning", "google": {"events": []}, "local": {}}, llm=_receipt_llm())
-    assert out["brief_markdown"] == _RECEIPT_BRIEF
+    assert _body(out["brief_markdown"]) == _RECEIPT_BRIEF
     assert _marker(tmp_path) is None                               # nothing said, nothing recorded
 
 
@@ -2228,7 +2252,7 @@ def test_an_unreadable_update_cache_costs_nothing(monkeypatch, tmp_path):
     (tmp_path / "cache").mkdir()
     (tmp_path / "cache" / "update_check.json").write_text("{not json")
     out = cb.compose({"type": "morning", "google": {"events": []}, "local": {}}, llm=_receipt_llm())
-    assert out["brief_markdown"] == _RECEIPT_BRIEF
+    assert _body(out["brief_markdown"]) == _RECEIPT_BRIEF
 
 
 # --- the brief's three read-view fixes: snooze, the fold's receipts, the "+N more" cap ------------
@@ -2275,7 +2299,7 @@ def test_a_folded_rows_chase_is_reported_once(monkeypatch, tmp_path):
                   chased_count=1, last_chased_at=today, resolved_at=today)
     chased, closed = cb._ledger_receipts(today)
     assert [cb._chase_clause(e) for e in chased] == [
-        "Gave Maya Chen a nudge about the signed contract (first ask)."]
+        "Reminded you to chase Maya Chen about the signed contract (first reminder)."]
     assert closed == []
 
 
@@ -2463,9 +2487,67 @@ def test_snapshot_archive_accumulates_dated_copies_and_prunes(tmp_path):
         cb._save_local_snapshot({"imessage": [{"text": "later", "timestamp": "2026-08-25 18:00:00"}],
                                  "generated_at": "2026-08-25 18:00:00",
                                  "source_status": {"imessage": "ok"}})
-        names = sorted(p.name for p in arch.iterdir())
+        names = sorted(p.name for p in arch.glob("*.json"))
         assert names == ["2026-08-25.json"]                    # dated, deduped by day, pruned
         day = json.load(open(arch / "2026-08-25.json"))
         assert day["local"]["imessage"][0]["text"] == "later"  # last write of the day wins
     finally:
         del os.environ["SOTTO_DATA"]
+
+
+@pytest.mark.parametrize('bad', ['{}', '{"markdown":""}', '{"markdown":"  "}',
+                                 '{"markdown":42}', '[]', 'not JSON'])
+def test_empty_extraction_retries_full_sources_before_critic(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    calls = []
+    def llm(prompt, inputs, system=None, schema=None):
+        calls.append((prompt, system, schema))
+        assert not inputs.get('_critic') and not inputs.get('_revise')
+        return bad if len(calls) == 1 else json.dumps({'markdown': 'Nothing needs your attention today.'})
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert 'Nothing needs your attention today.' in out['brief_markdown']
+    assert set(calls[0][2]['required']) == {'markdown', 'actionItems', 'extractedKnowledge'}
+
+
+def test_repeated_empty_extraction_fails_without_critic_or_memory_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CRITIC', 'always')
+    calls = []
+    def llm(prompt, inputs, **kwargs):
+        assert not inputs.get('_critic') and not inputs.get('_revise')
+        calls.append(prompt)
+        return '{"markdown":""}'
+    with pytest.raises(RuntimeError, match='extraction failed twice'):
+        cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm, critic=True)
+    assert len(calls) == 2
+    assert not (tmp_path / 'briefs').exists()
+
+
+def test_revision_receives_original_calendar_and_conversation_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CRITIC', 'always')
+    source = 'VERIFIED SOURCE: Tuesday lunch at Noon Cafe. The later reply resolved the missed call.'
+    monkeypatch.setattr(cb, 'build_prompt', lambda *a: source)
+    def llm(prompt, inputs):
+        if inputs.get('_critic'):
+            return json.dumps({'score': 60, 'summary': 'missing meeting', 'patches': [
+                {'type': 'missing', 'detail': 'Restore the calendar', 'severity': 'moderate'}]})
+        if inputs.get('_revise'):
+            assert source in prompt
+            return json.dumps({'brief_markdown': 'Coming Up: Tuesday lunch at Noon Cafe.', 'actions': []})
+        return json.dumps({'brief_markdown': 'A valid but incomplete draft.', 'actions': []})
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm, critic=True)
+    assert 'Tuesday lunch at Noon Cafe.' in out['brief_markdown']
+
+
+def test_calendar_preview_keeps_last_meeting_and_quiet_line_is_time_neutral():
+    body = ('Nothing needs you this morning; inbox is clear and no loops are open.\n\n'
+            '**Coming Up**\n' + '\n'.join(f'- **{n}:00 PM** — Meeting {n}' for n in range(1, 6))
+            + '\n\n## ✅ Already Handled\nDone')
+    out = cb._finish_brief_presentation({'brief_markdown': body})
+    assert 'this morning' not in out['brief_markdown']
+    assert '5:00 PM' in out['brief_markdown']
+    assert out['brief_markdown'].count(cb.brief_validate.CALENDAR_PREVIEW_NOTE) == 1
+    assert not cb.brief_validate._check_coming_up_length(out['brief_markdown'])
+    assert cb._finish_brief_presentation(out) == out

@@ -74,31 +74,36 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 
 | File | Contains | Retention |
 |---|---|---|
-| `knowledge/last_local_snapshot.json` | **The complete raw Bridge payload** — every message, call, note, reminder, file and contact from the last pull | **Overwritten each brief, never auto-deleted.** The 24h TTL only stops it being *reused*, not *stored*. Delete it by hand or with `forget.py --snapshot` (below). |
+| `knowledge/last_local_snapshot.json` | The latest consent-filtered Bridge payload, with per-source observation times; a partial read may retain still-usable older rows | **Reconciled each brief, never auto-deleted.** The 24h TTL stops old source content being reused, not stored. Contacts retain the existing identity carry-forward exception for thin live reads. Disabled fields are excluded on read and the next save. Delete with `forget.py --snapshot`. |
 | `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted |
 | `knowledge/x_link_suggestions.json` | The X resolver's own notes about people the graph has no file for: metadata-only identity candidates too weak (or too conflicted) to link, and the negative results that stop tomorrow's brief re-asking X the same question | **Never auto-deleted** — bounded to 100 suggestions, and negatives self-prune at 90 days on each write. A negative never creates a person file; confirmation UI is a later phase |
 | `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
 | `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
-| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `<date>.<kind>.learned.json` · `.claim` · `.delivered` | Delivered briefs, which loops each named, the Learn step's receipt (which memory writers ran), and the per-day markers | **60 days** |
+| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `<date>.<kind>.learned.json` · `.claim` · `.delivered` | Composed brief archives, named loops, phased learning receipts and daily markers; an archive alone is not proof of delivery | **60 days** |
 | `briefs/<date>.<kind>.payload.json` | The staged wake payload a brief was built from | **7 days** |
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines, **and lines older than 90 days are dropped** |
-| `events/delivery.jsonl` | Whether each nudge actually landed | **90 days** |
+| `events/delivery.jsonl` | Run and transport outcomes, including accepted, failed, expired and superseded results; acceptance is not proof of reading | **90 days** |
 | `events/sends.jsonl` | One metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` — the hash of the exact bytes that left, never the bytes | **180 days** — the authorization trail, kept twice as long on purpose |
 | `events/drafts.jsonl` | Every draft Sotto offered you, **including its text** | **30 days** |
-| `events/outbox.json` | One row per message Sotto composed, **carrying its text only while that text might still have to be sent** | The words are dropped the moment the row closes (delivered, gave up, or aged out); the closed row — id, kind, attempts, reason — is pruned after 7 days |
-| `events/delivery-effects-<run>.json` | Run-scoped chase/handoff effects awaiting the host send result | Deleted immediately after that run succeeds or fails; a crashed run's leftover goes at **7 days** |
+| `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. Closed metadata lasts 7 days; unfinished acceptance or invalidation effects remain retryable until finalized. |
+| `events/delivery-effects-<run>.json` | Merged source/Calendar eligibility, original cutoff and delivery-dependent effects for one work run | Removed after the completed result reaches the outbox; retryable failures retain it. Abandoned staged files expire after **7 days**. |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
 | `style.json` | Verbatim samples of things **you** wrote | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, and the drafts-you-shipped bucket at its newest 20 per register); the sweep exempts it on that strength |
 | `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
 | `hermes/sessions/` | Hermes' own chat transcripts — one archived per day by the nightly session archive (which keeps transcripts; `/resume` reopens them), plus one per deploy | **Known gap:** Hermes' state is exempt from the sweep, and whether Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day |
+| `cache/brief-granola.json` | Gathered meeting notes plus their observation time | **1 day**; older than 30 minutes is disclosed when reused, and data older than 24 hours is not reused |
+| `events/work.sqlite3` (+ WAL/SHM) | Accepted jobs, leases and recoverable completed results | Raw payload/results removed on terminal transition; metadata and input ownership aliases expire after **7 days** |
+| `events/work-inputs/brief-*/` | Resumable brief inputs, artifacts and completion manifests | Raw current/prepared inputs removed after ancillary success; remaining staged files expire after **7 days** |
+| `config/source-state.json` | Bridge source status and observation time, without message bodies | Bounded current state; never swept |
+| `.sotto-volume.json` · `.sotto-runtime.lock` · `.sotto-recovery-hold.json` · `config/model-lease.json` | Adapter-owned volume identity, writer lock, restore hold and model lease metadata | Adapter lifecycle state; never swept |
 | `cache/research_<date>.json` | Attendee research render cache | 7 days, pruned by the research run |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect; never swept |
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |
 | `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them; never swept |
 | `proactive/<date>.json` | The watcher's once-per-day nudge dedup stamps | **30 days** |
-| `proactive/mute_offers.json` | One date per person the evening brief has asked you about muting | Its writer drops entries past the 30-day cooldown; bounded by the people you keep dismissing |
+| `proactive/mute_offers.json` | Legacy dates from the now-paused automatic mute offers | No current reader or writer; existing files remain on the volume |
 | `proactive/pending_offer.json` | The one standing question Sotto last asked you (it can name a person), plus `payload_sha256` when a yes to it would send or write — the hash of the offered content, never the content | Expires 180 min after it is written, at read |
 | `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
 | `dashboard_sessions.json` | Dashboard login sessions | Expire on idle; pruned on every read |
@@ -133,7 +138,7 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 | `--caches` | `cache/research_*.json`, `cache/calendar_today.json` — both rebuilt on the next run |
 | `--logs` | truncates `logs/compose_brief.log` (truncated, not unlinked: a running process holds it open) |
 | `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl` |
-| `--all` | every one of the above |
+| `--all` | every category above |
 
 **It never touches `knowledge/people/`, `knowledge/companies/` or `knowledge/continuity/`.** That is
 the memory — who someone is, what a company builds, what you still owe whom. Deleting *that* is a
@@ -183,3 +188,52 @@ Three things, none of which exist today: a local model with a large enough conte
 payload, a `compose_brief` path that targets it, and an honest quality comparison against the hosted
 models so you know what you are trading. Until all three exist, no configuration of Sotto keeps your
 message content on your machine, and this page will keep saying so.
+
+`preferences.json` retains its existing explicit block and historical inferred fields. Only the
+explicit instructions affect behavior. Chat and dashboard invoke `preferences.py`; Learn no longer
+rewrites this file. Historical fields are preserved, not migrated or exposed as active controls.
+
+### Progressive history and explicit feedback
+
+Historical pages are temporary process inputs, fetched only from connected/consented sources.
+Gmail pages include message bodies but no attachments; Bridge pages cover iMessage and WhatsApp.
+They use the existing native model route. Selected sourced facts join `knowledge/people/*.md`;
+raw history is not copied into a new archive or the live event queue. The first useful look uses
+the ordinary brief archive, with type `welcome` and the same 60-day retention.
+
+`knowledge/history-state.json` contains frozen-window bounds, cursors/counts and sanitized failure
+classes; `knowledge/dreamer.json` contains person IDs, hashes and review time. Neither contains raw
+message bodies. `knowledge/conflicts.json` retains reference pairs for at most 100 people. These
+small state files have no age sweep; delete them with the rest of the volume. Deleting progress
+causes connected history to be reviewed again, not erased. `config/onboarding.json` remembers that
+the first-use message was delivered; removing it can restart onboarding on a new installation.
+
+Explicit usefulness ratings join `outcomes.jsonl`, retained for 90 days by the existing sweep. They
+include an output reference, up to 900 characters of the rated excerpt and up to 900 characters of
+the user's explanation. Prompt readers use only the latest eight examples from the past 42 days.
+History-derived facts remain memory like other person facts: disabling a source stops new reads
+but does not erase previously captured person facts or writing samples.
+
+
+## Work recovery and source observations
+
+The shared source reader persists metadata in `config/source-state.json`: source status,
+observation time, without message bodies. Google coverage is carried in per-job source-result receipts. A successful empty read is an observation;
+a failed read is not evidence that prior events disappeared. Disabled sources are projected out of
+cached local inputs and memory selection in both supported deployment modes.
+
+`events/work.sqlite3` stores accepted work until a completed artifact enters the existing outbox.
+Pending work may contain the context needed to resume; terminal rows discard their payload/result,
+and metadata plus input-ownership aliases expire after seven days. The SQLite WAL is part of this
+store and must be backed up using SQLite's backup API, not copied in isolation while running.
+`events/work-inputs/brief-*/` holds resumable composition inputs and artifact manifests. Ancillary
+learning removes raw current/prepared inputs after success; the retention sweep removes old
+intermediates after seven days, matching the ancillary job deadline. The artifact carries its original source cutoff and used-source IDs. A retry does not move that cutoff forward, so later messages remain eligible for the next digest. Canonical knowledge and open loops retain their existing policy.
+
+The outbox deletes sent text after acceptance but keeps the minimum delivery effects until they
+finish. A provider message ID, target and acceptance time bind an active offer to its question.
+These receipts do not mean the user read or approved an action. Deferred sends are revalidated
+against current consent and relevant loop/Calendar state. No Cloud-only copy of the skills or
+personalization pipeline is introduced.
+
+The notes-cache lifetime is enforced by `retention.NOTES_CACHE_DAYS`; its reuse age is measured from the observation, not a later file rewrite. `forget.py --caches` currently covers the two paths listed above; the notes cache can also be deleted directly without deleting canonical meeting facts.

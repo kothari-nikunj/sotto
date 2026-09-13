@@ -108,7 +108,8 @@ def _run(api, args, timeout=60):
     r = subprocess.run([py, api, *args], capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"google_api {' '.join(args)} failed")
-    return json.loads(r.stdout or "null")
+    from google_cli import decode_output
+    return decode_output(r.stdout, args)
 
 
 def _ensure_google_deps():
@@ -260,7 +261,11 @@ def _token_path() -> str:
 
 
 def _gmail_service():
-    """A Gmail client on the host's existing credentials. Scopes are NOT passed (setup.py's own
+    return _google_service("gmail", "v1")
+
+
+def _google_service(api, version):
+    """A client on the host's existing credentials. Scopes are NOT passed (setup.py's own
     rule: the user may have granted a subset, and passing them makes refresh fail with
     invalid_scope)."""
     path = _token_path()
@@ -268,7 +273,7 @@ def _gmail_service():
         raise RuntimeError("Google isn't connected on this host (no google_token.json)")
     from google.oauth2.credentials import Credentials  # noqa: PLC0415
     from googleapiclient.discovery import build        # noqa: PLC0415
-    return build("gmail", "v1", credentials=Credentials.from_authorized_user_file(path),
+    return build(api, version, credentials=Credentials.from_authorized_user_file(path),
                  cache_discovery=False)
 
 
@@ -345,17 +350,21 @@ def _attachments_for(mids: list) -> dict:
     source speaks up."""
     if not mids or not _token_path():
         return {}
-    try:
-        service = _gmail_service()
-    except Exception as e:  # noqa: BLE001
-        _diag(f"[gather_google] attachments unavailable: {e}")
-        return {}
-
     def _one(mid):
+        # googleapiclient's httplib2 transport is not thread-safe. A shared client
+        # corrupted concurrent TLS reads in the first live Cloud gather (SIGSEGV).
+        # Each worker owns and closes its connection; cohort ordering stays unchanged.
+        service = None
         try:
+            service = _gmail_service()
             return mid, _fetch_attachments(service, mid)
         except Exception:  # noqa: BLE001
             return mid, []
+        finally:
+            if service is not None:
+                close = getattr(service, "close", None)
+                if callable(close):
+                    close()
 
     out = {}
     with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(mids))) as ex:
@@ -580,17 +589,58 @@ def gather_stale_sent(api, service=None, now=None) -> list:
     return stale_from_threads(rows, threads, now)
 
 
-def gather_calendar(api, back_days: int = 0):
+def gather_calendar(api, back_days: int = 0, service=None, observation=None):
     """Next 3 days, plus `back_days` of history — the daily gather looks only forward; the Golden
     Corpus backfill (--window-days) needs the meetings that already happened. History comes in
     CAL_SLICE_DAYS windows deduped by id: the calendar CLI pages at ~25 events per list."""
+    from calendar_context import meeting_events
+
     now = datetime.datetime.now(datetime.timezone.utc)
     end = now + datetime.timedelta(days=3)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
+    if observation is not None:
+        observation.update(coverage={"since": (now - datetime.timedelta(days=max(0, back_days))).strftime(fmt),
+                                     "until": end.strftime(fmt)}, complete=False)
+    # Hermes' list command drops attendees/RSVPs and does not follow nextPageToken.
+    # Use the same granted credentials as attachments, keeping Google's complete event
+    # shape through our existing normalizer. The CLI remains for hosts without that token.
+    if service is not None or _token_path():
+        owned = service is None
+        service = service if service is not None else _google_service('calendar', 'v3')
+        out, seen, tokens, page = [], set(), set(), None
+        try:
+            for _ in range(20):
+                params = {'calendarId': 'primary',
+                          'timeMin': (now - datetime.timedelta(days=max(0, back_days))).strftime(fmt),
+                          'timeMax': end.strftime(fmt), 'singleEvents': True,
+                          'orderBy': 'startTime', 'maxResults': 250}
+                if page:
+                    params['pageToken'] = page
+                result = service.events().list(**params).execute()
+                for raw in result.get('items', []):
+                    if raw.get('status') == 'cancelled':
+                        continue
+                    event = normalize_event(raw)
+                    key = str(event.get('id') or '') or json.dumps(event, sort_keys=True)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(event)
+                page = result.get('nextPageToken')
+                if not page:
+                    if observation is not None:
+                        observation["complete"] = True
+                    return meeting_events(out)
+                if page in tokens:
+                    raise RuntimeError('Calendar pagination repeated a page token')
+                tokens.add(page)
+            raise RuntimeError('Calendar window exceeds the pagination safety limit')
+        finally:
+            if owned:
+                service.close()
     if back_days <= 0:
         items = _as_list(_run(api, ["calendar", "list", "--start", now.strftime(fmt),
                                     "--end", end.strftime(fmt)]))
-        return [normalize_event(e) for e in items]
+        return meeting_events([normalize_event(e) for e in items])
     out, seen = [], set()
     lo = now - datetime.timedelta(days=back_days)
     while lo < end:
@@ -604,7 +654,7 @@ def gather_calendar(api, back_days: int = 0):
             seen.add(key)
             out.append(e)
         lo = hi
-    return out
+    return meeting_events(out)
 
 
 def _attendee_emails_from_file(path: str) -> list:
@@ -710,10 +760,60 @@ def normalize_mcp(gmail_raw_path, cal_raw_path, sent_raw_path=None):
     return merge_sent(emails, sent), events
 
 
+def history_page(since: int, until: int, page_token: str = '', limit: int = 100, service=None, now=None):
+    """Frozen-window Gmail history through the existing credential builder; resume real API pages.
+
+    Both directions are searched together. No attachments or writes. A failed get fails the page,
+    so the caller never advances its checkpoint over missing messages.
+    """
+    from source_context import allowed
+    if not allowed('gmail'):
+        raise RuntimeError('Gmail history is not enabled')
+    epoch = int((now or datetime.datetime.now(datetime.timezone.utc)).timestamp())
+    if (not all(isinstance(v, int) and not isinstance(v, bool) for v in (since, until, limit))
+            or not 1 <= limit <= 100 or since > until or since < epoch - 366*86400 or until > epoch + 60):
+        raise ValueError('invalid Gmail history window')
+    own_service = service is None
+    service = service or _gmail_service()
+    def plain(part):
+        if part.get('filename'):
+            return ''
+        if part.get('mimeType') == 'text/plain':
+            raw = part.get('body', {}).get('data', '')
+            return base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)).decode('utf-8', errors='replace') if raw else ''
+        return '\n'.join(filter(None, (plain(p) for p in part.get('parts', []))))
+    try:
+        params = {'userId': 'me', 'q': f'after:{since} before:{until + 1}', 'maxResults': limit}
+        if page_token:
+            params['pageToken'] = page_token
+        page = service.users().messages().list(**params).execute()
+        messages = []
+        for item in page.get('messages', []):
+            full = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
+            payload = full.get('payload', {})
+            headers = {h['name'].lower(): h.get('value', '') for h in payload.get('headers', [])}
+            at = datetime.datetime.fromtimestamp(int(full['internalDate']) / 1000, datetime.timezone.utc)
+            if not since <= at.timestamp() < until + 1:
+                continue
+            full.update({'from': headers.get('from', ''), 'to': headers.get('to', ''),
+                         'subject': headers.get('subject', ''), 'body': plain(payload)[:8000],
+                         'date': at.isoformat()})
+            messages.append(normalize_email(full, full))
+        if not allowed('gmail'):
+            raise RuntimeError('Gmail consent changed during history read')
+        return {'source': 'gmail', 'status': 'ok', 'rows': messages,
+                'next_cursor': page.get('nextPageToken'), 'complete': not page.get('nextPageToken'),
+                'since': since, 'until': until}
+    finally:
+        if own_service:
+            service.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gmail-out", default="/tmp/sotto_gmail.json")
     ap.add_argument("--cal-out", default="/tmp/sotto_cal.json")
+    ap.add_argument("--source-results-out", help="write per-source status/completeness receipts beside legacy arrays")
     ap.add_argument("--max", type=int, default=40)
     ap.add_argument("--bodies", type=int, default=12)
     ap.add_argument("--window-days", dest="window_days", type=int, default=1,
@@ -743,6 +843,16 @@ def main():
     ap.add_argument("--comms-out", dest="comms_out", default="/tmp/sotto_attendee_comms.json",
                     help="output file for --attendee-comms (default /tmp/sotto_attendee_comms.json)")
     a = ap.parse_args()
+    from source_context import allowed, source_result
+    import jsonstore
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    source_results = {source: source_result('skipped' if skipped else 'unavailable', observed_at=observed_at)
+                      for source, skipped in (('gmail', a.skip_gmail), ('calendar', a.skip_calendar))}
+
+    def write_source_results():
+        if a.source_results_out:
+            jsonstore.write_atomic(a.source_results_out, source_results)
+
 
     if a.ensure_deps:
         # Setup-time heal: pay the (up to 240s) pip install during onboarding, so the first brief's
@@ -778,6 +888,17 @@ def main():
 
     if a.from_mcp_gmail or a.from_mcp_calendar or a.from_mcp_sent:
         emails, events = normalize_mcp(a.from_mcp_gmail, a.from_mcp_calendar, a.from_mcp_sent)
+        # An arbitrary MCP dump has no verified pagination/window contract. It remains useful
+        # context but never proves an absent event was cancelled.
+        for source, supplied in (('gmail', a.from_mcp_gmail or a.from_mcp_sent), ('calendar', a.from_mcp_calendar)):
+            source_results[source] = source_result('partial' if supplied else 'skipped')
+            if not allowed(source):
+                source_results[source] = source_result('disabled')
+        if not allowed('gmail'):
+            emails = []
+        if not allowed('calendar'):
+            events = []
+        write_source_results()
         with open(a.gmail_out, "w", encoding="utf-8") as f:
             json.dump(emails, f)
         with open(a.cal_out, "w", encoding="utf-8") as f:
@@ -799,11 +920,16 @@ def main():
     else:
         _diag(f"[gather_google] using {api}")
         _ensure_google_deps()   # guarantee googleapiclient in THIS interpreter before any fetch
-        if not a.skip_gmail:
+        if not a.skip_gmail and allowed('gmail'):
             try:
                 emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
+                capped = a.max > 0 and len(emails) >= a.max
+                source_results['gmail'] = source_result('partial' if capped else 'ok', complete=not capped,
+                    since=(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.window_days)).isoformat(),
+                    until=observed_at)
             except Exception as e:  # noqa: BLE001
                 err = f"gmail: {e}"
+                source_results["gmail"] = source_result("unavailable", error=type(e).__name__)
             # Sent lane is exhaust, not brief content — its own try so a failure here can never
             # cost the brief its inbox.
             if not a.skip_sent and a.sent_max > 0:
@@ -818,11 +944,26 @@ def main():
                     stale = gather_stale_sent(api)
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; stale: {e}") if err else f"stale: {e}"
-        if not a.skip_calendar:
+        if not a.skip_calendar and allowed('calendar'):
             try:
-                events = gather_calendar(api, back_days=max(0, a.window_days - 1))
+                observation = {}
+                events = gather_calendar(api, back_days=max(0, a.window_days - 1), observation=observation)
+                complete = observation.get('complete') is True
+                source_results['calendar'] = source_result('ok' if complete else 'partial', complete=complete,
+                    **observation.get('coverage', {}))
             except Exception as e:  # noqa: BLE001
                 err = (err + f"; calendar: {e}") if err else f"calendar: {e}"
+                source_results["calendar"] = source_result("unavailable", error=type(e).__name__)
+
+    # Recheck grants after I/O; a concurrent revocation must also discard staged results.
+    for source in ('gmail', 'calendar'):
+        if not allowed(source):
+            source_results[source] = source_result('disabled')
+            if source == 'gmail':
+                emails, sent, stale = [], [], []
+            else:
+                events = []
+    write_source_results()
 
     # Email-window honesty: the search returning EXACTLY the cap means the 24h window almost
     # certainly held more — never silently truncate. Wrap the array in a metadata envelope

@@ -1029,7 +1029,7 @@ def _audit_writes(root):
 
 WRITE_REQS = (("/api/people/sarah-chen/facts", {"op": "archive", "fact_id": "f_aaa"}),
               ("/api/loops", {"anchor_key": "thread:abc", "op": "resolve"}),
-              ("/api/prefs", {"op": "delete", "list": "edit_heavy", "value": "Bob|reply"}),
+              ("/api/prefs", {"op": "delete", "list": "mute_people", "value": "Uncle Bob"}),
               ("/api/master", {"op": "set", "section": "About", "text": "a line"}))
 
 
@@ -1253,82 +1253,8 @@ def test_post_loops_resolve_and_dismiss(tmp_path):
         srv.shutdown()
 
 
-def test_post_prefs_deletes_rules_across_the_real_shape(tmp_path):
-    m, srv, base = _server(tmp_path)
-    _fixtures(str(tmp_path))
-    prefs_path = os.path.join(str(tmp_path), "preferences.json")
-    _write(prefs_path, json.dumps(REAL_PREFS))
-    try:
-        _, authed = _login_with_csrf(base)
-        # explicit list rule
-        code, body, _ = _post_json(base, "/api/prefs",
-                                   {"op": "delete", "list": "mute_senders",
-                                    "value": "@news.acme.com"}, headers=authed)
-        assert code == 200
-        prefs = json.loads(body)
-        assert prefs["explicit"]["mute_senders"] == []
-        assert prefs["explicit"]["mute_people"] == ["Uncle Bob"]      # untouched sibling
-        # learned top-level list rule
-        prefs = json.loads(_post_json(base, "/api/prefs",
-                                      {"op": "delete", "list": "deprioritization_hints",
-                                       "value": "Bob|reply"}, headers=authed)[1])
-        assert prefs["deprioritization_hints"] == ["Newsletter|digest"]
-        # approval_defaults dict rule (deleted by key)
-        prefs = json.loads(_post_json(base, "/api/prefs",
-                                      {"op": "delete", "list": "approval_defaults",
-                                       "value": "Sarah Chen|reply"}, headers=authed)[1])
-        assert prefs["approval_defaults"] == {}
-        # analytics/version never touched; the response IS the file (atomic 0600 write)
-        assert prefs["analytics"] == REAL_PREFS["analytics"] and prefs["version"] == 1
-        on_disk = json.load(open(prefs_path))
-        assert on_disk == prefs
-        assert (os.stat(prefs_path).st_mode & 0o777) == 0o600
-        # validation: toggle unsupported (no enabled flag in the shape), whitelisted lists only,
-        # empty value rejected, absent value → 404
-        for body, want in (({"op": "toggle", "list": "edit_heavy", "value": "Bob|reply"}, 400),
-                           ({"op": "delete", "list": "analytics", "value": "x"}, 400),
-                           ({"op": "delete", "list": "edit_heavy", "value": "  "}, 400),
-                           ({"op": "delete", "list": "edit_heavy", "value": "zzz"}, 404)):
-            assert _post_json(base, "/api/prefs", body, headers=authed)[0] == want, body
-        writes = _audit_writes(tmp_path)
-        assert [w["target"] for w in writes] == ["mute_senders:@news.acme.com",
-                                                "deprioritization_hints:Bob|reply",
-                                                "approval_defaults:Sarah Chen|reply"]
-        assert all(w["endpoint"] == "/api/prefs" and w["op"] == "delete" for w in writes)
-    finally:
-        srv.shutdown()
 
 
-def test_post_prefs_tombstones_recomputed_rules_only(tmp_path):
-    """A rule you delete stays deleted: deleting from a RECOMPUTED list (the learner rebuilds
-    deprioritization_hints / edit_heavy / approval_defaults from outcomes.jsonl every morning) also
-    records {list, value} under the top-level `suppressed`, which learn_preferences.py filters out.
-    The `explicit` block needs no tombstone — the learner carries it forward verbatim."""
-    m, srv, base = _server(tmp_path)
-    _fixtures(str(tmp_path))
-    prefs_path = os.path.join(str(tmp_path), "preferences.json")
-    _write(prefs_path, json.dumps(REAL_PREFS))
-    try:
-        _, authed = _login_with_csrf(base)
-        prefs = json.loads(_post_json(base, "/api/prefs",
-                                      {"op": "delete", "list": "mute_senders",
-                                       "value": "@news.acme.com"}, headers=authed)[1])
-        assert "suppressed" not in prefs                       # explicit → no tombstone needed
-        prefs = json.loads(_post_json(base, "/api/prefs",
-                                      {"op": "delete", "list": "deprioritization_hints",
-                                       "value": "Bob|reply"}, headers=authed)[1])
-        prefs = json.loads(_post_json(base, "/api/prefs",
-                                      {"op": "delete", "list": "approval_defaults",
-                                       "value": "Sarah Chen|reply"}, headers=authed)[1])
-        assert prefs["suppressed"] == [
-            {"list": "deprioritization_hints", "value": "Bob|reply"},
-            {"list": "approval_defaults", "value": "Sarah Chen|reply"}]
-        assert json.load(open(prefs_path))["suppressed"] == prefs["suppressed"]
-        # top level, NOT inside `explicit`: preferences.py's _save() reshapes that block to its own
-        # LISTS/SCALARS and would silently drop an extra key.
-        assert "suppressed" not in prefs["explicit"]
-    finally:
-        srv.shutdown()
 
 
 # ── Parser unit coverage (the tolerant stdlib frontmatter reader) ────────────────────────────────
@@ -1359,11 +1285,12 @@ def test_frontmatter_parser_tolerates_the_exhaust_shapes(tmp_path):
 # every time).
 
 FAKE_GATHER = """\
-import argparse, json
+import argparse, json, datetime
 ap = argparse.ArgumentParser()
 ap.add_argument("--skip-gmail", action="store_true")
 ap.add_argument("--cal-out")
 ap.add_argument("--gmail-out")
+ap.add_argument("--source-results-out")
 a, extra = ap.parse_known_args()
 assert a.skip_gmail and a.cal_out and not extra
 with open({count!r}, "a") as f:
@@ -1374,6 +1301,9 @@ with open(a.cal_out, "w") as f:
     f.write(payload)
 with open(a.gmail_out, "w") as f:              # gather always writes both files
     f.write("[]")
+with open(a.source_results_out, "w") as f:
+    json.dump(dict(calendar=dict(status="ok", complete=True,
+        observed_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))), f)
 """
 
 FAKE_GATHER_CRASH = "import sys\nsys.exit(1)\n"   # dies before writing any output file
@@ -1475,7 +1405,8 @@ def test_api_calendar_degrades_quietly(tmp_path):
         _stub_gather(m, tmp_path, source=FAKE_GATHER_CRASH)
         m._find_sotto_script = lambda *rel: os.path.join(str(tmp_path), "fake_gather_google.py")
         cal = json.loads(_get(base, "/api/calendar", headers=cookie)[1])
-        assert cal["events"] == [] and cal["cached"] is False and "unavailable" not in cal
+        assert cal["events"] == [] and cal["cached"] is False and cal["unavailable"] is True
+        assert cal["generated_at"] == ""  # failed observation is never stamped fresh
         cal2 = json.loads(_get(base, "/api/calendar", headers=cookie)[1])
         assert cal2["cached"] is True
     finally:
@@ -1766,7 +1697,7 @@ def test_calendar_refresh_file_rides_the_dashboard_s_fetch(tmp_path):
         assert data["events"] == [{"summary": "Board sync",
                                    "start": f"{today}T09:00:00-07:00",
                                    "end": f"{today}T10:00:00-07:00",
-                                   "attendees": 2, "all_day": False}]
+                                   "attendees": 2, "all_day": False, "id": "e1"}]
         assert "sarah@acme.com" not in json.dumps(data)
         # and the reverse direction: a thread refresh warms the endpoint
         m.CALCACHE._CAL_CACHE.update({"ts": 0.0, "value": None})
@@ -2167,7 +2098,7 @@ def test_api_runs_surfaces_what_the_channel_has_not_acknowledged(tmp_path):
     try:
         cookie = _login(base)
         assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
-            "pending": 0, "failed": 0}
+            "pending": 0, "failed": 0, "effects_pending": 0, "effects_failed": 0}
         _write(os.path.join(str(tmp_path), "events", "outbox.json"), json.dumps({"rows": [
             {"id": "a" * 16, "kind": "brief", "created_at": time.time(), "day": "2026-08-28",
              "attempts": 2, "next_at": 0, "last_error": "gateway offline", "status": "pending",
@@ -2184,11 +2115,11 @@ def test_api_runs_surfaces_what_the_channel_has_not_acknowledged(tmp_path):
         ]}))
         # delivered and expired are closed business; only what is owed and what was lost show
         assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
-            "pending": 2, "failed": 1}
+            "pending": 2, "failed": 1, "effects_pending": 0, "effects_failed": 0}
         # an unreadable outbox degrades to zeroes — a stat line is never worth a 500
         _write(os.path.join(str(tmp_path), "events", "outbox.json"), "{not json")
         assert json.loads(_get(base, "/api/runs", headers=cookie)[1])["outbox"] == {
-            "pending": 0, "failed": 0}
+            "pending": 0, "failed": 0, "effects_pending": 0, "effects_failed": 0}
     finally:
         srv.shutdown()
 
@@ -2289,6 +2220,11 @@ def test_post_prefs_add_rides_the_preferences_cli_and_only_for_stated_lists(tmp_
                           headers=authed)[0] == 200
         after = json.load(open(os.path.join(str(tmp_path), "preferences.json")))
         assert after["explicit"]["vip_people"] == []
+        # a delete of a value that is not there (a stale second tab, a typo) is 404 — and never an
+        # audit row for a write that did not happen
+        for absent in ({"op": "delete", "list": "vip_people", "value": "Sarah Chen"},
+                       {"op": "delete", "list": "mute_people", "value": "zzz"}):
+            assert _post_json(base, "/api/prefs", absent, headers=authed)[0] == 404, absent
         assert [w["op"] for w in _audit_writes(tmp_path)] == ["add", "add", "delete"]
     finally:
         srv.shutdown()
@@ -2524,5 +2460,30 @@ def test_labels_page_reads_and_writes_the_golden_labels(tmp_path):
         assert code == 200
         with open(os.path.join(corp, "labels.yaml"), encoding="utf-8") as f:
             assert yaml.safe_load(f)["reviewed"] is True
+    finally:
+        srv.shutdown()
+
+
+def test_prefs_edit_only_stated_rules_and_preserve_history(tmp_path):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    prefs_path = os.path.join(str(tmp_path), "preferences.json")
+    _write(prefs_path, json.dumps(REAL_PREFS))
+    try:
+        _, authed = _login_with_csrf(base)
+        for lst in ("deprioritization_hints", "approval_defaults", "edit_heavy"):
+            assert _post_json(base, "/api/prefs", {"op": "delete", "list": lst,
+                              "value": "Bob|reply"}, headers=authed)[0] == 400
+        for lst, value in (("mute_senders", "@news.acme.com"), ("tone_notes", "keep it terse")):
+            code, body, _ = _post_json(base, "/api/prefs", {"op": "delete", "list": lst,
+                                      "value": value}, headers=authed)
+            assert code == 200, body
+            assert json.loads(body)["explicit"][lst] == []
+        persisted = json.load(open(prefs_path))
+        assert persisted["explicit"]["mute_people"] == ["Uncle Bob"]
+        assert {k:v for k,v in persisted.items() if k != "explicit"} == {
+            k:v for k,v in REAL_PREFS.items() if k != "explicit"}
+        assert "suppressed" not in persisted
+        assert (os.stat(prefs_path).st_mode & 0o777) == 0o600
     finally:
         srv.shutdown()

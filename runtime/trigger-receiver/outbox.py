@@ -19,12 +19,11 @@ the midday digest) reaches the channel through it, because every one of them is 
 `_spawn_and_deliver` and delivered by that function. So the outbox wraps exactly that call:
 enqueue BEFORE the first send attempt, transition only on the channel's ack. One writer, one file.
 
-WHAT "THE CHANNEL ACKNOWLEDGES" MEANS TODAY, honestly. The strongest ack available at this seam is
-`hermes send` exiting 0 — the CLI's own report that it handed the message to the platform. That is
-weaker than a gateway send-API returning a message id, and it is what exists; when Photon (or any
-channel with a real receipt) lands, `HOOKS["send"]` is the one function to strengthen and every
-lane inherits it. Everything upstream of the send — a spawned run exiting 0 — is NOT an ack and is
-not treated as one.
+WHAT THE CHANNEL ACKNOWLEDGES. The shared Hermes adapter requires structured success and a
+provider message ID. CLI exit zero alone is insufficient. The outbox retains this acceptance
+receipt, then applies the delivery effects. Acceptance does not prove device arrival or reading;
+a spawned model run exiting zero says nothing about delivery. Failed effects retry five times
+without sending the message again, then quarantine with their recovery evidence retained.
 
 WHERE THE CHANNEL-HEALTH GATE STAYS. `receiver._delivery_channel_ready` is an on-disk probe (are
 there WhatsApp creds?), and by its own docstring it cannot tell a live channel from a dead one. It
@@ -40,8 +39,9 @@ THE ONE THING IT CANNOT PROMISE. If the process dies in the window between the c
 message and this module recording that it did, the row is still pending and the next drain sends it
 again. The attempt is charged BEFORE the send precisely so that window is bounded by
 `MAX_ATTEMPTS` rather than unbounded — a duplicate brief is a nuisance, a silently lost one is the
-failure this module exists to end. Every non-crash path is exactly-once: the transitions run inside
-`json_transaction`'s locked read-modify-write, so two drains cannot both deliver one row.
+failure this module exists to end. Concurrent drains are serialized within the tenant runtime, and state transitions use
+`json_transaction`'s locked read-modify-write. Provider timeouts can still have unknown acceptance;
+this is bounded retry with duplicate suppression, not a universal exactly-once guarantee.
 
 THE DELIVER-ONCE GATE IS MACHINERY HERE, NOT A PROMPT (Aug 30, 2026). The evening brief went out
 twice — the cron lane claimed `briefs/<day>.evening.delivered` at 17:34 and delivered, and the
@@ -61,7 +61,8 @@ invented here:
     release valve refuses to promote a held nudge past (`triage_event.VALVE_MAX_AGE_MIN`). A
     "meeting in 10 minutes" ping that arrives an hour late is worse than silence, so it is
     ledgered `expired` and never sent.
-  * a **brief** (morning, evening, the weekly pulse) retries until the end of its LOCAL day and
+  * a **brief** retries until its explicit deadline (scheduled daily briefs: due time plus four
+    hours), bounded by the end of its LOCAL day, and
     then `failed` — visibly, because a day with no brief is something you must be told about.
   * the **digest** retries until the end of its local day too, then `expired` — that day ends
     before the next digest window opens at 12:30, and tomorrow's digest supersedes it.
@@ -70,17 +71,17 @@ MAX_ATTEMPTS is the backstop underneath all three, not a fourth rule: at the cap
 full day of trying, longer than any kind's expiry, so in practice expiry is what ends a row and this
 only catches one whose clock stopped moving.
 
-WHAT IT KEEPS, AND FOR HOW LONG. A row carries the message's text only while that text might still
-have to be sent: `_close` takes the payload out of the file at the moment the row goes terminal, so
-what remains is the id, the kind, the attempt count and the reason. Keeping a delivered brief's
-words on the volume for a week would be exactly the situational storage the standing bars forbid.
-The closed row itself is pruned after RETENTION_SECS, which is what keeps "what failed?" answerable.
+WHAT IT KEEPS, AND FOR HOW LONG. Message text is removed when a row becomes terminal.
+Delivered rows retain provider receipts and replayable effects until those effects settle;
+invalidated rows retain only the replacement-enqueue intent until it succeeds. Closed rows are
+pruned after RETENTION_SECS, except unfinished effects. The pre-delivery work queue separately
+retains composed results for its bounded recovery period.
 
 Loaded by receiver.py via importlib (the relay/connectors/dashboard/calcache pattern); the receiver
 wires HOOKS — late-bound lambdas over ITS globals — so this module never imports the receiver and
 stays import-safe on its own. Stdlib only.
 
-Named constants, not knobs (defaults matter — see CLAUDE.md): MAX_ATTEMPTS, BACKOFF_BASE_SECS,
+Named constants, not knobs (defaults matter — see CLAUDE.md): MAX_ATTEMPTS, MAX_EFFECT_ATTEMPTS, BACKOFF_BASE_SECS,
 BACKOFF_MAX_SECS, DRAIN_INTERVAL_SECS, NUDGE_MAX_AGE_MIN, RETENTION_SECS. The only env var is
 SOTTO_OUTBOX=0, which turns the retry heartbeat off (the enqueue/ack path stays, so nothing is ever
 sent unrecorded).
@@ -124,6 +125,8 @@ HOOKS = {
     # marker's path AND which labels have one (the pulse and the digest do not, and it answers
     # "send" for them), because that path already has exactly one owner and it is not this module.
     "brief_gate": _unwired("brief_gate"),
+    "valid": lambda payload: True,
+    "on_invalid": lambda payload: None,
 }
 
 # ── The constants (this module is their one writer) ──────────────────────────────────────────────
@@ -146,6 +149,7 @@ TERMINAL = (STATUS_DELIVERED, STATUS_FAILED, STATUS_EXPIRED, STATUS_SUPERSEDED)
 GATE_SEND = "send"
 GATE_SUPERSEDED = "superseded"
 GATE_NOT_A_BRIEF = "not_a_brief"     # a brief-kind body with no composed brief behind it
+GATE_RETRY = "retry"                 # the marker's lock is held elsewhere: ask again next pass
 NOT_A_BRIEF_DETAIL = ("no composed brief on the volume for today — the run never ran the composer, "
                       "so this text is not the brief and does not claim the day")
 SUPERSEDED_DETAIL = ("today's brief was already delivered by the other lane — this copy was "
@@ -158,6 +162,7 @@ DRAIN_INTERVAL_SECS = 60      # its own beat, not the valve's: a brief must not 
 # the capped backoff — longer than the longest expiry any kind has. It exists so a row whose day
 # never seems to end (a clock jump, a stuck timezone) still stops, loudly, instead of forever.
 MAX_ATTEMPTS = 96
+MAX_EFFECT_ATTEMPTS = 5       # accepted messages never resend; broken effects quarantine after five tries
 # MUST equal triage_event.VALVE_MAX_AGE_MIN — the funnel's own "a held nudge this old is not worth
 # promoting" number. Copy-plus-guard, exactly like keys.py and the dashboard's mirror of the same
 # constant: tests/test_docs_drift.py fails the suite if the two ever disagree.
@@ -226,7 +231,7 @@ def _prune(rows: list, now: float) -> list:
     """Terminal rows older than RETENTION_SECS leave; pending rows never do (only a terminal
     transition may end a row's life — that is the whole promise)."""
     return [r for r in rows
-            if r.get("status") not in TERMINAL
+            if r.get("status") not in TERMINAL or r.get("effects_pending")
             or (now - float(r.get("created_at") or 0)) <= RETENTION_SECS]
 
 
@@ -253,6 +258,10 @@ def _close(row: dict) -> dict:
 
 def _expiry(row: dict, now: float, today: str):
     """(terminal status, one-sentence reason) when this row has aged out, else None."""
+    payload = row.get('payload') or {}
+    valid_until = payload.get('valid_until')
+    if valid_until is not None and now >= float(valid_until):
+        return STATUS_EXPIRED, 'the useful delivery window has ended'
     kind = row.get("kind")
     if kind == KIND_NUDGE:
         age = now - float(row.get("created_at") or 0)
@@ -278,7 +287,8 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
         row = _find(rows, key)
         if row is None:
             row = {"id": key, "kind": kind, "created_at": now, "day": today, "attempts": 0,
-                   "next_at": now, "last_error": "", "status": STATUS_PENDING, "payload": payload}
+                   "next_at": now, "last_error": "", "status": STATUS_PENDING, "payload": payload,
+                   'acceptance': 'not_attempted', 'acceptance_uncertain': False}
             rows.append(row)
         doc["rows"] = rows
         return str(row.get("status") or STATUS_PENDING)
@@ -301,7 +311,7 @@ def _claim(key: str, now: float, today: str):
         if aged:
             row["status"], row["last_error"] = aged[0], aged[1]
             return ("aged", _close(row), aged)
-        if now < float(row.get("next_at") or 0):
+        if now < max(float(row.get('next_at') or 0), float((row.get('payload') or {}).get('not_before') or 0)):
             return None
         row["attempts"] = int(row.get("attempts") or 0) + 1
         row["next_at"] = now + backoff_secs(row["attempts"])
@@ -309,7 +319,7 @@ def _claim(key: str, now: float, today: str):
                 (row["attempts"], str(row.get("day") or "")))
 
 
-def _supersede(key: str, detail: str):
+def _supersede(key: str, detail: str, recompose=False):
     """Close a row whose brief the other lane already delivered. Terminal like every other ending —
     the payload leaves the file and no drain will ever claim it again."""
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
@@ -319,10 +329,43 @@ def _supersede(key: str, detail: str):
         if row is None or row.get("status") != STATUS_PENDING:
             return None
         row["status"], row["last_error"] = STATUS_SUPERSEDED, detail[:300]
-        return _close(row)
+        payload = _close(row)
+        if recompose:
+            row['effects_pending'] = True
+            row['effect_phase'] = 'invalidate'
+            row['effects_next_at'] = 0
+            row['payload'] = {k: v for k, v in payload.items() if k in ('label', 'valid_until')}
+            row['payload'].update(run_id=payload.get('run_id') or key, day=row.get('day'),
+                                  acceptance=row.get('acceptance', 'unknown'),
+                                  acceptance_uncertain=bool(row.get('acceptance_uncertain')))
+        return payload
 
 
-def _settle(key: str, ok: bool, detail: str, attempts: int):
+def invalidated_claim(run_id, day, label):
+    """Authoritative evidence for releasing an invalidated brief's unaccepted reservation."""
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), run_id)
+        if (not row or row.get('status') != STATUS_SUPERSEDED
+                or row.get('effect_phase') != 'invalidate' or row.get('day') != day
+                or (row.get('payload') or {}).get('label') != label):
+            return False
+        return (row.get('acceptance') in ('not_attempted', 'rejected')
+                and not row.get('acceptance_uncertain'))
+
+
+def _begin_send(key):
+    """Persist ambiguity before the provider call, including a crash without a response."""
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), key)
+        if not row or row.get('status') != STATUS_PENDING:
+            return False
+        if row.get('acceptance', 'unknown') in ('unknown', 'in_flight'):
+            row['acceptance_uncertain'] = True
+        row['acceptance'] = 'in_flight'
+        return True
+
+
+def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
     """Record the channel's answer. Delivered exactly once: a row already terminal is left alone, so
     two drains racing the same message cannot both mark it delivered or both give up on it."""
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
@@ -332,8 +375,21 @@ def _settle(key: str, ok: bool, detail: str, attempts: int):
         if row is None or row.get("status") != STATUS_PENDING:
             return None
         if ok:
+            row['acceptance'] = 'accepted'
             row["status"], row["last_error"] = STATUS_DELIVERED, ""
-            return ("delivered", _close(row))
+            payload = _close(row)
+            row['receipt'] = {**(receipt or {}), 'accepted_at': time.time()}
+            # Drop message text immediately, retain only replayable post-acceptance effects.
+            row['payload'] = {k: v for k, v in payload.items() if k in
+                              ('label', 'effects', 'run_id', 'coverage_until', 'decision_ids')}
+            row['payload']['receipt'] = row['receipt']
+            row['effects_pending'] = True
+            row['effects_next_at'] = 0
+            return ('delivered', payload)
+        acceptance = (receipt or {}).get('acceptance', 'unknown')
+        row['acceptance'] = acceptance if acceptance in ('not_attempted', 'rejected') else 'unknown'
+        if row['acceptance'] == 'unknown':
+            row['acceptance_uncertain'] = True
         row["last_error"] = detail[:300]
         if attempts >= MAX_ATTEMPTS:
             row["status"] = STATUS_FAILED
@@ -363,6 +419,21 @@ def _attempt(key: str) -> bool:
             return False
         attempts, day = extra
         label = str(payload.get("label") or "")
+        try:
+            current = bool(HOOKS['valid'](payload))
+        except Exception as e:  # noqa: BLE001 — one row's broken check must not stall the rows behind it
+            # The attempt is already charged, so a check that keeps raising still runs out of
+            # budget; what it can't do any more is abort the whole drain pass at the head of the
+            # queue with the day's brief waiting behind it.
+            print(f"[sotto] {label or '?'}: validity check failed ({type(e).__name__}) — held for the next pass",
+                  flush=True)
+            return False
+        if not current:
+            closed = _supersede(key, 'the underlying item changed or its source was disconnected', recompose=True)
+            if closed is not None:
+                _payload_receipt(closed, STATUS_SUPERSEDED, 'item no longer current')
+            _apply_effects(key)
+            return False
         # THE DELIVER-ONCE GATE, asked before the channel is (Aug 30: the evening brief went out
         # twice, a full minute after the winning lane's marker existed, because the gate was an
         # INSTRUCTION in the skill and the run did not honour it). A brief-kind row now proves at
@@ -379,6 +450,11 @@ def _attempt(key: str) -> bool:
                     print(f"[sotto] {label}: superseded — {SUPERSEDED_DETAIL}", flush=True)
                     _payload_receipt(closed, STATUS_SUPERSEDED, SUPERSEDED_DETAIL)
                 return False
+            if gate == GATE_RETRY:
+                # The marker's lock was busy: neither ours nor provably another lane's. The row
+                # stays pending (its attempt is charged) and the next pass asks the gate again.
+                print(f"[sotto] {label}: the deliver-once gate was busy — held for the next pass", flush=True)
+                return False
             if gate == GATE_NOT_A_BRIEF:
                 # Failed, loudly, on the first attempt — retrying the same non-brief cannot help,
                 # and the day stays unclaimed for the lane that can still compose one.
@@ -392,21 +468,23 @@ def _attempt(key: str) -> bool:
                         print(f"[sotto] outbox: not-a-brief follow-up failed ({type(e).__name__}: {e})",
                               flush=True)
                 return False
+        receipt = {}
+        if not _begin_send(key):
+            return False
         try:
-            ok, detail = HOOKS["send"](payload.get("body") or "", payload.get("target") or "")
-        except Exception as e:  # noqa: BLE001 — a send that raises is a send that failed
-            ok, detail = False, f"{type(e).__name__}: {e}"
-        settled = _settle(key, ok, detail, attempts)
+            answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '')
+            ok, detail = answer[:2]
+            receipt = answer[2] if len(answer) > 2 else {}
+        except Exception as e:  # a send that raises has unknown acceptance, never confirmed delivery
+            ok, detail = False, type(e).__name__
+            receipt = {'acceptance': 'unknown'}
+        settled = _settle(key, ok, detail, attempts, receipt)
         if settled is None:
             return bool(ok)
         state, payload = settled
         if state == "delivered":
             _payload_receipt(payload, STATUS_DELIVERED)
-            try:
-                HOOKS["on_delivered"](payload)
-            except Exception as e:  # noqa: BLE001 — the message landed; the follow-up must not undo that
-                print(f"[sotto] outbox: post-delivery effects failed ({type(e).__name__}: {e})",
-                      flush=True)
+            _apply_effects(key)
             return True
         # LOUD on every failed attempt, exactly as before the outbox existed: a nudge decided and
         # then not delivered is the thing this whole seam is here to make impossible to miss. What
@@ -426,6 +504,53 @@ def _attempt(key: str) -> bool:
             _INFLIGHT.discard(key)
 
 
+def _apply_effects(key):
+    now = time.time()
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), key)
+        if not row or not row.get('effects_pending') or now < row.get('effects_next_at', 0):
+            return False
+        row['effects_next_at'] = now + 60
+        row['effects_attempts'] = int(row.get('effects_attempts') or 0) + 1
+        attempt = row['effects_attempts']
+        payload = dict(row.get('payload') or {})
+        phase = row.get('effect_phase', 'accepted')
+    try:
+        # None is the legacy hook's successful return; explicit False is a retryable failure.
+        ok = HOOKS['on_invalid' if phase == 'invalidate' else 'on_delivered'](payload) is not False
+    except Exception as error:
+        ok = False
+        print(f'[sotto] outbox: effects pending ({type(error).__name__})', flush=True)
+    if ok:
+        with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+            row = _find(_rows(doc), key)
+            if row and row.get('status') in (STATUS_DELIVERED, STATUS_SUPERSEDED):
+                row['effects_pending'] = False
+                row['effects_status'] = 'applied'
+                _close(row)
+    elif attempt >= MAX_EFFECT_ATTEMPTS:
+        quarantined = None
+        with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+            row = _find(_rows(doc), key)
+            if row and row.get('effects_pending'):
+                row['effects_pending'] = False
+                row['effects_status'] = 'quarantined'
+                row['effects_error'] = 'post-delivery effect failed permanently'
+                quarantined = dict(row.get('payload') or {})
+        print(f'[sotto] outbox: effects quarantined after {MAX_EFFECT_ATTEMPTS} attempts', flush=True)
+        if quarantined is not None:
+            # A print line is not a receipt: the message DID go out, and the Record must say that
+            # what was supposed to follow it (a chase counted, an offer armed, a hand-off stamped)
+            # never happened — otherwise "why did Sotto never notice my yes?" has no answer.
+            detail = (f'superseded, but releasing its reservation for a fresh brief failed '
+                      f'permanently after {MAX_EFFECT_ATTEMPTS} attempts (quarantined)'
+                      if phase == 'invalidate' else
+                      f'delivered, but its follow-up effects failed permanently after '
+                      f'{MAX_EFFECT_ATTEMPTS} attempts (quarantined)')
+            _payload_receipt(quarantined, STATUS_FAILED, detail)
+    return ok
+
+
 # ── The three public entry points ────────────────────────────────────────────────────────────────
 
 def deliver(payload: dict) -> bool:
@@ -437,7 +562,7 @@ def deliver(payload: dict) -> bool:
     is the spawning run's identity — the same one its child env carries as SOTTO_DELIVERY_RUN_ID —
     and it is what the brief gate compares against the marker."""
     label, body = str(payload.get("label") or ""), str(payload.get("body") or "")
-    key = message_key(label, body)
+    key = str(payload.get('run_id') or '') or message_key(label, body)
     now, today = time.time(), str(HOOKS["local_today"]() or "")
     if _enqueue(key, kind_for(label), payload, now, today) != STATUS_PENDING:
         return False          # this exact message already reached a terminal state — no double-send
@@ -455,8 +580,11 @@ def drain() -> dict:
                 rows = _prune(_rows(doc), time.time())
                 doc["rows"] = rows
                 keys = [str(r.get("id")) for r in rows if r.get("status") == STATUS_PENDING]
+                effect_keys = [str(r.get('id')) for r in rows if r.get('effects_pending')]
         except Exception:  # noqa: BLE001 — an unreadable outbox must never kill the heartbeat
             return {"attempted": 0, "delivered": 0}
+        for key in effect_keys:
+            _apply_effects(key)
         attempted = delivered = 0
         for key in keys:
             attempted += 1
@@ -467,10 +595,25 @@ def drain() -> dict:
         _DRAIN_LOCK.release()
 
 
+def invalidation_revision(kind, day):
+    """A reverted context must not reuse a terminal, invalidated prepared artifact."""
+    if not kind:
+        return ''
+    try:
+        with open(path(), encoding='utf-8') as stream:
+            rows = _rows(json.load(stream))
+    except FileNotFoundError:
+        return ''
+    ids = sorted(str(row['id']) for row in rows if row.get('day') == day
+                 and row.get('effect_phase') == 'invalidate'
+                 and str((row.get('payload') or {}).get('label', '')).endswith('sotto-' + kind + '-brief'))
+    return _content_id('\n'.join(ids)) if ids else ''
+
+
 def counts() -> dict:
     """{pending, failed} for the dashboard — current state, read from the outbox itself rather than
     from the receipt log, because the log is history and this is what is still owed to you."""
-    out = {"pending": 0, "failed": 0}
+    out = {"pending": 0, "failed": 0, "effects_pending": 0, "effects_failed": 0}
     try:
         # A plain read, deliberately: this runs on every dashboard page load, and taking the write
         # lock to count rows would make a stat line contend with the drain that is doing the work.
@@ -479,6 +622,10 @@ def counts() -> dict:
     except Exception:  # noqa: BLE001 — no outbox, or an unreadable one, is a quiet zero
         return out
     for row in rows:
+        if row.get("effects_pending"):
+            out["effects_pending"] += 1
+        if row.get('effects_status') == 'quarantined':
+            out['effects_failed'] += 1
         if row.get("status") == STATUS_PENDING:
             out["pending"] += 1
         elif row.get("status") == STATUS_FAILED:

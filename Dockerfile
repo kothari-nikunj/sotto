@@ -14,13 +14,10 @@
 # in the file, and the digest is what wins.
 FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
 
-# ROOT, deliberately, and this is a KNOWN GAP rather than an oversight: the Hermes installer below
-# writes to /root/.hermes, and the skills, the bundle, SOUL.md, start.sh and the volume's first-boot
-# copy all address that path. Running as a non-root user means relocating the agent's entire home,
-# which is upstream's layout, not ours to redefine — so the container runs as root and the mitigation
-# lives elsewhere (the process holds no host mounts beyond /data, and the platform isolates it).
-# Whoever revisits this: it is one migration — a `USER sotto` with $HOME=/home/sotto — and it must be
-# done for the installer, the skills tree, and start.sh in the SAME change, or it half-works.
+# The supervisor remains root so it can seed and reconcile the persistent Hermes home. In managed
+# mode `managed_exec.py` drops the receiver and gateway to the shared `sotto` UID before either
+# imports runtime code; the receiver also becomes nondumpable. Image code and the FHS Hermes runtime
+# stay root-owned and non-writable. Self-host retains the historical root runtime for compatibility.
 
 # Prereqs for Hermes' installer (per Nous docs: git, curl, xz-utils; build tools; ripgrep/ffmpeg the
 # agent uses) + tini as a proper init (reaps the receiver/pairing/bridge child processes and forwards
@@ -28,6 +25,7 @@ FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e2631
 # `--no-install-recommends` keeps the list to exactly what is named here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates xz-utils build-essential ripgrep ffmpeg tini \
+ && useradd --create-home --uid 10001 sotto \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Hermes (Nous Research's official installer — also pulls Python/Node into its own runtime).
@@ -40,7 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the stale pin into every build failing until someone re-verified. Vendoring ends the recurrence:
 # the bytes that run are the bytes reviewed in git, and a build needs no network to stay honest.
 #
-# To upgrade Hermes, fetch the script fresh, review the diff, and commit it:
+# To upgrade Hermes, deliberately select a tested full SHA in hermes.commit.
+# The installer refresh below changes installer bytes only, not that runtime pin.
+# To refresh the installer, review and commit the diff:
 #   curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
 #     -o adapters/hermes/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
 # (the -A string matters — the host serves different bytes to unknown user agents), or run
@@ -50,10 +50,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /app/hermes-image-version.txt (see below).
 # (Vendored 2026-08-31, sha256 2076946edc23b3aed4a82ccb2e6b38ab593575626206dbdd192384e375b6d57c.)
 COPY adapters/hermes/hermes-install.sh /tmp/hermes-install.sh
-RUN bash /tmp/hermes-install.sh \
- && rm -f /tmp/hermes-install.sh
+COPY adapters/hermes/hermes.commit /tmp/hermes.commit
+RUN HERMES_INSTALL_DIR=/usr/local/lib/hermes-agent \
+      UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
+      UV_PYTHON_BIN_DIR=/usr/local/share/uv/bin \
+      bash /tmp/hermes-install.sh \
+      --commit "$(cat /tmp/hermes.commit)" --force-commit \
+ && test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "$(cat /tmp/hermes.commit)" \
+ && install -m 0755 /root/.local/bin/hermes /usr/local/bin/hermes \
+ && install -m 0755 /root/.local/bin/hermes-agent /usr/local/bin/hermes-agent \
+ && mkdir -p /usr/local/share/uv/python /usr/local/share/uv/bin \
+ && chown -R root:root /usr/local/lib/hermes-agent /usr/local/share/uv /usr/local/bin/hermes /usr/local/bin/hermes-agent \
+ && chmod -R go-w /usr/local/lib/hermes-agent /usr/local/share/uv \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin hermes --version >/dev/null \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin hermes send --help | grep -q -- --json \
+ && mkdir -p /app \
+ && cp /tmp/hermes.commit /app/hermes-image-commit.txt \
+ && rm -f /tmp/hermes-install.sh /tmp/hermes.commit
 # The installer puts `hermes` on PATH for the install user; make common locations explicit for start.sh.
-ENV PATH="/root/.local/bin:/root/.hermes/bin:${PATH}"
+ENV PATH="/usr/local/bin:/usr/local/share/uv/bin:${PATH}"
 # Snapshot what the INSTALLER owns inside ~/.hermes (captured BEFORE any Sotto skills are copied) and
 # the Hermes version this image was built with. start.sh uses these to (a) print the running vs image
 # version in every boot log and (b) refresh the installer-owned entries on the /data volume when
@@ -85,11 +100,15 @@ RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles
 # crons.json, configure_mcp.py and wa_pair.py, and every consumer reads them from there (start.sh
 # already referenced its siblings by that path). No second copy at /app/ to drift from it.
 COPY sotto-chief-of-staff/ /root/.hermes/skills/sotto/
+COPY sotto-chief-of-staff/ /app/sotto-skills/
 COPY adapters/hermes/sotto.bundle.yaml /root/.hermes/skill-bundles/sotto.yaml
 COPY runtime/trigger-receiver/ /app/trigger-receiver/
 # THE timezone chain — one file in the skills tree, carried beside the receiver so the receiver, the
 # dashboard and start.sh run the same code the skills do (no import across trees, and no copy in git).
 COPY sotto-chief-of-staff/_shared/lib/tzchain.py /app/trigger-receiver/tzchain.py
+COPY sotto-chief-of-staff/_shared/lib/work_queue.py /app/trigger-receiver/work_queue.py
+COPY sotto-chief-of-staff/_shared/lib/calendar_context.py /app/trigger-receiver/calendar_context.py
+COPY sotto-chief-of-staff/_shared/lib/source_catalog.py /app/trigger-receiver/source_catalog.py
 COPY adapters/hermes/ /app/adapters/hermes/
 # The two interactive playgrounds live in docs/ (one source of truth) and are SERVED from
 # /static/* — so they are copied in beside the frontend assets at build time. That keeps
@@ -111,6 +130,8 @@ RUN cat /app/adapters/hermes/sotto-persona.md >> /root/.hermes/SOUL.md 2>/dev/nu
 # Two processes: the trigger receiver (HTTP) + Hermes (agent loop + gateway + scheduler).
 # Railway exposes $PORT → the receiver. Hermes runs alongside. tini is PID 1 so the background
 # receiver/pairing/whatsapp-bridge children are reaped and SIGTERM is forwarded on redeploy.
-RUN chmod +x /app/adapters/hermes/start.sh
+RUN chmod +x /app/adapters/hermes/start.sh /app/adapters/hermes/managed_exec.py \
+ && chown -R root:root /app \
+ && chmod -R go-w /app /usr/local/lib/hermes-agent /usr/local/share/uv
 ENTRYPOINT ["tini", "--"]
-CMD ["/app/adapters/hermes/start.sh"]
+CMD ["python3", "/app/adapters/hermes/runtime_lock.py", "/app/adapters/hermes/start.sh"]

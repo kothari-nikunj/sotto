@@ -32,7 +32,7 @@
    .view-title dropped from display scale to 1.75rem. Scalars read as one
    .stat-strip line rather than a stack of .meter rows.
 
-   PHONE: below 640px the nav is a fixed bottom tab bar (.nav-tabs), four equal
+   PHONE: below 640px the nav is a fixed bottom tab bar (.nav-tabs), equal-width
    cells, no hidden horizontal scroll. /setup's server-rendered nav is a plain
    .nav and keeps its top bar.
 
@@ -392,7 +392,7 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .top-setup { display: none; }
 
 /* ---------- Phone: the nav is a bottom tab bar ----------
-   Four destinations, four equal cells, always all visible. The horizontal
+   Visible destinations get equal-width cells, always all visible. The horizontal
    scroller it replaces hid half its items off the right edge with no scrollbar
    to say so — a nav you have to discover by swiping is not a nav. Scoped to
    .nav-tabs so the server-rendered /setup pages keep their own top nav. */
@@ -402,7 +402,8 @@ button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
     left: 0; right: 0; bottom: 0;
     z-index: 60;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
     gap: 0;
     overflow: visible;
     background: var(--paper-nav);

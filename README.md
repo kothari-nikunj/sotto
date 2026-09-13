@@ -29,6 +29,10 @@ ours** in the path; it does not mean the data stays on your machine. If that dis
 you, read [docs/DATA-FLOW.md](docs/DATA-FLOW.md) before installing — it names every place your data
 goes, what is written to disk, and how long it stays.
 
+Preferences are instructions you state in chat or Memory: mutes, VIPs, tone and cadence.
+Using a draft does not grant more permission. The optional maintainer label editor is documented
+in the [evaluation guide](sotto-chief-of-staff/evals/README.md); it is not part of setup.
+
 ## How it works
 
 Two pieces:
@@ -63,8 +67,8 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
    **[Choosing your channel and model](CHANNELS.md)**.
 2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
    drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
-   click from the `/setup` page it opens. First run asks for an **access code** — Sotto Bridge is
-   invite-only for now, the code is checked on your Mac and never sent anywhere, and if you don't
+   click from the `/setup` page it opens. First run asks for an **access code** — the distributed Bridge binary's first-run access is invite-only for now (self-host deployment
+   itself is not), the code is checked on your Mac and never sent anywhere, and if you don't
    have one you can ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
    **Already running an older Bridge?** Updating to **1.2.7 or newer** asks your existing install for
    a code once, and it stops streaming to your cloud until you enter one — nothing else is lost
@@ -135,12 +139,16 @@ local material, and the escape hatch) plus how to add a service:
 | Doc | What |
 |---|---|
 | **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
+| [cloud/accounts/README.md](cloud/accounts/README.md) | Invited Cloud accounts, browser continuation and existing-tenant adoption |
+| [adapters/hermes/RECOVERY.md](adapters/hermes/RECOVERY.md) | Managed volume migration, model lease continuity, scoped device access and offline tenant restore |
 | [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
 | [docs/DATA-FLOW.md](docs/DATA-FLOW.md) | **Where your data goes** — every destination, every file written, how long each stays, and the gaps stated plainly. Read this before installing |
 | [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: the six modules, five daemon threads, six subprocess boundaries, and every shared file on the volume |
+| [docs/CLOUD-PILOT.md](docs/CLOUD-PILOT.md) | Managed pilot contracts, verification and remaining launch gates |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: modules, daemon threads, subprocess boundaries, and shared files on the volume |
+| [sotto-chief-of-staff/evals/README.md](sotto-chief-of-staff/evals/README.md) | Developer verification, including the continuous tracking probe and its current gaps |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
 | [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
 | **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — Telegram (default) · WhatsApp · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |
@@ -156,23 +164,30 @@ MCP, agentskills) with thin per-runtime adapters. It runs today on
 
 | Directory | What |
 |---|---|
-| `sotto-chief-of-staff/` | The processing: 16 skills + deterministic Python (extraction, knowledge graph, continuity ledger, style, triage) over `$SOTTO_DATA` |
-| `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, wake triggers, real-time event ingestion + triage funnel |
+| `sotto-chief-of-staff/` | The shared skill pack + Python pipeline (extraction, knowledge, continuity, voice, relevance and continuous memory) over `$SOTTO_DATA` |
+| `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, first useful look, scheduled delivery, quiet memory work + live triage |
 | `adapters/` | Per-host wiring (Hermes, OpenClaw) — see [adapters/README.md](adapters/README.md) |
 | `contracts/` | LocalData JSON Schema + the on-disk data layout |
 
-**Running the tests.** Python 3.11+ and three pinned dev dependencies; no services, no keys, no
-network — every test is hermetic:
+Cloud and receiver-based self-host use the same backend and skill procedures. The receiver admits
+work to a small queue on the tenant volume, saves completed artifacts, and hands them to the existing
+delivery outbox. Required knowledge and continuity writes precede a brief; optional learning runs
+separately. Source consent applies to cached context as well as live reads, and delivery retries
+recheck whether the underlying item is still current. See [the runtime map](docs/ARCHITECTURE.md)
+and [storage/retention](docs/DATA-FLOW.md) for the exact boundaries and recovery limits.
+
+**Running the shared verification.** Python 3.11+ and the pinned development dependencies:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-cd sotto-chief-of-staff && python3 -m pytest tests -q && python3 tools/validate_skills.py
-cd .. && python3 -m pytest runtime/trigger-receiver -q
+python3 sotto-chief-of-staff/tools/verify.py
 ```
 
-CI runs exactly these three, in this order, on every push and pull request — so green locally means
-green there. A handful of tests exercise release tooling that lives outside this repo; they skip
-themselves rather than fail, which is why a clean clone goes green with nothing pending.
+CI, the public distribution and the release script use that command. It runs Ruff, skill validation,
+pipeline, receiver, adapter, model-proxy and accounts tests, shell parsing and available publication
+guards. Tests use synthetic sources and local fixtures; none call paid models or deploy services.
+Some tests bind a local loopback server. Bridge compilation and macOS integration remain a separate
+platform verification step; backend test success alone does not certify the desktop app.
 
 (Working in the monorepo? `docs/ADDING-A-SOURCE.md` there covers adding a new Bridge data source —
 it edits Bridge source, so it deliberately doesn't ship in this repo.)
@@ -181,3 +196,5 @@ The Bridge app ships signed [on Releases](https://github.com/kothari-nikunj/sott
 its macOS data readers are not part of this source tree. It updates itself: a daily check against
 that same Releases page, an **"Update available"** item in its menu, and a one-click in-place install
 that keeps your Full Disk Access grant.
+
+Cloud account and onboarding contracts: [account service](cloud/accounts/README.md). Cloud and self-host use the same shared runtime and skill pack.

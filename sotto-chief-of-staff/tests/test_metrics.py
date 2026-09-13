@@ -127,7 +127,7 @@ def test_stubbed_compose_emits_brief_cost_line(tmp_path, monkeypatch):
     resp.write_text(json.dumps({"brief_markdown": "# Brief", "actions": []}))
     monkeypatch.setenv("SOTTO_LLM_STUB", str(resp))
     out = cb.compose({"type": "morning", "google": {}, "local": {}})
-    assert out["brief_markdown"] == "# Brief"
+    assert out["brief_markdown"].startswith("# Good ") and out["brief_markdown"].endswith("\n\n# Brief")
     log = (tmp_path / "logs" / "compose_brief.log").read_text()
     assert "[brief-cost] kind=morning" in log
     assert "est=n/a" in log                               # stub is unpriced

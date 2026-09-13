@@ -123,7 +123,9 @@ The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container 
 **Which channel?** One sentence decides it, and the boot log says which and why: *Sotto delivers to
 Telegram unless this volume already holds a paired WhatsApp session and no `TELEGRAM_BOT_TOKEN` is
 set.* So a fresh deploy is Telegram, an instance that was set up on WhatsApp keeps WhatsApp across
-redeploys with nothing to set, and `SOTTO_CRON_DELIVER` overrides both.
+redeploys with nothing to set, and `SOTTO_CRON_DELIVER` overrides both. The managed Cloud pilot
+(`SOTTO_DEPLOYMENT_MODE=managed`) is the one exception: its boot fixes `SOTTO_CRON_DELIVER=photon`
+and does not read the resolver above ([adapters/hermes/README.md](adapters/hermes/README.md)).
 
 **Want WhatsApp instead?** Three variables, and nothing about it was removed — the container still
 pairs it for you and serves the QR at `/whatsapp/qr`:
@@ -282,7 +284,7 @@ the template's **Variables** pre-declare these so the friend types as little as 
 | `BRIDGE_TOKEN` | **default = generated secret**, e.g. `${{ secret(48) }}` — so it's auto-created, never typed |
 | `GOOGLE_AI_API_KEY` | prompt (their Gemini key) |
 | `TELEGRAM_BOT_TOKEN` | prompt (their @BotFather token) |
-| `SOTTO_CRON_DELIVER` | fixed `telegram` |
+| `SOTTO_CRON_DELIVER` | fixed `telegram` for this self-host template (managed boot sets `photon` itself and ignores the template value) |
 | `WHATSAPP_ENABLED` | fixed `false` |
 | `GOOGLE_OAUTH_CLIENT_JSON` | **no longer needed** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy) |
 
@@ -316,10 +318,10 @@ removes one. The `sotto-routines` skill owns this.
 
 | Rule | Why it matters |
 |---|---|
-| **Every personal routine is named `user-<slug>`** — that prefix is the FENCE | Boot (`start.sh`) wipes Sotto's own five jobs on every deploy to kill duplicate crons and re-creates the three the agent runs (the two briefs are fired by the trigger receiver instead, so they are removed and never re-created here); it skips `user-` jobs entirely, so a redeploy never eats your routine. Sotto also never *removes* a job without that prefix, and never creates one with it that shadows a system job. The five system jobs live in `adapters/hermes/crons.json` — the one schedule source — and are changed via *set up Sotto*, not here. |
+| **Every personal routine is named `user-<slug>`** — that prefix is the FENCE | Boot (`start.sh`) removes stale Hermes registrations for Sotto's five receiver-owned system jobs; the shared receiver schedule owns them in Cloud and receiver-based self-host. Reconciliation skips `user-` jobs entirely, so a redeploy never eats your routine. Sotto also never *removes* a job without that prefix, and never creates one with it that shadows a system job. The five system jobs live in `adapters/hermes/crons.json` — the one schedule source — and are changed via *set up Sotto*, not here. |
 | **Cap: 10 routines** | The 11th asks which one to drop rather than growing an unread schedule. |
 | **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your Telegram chat) — same target as the briefs. Boot disables Hermes' generic `Cronjob Response` envelope, so briefs, nudges, and routines arrive as their clean user-facing copy rather than with a job id and scheduler footer. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
-| **Timezone changes don't move existing routines (v1)** | Hermes captures the zone when a job is created. Changing your timezone re-registers Sotto's own agent-run jobs (the briefs need no re-registration — the receiver reads the zone every minute) — your personal routines keep firing on the **old** clock until you recreate them (ask Sotto to; it's one line each). |
+| **Timezone changes don't move existing routines (v1)** | Hermes captures the zone when a job is created. Changing your timezone updates Sotto's system jobs on the next receiver tick — your personal routines keep firing on the **old** clock until you recreate them (ask Sotto to; it's one line each). |
 
 ## Environment variables — full reference
 
@@ -330,8 +332,15 @@ research caps — are named constants in the code that owns them, not variables 
 
 | Variable | Purpose | When |
 |---|---|---|
+| `SOTTO_DEPLOYMENT_MODE` | `self-host` (default) or `managed`; managed mode requires the operator-provided settings below and Photon owner configuration. | managed operator only |
+| `SOTTO_TENANT_ID` | Stable managed tenant identity; capability/activation receipts must match. | managed operator only |
+| `SOTTO_MODEL_PROXY_URL` | HTTPS proxy root; native pipeline uses `/native/v1beta`, Hermes uses `/openai/v1`. Also required for metered self-host background history/Dreamer. | managed or metered background |
+| `SOTTO_MODEL_PROXY_TOKEN` | Tenant model bearer for both routes. The receiver renews its expiry through the proxy; bearer rotation remains an explicit operator change. Also pairs with the proxy URL for self-host background learning. | managed or metered background |
+| `SOTTO_CONTROL_TOKEN` | Independent receiver/account bootstrap and model lease credential. Keep out of Hermes and worker environments; configure its SHA-256 as the proxy tenant’s `renewal_token_sha256`. | managed operator only |
+| `SOTTO_VOLUME_ID` | Identity of the real attached managed volume. Initialize `.sotto-volume.json` explicitly before first upgraded boot; a missing/mismatched mount stops startup. | required in managed mode |
+| `SOTTO_PROXY_TENANTS` | Proxy service only: configured tenant token hashes, expiry and admission budgets; never set on a tenant instance. Pilot provisioning only. | proxy operator only |
 | `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface) | never |
-| `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for the briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
+| `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for self-host briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
 | `TELEGRAM_BOT_TOKEN` | your bot's token from [@BotFather](https://t.me/BotFather) — **the one channel variable on the default path**. Boot validates it, prints a one-tap `https://t.me/<bot>?start=<setup code>` link, waits up to five minutes for a message carrying that code (anything else is ignored, so a stranger who finds your bot can't claim it), and writes the chat id into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` (remembered on `/data`, so it happens once; a timeout just retries next boot). | **required** (default channel) |
 | `WHATSAPP_ALLOWED_USERS` | WhatsApp path only: who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | optional (channel) |
 | `WHATSAPP_HOME_CHANNEL` | WhatsApp path only: where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery there:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | optional (channel) |
@@ -347,6 +356,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_CRITIC` | the brief's second-pass Gemini **critic + revise** quality gate (`auto` \| `always` \| `off`, default `auto`). `auto` skips the two extra Gemini calls on a **small/low-risk** brief (rendered source payload `<15000` chars AND `≤5` actions) and runs them otherwise; `always` = every brief; `off` = never. | optional (quality) |
 | `SOTTO_FALLBACK_MODEL` | backup model the brief falls back to on a 429/5xx/timeout. On gemini it defaults to `gemini-3-flash-preview` (cheaper, separate per-model rate-limit bucket, same key); other families have **no default** and a cross-family value is refused — the fallback must stay in the primary's family, so a quota blip never sends your data to a provider you didn't configure. The backup must clear the same 400K context floor. | optional (resilience) |
 | `SOTTO_FALLBACK_API_KEY` | optional second Gemini key (different project) used for the fallback — dodges per-project quota (the 429 storm). Can be set alone (same model, backup key) or with `SOTTO_FALLBACK_MODEL`. | optional (resilience) |
+| `SOTTO_BACKGROUND_UNMETERED` | Exact `true` explicitly allows self-host history learning and Dreamer to use direct BYOK without a finite proxy budget. Unset is the safe default: background learning waits for the proxy URL/token and a finite tenant `budget_cents`. Foreground chat and ordinary briefs are unaffected. | optional owner choice |
 | `SOTTO_ALLOW_SELF_IMPROVE` | `1` to allow Hermes' skill self-writes + Curator on this instance. Default (unset) **protects** Sotto's skills: gates `skills.write_approval`, disables curator pruning. Set `1` only on a shared general-purpose Hermes. | optional |
 | `SOTTO_SPAWN_TOOLSETS` | comma-separated **Hermes toolset ids** the spawned one-shot runs (briefs, nudges, event agents) are scoped to — e.g. `sotto-local,google-workspace`. **Unset by design, and usually should stay unset:** toolset ids vary by install, so a wrong guess would break *every* brief and no default can be safely picked for you. Run `hermes tools --summary` to see the ids this deploy actually has before setting it. Ignored unless the runner is `hermes` (`SOTTO_RUN_SKILL` may name another agent, which would choke on the flag). | optional |
 | `SOTTO_REFRESH_HERMES` | `1` for **one boot** adopts the image's Hermes runtime onto the `/data` volume (see *Staying updated*). A denylist protects WhatsApp login, sessions, config, SOUL, and the knowledge graph. Unset after the version line confirms the upgrade. | optional (upgrade) |
@@ -382,7 +392,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_WHATSAPP_PAIR_TIMEOUT` | how long the boot-time **WhatsApp** QR pairing step stays open, in seconds (default `900` = 15 min) — both the pairer and boot's wait derive from this one var, so raising it really buys more scan time. Miss the window and a redeploy reopens pairing anyway. (Telegram's capture has no variable: its five-minute wait is a named constant in `telegram_link.py`, and a miss costs nothing but the next boot.) | optional |
 | `SOTTO_HIDE_AGENT_NAME` | `1` drops the ***Sotto*** reply prefix on WhatsApp messages entirely (default: prefixed, so you can tell its messages from yours in self-chat). | optional |
 | `SOTTO_TOOL_PROGRESS` | what streams into chat while Sotto works: `off` (default — nothing mid-turn; the typing indicator and the periodic "⏳ Working" heartbeat cover the wait) · `new` (plain-language narration + one edit-in-place tool bubble, cleaned up on delivery) · `all`/`verbose` (debugging). | optional (UX) |
-| `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Telegram only (Hermes has no bot reactions on WhatsApp). | optional (UX) |
+| `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Photon iMessage also uses 👀 working, 👍 reply succeeded and 👎 processing/reply error. This is reply status, not a receipt for an external action. Hermes has no bot reactions on WhatsApp. | optional (UX) |
 | `GATEWAY_ALLOW_ALL_USERS` | `true` = open access (testing only). | optional |
 | `GOOGLE_OAUTH_CLIENT_JSON` | **optional now** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy). This var remains as a legacy/headless fallback (loaded at boot). | optional (legacy) |
 | `GOOGLE_AUTH_CODE` | the one-time code from `/google/auth`; **clear it** after `Google: connected ✓`. | during Google connect |
@@ -505,3 +515,44 @@ Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and 
 | WhatsApp QR re-prompts every deploy | Volume not mounted at `/data` (step 3), or `start.sh` state-persist step failed. |
 | Mac can't reach the trigger | No public domain (step 4), or `SOTTO_TRIGGER_TOKEN` mismatch. |
 | Local data missing from briefs (messages/calls/contacts empty) | Run `sotto-bridged --doctor` on the Mac — it names each source `ok` / `needs Full Disk Access` / `unavailable` and prints the exact FDA fix (grant Full Disk Access to the *right* app: the `.app` for GUI runs, the terminal for CLI runs). Exit `0` = all sources read. |
+
+### Personal Cloud account broker (operator only)
+
+The invite-only broker in `cloud/accounts/` adopts registered isolated instances; it does not provision
+additional tenants. See its README for the separate web OAuth client, private volume and sign-in flow.
+
+| Variable | Purpose | Scope |
+|---|---|---|
+| `SOTTO_CONTROL_TOKEN` | Independent random secret authenticating the account broker's bootstrap requests; never passed to Hermes tools. | Managed instance and broker only |
+| `SOTTO_IMESSAGE_NUMBER` | This tenant's assigned Sotto number, displayed after pairing and excluded from Bridge iMessage context. | Managed instance only |
+| `SOTTO_ACCOUNT_CONFIG` | Broker-only JSON secret: web OAuth client, state encryption key and legacy pilot admission/route. Additional pre-created tenants are registered through the local operator command, with control credentials encrypted in the broker database. | Separate account service only |
+
+The proxy tenant configuration accepts `budget_cents: null` to disable the spending admission cutoff while retaining usage records and credential checks. Numeric budgets return HTTP 402 with `sotto_budget_exhausted` when exhausted; upstream HTTP 429 remains a separate transient rate-limit condition. The personal pilot uses no spending cutoff at the owner’s request.
+
+### Metered self-host background learning
+
+Deploy the existing `cloud/model-proxy/Dockerfile` as a separate service with its own persistent
+`SOTTO_DATA` volume, `GOOGLE_AI_API_KEY`, and `SOTTO_PROXY_TENANTS`. Give the self-host tenant a
+finite integer `budget_cents`, an enabled flag, expiry, and SHA-256 bearer hash. Then set that
+service's HTTPS root as `SOTTO_MODEL_PROXY_URL` and the unhashed tenant bearer as
+`SOTTO_MODEL_PROXY_TOKEN` on the Sotto service. History learning and Dreamer wait if either value
+is absent, the budget is null, or the allowance is exhausted. The proxy reserves a conservative
+$2 maximum allowance before each upstream call and records usage in its existing SQLite ledger;
+this bounds admission and is not a reconstruction of the provider invoice. To accept unmetered
+direct BYOK background spend instead, set `SOTTO_BACKGROUND_UNMETERED=true` explicitly.
+The Sotto service authenticates a content-free `GET /v1/capabilities/background-budget` before it
+reads history. Upgrade an older proxy that returns 404; unsupported, unauthorized, unlimited or
+exhausted capability responses keep background work held. The model POST enforces the same finite
+requirement atomically with its ledger reservation. Bearer expiry is rechecked inside that
+transaction after reading the request body and waiting for the ledger lock; an expired bearer
+returns 401 without reserving spend or contacting the provider.
+
+Personal comparison pilot: all 11 Bridge source types can be enabled with explicit consent in the same source settings as self-host. `SOTTO_PROACTIVE=1` and `SOTTO_DIGEST=1` restore the existing proactive and digest schedules; their output uses the same Photon destination as briefs. Quiet hours, interrupt gates and duplicate suppression still apply.
+
+## Managed operations and recovery
+
+The runtime supervisor recycles the container if either essential process exits. Managed startup
+checks the attached volume before launching writers. See [the tenant recovery runbook](adapters/hermes/RECOVERY.md)
+for the one-time volume migration, model lease renewal, scoped Bridge revocation and verified offline
+export/restore. Tenant cold restore is covered by synthetic tests; fleet control-state recovery and
+automated backups still require operator verification.

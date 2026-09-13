@@ -46,73 +46,41 @@ Do NOT explore the filesystem / packages / Hermes internals or run `hermes tools
      - otherwise → mark it "optional, skipped" and move on (one line: "No Granola — optional; one-click connect lives on your `/setup` page under **Connected services**."). Never block setup on it.
    Don't claim full capability until **FDA + the Bridge connection are green**; report Google, the delivery channel and Granola honestly as found.
 
-**3. Seed memory + voice (so day 1 isn't cold).** Once the Bridge is green, do a one-time seed so the first brief already knows people and writes like the user:
-   1. `read_local(since_hours=1008)` (≈6 weeks) → `/tmp/sotto_seed.json`.
-   2. `execute_code`:
-      ```bash
-      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/style_extract.py" /tmp/sotto_seed.json      # learn their writing voice
-      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/prewarm_graph.py" /tmp/sotto_seed.json      # pre-warm the graph: who they talk to most
-      python3 "$HOME/.hermes/skills/sotto/relationship-pulse/scripts/relationship_pulse.py" /tmp/sotto_seed.json   # seed who's waiting / going quiet
-      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/compose_brief.py" --seed-snapshot /tmp/sotto_seed.json   # so day-one nudges can name senders
-      ```
-   `--seed-snapshot` writes `knowledge/last_local_snapshot.json` — the file the event funnel resolves
-   every sender's name from. Without it the first day's nudges are nameless until the 6:30 brief
-   writes it. Prints `{"seeded": true, "contacts": N}`; a thin seed prints `seeded: false` and is
-   harmless.
-   `prewarm_graph.py` creates identity stubs for the user's most-frequent contacts so the FIRST brief
-   already recognizes the people in their world — it does NOT invent roles/companies (that's earned
-   later via the Learn step). By default it also background-researches the emailed contacts, stored
-   only as clearly-labeled low-confidence "per web search" notes (missing Gemini key → silently plain
-   stubs; `SOTTO_PREWARM_RESEARCH=0` skips the research). Safe to run with no output to read.
-   If the Bridge is slow, skip this and let the first brief seed it. `style_extract.py` prints
-   `{"messages_analyzed": N, ...}` — only claim the seed worked if N > 0. Say one line: "Learned your
-   writing style and the people you talk to most." (If N = 0, say the seed was thin and the briefs
-   will learn as they run — don't announce a learned style that doesn't exist.)
+**3. First useful look and progressive learning.** The receiver handles this automatically in
+Cloud and self-host once a context source and delivery channel are ready. It seeds observed voice
+and people from recent context, composes a short first look through the normal pipeline, and sends
+it through the existing outbox. `config/onboarding.json` records delivery/retry state; upgrades with
+prior briefs keep their current conversation. Do not run a second seed, queue another welcome, or
+make the user answer a profile questionnaire first.
 
-**3b. The standing file — propose from the seed, confirm, then two questions (skippable).** The
-seed learned who they *talk to*; use it so they confirm instead of typing from scratch — but the
-file's authority comes from being THEIR stated words, so nothing is written unconfirmed. From what
-step 3 already gathered (their sent mail's signature and domain, the seed's most-messaged people),
-DRAFT the first two sections and ask all of it in ONE friendly message:
-> "Last thing — I want to get your standing file right. From what I've seen: **you're** <drafted
-> one-liner — name, role, company from their sent mail — or 'I couldn't tell what you do — one
-> sentence?'>. **Your inner circle** looks like <top 4–6 most-messaged names from the seed> — who
-> here actually belongs (partners, EA, family), and who's missing? Two I can't guess: **what are
-> you focused on right now**, and **any standing rules** for how you like things done ('intros are
-> always forwardable emails', 'never book Fridays')? Correct anything, skip anything — this is
-> editable later in chat or on your dashboard."
-Write ONLY what they confirmed or corrected — a proposal they ignored is not an answer; never
-write your own draft unconfirmed, and never invent content for a skipped section:
-```bash
-python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section About --text "<their answer>"
-python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section People --text "<their answer>"
-python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section Priorities --text "<their answer>"
-python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/master_file.py" set --section Procedures --text "<their rules, one per line>"
-```
-This is `knowledge/master.md` — it rides along in every brief and meeting prep from the first one,
-and they can edit it anytime on the dashboard's **Learned** page or by telling you in chat. If they
-skip everything, say "no problem — tell me anytime" and move on; never block setup on it.
+The same heartbeat reviews paginated iMessage, WhatsApp and Gmail history progressively. Read
+`knowledge/history-state.json` for actual per-source progress: frozen initial bounds, pages and
+rows fetched, messages reviewed, completion and sanitized failures. A bounded window is not a
+claim that all history has been reviewed. Mac sources need the Bridge online; Google can continue
+while the Mac sleeps. Other sources retain their existing brief/prep learning paths. Historical
+pages never enter the live nudge queue. Keep progress quiet unless the user asks or a connection
+needs their attention.
 
-**4. Schedule the briefs — dedup first, ALWAYS.** Run every `hermes cron …` command in this step
-through the **`terminal` tool**, verbatim (`execute_code` is for the Python scripts, not host CLIs —
-the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check which of the host-scheduled jobs below already exist (match by name/skill — the installer (`start.sh`) normally registers them at boot). Create ONLY the missing ones; never create a job whose name already appears in the list (a second "set up Sotto" must not double-schedule — duplicate crons have caused 429 storms before). Never create a `sotto-followup` cron — the post-meeting followup pass runs inside the evening brief now (the old standalone 16:45 cron is retired, and boot removes leftovers):
-   All five jobs, their schedules, their skills and who runs each one live in
-   **`adapters/hermes/crons.json`** — the one source `start.sh`, the installers and the receiver read;
-   if a schedule here ever disagrees with it, `crons.json` is right. Always pass **`--name`** (so boot-time dedup recognizes the job) and
-   **`--deliver "$SOTTO_CRON_DELIVER"`** — without `--deliver` the brief goes to the
-   default `local` sink and never reaches the user:
-   - Morning and evening briefs — **do NOT create these**. They are `"runner": "receiver"` jobs: the
-     trigger receiver fires them off `crons.json` on its own clock so a brief has one delivery lane
-     (its outbox, with retries and the deliver-once gate). If `hermes cron list` still shows a
-     `sotto-morning-brief` or `sotto-evening-brief` job, leave it alone — the next boot removes it.
-     Only where NO receiver runs (a laptop-only install) does the host scheduler carry them, and the
-     local installer already registered them there.
-   - Weekly relationship pulse — `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "$SOTTO_CRON_DELIVER"`
-   - Proactive check (mostly-silent watcher) — `hermes cron create "*/15 * * * *" "Run my proactive check" --skill sotto-proactive --name sotto-proactive --deliver "$SOTTO_CRON_DELIVER"` (skip if the user disabled it via `SOTTO_PROACTIVE=0`)
-   - Midday catch-up digest — `hermes cron create "30 12 * * *" "Run my midday digest" --skill sotto-event --name sotto-midday-digest --deliver "$SOTTO_CRON_DELIVER"` (adaptive: delivers only on a heavy day, else silent; skip if disabled via `SOTTO_DIGEST=0`)
-   **On a non-Hermes host, register the same host-scheduled jobs with that host's scheduler** — OpenClaw is `openclaw cron add "<cron>" "<prompt> (use the <skill> skill)" --name <name> --declaration-key sotto:<name> --announce --channel "$SOTTO_CRON_DELIVER"` (no `--skill` flag, and without `--declaration-key` a re-run silently creates a duplicate).
-   `SOTTO_CRON_DELIVER` is the whole channel choice and it is ONE target for every job — never pass a different `--deliver` per job, and never substitute a channel name for the variable. Boot exports it (start.sh step 0.4 is the one place the channel is decided); if it is empty, say so and stop rather than guessing, because a guessed channel delivers the user's briefs somewhere they never set up.
-   Tell the user the times and that they can change them ("want different times? just tell me").
+**3b. Preferences are optional corrections after useful work.** Learn voice from real sends and
+use explicit ratings as examples. Never turn observed activity into a confirmed family role,
+standing rule or permission. If the user gives a priority or rule, use `sotto-feedback` and the
+existing master-file writer. Ask a single specific question only when its answer would change a
+real next action; there is no mandatory “tell me about yourself” form.
+
+**4. Check the installed schedule; do not create system jobs from chat.**
+   `adapters/hermes/crons.json` owns the jobs, times, feature gates and runner selection.
+   On Railway, boot reconciles the host jobs and the receiver schedules its own jobs. Verify from
+   the two sources you can read: `execute_code` → `cat "${SOTTO_CRONS_JSON:-/app/adapters/hermes/crons.json}"`
+   (the container copy; a source checkout keeps it at `adapters/hermes/crons.json`) for every job, its schedule and who runs it
+   (`"runner": "receiver"` rows fire from the receiver and never appear in `hermes cron list`), then
+   `terminal` → `hermes cron list` for the host-run rows. A job with a `gate` whose env var is `0` is
+   off. Report only the schedule you actually verified, in the configured timezone; the dashboard's
+   Activity page shows the same schedule to the user. If neither source is readable, say scheduling
+   is unverified; don't promise delivery times.
+   Missing jobs are an installation problem: on Railway, inspect boot's reconciliation warning;
+   locally, use the host adapter's installer instructions (OpenClaw prints the registration commands).
+   Never copy hardcoded schedules into new `hermes cron create` / `openclaw cron add` calls here.
+   The user's separate `user-*` routines still belong to `sotto-routines`.
 
 **5. Close with an HONEST per-connection checklist** — one line per connection, using what step 2 actually verified (✓ = probed OK, ✗ = failed + the one-line fix, – = optional and skipped). Never print a blanket "all set" over a red row. The shape:
    > Here's where you stand:
@@ -120,7 +88,7 @@ the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check 
    > - **Google** (Gmail + Calendar) — ✓ connected *(or ✗ — open the `/setup` link from your deploy logs to connect)*
    > - **Delivery** (where briefs land) — ✓ Telegram, linked *(or ✗ Telegram, not linked yet — tap the pairing link in your deploy logs, then restart; on WhatsApp, scan the QR on your `/setup` page; on any other channel, just name it)*
    > - **Granola** (meeting notes) — ✓ connected *(or – optional, skipped)*
-   > Briefs are scheduled for 6:30am and 5:30pm.
+   > Briefs — <verified times and timezone from step 4, or “schedule not yet verified”>.
    **Then say the posture out loud — three plain lines, once, right here** (this is the only moment
    the user is guaranteed to read it; state it, don't sell it — no marketing, no emphasis stacking):
    > - No bot ever joins your calls. Meeting notes come from Granola reading the notes you already
@@ -133,7 +101,10 @@ the same rule routines/SKILL.md states). Run `hermes cron list` FIRST and check 
    (`docs/HOW-SOTTO-DECIDES.md` in the repo they deployed from — it isn't installed locally) — one
    line, then move on.
    A ✗ delivery row is worth one extra line — a scheduled brief with nowhere to land is silently lost — but it never blocks an on-demand brief in this chat.
-   Then offer the first brief: if Bridge AND Google are ✓ → "You're all set ✅ — want your first brief right now? Just say *good morning*. Otherwise I'll have it ready at 6:30am." If anything required is ✗ → "Once that's fixed, say *set up Sotto* again and I'll re-check — you can still say *good morning* for a partial brief from what I can see." If they say yes → run `sotto-morning-brief`.
+   When the receiver and channel are ready, the first useful look arrives automatically;
+   don't make the user ask for it. If this install has no running receiver, say that automation is
+   unavailable and offer an on-demand brief through `sotto-morning-brief`. Failed connections get
+   the one concrete fix, and intentionally skipped sources never prevent using the others.
 
 ## Notes
 - **Telegram and Gemini are the defaults, not requirements.** If they ask about WhatsApp, iMessage, or a non-Gemini model, don't improvise — point them at the project's **CHANNELS.md** ("Choosing your channel and model") on GitHub, in the repo they deployed from (it isn't installed locally); it carries the tradeoffs, the exact steps, and how tested each one is. One line, then move on.

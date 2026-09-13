@@ -78,12 +78,8 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
   importance: a person you actively track (a `people/*.md` file with facts / talking points / a known
   company) outranks a chatty-but-shallow contact going quiet. Untracked people fall back to the old
   volume-only ranking, so the weighting only ever sharpens the order — it never hides anyone.
-- Cron: the weekly job (Monday 9am) is registered at boot from `adapters/hermes/crons.json`. To
-  (re)create it by hand, use the host's own scheduler the way the installer does — Hermes:
-  `hermes cron create "0 9 * * 1" "Run my relationship pulse" --skill sotto-relationship-pulse --name sotto-relationship-pulse --deliver "$SOTTO_CRON_DELIVER"`;
-  OpenClaw: `openclaw cron add "0 9 * * 1" "Run my relationship pulse (use the sotto-relationship-pulse skill)" --name sotto-relationship-pulse --declaration-key sotto:sotto-relationship-pulse --announce --channel "$SOTTO_CRON_DELIVER"`.
-  Without `--deliver` (Hermes) / `--announce --channel` (OpenClaw) the job runs and its output goes
-  to the default `local` sink — the user never sees it (setup/SKILL.md step 4 states the same rule).
-  `SOTTO_CRON_DELIVER` is exported by boot, which is the one place the channel is decided; empty
-  means this host never resolved one, and a channel you name yourself is a guess about where the
-  user reads their briefs.
+- The adapter owns this job's registration from `adapters/hermes/crons.json`. Use its installed
+  schedule; do not create a second weekly job from this skill. Missing or unverified schedules
+  follow the setup skill's installation check. Personal `user-*` routines are separate.
+
+The same pass stores dated activity evidence for relationship importance: distinct contact days and days in each direction over six weeks. It combines iMessage, WhatsApp, calls and known-person email using the existing identity resolver. Overlapping reads are deduplicated; one noisy conversation does not become a VIP. The shared importance reader classifies VIP/VVIP for gift eligibility and the People skill. Existing attention/quiet-hour policy is separate: an overdue reply is urgency, not proof of closeness.

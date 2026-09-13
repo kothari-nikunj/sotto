@@ -57,6 +57,7 @@ from http.cookiejar import CookieJar
 _LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
+import gemini_transport
 from timeutil import configured_user_email  # noqa: E402
 
 MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
@@ -344,7 +345,7 @@ def _gemini_read(images: list, title: str) -> str:
     """ONE multimodal call: every page image inline, per-page extraction out. Direct REST on the
     same key/model as every other Gemini call in this tree (gemini.py's call shape is text-only by
     design — the brief pipeline never sends images, so this stays here with its one caller)."""
-    key = os.environ.get("GOOGLE_AI_API_KEY", "").strip()
+    key = gemini_transport.credential()
     if not key:
         return ""
     parts = [{"text": (f"These are the pages of a deck{f' titled {title!r}' if title else ''}, in "
@@ -354,10 +355,7 @@ def _gemini_read(images: list, title: str) -> str:
     for img in images:
         parts.append({"inline_data": {"mime_type": "image/png",
                                       "data": base64.b64encode(img).decode()}})
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}",
-        data=json.dumps({"contents": [{"parts": parts}]}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+    req = gemini_transport.request(MODEL, {"contents": [{"parts": parts}]}, key)
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read())

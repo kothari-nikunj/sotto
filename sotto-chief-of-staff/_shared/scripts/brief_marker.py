@@ -89,7 +89,10 @@ def claim(kind: str) -> bool:
     except FileExistsError:
         return False
     except OSError:
-        return True   # if the volume is unwritable, don't block the brief — better a rare dupe than none
+        # This is an authorization gate. An uncertain claim must never become permission for two
+        # lanes to deliver the same brief; the next scheduler tick can retry once the volume/lock
+        # is healthy.
+        return False
     _stamp_digest_window()   # this run is the one that delivers → the digest window starts here
     return True
 

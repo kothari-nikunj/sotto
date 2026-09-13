@@ -221,7 +221,7 @@ def _research_facts(updates: list) -> int:
     return n
 
 
-def prewarm(local: dict) -> dict:
+def prewarm(local: dict, research: bool = True) -> dict:
     cards = _contact_cards(local)
     top = _top_contacts(local)
     updates = []
@@ -237,7 +237,7 @@ def prewarm(local: dict) -> dict:
         updates.append(upd)
 
     researched = 0
-    if os.environ.get("SOTTO_PREWARM_RESEARCH", "1") != "0" and updates:   # default ON; =0 skips
+    if research and os.environ.get("SOTTO_PREWARM_RESEARCH", "1") != "0" and updates:   # default ON; =0 skips
         researched = _research_facts(updates)
 
     if updates:
@@ -270,7 +270,7 @@ def main():
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         print(json.dumps({"stubs": 0, "researched": 0, "people": []}))
         return
-    print(json.dumps(prewarm(local)))
+    print(json.dumps(prewarm(local, research="--identities-only" not in sys.argv)))
 
 
 if __name__ == "__main__":

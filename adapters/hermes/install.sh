@@ -31,9 +31,21 @@ note() { echo "+ $*"; }
 echo "== Sotto · Hermes adapter (dry-run=$DRY_RUN) =="
 
 command -v hermes >/dev/null 2>&1 || {
-  echo "Hermes not found. Install it first: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+  echo "Hermes not found. Install Sotto's pinned compatible runtime, then re-run:" >&2
+  echo "  bash \"$HERE/hermes-install.sh\" --commit \"$(cat "$HERE/hermes.commit")\"" >&2
   [ "$DRY_RUN" -eq 1 ] || exit 1
 }
+
+# Delivery is safe only when Hermes returns structured provider acceptance. Older local installs
+# lack `send --json`; falling back to plain send would make a retry capable of duplicating a message.
+if command -v hermes >/dev/null 2>&1 && ! hermes send --help 2>&1 | grep -q -- '--json'; then
+  cat >&2 <<EOF
+Hermes is too old for Sotto delivery: 'hermes send' does not support --json provider receipts.
+No messages were sent. Install the repository's pinned compatible runtime, then re-run:
+  bash "$HERE/hermes-install.sh" --commit "$(cat "$HERE/hermes.commit")"
+EOF
+  [ "$DRY_RUN" -eq 1 ] || exit 1
+fi
 
 # 1) Model + scheduler.
 #    The brief ALWAYS runs on Gemini via _shared/scripts/compose_brief.py (needs GOOGLE_AI_API_KEY in
@@ -63,6 +75,10 @@ if ! command -v hermes >/dev/null 2>&1 || hermes config get cron.wrap_response >
 else
   note "[sotto] note: cron.wrap_response not supported by this Hermes version — scheduled messages may include a wrapper"
 fi
+
+# Match the container's lifecycle-notice policy on local/self-host installs too.
+run python3 "$HERE/notification_config.py" "$HERMES_HOME" "${SOTTO_CRON_DELIVER:-telegram}"
+run python3 "$HERE/web_config.py" "$HERMES_HOME"
 
 # 1.5) Gemini key names. Sotto's brief reads GOOGLE_AI_API_KEY, but Hermes' gemini provider reads
 #      GEMINI_API_KEY / GOOGLE_API_KEY. Map whichever the user set (in the environment, or already in
@@ -276,6 +292,12 @@ For CLOUD mode you don't need a local engine at all: set BRIDGE_TOKEN (the beare
 Mac app) and re-run — the Bridge dials out to the reverse relay instead.
 EOF
   exit 1
+fi
+
+# Channel fixes are shared with the container runtime; tenant policy is conditional
+# inside the plugin. Existing Telegram/WhatsApp installs are unaffected.
+if [ "${SOTTO_CRON_DELIVER:-}" = "photon" ]; then
+  run python3 "$HERE/photon_setup.py" "$HERMES_HOME"
 fi
 
 echo "== Done. In chat: '/sotto setup' (or 'Sotto, set up') — it verifies health(), seeds your memory + writing voice, and offers your first brief. =="

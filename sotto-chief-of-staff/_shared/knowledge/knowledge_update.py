@@ -60,9 +60,11 @@ import difflib
 import glob
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import yaml
 
@@ -402,7 +404,7 @@ def load_merge_suggestions() -> list:
 
 def load_merge_dismissed() -> list:
     """The tombstoned pairs — [{from, into, at}, …] — or [] (a missing/corrupt file is "none").
-    Mirrors learn_preferences' `suppressed`: a list the user's "no" is written into, so a refresh
+    Records the user's "no" in a suppression list, so a refresh
     that recomputes from scratch cannot resurrect what they already answered."""
     try:
         with open(_suggestions_path(), encoding="utf-8") as f:
@@ -588,19 +590,56 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
     "unlinked" relation is stored by exactly the code that stores every other fact."""
     if float(fu.get("confidence", 0.8)) < 0.5:
         return
+    observed = str(fu.get('observed_date') or '')
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', observed) and observed <= today:
+        today = observed
     force = fu.get("change_type") == "correction"
     action, existing_id = kg.find_similar_fact(
         p.facts, fu["fact"], fu.get("memory_type", ""), force
     )
+    source = fu.get('source') or 'brief_extraction'
+    ref = str(fu.get('source_ref') or '')[:500]
+    new_refs = {v for v in fu.get('evidence_refs', []) if isinstance(v, str) and 0 < len(v) <= 500}
+    new_refs = set(sorted(new_refs | ({ref} if ref else set()))[:64])
+    if existing_id and p.facts[existing_id].source == 'user_edit' and source != 'user_edit':
+        return  # Neither historical ingestion nor a model revisiting its own memory can undo a correction.
+    if source == 'observed_message' and not force:
+        # Overlapping words do not prove two historical statements agree. Keep both assertions
+        # for evidence-based curation instead of strengthening or overwriting one heuristically.
+        exact = next((fid for fid, fact in p.facts.items()
+                      if ' '.join(fact.text.split()).casefold() == ' '.join(fu['fact'].split()).casefold()), None)
+        action, existing_id = ((kg.BUMP if p.facts[exact].status == 'active' else kg.SKIP, exact)
+                               if exact else (kg.NEW, None))
     if action == kg.BUMP:
         ex = p.facts[existing_id]
+        if source == 'user_edit':
+            # An explicit confirmation upgrades authority once; automatic replay never does.
+            if ex.source != 'user_edit':
+                ex.seen += 1
+                counts['confirmed'] += 1
+            ex.source, ex.source_ref = 'user_edit', ref or 'user-confirmation'
+            ex.conf = float(fu.get('confidence', 1.0))
+            ex.last = max(ex.last or today, today)
+            return
+        refs = set(ex.evidence_refs or []) | ({ex.source_ref} if ex.source_ref else set())
+        if not new_refs - refs or len(refs) >= 64:
+            # Re-reading the same evidence is not independent confirmation: no seen/conf bump.
+            # It IS a fresh observation, though — an extraction that carries no source_ref (the
+            # prompt allows that) would otherwise never refresh `last`, and a fact restated every
+            # morning decayed and was pruned as if nobody had mentioned it since the first day.
+            ex.last = max(ex.last or today, today)
+            return
+        ex.evidence_refs = sorted(refs | new_refs)[:64]
         ex.seen += 1
         ex.conf = min(ex.conf + 0.1, 1.0)
-        ex.last = today
+        ex.first = min(ex.first or today, today)
+        ex.last = max(ex.last or today, today)
         counts["confirmed"] += 1
     elif action in (kg.SUPERSEDE, kg.NEW):
         if action == kg.SUPERSEDE:
             ex = p.facts[existing_id]
+            if today < ex.last and not force:
+                return
             ex.status = "archived"
             ex.archived_text = ex.text
             counts["superseded"] += 1
@@ -610,8 +649,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
             seen=1, conf=float(fu.get("confidence", 0.8)),
             # provenance: research writers (persist_prep) pass source="web_research";
             # extraction writes omit it and keep the default label.
-            source=fu.get("source") or "brief_extraction",
-            source_ref=fu.get("source_ref", ""), first=today, last=today,
+            source=source, evidence_refs=sorted(new_refs),
+            source_ref=ref, first=today, last=today,
         )
         counts["new"] += 1
     # SKIP: silently ignore
@@ -1047,6 +1086,61 @@ def link_relation(*a, **k):
 def unlink_relation(*a, **k):
     with graph_lock():
         return _unlink_relation_unlocked(*a, **k)
+
+
+def consolidate(slug, expected_hash, summary_refs, conflicts, now=None):
+    """Apply a Dreamer selection through the graph writer, preserving evidence and human edits.
+
+    The model selects existing fact IDs. It cannot supply replacement prose, confidence,
+    instructions, identity, or deletion targets. Only exact duplicate text is archived.
+    """
+    import hashlib
+    import jsonstore
+    if not kg.valid_canonical_id(slug):
+        raise ValueError('invalid person id')
+    now = now or datetime.now(timezone.utc)
+    with graph_lock():
+        path = _person_path(slug)
+        raw = open(path, encoding='utf-8').read()
+        if hashlib.sha256(raw.encode()).hexdigest() != expected_hash:
+            return {'status': 'changed_during_review'}
+        person = kg.parse_person_file(raw)
+        active = {fid: fact for fid, fact in person.facts.items() if fact.status == 'active'}
+        if (not isinstance(summary_refs, list) or len(summary_refs) > 4
+                or len(set(summary_refs)) != len(summary_refs)
+                or any(fid not in active for fid in summary_refs)
+                or not isinstance(conflicts, list) or len(conflicts) > 3):
+            raise ValueError('invalid consolidation references')
+        for pair in conflicts:
+            if not isinstance(pair, list) or len(pair) != 2 or len(set(pair)) != 2 or any(fid not in active for fid in pair):
+                raise ValueError('invalid contradiction references')
+        # Never overwrite a human-maintained summary or turn uncertain facts into confident prose.
+        prior_text = ' '.join(person.facts[fid].text for fid in person.summary_refs if fid in person.facts)
+        protected_summary = (person.summary and (
+            (person.summary_refs and person.summary != prior_text)
+            or (not person.summary_refs and person.updated_by == 'user_edit')))
+        if not protected_summary:
+            person.summary_refs = summary_refs
+            person.summary = ' '.join(active[fid].text for fid in summary_refs)
+        duplicates, seen = 0, {}
+        # User-corrected facts are never archived; every original and source ref remains stored.
+        for fid, fact in sorted(active.items(), key=lambda kv: (kv[1].source != 'user_edit', kv[0])):
+            key = (fact.type, ' '.join(fact.text.split()).casefold())
+            if key in seen and fact.source != 'user_edit' and fid not in summary_refs:
+                fact.status, fact.archived_text = 'archived', fact.text
+                duplicates += 1
+            else:
+                seen[key] = fid
+        # Curation is not a new observation: preserve each fact's date/confidence and file recency.
+        kg.write_person_file(path, person, now)
+        written_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        conflict_path = os.path.join(kg.data_root(), 'knowledge', 'conflicts.json')
+        with jsonstore.transaction(conflict_path, default={'people': {}}) as state:
+            state.setdefault('people', {})[slug] = {'pairs': conflicts, 'at': kg.now_iso(now)}
+            state['people'] = dict(sorted(state['people'].items(), key=lambda kv: kv[1]['at'])[-100:])
+        return {'status': 'ok', 'duplicates': duplicates, 'conflicts': len(conflicts),
+                'summary_facts': len(summary_refs), 'protected_summary': bool(protected_summary),
+                'hash': written_hash}
 
 
 # The LAST lines of this file, on purpose. This guard once sat above the three locked wrappers —

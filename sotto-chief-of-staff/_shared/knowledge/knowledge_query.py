@@ -17,9 +17,10 @@ The default mode prints the NAMED form compose_brief._normalize_local consumes d
 contact_index covers EVERY person file (not just recently-updated ones) — it is the identity map
 that lets the brief resolve a phone and an email to the SAME person (the phone↔email bridge).
 
-WHO PACKS, in one sentence: a person packs when they appear in today's inputs (--gmail) or on
-today's calendar (--calendar), and the --relevant-days file-mtime window is the fallback cohort
-used only when no inputs are supplied (no --gmail, or a gather that produced no addresses). mtime
+WHO PACKS: current Gmail, Calendar and consented Bridge participants (--local), plus canonical
+active-loop participants, select the bounded cohort. Durable graph facts travel with that
+cohort; a display name or nearby timestamp cannot join two conversations. The --relevant-days
+file-mtime window is the fallback only when no participant identifiers can be obtained. mtime
 says when a file was last REWRITTEN, which is not the same question as "does this person matter
 today" (persist_prep.py documents the same lesson) — so the person who emailed you this morning
 used to pack nothing and the model re-derived what the graph already knew.
@@ -41,6 +42,9 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import knowledge as kg  # noqa: E402
+from personal_context import participant_identifiers  # noqa: E402
+
+MAX_PEOPLE_PACKED = 80
 
 
 LOW_CONFIDENCE = 0.6   # below this a fact must be visibly labeled in the packed context
@@ -82,6 +86,17 @@ def pack_person(p: kg.PersonFile, expanded: bool, now: datetime) -> str:
         if handle:
             identity += f" | X @{handle}"
     lines.append(identity)
+    if p.summary_refs and all(fid in p.facts and p.facts[fid].status == 'active' for fid in p.summary_refs):
+        lines.append('Context: ' + ' '.join(_fact_text(p.facts[fid], now) for fid in p.summary_refs))
+    try:
+        import jsonstore
+        state = jsonstore.read(os.path.join(kg.data_root(), 'knowledge/conflicts.json'), default={})
+        for pair in state.get('people', {}).get(p.canonical_id, {}).get('pairs', [])[:1]:
+            if len(pair) == 2 and all(fid in p.facts and p.facts[fid].status == 'active' for fid in pair):
+                lines.append('Unresolved memory conflict (do not choose silently): '
+                             + ' / '.join(p.facts[fid].text for fid in pair))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
 
     # Relations, as sentences, right under the identity line — so every consumer of a packed person
     # block (the brief, meeting prep's "Your thread", Ask, the event funnel's "who is this")
@@ -166,6 +181,25 @@ def _gmail_addresses(path: str | None) -> set:
     return out
 
 
+def _input(path, key):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value.get(key, value) if isinstance(value, dict) else value
+    except (OSError, ValueError, TypeError):
+        return {} if key == 'local' else []
+
+
+def active_loop_participants():
+    """Use the ledger's read contract; retrieving a commitment never creates or changes it."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+    try:
+        import ledger_io
+        return ledger_io.load_active()
+    except (OSError, ValueError, TypeError, ImportError):
+        return []
+
+
 def _company_entry(known: dict) -> str:
     """One company file → one packed block: what it is, then its newest news. Capped."""
     lines = []
@@ -216,6 +250,8 @@ def main():
                                        "email domains pull in company context")
     ap.add_argument("--gmail", help="gathered gmail JSON; everyone in today's From/To packs. "
                                     "Supplying it REPLACES the --relevant-days mtime window")
+    ap.add_argument("--local", help="consented Bridge local JSON; include current phone/chat participants")
+    ap.add_argument("--loops", help="active commitment JSON; defaults to the canonical active ledger")
     args = ap.parse_args()
     now = datetime.now()
 
@@ -240,15 +276,19 @@ def main():
         return
 
     cutoff = now - timedelta(days=args.relevant_days)
-    cal_emails = _calendar_attendee_emails(args.calendar)
-    gmail_emails = _gmail_addresses(args.gmail)
-    today_emails = cal_emails | gmail_emails
+    from source_context import allowed
+    cal_emails = _calendar_attendee_emails(args.calendar) if allowed('calendar') else set()
+    local = _input(args.local, 'local') if args.local else {}
+    loops = _input(args.loops, 'items') if args.loops else active_loop_participants()
+    participants = participant_identifiers(local=local if isinstance(local, dict) else {},
+        gmail=_input(args.gmail, 'emails') if args.gmail else [],
+        calendar=_input(args.calendar, 'events') if args.calendar else [], loops=loops)
     # THE GATE, in one sentence: a person packs when they appear in today's inputs or on today's
     # calendar; the mtime window is the fallback cohort, used only when no inputs were supplied.
     # mtime only says when a file was last REWRITTEN, so under it someone who emailed you this
     # morning packs zero context and the model re-derives what the graph already knows. An empty or
     # unreadable --gmail is "no inputs", not "nobody" — a broken gather degrades to the old cohort.
-    inputs_gate = bool(gmail_emails)
+    inputs_gate = bool(participants)
     person_knowledge, contact_index, companies = {}, [], []
     for path in sorted(glob.glob(os.path.join(kg.people_dir(), "*.md"))):
         try:
@@ -268,7 +308,7 @@ def main():
             if handles:
                 entry["x_handles"] = handles
             contact_index.append(entry)
-        if not any(i.strip().lower() in today_emails for i in identifiers):
+        if not ({kg.normalize_identifier(i) for i in identifiers} | {p.canonical_id}).intersection(participants):
             if inputs_gate:
                 continue
             try:
@@ -276,11 +316,19 @@ def main():
                     continue
             except OSError:
                 continue
+        if len(person_knowledge) >= MAX_PEOPLE_PACKED:
+            continue
         person_knowledge[p.canonical_id or kg.slugify(p.name)] = pack_person(p, False, now)
         if p.company:
             companies.append(p.company)
 
-    out = {"person_knowledge": person_knowledge, "contact_index": contact_index}
+    expanded = set(participants)
+    for person in contact_index:
+        ids = {kg.normalize_identifier(i) for i in person['identifiers']} | {person['canonical_id']}
+        if ids.intersection(participants):
+            expanded.update(ids)
+    out = {"person_knowledge": person_knowledge, "contact_index": contact_index,
+           "memory_participants": sorted(expanded)}
     domains = sorted({e.split("@", 1)[1] for e in cal_emails if "@" in e})
     company_knowledge = pack_companies(domains, companies)
     if company_knowledge:   # absent, not empty, when nothing is on file — the brief renders neither

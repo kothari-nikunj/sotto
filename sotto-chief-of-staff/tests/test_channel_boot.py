@@ -28,7 +28,7 @@ CODE_END = "# Hermes v0.20 dropped some config keys"
 TELEGRAM_START = 'if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_ALLOWED_USERS:-}" ]; then'
 TELEGRAM_END = "# 5b) Pair WhatsApp."
 GATEWAY_START = "START_GATEWAY=1"
-GATEWAY_END = "# No gateway to supervise:"
+GATEWAY_END = "# Both essential processes belong to the same supervisor"
 
 
 def _block(first: str, last: str) -> str:

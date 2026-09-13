@@ -7,9 +7,8 @@ A periodic "tune-up" surfaces three things, all deterministic from the volume:
                      without resolution — the candidates the user can dismiss / snooze / keep. (The
                      brief auto-expires loops at 7 days; this catches the 3–7d window + repeat-offenders
                      BEFORE they clutter another brief, and gives a user-driven exit the auto-sweep lacks.)
-  - mute_suggestions: contacts the user keeps dismissing (from the BEHAVIORAL learner's
-                     deprioritization_hints) who aren't muted yet — the bridge from "learned" to an
-                     explicit mute the brief honors.
+  - mute_suggestions: empty until explicit feedback can be distinguished from inferred draft
+                     non-use. Existing deprioritization_hints are not evidence to mute a person.
   - current        : the settings a retune might change (timezone + the explicit mutes/tone in effect).
 
 Read-only. `retune_apply.py` performs the chosen dismiss/snooze/keep; `preferences.py` performs mutes.
@@ -80,21 +79,12 @@ def scan() -> dict:
         **pref.load_explicit(),
     }
 
-    # Behavioral → explicit bridge: contacts the learner flagged as repeatedly-dismissed, not yet muted.
-    muted_people_lc = {p.lower() for p in current.get("mute_people", [])}
+    # Fail closed at the shared consumer (evening brief AND tune-up), including old preferences.
+    # The matcher records unmatched drafts as "dismissed" and historical outcomes have no
+    # provenance separating that inference from a deliberate rejection. Even rejecting a draft
+    # does not mean the person should be muted. Keep the response shape; explicit mute commands
+    # remain available. Restore suggestions only with the designed feedback/evidence contract.
     suggestions = []
-    try:
-        with open(os.path.join(os.environ.get("SOTTO_DATA", "/data"), "preferences.json"), encoding="utf-8") as f:
-            hints = (json.load(f) or {}).get("deprioritization_hints", []) or []
-    except (OSError, json.JSONDecodeError, ValueError):
-        hints = []
-    seen = set()
-    for h in hints:
-        contact = _s(h).split("|", 1)[0].strip()
-        if not contact or contact.lower() in muted_people_lc or contact.lower() in seen:
-            continue
-        seen.add(contact.lower())
-        suggestions.append({"name": contact, "reason": "you keep dismissing their items"})
 
     return {
         "stale_loops": stale,

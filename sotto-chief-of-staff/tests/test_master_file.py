@@ -138,16 +138,14 @@ def test_dashboard_cap_mirror_agrees():
     assert int(m.group(1)) == mf.MASTER_CHAR_CAP
 
 
-def test_setup_skill_asks_the_four_questions():
-    # Onboarding writes the file via the one CLI, section by section, skippable.
+def test_setup_delivers_value_before_optional_preferences():
     with open(os.path.join(ROOT, "setup", "SKILL.md"), encoding="utf-8") as f:
         text = f.read()
-    assert "master_file.py" in text
-    for section in ("About", "People", "Priorities", "Procedures"):
-        assert f"--section {section}" in text
-    assert "never block setup on it" in text
-    # Prefill-and-confirm: setup DRAFTS About/People from the seed but writes only confirmed words.
-    assert "Write ONLY what they confirmed" in text
+    assert 'handles this automatically' in text
+    assert 'no mandatory' in text and 'profile questionnaire' in text
+    assert 'sotto-feedback' in text and 'master-file writer' in text
+    assert 'Never turn observed activity into' in text
+    assert 'permission' in text and 'actual per-source progress' in text
 
 
 def test_procedure_offer_picks_fresh_rule_and_records_the_bridge(tmp_path):

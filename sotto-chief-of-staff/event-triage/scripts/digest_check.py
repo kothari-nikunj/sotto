@@ -2,39 +2,24 @@
 """
 digest_check.py — the adaptive midday catch-up gate (Phase 2 §3).
 
-Reads $SOTTO_DATA/events/queue.jsonl entries queued SINCE the last digest stamp
-($SOTTO_DATA/events/last_digest.txt) and decides deterministically whether a midday digest is worth
-delivering. Heavy day (SIGNAL count >= SOTTO_DIGEST_MIN, default 8) →
-  {"deliver": true, "items": [{sender, class, preview, ts}, …]}
-(one item per sender — the NEWEST entry per sender wins; hard cap 6, matching the skill's 6-line
-rule); a quiet day →
-  {"deliver": false}
-so the sotto-event skill's digest mode stays silent.
+Reads the queue since the last digest/acknowledged brief. The existing activity gate (at least
+SOTTO_DIGEST_MIN, default 8, known-sender ambient/deferred events) avoids reviewing empty activity;
+one already-actionable item also triggers review. Neither gate decides what deserves delivery. One bounded native-model review applies
+_shared/references/relevance.md to conversations, including later outbound replies. Unknown/group
+rows may qualify on their substance; names and queue classes cannot make noise relevant.
 
-What counts toward the threshold (Sprint 0 §2a — the gate measures SIGNAL, not noise):
-  - class "ambient" from a KNOWN sender (Tier-1 judged it FYI-worthy), and
-  - classes "quiet"/"cooldown"/"stale"/"budget"/"snoozed"/"meeting_hold" from a KNOWN sender
-    (agent-worthy verdicts that were deterministically deferred — the closest thing the queue has
-    to "actionable"; "budget" is the daily interrupt cap, "snoozed" the user's cadence lever, and
-    since neither promotes back through the release valve the digest is their way out;
-    "meeting_hold" DOES promote when the meeting ends, but a day spent entirely in rooms is
-    exactly the day the digest exists for).
-KNOWN = the resolved sender name triage wrote is a real name: non-empty, not the "Unknown"
-sentinel, not phone-shaped (same standard as triage_event._is_known_name) — AND a person, not
-Sotto: a held proactive nudge carries its own title as `sender` ("Your open-loops list is getting
-heavy"), and a birthday reminder is not a signal from someone you know. Those rows never trip the
-heavy-day gate and rank below the fold; they still ride along in `items` when a digest delivers,
-under their own line. Cold-sender email
-("unknown"), group chatter ("group"), unknown-number missed calls and "error" entries never trip
-"heavy day" — but when a digest DOES deliver they may still ride along in items, below the fold
-(counted classes first: deferred-actionable, then known-ambient, then the rest; newest first
-within each band). "signal" (the user's own outbound) is ledger fodder — never an item.
+Review precedes the six-item delivery cap and uses at most 100 conversations, 20 recent messages
+per conversation, each message truncated by the shared conversation renderer
+(personal_context.CONVERSATION_TEXT_CHARS). Existing deferred-actionable bands take priority
+when bounding the review; the brief remains the backstop beyond it. Relevant action/decision items
+lead, meaningful developments follow. No relevant items means completed silence; malformed judgments or provider failure
+means retryable silence with an unchanged coverage window. No sender/category blacklist and no per-item model calls.
 
   digest_check.py              → the decision JSON (the skill consumes it verbatim);
-                                 ALWAYS stamps last_digest.txt at the end of the run (§2b) —
-                                 silent runs advance the window too, so it can't grow unbounded
+                                 successful silent reviews advance the window; delivered reviews
+                                 carry coverage_until for the receiver to acknowledge after sending
   digest_check.py --stamp      → records now to last_digest.txt (kept for the skill's post-deliver
-                                 stamp; harmless now that check runs self-stamp)
+                                 stamp; use --now coverage_until after acceptance)
                                  (the BRIEF also advances this window — brief_marker.claim() calls
                                  advance_stamp() when it WINS the deliver-once claim, so the 12:30
                                  digest can't re-surface what the delivered brief just covered;
@@ -60,6 +45,12 @@ if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
 from textutil import _looks_like_phone_number, _s  # noqa: E402
 from timeutil import _parse_ts  # noqa: E402
+import relevance  # noqa: E402
+from personal_context import conversation_key, conversation_message  # noqa: E402
+
+REVIEW_CONVERSATION_CAP = 100
+REVIEW_MESSAGES_CAP = 20
+# No per-message text cap here: conversation_message() (personal_context) owns that truncation.
 
 ITEM_CAP = 6                                     # matches the skill's 6-line rule (Sprint 0 §2d)
 # The proactive lane's synthetic event source — the contract with proactive_scan._proactive_event
@@ -69,9 +60,9 @@ PROACTIVE_SOURCE = "proactive"
 # deterministically-deferred agent verdicts (quiet hours / cooldown / stale-catchup / daily
 # interrupt budget / user snooze / in-meeting hold).
 COUNT_CLASSES = frozenset({"ambient", "quiet", "cooldown", "stale", "budget", "snoozed",
-                           "meeting_hold"})
+                           "meeting_hold", "actionable", "scheduling_ask"})
 # Of those, the deferred-agent ones sort first in items — they were judged interrupt-worthy once.
-ACTIONABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"})
+ACTIONABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold", "actionable", "scheduling_ask"})
 
 
 def _int_env(name: str, default: int) -> int:
@@ -215,34 +206,110 @@ def _band(entry: dict) -> int:
     return 2
 
 
+def review_conversations(conversations: list) -> list:
+    return relevance.judge(json.dumps(conversations, ensure_ascii=False), batch=True,
+                           label=" [digest relevance]")
+
+
+def _conversation_key(entry: dict) -> str:
+    return conversation_key(entry.get("event") or {})
+
+
+def _message(entry: dict) -> dict:
+    ev = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+    return conversation_message(ev, timestamp=_s(entry.get("ts")),
+                                prior_class=_s(entry.get("verdict_class")))
+
+
 def check(entries: list, min_n: int | None = None) -> dict:
-    """Pure decision: deliver iff the KNOWN-sender signal pile (see module docstring) is heavy
-    enough. Items are deduped by sender (newest per sender wins), ordered known-actionable →
-    known-ambient → everything else, newest first within each band, capped at ITEM_CAP."""
+    """Activity gate → bounded conversation review → relevance ranking → delivery cap.
+
+    All context is read-only. The injectable review_conversations seam tests selection without
+    paid calls; live judgment evaluation uses that same seam and the actual shared policy.
+    """
+    from source_context import allowed
+    import delivery_effects
+    entries = [e for e in entries if (not delivery_effects.source_for_event(e.get('event') or {})
+                or allowed(delivery_effects.source_for_event(e.get('event') or {})))]
     min_n = _int_env("SOTTO_DIGEST_MIN", 8) if min_n is None else min_n
-    candidates = [e for e in entries if _s(e.get("verdict_class")) != "signal"]
-    counted = [e for e in candidates if _counts_toward_threshold(e)]
-    if len(counted) < min_n:
+    candidates = [e for e in entries if _s(e.get("verdict_class")) != "signal"
+                  and e.get("verdict") != "drop"]
+    actionable = any((_s(e.get('verdict_class')) in ACTIONABLE_CLASSES
+                      or _s(e.get('held_class')) in ('urgent', 'actionable', 'scheduling_ask'))
+                     and _s((e.get('event') or {}).get('source')) != PROACTIVE_SOURCE
+                     for e in candidates)
+    if not actionable and sum(_counts_toward_threshold(e) for e in candidates) < min_n:
         return {"deliver": False}
-    # queue.jsonl is append-ordered → iterate newest-first and keep the first (= newest) per sender.
+    # Keep every message as context: newest-per-person alone can hide an ask or its later answer.
     by_sender: dict = {}
     for entry in reversed(candidates):
-        it = _item(entry)
-        key = it["sender"].strip().lower()
+        key = _conversation_key(entry)
         if key not in by_sender:
-            by_sender[key] = (_band(entry), it)
-    ranked = list(by_sender.values())          # newest-first already; stable sort keeps that
-    ranked.sort(key=lambda pair: pair[0])
-    items = [it for _band_, it in ranked[:ITEM_CAP]]
-    return {"deliver": True, "items": items}
+            by_sender[key] = entry
+        elif _band(entry) < _band(by_sender[key]):
+            by_sender[key] = entry
+    ranked = sorted(by_sender.items(), key=lambda pair: _band(pair[1]))[:REVIEW_CONVERSATION_CAP]
+    messages = {key: [] for key, _ in ranked}
+    for entry in entries:
+        key = _conversation_key(entry)
+        if key in messages:
+            messages[key].append(_message(entry))
+    conversations = [{"id": i, "sender": _item(entry)["sender"],
+                      "messages": sorted(messages[key], key=lambda m: delivery_effects.instant(m['ts']) or 0)[-REVIEW_MESSAGES_CAP:]}
+                     for i, (key, entry) in enumerate(ranked)]
+    try:
+        judgments = review_conversations(conversations)
+        # Fail closed on missing/duplicate/invented IDs, not partial model output silently accepted.
+        ids = [j.get("id") for j in judgments]
+        if (any(type(i) is not int for i in ids) or sorted(ids) != list(range(len(conversations)))
+                or any(j.get("class") not in relevance.CLASSES or not _s(j.get("why"))
+                       for j in judgments)):
+            raise ValueError("incomplete digest relevance review")
+        selected = []
+        for j in judgments:
+            if j["class"] == "ignore":
+                continue
+            i = j["id"]
+            entry = ranked[i][1]
+            item = _item(entry)
+            item.update(relevance=j["class"], why=j["why"], messages=conversations[i]["messages"])
+            band = ({"urgent": 0, "actionable": 1, "scheduling_ask": 1}.get(j["class"],
+                    2 + int(_band(entry) == 2)))
+            selected.append((band, i, item))
+        selected.sort(key=lambda row: (row[0], row[1]))
+        chosen = selected[:ITEM_CAP]
+        items = [item for _, _, item in chosen]
+        if not items:
+            return {'deliver': False}
+        eligibility, deadlines = [], []
+        for _, i, item in chosen:
+            descriptor = delivery_effects.for_bundle({'events': [ranked[i][1]]})
+            for effect in descriptor['effects']:
+                # Replies already considered by this review are context. Only a newer observed
+                # reply supersedes the held digest; otherwise a partial reply blocks it forever.
+                effect['observed_until'] = max((m['ts'] for m in item['messages']),
+                    key=lambda ts: delivery_effects.instant(ts) or 0, default=item['ts'])
+            eligibility.extend(descriptor['effects'])
+            if descriptor['valid_until'] is not None:
+                deadlines.append(descriptor['valid_until'])
+        return {'deliver': True, 'items': items, 'effects': eligibility,
+                'valid_until': min(deadlines) if deadlines else None}
+    except Exception as err:  # noqa: BLE001 — a failed relevance review must never become a digest
+        print(f"[digest] relevance review failed ({type(err).__name__}); staying silent", file=sys.stderr)
+        return {"deliver": False, "status": "retry", "retryable": True, "error": type(err).__name__}
 
 
 def run_check(now: datetime) -> dict:
-    """One check run: decide off the current window, then ALWAYS advance the window stamp — a
-    silent run must not let 'since last digest' grow unbounded (Sprint 0 §2b). Anything the silent
-    window skipped wasn't digest-worthy then; the brief remains the backstop."""
-    result = check(entries_since(read_stamp()))
-    write_stamp(now)
+    """A failed review preserves coverage; a delivered review closes it only on acceptance."""
+    entries = [e for e in entries_since(read_stamp())
+               if (_parse_iso(e.get('ts')) or now) <= now]
+    result = check(entries)
+    if result.get('retryable'):
+        return result
+    if result.get('deliver'):
+        result['coverage_until'] = now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    else:
+        advance_stamp(now)  # successfully reviewed silence is a completed window
     return result
 
 
@@ -254,10 +321,13 @@ def main():
     a = ap.parse_args()
     now = _parse_iso(a.now) or datetime.now(timezone.utc)
     if a.stamp:
-        write_stamp(now)
+        advance_stamp(now)
         print("stamped")
         return
-    print(json.dumps(run_check(now)))
+    result = run_check(now)
+    print(json.dumps(result))
+    if result.get("retryable"):
+        sys.exit(75)
 
 
 if __name__ == "__main__":

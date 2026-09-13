@@ -113,7 +113,8 @@ def test_apply_new_then_bump_increments_seen_and_conf(tmp_path):
     }]}
     r1 = ku.apply(ext, NOW)
     assert r1["applied"]["new"] == 1
-    # re-extract same fact -> bump
+    # An independent reference confirms it; rereading the same text alone cannot.
+    ext["person_updates"][0]["facts"][0]["source_ref"] = "email:new-observation"
     r2 = ku.apply(ext, NOW)
     assert r2["applied"]["confirmed"] == 1 and r2["applied"]["new"] == 0
     path = kg.find_person_file(name="Sarah Chen", identifier="sarah@acme.com")
@@ -316,6 +317,7 @@ def test_plain_reobservation_still_bumps_after_fix(tmp_path):
                    "memory_type": "context", "confidence": 0.7}],
     }]}
     ku.apply(ext, NOW)
+    ext["person_updates"][0]["facts"][0]["source_ref"] = "email:new-observation"
     r2 = ku.apply(ext, NOW)
     assert r2["applied"]["confirmed"] == 1 and r2["applied"]["new"] == 0
 

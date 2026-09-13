@@ -26,7 +26,7 @@ Seven nudge kinds:
                     delivered (quiet hours, a snooze, a dead container) is never counted against the
                     two this item gets. Held back only when today's DELIVERED brief already named
                     that same loop (`_brief_named_keys`) — the one collision that is a double-tell.
-  - birthday      — a saved contact whose birthday is today, or `SOTTO_BIRTHDAY_LEAD_DAYS` out
+  - birthday      — a saved contact whose birthday is today, or a VIP/VVIP birthday `SOTTO_BIRTHDAY_LEAD_DAYS` out
                     (the lead nudge is the one that can still become a gift). The day-of nudge is
                     skipped entirely once a brief has DELIVERED today: that brief carried the 🎂
                     line and the quick-wish tap, so this would be the same nudge twice.
@@ -92,7 +92,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -102,7 +101,9 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
 from textutil import _arr, _s, unwrap_tool_result  # noqa: E402
+from calendar_context import human_attendees, meeting_events  # noqa: E402
 from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email  # noqa: E402
+import delivery_effects  # noqa: E402
 # The funnel itself — this file calls triage() in-process, so there is one gate order and not a
 # second copy of it. (Same cross-skill sys.path pattern this file already uses for retune_scan;
 # skill dirs aren't packages.)
@@ -130,7 +131,8 @@ def _state_lock(date: str):
     Bridge's wake trigger) — without a lock they both read an empty set and both fire the same
     nudge. This is triage_event._locked, IMPORTED not re-implemented: one lock, one
     implementation."""
-    with _funnel()._locked(_state_path(date)):
+    import jsonstore
+    with jsonstore.lock(_state_path(date)):
         yield
 
 
@@ -145,15 +147,8 @@ def _load_state(date: str) -> set:
 def _save_state(date: str, nudged: set):
     """Atomic (tmp + os.replace), like every other state file under $SOTTO_DATA. Callers hold
     _state_lock for the whole read-decide-write, so the file can never be half-updated either."""
-    try:
-        p = _state_path(date)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"nudged": sorted(nudged)}, f)
-        os.replace(tmp, p)
-    except Exception:
-        pass
+    with delivery_effects.proactive_state(date) as state:
+        state['nudged'] = sorted(nudged)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -242,13 +237,7 @@ def _retune_cooldown_ok(today_str: str) -> bool:
 
 
 def _stamp_retune_offer(today_str: str):
-    try:
-        p = _retune_marker()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(today_str)
-    except Exception:
-        pass
+    delivery_effects.stamp_retune(today_str)
 
 
 def _funnel():
@@ -263,7 +252,9 @@ def _proactive_event(n: dict) -> dict:
     """THE adapter: one nudge rendered as the synthetic event `triage()` reads. `source` is
     "proactive", which is what tells the funnel to classify it as a nudge Sotto planned (and what
     keeps it out of the escalation join, the release valve and the digest's heavy-day count)."""
-    return {"source": "proactive", "kind": _s(n.get("kind")), "key": _s(n.get("key")),
+    return {**{k: n[k] for k in ('anchor_key', 'intention_id', 'calendar_event_id',
+                                'calendar_start', 'calendar_observed_at', 'valid_until', 'thread_id') if k in n},
+            "source": "proactive", "kind": _s(n.get("kind")), "key": _s(n.get("key")),
             "text": _s(n.get("title")), "detail": _s(n.get("detail")),
             "person": _s(n.get("person")), "from": _s(n.get("identifier")),
             "channel": _s(n.get("channel")), "timestamp":
@@ -301,26 +292,27 @@ def _submit(te, fresh: list, now_local: datetime) -> dict:
             for ev in ((out.get("bundle") or {}).get("events") or [])}
 
 
-def _defer_delivery_effects(fired: list) -> bool:
+def _defer_delivery_effects(fired: list, date=None, result=None) -> bool:
     """Detached receiver runs learn whether the host send succeeded only after this process exits.
     Leave the small correlated receipt it needs; interactive runs return False and keep the historical
     immediate-finalize behavior because their response is the delivery surface."""
-    run_id = _s(os.environ.get("SOTTO_DELIVERY_RUN_ID")).strip()
-    if not run_id or not re.fullmatch(r"[a-f0-9]{16,64}", run_id):
+    run_id = delivery_effects.run_id()
+    if not run_id:
         return False
-    os.makedirs(os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events"), exist_ok=True)
-    path = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events",
-                        f"delivery-effects-{run_id}.json")
-    payload = {
-        "decision_ids": [_s(n.get("decision_id")) for n in fired if _s(n.get("decision_id"))],
-        "effects": [{"kind": n["kind"], "anchor_key": _s(n.get("anchor_key"))}
-                    for n in fired if n.get("kind") in _FINALIZE_FLAG and _s(n.get("anchor_key"))],
-    }
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.replace(tmp, path)
-    return True
+    date = date or _now_local(configured_tz() or '+00:00').strftime('%Y-%m-%d')
+    captured = result.get('_eligibility') if isinstance(result, dict) else None
+    effects = list(captured if captured is not None else
+                   delivery_effects.for_bundle({'events': [_proactive_event(n) for n in fired]})['effects'])
+    for n in fired:
+        effects.append({'kind': 'proactive_seen', 'date': date, 'key': n['key'], 'run_id': run_id})
+        if n.get('kind') in _FINALIZE_FLAG and n.get('anchor_key'):
+            effects.append({'kind': n['kind'], 'anchor_key': n['anchor_key']})
+        if n.get('intention_id'):
+            effects.append({'kind': 'intention', 'id': n['intention_id']})
+        if n.get('kind') == 'retune_offer':
+            effects.append({'kind': 'retune_offer', 'date': date})
+    return delivery_effects.stage(effects, [n['decision_id'] for n in fired if n.get('decision_id')],
+                                  result=result)
 
 
 # Phase two, per lane: what continuity_resolve records once the nudge has ACTUALLY gone out.
@@ -548,11 +540,50 @@ def _stale_loop_count() -> int:
         return 0
 
 
+def _birthday_importance(local, now):
+    from relationship_importance import for_contact  # noqa: PLC0415
+    from collections import Counter  # noqa: PLC0415
+    root = os.environ.get("SOTTO_DATA", "/data")
+    def read(relative):
+        try:
+            with open(os.path.join(root, relative), encoding="utf-8") as stream:
+                value = json.load(stream)
+                return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+    history = read("knowledge/relationship_state.json").get("history", {})
+    vips = read("preferences.json").get("explicit", {}).get("vip_people", [])
+    contacts = _arr(local, "contacts")
+    names = Counter(_s(ct.get("name")).strip().casefold() for ct in contacts)
+    # Contacts can contain two cards for one canonical person (for example a phone-only card and
+    # an email card). Preserve every explicit-VIP alias inside that identity, while keeping two
+    # genuinely different canonical people separate even when their display names match.
+    by_cid = {}
+    for ct in contacts:
+        cid = _s(ct.get("canonical_id")).strip()
+        name = _s(ct.get("name")).strip().casefold()
+        if cid and name:
+            by_cid.setdefault(cid, []).append(name)
+    result = {}
+    for ct in contacts:
+        name = _s(ct.get("name")).strip().casefold()
+        cid = _s(ct.get("canonical_id")).strip()
+        if not name or (not cid and names[name] != 1):
+            continue
+        importance = for_contact(ct, history, vips, now, aliases=by_cid.get(cid, ()))
+        if cid:
+            result[f"canonical:{cid}"] = importance
+        if names[name] == 1:
+            result[name] = importance
+    return result
+
+
 def scan(calendar, continuity, local, user_email, now_local,
          stale_count: int = 0, retune_offer_allowed: bool = False,
          prepped_emails=None, brief_recent: bool = False,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
-         brief_named=None, intentions=None, handoff_allowed: bool = False) -> dict:
+         brief_named=None, intentions=None, handoff_allowed: bool = False,
+         birthday_importance=None) -> dict:
     """Pure decision (no I/O, no gates): given the inputs and the local 'now', return every nudge
     that is DUE now. Whether any of them reaches the user — the snooze, quiet hours, the mutes, the
     in-meeting hold, the daily interrupt budget — is the funnel's call, made in one place, on the
@@ -574,6 +605,7 @@ def scan(calendar, continuity, local, user_email, now_local,
             continue
         nudges.append({"kind": "intention", "key": f"intention:{_s(item.get('id'))}",
                        "intention_id": _s(item.get("id")), "title": _s(item.get("action")),
+                       **({'anchor_key': _s(item['anchor_key'])} if item.get('anchor_key') else {}),
                        "detail": _s(item.get("context"))})
 
     # 1) Meeting prep — external meeting starting within the lead window (and not already started).
@@ -581,7 +613,7 @@ def scan(calendar, continuity, local, user_email, now_local,
         events = calendar.get("events") or calendar.get("items") or []
     else:
         events = calendar if isinstance(calendar, list) else []
-    for e in events:
+    for e in meeting_events(events):
         if not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined":
             continue                  # a meeting you declined is not a room you're walking into
         st = _parse_ts(_s(e.get("start")))
@@ -592,9 +624,9 @@ def scan(calendar, continuity, local, user_email, now_local,
         mins_away = (st.astimezone(timezone.utc) - now_local.astimezone(timezone.utc)).total_seconds() / 60.0
         if not (0 <= mins_away <= lead):
             continue
-        ext = [a for a in _arr(e, "attendees")
-               if _s(a.get("email")).lower() != user_email
-               and not (user_domain and _s(a.get("email")).lower().endswith("@" + user_domain))]
+        ext = [a for a in human_attendees(e, user_email)
+               if _s(a.get('status')).lower() != 'declined'
+               and not (user_domain and a['email'].endswith("@" + user_domain))]
         if not ext:
             continue  # internal/solo meeting — no prep nudge
         # "…that you haven't prepped" — the honest, deterministic signal for that is today's
@@ -609,6 +641,9 @@ def scan(calendar, continuity, local, user_email, now_local,
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
         who, loop = _prep_lines(ext[0], continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{_s(e.get('id'))}",
+                       "calendar_event_id": _s(e.get('id')), "calendar_start": st.isoformat(),
+                       "calendar_observed_at": _s(e.get('calendar_observed_at')) or now_local.isoformat(),
+                       "valid_until": st.isoformat(),
                        "title": _s(e.get("summary")) or "Meeting",
                        "person": _s(ext[0].get("displayName")) or _s(ext[0].get("email")).split("@")[0],
                        "who": who, "open_loop": loop,
@@ -633,6 +668,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                            "title": title, "person": _s(c.get("name")),
                            "detail": ("overdue" if dl < today else "due today"),
                            "channel": _s(c.get("channel")), "identifier": _s(c.get("identifier")),
+                           "anchor_key": _s(c.get('anchor_key')),
                            "thread_id": _s(c.get("thread_id"))})
 
     # 2b) The chase — something you're WAITING ON that the ledger marked chase-pending today. At
@@ -662,7 +698,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "channel": _s(c.get("channel")), "identifier": _s(c.get("identifier")),
                        "thread_id": _s(c.get("thread_id"))})
 
-    # 3) Birthdays — a saved contact whose birthday is today (MM-DD), plus a LEAD nudge
+    # 3) Birthdays — a saved contact whose birthday is today (MM-DD), plus a VIP/VVIP LEAD nudge
     #    `SOTTO_BIRTHDAY_LEAD_DAYS` (default 3) out: a gift idea three days early beats a reminder
     #    the morning of. Both are suppressed for 2h after a delivered brief (the same window and
     #    the same reason as the retune offer): the brief already carried the 🎂 line.
@@ -684,10 +720,16 @@ def scan(calendar, continuity, local, user_email, now_local,
                 if _s(ct.get("birthday"))[:5] != mmdd or not _s(ct.get("name")):
                     continue
                 nm = _s(ct.get("name"))
+                importance = ((birthday_importance or {}).get(
+                    f"canonical:{_s(ct.get('canonical_id')).strip()}")
+                    or (birthday_importance or {}).get(nm.strip().casefold(), {}))
+                if days_out and importance.get("tier") not in {"vip", "vvip"}:
+                    continue
                 nudges.append({
                     "kind": "birthday",
                     "key": f"bday:{nm.lower()}:{year}" + (f":lead{days_out}" if days_out else ""),
                     "lead_days": days_out, "person": nm,
+                    "importance": importance if days_out else {},
                     "title": (f"{nm}'s birthday is today" if not days_out
                               else f"{nm}'s birthday is in {days_out} days"),
                     "detail": ("send a quick note" if not days_out
@@ -735,6 +777,10 @@ def main():
 
     local = unwrap_tool_result(_load(args.local, {}))
     calendar = _load(args.calendar, [])
+    from source_context import allowed, project_local
+    local = project_local(local if isinstance(local, dict) else {})
+    if not allowed('calendar'):
+        calendar = []
     # Open loops come from the ledger itself. --continuity is an override for tests/callers that
     # already hold the list; the agent no longer hand-reshapes one into /tmp.
     continuity = _load(args.continuity, None)
@@ -752,6 +798,7 @@ def main():
     brief_recent = _recent_brief_delivered(now_local)
     retune_ok = _retune_cooldown_ok(date) and not brief_recent
     due = scan(calendar, continuity, local, user_email, now_local,
+               birthday_importance=_birthday_importance(local, now_local),
                stale_count=stale_count, retune_offer_allowed=retune_ok,
                prepped_emails=_research_cache_emails(date), brief_recent=brief_recent,
                chase_candidates=_chase_candidates(date),
@@ -761,40 +808,55 @@ def main():
                intentions=_intention_candidates(now_local))["nudges"]
 
     te = _funnel()
-    result = {"nudges": [], "held": [], "quiet": False}
-    with _state_lock(date):
-        seen = _load_state(date)
-        fresh = [n for n in due if n["key"] not in seen]
-        hold = _clock_hold(te, now_local)
-        if hold:
-            # Don't submit what today already recorded: the funnel writes a verdict for every nudge
-            # it is handed, and a quiet night is forty ticks of the same list.
-            fresh = [n for n in fresh if f"held:{n['key']}" not in seen]
-            result["quiet"], result["reason"] = True, hold
-        fired_ids = _submit(te, fresh, now_local)
-        fired = [dict(n, decision_id=fired_ids[n["key"]])
-                 for n in fresh if n["key"] in fired_ids]
-        result["nudges"] = fired
-        result["held"] = [n for n in fresh if n["key"] not in fired_ids]
-        # A nudge burns its key once the funnel has DECIDED about it — delivered, queued for the
-        # digest, or dropped — so a 15-min cron never repeats it. One held by the CLOCK keeps its
-        # key (it fires when the hold lifts) and burns a `held:` marker instead, so The Record
-        # carries the verdict once for the day rather than once per tick.
-        burned = ({f"held:{n['key']}" for n in result["held"]} if hold
-                  else {n["key"] for n in fresh})
-        if burned:
-            _save_state(date, seen | burned)
-        if not hold:
-            for n in fresh:
-                if n.get("kind") == "intention" and n.get("intention_id"):
-                    _finish_intention(n["intention_id"])
-    if any(n["kind"] == "retune_offer" for n in fired):
-        _stamp_retune_offer(date)   # the tidy-up's cooldown; the hand-off is asked once by its stamp
-    deferred = _defer_delivery_effects(fired) if fired else False
+    ident = delivery_effects.run_id()
+    result = delivery_effects.cached_result()
+    if result is None:
+        result = {"nudges": [], "held": [], "quiet": False}
+        with delivery_effects.proactive_state(date) as state:
+            seen = set(state['nudged'])
+            # A pending result is owned by its durable run, never by the clock tick. If its
+            # delivery expires, the next scan can reconsider it against current evidence.
+            state['pending'] = {k: v for k, v in state['pending'].items()
+                                if (delivery_effects.instant(v.get('valid_until')) or 0) > now_local.timestamp()}
+            fresh = [n for n in due if n['key'] not in seen and n['key'] not in state['pending']]
+            hold = _clock_hold(te, now_local)
+            if hold:
+                fresh = [n for n in fresh if f"held:{n['key']}" not in seen]
+                result['quiet'], result['reason'] = True, hold
+            fired_ids = _submit(te, fresh, now_local)
+            fired = [dict(n, decision_id=fired_ids[n['key']])
+                     for n in fresh if n['key'] in fired_ids]
+            result['nudges'] = fired
+            result['held'] = [n for n in fresh if n['key'] not in fired_ids]
+            if hold:
+                seen |= {f"held:{n['key']}" for n in result['held']}
+            if ident:
+                for n in fired:
+                    until = delivery_effects.instant(n.get('valid_until'))
+                    state['pending'][n['key']] = {
+                        'run_id': ident,
+                        'valid_until': min(until or float('inf'), now_local.timestamp()
+                                           + delivery_effects.MAX_PENDING_SECONDS)}
+                # The result and its reservation commit together. A retry returns these exact
+                # decisions without spending the interrupt budget or asking the model again.
+                result['_delivery_date'] = date
+                result['_eligibility'] = delivery_effects.for_bundle(
+                    {'events': [_proactive_event(n) for n in fired]})['effects']
+                state.setdefault('runs', {})[ident] = result
+            else:
+                # Direct interactive invocations return into their visible conversation.
+                seen |= {n['key'] for n in fired}
+            state['nudged'] = sorted(seen)
+    fired = result.get('nudges', [])
+    deferred = _defer_delivery_effects(fired, result.get('_delivery_date', date), result)
     if not deferred:
         for n in fired:
-            if n["kind"] in _FINALIZE_FLAG:
-                _finalize(n["kind"], n.get("anchor_key"))
+            if n.get('intention_id'):
+                _finish_intention(n['intention_id'])
+            if n['kind'] == 'retune_offer':
+                _stamp_retune_offer(date)
+            if n['kind'] in _FINALIZE_FLAG:
+                _finalize(n['kind'], n.get('anchor_key'))
     try:
         from sotto_log import diag
         diag(f"[proactive_scan] {len(result['nudges'])} nudge(s)"

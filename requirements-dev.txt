@@ -1,4 +1,4 @@
-# Everything the test gauntlet needs, and nothing else. Five packages:
+# Everything the test gauntlet needs, including the managed service transports:
 #
 #   pytest                     — the two suites (sotto-chief-of-staff/tests, runtime/trigger-receiver)
 #   ruff                       — static correctness checks (undefined names, dead imports/locals)
@@ -18,4 +18,10 @@ pytest==9.1.1
 ruff==0.16.4
 pyyaml==6.0.1
 google-api-python-client==2.198.0
+google-auth-oauthlib==1.4.0
+cryptography==50.0.1
 firecrawl-anydoc==0.2.4
+
+# Account broker transport is exercised by the same gate.
+google-auth==2.56.3
+requests==2.32.5

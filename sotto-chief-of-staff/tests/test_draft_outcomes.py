@@ -3,7 +3,7 @@
 The contract in one sentence: a draft matches the first message the user sent to the same person
 within 24 hours of the offer — ≥0.95 similarity is executed (verbatim), ≥0.60 is edited_and_sent,
 a 24-hour-old draft with no match is dismissed, and everything lands through log_outcome so
-learn_preferences' existing tally consumes it with zero new wiring.
+the Learn runner invokes it directly.
 """
 import importlib.util
 import json
@@ -133,6 +133,30 @@ def test_grading_is_idempotent(tmp_path, monkeypatch):
     assert len(_outcomes(tmp_path)) == 1
 
 
+def test_inferred_non_use_cannot_become_a_mute_offer(tmp_path, monkeypatch):
+    """Exercise matcher -> tune-up with the real persisted history.
+    A busy user sending unrelated mail must not be accused of rejecting this person.
+    """
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    for hours in (30, 29, 28):
+        _write_draft(tmp_path, NOW - timedelta(hours=hours), "imessage", "+14155551234",
+                     f"Follow-up draft offered {hours} hours ago")
+    _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550000", "An unrelated reply")
+    assert do.run(now=NOW)["dismissed"] == 3       # retained historical outcome vocabulary
+    assert not (tmp_path / "preferences.json").exists()
+    import retune_scan
+    assert retune_scan.scan()["mute_suggestions"] == []
+    assert not (tmp_path / "proactive" / "pending_offer.json").exists()
+    # A direct user instruction still works through the existing preference command.
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, os.path.join(SCRIPTS, "preferences.py"),
+                             "mute-person", "Maya"], capture_output=True, text=True,
+                            env=os.environ, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((tmp_path / "preferences.json").read_text())["explicit"]["mute_people"] == ["Maya"]
+
+
 def _write_email_signal(tmp_path, ts, to, text, cc=""):
     p = tmp_path / "events" / "queue.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -184,21 +208,6 @@ def test_verbatim_send_confirms_the_style_sample(tmp_path, monkeypatch):
     assert len(style["confirmed"]) == 1 and style["confirmed"][0]["source"] == "confirmed"
 
 
-def test_learn_preferences_runs_the_matcher_first(tmp_path, monkeypatch):
-    """One Learn invocation does match → tally: the outcomes the matcher just wrote are in the
-    same run's tally, so approval_defaults and deprioritization learn from real draft outcomes
-    with zero new SKILL steps."""
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    lp_path = os.path.join(HERE, "..", "approval-tiers", "scripts", "learn_preferences.py")
-    spec = importlib.util.spec_from_file_location("lp", lp_path)
-    lp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(lp)
-    t0 = NOW - timedelta(hours=2)
-    _write_draft(tmp_path, t0, "imessage", "+14155551234", "On my way.")
-    _write_signal(tmp_path, t0 + timedelta(minutes=5), "+14155551234", "On my way.")
-    prefs = lp.learn()
-    assert isinstance(prefs, dict)
-    assert _outcomes(tmp_path)[0]["outcome"] == "executed"   # the matcher ran inside learn()
 
 
 def test_poll_gmail_sent_lane_marks_is_from_me(tmp_path, monkeypatch):

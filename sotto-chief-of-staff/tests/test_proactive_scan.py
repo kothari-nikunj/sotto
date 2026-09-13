@@ -67,6 +67,20 @@ def test_a_declined_meeting_never_gets_a_prep_nudge():
     assert not ps.scan(cal, [], {}, "me@x.com", now)["nudges"]
 
 
+def test_prep_attendees_exclude_rooms_decliners_and_the_owners_alias():
+    now = _at(10)
+    event = {'id': 'meeting', 'summary': 'Coffee',
+             'start': (now + timedelta(minutes=20)).isoformat(), 'attendees': [
+                 {'email': 'alias@other.net', 'self': True},
+                 {'email': 'room@resource.calendar.google.com'},
+                 {'email': 'boardroom@other.net', 'resource': True},
+                 {'email': 'cancelled@other.net', 'responseStatus': 'declined'}]}
+    assert ps.scan([event], [], {}, 'me@example.com', now)['nudges'] == []
+    event['attendees'].append({'email': 'guest@other.net', 'displayName': 'Guest'})
+    nudge, = ps.scan([event], [], {}, 'me@example.com', now)['nudges']
+    assert nudge['person'] == 'Guest'
+
+
 def test_meeting_outside_window_skipped():
     now = _at(10)
     far = (now + timedelta(minutes=120)).strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -299,6 +313,7 @@ def test_the_lead_birthday_keeps_the_two_hour_delay(tmp_path, monkeypatch, capsy
     window the tidy-up offer waits out."""
     import json
     _quiet_never(monkeypatch, tmp_path)
+    monkeypatch.setattr(ps, "_birthday_importance", lambda *a: {"jordan": {"tier": "vip"}})
     monkeypatch.setenv("SOTTO_BIRTHDAY_LEAD_DAYS", "3")
     now = ps._now_local("+00:00")
     local_path = tmp_path / "local.json"
@@ -423,6 +438,32 @@ def test_the_in_meeting_hold_applies_to_this_lane_too(tmp_path, monkeypatch, cap
     assert queued[0]["verdict_class"] == "meeting_hold" and queued[0]["held_class"] == "commitment"
     assert "in a meeting until" in _surfaced_rows(tmp_path)[0]["reason"]
     assert not (tmp_path / "events" / "budget.json").exists()   # a held nudge spends nothing
+
+
+def test_back_to_back_meeting_prep_is_timely_but_still_honors_snooze(tmp_path, monkeypatch, capsys):
+    import json
+    _quiet_never(monkeypatch, tmp_path)
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'me@example.com')
+    now = ps._now_local('+00:00')
+    start = now + timedelta(minutes=20)
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    (cache / 'calendar_today.json').write_text(json.dumps({
+        'date': now.strftime('%Y-%m-%d'), 'refresh_secs': 900,
+        'generated_at': now.isoformat(), 'events': [
+            {'summary': 'Current meeting', 'attendees': 3, 'all_day': False,
+             'start': (now - timedelta(minutes=10)).isoformat(), 'end': start.isoformat()}]}))
+    calendar = tmp_path / 'calendar.json'
+    calendar.write_text(json.dumps([{
+        'id': 'next-meeting', 'summary': 'Next meeting', 'start': start.isoformat(),
+        'attendees': [{'email': 'me@example.com', 'self': True},
+                      {'email': 'guest@else.net', 'displayName': 'Guest'}]}]))
+    prefs = tmp_path / 'preferences.json'
+    prefs.write_text(json.dumps({'explicit': {'nudge_snooze_until': (now + timedelta(hours=1)).isoformat()}}))
+    assert _run_main(monkeypatch, capsys, '--calendar', str(calendar))['nudges'] == []
+    prefs.write_text('{}')
+    out = _run_main(monkeypatch, capsys, '--calendar', str(calendar))
+    assert [n['kind'] for n in out['nudges']] == ['meeting_prep']
 
 
 def test_a_stale_calendar_never_holds_this_lane_either(tmp_path, monkeypatch, capsys):
@@ -587,8 +628,36 @@ def test_receiver_run_defers_chase_state_until_the_host_confirms_delivery(
     assert finalized == []
     effects = json.loads((tmp_path / "events" / ("delivery-effects-" + "a" * 24 + ".json")).read_text())
     assert effects["decision_ids"] == [out["nudges"][0]["decision_id"]]
-    assert effects["effects"] == [
-        {"kind": "chase", "anchor_key": "email:waiting_on:id:acme"}]
+    assert {"kind": "chase", "anchor_key": "email:waiting_on:id:acme"} in effects['effects']
+    assert {e['kind'] for e in effects['effects']} == {'eligibility', 'proactive_seen', 'chase'}
+    assert out['nudges'][0]['key'] not in ps._load_state(out['_delivery_date'])
+
+
+def test_held_intention_remains_due_then_waits_for_delivery_ack(tmp_path, monkeypatch, capsys):
+    import delivery_effects
+    import schedule_wakeup
+    import json
+    _quiet_never(monkeypatch, tmp_path)
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'c' * 32)
+    now = datetime.now(timezone.utc)
+    item = schedule_wakeup.create((now + timedelta(minutes=1)).isoformat(), 'Check the waiver')
+    monkeypatch.setattr(ps, '_intention_candidates', lambda now: [item])
+    monkeypatch.setenv('SOTTO_NUDGE_BUDGET', '0')
+    held = _run_main(monkeypatch, capsys)
+    assert held['held'] and not held['nudges']
+    assert schedule_wakeup.current()[0]['status'] == 'scheduled'
+    assert 'intention:' + item['id'] not in ps._load_state(held['_delivery_date'])
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'd' * 32)
+    monkeypatch.setenv('SOTTO_NUDGE_BUDGET', '4')
+    fired = _run_main(monkeypatch, capsys)
+    assert fired['nudges'] and schedule_wakeup.current()[0]['status'] == 'scheduled'
+    retry = _run_main(monkeypatch, capsys)
+    assert retry == fired
+    budget = json.loads((tmp_path / 'events/budget.json').read_text())
+    assert budget['count'] == 1
+    staged = json.loads((tmp_path / 'events' / ('delivery-effects-' + 'd' * 32 + '.json')).read_text())
+    assert delivery_effects.finalize(staged['effects'], {'accepted_at': now.timestamp()})
+    assert schedule_wakeup.current()[0]['status'] == 'fired'
 
 
 def test_chase_waits_out_a_freshly_delivered_brief(tmp_path, monkeypatch, capsys):
@@ -688,7 +757,7 @@ def test_birthday_lead_nudge_fires_at_the_lead_window_and_again_day_of(monkeypat
     now = _at(10)
     bday = (now + timedelta(days=3)).strftime("%m-%d")
     local = {"contacts": [{"name": "Jordan", "birthday": bday}]}
-    lead = [n for n in ps.scan([], [], local, "me@x.com", now)["nudges"] if n["kind"] == "birthday"]
+    lead = [n for n in ps.scan([], [], local, "me@x.com", now, birthday_importance={"jordan": {"tier": "vip"}})["nudges"] if n["kind"] == "birthday"]
     assert len(lead) == 1 and lead[0]["lead_days"] == 3
     assert "in 3 days" in lead[0]["title"] and "gift" in lead[0]["detail"]
     # …and the day-of nudge still fires, under its own key (so neither dedups the other away)
@@ -710,6 +779,7 @@ def test_birthday_lead_zero_keeps_the_old_day_of_only_behavior(monkeypatch):
 def test_birthday_lead_fires_once_per_day_not_per_tick(tmp_path, monkeypatch, capsys):
     import json
     _quiet_never(monkeypatch, tmp_path)
+    monkeypatch.setattr(ps, "_birthday_importance", lambda *a: {"jordan": {"tier": "vip"}})
     monkeypatch.setenv("SOTTO_BIRTHDAY_LEAD_DAYS", "3")
     now = ps._now_local("+00:00")
     local_path = tmp_path / "local.json"
@@ -905,3 +975,45 @@ def test_a_second_chase_is_not_blocked_by_the_brief_naming_the_loop(tmp_path, mo
     out = ps.scan([], [], {}, "me@x.com", now, chase_candidates=[c],
                   brief_named=ps._brief_named_keys(now))
     assert [n["kind"] for n in out["nudges"]] == ["chase"]
+
+
+def test_gift_prompt_requires_vip_but_day_of_greeting_does_not():
+    now = _at(10)
+    local = {'contacts': [{'name': 'Jordan', 'birthday': (now + timedelta(days=3)).strftime('%m-%d')}]}
+    assert not [n for n in ps.scan([], [], local, 'me@x.com', now)['nudges'] if n['kind'] == 'birthday']
+    for tier in ('vip', 'vvip'):
+        due = ps.scan([], [], local, 'me@x.com', now, birthday_importance={'jordan': {'tier': tier}})['nudges']
+        assert len(due) == 1 and due[0]['importance']['tier'] == tier
+    local['contacts'][0]['birthday'] = now.strftime('%m-%d')
+    due = ps.scan([], [], local, 'me@x.com', now)['nudges']
+    assert len(due) == 1 and 'gift' not in due[0]['detail']
+
+
+def test_gift_gate_reads_explicit_choice_without_promoting_an_urgent_stranger(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    (tmp_path / 'knowledge').mkdir()
+    (tmp_path / 'knowledge/relationship_state.json').write_text(json.dumps({'attention_queue': [{'display_name': 'Stranger', 'priority': 99999}], 'history': {}}))
+    (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'vip_people': ['Jordan']}}))
+    local = {'contacts': [{'name': 'Jordan'}, {'name': 'Stranger'}]}
+    importance = ps._birthday_importance(local, _at(10))
+    assert importance['jordan']['tier'] == 'vip'
+    assert importance['stranger']['tier'] == 'regular'
+
+
+def test_duplicate_cards_for_one_identity_keep_explicit_vip_alias(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    (tmp_path / 'knowledge').mkdir()
+    (tmp_path / 'knowledge/relationship_state.json').write_text(json.dumps({'history': {}}))
+    (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'vip_people': ['Jordy']}}))
+    local = {'contacts': [
+        {'name': 'Jordy', 'canonical_id': 'c_jordan'},
+        {'name': 'Jordan Lee', 'canonical_id': 'c_jordan'},
+        {'name': 'Jordan Lee', 'canonical_id': 'c_other'},
+    ]}
+    importance = ps._birthday_importance(local, _at(10))
+    assert importance['jordy']['tier'] == 'vip'
+    assert importance['canonical:c_jordan']['tier'] == 'vip'
+    # The same-name c_other card cannot borrow the explicit choice.
+    assert importance['canonical:c_other']['tier'] == 'regular'

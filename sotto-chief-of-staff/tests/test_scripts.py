@@ -1,4 +1,4 @@
-"""Tests for continuity_resolve, log_outcome, learn_preferences, style_extract, style_apply."""
+"""Tests for continuity_resolve, log_outcome, style_extract, style_apply."""
 import importlib.util
 import json
 import os
@@ -16,7 +16,6 @@ def _load(rel, name):
 
 cr = _load("morning-brief/scripts/continuity_resolve.py", "continuity_resolve")
 lo = _load("_shared/scripts/log_outcome.py", "log_outcome")
-lp = _load("approval-tiers/scripts/learn_preferences.py", "learn_preferences")
 se = _load("_shared/scripts/style_extract.py", "style_extract")
 sa = _load("_shared/scripts/style_apply.py", "style_apply")
 
@@ -196,14 +195,6 @@ def test_continuity_dedup_bumps_times_surfaced(tmp_path):
     assert item["times_surfaced"] == 2
 
 
-def test_log_outcome_and_learn(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
-    for _ in range(3):
-        lo.log({"contact": "spammy", "action_type": "reply", "outcome": "dismissed"})
-    lo.log({"contact": "sarah", "action_type": "reply", "outcome": "edited_and_sent"})
-    prefs = lp.learn()
-    assert "spammy|reply" in prefs["deprioritization_hints"]
-    assert prefs["analytics"]["total_outcomes"] == 4
 
 
 def test_log_outcome_rejects_invalid(tmp_path):

@@ -1,6 +1,6 @@
 ---
 name: sotto-people
-description: Use when the user asks Sotto about the people in their life — who needs attention, who they haven't talked to in a while, birthdays, or a profile of a specific person.
+description: Use when the user asks Sotto about the people in their life — who needs attention, who they haven't talked to in a while, birthdays, a profile of a specific person, or finding, adding, editing or deleting a Google contact.
 metadata:
   hermes:
     tags: [chief-of-staff, sotto, people]
@@ -33,3 +33,18 @@ The People tab, as a conversation. PORT SOURCE: people analytics + attention que
 - **Grounded only:** state only facts found in the knowledge graph, the continuity ledger, or live Bridge/Google results. If it isn't there, say "I don't have that on X" — never guess a role, company, or reason.
 - **No data:** empty graph + empty ledger → one honest line ("I don't have anything on the people front yet — briefs build this up over time"), not a padded answer.
 - Surface *why* someone needs attention, then offer to draft (hand to `sotto-draft-reply`, under the approval tiers).
+
+## Google address book
+
+Use `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/google_action.py" capabilities` to check actual grants. Google Contacts is separate from the Mac Contacts reader and Sotto's relationship graph.
+
+- Find: `contacts-search --query "<name, email or phone prefix>"`. Read the exact match with `contacts-get --resource-name people/c...` before editing. Ask which contact if ambiguous; never invent a resource name.
+- Add on request: `contacts-create --fields-json '{"names":[{"givenName":"Alex","familyName":"Example"}],"emailAddresses":[{"value":"alex@example.com"}]}'`.
+- Edit on request: `contacts-update --resource-name people/c... --fields-json '{"phoneNumbers":[{"value":"+15555550123","type":"mobile"}]}'`. Each supplied field replaces its entire array: preserve existing numbers/emails when adding another. Omitted fields remain unchanged. Allowed fields are names, emailAddresses, phoneNumbers, organizations, birthdays, addresses and biographies.
+- Delete only when the user explicitly asks to delete that exact contact: `contacts-delete --resource-name people/c...`.
+
+All writes use the shared approval/unattended gate. Never bypass it through the upstream CLI or direct API. A connection grant permits tools to act when asked; it does not authorize background edits. Confirm completion only after the tool returns a successful result with the contact ID. If access is missing, ask the user to reconnect Google; do not claim it was saved locally or to their Mac.
+
+## Who matters most
+
+For "who is important / who are my VIPs", run `python3 "$HOME/.hermes/skills/sotto/_shared/lib/relationship_importance.py"`; add `--person "<name>"` to explain one person. This reads the shared relationship history and applies the current rolling window, rather than ranking by overdue replies or raw message volume. Report the returned tier, active days/weeks and two-way evidence. The user's `preferences.py vip` choice overrides activity; names that resolve ambiguously need clarification. This importance controls proactive gift offers, not automatic permission to send, buy or bypass quiet hours. Explicitly requested gift help is always allowed.

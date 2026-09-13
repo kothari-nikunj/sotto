@@ -35,7 +35,10 @@ before loading any skill or drafting anything, is:
 
     python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" get
 
-- **A fresh offer comes back** → that is what they said yes to, even if something else in this
+- **`ambiguous: true`** → more than one delivered question is still unanswered. Ask which
+  question they mean. Do not choose the newest one, clear the offers, or perform an action.
+  An explicit reply-to message ID can select its exact question with `get --message-id <id>`.
+- **A single fresh offer comes back** → that is what they said yes to, even if something else in this
   session looks like a plausible referent. Act on it — `meeting_prep` → run **`sotto-meeting-prep`**
   focused on that offer's `person`, the deep single-person prep, never a list of the day's other
   meetings — then run `pending_offer.py clear`. `procedure` → the offer's `detail` is a standing
@@ -43,23 +46,40 @@ before loading any skill or drafting anything, is:
   `master_file.py append --section Procedures --text "<the detail>"`, confirm in one line
   ("Standing rule saved: …"), then `pending_offer.py clear`.
   If the offer carries a **`payload_sha256`**, its yes causes a real effect: run the acting verb with
-  `--offer-bound` (it re-checks the hash and refuses if the content changed since the offer, and
-  clears the offer itself on success) — never hand-clear it and send anyway.
+  `--offer-bound --offer-id "<offer_id>"` (the `offer_id` that `get` returned — a bare
+  `--offer-bound` is refused). The verb requires that exact fresh offer, its named action and a
+  matching payload hash, refuses if the content changed since the offer, and consumes the offer
+  before the effect starts — so after any outcome (sent, refused by the provider, timed out,
+  crashed) a retry needs a fresh offer; never hand-clear it and send anyway.
+  For an offer with no `payload_sha256` (a read-only yes), clear that exact offer with
+  `pending_offer.py clear --offer-id "<offer_id>"` once you have acted; a new question may arrive
+  during your work.
 - **`{}`** → only then resolve the reply against this conversation; if nothing here plainly fits,
   ask, in one line, what they mean. Never guess.
 
-The same check runs for a short reply that DISMISSES — "done", "handled", "already handled",
-"sorted", "let it go", "drop it", "skip it", "no", "leave it" (the two lists are
-`pending_offer.DISMISS_RESOLVED` / `DISMISS_DROPPED`). A fresh offer of kind `chase`, `commitment`
-or `handoff` carries the loop's **`anchor_key`**: "done"-shaped →
-`knowledge_edit.py --op loop --anchor "<anchor_key>" --to resolved`; "let it go"-shaped →
-`… --to dismissed`. Confirm in one line ("Closed — Maya's contract."), then `pending_offer.py clear`.
-A dismissal of any other kind of offer (a prep, a tidy-up, a mute, a standing rule) just clears it;
-say nothing more than "ok". Never resolve a loop by name-matching a bare "done" against this
-conversation — without the anchor on the offer, ask which one they mean.
+For a short negative, completion or cancellation reply — "no", "skip it", "done", "handled",
+"let it go", "drop it" — run the deterministic handler with the user's EXACT words:
 
-A `mute` offer ("you keep dismissing Bob's items — stop bringing them up?") on a yes runs
-`preferences.py mute-person "<the offer's person>"`, confirms in one line, then clears.
+    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" dismiss-reply --text "<actual user reply>"
+
+Pass the text literally as one argument; never paraphrase "no" into "drop it". The handler owns
+the vocabulary and calls the existing ledger writer only for explicit completion/cancellation.
+`no_offer` uses the existing **`{}` fallback above**: resolve against the visible conversation;
+ask only if it has no clear referent. Do not use an expired offer's anchor. An ordinary "no" to a
+question in this chat needs no clarification and still cannot cancel an obligation.
+`declined` means the offer was declined and the obligation was left unchanged: for a loop say
+"OK — I'll leave it open." `resolved` / `dismissed` means that exact anchored loop was changed;
+confirm in one line. If `offer_cleared` is false, a new offer or cleanup failure may remain; do not
+hand-clear it. `clarify` with `loop_changed: false` means nothing changed: ask what they mean,
+without clearing the offer or editing a loop yourself. `clarify` with `loop_changed: null` means
+the write could not be confirmed: report the failure, inspect the anchored loop before any retry,
+and never claim success or blindly repeat the write. A bare "no", "not yet" or "skip it" NEVER cancels an obligation,
+including when the question was "is this done?". A negative to a prep or standing-rule offer just
+declines that offer. Never bypass this handler with a direct loop write for these short replies.
+
+Automatic mute suggestions are paused: recorded draft non-use is not a request to mute a person.
+If an old `mute` offer is still pending, clear it and ask for an explicit instruction such as
+"mute Bob"; never act on its bare "yes". Explicit mute requests still use `sotto-feedback`.
 
 An explicit request ("prep me for Shivani") always wins over the file; the file exists precisely
 because a bare "sure" carries no referent of its own. Skipping this check is how the user says yes
@@ -85,6 +105,29 @@ Facts about who they are / their world go to `About`, `People`, or `Priorities` 
 rule per line. Never write anything you merely inferred — an unstated pattern is a suggestion to
 offer, not a memory to save. If the write fails because the file is at its size cap, say which
 section is largest and ask what to trim — never trim on your own.
+
+### Observed context and usefulness
+
+The receiver prepares the first useful look automatically after context and delivery connect.
+It also resumes historical learning and runs bounded work-driven curation. Do not start another seed
+or Dreamer from chat, promise the whole history is processed, or ask a profile questionnaire before
+delivering value. The progress receipt is `$SOTTO_DATA/knowledge/history-state.json`; a connected
+source, a fetched page, and a semantically reviewed message are different claims.
+
+For a question that needs prior context, read the person's `knowledge_query.py` output and:
+
+    python3 "$HOME/.hermes/skills/sotto/_shared/lib/personal_context.py" --feedback-only
+
+The person's `knowledge_query.py --person` response includes durable graph facts. The separate
+command renders the owner's specific usefulness examples. Historical asks are never recreated as
+current work; the live ledger owns outstanding actions. Unresolved memory conflicts stay uncertain until evidence or the
+owner resolves them. Facts and summaries remain correctable through the existing feedback skill.
+
+Actual sent messages and edits are evidence for writing voice; sustained reciprocal activity
+informs relationship importance. Neither implies permission, a standing priority or a sender mute.
+The owner's current explicit instructions override inferred patterns. Missing feedback and silence
+are not negative ratings. “That was useful” or “not useful” goes to **sotto-feedback**, bound to the
+actual item; don't infer it from a processing Tapback.
 
 ### Finding someone's email address — search before you ever ask
 
@@ -140,6 +183,11 @@ have is "not connected" — never try to discover, build, or repair it yourself.
   scan, and it reads nothing a gated deck shows. The tool's own `gate` / verification refusal is
   the answer to relay verbatim (with `--passcode` if the user gives one), never a reason to try
   another way.
+- **A tap link is copied or omitted, never rewritten.** Every tappable link comes from a script
+  (`action_links.py`, an action's `tap_link`) and is delivered verbatim. Never mask, shorten or
+  retype a phone number or address inside one (`+141****3682` opens nothing — the delivery seam
+  drops it), never change its scheme, and never append your own "Tap to send" after a brief that
+  already rendered the link. No script output, no link.
 - **Never loop on failure.** If a tool call errors, do **not** retry the same call. Report what failed in
   one line and stop. Do not try variations of the same command repeatedly.
 - **`execute_code` blocked (scheduled/cron runs)?** Run the SAME command through the `terminal` tool
@@ -152,3 +200,5 @@ have is "not connected" — never try to discover, build, or repair it yourself.
   tokens for nothing. Say "I hit a rate limit, pausing" and stop.
 - **Stay in your lane.** Chief-of-staff tasks → the `sotto-*` skills. Everything else → the general
   assistant. Never improvise infrastructure debugging or setup automation.
+
+Proactive gifts: offer gift help only when the shared relationship importance reader returns VIP or VVIP, including an explicit user VIP choice. A birthday, guest invitation, rich research profile or overdue reply alone is not evidence of importance. Use `sotto-people` to check and explain the activity evidence. Ordinary birthday greetings can remain; never upgrade one to a gift pitch. If the user explicitly asks for gift help for someone, help regardless of inferred tier; do not purchase without their approval.

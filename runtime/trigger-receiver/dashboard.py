@@ -41,10 +41,8 @@ Write model (M2 — "edits feed the flywheel, not a side channel"):
     receiver's HOOKS["find_script"], the _find_sotto_script pattern) — so a dashboard correction
     rides the identical knowledge_update.apply() / ledger code path a chat correction does. The
     receiver image carries no PyYAML; the skills tree does. Skills tree absent → 503.
-  * Preferences have no chat-equivalent write path, so /api/prefs edits preferences.json directly
-    (whitelisted lists only, atomic 0600 write). Deleting a RECOMPUTED rule also writes a
-    `suppressed` tombstone so learn_preferences.py can't resurrect it — a rule you delete stays
-    deleted.
+  * Preferences use preferences.py, the same writer as chat. Historical inferred rules are
+    ignored; only stated preferences are editable here.
   * Every successful write appends {ts, event: "write", endpoint, target, op} to
     dashboard_audit.jsonl. Input caps: text <= 500 chars; empty/whitespace ops rejected.
 """
@@ -80,13 +78,8 @@ def _unwired_write_json(*_a, **_k):
     raise RuntimeError("dashboard.HOOKS['write_json'] is unwired — load this module from receiver.py")
 
 
-def _unwired_transaction(*_a, **_k):
-    raise RuntimeError("dashboard.HOOKS['json_transaction'] is unwired — load this from receiver.py")
-
-
 HOOKS = {
     "data_root": lambda: os.environ.get("SOTTO_DATA", "/data"),
-    "json_transaction": _unwired_transaction,
     "setup_code": lambda: "",
     "bridge_connected": lambda: False,
     "last_event_at": lambda: None,
@@ -249,30 +242,14 @@ ACTIVE_LOOP_STATUSES = frozenset({"open", "waiting", "failed", "blocked"})
 # still carry them.
 EXCLUDED_LOOP_ACTION_TYPES = frozenset({"meeting_prep", "meeting_info"})
 
-# preferences.json real shape (learn_preferences.py + preferences.py): top-level rule lists
-# `deprioritization_hints` / `edit_heavy` (["contact|action_type", ...]), dict `approval_defaults`
-# ({"contact|action_type": tier}), and the user-stated `explicit` block's four lists. No rule
-# carries an enabled flag, so the one safe op is delete; `analytics`/`version`/`style` stay
-# untouchable. Deleting from a dict list uses the entry VALUE as its id (stable across the
-# learner's wholesale rewrites, unlike an index). PREF_TOP_LISTS + PREF_DICTS are the RECOMPUTED
-# ones — deleting from those also writes a `suppressed` tombstone (see _post_prefs).
-PREF_TOP_LISTS = frozenset({"deprioritization_hints", "edit_heavy"})
-PREF_EXPLICIT_LISTS = frozenset({"mute_senders", "mute_people", "mute_sections", "tone_notes",
-                                 "vip_people"})
-PREF_DICTS = frozenset({"approval_defaults"})
-# The explicit block's lists DO have a chat-equivalent writer — preferences.py, the CLI the
-# sotto-feedback skill uses — so adds and removes there ride it (see _run_prefs). These are its CLI
-# verbs: {list: (add-verb, remove-verb)}. The recomputed lists above have no such verb, which is
-# exactly why _post_prefs still edits them directly (and tombstones them).
-# An empty remove-verb means the CLI has no PER-VALUE removal for that list (preferences.py's
-# `clear-tone` clears all tone notes, which is a different act) — those deletes fall back to this
-# module's own atomic edit, exactly as they did before.
+# Stated preferences are edited through the same CLI as chat. Historical learned fields
+# remain on disk for inspection, but are no longer produced or offered as policy controls.
 PREF_EXPLICIT_VERBS = {
     "mute_senders": ("mute-sender", "unmute-sender"),
     "mute_people": ("mute-person", "unmute-person"),
     "mute_sections": ("mute-section", "unmute-section"),
     "vip_people": ("vip", "unvip"),
-    "tone_notes": ("tone", ""),
+    "tone_notes": ("tone", "remove-tone"),
 }
 # The Add form offers only the lists with a deterministic verb AND a rule you can state in one
 # sentence. tone_notes is deliberately absent: "keep it terse" is a note to the writer, not a
@@ -1692,7 +1669,9 @@ def _outbox_counts() -> dict:
     except Exception:  # noqa: BLE001 — a stat line is never worth a 500 on the Briefs page
         raw = {}
     out = {}
-    for field in ("pending", "failed"):
+    # effects_failed: messages that DID go out but whose follow-up (a chase counted, an offer
+    # armed) was quarantined — the one number that explains "Sotto never noticed my yes".
+    for field in ("pending", "failed", "effects_pending", "effects_failed"):
         value = raw.get(field) if isinstance(raw, dict) else None
         out[field] = value if isinstance(value, int) and not isinstance(value, bool) else 0
     return out
@@ -1796,10 +1775,12 @@ def api_calendar() -> dict:
     snap = HOOKS["calendar_snapshot"]()
     if not isinstance(snap, dict):      # None = skills tree absent (or the hook is unwired)
         return {"events": [], "unavailable": True}   # cheap check — nothing worth caching
-    events = snap.get("events") or []
+    events = [{key: value for key, value in event.items() if key != "_id"}
+              for event in (snap.get("events") or [])]
     return {"events": _enrich_calendar_events(events),
             "generated_at": _s(snap.get("generated_at")),
-            "cached": bool(snap.get("cached"))}
+            "cached": bool(snap.get("cached")),
+            **{key: snap[key] for key in ("status", "complete", "unavailable", "last_attempt_at") if key in snap}}
 
 
 def api_research() -> dict:
@@ -2438,90 +2419,35 @@ def _post_runs(h, body: dict):
     return _json(h, 200, {"ok": True, "skill": _s(result.get("skill")), **api_runs()})
 
 
-def _write_prefs(prefs: dict) -> None:
-    """THE atomic 0600 write of preferences.json — indent=2 because learn_preferences.py writes it
-    that way and the two must not fight over the file's shape."""
-    HOOKS["write_json"](os.path.join(_root(), "preferences.json"), prefs, 0o600, 2)
-
-
 def _post_prefs(h, body: dict):
-    """POST /api/prefs {op: "delete"|"add", list, value} → the updated preferences object.
-
-    TWO write paths, because preferences.json has two halves and only one of them has a chat verb:
-      * the `explicit` block (mutes, VIPs, tone notes) is the user's STATED preferences, and
-        preferences.py is the CLI the sotto-feedback skill writes them with — so adds and per-value
-        removes shell out to it (PREF_EXPLICIT_VERBS). Muting a sender from the dashboard is
-        byte-for-byte what texting "stop surfacing them" does.
-      * `deprioritization_hints`, `edit_heavy` and `approval_defaults` are LEARNED — recomputed
-        from outcomes.jsonl by every Learn run, with no verb to state them — so a delete there is
-        this module's own atomic edit, plus a tombstone.
-
-    ONE SENTENCE: a rule you delete stays deleted. Because the learned lists are rebuilt every
-    morning, removing the entry alone would let it reappear — the delete is therefore also recorded
-    in the top-level `suppressed` list, which learn_preferences.py filters out when it rebuilds. The
-    `explicit` block needs no tombstone: the learner carries it forward verbatim.
-    (`suppressed` is top-level, not inside `explicit`, because preferences.py's _save() reshapes
-    that block to its own LISTS/SCALARS and would drop any extra key.)"""
+    """Edit a stated preference through the chat CLI; never infer permission from draft usage."""
     op = _s(body.get("op"))
     if op not in ("delete", "add"):
         return _json(h, 400, {"error": "bad op"})
     lst = _s(body.get("list"))
-    if op == "add":
-        if lst not in PREF_ADDABLE:
-            return _json(h, 400, {"error": "bad list"})
-    elif lst not in PREF_TOP_LISTS | PREF_EXPLICIT_LISTS | PREF_DICTS:
+    if lst not in (PREF_ADDABLE if op == "add" else PREF_EXPLICIT_VERBS):
         return _json(h, 400, {"error": "bad list"})
     value = _clean_text(body.get("value"))
     if value is None:
         return _json(h, 400, {"error": "bad value (1-500 chars required)"})
-    verbs = PREF_EXPLICIT_VERBS.get(lst) or ("", "")
-    verb = verbs[0] if op == "add" else verbs[1]
-    if verb:
-        result = _run_prefs([verb, value])
-        if result is None:
-            return _json(h, 503, {"error": "skills tree unavailable"})
-        if not result.get("ok"):
-            return _json(h, 400, {"error": _s(result.get("error")) or "that didn't save"})
-        prefs = _read_json_file("preferences.json", default=None)
-        if not isinstance(prefs, dict):
-            prefs = {}
-        _audit("write", endpoint="/api/prefs", target=f"{lst}:{value}"[:200], op=op)
-        return _json(h, 200, prefs)
-    if op == "add":                     # no verb for this list → nothing safe to invent
-        return _json(h, 400, {"error": "bad list"})
-    # The delete of a LEARNED rule is the one direct write this surface keeps (it has no CLI verb),
-    # and it is a read-modify-write on the file the learner also rewrites every brief. It therefore
-    # runs inside the shared lock — same sidecar the skills tree takes — so a tombstone can't be
-    # lost to a rebuild that started a moment earlier.
-    removed = False
-    with HOOKS["json_transaction"](os.path.join(_root(), "preferences.json"),
-                                   default={}, mode=0o600, indent=2) as prefs:
-        if lst in PREF_DICTS:
-            d = prefs.get(lst)
-            if isinstance(d, dict) and value in d:
-                d.pop(value)
-                removed = True
-        elif lst in PREF_TOP_LISTS:
-            v = prefs.get(lst)
-            if isinstance(v, list) and value in v:
-                prefs[lst] = [x for x in v if x != value]
-                removed = True
-        else:  # explicit block lists (preferences.py's reserved user-stated block)
-            ex = prefs.get("explicit")
-            if isinstance(ex, dict) and isinstance(ex.get(lst), list) and value in ex[lst]:
-                ex[lst] = [x for x in ex[lst] if x != value]
-                removed = True
-        if removed and (lst in PREF_TOP_LISTS | PREF_DICTS):
-            # recomputed every Learn run → leave a tombstone so it can't be resurrected
-            sup = prefs.get("suppressed")
-            if not isinstance(sup, list):
-                sup = []
-            tomb = {"list": lst, "value": value}
-            if tomb not in sup:
-                sup.append(tomb)
-            prefs["suppressed"] = sup
-        snapshot = dict(prefs)
-    if not removed:
+    verb = PREF_EXPLICIT_VERBS[lst][0 if op == "add" else 1]
+    # A delete of a value that is not there (a stale second tab, a typo) is not a write: say so
+    # before the CLI runs, and never record an audit row for a change that did not happen.
+    if op == "delete" and not _explicit_has(_read_json_file("preferences.json", default={}), lst, value):
         return _json(h, 404, {"error": "not found"})
-    _audit("write", endpoint="/api/prefs", target=f"{lst}:{value}"[:200], op="delete")
-    return _json(h, 200, snapshot)
+    result = _run_prefs([verb, value])
+    if result is None:
+        return _json(h, 503, {"error": "skills tree unavailable"})
+    if not result.get("ok"):
+        return _json(h, 400, {"error": _s(result.get("error")) or "that didn't save"})
+    prefs = _read_json_file("preferences.json", default={})
+    _audit("write", endpoint="/api/prefs", target=f"{lst}:{value}"[:200], op=op)
+    return _json(h, 200, prefs if isinstance(prefs, dict) else {})
+
+
+def _explicit_has(prefs, lst: str, value: str) -> bool:
+    """Is `value` in the explicit list, case-insensitively — the CLI's own norming is at most that."""
+    block = prefs.get("explicit") if isinstance(prefs, dict) else None
+    values = block.get(lst) if isinstance(block, dict) else None
+    want = value.strip().lower()
+    return any(_s(v).strip().lower() == want for v in (values if isinstance(values, list) else []))

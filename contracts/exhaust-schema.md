@@ -4,8 +4,7 @@ Byte-compatible with today's iCloud `Sotto/` layout (PORT SOURCE: knowledge_file
 style-profile.ts) so existing files migrate as-is. Encrypted at rest, per-tenant.
 
 Every row names its **owning writer** — the one script allowed to write that shape. Readers are
-many; writers are one (`preferences.json` is the single documented exception, and it carries its own
-rule). Paths are relative to `$SOTTO_DATA/`; scripts are relative to `sotto-chief-of-staff/`.
+many; writers are one. Paths are relative to `$SOTTO_DATA/`; scripts are relative to `sotto-chief-of-staff/`.
 
 | Path | What it is | Written by |
 |---|---|---|
@@ -14,8 +13,8 @@ rule). Paths are relative to `$SOTTO_DATA/`; scripts are relative to `sotto-chie
 | `knowledge/continuity/<anchor>.md` | open loop — frontmatter only | `morning-brief/scripts/continuity_resolve.py` (`_shared/scripts/retune_apply.py` and `_shared/knowledge/knowledge_edit.py --op loop*` mutate through its loader/persister; `_shared/scripts/ledger_io.py` is the shared READ side) |
 | `knowledge/relationship_state.json` | attention queue + insights + per-contact history | `relationship-pulse/scripts/relationship_pulse.py` |
 | `style.json` | writing-style fingerprint (buckets + per_person) | `_shared/scripts/style_extract.py` |
-| `preferences.json` | learned rules (deprioritization, edit_heavy, analytics) **and** the user's stated `explicit` block | **two writers, deliberately:** `approval-tiers/scripts/learn_preferences.py` (learned lists) and `_shared/scripts/preferences.py` (`explicit`). See ARCHITECTURE.md — a rule you delete stays deleted. |
-| `outcomes.jsonl` | action outcomes (one JSON per line) | `_shared/scripts/log_outcome.py` |
+| `preferences.json` | User-stated `explicit` instructions; legacy inferred fields preserved but ignored | `_shared/scripts/preferences.py` — chat and dashboard invoke the same writer; Learn never rewrites it |
+| `outcomes.jsonl` | action outcomes + explicit item usefulness examples (one JSON per line) | `_shared/scripts/log_outcome.py` |
 | `events/surfaced.jsonl` · `events/queue.jsonl` | the Record: one row per verdict, and the work list the digest/valve consume | `event-triage/scripts/triage_event.py` |
 | `briefs/<date>_<type>.json` | delivered briefs | `_shared/scripts/compose_brief.py` (`_archive_brief`) |
 | `briefs/<date>.<type>.delivered` | per-day delivery flag (the deliver-once claim) | `_shared/scripts/brief_marker.py` |
@@ -33,6 +32,7 @@ linkedin: https://…        # optional
 last_researched: 2026-06-20 # optional
 updated_at: 2026-06-23T07:00:00Z
 updated_by: brief_extraction
+summary_refs: [f_a3e8c1b2f0]  # optional Dreamer selection; absent in legacy files
 relations:                   # optional; omitted entirely when there are none
 - type: introduced_by        # CLOSED vocabulary — see below
   slug: c_9f21ab             # the OTHER person's file stem (their canonical_id)
@@ -49,6 +49,7 @@ facts:
     conf: 0.95               # 0..1, decays 0.08/wk, floor 0.4
     source: brief_extraction
     source_ref: ""
+    evidence_refs: ["gmail:message-id"]  # optional, at most 64 independent references
     first: 2026-01-15
     last: 2026-02-18
     # archived_text: "<old>"  # only when superseded
@@ -247,3 +248,62 @@ validates; the consumer renders those as a bare `(no date)`.
 The windows are named constants in the Bridge (`LOCAL_LOOKBACK_DAYS`, `NOTES_MIN_LOOKBACK_HOURS`,
 `REMINDERS_LOOKAHEAD_DAYS`) — no env var. Rendering: `_shared/lib/render_local.py`
 (`_format_reminders`), against the brief's injected instant, never a second clock.
+
+## First-use and background memory
+
+`config/onboarding.json` is owned by receiver `onboarding.py`: phase (`composing`, `queued`,
+`delivered`, `existing`), lease/retry times, UTC attempt day/count and completion time. Waiting for
+sources does not claim delivery. Welcome archives use the ordinary brief shape with type `welcome`.
+
+`knowledge/history-state.json` is owned by `memory_cycle.py`: `sources[source]` carries initial
+and current window bounds, cursor, completion, pages/rows/reviewed counts, last success and optional
+sanitized retry/error and rejected-request revision; `next_source`, `last_run`, `receipt` govern
+bounded work. Retired daily accounting fields are removed when the cycle next runs. It stores no message bodies. `knowledge/dreamer.json` is owned by `dreamer.py`:
+`reviewed` maps canonical person IDs to the exact file hash reviewed, plus `last_run`.
+
+Historical learning writes durable facts through the existing graph writer. The retired episode
+store is not read; the next memory cycle deletes it without promoting summaries into facts or tasks.
+`knowledge/conflicts.json` is owned by `knowledge_update.consolidate`: `people[id] = {pairs: [[fact_id, fact_id]], at}`, at most three pairs
+per person and 100 people. Readers only show pairs whose facts are still active.
+
+Usefulness rows in `outcomes.jsonl` retain the existing timestamp/action shape and add
+`source: user_feedback`, `outcome: useful|not_useful`, `reference`, `excerpt`, `reason`. The
+`action_id` starts `feedback:` and cannot collide with draft grading keys. `log_outcome.py` remains
+the sole writer. These examples never mutate `preferences.json` or approval tiers.
+
+
+### Durable work and observation ownership
+
+| File | Single writer | Readers |
+|---|---|---|
+| `events/work.sqlite3` (+ SQLite WAL/SHM) | `_shared/lib/work_queue.py` | Receiver admission/worker recovery; triage input ownership; health metadata |
+| `events/work-inputs/brief-*/` | `brief_runner.py` | The same procedure and its ancillary learning follow-up; retention sweep |
+| `cache/brief-granola.json` | `brief_runner.py` | Brief preparation and composition; one-day retention sweep |
+| `.sotto-volume.json` | adapter `managed_volume.py` | Managed boot identity verification and recovery |
+| `.sotto-runtime.lock` | adapter `runtime_lock.py` | Process-lifetime writer exclusion |
+| `.sotto-recovery-hold.json` | adapter `recovery.py` | Restore delivery hold and explicit release |
+| `config/model-lease.json` | adapter `model_lease.py` | Model credential expiry diagnostics and renewal |
+| `config/source-state.json` | `_shared/lib/source_context.py` | Source projection, contextual memory, delivery validity |
+| `events/delivery-effects-<run>.json` | `_shared/lib/delivery_effects.py` (merged transaction) | Receiver result commit and outbox handoff |
+
+`work.sqlite3` owns execution and result recovery; `events/outbox.json` owns sending. A completed
+job result has the same stable ID at both stages. Provider acceptance requires structured success
+and a provider message ID. It leaves replayable `effects_pending` metadata; finalization retries do
+not send again. Invalidation uses a separate effect phase to retry replacement admission without
+activating offers or other acceptance effects. Raw text leaves terminal rows immediately.
+
+`config/source-state.json` stores `sources[id] = {status, observed_at, observed_epoch}` from
+authenticated Bridge observations. `disabled` revokes cached-source use; availability failures do
+not revoke permission. Managed capability state remains the authority for managed consent.
+Google's separate source-result receipt carries `{status, observed_at, complete, coverage:{since,until}}`
+with status `ok`, `partial`, `unavailable`, `disabled` or `skipped`. Legacy Gmail/Calendar data shapes
+are unchanged. A missing receipt is not equivalent to a successful empty read.
+
+Brief artifacts retain `_source_permissions`, `_source_cutoff` and `_calendar_eligibility`.
+The delivery sidecar merges those facts with other effects. Calendar eligibility carries exact
+provider ID/start and source observation time; absence is actionable only in a complete, fresh,
+matching-day projection observed no earlier than the candidate. `coverage_until` remains the
+original reviewed cutoff when an artifact is replayed. It advances the digest window only after
+acceptance, preserving later incoming context.
+
+`cache/brief-granola.json` contains `{observed_at, data}`. The data is a gathered-meetings envelope, reused for at most 24 hours with a warning beyond 30 minutes. The retention sweep applies `NOTES_CACHE_DAYS = 1`; expiry does not delete canonical meeting facts.

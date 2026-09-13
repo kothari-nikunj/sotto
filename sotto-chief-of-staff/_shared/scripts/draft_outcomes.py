@@ -4,8 +4,8 @@ draft_outcomes.py — match offered drafts against what the user actually sent (
 
 In one sentence: a draft matches the first message you sent to the same person within 24 hours of
 the offer — ≥0.95 similarity is sent-verbatim, ≥0.60 is edited-and-sent, and a 24-hour-old draft
-with no match was dismissed; every terminal outcome lands in outcomes.jsonl through log_outcome
-(the writer learn_preferences.py has always tallied), and a verbatim send confirms its style
+with no match is recorded as dismissed (legacy vocabulary, not explicit feedback); every terminal outcome lands in outcomes.jsonl through log_outcome
+and a verbatim send confirms its style
 sample so the voice register finally gets graded.
 
 The two halves it joins:
@@ -19,13 +19,15 @@ The two halves it joins:
 We only grade what we can see, and "can see" is checked per draft: a draft is dismissed only when
 its channel's outbound lane showed life during the window (at least one sent-message signal from
 that lane) — a Mac that slept all day, or a disabled Gmail poll, must never turn every offered
-draft into a false "dismissed" that poisons learn_preferences' deprioritization. Email is
+draft into a false "dismissed" that misstates draft usage. Email is
 observable since the poll's `in:sent` lane (poll_gmail.SENT_QUERY) started queuing the user's own
 outbound mail as signals; email signal text is compared with the quoted reply tail stripped, since
 a Gmail reply body carries the whole thread below the new words.
 
-Runs at the top of learn_preferences.learn(), so one Learn invocation does match → tally in
-order; also a CLI (prints the run summary as JSON) for on-demand runs and tests. Idempotent:
+Automatic mute suggestions do not consume these dismissal signals. Cross-channel attribution and
+a distinct non-use outcome belong to the coordinated tracking redesign.
+
+Runs directly in learn_step.py; also a CLI (prints the run summary as JSON) for on-demand runs and tests. Idempotent:
 outcomes.jsonl rows carry the draft's key as action_id, and a draft with a recorded outcome is
 never graded twice.
 """
@@ -82,9 +84,13 @@ def _rows(path: str) -> list:
                 if not line or line.startswith("#"):
                     continue
                 try:
-                    out.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # A torn write or a stray echo can leave a non-object line; it is not a row, and
+                # since Learn runs this grader directly one such line must not fail the receipt.
+                if isinstance(row, dict):
+                    out.append(row)
     except OSError:
         pass
     return out
@@ -237,8 +243,7 @@ def run(now=None) -> dict:
 
 
 def action_links_drafts_path() -> str:
-    """One path, one owner: action_links.drafts_path() writes it, we read it. Imported lazily so a
-    broken sibling never breaks the tally learn_preferences runs after us."""
+    """One path, one owner: action_links.drafts_path() writes it, we read it. Imported lazily so the grader can still find historical drafts if the link builder is unavailable."""
     try:
         import action_links  # noqa: PLC0415
         return action_links.drafts_path()

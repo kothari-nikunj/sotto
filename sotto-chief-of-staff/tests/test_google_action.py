@@ -13,6 +13,42 @@ def test_run_errors_clearly_when_cli_missing(monkeypatch):
     assert out["status"] == "error" and "not found" in out["error"]
 
 
+def test_managed_readonly_draft_fails_before_google_and_keeps_text(tmp_path, monkeypatch):
+    token = tmp_path / 'token.json'
+    token.write_text(json.dumps({'refresh_token': 'fixture', 'scopes': [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/calendar.readonly']}))
+    monkeypatch.setattr(ga, '_token_path', lambda: str(token))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setattr(ga, '_gmail_service', lambda: pytest.fail('must not attempt a write'))
+    cap = ga.capabilities()
+    assert cap['gmail_read'] and cap['calendar_read']
+    assert not cap['gmail_draft'] and not cap['calendar_write']
+    result = ga._gmail_draft('person@example.com', 'Draft text')
+    assert result['status'] == 'error' and result['fallback'] == 'request_google_consent'
+
+
+def test_capabilities_uses_granted_scopes_and_no_credentials_escape(tmp_path, monkeypatch, capsys):
+    token = tmp_path / 'token.json'
+    token.write_text(json.dumps({'refresh_token': 'secret-fixture', 'scopes':
+        'openid https://www.googleapis.com/auth/gmail.compose'}))
+    monkeypatch.setattr(ga, '_token_path', lambda: str(token))
+    monkeypatch.setattr('sys.argv', ['google_action.py', 'capabilities'])
+    ga.main()
+    out = capsys.readouterr().out
+    assert 'secret-fixture' not in out
+    assert json.loads(out)['gmail_draft'] is True
+    assert json.loads(out)['gmail_read'] is False
+
+
+def test_managed_draft_needs_actual_google_receipt(monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setattr(ga, 'capabilities', lambda: {'gmail_draft': True})
+    _fake_service(monkeypatch, draft_result={})
+    result = ga._gmail_draft('person@example.com', 'Draft text')
+    assert result['status'] == 'error' and result['fallback'] == 'draft_text'
+
+
 def test_gmail_reply_builds_exact_cli(monkeypatch, capsys):
     cap = {}
     monkeypatch.setattr(ga, "_run", lambda args: cap.__setitem__("args", args) or {"status": "sent", "threadId": "t"})

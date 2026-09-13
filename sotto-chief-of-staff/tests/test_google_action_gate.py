@@ -7,7 +7,7 @@ inside google_action.py. These tests pin: the refusal (shape + exit 2 + no netwo
 allowed unattended, the metadata-only receipt with a payload hash that proves either way, and
 `--offer-bound` — which turns a cross-process "sure" into a match against the exact content offered.
 """
-import importlib.util, json, os
+import importlib.util, json, os, subprocess, sys
 import pytest
 
 HERE = os.path.dirname(__file__)
@@ -21,6 +21,10 @@ po = importlib.util.module_from_spec(_po_spec); _po_spec.loader.exec_module(po)
 
 BODY = "Confirming Thursday 3pm — see you at the Ferry Building."
 SUBJECT = "Re: Thursday"
+
+
+def _send_payload(body=BODY, to="alex@acme.com", subject=""):
+    return ga._canonical({"to": to, "subject": subject, "body": body})
 
 
 @pytest.fixture(autouse=True)
@@ -74,7 +78,9 @@ def test_unattended_send_is_refused_before_any_network(argv, ident, monkeypatch,
     assert receipt["verb"] == argv[0]
     assert receipt["unattended"] is True and receipt["result"] == "refused"
     assert receipt["ts"].endswith("Z")
-    assert receipt["payload_sha256"] == po.payload_hash(BODY.encode("utf-8"))
+    expected_payload = (_send_payload(subject=SUBJECT) if argv[0] == 'gmail-send'
+                        else ga._canonical({'message_id': 'M1', 'body': BODY}))
+    assert receipt["payload_sha256"] == po.payload_hash(expected_payload.encode("utf-8"))
 
 
 def test_any_non_empty_value_means_unattended(monkeypatch, capsys):
@@ -232,7 +238,7 @@ def test_attended_send_proceeds_and_records_sent(monkeypatch, capsys, tmp_path):
     receipt, = _receipts(tmp_path)
     assert receipt == {"ts": receipt["ts"], "verb": "gmail-send", "to": "alex@acme.com",
                        "unattended": False, "result": "sent",
-                       "payload_sha256": po.payload_hash(BODY.encode("utf-8")),
+                       "payload_sha256": po.payload_hash(_send_payload(subject=SUBJECT).encode("utf-8")),
                        "offer_bound": False}
 
 
@@ -279,7 +285,7 @@ def test_the_payload_hash_names_the_bytes_without_keeping_them(monkeypatch, tmp_
                                      "--subject", SUBJECT, "--body", BODY])
     ga.main()
     receipt, = _receipts(tmp_path)
-    assert receipt["payload_sha256"] == po.payload_hash(BODY.encode("utf-8"))
+    assert receipt["payload_sha256"] == po.payload_hash(_send_payload(subject=SUBJECT).encode("utf-8"))
     assert receipt["payload_sha256"] != po.payload_hash((BODY + " ").encode("utf-8"))
 
 
@@ -288,12 +294,12 @@ def test_the_payload_hash_names_the_bytes_without_keeping_them(monkeypatch, tmp_
 OFFER_Q = "Want me to send that confirmation?"
 
 
-def _bind(tmp_path, monkeypatch, payload: str):
+def _bind(tmp_path, monkeypatch, payload: str, action="gmail-send"):
     """The offering lane, three processes ago: one fresh offer carrying only the payload's hash."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(ga, "_pending_offer", lambda: po)
-    po.set_offer("commitment", OFFER_Q, person="Alex",
-                 payload_sha256=po.payload_hash(payload.encode("utf-8")))
+    return po.set_offer("commitment", OFFER_Q, person="Alex",
+                        payload_sha256=po.payload_hash(payload.encode("utf-8")), action=action)
 
 
 def _offer_file(tmp_path):
@@ -301,33 +307,70 @@ def _offer_file(tmp_path):
 
 
 def test_offer_bound_send_matches_then_sends_and_clears(monkeypatch, capsys, tmp_path):
-    _bind(tmp_path, monkeypatch, BODY)
+    offer = _bind(tmp_path, monkeypatch, _send_payload())
     monkeypatch.setattr(ga, "_run", lambda args: {"status": "sent", "id": "m1"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
-                                     "--body", BODY, "--offer-bound"])
+                                     "--body", BODY, "--offer-bound", "--offer-id", offer['offer_id']])
     ga.main()                                        # no SystemExit
     assert json.loads(capsys.readouterr().out)["status"] == "sent"
 
-    receipt, = _receipts(tmp_path)
+    started, receipt = _receipts(tmp_path)
+    assert started['result'] == 'started' and started['offer_id'] == offer['offer_id']
     assert receipt["result"] == "sent" and receipt["offer_bound"] is True
     assert not _offer_file(tmp_path).exists()        # the yes is spent, exactly once
+
+
+def test_offer_id_selects_exact_action_from_ambiguous_current_state(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(ga, "_pending_offer", lambda: po)
+    digest = po.payload_hash(_send_payload().encode())
+    first = po.set_offer("commitment", OFFER_Q, payload_sha256=digest, action="gmail-send")
+    second = po.set_offer("commitment", "Delete the event?", payload_sha256=digest,
+                          action="calendar-delete")
+    first.update(offer_id="offer-send", message_id="m1")
+    second.update(offer_id="offer-delete", message_id="m2")
+    _offer_file(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    _offer_file(tmp_path).write_text(json.dumps({"offers": [first, second], "accepted": {}}))
+    monkeypatch.setattr(ga, "_run", lambda args: {"status": "sent"})
+    monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
+                                     "--body", BODY, "--offer-bound", "--offer-id", "offer-send"])
+    ga.main()
+    assert json.loads(capsys.readouterr().out)["status"] == "sent"
+    assert po.get_offer(offer_id="offer-delete")["action"] == "calendar-delete"
+
+
+def test_offer_id_refuses_offer_for_another_action(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(ga, "_pending_offer", lambda: po)
+    offer = po.set_offer("commitment", OFFER_Q,
+                         payload_sha256=po.payload_hash(BODY.encode()), action="calendar-delete")
+    offer["offer_id"] = "wrong-action"
+    _offer_file(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    _offer_file(tmp_path).write_text(json.dumps({"offers": [offer], "accepted": {}}))
+    _no_network(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
+                                     "--body", BODY, "--offer-bound", "--offer-id", "wrong-action"])
+    with pytest.raises(SystemExit) as exc:
+        ga.main()
+    assert exc.value.code == 2
+    assert "does not authorize this action" in json.loads(capsys.readouterr().out)["error"]
 
 
 def test_offer_bound_refuses_a_mutated_payload_and_keeps_the_yes(monkeypatch, capsys, tmp_path):
     """Approve-then-mutate is the whole reason this exists: the user said yes to one sentence and
     the acting session assembled another. The offer is NOT cleared — their yes wasn't consumed by
     a send they never saw."""
-    _bind(tmp_path, monkeypatch, BODY)
+    offer = _bind(tmp_path, monkeypatch, _send_payload())
     _no_network(monkeypatch)
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
                                      "--body", BODY + " Also, wire the deposit today.",
-                                     "--offer-bound"])
+                                     "--offer-bound", "--offer-id", offer['offer_id']])
     with pytest.raises(SystemExit) as exc:
         ga.main()
     assert exc.value.code == 2
 
     out = json.loads(capsys.readouterr().out)
-    assert out["error"] == ("refused: payload does not match what the user approved — the content "
+    assert out["error"] == ("refused: payload does not match what the user approved — the action "
                             "changed after the offer")
     assert out["fallback"] == "re_offer"
 
@@ -336,23 +379,94 @@ def test_offer_bound_refuses_a_mutated_payload_and_keeps_the_yes(monkeypatch, ca
     assert _offer_file(tmp_path).exists()            # unspent: the question still stands
 
 
+def test_offer_bound_refuses_recipient_or_subject_substitution(monkeypatch, capsys, tmp_path):
+    offer = _bind(tmp_path, monkeypatch, _send_payload(subject='Approved subject'))
+    _no_network(monkeypatch)
+    monkeypatch.setattr('sys.argv', ['google_action.py', 'gmail-send', '--to', 'mallory@example.com',
+                                    '--subject', 'Changed subject', '--body', BODY, '--offer-bound',
+                                    '--offer-id', offer['offer_id']])
+    with pytest.raises(SystemExit):
+        ga.main()
+    assert 'action changed' in json.loads(capsys.readouterr().out)['error']
+    assert po.get_offer(offer_id=offer['offer_id'])  # validation failed before claim
+
+
+def test_print_payload_is_the_exact_offer_writer_contract(monkeypatch, capsys):
+    monkeypatch.setattr('sys.argv', ['google_action.py', 'gmail-send', '--to', 'alex@acme.com',
+                                    '--subject', SUBJECT, '--body', BODY, '--print-payload'])
+    ga.main()
+    assert capsys.readouterr().out == _send_payload(subject=SUBJECT)
+
+
+def test_cli_preview_file_offer_and_fake_effect_round_trip(tmp_path, monkeypatch):
+    google = os.path.join(HERE, '..', '_shared', 'scripts', 'google_action.py')
+    pending = os.path.join(HERE, '..', '_shared', 'scripts', 'pending_offer.py')
+    env = {**os.environ, 'SOTTO_DATA': str(tmp_path)}
+    preview = subprocess.run([sys.executable, google, 'gmail-send', '--to', 'alex@acme.com',
+                              '--subject', SUBJECT, '--body', BODY, '--print-payload'],
+                             check=True, capture_output=True, env=env).stdout
+    assert not preview.endswith(b'\n')
+    payload_file = tmp_path / 'payload.json'
+    payload_file.write_bytes(preview)
+    offered = subprocess.run([sys.executable, pending, 'set', '--kind', 'commitment',
+                              '--question', OFFER_Q, '--action', 'gmail-send',
+                              '--payload-file', str(payload_file)], check=True, capture_output=True,
+                             text=True, env=env)
+    offer = json.loads(offered.stdout)
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ga, '_pending_offer', lambda: po)
+    effects = []
+    out, refused = ga._gated('gmail-send', {'to': 'alex@acme.com'}, preview.decode(),
+                              lambda: effects.append(1) or {'status': 'sent'}, True,
+                              offer['offer_id'])
+    assert not refused and out['status'] == 'sent' and effects == [1]
+
+
+def test_calendar_rsvp_payload_includes_calendar():
+    from types import SimpleNamespace
+    primary = ga._action_payload(SimpleNamespace(cmd='calendar-rsvp', event_id='e1', response='accepted',
+                                                  calendar='primary', comment='', offer_bound=False,
+                                                  offer_id='', print_payload=False))
+    other = ga._action_payload(SimpleNamespace(cmd='calendar-rsvp', event_id='e1', response='accepted',
+                                                calendar='other@example.com', comment='', offer_bound=False,
+                                                offer_id='', print_payload=False))
+    assert primary != other and 'other@example.com' in other
+
+
+def test_two_concurrent_claimants_execute_only_one_effect(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ga, '_pending_offer', lambda: po)
+    payload = _send_payload()
+    offer = _bind(tmp_path, monkeypatch, payload)
+    effects = []
+    def attempt():
+        return ga._gated('gmail-send', {'to': 'alex@acme.com'}, payload,
+                         lambda: effects.append(1) or {'status': 'sent'}, True, offer['offer_id'])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: attempt(), range(2)))
+    assert effects == [1]
+    assert sorted(refused for _, refused in results) == [False, True]
+
+
 @pytest.mark.parametrize("prepare, reason", [
     (lambda tmp, mp: None,
-     "no fresh offer on file — the approval this would bind to is absent or expired"),
+     "selected offer is absent, expired, already claimed, or ambiguous"),
     (lambda tmp, mp: po.set_offer("commitment", OFFER_Q, ttl_min=-1,
-                                  payload_sha256=po.payload_hash(BODY.encode("utf-8"))),
-     "no fresh offer on file — the approval this would bind to is absent or expired"),
-    (lambda tmp, mp: po.set_offer("meeting_prep", "want me to pull prep?"),
+                                  payload_sha256=po.payload_hash(_send_payload().encode()), action='gmail-send'),
+     "selected offer is absent, expired, already claimed, or ambiguous"),
+    (lambda tmp, mp: po.set_offer("meeting_prep", "want me to pull prep?", action='gmail-send'),
      "the offer carried no payload to bind to — re-offer with the content in view"),
 ])
 def test_offer_bound_refuses_without_a_matching_offer(prepare, reason, monkeypatch, capsys, tmp_path):
     """Absent, expired, or an offer that never carried bytes — none of them is an authorization."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(ga, "_pending_offer", lambda: po)
-    prepare(tmp_path, monkeypatch)
+    offer = prepare(tmp_path, monkeypatch)
     _no_network(monkeypatch)
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
-                                     "--body", BODY, "--offer-bound"])
+                                     "--body", BODY, "--offer-bound", "--offer-id",
+                                     offer['offer_id'] if offer else 'missing'])
     with pytest.raises(SystemExit) as exc:
         ga.main()
     assert exc.value.code == 2
@@ -378,25 +492,27 @@ def test_offer_bound_calendar_write_binds_to_the_whole_event(monkeypatch, capsys
     monkeypatch.delenv("SOTTO_USER_EMAIL", raising=False)
     payload = ga._event_payload("Sync", "2026-08-13T14:00:00-07:00", "2026-08-13T14:30:00-07:00",
                                 "", "", "")
-    _bind(tmp_path, monkeypatch, payload)
+    offer = _bind(tmp_path, monkeypatch, payload, action="calendar-create")
     monkeypatch.setattr(ga, "_run", lambda args: {"status": "created", "id": "E1"})
     monkeypatch.setattr("sys.argv", ["google_action.py", *CAL_ARGV["calendar-create"],
-                                     "--offer-bound"])
+                                     "--offer-bound", "--offer-id", offer['offer_id']])
     ga.main()
     assert json.loads(capsys.readouterr().out)["status"] == "created"
     assert _receipts(tmp_path)[0]["offer_bound"] is True
     assert not _offer_file(tmp_path).exists()
 
 
-def test_a_failed_bound_send_leaves_the_offer_unspent(monkeypatch, capsys, tmp_path):
-    """The API refused, so nothing left the house — the user's yes is still good for a retry."""
-    _bind(tmp_path, monkeypatch, BODY)
+def test_a_failed_bound_send_spends_the_offer(monkeypatch, capsys, tmp_path):
+    """Once an effect begins, an error may be uncertain; retry requires a fresh approval."""
+    offer = _bind(tmp_path, monkeypatch, _send_payload())
     monkeypatch.setattr(ga, "_run", lambda args: {"status": "error", "error": "503"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-send", "--to", "alex@acme.com",
-                                     "--body", BODY, "--offer-bound"])
+                                     "--body", BODY, "--offer-bound", "--offer-id", offer['offer_id']])
     ga.main()
-    assert _receipts(tmp_path)[0]["result"] == "error"
-    assert _offer_file(tmp_path).exists()
+    receipts = _receipts(tmp_path)
+    assert [row['result'] for row in receipts] == ['started', 'error']
+    assert receipts[0]['offer_id'] == receipts[1]['offer_id'] == offer['offer_id']
+    assert not _offer_file(tmp_path).exists()
 
 
 def test_unattended_beats_the_binding(monkeypatch, capsys, tmp_path):

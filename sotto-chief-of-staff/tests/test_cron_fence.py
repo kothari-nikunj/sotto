@@ -113,11 +113,11 @@ def test_receiver_run_jobs_are_removed_from_hermes_but_never_created(tmp_path):
     spec = json.load(open(CRONS_JSON))
     receiver_run = {row["name"] for row in spec if row.get("runner") == "receiver"}
     assert receiver_run == {"sotto-morning-brief", "sotto-evening-brief",
-                            "sotto-proactive", "sotto-midday-digest"}
-    # the only shapes the receiver's tick can read: fixed daily or a */N interval
+                            "sotto-proactive", "sotto-midday-digest", "sotto-relationship-pulse"}
+    # The receiver reads fixed daily/weekly times and */N intervals.
     for row in spec:
         if row.get("runner") == "receiver":
-            assert re.match(r"\A(\d+ \d+|\*/\d+ \*) \* \* \*\Z", row["schedule"]), row
+            assert re.match(r"\A(\d+ \d+|\*/\d+ \*) \* \* (\*|[0-6])\Z", row["schedule"]), row
     _, calls, remaining = _run_reconcile(tmp_path)
     created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
     assert not (created & receiver_run)
@@ -140,7 +140,7 @@ def test_reconciler_honors_gates_and_schedule_source(monkeypatch):
     assert "sotto-midday-digest" not in jobs
     assert jobs["sotto-proactive"] == "*/30 * * * *"
     assert [n for n, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER)] \
-        == ["sotto-relationship-pulse"]
+        == []
 
 
 def test_start_sh_calls_the_shared_reconciler():
@@ -158,3 +158,19 @@ def test_hermes_cron_delivers_sotto_copy_without_the_scheduler_envelope():
     assert "hermes config set cron.wrap_response false" in INSTALL
     assert re.search(r"(?m)^cron:\n\s+wrap_response:\s+false(?:\s|#|$)", CONFIG)
     assert "disables Hermes' generic `Cronjob Response` envelope" in RAILWAY
+
+
+def test_managed_pilot_only_enables_receiver_owned_system_jobs(monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('managed_cron_contract', RECONCILER)
+    reconciler = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reconciler)
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    assert reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER) == []
+    names = {name for name, *_ in reconciler.active_jobs(CRONS_JSON)}
+    assert 'sotto-morning-brief' in names and 'sotto-evening-brief' in names
+    assert 'sotto-relationship-pulse' in names
+    assert names == {name for name, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
+    assert reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER) == []
+    assert names == {name for name, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}

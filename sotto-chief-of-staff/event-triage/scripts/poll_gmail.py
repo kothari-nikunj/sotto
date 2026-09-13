@@ -68,7 +68,8 @@ def _run(api, args, timeout=60):
     r = subprocess.run([py, api, *args], capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"google_api {' '.join(args)} failed")
-    return json.loads(r.stdout or "null")
+    from google_cli import decode_output
+    return decode_output(r.stdout, args)
 
 
 def _as_list(v):

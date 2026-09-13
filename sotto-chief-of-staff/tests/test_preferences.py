@@ -16,7 +16,6 @@ def _load(name, relpath):
 
 
 pr = _load("preferences", "_shared/scripts/preferences.py")
-lp = _load("learn_preferences", "approval-tiers/scripts/learn_preferences.py")
 
 
 def test_add_remove_roundtrip(tmp_path, monkeypatch):
@@ -56,16 +55,6 @@ def test_load_explicit_shape_when_missing(tmp_path, monkeypatch):
                   "vip_people": [], "nudge_snooze_until": "", "brief_audio": ""}
 
 
-def test_learner_preserves_explicit_block(tmp_path, monkeypatch):
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    pr.add("mute_senders", "news@example.com")        # user states a preference…
-    # …then a (separate) outcome stream drives the behavioral learner, which rewrites preferences.json
-    (tmp_path / "outcomes.jsonl").write_text(
-        json.dumps({"contact": "a", "action_type": "draft", "outcome": "executed"}) + "\n")
-    lp.learn()
-    data = json.load(open(os.path.join(str(tmp_path), "preferences.json")))
-    assert "deprioritization_hints" in data                         # learner wrote its half
-    assert data["explicit"]["mute_senders"] == ["news@example.com"]  # and did NOT wipe the explicit half
 
 
 # ── Cadence: the nudge snooze the "quieter today" verbs write ─────────────────────────────────────
@@ -151,15 +140,6 @@ def test_snooze_verbs_write_and_clear_through_the_cli(tmp_path, monkeypatch, cap
     assert "error" in json.loads(capsys.readouterr().out)
 
 
-def test_learner_preserves_the_snooze_scalar(tmp_path, monkeypatch):
-    """The scalar rides in the same reserved block the behavioral learner must never wipe."""
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    pr.set_scalar("nudge_snooze_until", "2026-08-08T06:00")
-    (tmp_path / "outcomes.jsonl").write_text(
-        json.dumps({"contact": "a", "action_type": "draft", "outcome": "executed"}) + "\n")
-    lp.learn()
-    data = json.load(open(os.path.join(str(tmp_path), "preferences.json")))
-    assert data["explicit"]["nudge_snooze_until"] == "2026-08-08T06:00"
 
 
 # ── VIP: the user's stated list (the dashboard's toggle and chat write the same file) ────────────
@@ -184,7 +164,7 @@ def test_is_vip_is_exact_and_case_insensitive():
     assert not pr.is_vip("Sarah Chen", None)
 
 
-def test_learner_preserves_the_vip_list_too(tmp_path, monkeypatch):
+def test_explicit_vip_list_is_persisted(tmp_path, monkeypatch):
     """vip_people is a plain explicit list, so the behavioral learner carries it forward like the
     mutes — which is what makes "Sarah is a VIP" survive the next morning's rebuild."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
@@ -223,8 +203,6 @@ def _spawn(script, args, data_dir):
 
 PREFS_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                          "_shared", "scripts", "preferences.py")
-LEARN_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                         "approval-tiers", "scripts", "learn_preferences.py")
 
 
 def test_two_concurrent_preference_writes_both_survive(tmp_path):
@@ -243,37 +221,12 @@ def test_two_concurrent_preference_writes_both_survive(tmp_path):
     assert {"seed@x.test", "alice@x.test", "bob@x.test"} <= set(mutes)
 
 
-def test_a_preference_set_during_the_learn_rebuild_is_not_clobbered(tmp_path):
-    """The collision that actually happens every morning: the Learn step rewrites preferences.json
-    wholesale from behaviour while you mute someone. Both must survive."""
-    from concurrent.futures import ThreadPoolExecutor
-    with open(os.path.join(str(tmp_path), "outcomes.jsonl"), "w") as f:
-        for i in range(200):
-            f.write(json.dumps({"ts": "2026-08-01", "action_id": f"a{i}", "outcome": "executed",
-                                "channel": "email", "contact": f"p{i % 5}@y.test",
-                                "action_type": "reply", "tier": "one_tap"}) + "\n")
-    with ThreadPoolExecutor(2) as ex:
-        rs = list(ex.map(lambda w: _spawn(LEARN_CLI, [], tmp_path) if w == "learn"
-                         else _spawn(PREFS_CLI, ["vip", "Ada Lovelace"], tmp_path),
-                         ["learn", "vip"]))
-    assert all(r.returncode == 0 for r in rs), [r.stderr for r in rs]
-    got = json.loads(open(os.path.join(str(tmp_path), "preferences.json")).read())
-    assert "Ada Lovelace" in got["explicit"]["vip_people"]   # the user's write survived
-    assert "analytics" in got                                # …and so did the learner's
 
 
-def test_a_corrupt_preferences_file_is_never_papered_over(tmp_path):
-    """A learner that mints a fresh file over an unreadable one drops the explicit block and every
-    tombstone with it. It must refuse instead."""
-    p = os.path.join(str(tmp_path), "preferences.json")
-    with open(p, "w") as f:
-        f.write("{not json")
-    # outcomes must exist, or the learner returns before it ever reaches the write it must refuse
-    with open(os.path.join(str(tmp_path), "outcomes.jsonl"), "w") as f:
-        for i in range(10):
-            f.write(json.dumps({"ts": "2026-08-01", "action_id": f"a{i}", "outcome": "executed",
-                                "channel": "email", "contact": "p@y.test",
-                                "action_type": "reply", "tier": "one_tap"}) + "\n")
-    r = _spawn(LEARN_CLI, [], tmp_path)
-    assert "unreadable" in (r.stderr or "")
-    assert open(p).read() == "{not json"      # untouched, awaiting repair
+def test_draft_grading_does_not_rewrite_corrupt_preferences(tmp_path):
+    p = tmp_path / "preferences.json"
+    p.write_text("{not json")
+    script = os.path.join(ROOT, "_shared", "scripts", "draft_outcomes.py")
+    result = _spawn(script, [], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert p.read_text() == "{not json"

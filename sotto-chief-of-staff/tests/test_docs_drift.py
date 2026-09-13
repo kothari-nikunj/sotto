@@ -31,6 +31,7 @@ WHAT IS DELIBERATELY NOT GUARDED HERE (prose that is prose):
     literals, not named constants; asserting them would mean parsing `triage_event.py`'s regex
     source, which is a worse guard than the funnel tests that exercise the behaviour directly.
 """
+import ast
 import importlib.util
 import inspect
 import json
@@ -62,7 +63,6 @@ dc = _load("dd_digest", PACK, "event-triage", "scripts", "digest_check.py")
 cr = _load("dd_continuity", PACK, "morning-brief", "scripts", "continuity_resolve.py")
 ps = _load("dd_proactive", PACK, "proactive", "scripts", "proactive_scan.py")
 sx = _load("dd_style_extract", PACK, "_shared", "scripts", "style_extract.py")
-lp = _load("dd_learn_prefs", PACK, "approval-tiers", "scripts", "learn_preferences.py")
 rec = _load("dd_receiver", HERMES, "runtime", "trigger-receiver", "receiver.py")
 cal = _load("dd_calcache", HERMES, "runtime", "trigger-receiver", "calcache.py")
 ob = _load("dd_outbox", HERMES, "runtime", "trigger-receiver", "outbox.py")
@@ -70,6 +70,11 @@ rt = _load("dd_retention", HERMES, "runtime", "trigger-receiver", "retention.py"
 fg = _load("dd_forget", PACK, "tools", "forget.py")
 dsh = _load("dd_dashboard", HERMES, "runtime", "trigger-receiver", "dashboard.py")
 att = _load("dd_attachments", PACK, "_shared", "lib", "attachments.py")
+bv = _load("dd_brief_validate", PACK, "_shared", "lib", "brief_validate.py")
+on = _load("dd_onboarding", HERMES, "runtime", "trigger-receiver", "onboarding.py")
+br = _load("dd_brief_runner", HERMES, "runtime", "trigger-receiver", "brief_runner.py")
+mc = _load("dd_memory_cycle", PACK, "_shared", "scripts", "memory_cycle.py")
+pc = _load("dd_personal_context", PACK, "_shared", "lib", "personal_context.py")
 
 ISLAND_RE = re.compile(
     r'<script\s+type="application/json"\s+id="sotto-rules">(.*?)</script>', re.S)
@@ -123,6 +128,18 @@ def _same(field, page, code):
     assert page == code, (
         f"docs drift — the playgrounds' rules island says {field} = {page!r}, the code says "
         f"{code!r}.\n{RULE}")
+
+
+def _literal_constant(path, name):
+    """Read one module-level literal without importing a service and its runtime dependencies."""
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    values = [ast.literal_eval(node.value) for node in tree.body
+              if isinstance(node, (ast.Assign, ast.AnnAssign))
+              for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+              if isinstance(target, ast.Name) and target.id == name]
+    assert len(values) == 1, f"expected one literal {name} in {path}, found {len(values)}"
+    return values[0]
 
 
 def _anchor(text):
@@ -226,6 +243,7 @@ def test_delivery_outbox():
     _same("outbox.backoff_base_secs", R["outbox"]["backoff_base_secs"], ob.BACKOFF_BASE_SECS)
     _same("outbox.backoff_max_secs", R["outbox"]["backoff_max_secs"], ob.BACKOFF_MAX_SECS)
     _same("outbox.max_attempts", R["outbox"]["max_attempts"], ob.MAX_ATTEMPTS)
+    _same("outbox.effect_attempts", R["outbox"]["effect_attempts"], ob.MAX_EFFECT_ATTEMPTS)
     _same("outbox.nudge_max_age_min", R["outbox"]["nudge_max_age_min"], ob.NUDGE_MAX_AGE_MIN)
     _same("outbox.nudge_max_age_min (the funnel's own window)", ob.NUDGE_MAX_AGE_MIN,
           te.VALVE_MAX_AGE_MIN)
@@ -234,8 +252,79 @@ def test_delivery_outbox():
     # composed archive (a body is a brief only if compose_brief archived one) and the Learn receipt.
     _same("outbox.composed_brief_max_age_hours", R["outbox"]["composed_brief_max_age_hours"] * 3600,
           rec.COMPOSED_BRIEF_MAX_AGE_SECS)
-    _same("cron.brief_retries_per_day", R["cron"]["brief_retries_per_day"], rec.BRIEF_RETRIES_PER_DAY)
-    _anchor("re-fired once")
+    _same("work.max_attempts", R["work"]["max_attempts"], rec.WORK_QUEUE.MAX_ATTEMPTS)
+    _same("work.max_workers", R["work"]["max_workers"], rec.WORK_QUEUE.MAX_WORKERS)
+    _same("work.background_max_wait_seconds", R["work"]["background_max_wait_seconds"],
+          rec.WORK_QUEUE.BACKGROUND_MAX_WAIT_SECONDS)
+    _same("work.lease_seconds", R["work"]["lease_seconds"], rec.WORK_QUEUE.LEASE_SECONDS)
+    _same("work.prepare_minutes", R["work"]["prepare_minutes"], rec.BRIEF_PREPARE_SECONDS // 60)
+    _same("work.compose_lead_seconds", R["work"]["compose_lead_seconds"],
+          rec.BRIEF_COMPOSE_LEAD_SECONDS)
+    _same("valve.deadline_horizon_hours", R["valve"]["deadline_horizon_hours"] * 3600,
+          te.ASK_DEADLINE_HORIZON_SECONDS)
+    _same("shared actionable deadline horizon", te.ASK_DEADLINE_HORIZON_SECONDS,
+          bv.ACTION_DEADLINE_HORIZON_SECONDS)
+    _same("work.catchup_hours", R["work"]["catchup_hours"], rec.DAILY_CATCHUP_SECONDS // 3600)
+    _same("work.retention_days", R["work"]["retention_days"], rec.WORK_QUEUE.RETENTION_SECONDS // 86400)
+    _anchor("at most three execution attempts")
+
+
+def test_onboarding_brief_and_learning_caps():
+    _same('onboarding.lease_minutes', R['onboarding']['lease_minutes'], on.LEASE_SECONDS // 60)
+    _same('onboarding.retry_minutes', R['onboarding']['retry_minutes'], on.RETRY_SECONDS // 60)
+    _same('onboarding.attempts_per_day', R['onboarding']['attempts_per_day'], on.ATTEMPTS_PER_DAY)
+    _same('brief.preparation_max_age_minutes', R['brief']['preparation_max_age_minutes'],
+          br.PREPARATION_MAX_AGE_SECONDS // 60)
+    _same('brief.notes_cache_hours', R['brief']['notes_cache_hours'], br.NOTES_CACHE_MAX_AGE_SECONDS // 3600)
+    # the retention group states the same cache age in days — one number, two renderings
+    _same('retention.notes_cache_days', R['retention']['notes_cache_days'] * 86400,
+          br.NOTES_CACHE_MAX_AGE_SECONDS)
+    _same('brief.welcome_seed_seconds', R['brief']['welcome_seed_seconds'], br.WELCOME_SEED_BUDGET_SECONDS)
+    _same('brief.followup_retention_days', R['brief']['followup_retention_days'],
+          br.FOLLOWUP_RETENTION_SECONDS // 86400)
+    _same('learning.source_retry_seconds', R['learning']['source_retry_seconds'], mc.SOURCE_RETRY_SECONDS)
+    _same('learning.unchanged_extraction_attempts', R['learning']['unchanged_extraction_attempts'],
+          mc.UNCHANGED_EXTRACTION_ATTEMPTS)
+    _same('learning.conversation_messages', R['learning']['conversation_messages'], pc.CONVERSATION_MESSAGES)
+    _same('learning.conversation_text_chars', R['learning']['conversation_text_chars'], pc.CONVERSATION_TEXT_CHARS)
+    _same('learning.conversation_total_chars', R['learning']['conversation_total_chars'], pc.CONVERSATION_TOTAL_CHARS)
+    _anchor('five post-delivery effect attempts')
+    _anchor('two attempts for the same source revision')
+
+
+def test_background_cadences_are_stated_in_prose():
+    """The cadences that have no island field but are still claims about code: the memory pass
+    interval, the two delivery-eligibility windows, and the managed model-lease timings. Each is
+    built FROM its constant so a moved knob breaks the doc, not just the page."""
+    de = _load("dd_delivery_effects", PACK, "_shared", "lib", "delivery_effects.py")
+    ml = _load("dd_model_lease", HERMES, "adapters", "hermes", "model_lease.py")
+    _anchor(f"at most once every {rec.MEMORY_INTERVAL_SECONDS // 60} minutes "
+            "(`receiver.MEMORY_INTERVAL_SECONDS`)")
+    _anchor(f"at most {mc.PAGES_PER_RUN} rotating history pages")
+    _anchor(f"younger than {de.CALENDAR_MIN_FRESH_SECONDS} seconds")
+    _anchor(f"deliverable for {de.POST_MEETING_VALID_SECONDS // 60} minutes after the meeting ended")
+    _anchor(f"within {ml.RENEW_BEFORE_SECONDS // 3600} hours of expiry")
+    assert ml.RETRY_SECONDS == 3600, RULE      # "retries hourly" is the sentence; hold it to that
+    _anchor("retries hourly (`model_lease.RETRY_SECONDS`)")
+
+
+def test_account_and_proxy_capacity_guards():
+    accounts = os.path.join(HERMES, 'cloud', 'accounts', 'server.py')
+    model_proxy = os.path.join(HERMES, 'cloud', 'model-proxy', 'server.py')
+    _same('accounts.pending_signins', R['accounts']['pending_signins'],
+          _literal_constant(accounts, 'PENDING_SIGNINS'))
+    _same('accounts.max_signins', R['accounts']['max_signins'],
+          _literal_constant(accounts, 'MAX_SIGNINS'))
+    _same('accounts.device_code_attempts', R['accounts']['device_code_attempts'],
+          _literal_constant(accounts, 'DEVICE_CODE_ATTEMPTS'))
+    _same('proxy.requests_per_window', R['proxy']['requests_per_window'],
+          _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW'))
+    _same('proxy.rate_window_seconds', R['proxy']['rate_window_seconds'],
+          _literal_constant(model_proxy, 'RATE_WINDOW_SECONDS'))
+    _anchor('50 unverified pending sign-ins')
+    _anchor('500 total sign-in sessions')
+    _anchor('five native code attempts')
+    _anchor('60 admitted requests per tenant in a rolling 60-second window')
 
 
 def test_the_learn_step_is_one_command_with_a_receipt():
@@ -245,7 +334,7 @@ def test_the_learn_step_is_one_command_with_a_receipt():
     ls = _load("dd_learn_step", PACK, "_shared", "scripts", "learn_step.py")
     _same("learn.step_timeout_secs", R["learn"]["step_timeout_secs"], ls.STEP_TIMEOUT_SECS)
     assert [name for name, _rel, _b in ls.STEPS] == [
-        "knowledge", "continuity", "preferences", "style", "granola", "contacts"], RULE
+        "knowledge", "continuity", "drafts", "style", "granola", "contacts"], RULE
     assert ls.receipt_path("2026-09-04", "morning").endswith("briefs/2026-09-04.morning.learned.json")
     assert isinstance(rt.accounts_for("briefs/2026-09-04.morning.learned.json"), rt.Rule), RULE
     _anchor("one command")
@@ -383,9 +472,6 @@ def test_the_bridge_daily_contacts_subset():
         _same(f"contacts.{field}", R["contacts"][field], int(m.group(1)))
 
 
-def test_learned_approval_default_thresholds():
-    _same("approval.min_accepted", R["approval"]["min_accepted"], lp.MIN_ACCEPTED_FOR_DEFAULT)
-    _same("approval.min_accept_rate", R["approval"]["min_accept_rate"], lp.MIN_ACCEPT_RATE)
 
 
 def test_continuity_resolution_windows():
@@ -421,9 +507,9 @@ def test_the_stale_sent_lane_and_the_rsvp_ask():
     _same("stale.max_days", R["stale"]["max_days"], gg.STALE_MAX_DAYS)
     _same("stale.max_threads", R["stale"]["max_threads"], gg.STALE_MAX_THREADS)
     _same("calendar.rsvp_ask_hours", R["calendar"]["rsvp_ask_hours"], cb.RSVP_ASK_HOURS)
-    # "Three dismissals is Sotto asking once whether to stop bringing it up" — once a month, per person
-    _same("mute_offer.cooldown_days", R["mute_offer"]["cooldown_days"], cb.MUTE_OFFER_COOLDOWN_DAYS)
-    _anchor(f"once every {cb.MUTE_OFFER_COOLDOWN_DAYS} days")
+    # The mute producer is paused; no active cooldown may be advertised by the rules islands.
+    assert "mute_offer" not in R
+    assert not hasattr(cb, "MUTE_OFFER_COOLDOWN_DAYS")
     _anchor(f"{gg.STALE_SILENT_DAYS} to {gg.STALE_MAX_DAYS} days ago")
     _anchor(f"{gg.STALE_MAX_THREADS} threads at most")
     _anchor(f"within {cb.RSVP_ASK_HOURS} hours")
@@ -614,7 +700,12 @@ def test_how_sotto_decides_states_every_number():
     _anchor(f"`SOTTO_CALENDAR_REFRESH_SECS` (default {cal.REFRESH_SECS_DEFAULT // 60} min)")
     _anchor(f"`SOTTO_EMAIL_POLL_SECS` (default {_env_default(rec, 'SOTTO_EMAIL_POLL_SECS')}s)")
     _anchor(f"`SOTTO_EVENTS_TICK_SECS`, default {R['intervals']['events_tick_secs']}s")
-    _anchor(" · ".join(f"`{c}`" for c in R["classes"]["tier1_nudge"]) + " → nudge")
+    # Tier 1's ask classes: only `urgent` nudges at once; the other two queue for the release
+    # valve (`_classify_tier1` returns "queue" for them) — the doc must say so in those words.
+    asks = R["classes"]["tier1_nudge"]
+    _anchor("`urgent` → nudge")
+    _anchor(" · ".join(f"`{c}`" for c in asks if c != "urgent") + " → queued")
+    _anchor("only the release valve (below) can turn one into a nudge")
     # the attachment lane — the same three numbers the island carries, stated in prose
     _anchor(f"At most {att.MAX_ATTACHMENTS_PER_EMAIL} converted per email")
     _anchor(f"{att.MAX_ATTACHMENT_BYTES // 1_000_000} MB per attachment")
@@ -819,7 +910,117 @@ def _scan_data_paths():
                 if parts:
                     found.setdefault(_code_path(parts), set()).add(
                         os.path.relpath(path, HERMES))
+            for rel_path in _pathlib_data_paths(src):
+                found.setdefault(rel_path, set()).add(os.path.relpath(path, HERMES))
     return found
+
+
+def _pathlib_data_paths(src):
+    """Literal descendants of `Path(DATA|data|_root()|SOTTO_DATA)`, including chained `/` joins.
+
+    A variable literally named `root` counts as a base too — but only in a module that BINDS it to
+    one (`root = Path(os.environ.get('SOTTO_DATA', …))`, `root = Path(data)`, `root = _root()`), or
+    to a literal descendant of one (`root = Path(…) / "config"`, whose prefix is then carried into
+    every `root / "x"` below it). A `root` that is a function parameter, `Path(__file__)…` or
+    `HERMES_HOME` names some other tree, and guessing would flag files that are not on the volume.
+    Every base binding in a module must agree on the prefix; a module that binds `root` two ways
+    is not scanned through that name at all."""
+    root_prefix = [None]          # closed over by parts(); set once the module's bindings are read
+
+    def base(node):
+        if isinstance(node, ast.Name) and node.id in ('DATA', 'data'):
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '_root':
+            return True
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'get' and node.args
+                and isinstance(node.args[0], ast.Constant) and node.args[0].value == 'SOTTO_DATA'):
+            return True
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and node.slice.value == 'SOTTO_DATA'):
+            return True               # os.environ['SOTTO_DATA']
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == 'Path' and len(node.args) == 1 and base(node.args[0]))
+
+    def parts(node):
+        if isinstance(node, ast.Name) and node.id == 'root':
+            return None if root_prefix[0] is None else list(root_prefix[0])
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'Path'
+                and len(node.args) == 1 and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == 'root'):
+            return parts(node.args[0])                    # Path(root) / "x"
+        if base(node):
+            return []
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left = parts(node.left)
+            if left is not None and isinstance(node.right, ast.Constant) and isinstance(node.right.value, str):
+                return [*left, node.right.value]
+            if left is not None and isinstance(node.right, ast.JoinedStr):
+                rendered = ''.join(
+                    value.value if isinstance(value, ast.Constant) else '*'
+                    for value in node.right.values)
+                return [*left, rendered]
+        return None
+
+    found = set()
+    tree = ast.parse(src)
+    # What does this module mean by `root`? Read every `root = …` binding with `root` still
+    # unbound, so a self-referential `root = root / "x"` resolves to nothing rather than to itself.
+    bindings = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'root'):
+            prefix = parts(node.value)
+            bindings.add(None if prefix is None else tuple(prefix))
+    if len(bindings) == 1 and None not in bindings:
+        root_prefix[0] = list(bindings.pop())
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        if isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Div) and parent.left is node:
+            continue
+        value = parts(node)
+        if value:
+            found.add(_code_path(value))
+    return found
+
+
+def test_pathlib_volume_scanner_finds_literal_files_and_skips_dynamic_names():
+    fixture = '''
+from pathlib import Path
+lease = Path(data) / "config" / "model-lease.json"
+history = Path(DATA) / "knowledge" / f"{day}.json"
+dynamic = Path(DATA) / name
+outside = Path("/tmp") / "unrelated.json"
+'''
+    assert _pathlib_data_paths(fixture) == {
+        'config/model-lease.json', 'knowledge/*.json'}
+
+
+def test_pathlib_volume_scanner_follows_a_root_bound_to_the_volume():
+    """`root / 'events/outbox.json'` counts exactly when the module binds `root` to the volume —
+    directly, or to a literal child of it (the prefix rides along). A `root` bound elsewhere or
+    merely received as a parameter is not the volume, and joins off it are not scanned."""
+    bound = '''
+from pathlib import Path
+root = Path(os.environ.get('SOTTO_DATA', '/data'))
+outbox = root / 'events/outbox.json'
+delivered = root / 'briefs' / f'{day}.{kind}.delivered'
+'''
+    assert _pathlib_data_paths(bound) == {'events/outbox.json', 'briefs/*.*.delivered'}
+    child = '''
+root = Path(data) / "config"
+receipt = root / "photon-activation.json"
+'''
+    assert _pathlib_data_paths(child) == {'config', 'config/photon-activation.json'}
+    elsewhere = '''
+def check(root):
+    return (root / 'google_token.json').exists()
+def main():
+    root = Path(__file__).resolve().parents[2]
+    return root / 'tools/prepare-public-repo.sh'
+'''
+    assert _pathlib_data_paths(elsewhere) == set()
 
 
 def test_the_shared_file_map_covers_every_path_the_code_writes():
@@ -854,7 +1055,9 @@ def test_the_completeness_scan_actually_finds_paths():
     it must find the map's own landmark rows in the real tree."""
     found = _scan_data_paths()
     for expected in ("events/gmail_seen.json", "events/sends.jsonl", "proactive/wake_run.last",
-                     "knowledge/relationship_state.json", "config/settings.json"):
+                     "knowledge/relationship_state.json", "config/settings.json",
+                     "events/outbox.json",        # onboarding.py, through a volume-bound `root`
+                     "config/photon-activation.json"):   # sotto_photon, through `root = … / "config"`
         assert expected in found, (
             f"the $SOTTO_DATA path scan no longer finds {expected!r} — the scan regex has drifted "
             f"from how the tree builds paths, and the completeness guard is now vacuous.\n{RULE}")
@@ -890,8 +1093,7 @@ def test_the_search_providers_are_the_same_ladder_in_both_processes():
 # ── the read-modify-write lock, which exists in two processes ───────────────────────────────────
 
 def test_both_runtimes_lock_preferences_on_the_same_sidecar():
-    """`preferences.json` is the one file two RUNTIMES both write: the skills tree (preferences.py,
-    learn_preferences.py) and the receiver image (the dashboard's learned-rule delete). flock is an
+    """The skills and receiver runtimes share the JSON lock protocol. flock is an
     OS primitive, so they serialise correctly ONLY if they name the same lock file. The receiver
     cannot import the skills tree, so the protocol is duplicated exactly once — and this is the
     guard that keeps the two names identical. Change one, change the other, same commit."""
@@ -913,3 +1115,17 @@ def test_receiver_marker_strip_matches_chatfmt():
         f"receiver._MARKER_RE ({rec._MARKER_RE.pattern!r}) drifted from its owner "
         f"chatfmt._MARKER_RE ({cf._MARKER_RE.pattern!r}).\n{RULE}")
     assert rec._MARKER_RE.flags == cf._MARKER_RE.flags
+
+
+def test_birthday_importance_rules_match_shared_policy():
+    import relationship_importance as importance
+    for key, value in {
+        'importance_window_days': importance.WINDOW_DAYS,
+        'vip_active_days': importance.VIP_ACTIVE_DAYS,
+        'vip_active_weeks': importance.VIP_ACTIVE_WEEKS,
+        'vip_direction_days': importance.VIP_EACH_DIRECTION_DAYS,
+        'vvip_active_days': importance.VVIP_ACTIVE_DAYS,
+        'vvip_active_weeks': importance.VVIP_ACTIVE_WEEKS,
+        'vvip_direction_days': importance.VVIP_EACH_DIRECTION_DAYS,
+    }.items():
+        _same('birthday.' + key, R['birthday'][key], value)

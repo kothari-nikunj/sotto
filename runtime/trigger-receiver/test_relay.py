@@ -70,6 +70,23 @@ def test_full_forward_cycle_with_a_bridge():
     assert resp["id"] == 7
 
 
+def test_response_hook_failure_does_not_discard_authenticated_bridge_result():
+    r = relay.Relay()
+    r.on_response = lambda _request, _result: (_ for _ in ()).throw(RuntimeError('observer down'))
+
+    def bridge():
+        req = r.poll(timeout=5)
+        r.respond({"jsonrpc": "2.0", "id": req["id"], "result": {"answer": 42}})
+
+    thread = threading.Thread(target=bridge)
+    thread.start()
+    time.sleep(0.05)
+    response = r.mcp_call({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                           "params": {"name": "read_local"}}, timeout=5)
+    thread.join()
+    assert response == {"jsonrpc": "2.0", "id": 8, "result": {"answer": 42}}
+
+
 def test_forward_uses_unique_internal_ids_and_restores_the_external_id():
     r = relay.Relay()
     got = []
@@ -143,7 +160,7 @@ def test_bridge_connected_timing():
     assert not r.bridge_connected()            # ages out
 
 
-def test_http_routes_and_auth_through_the_receiver():
+def test_http_routes_and_auth_through_the_receiver(tmp_path):
     """The receiver's HTTP wiring: /mcp routes JSON-RPC into the relay, bearer auth is enforced, and
     /health reports bridge connectivity. (The poll→respond forwarding itself is covered by the
     Relay-class tests above; this guards the route+auth layer without thread-timing flakiness.)"""
@@ -155,6 +172,7 @@ def test_http_routes_and_auth_through_the_receiver():
     spec = _il.spec_from_file_location("receiver", os.path.join(HERE, "receiver.py"))
     rec = _il.module_from_spec(spec)
     spec.loader.exec_module(rec)
+    rec.DATA = str(tmp_path)
     rec.MCP_TOKEN = "tok"
     rec.TOKEN = "tok"
 
@@ -197,3 +215,47 @@ def test_ping_is_answered_locally_even_when_bridge_connected():
     r._touch()  # mark the Mac as connected
     resp = r.mcp_call({"jsonrpc": "2.0", "id": 8, "method": "ping"})
     assert resp == {"jsonrpc": "2.0", "id": 8, "result": {}}
+
+
+def test_response_validator_uses_pending_request_and_withholds_denied_result():
+    r = relay.Relay()
+    r._touch()
+    allowed = []
+    r.validate_response = lambda request, result: allowed.append((request, result)) or False
+    result = []
+    t = threading.Thread(target=lambda: result.append(r._forward({
+        'jsonrpc': '2.0', 'id': 7, 'method': 'tools/call',
+        'params': {'name': 'read_history', 'arguments': {'source': 'imessage'}}}, timeout=.2)))
+    t.start()
+    req = r.poll(timeout=.1)
+    assert r.respond({'id': req['id'], 'result': {'private': 'content'}}) is False
+    t.join()
+    assert result == [None] and allowed[0][0]['params']['arguments']['source'] == 'imessage'
+    assert allowed[0][1] == {'private': 'content'}
+
+
+def test_response_hooks_run_outside_the_relay_lock():
+    """validate_response reads capability state and on_response writes a ledger under a file lock;
+    neither may hold `_lock`, which every forward, poll hand-off and unrelated respond waits on."""
+    r = relay.Relay()
+    r._touch()
+    held_during = []
+
+    def hook(_request, _result):
+        free = r._lock.acquire(timeout=0)
+        if free:
+            r._lock.release()
+        held_during.append(not free)
+        return True
+
+    r.validate_response = hook
+    r.on_response = hook
+    result = []
+    t = threading.Thread(target=lambda: result.append(r._forward({
+        'jsonrpc': '2.0', 'id': 9, 'method': 'tools/call',
+        'params': {'name': 'read_local', 'arguments': {}}}, timeout=2)))
+    t.start()
+    req = r.poll(timeout=1)
+    assert r.respond({'id': req['id'], 'result': {'ok': True}}) is True
+    t.join()
+    assert held_during == [False, False] and result[0]['result'] == {'ok': True}

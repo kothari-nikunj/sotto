@@ -17,7 +17,8 @@
     "name": "sotto-relationship-pulse",
     "schedule": "0 9 * * 1",
     "prompt": "Run my relationship pulse",
-    "skill": "sotto-relationship-pulse"
+    "skill": "sotto-relationship-pulse",
+    "runner": "receiver"
   },
   {
     "name": "sotto-proactive",

@@ -46,3 +46,62 @@ def to_chat(text) -> str:
     t = re.sub(r"[ \t]+$", "", t, flags=re.M)     # trailing space the marker strip leaves
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
+
+def to_imessage(text) -> str:
+    """Plain text for Messages, for both interactive and scheduled deliveries.
+
+    Preserve words and web destinations; remove presentation syntax and encoded email
+    actions that Messages cannot render usefully. Canonical archives stay untouched.
+    Idempotent because Hermes formats both before retries and at the send boundary.
+    """
+    t = _MARKER_RE.sub("", _s(text))
+    # Balanced parentheses occur in real web links (e.g. Wikipedia article names).
+    link = re.compile(r"!?\[([^\]\n]+)\]\(")
+    cursor, parts = 0, []
+    while match := link.search(t, cursor):
+        end, depth = match.end(), 1
+        while end < len(t) and depth and t[end] != "\n":
+            depth += (t[end] == "(") - (t[end] == ")")
+            end += 1
+        if depth:
+            parts.append(t[cursor:match.end()])
+            cursor = match.end()
+            continue
+        label, url = match.group(1), t[match.end():end - 1]
+        if url.lower().startswith("mailto:"):
+            replacement = "(Copy the draft into Gmail to review and send.)"
+        else:
+            replacement = url if label == url else f"{label}: {url}"
+        parts.extend((t[cursor:match.start()], replacement))
+        cursor = end
+    parts.append(t[cursor:])
+    t = "".join(parts)
+    t = re.sub(r"mailto:[^\s<>]+", "(Copy the draft into Gmail to review and send.)", t, flags=re.I)
+    t = _HEADING_RE.sub(r"\1", t)
+    t = _HRULE_RE.sub("", t)
+    t = re.sub(r"^[ \t]*```[^\n]*$", "", t, flags=re.M)
+    t = re.sub(r"^[ \t]*(?:>[ \t]*)+", "", t, flags=re.M)
+    # Boundary checks keep URLs, snake_case identifiers and arithmetic intact.
+    for marker in (r"\*\*", r"__", r"\*", r"_", r"~~", r"`"):
+        t = re.sub(rf"(?<![\w/]){marker}(\S(?:[^\n]*?\S)?){marker}(?!\w)", r"\1", t)
+    t = re.sub(r"^[ \t]*[-*+]\s+", "• ", t, flags=re.M)
+    t = re.sub(r"[ \t]+$", "", t, flags=re.M)
+    # Consecutive short list entries need one line each, not separate paragraphs.
+    t = re.sub(r"(?<=\n)\n+(?=• )", "", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def compact_handled(text) -> str:
+    """Keep the complete handled recap but display its entries as a compact list."""
+    match = re.search(r"^\*?(?:✅ )?Already Handled\*?[ \t]*$", text, flags=re.M)
+    if not match:
+        return text
+    end = re.search(r"^\*?(?:Filtered|Coming Up|Needs Attention Now|Should Handle Today)\*?[ \t]*$",
+                    text[match.end():], flags=re.M)
+    # Only recognized brief sections; a free-form chat answer is not a brief.
+    if not end:
+        return text
+    stop = match.end() + end.start()
+    entries = [line.strip().lstrip("• ") for line in text[match.end():stop].splitlines() if line.strip()]
+    return text[:match.end()] + "\n" + "\n".join("• " + entry for entry in entries) + "\n\n" + text[stop:]

@@ -63,7 +63,9 @@ when you can't tell which loop they mean, ask.
      one thing here Sotto owes the user rather than merely suggests, so surface it on its own even
      when the rest of the list is short.
    Show `name — what` and why it's flagged ("surfaced 5×", "12 days old", "overdue"). Then any
-   **mute suggestions** ("You've dismissed Bob's items repeatedly — mute him?").
+   `mute_suggestions` is currently always empty: historical dismissal signals include inferred
+   draft non-use. Never turn those signals into a suggestion to mute someone. Honor an explicit
+   mute request through `sotto-feedback` as usual.
 3. **Apply only what they chose.**
    - **Dismiss / snooze / keep** — `retune_apply.py`:
      ```bash

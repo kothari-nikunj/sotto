@@ -47,7 +47,7 @@ def test_scan_flags_stale_and_classifies(tmp_path, monkeypatch):
     assert wait["direction"] == "waiting_on_them" and wait["suggestion"] == "nudge or drop"
 
 
-def test_scan_mute_suggestions_from_deprioritization(tmp_path, monkeypatch):
+def test_scan_ignores_legacy_deprioritization_without_changing_explicit_mutes(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
     # behavioral learner output + an already-muted person who must NOT be re-suggested
@@ -56,7 +56,8 @@ def test_scan_mute_suggestions_from_deprioritization(tmp_path, monkeypatch):
         "explicit": {"mute_people": ["Carol"], "mute_senders": [], "mute_sections": [], "tone_notes": []}}))
     out = scan.scan()
     names = [m["name"] for m in out["mute_suggestions"]]
-    assert names == ["Bob"]                              # Carol already muted → filtered out
+    assert names == []                                   # historical hints have no reliable provenance
+    assert out["counts"]["mute_suggestions"] == 0
     assert out["current"]["mute_people"] == ["Carol"]
 
 

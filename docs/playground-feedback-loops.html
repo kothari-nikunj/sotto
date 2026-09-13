@@ -110,51 +110,245 @@
 <!-- THE RULES ISLAND — byte-identical to the one in playground-architecture.html. -->
 <script type="application/json" id="sotto-rules">
 {
-  "cron":       { "morning": "6:30", "midday": "12:30", "evening": "17:30",
-                  "pulse_day": "Mondays", "pulse_time": "9:00", "proactive_min": 15,
-                  "brief_window_min": 10, "brief_retries_per_day": 1 },
-  "intervals":  { "events_tick_secs": 3, "email_poll_secs": 90, "valve_interval_secs": 900,
-                  "calendar_refresh_secs": 900, "triage_fork_secs": 30, "gmail_fork_secs": 180,
-                  "calendar_gather_fork_secs": 60, "dashboard_cli_fork_secs": 30 },
-  "calendar":   { "ttl_secs": 600, "stale_intervals": 2, "change_window_hours": 24, "decline_window_hours": 48, "invite_soon_hours": 4, "invite_grace_min": 15, "rsvp_ask_hours": 48 },
-  "tap":        { "grace_min": 5, "max_per_day": 3 },
-  "quiet":      { "start_hour": 21, "end_hour": 7 },
-  "vip":        { "min_priority": 10 },
-  "tier1":      { "text_max_chars": 1500 },
-  "escalation": { "window_min": 45 },
-  "freshness":  { "event_max_age_min": 30, "missed_call_max_age_min": 240 },
-  "cooldown":   { "min": 20 },
-  "budget":     { "nudge_per_day": 4 },
-  "valve":      { "max_per_tick": 2, "max_per_hour": 2, "max_age_min": 240 },
-  "outbox":     { "drain_interval_secs": 60, "backoff_base_secs": 60, "backoff_max_secs": 900,
-                  "max_attempts": 96, "nudge_max_age_min": 240, "composed_brief_max_age_hours": 20 },
-  "digest":     { "min_signals": 8 },
-  "ledger":     { "max_mb": 4, "keep_lines": 4000 },
-  "style":      { "confirmed_floor": 0.95, "confirmed_cap": 20,
-                  "ttl_days": { "work_email": 90, "work_message": 60, "personal_message": 30 } },
-  "approval":   { "min_accepted": 3, "min_accept_rate": 0.8 },
-  "continuity": { "deadline_grace_days": 2, "terminal_retention_days": 30 },
-  "retention":  { "sweep_hour": 3, "sweep_minute": 30, "delivery_receipt_days": 90,
-                  "send_receipt_days": 180, "triage_verdict_days": 90, "dashboard_audit_days": 90,
-                  "draft_ledger_days": 30, "brief_archive_days": 60, "staged_days": 7,
-                  "proactive_stamp_days": 30, "log_tail_mb": 5, "outcome_days": 90 },
-  "chase":      { "after_days": 3, "max": 2 },
-  "stale":      { "silent_days": 3, "max_days": 14, "max_threads": 20 },
-  "mute_offer": { "cooldown_days": 30 },
-  "birthday":   { "lead_days": 3 },
-  "surfacing":  { "already_nudged_max_lines": 2 },
-  "learn":      { "step_timeout_secs": 300 },
-  "contacts":   { "subset_max_hours": 48, "birthday_lookahead_days": 7 },
-  "x":          { "max_recent_posts": 5 },
-  "attachment": { "per_email": 3, "max_bytes": 8000000, "max_chars": 12000, "per_brief": 60000 },
-  "classes":    {
-    "promotable":          ["quiet", "cooldown", "stale", "budget", "meeting_hold"],
-    "tier1_nudge":         ["urgent", "actionable", "scheduling_ask"],
-    "budget_exempt":       ["missed_call", "escalation", "post_meeting", "calendar_change"],
-    "meeting_hold_exempt": ["missed_call", "escalation", "calendar_change"],
-    "cooldown_exempt":     ["escalation", "calendar_change"],
-    "digest_count":        ["ambient", "quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"],
-    "digest_actionable":   ["quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold"]
+  "cron": {
+    "morning": "6:30",
+    "midday": "12:30",
+    "evening": "17:30",
+    "pulse_day": "Mondays",
+    "pulse_time": "9:00",
+    "proactive_min": 15,
+    "brief_window_min": 10
+  },
+  "intervals": {
+    "events_tick_secs": 3,
+    "email_poll_secs": 90,
+    "valve_interval_secs": 900,
+    "calendar_refresh_secs": 900,
+    "triage_fork_secs": 30,
+    "gmail_fork_secs": 180,
+    "calendar_gather_fork_secs": 60,
+    "dashboard_cli_fork_secs": 30
+  },
+  "calendar": {
+    "ttl_secs": 600,
+    "stale_intervals": 2,
+    "change_window_hours": 24,
+    "decline_window_hours": 48,
+    "invite_soon_hours": 4,
+    "invite_grace_min": 15,
+    "rsvp_ask_hours": 48
+  },
+  "tap": {
+    "grace_min": 5,
+    "max_per_day": 3
+  },
+  "quiet": {
+    "start_hour": 21,
+    "end_hour": 7
+  },
+  "vip": {
+    "min_priority": 10
+  },
+  "tier1": {
+    "text_max_chars": 1500
+  },
+  "escalation": {
+    "window_min": 45
+  },
+  "freshness": {
+    "event_max_age_min": 30,
+    "missed_call_max_age_min": 240
+  },
+  "cooldown": {
+    "min": 20
+  },
+  "budget": {
+    "nudge_per_day": 4
+  },
+  "valve": {
+    "max_per_tick": 2,
+    "max_per_hour": 2,
+    "max_age_min": 240,
+    "deadline_horizon_hours": 24
+  },
+  "outbox": {
+    "drain_interval_secs": 60,
+    "backoff_base_secs": 60,
+    "backoff_max_secs": 900,
+    "max_attempts": 96,
+    "nudge_max_age_min": 240,
+    "composed_brief_max_age_hours": 20,
+    "effect_attempts": 5
+  },
+  "digest": {
+    "min_signals": 8
+  },
+  "ledger": {
+    "max_mb": 4,
+    "keep_lines": 4000
+  },
+  "style": {
+    "confirmed_floor": 0.95,
+    "confirmed_cap": 20,
+    "ttl_days": {
+      "work_email": 90,
+      "work_message": 60,
+      "personal_message": 30
+    }
+  },
+  "continuity": {
+    "deadline_grace_days": 2,
+    "terminal_retention_days": 30
+  },
+  "retention": {
+    "notes_cache_days": 1,
+    "sweep_hour": 3,
+    "sweep_minute": 30,
+    "delivery_receipt_days": 90,
+    "send_receipt_days": 180,
+    "triage_verdict_days": 90,
+    "dashboard_audit_days": 90,
+    "draft_ledger_days": 30,
+    "brief_archive_days": 60,
+    "staged_days": 7,
+    "proactive_stamp_days": 30,
+    "log_tail_mb": 5,
+    "outcome_days": 90
+  },
+  "chase": {
+    "after_days": 3,
+    "max": 2
+  },
+  "stale": {
+    "silent_days": 3,
+    "max_days": 14,
+    "max_threads": 20
+  },
+  "birthday": {
+    "lead_days": 3,
+    "importance_window_days": 42,
+    "vip_active_days": 6,
+    "vip_active_weeks": 3,
+    "vip_direction_days": 2,
+    "vvip_active_days": 12,
+    "vvip_active_weeks": 4,
+    "vvip_direction_days": 4
+  },
+  "surfacing": {
+    "already_nudged_max_lines": 2
+  },
+  "learning": {
+    "history_days": 42,
+    "pages_per_run": 3,
+    "review_messages": 160,
+    "dream_people": 8,
+    "dream_facts": 40,
+    "feedback_days": 42,
+    "feedback_limit": 8,
+    "source_retry_seconds": 3600,
+    "unchanged_extraction_attempts": 2,
+    "conversation_messages": 12,
+    "conversation_text_chars": 400,
+    "conversation_total_chars": 4800
+  },
+  "learn": {
+    "step_timeout_secs": 300
+  },
+  "contacts": {
+    "subset_max_hours": 48,
+    "birthday_lookahead_days": 7
+  },
+  "x": {
+    "max_recent_posts": 5
+  },
+  "attachment": {
+    "per_email": 3,
+    "max_bytes": 8000000,
+    "max_chars": 12000,
+    "per_brief": 60000
+  },
+  "classes": {
+    "promotable": [
+      "actionable",
+      "scheduling_ask",
+      "quiet",
+      "cooldown",
+      "stale",
+      "budget",
+      "meeting_hold"
+    ],
+    "tier1_nudge": [
+      "urgent",
+      "actionable",
+      "scheduling_ask"
+    ],
+    "budget_exempt": [
+      "missed_call",
+      "escalation",
+      "post_meeting",
+      "calendar_change"
+    ],
+    "meeting_hold_exempt": [
+      "missed_call",
+      "escalation",
+      "calendar_change",
+      "meeting_prep"
+    ],
+    "cooldown_exempt": [
+      "escalation",
+      "calendar_change"
+    ],
+    "digest_count": [
+      "ambient",
+      "quiet",
+      "cooldown",
+      "stale",
+      "budget",
+      "snoozed",
+      "meeting_hold",
+      "actionable",
+      "scheduling_ask"
+    ],
+    "digest_actionable": [
+      "quiet",
+      "cooldown",
+      "stale",
+      "budget",
+      "snoozed",
+      "meeting_hold",
+      "actionable",
+      "scheduling_ask"
+    ]
+  },
+  "work": {
+    "background_max_wait_seconds": 1800,
+    "lease_seconds": 120,
+    "max_attempts": 3,
+    "max_workers": 2,
+    "retention_days": 7,
+    "prepare_minutes": 10,
+    "compose_lead_seconds": 120,
+    "catchup_hours": 4
+  },
+  "onboarding": {
+    "lease_minutes": 20,
+    "retry_minutes": 30,
+    "attempts_per_day": 3
+  },
+  "brief": {
+    "preparation_max_age_minutes": 30,
+    "notes_cache_hours": 24,
+    "welcome_seed_seconds": 20,
+    "followup_retention_days": 7
+  },
+  "accounts": {
+    "pending_signins": 50,
+    "max_signins": 500,
+    "device_code_attempts": 5
+  },
+  "proxy": {
+    "requests_per_window": 60,
+    "rate_window_seconds": 60
   }
 }
 </script>
@@ -222,6 +416,57 @@ function fill(s){
    live:   how many stations are shipped today (the rest render dashed)
    Every `file` is a real path at HEAD. */
 const LOOPS = [
+{
+  "id": "context",
+  "title": "Continuous context",
+  "status": "closed",
+  "one": "A useful first look, then quiet learning from actual conversations and owner feedback. The pilot uses the same memory writers in Cloud and self-host.",
+  "hub": [
+    "Context",
+    "evidence, corrections and examples"
+  ],
+  "closes": "The next brief, relevance judgment and draft consume what was learned. Explicit corrections win; history never enters the live nudge queue.",
+  "detail": [
+    "Initial history spans {learning.history_days} days, fetched progressively in {learning.pages_per_run} pages per cycle. Self-host background model calls wait for the existing proxy with a finite tenant budget unless the owner explicitly enables unmetered BYOK. The receipt distinguishes fetched rows from reviewed messages. Mac sleep pauses local history while Google continues.",
+    "Each work-driven heartbeat reviews at most {learning.review_messages} direct-message records per page; other sources keep their existing consumers.",
+    "Each heartbeat curates one unfinished batch of up to {learning.dream_people} changed people and {learning.dream_facts} active facts each. It preserves corrections, records conflicts, archives exact duplicates and never treats curation as new evidence.",
+    "Only durable cited facts enter the graph; discussions and historical asks are not stored or recreated as work. The next prompts read {learning.feedback_limit} explicit usefulness examples from the past {learning.feedback_days} days. No response is not a negative rating.",
+    "Implemented on the pilot branch; procedural inference, complete provenance ranking, group semantic history and a dedicated conflict-review UI remain future work."
+  ],
+  "live": 5,
+  "stations": [
+    {
+      "s": "Connect",
+      "name": "First useful look",
+      "file": "runtime/trigger-receiver/onboarding.py · brief_runner.py",
+      "note": "Ready source and owner channel → recent context and actual voice → short welcome → existing outbox. Delivery acknowledgement completes first use. Existing installations keep their memory."
+    },
+    {
+      "s": "Observe",
+      "name": "Read bounded history",
+      "file": "_shared/scripts/memory_cycle.py · context_learning.py",
+      "note": "Resume frozen pages after failure. Only durable cited facts enter the graph; outstanding work remains owned by the live ledger."
+    },
+    {
+      "s": "Curate",
+      "name": "The Dreamer",
+      "file": "_shared/scripts/dreamer.py → knowledge_update.consolidate",
+      "note": "Select existing fact IDs, check the live file hash, preserve corrections, flag contradictions. No action, permission or code changes."
+    },
+    {
+      "s": "Rate",
+      "name": "An actual item was useful",
+      "file": "_shared/scripts/usefulness_feedback.py → log_outcome.py",
+      "note": "Owner-only useful/not-useful examples bound to an archived brief or offered draft. Neither reactions nor silence imply approval or a sender mute."
+    },
+    {
+      "s": "Use",
+      "name": "Better context next time",
+      "file": "_shared/lib/personal_context.py · relevance.py · knowledge_query.py · style_apply.py",
+      "note": "Brief and chat context reads curated durable facts. Relevance and drafting consume explicit examples; actual sends teach voice."
+    }
+  ]
+},
   {
     id: "knowledge",
     title: "Knowledge",
@@ -231,9 +476,9 @@ const LOOPS = [
     closes: "The correction re-enters at station 2. A dashboard fact edit builds the exact extraction payload a texted correction produces and runs it through the same <code>apply()</code> — SUPERSEDE semantics, archived text, dedup, migration, all identical. One apply path, whichever surface you used.",
     detail: [
       "Entity-dedup rides the same Learn step, in three deliberately asymmetric pieces: two files sharing a normalized identifier auto-merge (an identifier is not a coincidence); name-similarity is <strong>suggest-only, forever</strong> (name-slug keying is the original identity bug — two different John Smiths in one file) and a pair you dismiss is tombstoned so it is never suggested again; and companies get prevention rather than repair, with alias and domain consulted before a new file is minted and known names fed back into the extraction prompt.",
-      "Retrieval is gated by <strong>today's inputs</strong>, not file staleness: a person packs when they are on today's calendar or in today's email, and the 7-day file-mtime cohort is only the fallback when no inputs were supplied — otherwise the person you meet after a three-week gap, or who emailed you this morning, is packed with zero context.",
+      "Retrieval follows current participants from consented local messages, Gmail, Calendar and active loops, resolved through canonical aliases. The standalone file-mtime fallback applies only when no input files were supplied.",
       "Research is the expensive feeder, so it compounds both ways: a researched person is stamped <code>last_researched</code> and skipped for 30 days, and a researched COMPANY's deep dive lands on the company file — read back into the next dig as “already on file, do NOT re-derive it”, so the second person from that company costs the delta. Nothing situational is stored: openers and talking points are regenerated free from the durable facts every run.",
-      "<strong>The Learn step is one command, and it leaves a receipt.</strong> Every writer on this page's Knowledge, Preferences and Style circuits runs inside <code>learn_step.py</code> — six scripts in order, whether or not the agent remembered them — and the step writes <code>briefs/&lt;date&gt;.&lt;kind&gt;.learned.json</code> saying what ran, skipped or failed. The send seam reads it on the channel's ack: a brief that delivered without learning is logged out loud. Before this, 'run ALL SIX' was an instruction with nothing behind it, and a run that skipped it left every badge on this page green while the memory went a day colder.",
+      "<strong>The Learn step is one command with two phases and one receipt.</strong> Essential knowledge and continuity writes precede handoff. Draft outcomes, voice, meeting-note learning and Contacts synchronization run as durable ancillary work; queued or failed work is recorded in <code>briefs/&lt;date&gt;.&lt;kind&gt;.learned.json</code> without suppressing the brief. Explicit preferences remain owned by user-authorized edits.",
       "<strong>One human, one id, everywhere.</strong> The graph is the register: a contact index seeded from Apple Contacts adopts the person file's <code>canonical_id</code> the moment any identifier overlaps, rather than minting its own and forking the human — and the same id keys the style fingerprint's per-person bucket and the relationship pulse's history, whose last-contact is recorded per channel on ONE row. Before that, a person first graphed from a phone got a different id than the same person seeded from an email, and their texting voice and email voice accumulated as two strangers."
     ],
     live: 6,
@@ -250,22 +495,21 @@ const LOOPS = [
     id: "preferences",
     title: "Preferences",
     status: "closed",
-    one: "Feedback verbs and dashboard levers → preferences.json → the funnel and the brief obey; learned lists are rebuilt from scratch every brief, with tombstones.",
-    hub: ["Preferences", "stated rules + learned rules"],
-    closes: "<code>learn_preferences.py</code> runs in every brief's Learn step and rebuilds the three learned lists <em>from scratch</em> — which is exactly why the tombstones matter. The dashboard records each delete of a learned rule in the top-level <code>suppressed</code> array, and the learner filters those values back out. <strong>A rule you delete stays deleted.</strong>",
+    one: "Explicit feedback → preferences.json → the funnel and brief obey.",
+    hub: ["Preferences", "user-stated rules"],
+    closes: "Chat and dashboard invoke <code>preferences.py</code>; the funnel and brief consume its explicit block. Learn does not rewrite preferences.",
     detail: [
-      "The stated half never goes near the learner: an <code>explicit</code> change from the dashboard forks <code>preferences.py</code>, so muting a sender from the web is byte-for-byte what saying it in chat does.",
-      "A learned approval default is emitted only with real signal — at least {approval.min_accepted} accepted outcomes at ≥{approval.min_accept_rate:pct}% acceptance — and it is clamped: behaviour alone may relax <em>review</em> to <em>one_tap</em>, but it can never grant <code>auto</code> and never emits <code>forbidden</code>. <strong>Honestly: that sub-loop is RECORDING.</strong> <code>approval_defaults</code> and <code>edit_heavy</code> are computed, clamped and shown on the Learned page, and read at draft time by nothing — the approval-tiers reference asks an agent to honor them, and an agent running unattended honors nothing by construction. The stated half (mutes, VIPs, snoozes) is what closes this circuit. The one learned list with a consumer, <code>deprioritization_hints</code>, now reaches you without a tune-up conversation: the evening brief's question line asks <em>“you keep dismissing Bob's items — stop bringing them up?”</em> (one person, at most once every {mute_offer.cooldown_days} days), and your yes runs the same <code>preferences.py mute-person</code> that saying it in chat does — so three dismissals is Sotto asking once whether to stop. The <code>approval_defaults</code> seam stays a ROADMAP carry, honestly: a draft behind a tap is already one tap, and the only stronger form — creating the Gmail draft unasked — is a wall the unattended runner keeps by design.",
-      "<code>preferences.json</code> is the system's ONE shared-write file. Two writers, one for each half, and a documented rule for the overlap."
+      "Mutes, VIPs, tone and snoozes have one writer. Removing a tone note from the dashboard uses the same command path as chat.",
+      "The unused behavioral learner and its dashboard controls have been removed. Historical approval defaults, edit counters and dismissal hints stay on disk but are ignored. Draft usage never grants permission or justifies muting a person.",
+      "Draft outcome matching still runs directly in Learn and confirms verbatim voice samples. Its legacy dismissal label is not explicit feedback."
     ],
-    live: 6,
+    live: 5,
     stations: [
-      { s: "Say it", name: "You state a rule", file: "feedback skill · dashboard mute / VIP / snooze / add-a-rule", note: "“Mute Bob”, “make Sarah a VIP”, “be quiet until 3”, “keep my briefs terse”." },
-      { s: "One CLI", name: "One write path", file: "_shared/scripts/preferences.py (the explicit block)", note: "Chat and dashboard both fork it. No second implementation." },
-      { s: "Behave", name: "You act on drafts", file: "_shared/scripts/log_outcome.py → outcomes.jsonl", note: "draft_created · opened · copied · dismissed · executed · viewed · edited_and_sent. Since Aug 2026 the draft→outcome matcher (<code>draft_outcomes.py</code>) writes these automatically: every offered tap-link draft is matched against what you actually sent — verbatim → executed, edited → edited_and_sent, a day-old unmatched draft → dismissed." },
-      { s: "Learn", name: "Derive the rules", file: "approval-tiers/scripts/learn_preferences.py (inside learn_step.py)", note: "Runs in every brief's Learn step. Emits <code>deprioritization_hints</code>, <code>approval_defaults</code>, <code>edit_heavy</code> and <code>analytics</code> — rebuilt from scratch each run, with the dashboard's tombstones filtered back out. Only the hints have a consumer today (the tune-up scan turns them into mute suggestions you confirm)." },
-      { s: "Store", name: "preferences.json", file: "$SOTTO_DATA/preferences.json", note: "explicit · learned lists · the <code>suppressed</code> tombstones." },
-      { s: "Obey", name: "The funnel obeys", file: "triage_event.py (mutes, VIP, snooze) · compose_brief.py (muted people and senders removed from the data; tone and muted sections passed to the prompt)", note: "The mutes and the VIP list are read in Tier 0 — before any model call is made. In the brief, a muted person is removed from the <strong>data</strong>: their attention-queue entry, their emails and their 1:1 message threads never reach the model (a group they are in stays — a mute is a person, not a room). Two preferences are still prompt-only there, and say so: <code>mute_sections</code> and <code>tone_notes</code> are instructions the model is asked to honor." }
+      { s: "Say", name: "You state a preference", file: "feedback skill · dashboard", note: "Mute Bob, make Sarah a VIP, or be quiet until 3 — explicit user instructions." },
+      { s: "Write", name: "One command path", file: "_shared/scripts/preferences.py", note: "Chat and dashboard use the same writer for the explicit block." },
+      { s: "Store", name: "preferences.json", file: "$SOTTO_DATA/preferences.json", note: "The explicit block holds the instructions the system reads." },
+      { s: "Apply", name: "The system obeys", file: "triage_event.py · compose_brief.py", note: "The funnel reads mutes, VIPs and snoozes; the brief filters muted people and senders. Tone and section preferences are prompt instructions." },
+      { s: "Change", name: "You correct the preference", file: "feedback skill · dashboard → preferences.py", note: "Unmute Bob or end a snooze through the same command path." }
     ]
   },
   {
@@ -284,7 +528,7 @@ const LOOPS = [
     stations: [
       { s: "Verdict", name: "Every verdict, recorded", file: "triage_event._record_surfaced", note: "<code>{ts, sender, channel, verdict, reason, class}</code> — nudged, queued, dropped or promoted." },
       { s: "Ledger", name: "surfaced.jsonl", file: "$SOTTO_DATA/events/surfaced.jsonl", note: "The diagnostic substrate for “why didn't I get nudged about that?”." },
-      { s: "Digest", name: "The digest window", file: "receiver._on_delivered → digest_check.advance_stamp (brief_marker.claim() only on an in-agent install)", note: "The {cron.midday} digest only considers what was queued since the last DELIVERED brief — and needs at least {digest.min_signals} real signals from people you know, or it stays silent." },
+      { s: "Digest", name: "The digest window", file: "receiver._on_delivered → digest_check.advance_stamp (original accepted artifact cutoff)", note: "The {cron.midday} digest reviews what queued since the last DELIVERED brief when {digest.min_signals} known-sender ambient/deferred events justify a review. It shares the brief/nudge relevance policy, considers later replies, and selects only relevant items before the delivery cap; none means silence." },
       { s: "Escalate", name: "The escalation join", file: "triage_event._ledger_rows", note: "Bounded tails of queue.jsonl and surfaced.jsonl answer one question: has this exact person already reached you on a different channel in the last {escalation.window_min} minutes?" },
       { s: "Compress", name: "The evening brief", file: "compose_brief._load_surfaced_nudges → “Already Nudged Today” · brief_validate rule (h)", note: "Today's delivered nudges — surfaced verdicts whose <code>decision_id</code> has a delivered receipt, so a nudge that was decided but never landed can never be 'already told' — compressed to one line each. An item not listed was never nudged. Measured, not only requested: an already-nudged person may not open the brief and takes at most {surfacing.already_nudged_max_lines} lines." },
       { s: "Record", name: "The Record view", file: "dashboard.api_ledger → /app#record", note: "Rendered as-is: <em>muted sender</em>, <em>quiet hours</em>, <em>daily interrupt budget spent ({budget.nudge_per_day} nudges today)</em>." }
@@ -299,7 +543,7 @@ const LOOPS = [
     closes: "The seed-to-draft circuit is closed today: the gather's <code>in:sent</code> lane and the Mac's own outbound rows feed the extractor every brief, and <code>style_apply.py</code> quotes verbatim samples into the drafter prompt — per-person first, then the context bucket.",
     detail: [
       "Confirming a sample on the dashboard's Voice card forks <code>style_extract.py --confirm &lt;hash&gt;</code>, copying it into the <code>confirmed</code> bucket. That bucket is weighted hardest — it is floored at {style.confirmed_floor:pct}% quality, immune to TTL eviction, and quoted first as “drafts the user has shipped before (highest signal)”. <strong>That consumer weighting is live.</strong>",
-      "The “did he actually use it” arc closed in Aug 2026: the draft→outcome matcher confirms a verbatim-shipped draft's sample into the <code>confirmed</code> bucket automatically, so the register is graded by real sends, not only dashboard votes. The arc still open is the edit <em>diff</em> — “what did he change about what I wrote” driving prompt refinement; today an edit lands as an <code>edited_and_sent</code> outcome and an <code>edit_heavy</code> counter that nothing reads, and the diff itself is thrown away (a similarity score, not the text). Because the automatic confirmer feeds the bucket on every verbatim send, it is capped where it grows: the newest {style.confirmed_cap} per register are kept and quoted newest-first — before that the four quoted froze on the first four ever confirmed, forever.",
+      "The “did he actually use it” arc closed in Aug 2026: the draft→outcome matcher confirms a verbatim-shipped draft's sample into the <code>confirmed</code> bucket automatically, so the register is graded by real sends, not only dashboard votes. The arc still open is the edit <em>diff</em> — “what did he change about what I wrote” driving prompt refinement; today an edit lands as an <code>edited_and_sent</code> outcome, and the diff itself is thrown away (a similarity score, not the text). Because the automatic confirmer feeds the bucket on every verbatim send, it is capped where it grows: the newest {style.confirmed_cap} per register are kept and quoted newest-first — before that the four quoted froze on the first four ever confirmed, forever.",
       "Accumulation is real, not a sketch: three context buckets, quality scoring, promotion after a week above the quality bar, and per-bucket TTL eviction ({style.ttl_days:slash} days) so a voice from last spring doesn't outvote this week's."
     ],
     live: 6,
@@ -379,7 +623,7 @@ const LOOPS = [
     stations: [
       { s: "Read", name: "Every interaction", file: "relationship_pulse._interactions_by_contact", note: "iMessage, WhatsApp, missed and answered calls from the Bridge, and six weeks of Gmail both directions — who, which direction, when — folded onto one row per canonical id." },
       { s: "Score", name: "Cadence and drift", file: "relationship_pulse.compute · _cadence_trend · the lapsed pass", note: "<em>waiting_on_you</em> (they sent last), <em>losing_touch</em> (the cadence fell against their own history), <em>lapsed</em> (a regular contact gone fully quiet), each with a priority and a one-line reason." },
-      { s: "Store", name: "relationship_state.json", file: "$SOTTO_DATA/knowledge/relationship_state.json (_persist_state)", note: "The queue, the insights and the per-contact history, written tmp + replace. A degraded run writes nothing." },
+      { s: "Store", name: "relationship_state.json", file: "$SOTTO_DATA/knowledge/relationship_state.json (_persist_state)", note: "The queue, insights and per-contact history include dated reciprocal activity for shared VIP/VVIP gift eligibility, written tmp + replace. A degraded run writes nothing." },
       { s: "Brief", name: "Into the brief", file: "compose_brief.py → attention_queue · relationship_insights", note: "The daily brief reads the queue when the Bridge payload carries none — the weekly pulse persists it for exactly this; a muted person is filtered out of it before the model sees it." },
       { s: "Funnel", name: "A learned VIP", file: "triage_event._is_vip · _sender_one_liner", note: "A queue priority at or above {vip.min_priority} makes the sender a VIP in Tier 0 — the same gate the stated VIP list and a typed <code>family_of</code> relation use — and the queue_type rides into Tier 1 as the one relationship signal the classifier sees." },
       { s: "See", name: "The People page", file: "dashboard.py → /app#people (ATTENTION_SHOWN)", note: "Who is waiting on you and who is going quiet, rendered from the same file — and the muting and VIP levers beside them write back into the Preferences circuit." }
@@ -482,5 +726,8 @@ function paint(){
 
 paint();
 </script>
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared recovery core</h2><p>One Bridge and skill pack in both modes. Source observations preserve consent and coverage. Accepted work is durable before acknowledgment; the existing outbox remains the only sender. Brief research starts ten minutes early, composition becomes runnable two minutes before delivery, and the outbox releases on schedule. Evidenced asks wait until their deadline is within one day; passed invitations close, while overdue actionable work remains eligible. Provider acceptance activates replayable effects; optional learning cannot hold the brief.</p><p>Interactive Hermes behavior remains model-driven. Read receipts, inferred preferences and silence never authorize an external action.</p></section><section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared calendar and research</h2><p>Explicit context notes attach to a unique meeting with the same subject and exact interval; notes remain available without creating a second commitment. Coming Up is a calendar preview.</p><p>Hermes web tools use the same Sotto research providers as the pipeline. Failed history pages retain their checkpoint and record safe validation codes. Native HTTP 400/422 extraction failures pause until the schema, prompt, native client implementation or model route changes; transient failures retry. A constant native response shape avoids page-sized grammar expansion; the writer still validates every citation and text bound. Source text is excluded from diagnostics.</p></section>
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Mac source onboarding</h2><p>Cloud and self-host share the source list and Full Disk Access card. All Mac sources start on for new installs, with visible toggles before the first read. Google sign-in alone does not start collection. Startup and reconnect wait for source confirmation; explicit skip disables every Mac reader. Upgrades keep saved choices. Enabled, accessible and successfully read are separate states. Google handoff generations are durable before credential installation, so a crash cannot allow an older reconnect to restore superseded permissions.</p></section>
+<section style="margin:32px auto;max-width:960px;padding:24px"><h2>Browser setup and sender proof</h2><p>Browser sign-in is bound to its initiating cookie and explicit account approval. Reauthentication resumes the same account journey. A challenge must return from the intended Messages line; the observed identity is displayed before confirmation. The receiver supplies source and first-delivery readiness without private content. An unreachable receiver is unknown, and a verified binding alone is not delivery activation. Live shared routing and Mac confirmation integration remain pending.</p></section>
 </body>
 </html>

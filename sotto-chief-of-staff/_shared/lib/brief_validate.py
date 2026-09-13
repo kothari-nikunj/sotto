@@ -69,6 +69,7 @@ BANNED_PHRASES = (
 _BANNED_VARIANTS = {"requires your immediate attention": "require your immediate attention"}
 
 COMING_UP_MAX_LINES = 5
+CALENDAR_PREVIEW_NOTE = 'Calendar preview — open Calendar for the full schedule.'
 
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$")
 _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
@@ -176,6 +177,8 @@ def _check_coming_up_length(markdown: str, first_run: bool = False) -> list:
             continue
         if _HEADING_RE.match(line) or _is_coming_up_header(line):
             continue                     # the header itself isn't a content line
+        if stripped == CALENDAR_PREVIEW_NOTE:
+            continue
         count += 1
     # First brief: the one-time onboarding note MANDATES one trailing "what you can ask next" line
     # AFTER the brief, and Coming Up (usually last) absorbs it into this count. The offer is
@@ -368,6 +371,7 @@ def _surfaced(entry: dict, markdown: str) -> bool:
 # worked by the proactive nudges, not by the brief. Nothing here is model-judged; it reads the ledger
 # row. The validator, the composer and any future caller import THIS function, so "urgent" cannot
 # come to mean two things.
+ACTION_DEADLINE_HORIZON_SECONDS = 24 * 3600
 
 def open_entries(action_ledger) -> list:
     """The open/waiting rows of a ledger payload — what the contract is about."""
@@ -377,7 +381,8 @@ def open_entries(action_ledger) -> list:
 
 def _next_day(today: str) -> str:
     try:
-        return (date.fromisoformat(today[:10]) + timedelta(days=1)).isoformat()
+        return (date.fromisoformat(today[:10])
+                + timedelta(seconds=ACTION_DEADLINE_HORIZON_SECONDS)).isoformat()
     except (ValueError, TypeError):
         return ""
 

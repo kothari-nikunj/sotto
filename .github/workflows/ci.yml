@@ -35,13 +35,5 @@ jobs:
         # something this morning".
         run: python3 -m pip install --no-cache-dir -r requirements-dev.txt
 
-      - name: Pipeline + skills suite
-        working-directory: sotto-chief-of-staff
-        run: python3 -m pytest tests -q
-
-      - name: Skills validator
-        working-directory: sotto-chief-of-staff
-        run: python3 tools/validate_skills.py
-
-      - name: Trigger receiver suite
-        run: python3 -m pytest runtime/trigger-receiver -q
+      - name: Shared runtime contracts
+        run: python3 sotto-chief-of-staff/tools/verify.py

@@ -152,6 +152,7 @@ class FactMeta:
     conf: float = 0.8
     source: str = ""
     source_ref: str = ""
+    evidence_refs: list = field(default_factory=list)
     first: str = ""
     last: str = ""
 
@@ -166,6 +167,8 @@ class FactMeta:
         d["conf"] = self.conf
         d["source"] = self.source
         d["source_ref"] = self.source_ref
+        if self.evidence_refs:
+            d["evidence_refs"] = self.evidence_refs
         d["first"] = self.first
         d["last"] = self.last
         return d
@@ -181,6 +184,7 @@ class FactMeta:
             conf=float(d.get("conf", 0.8)),
             source=d.get("source", ""),
             source_ref=d.get("source_ref", ""),
+            evidence_refs=list(d.get("evidence_refs") or []),
             first=d.get("first", ""),
             last=d.get("last", ""),
         )
@@ -267,6 +271,7 @@ class PersonFile:
     relations: list = field(default_factory=list)  # [Relation] — typed edges, both ends
     facts: dict = field(default_factory=dict)  # fact_id -> FactMeta
     summary: str = ""
+    summary_refs: list = field(default_factory=list)
     talking_points: list = field(default_factory=list)
     recent_activity: list = field(default_factory=list)
     notes: str = ""
@@ -300,6 +305,8 @@ def find_similar_fact(facts: dict, new_text: str, new_type: str, force_correctio
         ratio = overlap / smaller
         if ratio > 0.5:
             if existing.status == "archived":
+                if force_correction:
+                    continue
                 return (SKIP, None)
             # High overlap is normally the SAME assertion re-observed → bump. But an explicit
             # correction shares most of its words with the fact it corrects ("is NOT the
@@ -328,6 +335,8 @@ def generate_canonical_id(seed: str) -> str:
 
 # ── Decay / prune (knowledge_files.rs:507-525) ────────────────────────────────
 def effective_confidence(fact: FactMeta, now: Optional[datetime] = None) -> float:
+    if fact.source == 'user_edit':
+        return fact.conf
     today = (now or datetime.now()).date()
     try:
         last = datetime.strptime(fact.last, "%Y-%m-%d").date()
@@ -434,6 +443,7 @@ def parse_person_file(content: str) -> PersonFile:
         relations=relations,
         facts=facts,
         summary=b["summary"],
+        summary_refs=list(fm.get('summary_refs') or []),
         talking_points=b["talking_points"],
         recent_activity=b["recent_activity"],
         notes=b["notes"],
@@ -459,6 +469,8 @@ def _person_frontmatter_dict(p: PersonFile) -> dict:
         d["last_researched"] = p.last_researched
     d["updated_at"] = p.updated_at
     d["updated_by"] = p.updated_by
+    if p.summary_refs:
+        d['summary_refs'] = p.summary_refs
     # Relations sit in the IDENTITY block (above `facts:`) — the same half of the frontmatter
     # knowledge_update._person_head reads without paying for the facts map. Omitted when empty, so
     # a file with no edges is byte-identical to what it was before relations existed.
@@ -657,6 +669,7 @@ def merge_person(dst: "PersonFile", src: "PersonFile") -> "PersonFile":
         dst.last_researched = src.last_researched
     if len(src.summary) > len(dst.summary):
         dst.summary = src.summary
+        dst.summary_refs = list(src.summary_refs)
     if len(src.notes) > len(dst.notes):
         dst.notes = src.notes
     if (src.updated_at or "") > (dst.updated_at or ""):

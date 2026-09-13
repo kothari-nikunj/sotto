@@ -47,6 +47,7 @@ from datetime import datetime, timezone, timedelta
 # plain dependency list, not a re-export surface: siblings that want `_s` or `_now_local` import
 # textutil / timeutil themselves, so nothing loads the brief engine to reach a string helper.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import relevance
 from textutil import (  # noqa: E402
     _arr, _obj, _s, _names_match, _is_excluded_domain, _normalize_identifier,
     _base_domain, _sender_addr, _extract_sender_name, unwrap_tool_result,
@@ -66,6 +67,7 @@ from timeutil import (  # noqa: E402
 from gemini import _diag, call_gemini  # noqa: E402
 from chatfmt import to_chat  # noqa: E402  (the ONE markdown→chat transformation)
 import metrics  # noqa: E402  (cost/latency observability — best-effort, never blocks a brief)
+from calendar_context import meeting_events  # noqa: E402
 from render_local import (  # noqa: E402
     build_contact_lookup, build_identity_resolver,
     resolve_contact_names, _action_age,
@@ -163,7 +165,7 @@ def _strip_maintainer_comments(text: str) -> str:
 
 def _load_prompt() -> str:
     with open(PROMPT_PATH, encoding="utf-8") as f:
-        return _strip_maintainer_comments(f.read())
+        return _strip_maintainer_comments(f.read()).replace("{{relevance_policy}}", relevance.policy())
 
 
 def _split_prompt(template: str) -> tuple[str, str]:
@@ -302,7 +304,7 @@ def select_attendees_for_research(inputs: dict) -> list:
     Returns [{name, email, meeting_title, meeting_start}], deduped by email, capped at the max."""
     google = _obj(inputs, "google")
     local = resolve_contact_names(_obj(inputs, "local"))
-    events = _arr(google, "events")
+    events = meeting_events(_arr(google, "events"))
     user_email = (_s(google.get("userEmail")) or configured_user_email()).lower()
     user_domain = user_email.split("@")[1] if "@" in user_email else ""
     # The same-domain skip means "colleagues don't need research" — that only holds for a CORPORATE
@@ -420,6 +422,25 @@ def _first_run_note(inputs: dict, local: dict, sa: dict, events, emails) -> str:
     if not _is_first_run(inputs, local):
         return ""
     coverage = _coverage_line(local, sa, events, emails, _email_truncation_note(_obj(inputs, "google")))
+    if inputs.get('type') == 'welcome':
+        return ("## FIRST USEFUL LOOK\n"
+                "Show understanding through useful work. Lead with the strongest verified connection "
+                "between the user's conversations, calendar and commitments. Use the normal attention "
+                "sections but include at most three substantive items; one strong item is enough. "
+                "Use the shared relevance policy, reconcile later replies, and do not revive old asks. "
+                "Include one concise proposed reply or concrete next step grounded in the source, in "
+                "the user's voice when writing samples are available. A proposal is not a saved draft, "
+                "a sent message, a booked meeting, or completed research. Do not claim any of those. "
+                "End with ONE explicit reply command attached to an actual item, such as Say draft Alex. "
+                "The closing command offers drafting for review, never immediate sending. "
+                "Do not say that asking for a draft sends a message. "
+                "Do not end with an unbound yes/no question. "
+                "Skip a generic introduction, connection checklist, Already Handled inventory and "
+                "Filtered counts. Never infer a relationship from frequency alone. If evidence is "
+                "thin, give a useful partial view honestly; do not invent a finding to fill space. "
+                "Name a failed source only when it materially limits a finding. Do not list optional "
+                "integrations to connect. This is a first look at recent context; older history "
+                "continues learning in the background.\n\n")
     return (
         "## FIRST BRIEF (one-time onboarding — overrides the no-intro rule, JUST for this brief)\n"
         "This is the user's very first Sotto brief. Open with ONE short, warm sentence introducing "
@@ -734,106 +755,118 @@ def _snapshot_age_hours(captured_at: str):
 
 
 
+def _live_local_observation(local: dict) -> bool:
+    """A successful empty read still observes the source; row counts never prove availability."""
+    return isinstance(local, dict) and (bool(local.get("source_status")) or _local_has_data(local))
+
+
+def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
+    from source_context import SOURCE_FIELDS, project_local
+    incoming = project_local(local)
+    cached = project_local(snapshot.get("local") or {})
+    if not cached:
+        return incoming
+    result = dict(incoming)
+    status = dict(incoming.get("source_status") or {})
+    availability = dict(incoming.get("_source_availability") or {})
+    observed = dict(incoming.get("_source_observed_at") or {})
+    prior_observed = cached.get("_source_observed_at") or {}
+    prior_status = cached.get("source_status") or {}
+    live_stamp = incoming.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    stale, unavailable = [], []
+    for source, fields in SOURCE_FIELDS.items():
+        known = source in status or source in prior_status or any(k in incoming or k in cached for k in fields)
+        if not known:
+            continue
+        choice = status.get(source)
+        if choice == "disabled" or prior_status.get(source) == "disabled" and not choice:
+            for field in fields:
+                result.pop(field, None)
+            status[source] = "disabled"
+            availability[source] = "disabled"
+            continue
+        # Current explicit ok plus empty data is a valid empty observation. Contacts without
+        # a status remain the existing thin-pull case, so identity carry-forward still works.
+        successful = choice == "ok" or (choice is None and any(result.get(k) for k in fields))
+        if successful:
+            observed[source] = live_stamp
+            continue
+        previous_stamp = prior_observed.get(source) or snapshot.get("captured_at")
+        age = _snapshot_age_hours(previous_stamp)
+        # Contacts are stable identity context; a live thin/failed pull can retain that identity
+        # cache. A wholly offline snapshot still obeys the same 24-hour bound as before.
+        usable = age is not None and 0 <= age <= LOCAL_SNAPSHOT_TTL_HOURS
+        if source == "contacts" and _live_local_observation(incoming):
+            usable = True
+        carried = False
+        for field in fields:
+            result.pop(field, None)
+            if usable and field in cached:
+                result[field] = cached[field]
+                carried = carried or bool(cached[field])
+        observed[source] = previous_stamp
+        status[source] = choice or "unavailable"
+        availability[source] = "unavailable"
+        if carried and previous_stamp:
+            stale.append(previous_stamp)
+        elif previous_stamp:
+            unavailable.append(previous_stamp)
+    if status:
+        result["source_status"] = status
+    if availability:
+        result["_source_availability"] = availability
+    if observed:
+        result["_source_observed_at"] = observed
+    if stale:
+        result["_local_stale_since"] = min(stale)
+    if unavailable and not stale:
+        result["_local_unavailable_since"] = min(unavailable)
+    return project_local(result)
+
+
 def _save_local_snapshot(local: dict) -> dict:
-    """Write the snapshot and RETURN the dict actually written, carry-forward applied — the caller
-    must compose from the returned copy. The symptom this heals is live ("raw phone numbers in the
-    brief"): a heal that only lands in the file fixes a future outage fallback, not the brief being
-    composed right now, and a thin pull would render nameless forever while the snapshot on disk
-    quietly stayed healthy."""
-    merged = dict(local)
+    """One locked writer: preserve per-source freshness and never revive disabled sources."""
+    import jsonstore
+    from source_context import project_local, record_bridge_status
+    record_bridge_status(local)
+    merged = project_local(local)
     try:
         path = _snapshot_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        stamp = merged.get("generated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        # Contacts carry-forward: contacts (the identity/name-resolution layer) change slowly and a
-        # pull can come back thin. If THIS pull has no contacts but the prior snapshot did, keep the
-        # old ones so a contacts-less refresh doesn't wipe name resolution (the "raw phone numbers in
-        # the brief" symptom). Everything else is plain last-write-wins.
-        #
-        # UNLESS the user turned Contacts OFF. `source_status: {"contacts": "disabled"}` is the
-        # Bridge reporting a CHOICE (bridge-config.json's disabled_sources), not a thin read, and
-        # carrying yesterday's address book forward past that choice keeps a disabled source alive
-        # in every later brief. A disabled source is dropped from the snapshot, not remembered.
-        if _s(_obj(merged, "source_status").get("contacts")) == _DISABLED_SOURCE:
-            merged.pop("contacts", None)
-        elif not _arr(merged, "contacts"):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    prev = (json.load(f).get("local") or {})
-                if _arr(prev, "contacts"):
-                    merged["contacts"] = prev["contacts"]
-            except Exception:
-                pass
-        # Under knowledge/, so the same tmp-then-replace every other knowledge writer uses: a crash
-        # mid-write on an `open(path, "w")` truncates first, and for snapshots/ that window is a
-        # permanently corrupt day in the corpus' only message-history source.
-        body = json.dumps({"captured_at": stamp, "local": merged})
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            f.write(body)
-        os.replace(path + ".tmp", path)
-        # Dated archive copy — the Golden Corpus reads these for message history (its own try:
-        # an archive hiccup must never cost the live snapshot, let alone the brief).
-        try:
-            arch_dir = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "knowledge", "snapshots")
-            os.makedirs(arch_dir, exist_ok=True)
-            day = _s(stamp)[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            arch = os.path.join(arch_dir, f"{day}.json")
-            with open(arch + ".tmp", "w", encoding="utf-8") as f:
-                f.write(body)
-            os.replace(arch + ".tmp", arch)
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_ARCHIVE_DAYS)).strftime("%Y-%m-%d")
-            for old in os.listdir(arch_dir):
-                if old.endswith(".json") and old[:10] < cutoff:
-                    os.remove(os.path.join(arch_dir, old))
-        except Exception:
-            pass
-    except Exception:
-        pass
+        stamp = merged.get("generated_at") or datetime.now(timezone.utc).isoformat()
+        with jsonstore.transaction(path, default={}) as previous:
+            old_age, new_age = _snapshot_age_hours(previous.get("captured_at")), _snapshot_age_hours(stamp)
+            if old_age is not None and new_age is not None and old_age < new_age:
+                # A slower old wake/brief input cannot roll the latest valid snapshot backwards.
+                return project_local(previous.get("local") or {})
+            merged = _merge_local_snapshot(merged, previous)
+            previous.clear()
+            previous.update(captured_at=stamp, local=merged)
+        # The corpus archive is a projection of the same observation, never a competing writer.
+        arch_dir = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "knowledge", "snapshots")
+        os.makedirs(arch_dir, exist_ok=True)
+        day = _s(stamp)[:10]
+        arch = os.path.join(arch_dir, f"{day}.json")
+        with jsonstore.transaction(arch, default={}) as archived:
+            if not archived.get("captured_at") or _s(archived["captured_at"]) <= _s(stamp):
+                archived.clear()
+                archived.update(captured_at=stamp, local=merged)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_ARCHIVE_DAYS)).strftime("%Y-%m-%d")
+        for old in os.listdir(arch_dir):
+            if old.endswith(".json") and old[:10] < cutoff:
+                os.remove(os.path.join(arch_dir, old))
+    except (OSError, ValueError, TypeError, jsonstore.Unreadable):
+        pass  # a broken cache never makes live context unavailable
     return merged
 
 
-
-
 def _local_fallback(local: dict) -> dict:
-    """Bridge unreachable (empty local): fall back to the last cached snapshot, tagged stale so the
-    brief says 'local context from Mac last seen …' rather than silently dropping to Google-only.
-    Snapshots older than LOCAL_SNAPSHOT_TTL_HOURS are dropped — better no local than stale loops."""
-    try:
-        path = _snapshot_path()
-        if not os.path.exists(path):
-            return local
-        with open(path, encoding="utf-8") as f:
-            snap = json.load(f)
-        cached = snap.get("local") or {}
-        if not _local_has_data(cached):
-            return local
-        age = _snapshot_age_hours(snap.get("captured_at"))
-        if age is not None and age > LOCAL_SNAPSHOT_TTL_HOURS:
-            # Expired — don't replay day(s)-old messages as if they're current. But the Bridge WAS
-            # here and now isn't, and a source that breaks must SAY so: returning a bare {} made the
-            # brief read as a complete, honest day with the local channels merely quiet (a Mac
-            # asleep 37h, Sep 2026 review). Mark every source the Mac was reporting as unavailable
-            # and date the last capture, so the prompt's Data Source Availability section warns.
-            # (No snapshot at all is different: a Bridge that was never here is unconfigured, and an
-            # unconfigured source reports nothing — that path above stays a no-op.)
-            out = dict(local or {})
-            avail = dict(out.get("_source_availability") or {})
-            reported = cached.get("source_status") if isinstance(cached.get("source_status"), dict) else {}
-            for sid in (reported or {"imessage": 1, "whatsapp": 1, "calls": 1}):
-                avail.setdefault(sid, "unavailable")
-            out["_source_availability"] = avail
-            out["_local_unavailable_since"] = snap.get("captured_at")
-            return out
-        cached = dict(cached)
-        cached["_local_stale_since"] = snap.get("captured_at")
-        # Preserve any availability/knowledge the caller did pass alongside the empty local.
-        for k, v in (local or {}).items():
-            if v and k not in cached:
-                cached[k] = v
-        return cached
-    except Exception:
-        return local
-
+    """Reuse only permitted, genuinely unavailable sources, with their original observation age."""
+    import jsonstore
+    from source_context import project_local, record_bridge_status
+    if _live_local_observation(local):
+        record_bridge_status(local)
+    snapshot = jsonstore.read(_snapshot_path(), default={})
+    return _merge_local_snapshot(local, snapshot) if snapshot else project_local(local)
 
 
 
@@ -849,10 +882,16 @@ def _normalize_local(inputs: dict) -> dict:
     - the Bridge's source_status → the consumer's _source_availability (ok→available, else→unavailable),
       so the prompt still warns when a local source is missing and the model won't invent actions for it.
     Values already present in `local` win (an explicit override is never clobbered)."""
-    local = dict(_obj(inputs, "local"))
+    from source_context import project_local
+    local = project_local(_obj(inputs, "local"))
+    for source, observation in _obj(inputs, "source_results").items():
+        if source in ("gmail", "calendar") and isinstance(observation, dict):
+            status = observation.get("status")
+            if status in ("unavailable", "partial", "disabled"):
+                local.setdefault("_source_availability", {})[source] = "disabled" if status == "disabled" else "unavailable"
 
     pk = _obj(inputs, "prior_knowledge")
-    named = ("person_knowledge", "company_knowledge", "contact_index", "journal_context")
+    named = ("person_knowledge", "company_knowledge", "contact_index", "journal_context", "memory_participants")
     if pk and not any(k in pk for k in named):
         # Bare knowledge_query.py output ({slug: packed_string}) → treat as person_knowledge.
         pk = {"person_knowledge": pk}
@@ -869,7 +908,7 @@ def _normalize_local(inputs: dict) -> dict:
 
     if not local.get("_source_availability") and isinstance(local.get("source_status"), dict):
         local["_source_availability"] = {
-            sid: ("available" if _s(st) == "ok" else "unavailable")
+            sid: ("available" if _s(st) == "ok" else "disabled" if _s(st) == "disabled" else "unavailable")
             for sid, st in local["source_status"].items()
         }
 
@@ -948,6 +987,15 @@ def _normalize_local(inputs: dict) -> dict:
 
 # An intro you made is theirs to answer to each other, not a debt owed to you.
 _INTRO_SUBJECT_RE = re.compile(r"^\s*(?:re:\s*|fwd?:\s*)*(?:intro(?:duction)?s?\b|connecting\b|meet\b|<>)", re.I)
+# A calendar RSVP is not a letter: Google Calendar sends "Accepted: <event> @ <when> (<organizer>)"
+# from your Gmail to the organizer, nobody answers it, and on Sep 5, 2026 the stale lane turned one
+# into "Team FPV hasn't answered", chased it, and reported the chase — three lines about a meeting
+# the user had already accepted. The shape is Google's own — a prefix from its vocabulary AND the
+# " @ <when>" it always appends — so a chase the user wrote as "Reminder: allocation numbers by
+# Friday?" is still a letter, and still a debt.
+_CALENDAR_SUBJECT_RE = re.compile(
+    r"^\s*(?:re:\s*|fwd?:\s*)*(?:accepted|declined|tentatively accepted|tentative|invitation|"
+    r"updated invitation|cancell?ed event|new event|proposed new time|reminder)\s*:.*\s@\s", re.I)
 STALE_MIN_SNIPPET_WORDS = 6     # under this, the thread was a "thanks" — nothing to be owed
 
 
@@ -963,6 +1011,8 @@ def _filter_stale_threads(rows: list, local: dict) -> list:
         if not email or email not in known_emails or _is_likely_automated(email):
             continue
         if _INTRO_SUBJECT_RE.search(_s(t.get("subject"))) or "<>" in _s(t.get("subject")):
+            continue
+        if _CALENDAR_SUBJECT_RE.search(_s(t.get("subject"))):
             continue
         if len(_s(t.get("snippet")).split()) < STALE_MIN_SNIPPET_WORDS:
             continue
@@ -995,7 +1045,7 @@ def _stale_debt_actions(local: dict, lookup: dict | None = None) -> list:
             "type": "waiting_on", "channel": "gmail", "contactName": name,
             "contactIdentifier": email, "emailReplyTo": email, "emailThreadId": _s(t.get("threadId")),
             "emailSubject": subject, "created_at": _s(t.get("sentDate"))[:10],
-            "contextSummary": f"{name} hasn't answered \"{subject}\" — you wrote {days} days ago",
+            "contextSummary": f"{name} hasn't answered \"{subject}\"",
             "contextAsk": f"a reply from {name} on \"{subject}\"",
             "contextUrgencyReason": f"{days} days without a reply",
             "confidence": 0.8,
@@ -1019,7 +1069,7 @@ def _rsvp_actions(inputs: dict, now=None) -> list:
     google = _obj(inputs, "google")
     now = now or datetime.now(timezone.utc)
     out = []
-    for e in _arr(google, "events"):
+    for e in meeting_events(_arr(google, "events")):
         if _s(e.get("my_response")).lower() != "needsaction" or not _s(e.get("id")):
             continue
         st = _parse_ts(_s(e.get("start")))
@@ -1194,7 +1244,71 @@ def _brief_day(tz: str, now=None) -> str:
     return local.strftime("%Y-%m-%d")
 
 
-def _format_master_context() -> str:
+# The brief's first line, by code: the time of day and the date, in the user's zone. The model was
+# told "no greeting" so the prose starts with what needs you; the owner found that cold (Sep 6,
+# 2026). A heading, not prose, so every validator rule about the first CONTENT line is unchanged.
+GREETING_HOURS = ((12, "Good morning"), (17, "Good afternoon"), (24, "Good evening"))
+
+
+def _local_now(tz: str, now=None):
+    """The wall clock — or the injected instant — in the user's zone, as an aware datetime."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    tzinfo = _resolve_tz(tz)
+    return (now.astimezone(tzinfo) if tzinfo is not None
+            else (now + timedelta(minutes=_tz_offset_minutes(tz))).replace(tzinfo=timezone.utc))
+
+
+def _greeting_line(inputs: dict) -> str:
+    """'# Good morning — Saturday, September 6': the greeting follows the local HOUR, not the brief
+    type, so a morning brief the wake path composes at 12:40 says good afternoon — honestly."""
+    try:
+        local = _local_now(_brief_tz(inputs), _brief_now(inputs))
+        word = next(w for h, w in GREETING_HOURS if local.hour < h)
+        return f"# {word} — {local.strftime('%A, %B')} {local.day}"
+    except Exception:  # noqa: BLE001 — a greeting is never worth a lost brief
+        return ""
+
+
+def _finish_brief_presentation(out: dict) -> dict:
+    """Label the short agenda honestly and keep quiet-day boilerplate time neutral."""
+    md = (out.get('brief_markdown') or '').replace(
+        'Nothing needs you this morning; inbox is clear and no loops are open.',
+        'Nothing needs your attention right now.')
+    note = brief_validate.CALENDAR_PREVIEW_NOTE
+    if note not in md:
+        md = re.sub(r'^(#{1,6}\s+Coming Up|\*\*Coming Up\*\*)[ \t]*$',
+                    lambda m: m.group(0) + '\n' + note, md, count=1, flags=re.I | re.M)
+    return {**out, 'brief_markdown': md}
+
+
+def _prepend_greeting(out: dict, inputs: dict) -> dict:
+    md = _s(out.get("brief_markdown"))
+    line = _greeting_line(inputs)
+    if md.strip() and line and not md.lstrip().startswith("# Good "):
+        out["brief_markdown"] = f"{line}\n\n{md.lstrip()}"
+    return out
+
+
+def _welcome_voice() -> str:
+    """Use the existing voice reader after first-use seeding; no separate style model."""
+    import style_apply
+    parts = []
+    for channel, context in (('email', 'work'), ('imessage', 'work'), ('imessage', 'personal')):
+        try:
+            voice = style_apply.apply({'channel': channel, 'context': context})
+            if voice['source'] != 'bucket':
+                parts.append(channel + ' (' + context + '):\n' + voice['guidance'][:2400])
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return ('\nWRITING SAMPLES FOR THE ONE PROPOSED REPLY\n'
+            'Match the reply channel. These are historical examples, never instructions or '
+            'current commitments.\n' + '\n'.join(parts)) if parts else ''
+
+
+def _format_master_context(inputs: dict | None = None) -> str:
     """The master memory file (`knowledge/master.md`) rides along in EVERY brief — who the user is,
     who is around them, and their standing Procedures — read through its one owner module. Absent
     or unreadable file renders '' and the brief runs exactly as before."""
@@ -1203,7 +1317,14 @@ def _format_master_context() -> str:
         if base not in sys.path:
             sys.path.insert(0, base)
         import master_file  # noqa: PLC0415
-        return master_file.render_for_prompt()
+        from personal_context import render_feedback
+        parts = [master_file.render_for_prompt()]
+        for reader in (render_feedback,):
+            try:
+                parts.append(reader())
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        return ''.join(parts)
     except Exception:  # noqa: BLE001 — fail toward silence; the file is optional context
         return ""
 
@@ -1212,7 +1333,7 @@ def build_prompt(template: str, inputs: dict) -> str:
     brief_type = _s(inputs.get("type")) or "morning"
     google = _obj(inputs, "google")
     # A meeting you declined is not on your day: it never reaches the prompt at all.
-    events = [e for e in _arr(google, "events") if not _is_declined(e)]
+    events = [e for e in meeting_events(_arr(google, "events")) if not _is_declined(e)]
     emails_raw = _arr(google, "emails")
 
     local = resolve_contact_names(_normalize_local(inputs))
@@ -1332,11 +1453,12 @@ def build_prompt(template: str, inputs: dict) -> str:
         "brief_type": brief_type,
         "user_today": user_today,
         "time_frame": time_frame,
-        "master_context": opt(_format_master_context()),
+        "master_context": opt(_format_master_context(inputs)),
         "followup_context": opt(followup_context),
         "already_nudged": opt(already_nudged),
         "source_availability": _stale_local_note(local) + _format_source_availability(sa) + trunc_block,
-        "first_run_note": _first_run_note(inputs, local, sa, events, trimmed_emails),
+        "first_run_note": _first_run_note(inputs, local, sa, events, trimmed_emails) +
+                          (_welcome_voice() if brief_type == "welcome" else ""),
         "user_preferences": opt(_format_user_preferences(prefs)),
         "signal_scores": _format_signal_scores(corr["signal_scores"]),
         "granola_context": _format_granola_context(corr["granola_context"]),
@@ -1496,22 +1618,7 @@ _CRITIC_POLICY_SECTIONS = ("## Triage Discipline", "## Priority Levels")
 _CRITIC_POLICY_HEADER = ("## Triage Policy (the SAME policy the brief was written under — judge "
                          "against this bar, NOT against completeness)\n\n")
 
-_CRITIC_TRIAGE_POLICY_FALLBACK = """Triage Discipline — before including each entry, the brief asks: "Would a great chief of staff interrupt for this?"
-- YES: Real stakes, real deadline, real relationship at risk, or a real opportunity window closing
-- MAYBE: Worth mentioning but not interrupting for — put it lower or fold it into another entry
-- NO: Social threads with no ask, FYI messages that don't change today's decisions, low-stakes scheduling, casual banter that's wrapped up → Already Handled at most, or skip entirely
-- NEVER: System-generated emails where no human is personally waiting for a response. These are not communication — they are system output. Skip entirely.
-A brief with 5 excellent entries beats one with 12 mediocre ones.
-
-Priority Levels:
-- Needs Attention Now: stakes are real AND timing matters. Must meet AT LEAST ONE:
-  - Explicit deadline (today, overdue, promised by date)
-  - Multi-channel escalation (same person, same topic, 2+ channels — they're clearly waiting)
-  - Missed calls (someone tried to reach you live)
-  - Time-sensitive decisions (offers expiring, invitations with deadlines)
-  - Commitments you made that are due
-  Items that are just "waiting for a response" without urgency belong in Should Handle Today or are omitted. A bare unread/unanswered message is NOT enough on its own.
-- Should Handle Today: genuinely worth acting on today — a clear next step and a reason to do it today. The test: a real human wrote something that expects a real human response. Automated emails, system notifications, and informational digests never qualify. If there is no clear ask, it is omitted unless it is a true stale loop (3+ days), cross-channel escalation, or a relationship the user explicitly keeps warm."""
+_CRITIC_TRIAGE_POLICY_FALLBACK = "Triage Discipline\n" + relevance.policy()
 
 
 def _extract_prompt_sections(template: str, headings) -> str:
@@ -1586,7 +1693,7 @@ def build_data_manifest(inputs: dict) -> dict:
     local = resolve_contact_names(_normalize_local(inputs))
     lookup = build_contact_lookup(_arr(local, "contacts"))
     emails = [_trim_email(e, lookup) for e in _arr(google, "emails")]
-    events = _arr(google, "events")
+    events = meeting_events(_arr(google, "events"))
 
     seen, threads = set(), []
     for e in emails:
@@ -1675,7 +1782,8 @@ Return JSON: {"brief_markdown":"<corrected brief>","actions":<the same actions[]
 
 
 
-def critique_and_revise(out: dict, inputs: dict, llm=call_gemini, violations: list | None = None) -> dict:
+def critique_and_revise(out: dict, inputs: dict, llm=call_gemini, violations: list | None = None,
+                        source_prompt: str | None = None) -> dict:
     """Run the critic; if it finds critical/moderate issues, revise the brief to fix them. Best-effort:
     any failure returns the original brief unchanged. Stamps out['_critic'] for observability.
     Deterministic brief_validate `violations` ride along: they're shown to the critic AND merged as
@@ -1693,7 +1801,13 @@ def critique_and_revise(out: dict, inputs: dict, llm=call_gemini, violations: li
         if not actionable:
             return out
         patch_lines = "\n".join(f"- [{p['severity']}] {p['type']}: {p['detail']}" for p in actionable)
+        # A repair must see the same evidence as extraction. Issues + a draft alone cannot
+        # recover omitted meetings or distinguish a missed call from a later resolved exchange.
+        if source_prompt is None:
+            _, user_template = _split_prompt(_load_prompt())
+            source_prompt = build_prompt(user_template, inputs)
         revise_prompt = (REVISE_SYSTEM + "\n\n## CRITIC ISSUES TO FIX\n" + patch_lines
+                         + "\n\n## ORIGINAL SOURCE CONTEXT\n" + source_prompt
                          + "\n\n## CURRENT BRIEF\n" + _s(out.get("brief_markdown"))
                          + "\n\n## CURRENT ACTIONS\n" + json.dumps(out.get("actions", []))[:8000]
                          + "\n\nReturn the corrected JSON only.")
@@ -1745,7 +1859,7 @@ def _event_link_map(inputs: dict) -> dict:
     google = _obj(inputs, "google")
     default_cal = _s(google.get("userEmail")) or configured_user_email()
     out = {}
-    for e in _arr(google, "events"):
+    for e in meeting_events(_arr(google, "events")):
         eid = _s(e.get("id"))
         if not eid:
             continue
@@ -1825,7 +1939,7 @@ def _collect_tap_targets(inputs: dict, event_links: dict | None, allow: set) -> 
             _allow(allow, *_EMAIL_IN_TEXT_RE.findall(_s(field)))
     for t in _arr(local, "stale_threads"):
         _allow(allow, t.get("threadId"), *_EMAIL_IN_TEXT_RE.findall(_s(t.get("to"))))
-    for e in _arr(google, "events"):
+    for e in meeting_events(_arr(google, "events")):
         _allow(allow, e.get("id"), e.get("meetingLink"), e.get("htmlLink"), e.get("hangoutLink"))
         _allow(allow, *[a.get("email") for a in _arr(e, "attendees")])
         _allow(allow, _obj(e, "organizer").get("email"), _obj(e, "creator").get("email"))
@@ -2080,82 +2194,6 @@ def _append_procedure_offer(out: dict, inputs: dict) -> dict:
     return out
 
 
-# "Three dismissals is Sotto asking once whether to stop bringing it up." The learner already
-# computes the hint (deprioritization_hints) and retune_scan already turns it into a mute
-# suggestion; before this the suggestion waited for a tune-up conversation nobody starts. The
-# evening brief's one question line carries it — and asks about one person at most once a month.
-MUTE_OFFER_COOLDOWN_DAYS = 30
-
-
-def _mute_offers_path() -> str:
-    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "proactive", "mute_offers.json")
-
-
-def _pick_mute_candidate(today: str) -> str:
-    """The first person retune_scan suggests muting whom we have not asked about within the
-    cooldown, or "". Reads the stamp file; never writes it (the offer does, once it is on the brief)."""
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import retune_scan  # noqa: PLC0415
-        suggestions = retune_scan.scan().get("mute_suggestions") or []
-    except Exception:  # noqa: BLE001
-        return ""
-    try:
-        with open(_mute_offers_path(), encoding="utf-8") as f:
-            offered = json.load(f) or {}
-    except (OSError, ValueError):
-        offered = {}
-    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=MUTE_OFFER_COOLDOWN_DAYS)).strftime("%Y-%m-%d")
-    for s in suggestions:
-        name = _s(s.get("name") if isinstance(s, dict) else s).strip()
-        if name and _s(offered.get(name.lower())) < cutoff:
-            return name
-    return ""
-
-
-def _stamp_mute_offer(name: str, today: str) -> None:
-    path = _mute_offers_path()
-    try:
-        with open(path, encoding="utf-8") as f:
-            offered = json.load(f) or {}
-    except (OSError, ValueError):
-        offered = {}
-    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=MUTE_OFFER_COOLDOWN_DAYS)).strftime("%Y-%m-%d")
-    offered = {k: v for k, v in offered.items() if _s(v) >= cutoff}     # bounded by the cooldown
-    offered[name.lower()] = today
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = os.path.join(os.path.dirname(path), ".mute_offers.json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(offered, f)
-    os.replace(tmp, path)
-
-
-def _append_mute_offer(out: dict, inputs: dict, today: str = "") -> dict:
-    """Evening only, and only when the evening has no other question (one question per evening, by
-    construction — the standing-rule offer goes first). The mute itself is NEVER written here: a
-    yes in the gateway runs `preferences.py mute-person`, the one writer that block has."""
-    if (_s(inputs.get("type")) or "morning") != "evening" or _s(inputs.get("_procedure_offer")):
-        return out
-    if not os.environ.get("SOTTO_DATA"):
-        return out
-    try:
-        today = today or _brief_day(_brief_tz(inputs), _brief_now(inputs))
-        name = _pick_mute_candidate(today)
-        if not name:
-            return out
-        question = (f"You keep dismissing {name}'s items — stop bringing them up? "
-                    f"Say yes and I'll mute them.")
-        md = _s(out.get("brief_markdown"))
-        out["brief_markdown"] = (md.rstrip() + "\n\n" + question + "\n") if md.strip() else question
-        _stamp_mute_offer(name, today)
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import pending_offer  # noqa: PLC0415
-        pending_offer.set_offer("mute", question, person=name)
-    except Exception as e:  # noqa: BLE001 — the brief never waits on a question
-        _diag(f"[compose_brief] mute offer skipped ({type(e).__name__}: {e})")
-    return out
-
-
 def _render_followup_context(fu: dict) -> str:
     """Deterministically render the merged followup result as an evening-brief prompt block. Empty
     string when there's nothing worth saying (no markdown, no commitments, no drafts)."""
@@ -2397,7 +2435,24 @@ def _open_loop_line(entries: list, now=None) -> str:
             + (f" ({age})" if age != "unknown" else ""))
 
 
-def _append_still_open(out: dict, open_ledger: list, now=None, today: str = "") -> dict:
+def _receipt_identity(e: dict) -> str:
+    """One loop, one key for 'is this the row What moved reports': the anchor when the row has one,
+    else who and what — the fixture rows and hand-added loops carry no anchor."""
+    return _s(e.get("anchor_key")).strip() or f"{_s(e.get('contact_name')).strip()}|{_s(e.get('summary')).strip()}"
+
+
+def _reported_chase_keys(inputs: dict, day: str) -> set:
+    """The loops the EVENING's What moved block will report as reminded today — read from the
+    same receipts reader, so Still open skips exactly what that block prints and nothing more. A
+    morning brief prints no receipts, so it skips nothing: an urgent loop reminded at 06:15 still
+    earns its Still open line at 06:30."""
+    if (_s(inputs.get("type")) or "morning") != "evening":
+        return set()
+    return {_receipt_identity(e) for e in _ledger_receipts(day)[0] if _receipt_identity(e) != "|"}
+
+
+def _append_still_open(out: dict, open_ledger: list, now=None, today: str = "",
+                       reported: set | None = None) -> dict:
     """The urgent-only backstop, inserted just before the Filtered section (the last one): one line
     per PERSON for the urgent loops the narrative failed to name, then — when non-urgent loops
     remain unsaid — ONE quiet line saying how many and where they live. Never a bulleted wall, and
@@ -2409,6 +2464,10 @@ def _append_still_open(out: dict, open_ledger: list, now=None, today: str = "") 
         md = _s(out.get("brief_markdown"))
         if not md:
             return out
+        # A loop the evening's What moved block reports as reminded today is told there; listing it
+        # again here was the third mention of one debt in one brief (Sep 5, 2026).
+        if reported:
+            open_ledger = [e for e in open_ledger if _receipt_identity(e) not in reported]
         missed = brief_validate.missing_open_loops(md, open_ledger, today)
         quiet = brief_validate.unsurfaced_open_loops(md, open_ledger, today)
         if not missed and not quiet:
@@ -2526,18 +2585,21 @@ def _receipt_what(entry: dict) -> str:
 
 
 def _chase_clause(e: dict) -> str:
-    """One delivered chase, in plain English: 'Gave Maya a nudge about the contract (second ask).'"""
+    """One delivered chase, in plain English — and honestly: what was delivered is a REMINDER to
+    the user with a draft behind it, never a message to the counterpart. 'Gave Maya a nudge' read
+    as if Sotto had written to Maya; `chased_count` counts reminders, so the clause says so:
+    'Reminded you to chase Maya about the contract (second reminder).'"""
     name, what = _s(e.get("contact_name")).strip(), _receipt_what(e)
     if name and what:
-        s = f"Gave {name} a nudge about {what}"
+        s = f"Reminded you to chase {name} about {what}"
     elif name:
-        s = f"Gave {name} a nudge"
+        s = f"Reminded you to chase {name}"
     elif what:
-        s = f"Sent a nudge about {what}"
+        s = f"Reminded you about {what}"
     else:
         return ""
     ordinal = _CHASE_ORDINALS.get(_receipt_int(e.get("chased_count")))
-    return s + (f" ({ordinal} ask)." if ordinal else ".")
+    return s + (f" ({ordinal} reminder)." if ordinal else ".")
 
 
 def _closed_clause(e: dict) -> str:
@@ -2803,8 +2865,22 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
             inputs["_procedure_offer"] = _pick_procedural_candidate(fu)
 
     prompt = build_prompt(user_template, inputs)
-    raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
-    out = _normalize_output(json.loads(raw))
+    # Native JSON/schema success can still contain an empty brief. Never let the critic
+    # manufacture a replacement from its compact manifest and accidentally claim the day.
+    # Retry extraction once with the identical full context; fail before the invalid output
+    # reaches the critic or post-compose learning/archive. Short quiet-day briefs remain valid.
+    for attempt in range(2):
+        raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
+        try:
+            out = _normalize_output(json.loads(raw))
+        except (ValueError, TypeError):
+            out = {}
+        markdown = out.get('brief_markdown')
+        if isinstance(markdown, str) and markdown.strip():
+            break
+        _diag(f"[compose_brief] invalid extraction (missing/non-text/empty brief), attempt {attempt + 1}/2")
+    else:
+        raise RuntimeError('Brief extraction failed twice; no brief was produced')
 
     # Debts code can see are minted by code, whatever the prose did with them: an email you sent
     # that nobody answered (a `waiting_on` with the recipient as counterpart) and an invite you
@@ -2852,11 +2928,17 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
                                        first_run=_is_first_run(inputs, {}))
         _diag(f"[compose_brief] critic {'ran' if run else 'skipped'} ({reason})")
         if run:
-            out = critique_and_revise(out, inputs, llm, violations=violations)
+            out = critique_and_revise(out, inputs, llm, violations=violations, source_prompt=prompt)
         else:
             out["_critic"] = {"skipped": True, "reason": reason}
+    # The greeting goes on first — after the validator and the critic have judged the prose, so
+    # neither ever sees a heading with nothing under it.
+    out = _finish_brief_presentation(out)
+    out = _prepend_greeting(out, inputs)
     # Last line of defence for the open-items contract (runs after the critic's retry had its chance)
-    out = _append_still_open(out, open_ledger, _brief_now(inputs), brief_day)
+    if inputs.get("type") != "welcome":
+        out = _append_still_open(out, open_ledger, _brief_now(inputs), brief_day,
+                                 reported=_reported_chase_keys(inputs, brief_day))
     # …and the record of which loops that left NAMED, so the chase lane can tell a genuine
     # double-tell from a nudge about something this brief never mentioned.
     _record_named_loops(open_ledger, out.get("brief_markdown"), brief_day,
@@ -2864,12 +2946,12 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     # …and then the evening's outcome receipts, read from the record rather than written by a model.
     out = _append_receipts(out, inputs, _brief_now(inputs))
     # …and last, the one-line "a newer Sotto is published" notice — housekeeping, once per version.
-    out = _append_update_notice(out)
+    if inputs.get("type") != "welcome":
+        out = _append_update_notice(out)
     # Evening: the one "make that a standing rule?" confirmation, when tonight's transcripts showed
     # the user stating one (deterministic append + the pending-offer bridge; see the function).
     out = _append_procedure_offer(out, inputs)
     # …or, when tonight has no standing-rule question, the one mute the learner has been suggesting.
-    out = _append_mute_offer(out, inputs, brief_day)
     # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event
     # map. LAST, so the critic's own rewrites are held to the same allowlist as the first draft.
     result = _attach_tap_links(out, event_links, allowlist)
@@ -2933,8 +3015,9 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="Render + run the Sotto FLEX brief extraction.")
     ap.add_argument("inputs", nargs="?", help="a single assembled inputs JSON file (back-compat; or stdin)")
-    ap.add_argument("--type", choices=["morning", "evening"], default="morning")
+    ap.add_argument("--type", choices=["morning", "evening", "welcome"], default="morning")
     ap.add_argument("--local", help="read_local output JSON (the 16 local sources) — REQUIRED for a real brief")
+    ap.add_argument("--source-results", help="gather source-result metadata, separate from legacy arrays")
     ap.add_argument("--gmail", help="Gmail JSON: an array, or {emails:[...]} / {messages:[...]}")
     ap.add_argument("--calendar", help="Calendar JSON: an array, or {events:[...]} / {items:[...]}")
     ap.add_argument("--granola", help="Granola JSON: an array, or {meetings:[...]}")
@@ -3030,7 +3113,7 @@ def main():
     if args.user_timezone:
         google["userTimezone"] = args.user_timezone
     local = unwrap_tool_result(load(args.local, {}))   # accept raw read_local tool-result wrappers
-    if _local_has_data(local):
+    if _live_local_observation(local):
         # Fresh data → remember it for a future Bridge outage, AND compose from the same healed
         # copy the snapshot gets: the contacts carry-forward must fix today's brief, not only
         # tomorrow's fallback.
@@ -3063,6 +3146,7 @@ def main():
               "Ensure read_local returned the contacts array.")
     inputs = {
         "type": args.type,
+        "source_results": load(args.source_results, {}),
         "window_hours": args.window_hours,
         "google": google,
         "granola": load(args.granola, {}),
@@ -3089,7 +3173,14 @@ def main():
           + (f" — WARNING: {'; '.join(str(w) for w in _gw)[:200]}" if _gw else "")
           + f", attendee_research {len(_ra)} person(s)"
           + (f" — WARNING: {'; '.join(str(w) for w in _rw)[:200]}" if _rw else ""))
+    # Includes the healed offline snapshot actually used by compose, rather than only the
+    # initial (possibly empty) Bridge reply. The outbox rechecks these IDs before delivery.
+    from source_context import allowed, used_sources
+    source_permissions = used_sources(local, google, google['events'], inputs['granola'])
     out = compose(inputs, critic=use_critic)
+    out['_source_permissions'] = source_permissions
+    if any(not allowed(source) for source in source_permissions):
+        raise RuntimeError('source permission changed while composing')
     _archive_brief(out, args.type)
     print(json.dumps(out))
 

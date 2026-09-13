@@ -15,6 +15,41 @@ spec = importlib.util.spec_from_file_location(
 cf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cf)
 
+
+def test_imessage_draft_and_research_are_readable_and_idempotent():
+    raw = '''Reply to Jordan:
+
+> Hi Jordan,
+>
+> Could we meet at **Andytown** at 11?
+>
+> Thanks
+
+[**Send email**](mailto:jordan@example.com?body=Hi%20Jordan%0A)
+
+---
+### What is the project?
+**Context:** A research spinout.
+- Live [demo](https://example.com/demo_(research)).
+- Read the `paper_id`.
+'''
+    out = cf.to_imessage(raw)
+    for unwanted in ('>', '**', '###', 'mailto:', '%20', '](', '`'):
+        assert unwanted not in out
+    assert 'Hi Jordan,\n\nCould we meet at Andytown at 11?' in out
+    assert 'demo: https://example.com/demo_(research)' in out
+    assert '• Read the paper_id.' in out
+    assert cf.to_imessage(out) == out
+
+
+def test_imessage_keeps_urls_and_words_and_full_handled_recap():
+    raw = '*Already Handled*\n\nJamie — replied.\n\nAlex — passed.\n\n*Filtered*\n\n2 newsletters'
+    out = cf.compact_handled(cf.to_imessage(raw))
+    assert 'Already Handled\n• Jamie — replied.\n• Alex — passed.\n\nFiltered' in out
+    assert cf.compact_handled(cf.to_imessage(out)) == out
+    plain = 'https://example.com/some_page_here?q=a_b_c\n2 * 3 = 6\nunknown_identifier'
+    assert cf.to_imessage(plain) == plain
+
 SAMPLE = """## Needs Attention Now
 
 **Sarah Chen**<!--id:sarah@acme.com|ch:email--> - Locked in Monday at 11 AM.

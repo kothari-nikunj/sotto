@@ -166,3 +166,26 @@ def test_calendar_and_email_are_one_cohort(tmp_path, monkeypatch):
     out = _run(tmp_path, "--calendar", _cal(tmp_path, "meet@x.com"),
                "--gmail", _gmail(tmp_path, "mailer@x.com"))
     assert len(out["person_knowledge"]) == 2
+
+
+def test_local_phone_contact_packs_with_unrelated_gmail(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ku.apply({'person_updates': [{'person_name': 'Local Person', 'identifier': '+14155550199',
+        'facts': [{'fact': 'Builds an acoustic instrument company', 'memory_type': 'context', 'confidence': .9}]}]})
+    _age_people()
+    local = tmp_path / 'local.json'
+    local.write_text(json.dumps({'imessage': [{'handle': '+1 (415) 555-0199', 'text': 'Can we meet?'}]}))
+    out = _run(tmp_path, '--local', str(local), '--gmail', _gmail(tmp_path, 'unrelated@example.com'))
+    assert 'acoustic instrument' in '\n'.join(out['person_knowledge'].values())
+    assert '4155550199' in out['memory_participants']
+
+
+def test_active_loop_participant_packs_without_new_messages(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ku.apply({'person_updates': [{'person_name': 'Waiting Person', 'identifier': 'waiting@example.com',
+        'facts': [{'fact': 'Runs ocean research', 'memory_type': 'context', 'confidence': .9}]}]})
+    _age_people()
+    loops = tmp_path / 'loops.json'
+    loops.write_text(json.dumps({'items': [{'status': 'waiting', 'contact_identifier': 'waiting@example.com'}]}))
+    out = _run(tmp_path, '--loops', str(loops), '--gmail', _gmail(tmp_path, 'unrelated@example.com'))
+    assert 'ocean research' in '\n'.join(out['person_knowledge'].values())

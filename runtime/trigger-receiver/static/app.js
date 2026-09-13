@@ -2643,7 +2643,7 @@
     else buildStandingSection(seq, body);
   }
 
-  /* The house rules — the learner's ledgers, each row deletable. */
+  /* Stated house rules, each removable through the preference CLI. */
   function buildRulesSection(seq, container) {
     container.replaceChildren(skeletonView(2));
     api("/api/learned").then(function (data) {
@@ -2908,19 +2908,11 @@
     return row;
   }
 
-  /* The learner's real shape: top-level rule lists, the approval_defaults
-     dict, and the user-stated explicit block. Delete sends the server's
-     contract — {op: "delete", list, value} — and re-renders from the
-     response. Anything shaped differently degrades to read-only. */
-  var PREF_SECTIONS = [
-    { list: "deprioritization_hints", label: "Deprioritized",
-      sub: "Kept out of the spotlight in your briefs." },
-    { list: "edit_heavy", label: "Edit-heavy",
-      sub: "You usually rewrite these drafts, so Sotto drafts them more carefully." }
-  ];
+  // Only stated rules affect behavior; historical inferred counters stay off this surface.
   var PREF_EXPLICIT = [
     { list: "mute_senders", label: "Muted senders" },
     { list: "mute_people", label: "Muted people" },
+    { list: "vip_people", label: "VIPs" },
     { list: "mute_sections", label: "Muted sections" },
     { list: "tone_notes", label: "Tone notes" }
   ];
@@ -2940,28 +2932,7 @@
     var sections = [];  // {label, sub, rows: [{main, tag, extra, del}]}
 
     if (isObj) {
-      var i, k, entry;
-      for (i = 0; i < PREF_SECTIONS.length; i++) {
-        entry = PREF_SECTIONS[i];
-        var vals = prefs[entry.list];
-        if (Array.isArray(vals) && vals.length) {
-          sections.push({ label: entry.label, sub: entry.sub,
-            rows: vals.map(ruleRowSpec(entry.list)) });
-        }
-      }
-      var approvals = prefs.approval_defaults;
-      if (approvals && typeof approvals === "object" && !Array.isArray(approvals) &&
-          Object.keys(approvals).length) {
-        var appRows = [];
-        for (k in approvals) {
-          if (!Object.prototype.hasOwnProperty.call(approvals, k)) continue;
-          var parts = splitRule(k);
-          appRows.push({ main: parts.main, tag: parts.tag,
-            extra: String(approvals[k]), list: "approval_defaults", value: k });
-        }
-        sections.push({ label: "Approval defaults",
-          sub: "How much of a green light each kind of action gets.", rows: appRows });
-      }
+      var i, entry;
       var explicit = prefs.explicit;
       if (explicit && typeof explicit === "object") {
         for (i = 0; i < PREF_EXPLICIT.length; i++) {
@@ -3662,7 +3633,7 @@
   }
 
   /* ---------------- Router ----------------
-     Four destinations (now · activity · memory · labels) plus two detail routes
+     Three destinations (now · activity · memory); labels is a maintainer route plus two detail routes
      that are reachable but not in the nav (#people/<slug>, #briefs/<date>/<kind>).
      Every pre-redesign address is still a real route: the aliases below CALL the
      new views directly rather than rewriting location.hash, so an old bookmark

@@ -45,6 +45,28 @@ def _parse_ts(ts: str):
         return None
 
 
+def parse_observed_time(value):
+    """An observed ISO/Bridge timestamp, Gmail date header, or epoch time, normalized to UTC."""
+    from email.utils import parsedate_to_datetime
+    raw = str(value or '').strip()
+    parsed = _parse_ts(raw)
+    if parsed is None and raw.isdigit():
+        try:
+            epoch = int(raw)
+            parsed = datetime.fromtimestamp(epoch / 1000 if epoch >= 100_000_000_000 else epoch,
+                                            tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+    if parsed is None and raw:
+        try:
+            parsed = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, IndexError):
+            return None
+    if parsed is None:
+        return None
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
 
 
 # ---------------------------------------------------------------------------

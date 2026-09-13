@@ -19,11 +19,19 @@ The agent end of event-driven proactivity: the Bridge/email poller pushes events
 deterministic triage funnel (`triage_event.py`, Tier 0 + a Flash-Lite Tier 1) has ALREADY decided this
 one deserves the user's attention — your job is only to say it well. **ONE short message, a draft
 ready, never auto-sent.** Everything that didn't reach you was dropped or queued on purpose; do not go
-looking for more events, and do not re-triage.
+looking for more events or overriding the delivery gates.
 
 > Scripts live under `$HOME/.hermes/skills/sotto/`. Use absolute paths. All context reads here are
 > READ-ONLY views — **NEVER run `continuity_resolve` or any ledger/graph writer from this skill**
 > (the brief's Learn step owns writes; the digest queue is consumed by `digest_check.py`, not by you).
+
+Read `_shared/references/relevance.md` before composing. It is the same policy used by event
+triage, digest review and brief extraction. A staged candidate is permission to consider it,
+not a requirement to fill a message: if the supplied context shows it was answered, completed,
+or no longer matters, return `NO_NUDGES`. Do not invent additional tasks or override cadence.
+Apply `_shared/references/approval-tiers.md` before proposing a reply: earning attention does
+not choose the user's answer. Keep unresolved accept/decline decisions open; never supply a
+single unsolicited pass or invent a reason for it.
 
 ## EVENT mode — the prompt names a bundle path (`$SOTTO_DATA/events/bundle-<ts>.json`)
 
@@ -42,8 +50,8 @@ looking for more events, and do not re-triage.
      Thursday"): one message total, one interrupt spent, never one message per event. (The funnel
      charges the budget the same way — one unit per bundle, not one per event.) Draft for the event
      you led with; the others are context unless the user asks.
-   - **The same human on two channels is ONE item.** Match senders across the bundle's events by
-     name, handle, and email (the identifiers the bundle carries, plus what the knowledge graph
+   - **The same underlying task across two channels is ONE item.** Join only with an explicit
+     reference or corroborated task details and canonical identity, handle, or email (the identifiers the bundle carries, plus what the knowledge graph
      told you): if Ali texted AND emailed, present Ali once — "Ali replied over iMessage and also
      emailed" — and offer ONE reply on whichever channel fits the ask, never two entries with two
      drafts for one person. Two drafts to the same human about the same day's thread is the
@@ -150,7 +158,8 @@ looking for more events, and do not re-triage.
    ready `text` sentence) — the receiver's calendar watcher noticed the diff on its 15-min tick.
    There is no inbound message: the nudge is the change plus ONE useful next thing, and it reads
    like a text — no event IDs, no calendar URLs, plain chat.
-   - **declined** — lead with the `text` ("Ali Panju just declined your 11:00 AM"). Add ONE short
+   - **declined** — emitted only for the user's one-to-one meeting, never a group RSVP or a
+     meeting merely visible on a shared calendar. Lead with the `text` ("Ali Panju just declined your 11:00 AM"). Add ONE short
      reschedule draft in the user's voice to the decliner ("Sorry to miss you this morning — want
      to grab time later this week?") and hand it over per step 4 (email attendee → the Gmail-draft
      ask; phone → tap link). Draft only — never touch the calendar.
@@ -196,19 +205,35 @@ looking for more events, and do not re-triage.
 ## DIGEST mode — the `sotto-midday-digest` cron (or the prompt says "digest")
 
 1. `execute_code` → `python3 "$HOME/.hermes/skills/sotto/event-triage/scripts/digest_check.py"`.
-   It reads the ambient queue since the last digest/brief and decides deterministically.
+   It reads the queue since the last digest/brief. The deterministic activity gate decides whether
+   review is worth running; one shared relevance review judges the conversations, including later
+   user replies, before selecting at most six items. One outstanding actionable request warrants
+   review even on a light day (the `SOTTO_DIGEST_MIN` threshold gates only ambient-only days).
+   Only evidenced urgency interrupts at once; an ordinary actionable/scheduling ask is queued, and
+   the release valve may promote it into a nudge on its own (a known sender, within 4 h, at most
+   2 per tick and 2 per hour, under the daily budget and cooldown; an ask with an evidenced
+   deadline waits until it is within 24 h) — whatever the valve has not released rides this
+   catch-up. Provider failure means retryable silence, not a completed review.
 2. **If it prints `{"deliver": false}` → output NOTHING and stop.** Silence is the correct, common
    outcome — a quiet day has no midday digest. Do not announce that there's nothing.
-3. Else compose **ONE compact catch-up message** from its `items` — a bold **Midday catch-up**
+3. Else compose **ONE compact catch-up message** from its reviewed `items` only. Use each item's
+   `why`, `relevance` and `messages` as evidence, not just its latest preview. Name the underlying
+   task or development and attribute relays honestly; don't ask the user to reply to a reminder
+   service as though it were the original person. Never fill unused slots, add unreviewed queue
+   entries, or restate items the evidence shows are resolved. If none remain, return `NO_NUDGES`.
+   For the message use a bold **Midday catch-up**
    title line first (the reader must know what this message IS before line one; owner, Aug 26:
    an untitled digest "reads weird"), then **hard cap 6 lines** (the digest format in
-   `_shared/references/voice.md`; the title doesn't count), grouped by person, most actionable
+   `_shared/references/voice.md`; the title doesn't count), grouped by the reviewed conversation, most actionable
    first, no drafts and no links needed here (the user can ask for any). Deliver as Sotto.
    - An item Sotto raised itself (a birthday, something you're owed, a meeting it wanted to prep)
      may ride along at the bottom, on its own line, in plain words — it never counts toward the
      heavy-day threshold, because that gate measures signals from PEOPLE.
-4. After delivering, stamp it so tomorrow's window starts here:
-   `python3 "$HOME/.hermes/skills/sotto/event-triage/scripts/digest_check.py" --stamp`.
+4. Receiver-managed runs carry the returned `coverage_until` into delivery completion; only transport
+   acceptance advances that reviewed window. Never stamp on composition or on a failed review. A
+   standalone interactive delivery may run `digest_check.py --stamp --now "<coverage_until>"`
+   after successful delivery. Exit 75 / `retryable:true` means a retryable review failure: stay quiet
+   and preserve the window; it does not mean the items were reviewed and unimportant.
 
 ## Notes
 - Cooldowns, quiet hours, the in-meeting hold, the daily interrupt budget, the user's nudge snooze,

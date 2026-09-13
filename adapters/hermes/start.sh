@@ -3,6 +3,28 @@
 # receiver and Hermes. Env (set on Railway/Render): GOOGLE_AI_API_KEY, BRIDGE_TOKEN (the Bridge's
 # shared bearer), SOTTO_TRIGGER_TOKEN (optional wake-push), gateway token. Tunnel-free.
 set -euo pipefail
+source /app/adapters/hermes/supervise.sh
+sotto_install_traps
+
+# A managed workload must use the exact runtime tested in its image. An old volume must
+# never silently substitute a different checkout. Self-host retains its upgrade workflow.
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  : "${SOTTO_TENANT_ID:?managed mode requires a tenant identity}"
+  : "${BRIDGE_TOKEN:?managed mode requires the internal MCP credential}"
+  : "${SOTTO_CONTROL_TOKEN:?managed mode requires a control-plane credential}"
+  : "${SOTTO_IMESSAGE_NUMBER:?managed mode requires the assigned iMessage number}"
+  : "${PHOTON_PROJECT_ID:?managed mode requires a Photon project}"
+  : "${PHOTON_PROJECT_SECRET:?managed mode requires a Photon credential}"
+  : "${PHOTON_ALLOWED_USERS:?managed mode requires an owner allowlist}"
+  : "${PHOTON_HOME_CHANNEL:?managed mode requires a home channel}"
+  : "${SOTTO_MODEL_PROXY_URL:?managed mode requires a model proxy URL}"
+  : "${SOTTO_MODEL_PROXY_TOKEN:?managed mode requires a tenant model credential}"
+  : "${SOTTO_VOLUME_ID:?managed mode requires the provisioned volume identity}"
+  python3 /app/adapters/hermes/managed_volume.py verify
+  export SOTTO_CRON_DELIVER=photon
+  unset GOOGLE_AI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY SOTTO_FALLBACK_API_KEY
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS TELEGRAM_HOME_CHANNEL
+fi
 
 # ── Named constants (defaults matter — see CLAUDE.md; these are NOT env knobs) ───────────────────
 # Parallel attendee-research children (Hermes `delegation.max_concurrent_children`). Five keeps a
@@ -43,8 +65,8 @@ done
 # 0) Persist Hermes state on the /data volume so REDEPLOYS don't wipe your WhatsApp login, config, SOUL,
 #    or the knowledge graph. The image bakes skills into /root/.hermes; we seed the volume from it on the
 #    first boot, always refresh the Sotto skills/bundle from the (possibly updated) image, then point
-#    ~/.hermes at the volume. Defensive (|| true): if the volume is missing, Hermes still boots, just
-#    non-persistent. Must run BEFORE any `hermes …` call below (they read $HOME/.hermes).
+#    ~/.hermes at the volume. Managed mode already verified its mount and identity above.
+#    Must run BEFORE any `hermes …` call below (they read $HOME/.hermes).
 HSTATE="${SOTTO_DATA:-/data}/hermes"
 if [ ! -d "$HSTATE" ]; then
   mkdir -p "$HSTATE"
@@ -85,12 +107,30 @@ fi
 # the reply-prefix note further down), and nothing else in this file talks to them. So a rule the
 # gateway must always carry (e.g. "a bare 'sure' with no referent → pending_offer.py get") belongs in
 # sotto-persona.md, which the Dockerfile and both install.sh's append the same way. One source.
-if [ -f "$HSTATE/SOUL.md" ] && [ -f /app/adapters/hermes/sotto-persona.md ]; then
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" != "managed" ] && [ -f "$HSTATE/SOUL.md" ] && [ -f /app/adapters/hermes/sotto-persona.md ]; then
   sed -i '/chief-of-staff persona/,$d' "$HSTATE/SOUL.md" 2>/dev/null || true
   printf '\n' >> "$HSTATE/SOUL.md"
   cat /app/adapters/hermes/sotto-persona.md >> "$HSTATE/SOUL.md"
 fi
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  test -s "$HSTATE/skills/sotto/_shared/scripts/compose_brief.py" \
+    && diff -qr /root/.hermes/skills/sotto "$HSTATE/skills/sotto" >/dev/null \
+    && cmp -s /root/.hermes/skill-bundles/sotto.yaml "$HSTATE/skill-bundles/sotto.yaml" \
+    || { echo "[sotto] managed skill initialization failed" >&2; exit 1; }
+fi
 rm -rf /root/.hermes && ln -s "$HSTATE" /root/.hermes            # ~/.hermes → volume (sessions persist)
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  chown -R sotto:sotto "${SOTTO_DATA:-/data}"
+  rm -rf /home/sotto/.hermes
+  ln -s "$HSTATE" /home/sotto/.hermes
+  chown -h sotto:sotto /home/sotto/.hermes
+  export HOME=/home/sotto USER=sotto LOGNAME=sotto
+  export SOTTO_SKILLS_ROOT=/app/sotto-skills
+  python3 /app/adapters/hermes/managed_config.py "$HSTATE"
+  # managed_config runs as the root supervisor and creates mode-0600 runtime files. Hand the
+  # completed state back to the shared workload UID before either child starts.
+  chown -R sotto:sotto "${SOTTO_DATA:-/data}"
+fi
 
 # Version visibility: every boot log states the Hermes actually RUNNING vs the one this image was
 # built with. If they differ, the volume seed is shadowing a newer image — SOTTO_REFRESH_HERMES=1
@@ -98,6 +138,16 @@ rm -rf /root/.hermes && ln -s "$HSTATE" /root/.hermes            # ~/.hermes →
 IMG_HVER="$(cat /app/hermes-image-version.txt 2>/dev/null | head -1 || echo unknown)"
 RUN_HVER="$( { hermes --version 2>/dev/null || hermes version 2>/dev/null || echo unknown; } | head -1)"
 echo "[sotto] hermes running: ${RUN_HVER:-unknown} | image built with: ${IMG_HVER:-unknown}"
+if ! hermes send --help 2>&1 | grep -q -- '--json'; then
+  echo "[sotto] FATAL: this Hermes cannot return structured provider send receipts (--json missing)." >&2
+  echo "[sotto] Refusing to start: a plain-send fallback could duplicate delivery on retry." >&2
+  echo "[sotto] Set SOTTO_REFRESH_HERMES=1 for one redeploy to adopt the pinned image runtime." >&2
+  exit 1
+fi
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "$(cat /app/hermes-image-commit.txt)" \
+    || { echo "[sotto] managed Hermes commit mismatch; refusing to start" >&2; exit 1; }
+fi
 if [ -n "$RUN_HVER" ] && [ -n "$IMG_HVER" ] && [ "$RUN_HVER" != "unknown" ] && \
    [ "$IMG_HVER" != "unknown" ] && [ "$RUN_HVER" != "$IMG_HVER" ]; then
   echo "[sotto] WARNING: running Hermes differs from this image's — the volume seed is stale."
@@ -151,12 +201,27 @@ else
   SOTTO_CRON_DELIVER="telegram"; CHANNEL_WHY="the default"
 fi
 export SOTTO_CRON_DELIVER
+if [ "$SOTTO_CRON_DELIVER" = "photon" ]; then
+  # The pinned Photon watchdog infers a dead subscription from quiet chat + a
+  # successful unary read. That cannot distinguish idle from half-open and
+  # restarts healthy personal lines every ten minutes. Disable only this
+  # silence heuristic; SDK interruptions, iterator errors and degraded-stream
+  # recovery retain their existing handling. Revisit when upstream exposes
+  # subscription-level heartbeat/sequence evidence.
+  export PHOTON_STREAM_SILENCE_PROBE_MS=0
+  python3 /app/adapters/hermes/photon_setup.py "$HSTATE"
+  python3 /app/adapters/hermes/photon_probe_compat.py \
+    /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar/stream-staleness.mjs
+fi
 if [ "$SOTTO_CRON_DELIVER" = "whatsapp" ]; then
   export WHATSAPP_ENABLED="${WHATSAPP_ENABLED:-true}"
 else
   export WHATSAPP_ENABLED="${WHATSAPP_ENABLED:-false}"
 fi
 echo "[sotto] delivery channel: $SOTTO_CRON_DELIVER ($CHANNEL_WHY); whatsapp gateway: $WHATSAPP_ENABLED"
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  unset WHATSAPP_ENABLED
+fi
 
 # 0.5) Start the trigger receiver IMMEDIATELY so Railway's /health healthcheck passes within seconds —
 #      before the slower boot steps below (Google auth makes network calls). Otherwise a slow first boot
@@ -174,7 +239,14 @@ GKEY="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-${GOOGLE_AI_API_KEY:-}}}"
 if [ -n "$GKEY" ]; then
   export GOOGLE_AI_API_KEY="$GKEY" GEMINI_API_KEY="$GKEY" GOOGLE_API_KEY="$GKEY"
 fi
-SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" python3 /app/trigger-receiver/receiver.py &
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
+    python3 /app/adapters/hermes/managed_exec.py receiver /app/trigger-receiver/receiver.py &
+else
+  SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
+    python3 /app/adapters/hermes/process_group.py python3 /app/trigger-receiver/receiver.py &
+fi
+RECEIVER_PID=$!
 
 # The receiver gates its whole setup surface (/setup, /whatsapp/qr, /google/auth, /debug/google…)
 # behind a per-deploy setup code — a bare URL now 403s. Any setup link WE print must carry
@@ -361,14 +433,14 @@ else
 fi
 # Progress UX (owner, Aug 2026): a chat channel is a place for RESULTS, not a terminal. By default
 # NOTHING streams mid-turn — no model narration ("thinking" text), no tool breadcrumbs; the
-# platform's native typing indicator (hermes default: on) plus the "⏳ Working — N min" heartbeat
-# cover the wait, and the first thing the user reads is the deliverable. One knob restores the old
+# iMessage acknowledges with a tapback, then refreshes typing through the active reply turn.
+# Other platforms retain their native typing indicator. One knob restores the old
 # streaming: SOTTO_TOOL_PROGRESS=new → plain-language narration + ONE edit-in-place tool bubble
 # (cleaned up on delivery); =all/verbose → full breadcrumbs for debugging. `off` is the default.
 TP="${SOTTO_TOOL_PROGRESS:-off}"
 if [ "$TP" = "off" ]; then
   hermes config set display.interim_assistant_messages false >/dev/null 2>&1 || true
-  echo "[sotto] progress stream: off (typing indicator only; SOTTO_TOOL_PROGRESS=new restores narration)"
+  echo "[sotto] progress stream: off (iMessage: tapback, steady typing, reply; SOTTO_TOOL_PROGRESS=new restores narration)"
 else
   hermes config set display.interim_assistant_messages true >/dev/null 2>&1 || true
   echo "[sotto] progress stream: $TP (narration + tool bubble)"
@@ -381,12 +453,15 @@ done
 # Tapbacks (owner ask, Aug 2026): with the progress stream off, the reaction IS the acknowledgment
 # — Hermes reacts on YOUR message: 👀 when it starts working, ✅ when the reply lands, ❌ on an
 # error (Telegram Bot API replaces the bot's reaction atomically, so you only ever see one).
-# Telegram-only: hermes has no bot-reaction support on WhatsApp, and the key is ignored where
-# unsupported. Hermes ships it off; Sotto turns it on — SOTTO_REACTIONS=0 restores off.
+# Photon uses the same lifecycle with native 👍/👎 outcomes; 👀 is a custom emoji tapback.
+# This acknowledges reply delivery, not completion of a business action. WhatsApp is unsupported.
+# Hermes ships reactions off; Sotto turns them on — SOTTO_REACTIONS=0 restores off.
 if [ "${SOTTO_REACTIONS:-1}" = "1" ]; then
+  export PHOTON_REACTIONS=true
   hermes config set telegram.reactions true >/dev/null 2>&1 || true
-  echo "[sotto] tapbacks: on — 👀 working · ✅ replied · ❌ error (telegram; SOTTO_REACTIONS=0 to disable)"
+  echo "[sotto] tapbacks: on — 👀 working · ✅ replied · ❌ error (Telegram; Photon uses 👍/👎 outcomes; SOTTO_REACTIONS=0 to disable)"
 else
+  export PHOTON_REACTIONS=false
   hermes config set telegram.reactions false >/dev/null 2>&1 || true
   echo "[sotto] tapbacks: off (SOTTO_REACTIONS=0)"
 fi
@@ -489,7 +564,9 @@ fi
 # brief. Non-fatal by construction (`|| true` inside the substitution guards set -euo pipefail; 10s cap
 # so a network blip can't stall boot). Exactly one log line either way.
 GMODEL="${SOTTO_GEMINI_MODEL:-gemini-3.8-flash}"
-if [ -n "$GKEY" ]; then
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  echo "[sotto] managed models use the tenant proxy"
+elif [ -n "$GKEY" ]; then
   GCHECK="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
     "https://generativelanguage.googleapis.com/v1beta/models/${GMODEL}?key=${GKEY}" 2>/dev/null || true)"
   if [ "$GCHECK" = "200" ]; then
@@ -511,7 +588,17 @@ while IFS='=' read -r gwk gwv; do
   [ -n "$gwk" ] || continue
   upsert_env "$gwk" "$gwv"
   echo "[sotto] gateway variable forwarded to Hermes: $gwk"
-done < <(env | grep -E '^(WHATSAPP|TELEGRAM|DISCORD|SIGNAL|SLACK|BLUEBUBBLES)_[A-Za-z0-9_]*=' || true)
+done < <(env | grep -E '^(PHOTON|WHATSAPP|TELEGRAM|DISCORD|SIGNAL|SLACK|BLUEBUBBLES)_[A-Za-z0-9_]*=' || true)
+
+# Reconcile the managed contract after generic self-host defaults. Never enable
+# a platform merely because a stale volume still contains its credential.
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  python3 /app/adapters/hermes/managed_config.py "$HSTATE"
+  # The receiver (uid sotto, started in step 2) may already spawn a brief child while boot continues;
+  # the files this rewrite just replaced are root:root 0600 until the step-5 hand-off, so give them
+  # back at once rather than leaving a window where a `hermes -z` child cannot read its own config.
+  chown sotto:sotto "$HSTATE/config.yaml" "$HSTATE/SOUL.md" "$HSTATE/.env"
+fi
 
 # 3.7) Google Workspace auth — DETERMINISTIC + headless. Doing this through the agent breaks: every
 #      `--auth-url` mints a NEW PKCE verifier, so a re-run invalidates a code you got from an earlier URL
@@ -524,6 +611,9 @@ if [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
   # Same search bases as receiver._google_setup_py — keep the two in step. (/root/.hermes is not
   # listed: HOME is /root in this image, so "$HOME/.hermes" already covers it.)
   GSETUP_PY=$(find "$HOME/.hermes" /usr/local/lib/hermes-agent -path '*google-workspace/scripts/setup.py' 2>/dev/null | head -1)
+  if [ "${SOTTO_DEPLOYMENT_MODE:-}" = managed ]; then
+    GSETUP_PY=/app/adapters/hermes/google_setup.py
+  fi
   PYBIN=$(command -v python || command -v python3)
   if [ -z "$GSETUP_PY" ]; then
     echo "[sotto] Google: setup.py not found (google-workspace skill missing?) — skipping."
@@ -625,7 +715,7 @@ fi
 #    Device). creds.json lands in the /data-backed session dir, so later boots skip straight to the gateway.
 #    Runs only when WHATSAPP_ENABLED is true (step 0.4: when WhatsApp is the channel, or you asked for it) —
 #    it is the only way to pair WhatsApp on Railway, where there is no interactive shell.
-if [ "$WHATSAPP_ENABLED" = "true" ] && [ ! -f "$WA_CREDS" ]; then
+if [ "${WHATSAPP_ENABLED:-false}" = "true" ] && [ ! -f "$WA_CREDS" ]; then
   echo "[sotto] WhatsApp not paired — starting pairing."
   if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
     QRQS="$(setup_qs)"
@@ -652,15 +742,17 @@ if [ "$WHATSAPP_ENABLED" = "true" ] && [ ! -f "$WA_CREDS" ]; then
   pkill -f "whatsapp" 2>/dev/null || true   # stop any lingering external bridge so the gateway owns it
 fi
 
-# 6) Gateway (agent loop + gateway + scheduler), SUPERVISED.
-#    A fresh Railway deploy briefly runs the new container alongside the old one. When the new
-#    container's WhatsApp link replaces the old one's, the gateway can exit once on a "stream
-#    conflict"/reconnect blip. As the container's main process, that single exit would fail the whole
-#    deploy (crash email) even though a restart fixes it. So supervise it: retry a few times IN-PROCESS
-#    (Railway sees one healthy container, no crash email) and forward SIGTERM so intentional redeploys
-#    shut down cleanly. The receiver (step 0.5) keeps serving /health throughout.
+# 6) Gateway plus receiver are supervised together. An unexpected exit recycles the instance;
+#    a coordinated TERM stops both process groups cleanly. Persistent jobs/outbox survive restart.
 #    (No reconnect watchdog needed in reverse mode: the relay's /mcp is always up locally, so Hermes
 #    never loses the sotto-local binding — a sleeping Mac just means tool calls return "offline".)
+python3 /app/adapters/hermes/notification_config.py "$HSTATE" "$SOTTO_CRON_DELIVER"
+python3 /app/adapters/hermes/web_config.py "$HSTATE"
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  # Boot-time Hermes commands above run under the root supervisor and use atomic replacements.
+  # Transfer only artifacts still owned by root; do not recursively rewrite active receiver files.
+  find "$HSTATE" -xdev -user root -exec chown sotto:sotto {} +
+fi
 # Re-print the setup link LAST: the receiver printed it in step 0.5, but ~400 lines of boot log +
 # the ASCII QR bury it, and ONBOARDING tells users to find this exact line in the deploy logs.
 # Same composition as receiver.py main(): Railway domain when public, else localhost:$PORT.
@@ -670,9 +762,6 @@ if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
 else
   echo "[sotto] Setup link (open in a browser): http://localhost:${PORT:-8787}/setup${SQS}"
 fi
-GW_PID=""
-term() { [ -n "$GW_PID" ] && kill -TERM "$GW_PID" 2>/dev/null || true; exit 0; }
-trap term TERM INT
 
 # The gateway does not start for an unlinked Telegram. One sentence: an unlinked channel cannot
 # deliver anything, and a running gateway long-polls getUpdates with the SAME bot token — so it would
@@ -690,26 +779,13 @@ if [ "$SOTTO_CRON_DELIVER" = "telegram" ] \
   echo "[sotto]   Your pairing message waits on Telegram's servers while it stays down: tap the"
   echo "[sotto]   pairing link above, then restart this deploy and the capture picks it up."
 fi
-# No gateway to supervise: hold the container open so /health, /setup and the briefs keep working.
-if [ "$START_GATEWAY" != "1" ]; then
-  # The receiver (step 0.5) is the only background job, and on this path it is the whole
-  # service: /health, /setup, the briefs. Its exit status IS the container's — `exit 0` here
-  # told Railway's ON_FAILURE policy that a dead receiver was a clean shutdown, so nothing
-  # restarted it (Day-0 simulation, Sep 2026). The TERM trap still ends a deploy cleanly.
-  rc=0; wait || rc=$?
-  echo "[sotto] receiver exited ($rc) with no gateway to hold the container — exiting $rc"
-  exit "$rc"
-fi
-gw_tries=0
-while :; do
-  hermes gateway & GW_PID=$!
-  gw_code=0; wait "$GW_PID" || gw_code=$?
-  [ "$gw_code" = "0" ] && { echo "[sotto] gateway exited cleanly"; break; }
-  gw_tries=$((gw_tries + 1))
-  if [ "$gw_tries" -ge 5 ]; then
-    echo "[sotto] gateway exited ($gw_code) $gw_tries times — giving up so Railway can recycle the container"
-    exit "$gw_code"
+# Both essential processes belong to the same supervisor, including an unlinked first boot.
+if [ "$START_GATEWAY" = "1" ]; then
+  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+    python3 /app/adapters/hermes/managed_exec.py gateway hermes gateway &
+  else
+    env -u SOTTO_CONTROL_TOKEN python3 /app/adapters/hermes/process_group.py hermes gateway &
   fi
-  echo "[sotto] gateway exited ($gw_code); restarting in 5s ($gw_tries/5)…"
-  sleep 5
-done
+  GW_PID=$!
+fi
+sotto_supervise

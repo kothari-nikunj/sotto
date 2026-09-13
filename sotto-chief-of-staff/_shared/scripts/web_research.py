@@ -92,7 +92,12 @@ def _diag(msg: str) -> None:
         print(msg, file=sys.stderr)
 
 
+import gemini_transport
+
+
 def _key(provider: str) -> str:
+    if provider == "gemini":
+        return gemini_transport.credential()
     return os.environ.get(KEY_ENV[provider], "").strip()
 
 
@@ -205,12 +210,11 @@ def _gemini_fetch_url(url: str, timeout: float) -> dict | None:
     """Gemini's url_context tool — the model fetches the URL server-side and answers from it. The
     floor rung: works on the key every deploy already has; JS-heavy or blocked pages may come back
     empty, which falls through to the caller's honest 'could not read it'."""
-    api = (f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}"
-           f":generateContent?key={_key('gemini')}")
+    api, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
     prompt = ("Read this page and return its content as plain text — the title on the first line, "
               f"then the substantive text, no commentary: {url}")
     data = _post(api, {"contents": [{"parts": [{"text": prompt}]}],
-                       "tools": [{"url_context": {}}]}, {}, timeout)
+                       "tools": [{"url_context": {}}]}, headers, timeout)
     cand = (data.get("candidates") or [{}])[0]
     text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
     if not text:
@@ -323,10 +327,9 @@ def _parallel_task(prompt: str, schema: dict, timeout: float) -> dict | None:
 # ── Gemini Search Grounding (the floor: the key we already have) ─────────────────────────────────
 
 def _gemini_search(query: str, timeout: float) -> dict | None:
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}"
-           f":generateContent?key={_key('gemini')}")
+    url, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
     data = _post(url, {"contents": [{"parts": [{"text": query}]}],
-                       "tools": [{"google_search": {}}]}, {}, timeout)
+                       "tools": [{"google_search": {}}]}, headers, timeout)
     cand = (data.get("candidates") or [{}])[0]
     text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or []))
     citations = []

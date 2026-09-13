@@ -89,5 +89,6 @@ def test_compose_output_carries_brief_text(tmp_path, monkeypatch):
                       "google": {"emails": [{"threadId": "t1", "from": "Sarah Chen <sarah@acme.com>",
                                              "subject": "ping", "body": "ping"}], "events": []},
                       "local": {}})
-    assert out["brief_text"] == "*Needs Attention Now*\n\n*Sarah Chen* - ping."
+    assert out["brief_text"].startswith("*Good ")                       # the greeting, bold in chat
+    assert out["brief_text"].endswith("\n\n*Needs Attention Now*\n\n*Sarah Chen* - ping.")
     assert "<!--id:" in out["brief_markdown"]                  # markdown keeps the markers for records

@@ -231,7 +231,7 @@ def test_no_draft_skills_point_at_the_register_instead_of_restating_it():
         assert "decline register" in text, f"{rel} does not invoke the decline register"
         assert "_shared/references/voice.md" in text, f"{rel} does not cite the voice source"
         assert 'action_type: "decline"' in text, (
-            f"{rel} must type a no so approval-tiers' never-relax guard can key on it")
+            f"{rel} must type a no so its outcome remains identifiable (approval-tiers.md)")
 
 
 def test_banned_list_stated_once_in_system_instruction():

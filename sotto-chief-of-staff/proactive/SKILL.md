@@ -30,6 +30,11 @@ cron already sent.
 > in", do not announce that there's nothing — no "all clear", no "scan complete". A no-nudge run is
 > the correct, common output, and the user never hears about it.
 
+Read `_shared/references/relevance.md` before composing the scanner's eligible candidates.
+Use that shared bar to explain the actual action, decision, preparation need or development.
+Do not add candidates or override the scanner's cadence/consent gates. If current evidence shows
+all candidates are resolved or irrelevant, return `NO_NUDGES` instead of padding the message.
+
 ## Procedure
 
 > Scripts live under `$HOME/.hermes/skills/sotto/`. Use absolute paths.
@@ -46,7 +51,10 @@ cron already sent.
    It prints `{"nudges":[…], "held":[…], "quiet":bool}`. **If `nudges` is empty (or `quiet` is true) → STOP, send nothing.**
    It has already recorded what it returns, so it won't repeat a nudge later today.
    **`held` is not yours to deliver** — the funnel did not hand those back: it queued them for the midday digest / next brief (the day's shared interrupt budget, the room you're in, the hour) or dropped them (a muted person). Say nothing about them, and never mention the budget.
-3. **For each nudge, draft (never send) and deliver ONE concise message:**
+3. **For each nudge, follow `_shared/references/approval-tiers.md` and deliver ONE concise message.**
+   An open decision stays open: ask which way the user wants to go, or show labeled alternatives
+   under `sotto-draft-reply`. Never convert a request for a decision into an unsolicited pass.
+   Draft when the direction is established; never send:
    - `intention` → deliver the stored action and context plainly. It was explicitly scheduled by
      the user, so do not reinterpret its condition, add another reminder, or turn it into a brief.
      A condition tied to an open loop has already been checked; if that loop closed, the scanner
@@ -73,11 +81,14 @@ cron already sent.
      `detail` as the whole message — it is already the sentence: *"I've nudged Maya twice about the
      contract — nudge them again, or let it go?"* Person, thing, binary choice. Don't dress it up,
      don't add a draft unless they say "nudge them", and don't fold it into a list of other items.
-     If they say let it go, run **`sotto-loops`** §B `dismiss` for that item; if they say nudge again,
+     If they say "let it go", "drop it", "done", "no" or "skip it", run
+     `pending_offer.py dismiss-reply --text "<actual user reply>"` and follow the persona's result
+     mapping (including `no_offer` → visible-conversation fallback). Never directly dismiss the
+     loop or hand-clear the offer for these replies. If they say nudge again,
      draft a chase per the rules above.
    - `birthday` → draft a short, warm note and present it with the contact's tap-link.
      When the nudge carries **`lead_days`** (the birthday is a few days out, not today), it's a *gift*
-     nudge, not a greeting: first run
+     nudge. It must carry `importance.tier` of `vip` or `vvip`; otherwise suppress the gift offer. Do not infer importance from a birthday, a meeting invite or unanswered mail. For eligible people, first run
      `python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_query.py" --person "<name>"`
      and use that person's own `interest`/`preference` facts to suggest ONE concrete idea
      ("Jordan's birthday is Thursday — he's been into film photography; a roll of Portra + a card?").
@@ -103,7 +114,7 @@ cron already sent.
      Good: *"You're meeting Vignesh Ravikumar and Shomik (Sierra Ventures) at Backhaus in ~13 min
      — want me to pull full prep on them?"* That is the whole message.
    - **Honor the approval tiers (`_shared/references/approval-tiers.md`): present drafts, never auto-send.** Deliver as **Sotto**.
-4. **If the push ENDED in a question, write it down — same turn, right after sending:**
+4. **If the push ENDS in a question, stage it in the same turn before your final response:**
    The user's "sure" arrives in the gateway's own session, which never saw your question; unless
    the question is on the volume, that session has nothing to resolve the "sure" against.
    ```bash
@@ -112,14 +123,19 @@ cron already sent.
      --question "You're meeting Shivani in ~44 min at Sightglass — want me to pull full prep on her?"
    ```
    Same for the other kinds (`--kind commitment|chase|handoff|retune_offer|intention`), with the question
-   exactly as you sent it. It overwrites — one pending question at a time, newest wins.
+   exactly as it appears in your final response. Receiver runs stage the offer and activate it only
+   after the provider accepts the message. Two fresh delivered questions remain separate;
+   `get` returns `ambiguous: true` and their questions until the user identifies one. Ask which
+   question they mean; never resolve a bare "yes" by choosing the newest offer.
    **A `chase`, `commitment` or `handoff` offer carries the nudge's `anchor_key`** —
    `--anchor-key "<the nudge's anchor_key>"` — so that a short "done", "handled" or "let it go" in
    the gateway resolves or drops that exact loop without you re-matching it by name.
    **If the tick delivered nothing, or the push asked nothing, record nothing.**
-   **If a yes to that question would send something or write the calendar**, write the exact content
-   to a file and pass `--payload-file <path>`: only its hash is stored, and the acting session must
-   pass `--offer-bound` so the user's "sure" binds to those bytes and nothing else. An offer whose
+   **If a yes to that question would send something or write the calendar**, run the intended
+   `google_action.py` verb with `--print-payload > <path>`, then pass
+   `--action <google-action-verb> --payload-file <path>`: only its full-action hash is stored,
+   and the acting session must pass `--offer-bound --offer-id <id>` so the user's "sure" selects
+   that fresh action and binds to those bytes. An offer whose
    yes only runs a read — prep, a cleanup, a standing rule — has nothing to hash; pass no file.
 
 ## Notes
@@ -127,6 +143,10 @@ cron already sent.
   quiet hours (default 21:00–07:00) are the funnel's, applied to this lane like any other event.
   The lead window is `proactive_scan.PROACTIVE_LEAD_MIN`; quiet hours are `SOTTO_QUIET_START/END`.
   Don't reimplement them.
+- A receiver run reserves its fired keys and caches its decisions under its stable delivery run ID.
+  Held keys remain eligible, and scheduled intentions stay scheduled. The delivery receipt marks
+  keys seen, finishes intentions, and applies chase/hand-off/offer effects; a failed send does none
+  of those. Retrying the run uses the same decisions without another interrupt charge.
 - **One rulebook, not two — structurally.** `proactive_scan.py` decides only WHAT is due and then
   hands the whole tick to the event funnel's own `triage()`, in process; what comes back is what you
   deliver. So the same gates apply because they are the same code: the **snooze** and **quiet
@@ -152,7 +172,7 @@ cron already sent.
   sent was never spent. Don't stamp anything, don't chase twice in a day, don't improvise a chase
   for a loop the scan didn't return.
 - The `birthday` nudge fires twice per person per year at most: once `SOTTO_BIRTHDAY_LEAD_DAYS`
-  (default 3) ahead — the one that can still become a gift — and once on the day. The dedup key carries
+  (default 3) ahead for VIP/VVIP relationships only, and once on the day for other saved contacts too. Gift eligibility comes from sustained reciprocal activity or your explicit VIP choice; missing evidence suppresses the gift offer. The dedup key carries
   the year, so neither can repeat.
 - This skill never writes the knowledge graph or continuity ledger (that's the brief's job) — it's read-only
   except its own nudge-dedup state.

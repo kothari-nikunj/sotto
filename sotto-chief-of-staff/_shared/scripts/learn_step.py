@@ -4,9 +4,9 @@ learn_step.py — the brief's Learn step as ONE command that leaves a receipt.
 
 In one sentence: a brief that delivered without writing its memory is a failed brief, and says so.
 
-The six Learn writers (knowledge, continuity, preferences, style, meeting attendance, contacts) used
+The six Learn writers (knowledge, continuity, draft outcomes, style, meeting attendance, contacts) used
 to be six separate instructions in the skill — "run ALL SIX" — with nothing verifying that any of
-them ran. The knowledge, preferences and style loops all rest on that step, and a run that skipped
+them ran. The knowledge, draft outcomes and style loops all rest on that step, and a run that skipped
 it (the way runs skipped the deliver-once claim, four times in one week) left the graph a day
 colder with every page still reading green. This runner is the machinery: the agent runs ONE
 command, every writer runs in order whether or not the agent remembered it, and the receipt
@@ -22,7 +22,7 @@ Usage:
 Steps, in order (a step whose input file is absent is recorded `skipped`, never `failed`):
   knowledge    knowledge_update.py <knowledge-out>        the brief's extracted_knowledge
   continuity   continuity_resolve.py --merge-only <cont>  the brief's actions[] → the ledger
-  preferences  learn_preferences.py                       drafts matched to sends → outcomes → rules
+  drafts       draft_outcomes.py                          drafts matched to sends → outcomes + voice confirms
   style        style_extract.py <local> --gmail <gmail>   what you actually sent
   granola      granola_graph.py --granola <granola>       who you actually sat with
   contacts     prewarm_graph.py --sync-contacts           identifiers, notes, birthdays
@@ -44,6 +44,8 @@ PACK = os.path.abspath(os.path.join(HERE, "..", ".."))            # sotto-chief-
 sys.path.insert(0, os.path.join(PACK, "_shared", "lib"))
 from timeutil import configured_tz, _user_local_date  # noqa: E402
 
+ESSENTIAL_STEPS = frozenset({"knowledge", "continuity"})
+
 STEP_TIMEOUT_SECS = 300      # one writer, generously: knowledge_update on a big day is seconds
 
 # name → (script path relative to the pack, argv builder taking the parsed args)
@@ -52,7 +54,7 @@ STEPS = (
      lambda a: [a.knowledge_out] if a.knowledge_out else None),
     ("continuity", ("morning-brief", "scripts", "continuity_resolve.py"),
      lambda a: ["--merge-only", a.continuity] if a.continuity else None),
-    ("preferences", ("approval-tiers", "scripts", "learn_preferences.py"),
+    ("drafts", ("_shared", "scripts", "draft_outcomes.py"),
      lambda a: []),
     # --gmail is OPTIONAL to style: a missing sent-mail file (a Gmail-less day, a failed gather)
     # must not skip the whole voice writer — style_extract itself tolerates the absent file.
@@ -89,8 +91,14 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
 def learn(args, run=subprocess.run, now=None) -> dict:
     """Run every step; return the receipt (also written to the volume)."""
     day = args.day or _user_local_date(configured_tz())
+    phase = getattr(args, "phase", "all")
     steps = {}
     for name, rel, build in STEPS:
+        if phase == "essential" and name not in ESSENTIAL_STEPS:
+            steps[name] = {"status": "queued", "detail": "durable follow-up after composition"}
+            continue
+        if phase == "ancillary" and name in ESSENTIAL_STEPS:
+            continue
         argv = build(args)
         inputs = [a for a in (argv or []) if not a.startswith("--")]
         if argv is None or any(not _present(p) for p in inputs):
@@ -108,33 +116,51 @@ def learn(args, run=subprocess.run, now=None) -> dict:
                "ts": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "steps": steps,
                "ok": all(s["status"] != "failed" for s in steps.values())}
+    if phase != "all":
+        receipt.update(phase=phase, run_key=getattr(args, "run_key", ""),
+                       required_ok=phase == "essential" and receipt["ok"])
     _write_receipt(receipt)
     return receipt
 
 
 def _write_receipt(receipt: dict) -> None:
-    """tmp + os.replace like every other writer on the volume. Best-effort: a receipt that could
-    not be written is exactly what the receiver's check reports, so nothing is hidden by raising."""
+    """Merge follow-up results into the same run's durable receipt through one locked writer."""
+    sys.path.insert(0, os.path.join(PACK, "_shared", "lib"))
+    import jsonstore
     path = receipt_path(receipt["day"], receipt["kind"])
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(receipt, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        print(f"[learn_step] receipt not written: {e}", file=sys.stderr, flush=True)
+        with jsonstore.transaction(path, default={}) as state:
+            if receipt.get("phase") == "ancillary":
+                if state.get("run_key") != receipt.get("run_key"):
+                    # A later brief owns today's display receipt; this old job must not replace it.
+                    return
+                receipt["steps"] = {**state.get("steps", {}), **receipt["steps"]}
+                receipt["required_ok"] = state.get("required_ok") is True
+                receipt["ok"] = receipt["required_ok"] and all(
+                    step.get("status") != "failed" for step in receipt["steps"].values())
+            state.clear()
+            state.update(receipt)
+    except (OSError, jsonstore.Unreadable) as error:
+        print(f"[learn_step] receipt not written: {type(error).__name__}", file=sys.stderr, flush=True)
+        if receipt.get('phase') in ('essential', 'ancillary'):
+            # A durable runner must retry when its completion receipt did not reach the volume.
+            # The legacy all-writers command retains its historical best-effort log behavior.
+            raise
+
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[1])
-    ap.add_argument("--type", default="morning", choices=("morning", "evening"))
+    ap.add_argument("--type", default="morning", choices=("morning", "evening", "welcome"))
     ap.add_argument("--local", default="", help="the read_local snapshot (style)")
     ap.add_argument("--gmail", default="", help="the gather's Gmail file (style's sent-mail lane)")
     ap.add_argument("--granola", default="", help="gather_granola output (meeting attendance)")
     ap.add_argument("--knowledge-out", dest="knowledge_out", default="",
                     help="the brief's extracted_knowledge payload (knowledge)")
     ap.add_argument("--continuity", default="", help="the --merge-only payload (continuity)")
+    ap.add_argument("--phase", choices=("all", "essential", "ancillary"), default="all",
+                    help="essential state gates delivery; ancillary learning runs as durable follow-up")
+    ap.add_argument("--run-key", default="", help=argparse.SUPPRESS)
     ap.add_argument("--day", default="", help=argparse.SUPPRESS)   # tests pin the day
     args = ap.parse_args(argv)
     receipt = learn(args)

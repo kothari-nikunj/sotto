@@ -16,6 +16,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+from personal_context import render_feedback  # noqa: E402
+
 
 def _root():
     return os.environ.get("SOTTO_DATA", "/data")
@@ -54,7 +57,7 @@ def apply(req: dict) -> dict:
     person = per_person.get(cid) or per_person.get(f"name:{recipient}") or \
         next((p for p in per_person.values() if (p.get("name") or "").lower() == recipient), None)
 
-    bucket = _bucket(channel, person.get("context") if person else None)
+    bucket = _bucket(channel, person.get("context") if person else req.get("context"))
     canonical = (style.get("canonical") or {}).get(bucket, [])
     recent = [s for s in (style.get("recent") or []) if s.get("bucket") == bucket]
     confirmed = [s for s in (style.get("confirmed") or []) if s.get("bucket") == bucket]
@@ -117,6 +120,7 @@ def apply(req: dict) -> dict:
     if source == "bucket" and len(parts) == 1:
         # Nothing learned yet — give a minimal honest instruction.
         parts.append("(No writing samples yet — write concise and natural; mirror the incoming message's register.)")
+    parts.append(render_feedback())
     parts.append('\nWrite as if you ARE this person. The samples above are the ground truth — if in doubt, re-read them.')
 
     return {"guidance": "\n".join(parts), "bucket": bucket, "source": source,

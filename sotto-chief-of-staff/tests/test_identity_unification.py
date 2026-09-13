@@ -298,7 +298,8 @@ def test_knowledge_query_emits_identity_map(tmp_path, monkeypatch):
                            os.path.join(ROOT, "_shared", "knowledge", "knowledge_query.py"),
                            "--relevant-days", "7"], capture_output=True, text=True, env=env)
     out = json.loads(proc.stdout)
-    assert set(out) == {"person_knowledge", "contact_index"}
+    assert set(out) == {'person_knowledge', 'contact_index', 'memory_participants'}
+    assert out['memory_participants'] == []  # no current task inputs; graph fallback remains separate
     assert len(out["contact_index"]) == 1
     entry = out["contact_index"][0]
     assert entry["identifiers"] == ["sarah@acme.com"] and entry["confidence"] == "medium"
