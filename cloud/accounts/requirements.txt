@@ -1,3 +1,0 @@
-google-auth==2.56.3
-requests==2.32.5
-cryptography==50.0.1

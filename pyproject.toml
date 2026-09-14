@@ -1,0 +1,82 @@
+# Sotto — project metadata + the two tool configs this tree actually uses.
+#
+# This file is METADATA and CONFIGURATION, not a build system: Sotto ships as a container image
+# (Dockerfile) and as skills copied onto a Hermes host, never as a wheel. There is deliberately no
+# [build-system] table — nothing here is `pip install`-able, and pretending otherwise would invite
+# someone to try. Runtime dependencies live in requirements.txt (baked into the image); test
+# dependencies in requirements-dev.txt (CI + a contributor's laptop). One manifest per lane.
+
+[project]
+name = "sotto"
+version = "0.1.0"
+description = "A chief of staff that runs on your own infrastructure: briefs, nudges, and a memory of your people."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+# Kept EMPTY on purpose: the runtime deps are pinned in requirements.txt, which is what the image
+# installs. A second list here would be a second source of truth for the same fact.
+dependencies = []
+
+# ── pytest ────────────────────────────────────────────────────────────────────────────────────────
+# The two suites are run by path, from their own directory (CLAUDE.md § Verification), so this table
+# stays basics-only: no `addopts`, no `testpaths` that could change what a bare `pytest` collects.
+# Its presence makes this directory pytest's rootdir, which is why the cache lands here (.gitignore
+# already covers **/.pytest_cache/).
+[tool.pytest.ini_options]
+minversion = "8.0"
+# Named markers, so an unknown one is a typo rather than a silently-skipped test.
+markers = [
+  "slow: a test that talks to the filesystem heavily or sleeps; safe to deselect locally",
+]
+
+# ── ruff ──────────────────────────────────────────────────────────────────────────────────────────
+# This section DESCRIBES the code that is already here. It is not a new lint regime: nobody is being
+# asked to reformat 60k lines, and every ignore below corresponds to a `# noqa:` the tree already
+# carries, i.e. a decision that was made once and is worth keeping rather than re-litigating file by
+# file. Running `ruff check .` should surface real problems, not house style.
+[tool.ruff]
+# The tree is written to ~100 columns; a handful of long literal strings (prompts, URLs) run past it.
+line-length = 110
+target-version = "py311"
+extend-exclude = ["**/__pycache__", "**/.pytest_cache", "**/node_modules", "**/target"]
+
+[tool.ruff.lint]
+# The families the tree's own noqa comments name — and nothing else.
+#   E4/E7/E9  pycodestyle imports, statements, syntax/IO errors
+#   F         pyflakes (unused imports/variables, undefined names) — the ones worth fixing
+#   BLE       blind `except Exception`
+#   PLC       pylint conventions (PLC0415 = import outside top level)
+#   N         pep8-naming
+# NOT selected: `S` (bandit). It reads 3,900 `assert`s in the test suites as findings and flags every
+# `subprocess.run` in a tree whose whole job is running subprocesses — signal-to-noise near zero.
+select = ["E4", "E7", "E9", "F", "BLE", "PLC", "N"]
+# Four global exemptions, each a house style with a reason:
+#   E501  long lines — the prompts and URLs above; `line-length` still governs the formatter.
+#   E702  `import sys; sys.path.insert(...)` one-liners in the script bootstraps (below).
+#   E741  single-letter loop variables (`l` for line) in short comprehensions.
+#   E731  a one-line `lambda` stub, in prod as in tests — the shortest honest local helper.
+ignore = ["E501", "E702", "E741", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+# Every skill script and shared lib begins by putting `_shared/` on sys.path and only THEN importing
+# from it — that is E402 (and E401 where the bootstrap is a one-liner), and it is structural: these
+# files run as `python3 path/to/script.py` under the agent, with no package install and no PYTHONPATH.
+# BLE001: pipelines fail toward silence, so a broad `except Exception` around a source is the design
+# (a source that breaks says so in the brief instead of taking the brief down with it).
+# PLC0415: imports inside functions keep cold start cheap for scripts that exit before reaching them.
+"sotto-chief-of-staff/**/*.py" = ["E401", "E402", "BLE001", "PLC0415"]
+"runtime/trigger-receiver/*.py" = ["E401", "E402", "BLE001", "PLC0415", "N802"]
+"sotto-bridge/tools/*.py" = ["E401", "E402", "BLE001", "PLC0415"]
+# Test names are sentences, and a sentence sometimes contains a word in CAPITALS for emphasis (N802).
+# N806: test locals like `D = m.DASHBOARD` are deliberate abbreviations; N803: fake Google
+# service doubles mirror the REAL Gmail API's camelCase kwargs (`userId`) — fidelity, not style.
+"**/tests/test_*.py" = ["N802", "N806", "N803"]
+# These three names are established exception API. Keep the naming exemption at the definitions,
+# rather than disabling N818 for every future exception in the tree.
+"sotto-chief-of-staff/_shared/knowledge/master_file.py" = ["N818"]
+"sotto-chief-of-staff/_shared/lib/jsonstore.py" = ["N818"]
+"sotto-chief-of-staff/_shared/lib/connector_tokens.py" = ["N818"]
+
+# What is deliberately NOT ignored: pyflakes findings. Undefined names, dead imports/locals, and
+# accidental redefinitions are defects, not house style. CI runs this exact configuration so new
+# findings fail before merge rather than accumulating into another cleanup pass.

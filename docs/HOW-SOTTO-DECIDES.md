@@ -587,13 +587,6 @@ Google reconnects preserve authorization order across restart: the receiver reco
 before installing credentials. An interrupted request may retry only while still current; older
 requests cannot restore permissions superseded by newer consent. Completed retries do not reinstall.
 
-Native Cloud sign-in starts with an opaque polling bearer and an account-service browser URL; it
-returns no confirmation code or Google authorization URL to the Mac. After Google succeeds, only
-the initiating cookie-bound browser sees the eight-character code. The user enters it in Bridge,
-which submits it to the native-only confirmation endpoint with that polling bearer and then resumes
-status polling. The broker permits five native code attempts, retains at most 50 unverified pending
-sign-ins and 500 total sign-in sessions, and never evicts verified or in-flight handoffs to admit an
-anonymous start. No credential handoff begins until the native code confirmation succeeds.
 
 The model proxy rejects duplicate JSON keys and forwards canonical JSON after validation. Admission
 uses one atomic SQLite ledger and permits 60 admitted requests per tenant in a rolling 60-second

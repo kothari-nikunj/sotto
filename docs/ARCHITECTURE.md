@@ -282,7 +282,6 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `.sotto-volume.json` | `managed_volume.py initialize` | managed boot and recovery verify the mounted tenant identity |
 | `.sotto-runtime.lock` | `runtime_lock.py` | supervisor and offline recovery refuse concurrent writers |
 | `.sotto-recovery-hold.json` | `recovery.py restore` | managed boot holds a restored tenant until explicit activation |
-| `accounts.sqlite` | account broker | encrypted pending account/device handoff and bounded sign-in sessions on the broker's separate volume |
 | `proxy.sqlite3` | model proxy | per-tenant lease, rate, reservation and content-free usage ledger on the proxy's separate volume |
 | `config/onboarding.json` | receiver `onboarding.py` | receiver first-use tick and scheduled hold |
 | `config/model-lease.json` | adapter `model_lease.py` | receiver renewal heartbeat and operator recovery diagnostics |
@@ -502,7 +501,6 @@ same-UID modification of tenant data or denial of service; the Linux built-image
 
 `cloud/model-proxy/server.py` is a separate pilot service and volume. Its `proxy.sqlite3` ledger stores tenant ID, route, model, timestamp, reservation, status and token counts, never prompts or responses. Two fixed surfaces share one tenant bearer: `/openai/v1/chat/completions` for Hermes; `/native/v1beta/models/{model}:generateContent` for all Sotto pipeline calls. `gemini_transport.py` changes destination and authentication only and refuses direct-key fallback in managed mode. Admission accounting is deliberately not an invoice; the owner has disabled the pilot allowance cutoff while retaining usage records. The receiver renews the existing bearer’s expiry to 30 days through `/v1/lease/renew` using an independent control credential. The proxy stores only the lease expiry and token hash; `enabled: false` blocks both requests and renewal. Bearer-byte rotation remains an operator change.
 
-The live owner pilot uses Google web OAuth, device-bound Bridge enrollment and source consent; the registered-account/browser implementation below is still under review; automatic fleet provisioning and cohort readiness remain pending. The personal pilot records Google consent after verifying the granted scopes; scheduled briefs remain held until activation and at least one recorded source connection. See [managed pilot status](CLOUD-PILOT.md).
 
 System jobs use the receiver in Cloud and receiver-based self-host. The weekly relationship pulse runs at 9 a.m. Monday in the user’s timezone. All managed scheduled jobs wait for messaging activation and a connected context source, then share the receiver’s outbox and silence handling.
 
@@ -550,25 +548,16 @@ misreport it as disconnected. Failed saves preserve the text instead of returnin
 
 ### Cloud account and device connection
 
-`cloud/accounts/server.py` owns OIDC identity and pending bootstrap state on a separate private
-SQLite volume. It adopts the configured tenant; the receiver's `cloud_pairing.py` owns device-bound
-grant redemption and immutable account binding. Only `adapters/hermes/google_setup.py` knows how
-to install Google credentials for Hermes. The broker erases its encrypted pending Google credential
-after the instance accepts it. The active token remains a private authorized-user JSON on the tenant
-volume; application-level encryption and fleet provisioning remain unimplemented.
 
-The Bridge's `CloudSignIn.swift` persists a P-256 signing key in Keychain, completes Google consent
-in the browser, then redeems the pairing grant without a user-visible token. `CloudConnectionView`
-shares the existing app with self-host and stores the product tier separately from local/remote
+`CloudConnectionView` shares the existing app with self-host and stores the product tier separately from local/remote
 agent topology. Local source choices write the existing fail-closed cloud-policy file; the app
 reports successful source reads and consent through authenticated `/cloud/consent`. The receiver
 rejects new event/wake payloads from disabled sources before staging or triage. Offline Macs retain
 established capability; a configured source without a successful read does not open brief readiness.
 Per-device relay credentials can now be revoked through the receiver’s control-authenticated API.
 This revokes Bridge access, not Google consent, historical data or existing browser sessions.
-Historical source-specific purge, dashboard exchange and the iCloud mirror remain deferred. See `cloud/accounts/README.md` for the exact pilot contract and limitations.
+Historical source-specific purge, dashboard exchange and the iCloud mirror remain deferred.
 
-Bridge keeps its unfinished Cloud sign-in polling credential and device challenge in Keychain for the 15-minute sign-in window. Retrying resumes that session; temporary network errors, rate limits and server failures retry during polling and device pairing. Successful pairing or expiry clears the pending credential.
 
 The shared `SOTTO_REACTIONS` setting also controls Photon processing Tapbacks through Hermes: 👀 while processing, 👍 after successful reply delivery, 👎 after processing/delivery failure, and no reaction after cancellation. These are best-effort conversational status indicators, never evidence that a draft was saved or an email sent.
 
@@ -691,12 +680,12 @@ The [recovery runbook](../adapters/hermes/RECOVERY.md) describes verified full-v
 restore to an empty replacement. Restore checks hashes and SQLite integrity and holds startup
 until explicit review/resume. Its synthetic cold-restore test preserves explicit memory, credentials,
 queued work and pending delivery. It does not establish an automated backup schedule or recovery
-of the separate accounts/proxy control state; those remain operator launch checks.
+of the separate proxy control state; those remain operator launch checks.
 
 `sotto-chief-of-staff/tools/verify.py` is the common credential-free backend/release gate used by
-local shipping, private CI and generated public CI. It includes accounts and proxy tests in
+local shipping, private CI and generated public CI. It includes proxy tests in
 addition to the shared pipeline, receiver, adapters, lint and available publication guards.
-The accounts, proxy and instance base images use the same pinned Python image digest. Managed boot
+The proxy and instance base images use the same pinned Python image digest. Managed boot
 compares installed Sotto skills/bundle against the shipped artifact; `user-*` routines remain
 outside system reconciliation. Receiver-based Cloud and self-host share procedures; standalone
 host adapters are supported separately and do not inherit the receiver’s durability guarantee.
@@ -734,24 +723,6 @@ The composer normalizes quiet-day boilerplate to time-neutral wording and labels
 calendar preview. The disclosure does not consume one of its five schedule lines. The critic,
 recipient guards, continuity writers and delivery markers retain their existing responsibilities.
 
-### Registered Cloud accounts and optional Mac enrollment
-
-`cloud/accounts/registry.py` owns immutable Google issuer/subject accounts, pre-created tenant
-routes and one-time email admissions within the existing encrypted account-service database.
-Tenant control tokens are encrypted with the same state key. The verified legacy owner is adopted
-before new sign-ins are accepted. Registering another tenant does not grant it the Photon project
-stream; shared-line transport remains a separate release gate. A suspended tenant cannot reconnect.
-
-For Mac entry, the broker first returns its own device-confirmation URL and an eight-character code
-shown in Bridge. The user enters that code in a browser; five attempts are allowed during the
-15-minute session. Only the confirming browser's hashed cookie can receive and complete Google
-OAuth, and no raw Google authorization URL is returned to the Mac. OIDC authorization and the tenant handoff commit in one account transaction. Each authorization increments the account credential generation. The receiver commits the generation and request fingerprint before installing credentials, then serializes installation against later reservations. A crash after the credential file write leaves an unapplied operation that only the same, still-current request can retry; older generations cannot restore superseded permissions. Exact retries return the recorded result without reinstalling it. The broker requires the generation echo; deploy the receiver before the broker. Browser entry omits a
-Mac key; `/cloud/bootstrap` installs source consent and binds the Google account without issuing
-Bridge credentials or claiming messaging activation. Mac entry retains the existing signed grant.
-`config/cloud-pairing.sqlite` also stores bootstrap request fingerprints and results so retries
-cannot substitute credentials or change entry type. Later Mac sign-in attaches a device to the same
-account and memory. Browser continuation is implemented below; live shared-number routing remains
-a separate release gate.
 
 `source_catalog.py` is the shared Bridge ID/payload map used by source readers and the receiver's
 consent gates; the image copies that same leaf beside the receiver. Contacts alone do not establish
@@ -771,27 +742,3 @@ uses Connect → Choose sources → Disk access, with the same defaults and conf
 The pilot Mac Messages step reads its existing owner activation receipt; shared-number confirmation
 in the Mac and transport activation remain later integration gates.
 
-`cloud/accounts/linking.py` defines that tested two-proof state transition in the account database:
-account-authorized start → trusted DM observation → account confirmation. It owns hashed expiring
-challenges and versioned unique sender bindings. It neither runs a model nor sends a message and is
-not exposed to public ingress before the gateway can authenticate the provider.
-
-`cloud/accounts/browser.py` owns short-lived cookie sessions and durable per-account journeys in
-the same account database. Same-origin CSRF-protected browser mutations cannot select a tenant.
-The Google callback requires its initiating cookie and rotates it transactionally with verified
-account assignment; copied links and polling tokens confer no browser account capability.
-Anonymous Mac starts occupy at most 50 unverified pending rows and replace the oldest pending row;
-confirmed pre-Google, provisioning and ready rows are preserved. Browser cookies use an analogous
-500-row anonymous FIFO while authenticated sessions are preserved. These are bounded TTL lockout
-protections, not DDoS protection.
-Reauthentication resumes the account's journey; changing accounts requires signing out first.
-`pages.py` renders the script-free setup forms. `/v1/journey` reports filtered receiver readiness,
-with unknown status when the instance cannot be reached. Browser challenge/confirmation endpoints
-call the same `linking.py` transitions and display the exact provider-observed identity for approval.
-Challenges are scoped to the intended line; completed/revoked payloads are erased. The transport
-supervisor must publish a verified ready line before setup offers one. That supervisor, durable
-tenant relay and receiver route activation are still pending; browser approval alone cannot start
-delivery. Existing Mac OAuth and device capabilities retain their separate contract. Pairing
-redemption remains one device-signed operation with a ten-minute exact-retry window after a lost
-response. Revocation blocks replay of revoked grants without breaking an already completed response
-contract or forcing arbitrary re-enrollment.

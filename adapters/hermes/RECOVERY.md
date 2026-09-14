@@ -63,9 +63,10 @@ A provider acceptance receipt proves acceptance, not that the user read the mess
 `test_recovery.py` rehearses a cold restore using synthetic explicit memory, credentials, a queued
 job and a pending outbox row, including the activation hold. This is an offline tenant-volume
 contract, not evidence of a live pilot backup, an automatic backup schedule, or recovery of the
-separate accounts/proxy services. Operators must also protect those services' SQLite volumes and
-external configuration, including the accounts encryption key and tenant/control token hashes.
+separate proxy service. Operators must also protect that service's SQLite volume and external
+configuration, including the tenant/control token hashes.
 Fleet-wide recovery remains a launch gate until that complete drill has been performed.
+
 
 ## Model credential continuity
 
@@ -93,5 +94,5 @@ A fresh Google sign-in can re-enroll the device; old grants and bearers remain i
 Legacy shared Bridge access remains valid only until the first device credential is issued.
 Shared operator credentials are not individually revocable device credentials. This API revokes
 Bridge access only: it does not erase historical data, revoke Google consent or terminate existing
-browser sessions. Newly enrolled devices receive no shared setup code; additional web setup needs
-an existing browser login or an operator login URL until dashboard session exchange is implemented.
+browser sessions. Newly enrolled devices receive no shared setup code.
+

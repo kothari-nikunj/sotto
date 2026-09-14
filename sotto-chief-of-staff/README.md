@@ -123,7 +123,7 @@ evals/                               # brief-quality eval harness
   corpus/                            # NEVER committed, NEVER shipped — real user data, built locally
 tests/                               # pytest: parity fixtures in → expected exhaust out (conftest sets sys.path)
 tools/                               # skill-tree tooling
-  verify.py                          # shared backend/release gate: pipeline, receiver, adapter, proxy, accounts, guards
+  verify.py                          # shared backend/release gate: pipeline, receiver, adapter, proxy, guards
   dry_run.py                         # offline full-loop rehearsal (no LLM, no network; fixtures/brief_bundle.json)
   validate_skills.py                 # SKILL.md lint (one of the checks verify.py runs; also usable on its own)
   forget.py                          # delete the exhaust (snapshot, caches, logs, receipts) — never the memory
@@ -135,8 +135,5 @@ tools/                               # skill-tree tooling
 - Python scripts read/write the exhaust at `$SOTTO_DATA` (the Hermes volume); keep person/company `.md` + `style.json` schemas **byte-compatible** with today's Sotto files.
 - Ship parity tests with fixtures for every script (cite the ported source file in a header comment).
 
-Hosting/onboarding contracts live outside the shared skill pack: `../cloud/accounts/registry.py` owns Cloud identity and tenant routes. See [Cloud accounts](../cloud/accounts/README.md). This introduces no second skill implementation.
-The same account service's `browser.py`, `pages.py` and `linking.py` own browser sessions, setup forms
-and account-approved sender proof; live shared transport remains a separate release gate.
 
 `_shared/lib/source_catalog.py` owns the Bridge source IDs and payload projections used by both the receiver consent gate and shared readers.

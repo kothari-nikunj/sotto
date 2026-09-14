@@ -325,8 +325,12 @@ def test_the_shipped_ci_workflow_names_no_credential():
         spec.loader.exec_module(module)
         from pathlib import Path
         commands = [argv[1:] for _cwd, argv in module.commands(Path(target))]
-        for suite in ("tests", "runtime/trigger-receiver", "adapters/hermes", "cloud/model-proxy", "cloud/accounts"):
+        for suite in ("tests", "runtime/trigger-receiver", "adapters/hermes", "cloud/model-proxy"):
             assert ["-m", "pytest", suite, "-q"] in commands
+        # The hosted account broker never ships, and the shipped gate does not name a suite it lacks.
+        assert ["-m", "pytest", "cloud/accounts", "-q"] not in commands
+        assert not os.path.isdir(os.path.join(target, "cloud", "accounts"))
+        assert os.path.isdir(os.path.join(target, "cloud", "model-proxy"))
         assert ["tools/validate_skills.py"] in commands
         assert ["-m", "ruff", "check", "."] in commands
         assert "requirements-dev.txt" in ci
@@ -428,4 +432,47 @@ def test_every_doc_the_readme_links_actually_ships():
             f"README links these, but the generator never copies them: {missing}\n"
             "Add each to tools/prepare-public-repo.sh's copy list.")
     finally:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fails_the_publish():
+    """The monorepo docs describe the account broker because the monorepo has it; the shipped docs
+    must not, because the shipped tree does not. Marked passages vanish (markers included), a
+    marked table row vanishes without breaking the table, and an UNMARKED mention is a moat leak."""
+    fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=".md",
+                                   dir=os.path.join(HERMES, "adapters", "hermes"))
+    os.close(fd)
+    rel = os.path.relpath(planted, HERMES)
+    target = tempfile.mkdtemp(prefix="sotto-dist-")
+    os.rmdir(target)
+    try:
+        with open(planted, "w", encoding="utf-8") as f:
+            f.write("Self-host paragraph stays.\n\n<!-- hosted-only -->\n## Broker\n\n"
+                    "The account broker in `cloud/accounts/` adopts tenants.\n<!-- /hosted-only -->\n\n"
+                    "| Service | Role |\n|---|---|\n| receiver | ships |\n"
+                    "| sotto-accounts | hosted <!-- hosted-only-row -->\n| model-proxy | ships |\n")
+        proc = _run_generator(target)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "MOAT GUARD: PASS" in proc.stdout
+        with open(os.path.join(target, rel), encoding="utf-8") as f:
+            shipped = f.read()
+        assert shipped == ("Self-host paragraph stays.\n\n\n| Service | Role |\n|---|---|\n"
+                           "| receiver | ships |\n| model-proxy | ships |\n"), shipped
+        # The playgrounds are docs too: their broker sections (marked in the monorepo) and the
+        # broker's shared-file row are gone from the shipped copies, markers included.
+        for name in ("playground-architecture.html", "playground-feedback-loops.html"):
+            with open(os.path.join(target, "docs", name), encoding="utf-8") as f:
+                playground = f.read()
+            for trace in ("hosted-only", "Account and device are separate",
+                          "Browser setup and sender proof", "account service", "account broker"):
+                assert trace not in playground, (name, trace)
+        shutil.rmtree(target, ignore_errors=True)
+        with open(planted, "w", encoding="utf-8") as f:
+            f.write("See `cloud/accounts/README.md` for the sign-in contract.\n")
+        proc = _run_generator(target)
+        assert proc.returncode != 0
+        assert "MOAT GUARD: FAIL" in proc.stdout and rel in proc.stdout
+    finally:
+        if os.path.exists(planted):
+            os.remove(planted)
         shutil.rmtree(target, ignore_errors=True)

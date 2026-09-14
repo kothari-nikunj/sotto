@@ -51,7 +51,8 @@ This controls environment inheritance, not access by an agent with unrestricted 
 permissions to the tenant’s own files or processes.
 
 Managed web Google consent is installed by `google_setup.install_cloud_google`, invoked through
-the authenticated receiver bootstrap. The account broker never learns existing tenant credentials;
-the adapter remains the only component that knows Hermes' credential files. The active token is
-private JSON on the tenant volume, not application-encrypted. Desktop loopback setup remains the
-manual pilot fallback before a web-client connection; subsequent managed reconnects use Bridge.
+the authenticated receiver bootstrap. The adapter remains the only component that knows Hermes'
+credential files. The active token is private JSON on the tenant volume, not application-encrypted.
+Desktop loopback setup remains the manual pilot fallback before a web-client connection; subsequent
+managed reconnects use Bridge.
+

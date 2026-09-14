@@ -139,14 +139,12 @@ local material, and the escape hatch) plus how to add a service:
 | Doc | What |
 |---|---|
 | **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
-| [cloud/accounts/README.md](cloud/accounts/README.md) | Invited Cloud accounts, browser continuation and existing-tenant adoption |
 | [adapters/hermes/RECOVERY.md](adapters/hermes/RECOVERY.md) | Managed volume migration, model lease continuity, scoped device access and offline tenant restore |
 | [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
 | [docs/DATA-FLOW.md](docs/DATA-FLOW.md) | **Where your data goes** — every destination, every file written, how long each stays, and the gaps stated plainly. Read this before installing |
 | [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
-| [docs/CLOUD-PILOT.md](docs/CLOUD-PILOT.md) | Managed pilot contracts, verification and remaining launch gates |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: modules, daemon threads, subprocess boundaries, and shared files on the volume |
 | [sotto-chief-of-staff/evals/README.md](sotto-chief-of-staff/evals/README.md) | Developer verification, including the continuous tracking probe and its current gaps |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
@@ -186,7 +184,7 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
 
 CI, the public distribution and the release script use that command. It runs Ruff, skill validation,
-pipeline, receiver, adapter, model-proxy and accounts tests, shell parsing and available publication
+pipeline, receiver, adapter, model-proxy tests, shell parsing and available publication
 guards. Tests use synthetic sources and local fixtures; none call paid models or deploy services.
 Some tests bind a local loopback server. Bridge compilation and macOS integration remain a separate
 platform verification step; backend test success alone does not certify the desktop app.
@@ -199,4 +197,5 @@ its macOS data readers are not part of this source tree. It updates itself: a da
 that same Releases page, an **"Update available"** item in its menu, and a one-click in-place install
 that keeps your Full Disk Access grant.
 
-Cloud account and onboarding contracts: [account service](cloud/accounts/README.md). Cloud and self-host use the same shared runtime and skill pack.
+
+Cloud and self-host use the same shared runtime and skill pack.

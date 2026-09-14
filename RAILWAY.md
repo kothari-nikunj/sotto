@@ -338,6 +338,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_MODEL_PROXY_TOKEN` | Tenant model bearer for both routes. The receiver renews its expiry through the proxy; bearer rotation remains an explicit operator change. Also pairs with the proxy URL for self-host background learning. | managed or metered background |
 | `SOTTO_CONTROL_TOKEN` | Independent receiver/account bootstrap and model lease credential. Keep out of Hermes and worker environments; configure its SHA-256 as the proxy tenant’s `renewal_token_sha256`. | managed operator only |
 | `SOTTO_VOLUME_ID` | Identity of the real attached managed volume. Initialize `.sotto-volume.json` explicitly before first upgraded boot; a missing/mismatched mount stops startup. | required in managed mode |
+| `SOTTO_IMESSAGE_NUMBER` | This tenant's assigned Sotto number, displayed after pairing and excluded from Bridge iMessage context. | managed operator only |
 | `SOTTO_PROXY_TENANTS` | Proxy service only: configured tenant token hashes, expiry and admission budgets; never set on a tenant instance. Pilot provisioning only. | proxy operator only |
 | `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface) | never |
 | `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for self-host briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
@@ -516,16 +517,8 @@ Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and 
 | Mac can't reach the trigger | No public domain (step 4), or `SOTTO_TRIGGER_TOKEN` mismatch. |
 | Local data missing from briefs (messages/calls/contacts empty) | Run `sotto-bridged --doctor` on the Mac — it names each source `ok` / `needs Full Disk Access` / `unavailable` and prints the exact FDA fix (grant Full Disk Access to the *right* app: the `.app` for GUI runs, the terminal for CLI runs). Exit `0` = all sources read. |
 
-### Personal Cloud account broker (operator only)
 
-The invite-only broker in `cloud/accounts/` adopts registered isolated instances; it does not provision
-additional tenants. See its README for the separate web OAuth client, private volume and sign-in flow.
-
-| Variable | Purpose | Scope |
-|---|---|---|
-| `SOTTO_CONTROL_TOKEN` | Independent random secret authenticating the account broker's bootstrap requests; never passed to Hermes tools. | Managed instance and broker only |
-| `SOTTO_IMESSAGE_NUMBER` | This tenant's assigned Sotto number, displayed after pairing and excluded from Bridge iMessage context. | Managed instance only |
-| `SOTTO_ACCOUNT_CONFIG` | Broker-only JSON secret: web OAuth client, state encryption key and legacy pilot admission/route. Additional pre-created tenants are registered through the local operator command, with control credentials encrypted in the broker database. | Separate account service only |
+### Model proxy spending cutoff (operator only)
 
 The proxy tenant configuration accepts `budget_cents: null` to disable the spending admission cutoff while retaining usage records and credential checks. Numeric budgets return HTTP 402 with `sotto_budget_exhausted` when exhausted; upstream HTTP 429 remains a separate transient rate-limit condition. The personal pilot uses no spending cutoff at the owner’s request.
 

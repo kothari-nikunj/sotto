@@ -125,7 +125,7 @@ drag it to `/Applications`, open it.
   the menu shows **"Update available"** and one click installs it in place — no re-download, no
   re-granting Full Disk Access, nothing to re-pair.
 - **Start at login** is enabled for you when you finish the wizard — flip it off later in
-  Settings → General if you prefer. Done — the app dials *out* to your cloud, so there's no tunnel,
+  Settings → This Mac if you prefer. Done — the app dials *out* to your cloud, so there's no tunnel,
   no port, nothing to keep alive. Closing and reopening your laptop needs nothing from you.
 - Optional: **"Send my brief when I wake my Mac"** is on by default — open your laptop after 7am and
   the morning brief arrives moments later (the 6:30 cloud schedule covers the closed-laptop case;

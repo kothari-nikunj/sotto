@@ -30,14 +30,14 @@ def preflight(python=None):
 def commands(root):
     python = sys.executable
     pack = root / 'sotto-chief-of-staff'
+    suites = ['runtime/trigger-receiver', 'adapters/hermes', 'cloud/model-proxy', 'cloud/accounts']
     return [
         (root, [python, '-m', 'ruff', 'check', '.']),
         (pack, [python, '-m', 'pytest', 'tests', '-q']),
         (pack, [python, 'tools/validate_skills.py']),
-        (root, [python, '-m', 'pytest', 'runtime/trigger-receiver', '-q']),
-        (root, [python, '-m', 'pytest', 'adapters/hermes', '-q']),
-        (root, [python, '-m', 'pytest', 'cloud/model-proxy', '-q']),
-        (root, [python, '-m', 'pytest', 'cloud/accounts', '-q']),
+        # One contract, two trees: the public distribution has no cloud/accounts (the hosted broker
+        # never ships), so a suite runs where its directory is and is simply absent otherwise.
+        *((root, [python, '-m', 'pytest', suite, '-q']) for suite in suites if (root / suite).is_dir()),
         (root, [python, 'adapters/hermes/reconcile_crons.py', '--help']),
         (root, [python, 'adapters/hermes/configure_mcp.py', '--help']),
     ]

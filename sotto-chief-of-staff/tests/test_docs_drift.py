@@ -308,19 +308,26 @@ def test_background_cadences_are_stated_in_prose():
     _anchor("retries hourly (`model_lease.RETRY_SECONDS`)")
 
 
-def test_account_and_proxy_capacity_guards():
-    accounts = os.path.join(HERMES, 'cloud', 'accounts', 'server.py')
+def test_proxy_capacity_guards():
     model_proxy = os.path.join(HERMES, 'cloud', 'model-proxy', 'server.py')
+    _same('proxy.requests_per_window', R['proxy']['requests_per_window'],
+          _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW'))
+    _same('proxy.rate_window_seconds', R['proxy']['rate_window_seconds'],
+          _literal_constant(model_proxy, 'RATE_WINDOW_SECONDS'))
+
+
+def test_account_broker_capacity_guards():
+    # The broker never ships in the public distribution, and neither do the HOW-SOTTO-DECIDES
+    # sentences about it (hosted-only passages are stripped) — so this half skips there.
+    accounts = os.path.join(HERMES, 'cloud', 'accounts', 'server.py')
+    if not os.path.isfile(accounts):
+        pytest.skip('cloud/accounts is not part of this tree (public distribution)')
     _same('accounts.pending_signins', R['accounts']['pending_signins'],
           _literal_constant(accounts, 'PENDING_SIGNINS'))
     _same('accounts.max_signins', R['accounts']['max_signins'],
           _literal_constant(accounts, 'MAX_SIGNINS'))
     _same('accounts.device_code_attempts', R['accounts']['device_code_attempts'],
           _literal_constant(accounts, 'DEVICE_CODE_ATTEMPTS'))
-    _same('proxy.requests_per_window', R['proxy']['requests_per_window'],
-          _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW'))
-    _same('proxy.rate_window_seconds', R['proxy']['rate_window_seconds'],
-          _literal_constant(model_proxy, 'RATE_WINDOW_SECONDS'))
     _anchor('50 unverified pending sign-ins')
     _anchor('500 total sign-in sessions')
     _anchor('five native code attempts')
