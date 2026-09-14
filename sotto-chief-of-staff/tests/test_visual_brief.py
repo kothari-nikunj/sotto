@@ -41,7 +41,7 @@ def test_quotes_provenance_and_renders_private_readable_cards(tmp_path):
     assert 'Historical preview' in deck['summary']
 
 
-def test_never_omits_overlong_action_or_required_link():
+def test_never_omits_overlong_action_or_pads_a_single_link_into_four_cards():
     for text in ('word ' * (v.MAX_WORDS + 1), 'Sign the waiver at https://example.com/waiver'):
         assert v.build('Morning\nNeeds Attention Now\n' + text) is None
 
@@ -158,5 +158,20 @@ Two newsletters.
     assert 'Sam - Reply to the invitation by tomorrow.' in blocks
     assert 'You called Taylor back.' in blocks
     assert len(v.render(deck, tmp_path)['images']) == 4
+    linked = v.build(source.replace('Sam - Reply to the invitation by tomorrow.',
+                                    'Sam - Reply at https://example.com/invite'))
+    assert linked and 'https://example.com/invite' in linked['summary']
+    assert len(v.render(linked, tmp_path)['images']) == 4
+    footer = v.build(source.replace('Sam - Reply to the invitation by tomorrow.',
+                                    '3 other open loops - see /app#loops'))
+    assert footer and '/app#loops' in footer['summary']
+    assert len(v.render(footer, tmp_path)['images']) == 4
     assert v.build(source.replace('Sam - Reply to the invitation by tomorrow.',
-                                 'Sam - Reply at https://example.com/invite')) is None
+                                 'Sam - Reply at https://example.com/' + 'x' * 1000)) is None
+
+
+def test_companion_links_exclude_prose_punctuation_but_keep_balanced_parentheses():
+    text = v.to_imessage('[invite](https://example.com/invite). (https://example.com/invite). '
+                         'Read https://example.com/wiki/Example_(topic).', normalize_style=False)
+    assert v._companion_links(text) == ['https://example.com/invite',
+                                       'https://example.com/wiki/Example_(topic)']

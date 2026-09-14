@@ -14,7 +14,7 @@ import re
 
 from chatfmt import to_imessage
 
-VERSION = 9
+VERSION = 10
 MAX_CARDS = 4
 MAX_WORDS = 200
 MAX_PREP_WORDS = 200
@@ -64,7 +64,7 @@ def build(text, kind='brief', preview=False):
             active = None
         elif active is not None:
             # Long paragraphs and links belong in text. Never cut off a qualifier, date or amount.
-            if len(line.split()) <= MAX_WORDS and not re.search(r'https?://|mailto:|/app#', line):
+            if len(line.split()) <= MAX_WORDS and (kind == 'brief' or not re.search(r'https?://|mailto:|/app#', line)):
                 active['blocks'].append({'text': line, 'line': index})
             elif kind == 'brief' and active['title'] in ('Needs you', 'Today', 'Open loops', 'In the loop'):
                 return None  # never hide an action merely because it is hard to fit
@@ -121,7 +121,28 @@ def build(text, kind='brief', preview=False):
     deck['id'] = hashlib.sha256(json.dumps(deck, sort_keys=True).encode()).hexdigest()[:24]
     # Keep the companion text short; dates and links remain selectable in Messages.
     deck['summary'] = ('Historical preview · ' if preview else '') + _display_text(title)
+    if kind == 'brief':
+        links = _companion_links(plain)
+        if links:
+            deck['summary'] += '\n' + '\n'.join(links)
+        if len(deck['summary'].encode('utf-16-le')) // 2 > 1000:
+            return None  # preserve usable links without overflowing the transport caption
     return deck
+
+
+def _companion_links(text):
+    links = []
+    for link in re.findall(r'https?://[^\s<>]+|mailto:[^\s<>]+|/app#[^\s<>]+', text):
+        link = link.rstrip('.,;:!?')
+        while link and link[-1] in ')]}':
+            closer = link[-1]
+            opener = {')': '(', ']': '[', '}': '{'}[closer]
+            if link.count(closer) <= link.count(opener):
+                break
+            link = link[:-1].rstrip('.,;:!?')
+        if link not in links:
+            links.append(link)
+    return links
 
 
 def _lines(draw, text, font, width):

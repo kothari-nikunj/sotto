@@ -105,3 +105,5 @@ user's PATH. The Photon sidecar's locked dependencies are installed at build tim
 run Node, npm and Spectrum gallery imports as the `sotto` user, before a deployment can start.
 Receiver `/health` alone does not prove the Photon gateway connected; verify sidecar capability
 and a provider receipt after a runtime packaging change.
+
+Brief galleries retain source links in the companion text so they remain selectable. Linked open-loop summaries do not disable the gallery. Unrenderable content or a caption exceeding the transport limit still uses the complete text.
