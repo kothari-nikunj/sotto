@@ -261,6 +261,8 @@ OUTBOX.HOOKS.update({
     # The ONE call that touches the channel. When a channel offers a real receipt (a gateway send
     # API returning an id), this is the single function that gets stronger and every lane inherits it.
     "send": lambda body, target: _send_via_channel(body, target),
+    "send_gallery": lambda presentation, target: _hermes_adapter('runtime_api').send_gallery(
+        presentation, target, SEND_TIMEOUT_SECS),
     "record": lambda label, status, detail="", usage=None, decision_ids=None: _record_delivery(
         label, status, detail, usage=usage, decision_ids=decision_ids),
     # A chase is only counted once the message that chased actually landed — wherever it landed,
@@ -778,7 +780,19 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
     effects = [effect for effect in (effects or []) if effect.get('kind') != 'pending_offer'
                or (str(effect.get('offer', {}).get('question') or '').strip()
                    and str(effect['offer']['question']).strip() in body)]
-    return OUTBOX.deliver({"label": label, "body": body, "target": _deliver_target(),
+    target = _deliver_target()
+    presentation = None
+    if not any(e.get('kind') == 'pending_offer' for e in effects):
+        # Consent offers/effects stay in their existing exact-text delivery contract.
+        prepare = _load_shared_lib('visual_delivery').prepare
+        def load_visual():
+            _shared_effects()  # establish the installed shared library search path
+            import visual_brief
+            return visual_brief
+        presentation = prepare(body, label, target, load_visual,
+                               _hermes_adapter('runtime_api').gallery_available)
+    return OUTBOX.deliver({"label": label, "body": body, "target": target,
+                           "presentation": presentation,
                            "usage": usage, "decision_ids": decision_ids,
                            "effects": effects or [], "run_id": run_id, "valid_until": valid_until,
                            "not_before": not_before, "coverage_until": coverage_until})

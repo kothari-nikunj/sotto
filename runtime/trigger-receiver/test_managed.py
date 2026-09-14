@@ -108,6 +108,10 @@ def test_photon_formats_chat_and_standalone_at_registered_boundary(monkeypatch, 
     fmt = importlib.util.module_from_spec(fmt_spec)
     fmt_spec.loader.exec_module(fmt)
     monkeypatch.setitem(sys.modules, fmt_spec.name, fmt)
+    gallery_spec = importlib.util.spec_from_file_location(spec.name + '.gallery', root / 'adapters/hermes/gallery.py')
+    gallery = importlib.util.module_from_spec(gallery_spec)
+    gallery_spec.loader.exec_module(gallery)
+    monkeypatch.setitem(sys.modules, gallery_spec.name, gallery)
     upstream = types.ModuleType('plugins.platforms.photon.adapter')
     deliveries = []
     fail_delivery = False

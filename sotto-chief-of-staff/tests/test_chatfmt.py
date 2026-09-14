@@ -45,7 +45,7 @@ def test_imessage_draft_and_research_are_readable_and_idempotent():
 def test_imessage_keeps_urls_and_words_and_full_handled_recap():
     raw = '*Already Handled*\n\nJamie — replied.\n\nAlex — passed.\n\n*Filtered*\n\n2 newsletters'
     out = cf.compact_handled(cf.to_imessage(raw))
-    assert 'Already Handled\n• Jamie — replied.\n• Alex — passed.\n\nFiltered' in out
+    assert 'Already Handled\n• Jamie - replied.\n• Alex - passed.\n\nFiltered' in out
     assert cf.compact_handled(cf.to_imessage(out)) == out
     plain = 'https://example.com/some_page_here?q=a_b_c\n2 * 3 = 6\nunknown_identifier'
     assert cf.to_imessage(plain) == plain
@@ -78,7 +78,7 @@ def test_double_asterisk_bold_becomes_single():
     out = cf.to_chat(SAMPLE)
     assert "**" not in out
     assert "*Sarah Chen* - Locked in" in out
-    assert "- *9:30 AM* — Morning Team Video Sync" in out
+    assert "- *9:30 AM* - Morning Team Video Sync" in out
 
 
 def test_markers_stripped_and_rules_dropped():
@@ -101,7 +101,7 @@ def test_idempotent_running_twice_changes_nothing():
     assert cf.to_chat(once) == once
     # already-chat-formatted producer output (single-asterisk headers/bold) also passes untouched
     chat = "*Waiting on you*\n- *Sarah Chen (Acme)* — waiting 5 days for reply\nsms:+14155551234"
-    assert cf.to_chat(chat) == chat
+    assert cf.to_chat(chat) == chat.replace(" — ", " - ")
 
 
 def test_multiline_marker_and_degenerate_inputs():
@@ -116,3 +116,12 @@ def test_behavior_matches_render_chat_text_contract():
     # a bolded name with an inline id marker must come out as a clean single-asterisk name.
     src = "**Sarah Chen**<!--id:sarah@acme.com|ch:email--> - ping."
     assert cf.to_chat(src) == "*Sarah Chen* - ping."
+
+
+def test_shared_prose_rule_preserves_destinations_and_machine_text():
+    source = 'Ready — reply today.\nhttps://example.com/a—b\n`exact—identifier`'
+    normalized = cf.prose_punctuation(source)
+    assert normalized == 'Ready - reply today.\nhttps://example.com/a—b\n`exact—identifier`'
+    assert cf.prose_punctuation(normalized) == normalized
+    assert cf.to_imessage('Ready — reply today.') == 'Ready - reply today.'
+    assert cf.to_chat('Ready — reply today.') == 'Ready - reply today.'

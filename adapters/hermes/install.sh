@@ -141,6 +141,10 @@ if [ "$DRY_RUN" -eq 0 ]; then
   touch "$HERMES_HOME/SOUL.md"
   grep -q "chief-of-staff mode called \*\*Sotto\*\*" "$HERMES_HOME/SOUL.md" 2>/dev/null || \
     cat "$HERE/sotto-persona.md" >> "$HERMES_HOME/SOUL.md"
+  if [ -f "$HERMES_HOME/skills/sotto/_shared/references/writing-style.md" ]; then
+    grep -q '^## Sotto writing style$' "$HERMES_HOME/SOUL.md" 2>/dev/null || \
+      cat "$HERMES_HOME/skills/sotto/_shared/references/writing-style.md" >> "$HERMES_HOME/SOUL.md"
+  fi
 fi
 
 # 5) Bridge MCP — two topologies, auto-selected:

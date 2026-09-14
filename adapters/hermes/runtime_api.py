@@ -38,6 +38,14 @@ def send_receipt(body, target, timeout=60):
     return sibling('send').send_receipt(body, target, timeout)
 
 
+def gallery_available():
+    return sibling('gallery').available()
+
+
+def send_gallery(presentation, target, timeout=60):
+    return sibling('gallery').send(presentation['images'], presentation['summary'], target, timeout)
+
+
 def send_capability(run=None):
     return sibling('send').send_capability(run)
 

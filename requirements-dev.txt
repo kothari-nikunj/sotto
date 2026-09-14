@@ -25,3 +25,6 @@ firecrawl-anydoc==0.2.4
 # Account broker transport is exercised by the same gate.
 google-auth==2.56.3
 requests==2.32.5
+
+# Local card typography; no hosted rendering or model call.
+Pillow==12.3.0

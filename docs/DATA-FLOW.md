@@ -135,7 +135,7 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 | Verb | Removes |
 |---|---|
 | `--snapshot` | `knowledge/last_local_snapshot.json` — the raw payload described above |
-| `--caches` | `cache/research_*.json`, `cache/calendar_today.json` — both rebuilt on the next run |
+| `--caches` | `cache/research_*.json`, `cache/calendar_today.json`, `cache/visual-briefs/*/*` — rebuilt when needed |
 | `--logs` | truncates `logs/compose_brief.log` (truncated, not unlinked: a running process holds it open) |
 | `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl` |
 | `--all` | every category above |
@@ -236,4 +236,8 @@ These receipts do not mean the user read or approved an action. Deferred sends a
 against current consent and relevant loop/Calendar state. No Cloud-only copy of the skills or
 personalization pipeline is introduced.
 
-The notes-cache lifetime is enforced by `retention.NOTES_CACHE_DAYS`; its reuse age is measured from the observation, not a later file rewrite. `forget.py --caches` currently covers the two paths listed above; the notes cache can also be deleted directly without deleting canonical meeting facts.
+The notes-cache lifetime is enforced by `retention.NOTES_CACHE_DAYS`; its reuse age is measured from the observation, not a later file rewrite. `forget.py --caches` covers the paths listed above; the notes cache can also be deleted directly without deleting canonical meeting facts.
+
+### Rendered card cache
+
+Optional visual briefs create private PNGs plus a source-text manifest under `cache/visual-briefs/<content-id>/`. These delivery artifacts expire under the seven-day staged-file sweep and are included in `forget.py --caches`. The Photon transport receives images through its existing attachment API; there are no public image URLs.

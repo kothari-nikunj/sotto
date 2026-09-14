@@ -109,7 +109,9 @@ meeting?" and never fall back to the sweep.
    ```
    It writes each researched attendee's title/company/summary into the knowledge graph as clearly-sourced, LOW-confidence (0.55) "Per web search: …" facts that decay — **grounded in the research output only, never invented** (same pattern as setup's `prewarm_graph.py`; the brief's Learn step promotes facts as they're confirmed). Attendees the research returned nothing for are skipped entirely. Idempotent; if research was empty this is a no-op.
    **The same command persists what it learned about the COMPANY to the company** (`knowledge/companies/<slug>.md`): the focus pass's deep dive — what it builds, the founder story, the market — becomes that company's `## About`, and each source-URLed traction signal a `## News` line. That is why the deep dive you pay for once is there for the *next* person from that company, and why the next `--focus` run is asked only for what's new. A persistence failure is reported in the output and never fails the prep.
-5. **Deliver** — send `prep_markdown` as **Sotto** (never "Hermes Agent"). It is already chat-ready (every `<!--…-->` marker stripped, bold in WhatsApp `*single-asterisk*` syntax) — do not re-format it. Where a meeting link or attendee `mailto:`/`https://wa.me/` helps, include the real URL inline.
+5. **Deliver** — On iMessage the shared adapter automatically presents a focused prep as a four-photo gallery when it fits. Return the complete text once; never send images yourself or repeat the caption. Other channels and short/sweep preps keep text.
+
+   Send `prep_markdown` as **Sotto** (never "Hermes Agent"). It is already chat-ready (every `<!--…-->` marker stripped, bold in WhatsApp `*single-asterisk*` syntax) — do not re-format it. Where a meeting link or attendee `mailto:`/`https://wa.me/` helps, include the real URL inline.
 
 ## Notes
 - **The deep dive opens with the private thread.** Who they are and how you're connected — intro

@@ -55,7 +55,7 @@ def test_headings_and_bold_become_whatsapp_syntax():
     assert "*Needs Attention Now*" in out                      # heading → *bold* line
     assert "*✅ Already Handled*" in out
     assert "*Sarah Chen* - Locked in" in out                   # **name** → *name*
-    assert "*9:30 AM* — Morning Team Video Sync" in out
+    assert "*9:30 AM* - Morning Team Video Sync" in out
 
 
 def test_rules_dropped_and_blank_runs_collapsed():

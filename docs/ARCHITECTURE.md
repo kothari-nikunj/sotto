@@ -318,6 +318,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `cache/calendar_today.json` | calcache | In-meeting hold and delivery eligibility: daily projection, opaque event IDs, actual observation time, status and completeness; an older or failed observation cannot prove a newly observed meeting disappeared |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
 | `cache/research_<date>.json` | skills (`research_attendees.py`) | dashboard (`/api/research` cards), skills (`compose_brief.py` joins it) |
+| `cache/visual-briefs/<id>/*` | shared `visual_brief.py` renderer | receiver gallery delivery; seven-day staged-artifact sweep |
 | `cache/brief-granola.json` | receiver `brief_runner.py` | resumable brief preparation and composition |
 | `cache/hermes-version.json` | `start.sh` | receiver (Integrations page) |
 | `cache/update_check.json` | receiver (daily update check — the ONE writer) | receiver (`/setup` line, `/api/overview` banner), skills (`compose_brief.py` update line) |
@@ -742,3 +743,11 @@ uses Connect → Choose sources → Disk access, with the same defaults and conf
 The pilot Mac Messages step reads its existing owner activation receipt; shared-number confirmation
 in the Mac and transport activation remain later integration gates.
 
+
+## Optional card presentation
+
+`_shared/lib/visual_brief.py` owns the common brief/prep templates and licensed local fonts. `visual_delivery.py` selects presentation at the receiver seam; the Hermes gallery adapter sends one multipart message through the existing outbox. Temporary PNGs/manifests use `cache/visual-briefs/` and the seven-day staged-artifact retention rule. [Visual briefs](VISUAL-BRIEFS.md) documents the opt-in and test gates.
+
+The shared writing policy lives at `sotto-chief-of-staff/_shared/references/writing-style.md`. Existing provider request builders attach it to system instructions, and Hermes installation/startup appends that same file to the persona. Cloud and self-host share this policy; no channel-specific prose policy or new persistent store is introduced.
+
+Focused iMessage meeting-prep replies use that same renderer at the Photon final-send boundary. A private acceptance receipt alongside the rendered manifest prevents duplicate sends across Hermes retries/restarts; Hermes retains the response obligation. Morning/evening scheduled delivery continues through the receiver outbox.

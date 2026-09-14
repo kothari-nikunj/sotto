@@ -1,0 +1,5 @@
+Generated once with the built-in image-generation tool for Sotto's card templates.
+
+Prompt: A small round wax seal with a single capital S pressed into its center. Restrained luxury stationery, pale pewter/stone-grey wax, slightly irregular poured rim, shallow debossed elegant serif S, soft upper-left light, tone-on-tone letter. Top-down view, transparent background, subtle contact shadow. No ink, strong gloss, metallic gold, red, black tile, squircle, laurel, crown, border text or other objects. Designed for a small corner mark on neutral briefing cards.
+
+This asset is bundled; rendering briefs never calls an image-generation service.

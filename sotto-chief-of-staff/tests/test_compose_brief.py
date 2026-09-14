@@ -102,12 +102,12 @@ def test_gemini_once_sends_system_instruction_and_schema(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     gemini._gemini_once("m", "k", "user data", system="policy", schema={"type": "object"})
     body = captured["body"]
-    assert body["systemInstruction"] == {"parts": [{"text": "policy"}]}
+    assert body["systemInstruction"] == {"parts": [{"text": gemini.gemini_transport.writing_system("policy")}]}
     assert body["contents"] == [{"parts": [{"text": "user data"}]}]
     assert body["generationConfig"]["responseSchema"] == {"type": "object"}
     # legacy call shape unchanged when the kwargs are omitted
     gemini._gemini_once("m", "k", "plain")
-    assert "systemInstruction" not in captured["body"]
+    assert captured["body"]["systemInstruction"] == {"parts": [{"text": gemini.gemini_transport.WRITING_STYLE}]}
     assert "responseSchema" not in captured["body"]["generationConfig"]
 
 
@@ -2041,7 +2041,7 @@ def test_the_brief_opens_with_the_time_of_day_and_the_date_in_your_zone():
     assert cb._greeting_line(pin(1)) == "# Good evening — Saturday, September 5"     # 18:40 PDT, the day before
     out = cb.compose(pin(14), llm=_receipt_llm())
     assert out["brief_markdown"].startswith("# Good morning — Sunday, September 6\n\n")
-    assert out["brief_text"].startswith("*Good morning — Sunday, September 6*\n\n")
+    assert out["brief_text"].startswith("*Good morning - Sunday, September 6*\n\n")
     # idempotent: a second pass never stacks a second greeting
     assert cb._prepend_greeting(out, pin(14))["brief_markdown"].count("# Good ") == 1
 

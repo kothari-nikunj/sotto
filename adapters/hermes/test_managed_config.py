@@ -30,7 +30,9 @@ def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     module.reconcile(tmp_path, env)
     first = (tmp_path / 'config.yaml').read_text()
     cfg = yaml.safe_load(first)
-    assert (tmp_path / 'SOUL.md').read_text() == Path(__file__).with_name('sotto-persona.md').read_text()
+    assert (tmp_path / 'SOUL.md').read_text().startswith(Path(__file__).with_name('sotto-persona.md').read_text())
+    policy = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff/_shared/references/writing-style.md'
+    assert (tmp_path / 'SOUL.md').read_text().endswith(policy.read_text())
     assert cfg['agent'] == {'name': 'Sotto', 'reasoning_effort': 'medium', 'max_turns': 60}
     assert cfg['model']['base_url'] == 'https://proxy.example/openai/v1'
     assert cfg['auxiliary']['vision'] == {'provider': 'main', 'model': ''}

@@ -343,3 +343,12 @@ def test_the_learning_loops_outcomes_and_the_style_profile_are_in_the_table():
     assert isinstance(rule, ret.Rule) and rule.policy == ret.DROP_LINES_OLDER
     assert rule.amount == ret.OUTCOME_DAYS == 90
     assert isinstance(ret.accounts_for("style.json"), ret.Exempt)
+
+
+def test_visual_delivery_artifacts_expire_without_touching_fresh_cards(_volume):
+    stale = _write(_volume, 'cache/visual-briefs/old/01.png', 'old image', age_days=8)
+    manifest = _write(_volume, 'cache/visual-briefs/old/manifest.json', '{}', age_days=8)
+    fresh = _write(_volume, 'cache/visual-briefs/new/01.png', 'new image', age_days=1)
+    ret.sweep(now=NOW)
+    assert not os.path.exists(stale) and not os.path.exists(manifest)
+    assert os.path.exists(fresh)

@@ -165,7 +165,7 @@ def test_prep_markdown_is_chat_formatted(tmp_path):
         md = out["prep_markdown"]
         assert "**" not in md and "## " not in md and "<!--" not in md
         assert "*Today's meetings*" in md               # heading → chat bold
-        assert "*Coffee with Taylor* — 10am" in md      # bold name → single asterisk, marker gone
+        assert "*Coffee with Taylor* - 10am" in md      # bold name → single asterisk, marker gone
         assert out["meetings"][0]["talking_points"] == ["Ask about the Series A"]   # keys untouched
     finally:
         del os.environ["SOTTO_LLM_STUB"]

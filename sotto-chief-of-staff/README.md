@@ -137,3 +137,7 @@ tools/                               # skill-tree tooling
 
 
 `_shared/lib/source_catalog.py` owns the Bridge source IDs and payload projections used by both the receiver consent gate and shared readers.
+
+Optional visual output: `_shared/lib/visual_brief.py` holds deterministic templates; `_shared/assets/card-fonts/` holds licensed fonts; `_shared/scripts/render_cards.py` renders saved brief/prep text without sending or calling a model.
+
+Shared writing rules: [`_shared/references/writing-style.md`](_shared/references/writing-style.md), used by the pipeline and Hermes persona across hosting modes and channels.

@@ -194,3 +194,11 @@ def test_data_flow_points_at_this_tool_by_its_real_path_and_verbs():
     assert "sotto-chief-of-staff/tools/forget.py" in body
     for verb in fg.VERBS:
         assert f"--{verb}" in body, f"DATA-FLOW.md doesn't mention forget.py's --{verb}"
+
+
+def test_caches_forgets_card_images_and_source_manifests(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _write(str(tmp_path), 'cache/visual-briefs/deck/01.png', 'private image')
+    _write(str(tmp_path), 'cache/visual-briefs/deck/manifest.json', 'private source text')
+    fg.forget({'caches'})
+    assert not _present(str(tmp_path))

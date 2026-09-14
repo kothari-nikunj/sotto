@@ -70,6 +70,7 @@ def _targets(verbs: set) -> list:
     if "caches" in verbs:
         add("cache/research_*.json", "deleted")
         add("cache/calendar_today.json", "deleted")
+        add("cache/visual-briefs/*/*", "deleted")
     if "logs" in verbs:
         add("logs/compose_brief.log", "truncated")
     if "receipts" in verbs:

@@ -34,12 +34,19 @@ def photon(request, monkeypatch):
             finally:
                 await self.stop_typing(chat_id)
 
+        def _record_sent_message(self, identifier):
+            self.calls.append(('/receipt', identifier))
+
+        async def _send_with_retry(self, chat_id, content, reply_to=None, metadata=None, **kwargs):
+            return await self.send(chat_id, content, reply_to, metadata)
+
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             self.calls.append(('/send', {'spaceId': chat_id, 'text': content}))
             return types.SimpleNamespace(success=True)
 
     upstream = types.ModuleType('plugins.platforms.photon.adapter')
     upstream.PhotonAdapter = PhotonAdapter
+    upstream.SendResult = types.SimpleNamespace
     upstream.register = lambda ctx: ctx.register_platform(adapter_factory=PhotonAdapter)
     for name in ['plugins', 'plugins.platforms', 'plugins.platforms.photon']:
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
@@ -52,10 +59,17 @@ def photon(request, monkeypatch):
     formatter = types.ModuleType(name + '.chatfmt')
     formatter.compact_handled = formatter.to_imessage = lambda value: value
     monkeypatch.setitem(sys.modules, formatter.__name__, formatter)
+    gallery = types.ModuleType(name + '.gallery')
+    gallery.prepare_prep = lambda _: None
+    gallery.recovery_receipt = lambda *a: None
+    monkeypatch.setitem(sys.modules, gallery.__name__, gallery)
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'chat')
     spec.loader.exec_module(plugin)
     plugin.register(types.SimpleNamespace(register_platform=lambda **kw: captured.update(kw)))
     monkeypatch.setattr(plugin, 'TYPING_START_DELAY_SECONDS', 0.01)
-    return captured['adapter_factory']()
+    instance = captured['adapter_factory']()
+    instance.gallery_test = gallery
+    return instance
 
 
 def test_isolated_typing_calls_and_fast_replies_do_not_flash(photon):
@@ -118,4 +132,37 @@ def test_interruption_during_start_delay_never_starts_typing(photon):
         stop.set()
         await task
     asyncio.run(turn())
+    assert photon.calls == []
+
+
+@pytest.mark.parametrize('acceptance', ['accepted', 'unknown', 'not_attempted'])
+def test_focused_prep_gallery_does_not_duplicate_uncertain_send(photon, acceptance):
+    calls = []
+    photon.gallery_test.prepare_prep = lambda _: {'images': ['1', '2', '3', '4'], 'summary': 'Company'}
+    def send(*args):
+        calls.append(args)
+        return acceptance == 'accepted', 'unconfirmed', {'acceptance': acceptance, 'message_id': 'parent', 'message_ids': ['child']}
+    photon.gallery_test.send_once = send
+    result = asyncio.run(photon._send_with_retry('chat', 'Complete original prep'))
+    assert len(calls) == 1
+    texts = [c for c in photon.calls if c[0] == '/send']
+    if acceptance == 'accepted':
+        assert result.success and result.message_id == 'parent'
+        assert photon.calls == [('/receipt', 'parent'), ('/receipt', 'child')]
+    elif acceptance == 'unknown':
+        assert not result.success and not texts
+    else:
+        assert texts == [('/send', {'spaceId': 'chat', 'text': 'Complete original prep'})]
+
+
+def test_ordinary_chat_uses_existing_delivery(photon):
+    assert asyncio.run(photon._send_with_retry('chat', 'Hello')).success
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Hello'})]
+
+
+@pytest.mark.parametrize('acceptance', ['accepted', 'unknown'])
+def test_gateway_recovery_never_resends_a_possible_gallery_as_text(photon, acceptance):
+    photon.gallery_test.recovery_receipt = lambda *a: {'acceptance': acceptance, 'message_id': 'parent'}
+    result = asyncio.run(photon.send('chat', 'Recovered reply plus original full prep'))
+    assert result.success == (acceptance == 'accepted')
     assert photon.calls == []

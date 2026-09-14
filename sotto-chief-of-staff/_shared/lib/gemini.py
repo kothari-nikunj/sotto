@@ -69,8 +69,7 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": gen,
     }
-    if system:
-        body["systemInstruction"] = {"parts": [{"text": system}]}
+    body["systemInstruction"] = {"parts": [{"text": gemini_transport.writing_system(system)}]}
     req = gemini_transport.request(model, body, key)
     t0 = _time.monotonic()
     with urllib.request.urlopen(req, timeout=300) as resp:  # 5-min ceiling
@@ -186,7 +185,7 @@ def _openai_once(model: str, key: str, prompt: str, label: str = "",
                  system: str | None = None, schema: dict | None = None) -> str:
     import time as _time
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    sys_text = _schema_system(system, schema)
+    sys_text = _schema_system(gemini_transport.writing_system(system), schema)
     messages = ([{"role": "system", "content": sys_text}] if sys_text else []) + \
                [{"role": "user", "content": prompt}]
     body: dict = {"model": model, "messages": messages, "temperature": 0.4,
@@ -220,8 +219,7 @@ def _anthropic_once(model: str, key: str, prompt: str, label: str = "",
                "anthropic-beta": "context-1m-2025-08-07"}
     body: dict = {"model": model, "max_tokens": ANTHROPIC_MAX_TOKENS, "temperature": 0.4,
                   "messages": [{"role": "user", "content": prompt}]}
-    if system:
-        body["system"] = system
+    body["system"] = gemini_transport.writing_system(system)
     if schema is not None:
         # Native structured output: a forced tool call whose input IS the schema.
         body["tools"] = [{"name": "result", "description": "The structured result.",

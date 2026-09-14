@@ -110,7 +110,7 @@ fi
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" != "managed" ] && [ -f "$HSTATE/SOUL.md" ] && [ -f /app/adapters/hermes/sotto-persona.md ]; then
   sed -i '/chief-of-staff persona/,$d' "$HSTATE/SOUL.md" 2>/dev/null || true
   printf '\n' >> "$HSTATE/SOUL.md"
-  cat /app/adapters/hermes/sotto-persona.md >> "$HSTATE/SOUL.md"
+  cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> "$HSTATE/SOUL.md"
 fi
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   test -s "$HSTATE/skills/sotto/_shared/scripts/compose_brief.py" \
@@ -209,6 +209,11 @@ if [ "$SOTTO_CRON_DELIVER" = "photon" ]; then
   # recovery retain their existing handling. Revisit when upstream exposes
   # subscription-level heartbeat/sequence evidence.
   export PHOTON_STREAM_SILENCE_PROBE_MS=0
+  if [ "${SOTTO_VISUAL_BRIEFS:-1}" = "1" ]; then
+    python3 /app/adapters/hermes/photon_gallery_compat.py \
+      /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar/index.mjs || \
+      echo "[sotto] gallery unavailable; keeping ordinary text delivery"
+  fi
   python3 /app/adapters/hermes/photon_setup.py "$HSTATE"
   python3 /app/adapters/hermes/photon_probe_compat.py \
     /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar/stream-staleness.mjs

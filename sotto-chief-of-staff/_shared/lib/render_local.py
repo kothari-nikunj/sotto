@@ -974,6 +974,9 @@ def _format_calendar(events, lookup: dict | None = None) -> str:
                 line += "\n    (you answered maybe)"
             if _missing_logistics(e):
                 line += "\n    ⚠ no video link and no address on the invite yet"
+            if e.get("location"):
+                location = ' '.join(_s(e.get("location")).split())
+                line += f"\n    location: {location}"
             if e.get("meetingLink"):
                 line += f"\n    meetingLink: {e.get('meetingLink')}"
             if e.get("description"):

@@ -6,11 +6,19 @@ translation, and no direct-key fallback when managed configuration is incomplete
 import json
 import os
 import re
+from pathlib import Path
 import urllib.parse
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from contextvars import ContextVar
+
+
+WRITING_STYLE = (Path(__file__).resolve().parents[1] / 'references/writing-style.md').read_text().strip()
+
+
+def writing_system(system=None):
+    return (system + '\n\n' if system else '') + WRITING_STYLE
 
 
 _BACKGROUND_PROXY = ContextVar('sotto_background_proxy', default=False)

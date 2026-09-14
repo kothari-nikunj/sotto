@@ -31,3 +31,6 @@ google-auth-oauthlib==1.4.0
 google-auth-httplib2==0.4.1
 cryptography==50.0.1
 firecrawl-anydoc==0.2.4
+
+# Local card typography; no hosted rendering or model call.
+Pillow==12.3.0

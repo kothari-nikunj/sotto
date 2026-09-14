@@ -549,3 +549,7 @@ checks the attached volume before launching writers. See [the tenant recovery ru
 for the one-time volume migration, model lease renewal, scoped Bridge revocation and verified offline
 export/restore. Tenant cold restore is covered by synthetic tests; fleet control-state recovery and
 automated backups still require operator verification.
+
+### Visual brief pilot
+
+`SOTTO_VISUAL_BRIEFS` defaults to `1`: Photon morning/evening briefs and focused meeting backgrounds use the shared card renderer. Set `0` to keep text. See [visual brief testing and delivery limits](docs/VISUAL-BRIEFS.md).

@@ -600,3 +600,11 @@ an expired credential returns 401 without reserving spend or reaching the provid
 Messages readiness comes from authenticated transport plus the receiver's existing source and
 first-delivery facts; an unreachable instance is unknown, not ready. Live shared routing remains a
 release gate.
+
+### Visual presentation
+
+Morning/evening briefs and focused meeting backgrounds default to four-photo galleries on iMessage; other channels, short updates and consent questions stay text. The shared renderer changes presentation only. It makes no additional relevance or model call. A brief with an action that cannot fit stays text; uncertain multipart acceptance is held rather than blindly retried. See [visual briefs](VISUAL-BRIEFS.md).
+
+## Shared writing rule
+
+All Sotto-generated prose uses the same [_shared/references/writing-style.md](../sotto-chief-of-staff/_shared/references/writing-style.md): plain, concrete language, no em dashes, and no canned AI phrasing or filler. The Gemini/OpenAI/Anthropic composition adapters attach it as a system instruction; raw document extraction transport preserves its original instructions; Hermes receives the same file with its persona in managed and self-host installs. The shared chat formatter normalizes prose punctuation while leaving URLs and literal machine text intact. AI-ism avoidance is a generation instruction, not a word-deletion filter.

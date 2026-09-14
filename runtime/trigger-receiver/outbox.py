@@ -359,6 +359,9 @@ def _begin_send(key):
         row = _find(_rows(doc), key)
         if not row or row.get('status') != STATUS_PENDING:
             return False
+        if ((row.get('payload') or {}).get('presentation')
+                and row.get('acceptance') in ('unknown', 'in_flight')):
+            return False  # multipart acceptance is ambiguous; never resend the gallery blindly
         if row.get('acceptance', 'unknown') in ('unknown', 'in_flight'):
             row['acceptance_uncertain'] = True
         row['acceptance'] = 'in_flight'
@@ -472,7 +475,10 @@ def _attempt(key: str) -> bool:
         if not _begin_send(key):
             return False
         try:
-            answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '')
+            if payload.get('presentation'):
+                answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '')
+            else:
+                answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '')
             ok, detail = answer[:2]
             receipt = answer[2] if len(answer) > 2 else {}
         except Exception as e:  # a send that raises has unknown acceptance, never confirmed delivery

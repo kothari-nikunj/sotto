@@ -27,7 +27,11 @@ def test_native_payload_preserved_across_tiers(monkeypatch, managed_proxy):
     assert cloud.get_header('Authorization') == 'Bearer tenant-test-token'
     monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
     direct = transport.request('gemini-3.8-flash', body, 'direct-key')
-    assert cloud.data == direct.data and json.loads(cloud.data) == body
+    assert cloud.data == direct.data
+    sent = json.loads(cloud.data)
+    assert sent == body  # raw extraction transport preserves source instructions exactly
+    assert {k: v for k, v in sent.items() if k != 'systemInstruction'} == {k: v for k, v in body.items() if k != 'systemInstruction'}
+    assert body['systemInstruction']['parts'] == [{'text': 'system'}]
     assert direct.get_header('Authorization') is None
 
 

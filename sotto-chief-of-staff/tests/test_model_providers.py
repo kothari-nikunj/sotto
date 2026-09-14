@@ -88,7 +88,7 @@ def test_anthropic_wire_shape(monkeypatch):
     assert c["url"] == "https://api.anthropic.com/v1/messages"
     assert c["headers"]["x-api-key"] == "key-ant"
     assert "context-1m" in c["headers"]["anthropic-beta"]   # the 1M window ask
-    assert c["body"]["system"] == "be terse"
+    assert c["body"]["system"] == gem.gemini_transport.writing_system("be terse")
     assert c["body"]["tool_choice"] == {"type": "tool", "name": "result"}
     assert c["body"]["tools"][0]["input_schema"] == {"type": "object"}
     assert c["body"]["max_tokens"] == gem.ANTHROPIC_MAX_TOKENS

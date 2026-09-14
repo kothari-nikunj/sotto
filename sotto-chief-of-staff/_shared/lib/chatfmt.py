@@ -36,9 +36,17 @@ def _s(v) -> str:
     return v if isinstance(v, str) else ("" if v is None else str(v))
 
 
+def prose_punctuation(text):
+    """Remove em dashes from prose, preserving literal code, URLs, and internal markers."""
+    protected = re.compile(r'(```[\s\S]*?```|`[^`\n]*`|<!--[^>]*-->|(?:https?://|mailto:|sms:|tel:)[^\s<>]+)')
+    parts = protected.split(text)
+    return ''.join(part if i % 2 else re.sub(r'[ \t]*—[ \t]*', ' - ', part)
+                   for i, part in enumerate(parts))
+
+
 def to_chat(text) -> str:
     """markdown-ish text → the chat-deliverable form (see module docstring). None/non-str → ''."""
-    t = _s(text)
+    t = prose_punctuation(_s(text))
     t = _MARKER_RE.sub("", t)
     t = _HEADING_RE.sub(lambda m: f"*{m.group(1)}*", t)
     t = _BOLD_RE.sub(r"*\1*", t)
@@ -48,14 +56,15 @@ def to_chat(text) -> str:
     return t.strip()
 
 
-def to_imessage(text) -> str:
+def to_imessage(text, *, normalize_style=True) -> str:
     """Plain text for Messages, for both interactive and scheduled deliveries.
 
     Preserve words and web destinations; remove presentation syntax and encoded email
     actions that Messages cannot render usefully. Canonical archives stay untouched.
     Idempotent because Hermes formats both before retries and at the send boundary.
     """
-    t = _MARKER_RE.sub("", _s(text))
+    source = prose_punctuation(_s(text)) if normalize_style else _s(text)
+    t = _MARKER_RE.sub("", source)
     # Balanced parentheses occur in real web links (e.g. Wikipedia article names).
     link = re.compile(r"!?\[([^\]\n]+)\]\(")
     cursor, parts = 0, []

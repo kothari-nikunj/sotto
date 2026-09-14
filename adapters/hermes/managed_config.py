@@ -53,6 +53,10 @@ def reconcile(home, env):
     # A dedicated managed Sotto uses the same Sotto persona block as Telegram,
     # without the fresh Hermes installation's competing default identity.
     persona = Path(__file__).with_name('sotto-persona.md').read_text()
+    source = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff/_shared/references/writing-style.md'
+    if not source.is_file():
+        source = Path('/app/sotto-skills/_shared/references/writing-style.md')
+    persona += '\n\n' + source.read_text()
     soul = home / 'SOUL.md'
     temporary = soul.with_suffix('.tmp')
     temporary.write_text(persona)

@@ -125,7 +125,7 @@ COPY VERSION /app/VERSION
 # Required at runtime (set as Railway/Render env, do NOT bake): GOOGLE_AI_API_KEY, SOTTO_TRIGGER_TOKEN,
 # the gateway token, and BRIDGE_TOKEN (the reverse-relay bearer configure_mcp.py registers on boot).
 # Seed the Sotto persona into SOUL.md at build time; start.sh refreshes it on the volume every boot.
-RUN cat /app/adapters/hermes/sotto-persona.md >> /root/.hermes/SOUL.md 2>/dev/null || true
+RUN cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> /root/.hermes/SOUL.md 2>/dev/null || true
 
 # Two processes: the trigger receiver (HTTP) + Hermes (agent loop + gateway + scheduler).
 # Railway exposes $PORT → the receiver. Hermes runs alongside. tini is PID 1 so the background

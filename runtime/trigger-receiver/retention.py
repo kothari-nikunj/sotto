@@ -208,6 +208,8 @@ SWEEP = (
     Rule("briefs/????-??-??.*.payload.json", DELETE_OLDER, STAGED_DAYS,
          f"a staged wake payload is read by that morning's brief and is dead weight "
          f"{STAGED_DAYS} days later"),
+    Rule("cache/visual-briefs/**/*", DELETE_OLDER, STAGED_DAYS,
+         "rendered excerpts and source manifests are temporary delivery artifacts"),
     Rule("cache/brief-granola.json", DELETE_OLDER, NOTES_CACHE_DAYS,
          "meeting notes cache is reusable for at most one day"),
     Rule("events/work-inputs/brief-*/*.json", DELETE_OLDER, STAGED_DAYS,

@@ -468,3 +468,15 @@ def test_research_that_ran_leaves_availability_alone():
     inputs = {"type": "morning", "google": {"events": []}, "local": {},
               "attendee_research": [{"email": "a@b.com", "summary": "bio"}]}
     assert "_source_availability" not in cb._normalize_local(inputs)
+
+
+def test_calendar_location_reaches_shared_composer_without_guessing():
+    inputs = {"type": "morning", "local": {}, "google": {"events": [
+        {"summary": "Lunch", "start": "2026-09-14T12:00:00-07:00", "location": "535 Mission St, Suite 800"},
+        {"summary": "Phone call", "start": "2026-09-14T14:00:00-07:00"},
+    ]}}
+    prompt = cb.build_prompt(cb._load_prompt(), inputs)
+    assert "location: 535 Mission St, Suite 800" in prompt
+    assert "<exact location>" in prompt
+    rendered = render_local._format_calendar(inputs["google"]["events"])
+    assert rendered.count('location:') == 1

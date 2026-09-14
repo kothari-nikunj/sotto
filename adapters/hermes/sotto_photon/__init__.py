@@ -81,7 +81,37 @@ def register(ctx):
             # loop supplies the cadence; keep its pause, cancellation and timeout rules.
             await self._sidecar_try('/typing', {'spaceId': chat_id, 'state': 'start'}, 'send_typing')
 
+        async def _send_with_retry(self, chat_id, content, reply_to=None, metadata=None,
+                                   max_retries=1, base_delay=2.0):
+            # Intercept the complete focused prep before upstream text formatting/truncation.
+            # Return an uncertain gallery result directly: upstream's text fallback could duplicate
+            # an accepted multipart message. Ordinary messages retain upstream's existing retries.
+            from . import gallery  # noqa: PLC0415 - installed by photon_setup
+            if managed() and not owner_destination(chat_id):
+                return upstream.SendResult(success=False, error='Gallery destination refused')
+            presentation = await asyncio.to_thread(gallery.prepare_prep, content)
+            if presentation:
+                ok, error, receipt = await asyncio.to_thread(
+                    gallery.send_once, presentation['images'], presentation['summary'], 'photon:' + chat_id, reply_to)
+                if ok:
+                    self._record_sent_message(receipt['message_id'])
+                    for identifier in receipt.get('message_ids', []):
+                        self._record_sent_message(identifier)
+                    return upstream.SendResult(success=True, message_id=receipt['message_id'], raw_response=receipt)
+                if receipt.get('acceptance') == 'unknown':
+                    return upstream.SendResult(success=False, error=error, raw_response=receipt)
+                # Proven unsent/rejected media can safely use the original complete text.
+            return await super()._send_with_retry(chat_id, content, reply_to, metadata,
+                                                  max_retries=max_retries, base_delay=base_delay)
+
         async def send(self, chat_id, content, reply_to=None, metadata=None):
+            from . import gallery  # noqa: PLC0415 - installed by photon_setup
+            receipt = await asyncio.to_thread(gallery.recovery_receipt, content, 'photon:' + chat_id)
+            if receipt:
+                accepted = receipt.get('acceptance') == 'accepted'
+                return upstream.SendResult(success=accepted, message_id=receipt.get('message_id'),
+                                           error=None if accepted else 'gallery acceptance unconfirmed',
+                                           raw_response=receipt)
             # All gateway status/final notices use this path. Serialize so concurrent
             # retry callbacks cannot each emit the same budget explanation.
             if not managed():
