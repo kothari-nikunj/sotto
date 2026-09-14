@@ -127,6 +127,20 @@ COPY VERSION /app/VERSION
 # Seed the Sotto persona into SOUL.md at build time; start.sh refreshes it on the volume every boot.
 RUN cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> /root/.hermes/SOUL.md 2>/dev/null || true
 
+# Photon must run under the managed Sotto UID, which cannot traverse /root. Keep the
+# installer's Node/npm tree in an immutable shared location and install the locked sidecar deps
+# in the image, before runtime code becomes read-only. Check the actual managed-user imports.
+RUN cp -a /root/.hermes/node /usr/local/lib/sotto-node \
+ && ln -s /usr/local/lib/sotto-node/bin/node /usr/local/bin/node \
+ && ln -s /usr/local/lib/sotto-node/bin/npm /usr/local/bin/npm \
+ && ln -s /usr/local/lib/sotto-node/bin/npx /usr/local/bin/npx \
+ && chmod -R a+rX,go-w /usr/local/lib/sotto-node \
+ && npm ci --prefix /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin node --version \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin npm --version \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin \
+      sh -c 'cd /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar && node --input-type=module -e "import {group,text,attachment} from \"spectrum-ts\"; if (![group,text,attachment].every(f => typeof f === \"function\")) process.exit(1)"'
+
 # Two processes: the trigger receiver (HTTP) + Hermes (agent loop + gateway + scheduler).
 # Railway exposes $PORT → the receiver. Hermes runs alongside. tini is PID 1 so the background
 # receiver/pairing/whatsapp-bridge children are reaped and SIGTERM is forwarded on redeploy.

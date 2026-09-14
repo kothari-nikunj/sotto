@@ -96,3 +96,12 @@ Shared operator credentials are not individually revocable device credentials. T
 Bridge access only: it does not erase historical data, revoke Google consent or terminate existing
 browser sessions. Newly enrolled devices receive no shared setup code.
 
+
+
+### Photon dependency readiness
+
+The image carries Node/npm under `/usr/local/lib/sotto-node`, with executables on the managed
+user's PATH. The Photon sidecar's locked dependencies are installed at build time. Image checks
+run Node, npm and Spectrum gallery imports as the `sotto` user, before a deployment can start.
+Receiver `/health` alone does not prove the Photon gateway connected; verify sidecar capability
+and a provider receipt after a runtime packaging change.
