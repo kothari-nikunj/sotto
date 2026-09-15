@@ -99,3 +99,171 @@ def test_supporting_context_does_not_create_another_invite_or_prep(calendar):
     assert cc.refresh_once()
     assert len(cc.snapshot()['events']) == 1
     assert cc.change_tick(now) == 0 and changes == []
+
+
+def _restart_change_detector(cc):
+    cc._CHANGE_BASELINE.update(events=None, source=None, account="", loaded=False,
+                               acknowledged=set())
+
+
+def test_complete_baseline_survives_restart_and_detects_deployment_window_change(calendar):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once()
+    assert cc.change_tick(now) == 0
+    state['events'][0]['start'] = (now + timedelta(hours=2)).isoformat()
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 1
+    assert [change['change'] for change in changes] == ['moved']
+    persisted = json.loads(Path(cc.change_state_path()).read_text())
+    assert persisted['events'][0]['start'] == state['events'][0]['start']
+    assert persisted['source']['status'] == 'ok' and persisted['source']['complete'] is True
+
+
+def test_invalid_persisted_baseline_is_never_used_to_infer_changes(calendar):
+    cc, state, now, changes = calendar
+    write = cc.HOOKS['write_json']
+    write(cc.change_state_path(), {'version': 1, 'events': [], 'acknowledged': [],
+                                   'account': 'owner@example.com',
+                                   'source': {'status': 'partial', 'complete': False,
+                                              'coverage': {}}})
+    assert cc.refresh_once()
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 0 and changes == []
+    saved = json.loads(Path(cc.change_state_path()).read_text())
+    assert saved['events'] == state['events'] and saved['source']['complete'] is True
+
+
+def test_restart_resumes_partial_batch_without_replaying_acknowledged_change(calendar):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    first = {**state['events'][0], 'id': 'first', 'summary': 'First invite',
+             'start': (now + timedelta(minutes=30)).isoformat()}
+    second = {**state['events'][0], 'id': 'second', 'summary': 'Second invite',
+              'start': (now + timedelta(minutes=45)).isoformat()}
+    state['events'].extend([first, second])
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    attempts = []
+    cc.HOOKS['calendar_change'] = lambda event: attempts.append(event['summary']) or len(attempts) == 1
+    assert cc.change_tick(now) == 1
+    assert attempts == ['First invite', 'Second invite']
+    _restart_change_detector(cc)
+    cc.HOOKS['calendar_change'] = lambda event: changes.append(event) or True
+    assert cc.change_tick(now) == 1
+    assert [change['summary'] for change in changes] == ['Second invite']
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 0
+
+
+def test_disabled_lane_advances_durable_baseline_without_replaying_on_reenable(calendar,
+                                                                                monkeypatch):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    state['events'].append({**state['events'][0], 'id': 'while-disabled',
+                            'start': (now + timedelta(minutes=30)).isoformat()})
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    monkeypatch.setenv('SOTTO_CALENDAR_NUDGES', '0')
+    assert cc.change_tick(now) == 0 and changes == []
+    monkeypatch.setenv('SOTTO_CALENDAR_NUDGES', '1')
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 0 and changes == []
+
+
+def test_calendar_permission_revocation_invalidates_baseline_before_regrant(calendar):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    state['observation'] = {**state['observation'], 'status': 'disabled', 'complete': False}
+    state['events'] = []
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    revoked = json.loads(Path(cc.change_state_path()).read_text())
+    assert revoked['source']['status'] == 'disabled' and revoked['events'] == []
+    state['observation'] = {**state['observation'], 'status': 'ok', 'complete': True}
+    state['events'] = [{
+        'id': 'after-regrant', 'summary': 'New calendar meeting',
+        'start': (now + timedelta(minutes=30)).isoformat(),
+        'end': (now + timedelta(hours=1)).isoformat(),
+        'attendees': [{'email': 'guest@example.com', 'displayName': 'Guest'}],
+    }]
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 0 and changes == []
+
+
+def test_connected_account_change_seeds_new_baseline_without_cross_account_diff(calendar,
+                                                                                monkeypatch):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'other-owner@example.net')
+    state['events'] = [{**state['events'][0], 'id': 'other-account-event',
+                        'start': (now + timedelta(minutes=30)).isoformat()}]
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    _restart_change_detector(cc)
+    assert cc.change_tick(now) == 0 and changes == []
+    saved = json.loads(Path(cc.change_state_path()).read_text())
+    assert saved['account'] == 'other-owner@example.net'
+
+
+def test_complete_status_without_observation_bounds_cannot_advance_baseline(calendar):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    before = Path(cc.change_state_path()).read_text()
+    state['events'].append({**state['events'][0], 'id': 'unbounded'})
+    state['observation'] = {'status': 'ok', 'complete': True, 'observed_at': ''}
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    assert cc.change_tick(now) == 0 and changes == []
+    assert Path(cc.change_state_path()).read_text() == before
+
+
+def test_unknown_account_identity_never_seeds_or_compares_durable_baseline(calendar,
+                                                                           monkeypatch):
+    cc, state, now, changes = calendar
+    monkeypatch.delenv('SOTTO_USER_EMAIL')
+    assert cc.refresh_once()
+    assert cc.change_tick(now) == 0 and changes == []
+    marker = json.loads(Path(cc.change_state_path()).read_text())
+    assert marker['source']['status'] == 'identity_unknown' and marker['events'] == []
+    state['events'].append({**state['events'][0], 'id': 'unknown-calendar-invite',
+                            'start': (now + timedelta(minutes=30)).isoformat()})
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    assert cc.change_tick(now) == 0 and changes == []
+    assert json.loads(Path(cc.change_state_path()).read_text())['source']['status'] == 'identity_unknown'
+
+
+def test_unknown_to_known_account_transition_seeds_without_replaying(calendar, monkeypatch):
+    cc, state, now, changes = calendar
+    monkeypatch.delenv('SOTTO_USER_EMAIL')
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    state['events'].append({**state['events'][0], 'id': 'before-identity',
+                            'start': (now + timedelta(minutes=30)).isoformat()})
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    assert cc.change_tick(now) == 0 and changes == []
+    saved = json.loads(Path(cc.change_state_path()).read_text())
+    assert saved['account'] == 'owner@example.com'
+
+
+def test_known_to_unknown_to_same_known_account_does_not_diff_across_identity_gap(calendar,
+                                                                                  monkeypatch):
+    cc, state, now, changes = calendar
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    monkeypatch.delenv('SOTTO_USER_EMAIL')
+    assert cc.change_tick(now) == 0
+    marker = json.loads(Path(cc.change_state_path()).read_text())
+    assert marker['source']['status'] == 'identity_unknown'
+    state['events'].append({**state['events'][0], 'id': 'during-unknown-identity',
+                            'start': (now + timedelta(minutes=30)).isoformat()})
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    assert cc.change_tick(now) == 0 and changes == []
+    saved = json.loads(Path(cc.change_state_path()).read_text())
+    assert saved['account'] == 'owner@example.com'

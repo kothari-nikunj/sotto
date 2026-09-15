@@ -44,6 +44,12 @@ not trusted as a deadline.
 
 Generic solicitations do not establish a personal obligation or opportunity merely by asking
 for money or a reply; an explicit user commitment or active interest can change that judgment.
+Material delivered for an ongoing discussion, requested review, or active evaluation can be an
+actionable next step even without a question mark or deadline. Use the conversation to establish
+what review or decision remains: a promised write-up arriving after the user's discussion is
+different from an unsolicited pitch. A sender's promise alone does not establish user interest.
+If the user already reviewed or declined it, do not reopen that work. An incomplete preview is
+not evidence that the full message contains no ask.
 Ordinary social plans matter when there is a real invitation or decision, not because every
 social message needs summarizing. Classify by the supplied evidence, including user preferences;
 missing context is not permission to invent a reason to include an item.

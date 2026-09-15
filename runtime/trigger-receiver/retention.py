@@ -255,6 +255,8 @@ EXEMPT = (
            "one file, overwritten by the calendar refresh; it cannot grow"),
     Exempt("cache/meeting_taps.json",
            "one file, rewritten per local day as {date, fired}; it cannot grow"),
+    Exempt("cache/calendar_changes.json",
+           "one bounded calendar-window baseline, atomically overwritten by calcache"),
     Exempt("cache/update_check.json", "one file, overwritten by the daily update check"),
     Exempt("cache/update_notice.json", "one file, overwritten per version"),
     Exempt("cache/hermes-version.json", "one file, written by start.sh at boot"),

@@ -72,6 +72,7 @@ _shared/
   lib/keys.py                        # queue/style-sample ids — VENDORED byte-identical into runtime/trigger-receiver/
   lib/mcp_client.py                  # minimal Streamable-HTTP MCP client for deterministic gathers
   lib/metrics.py                     # per-run cost/latency accumulator ([brief-cost] lines)
+  lib/gmail_read.py                 # shared full Gmail body reader and recursive MIME extraction
   lib/render_local.py                # per-source formatSourceForLLM-style renderers
   lib/sotto_log.py                   # shared diagnostics -> stderr + $SOTTO_DATA/logs/compose_brief.log
   lib/textutil.py                    # string/identifier/domain normalization primitives

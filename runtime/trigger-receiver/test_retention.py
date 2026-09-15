@@ -270,6 +270,12 @@ def test_globs_never_cross_a_directory_boundary():
     assert ret._to_regex("knowledge/**").match("knowledge")
 
 
+def test_calendar_change_baseline_is_explicitly_bounded_and_exempt():
+    entry = ret.accounts_for("cache/calendar_changes.json")
+    assert isinstance(entry, ret.Exempt)
+    assert "bounded" in entry.why and "overwritten" in entry.why
+
+
 # ── THE guard: the memory is never a target ──────────────────────────────────────────────────────
 
 MEMORY = (

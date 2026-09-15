@@ -1928,23 +1928,28 @@ def test_calendar_normalization_excludes_resources_before_the_docket_counts_peop
     assert rec.CALCACHE._norm_cal_event(event)['attendees'] == [{'name': '', 'email': 'me@example.com'}]
 
 
-def test_change_tick_baselines_first_dispatches_then_settles(monkeypatch):
+def test_change_tick_baselines_first_dispatches_then_settles(tmp_path, monkeypatch):
     """First tick after boot only sets the baseline (a restart can't replay the day); a dispatched
     change settles; a FAILED dispatch keeps the baseline so the next tick retries it; the kill
     switch disables the whole lane."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     cc = rec.CALCACHE
     now = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
     other = [{"email": "ali@x.com", "displayName": "Ali", "responseStatus": "needsAction"}]
     e1 = {"id": "e1", "summary": "Coffee", "start": "2026-08-17T18:00:00+00:00",
           "end": "2026-08-17T18:30:00+00:00", "attendees": other}
     sent = []
+    monkeypatch.setattr(rec, "DATA", str(tmp_path))
     # Pin the user's address: with one-attendee fixtures the docket inference would otherwise
     # conclude Ali is "everyone's common attendee" — i.e. the user — and skip him as self.
     monkeypatch.setenv("SOTTO_USER_EMAIL", "nikunj@fpv.com")
     monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
-    cc._LAST_RAW["events"] = [e1]
-    cc._CHANGE_BASELINE["events"] = None
+    cc._LAST_RAW.update(events=[e1], valid=True,
+                        coverage={"since": now.isoformat(),
+                                  "until": (now + timedelta(days=3)).isoformat()},
+                        observed_at=now.isoformat())
+    cc._CHANGE_BASELINE.update(events=None, source=None, account="", loaded=False,
+                               acknowledged=set())
     try:
         assert cc.change_tick(now) == 0 and sent == []       # baseline only
         e2 = dict(e1, id="e2", summary="Late add", start="2026-08-17T18:30:00+00:00")
@@ -1959,11 +1964,13 @@ def test_change_tick_baselines_first_dispatches_then_settles(monkeypatch):
         monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
         assert cc.change_tick(now) == 1                      # retried next tick, then settled
         monkeypatch.setenv("SOTTO_CALENDAR_NUDGES", "0")
-        cc._CHANGE_BASELINE["events"] = None
+        cc._CHANGE_BASELINE.update(events=None, source=None, account="", loaded=False,
+                                   acknowledged=set())
         assert cc.change_tick(now) == 0                      # kill switch
     finally:
-        cc._LAST_RAW["events"] = None
-        cc._CHANGE_BASELINE["events"] = None
+        cc._LAST_RAW.update(events=None, valid=False)
+        cc._CHANGE_BASELINE.update(events=None, source=None, account="", loaded=False,
+                                   acknowledged=set())
 
 
 def test_calendar_refresh_thread_knob_and_quiet_idle(tmp_path, monkeypatch):

@@ -31,6 +31,12 @@ invent a reason such as "not investing in this space." A single directional draf
 user's instruction or a clear commitment in the supplied conversation; factual replies remain
 grounded in their evidence. This applies equally to briefs, digests, nudges and attended chat.
 
+**Alternative drafts must also be factual.** Labeling a reply `Accept:` or `Decline:` does not
+permit invented past actions, internal discussions, investment conclusions, or reasons. Do not
+write "we debriefed with the team" or "we reviewed the memo" unless the supplied evidence says
+that happened. Offer a future direction the user can choose, such as "I'd like to continue the
+conversation" or "Thanks for meeting. We'll pass this time," without fabricating a backstory.
+
 **A Gmail draft is not a send — and still not automatic.** `gmail-draft` writes to the user's own
 drafts folder, so it can never leave the house without them pressing send; that is why an email
 offer says "want this in your Gmail drafts?" instead of pasting a `mailto:`. It is still `review`:

@@ -627,8 +627,9 @@ def test_an_email_with_no_attachments_makes_no_attachment_call(monkeypatch):
 def test_the_sent_lane_never_fetches_attachments(monkeypatch):
     """v1 is the inbox. The sent lane is style exhaust — converting the files the user attached to
     their own mail would spend API calls and prompt budget telling them what they already know."""
-    monkeypatch.setattr(gg, "_token_path",
-                        lambda: pytest.fail("attachment lane touched on the sent path"))
+    monkeypatch.setattr(gg, "_token_path", lambda: "")
+    monkeypatch.setattr(gg, "_attachments_for",
+                        lambda *a, **k: pytest.fail("attachment lane touched on the sent path"))
 
     def fake_run(api, args, timeout=60):
         if args[:2] == ["gmail", "search"]:

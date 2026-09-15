@@ -227,6 +227,12 @@ def test_poll_gmail_sent_lane_marks_is_from_me(tmp_path, monkeypatch):
             return [{"id": "i1", "from": "a@x.example", "subject": "hi"}]
         return {"from": "x", "to": [{"email": "y@x.example"}], "body": "b"}
     monkeypatch.setattr(pg, "_run", fake_run)
+    class Service:
+        def close(self):
+            pass
+    monkeypatch.setattr(pg, "gmail_service", Service)
+    monkeypatch.setattr(pg, "fetch_message", lambda _service, mid: {
+        "id": mid, "from": "x", "to": [{"email": "y@x.example"}], "body": "b"})
     flags = {e["rowid"]: bool(e.get("is_from_me")) for e in pg.poll()}
     assert flags == {"i1": False, "s1": True}
     assert not os.path.exists(tmp_path / "events" / "gmail_seen.json")

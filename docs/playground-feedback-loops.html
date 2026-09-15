@@ -522,6 +522,7 @@ const LOOPS = [
     detail: [
       "The window is anchored to the brief the channel actually <em>acknowledged</em>: on the receiver's delivery lane <code>receiver._on_delivered</code> advances the digest stamp on the ACK — not on the deliver-once claim, which happens earlier and can still fail to send — so the {cron.midday} digest can never repeat what the morning brief just covered, and a claimed brief that retried into the afternoon no longer hides the morning from it. (<code>brief_marker.claim()</code> still stamps on an in-agent local install, where the claim is the send.)",
       "The escalation join reads this ledger because it is the only place an <em>agent</em> verdict is retained — a live missed call exists nowhere else. Dropped rows are excluded on purpose: an automated or muted event is not someone reaching you.",
+      "Expected material for an active review remains actionable even without an explicit question. Unsolicited pitches and completed reviews stay quiet. The shared Gmail reader preserves nested bodies; failed reads retry without blocking successfully read neighbors. Calendar comparisons persist across restart, with acknowledged changes protected from replay.",
       "Bounded like the queue: {ledger.max_mb} MB, {ledger.keep_lines} lines, rotate-keeping-tail. The readers take bounded tails of it, so the join stays cheap per event."
     ],
     live: 6,

@@ -48,8 +48,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from attachments import (  # noqa: E402
     MAX_ATTACHMENTS_PER_EMAIL, MAX_ATTACHMENT_BYTES, apply_attachment_budget, convert_attachment,
 )
+from gmail_read import (fetch_message as _native_fetch_message, gmail_service as _shared_gmail_service,
+                        google_service as _shared_google_service,
+                        token_path as _shared_token_path)  # noqa: E402
 
-BODY_FETCH_WORKERS = 5   # concurrent full-body fetches (each its own google_api.py subprocess)
+BODY_FETCH_WORKERS = 5   # concurrent full-body fetches, each with its own client/transport
 
 # Sent lane (roadmap Step 2 item 0): a second, SMALL `in:sent newer_than:1d` search alongside the
 # inbox one. Two consumers, both of which need the user's own outgoing EMAIL and had no source for it:
@@ -227,6 +230,14 @@ def my_response(e: dict) -> str:
 def _fetch_body(api, mid):
     """One full-message fetch. A failure just means that email stays snippet-only."""
     try:
+        if _token_path():
+            service = _gmail_service()
+            try:
+                return mid, _native_fetch_message(service, str(mid))
+            finally:
+                close = getattr(service, "close", None)
+                if callable(close):
+                    close()
         return mid, _run(api, ["gmail", "get", str(mid)], timeout=30)
     except Exception:
         return mid, None
@@ -245,36 +256,26 @@ def _fetch_body(api, mid):
 # token file the CLI authenticates with. `_gmail_service` below is that one shared client builder;
 # google_action.py imports it from here rather than keeping a second copy.
 #
-# ONE EXTRA CALL, ONLY FOR THE COHORT: one `messages().get(format="full")` per bodies-cohort INBOX
-# message. Attachment bytes that Gmail already inlined cost nothing more; only the ones it hands
-# back as an `attachmentId` need the second `attachments().get`, so an email with no attachments
-# never makes one. The sent lane is skipped entirely — it is style exhaust, not brief content.
+# The native full-body read already returns the MIME payload, so the attachment lane reuses it and
+# makes no second `messages().get`. Only parts Gmail hands back as an `attachmentId` need an
+# `attachments().get`; an email with no attachments makes no attachment-only call.
 
 
 def _token_path() -> str:
     """The google-workspace token file — the SAME one google_api.py authenticates with
     ($HERMES_HOME/google_token.json, written by its setup.py). "" when Google isn't connected."""
-    for base in (os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"), "/root/.hermes"):
-        if base and os.path.isfile(os.path.join(base, "google_token.json")):
-            return os.path.join(base, "google_token.json")
-    return ""
+    return _shared_token_path()
 
 
 def _gmail_service():
-    return _google_service("gmail", "v1")
+    return _shared_gmail_service()
 
 
 def _google_service(api, version):
     """A client on the host's existing credentials. Scopes are NOT passed (setup.py's own
     rule: the user may have granted a subset, and passing them makes refresh fail with
     invalid_scope)."""
-    path = _token_path()
-    if not path:
-        raise RuntimeError("Google isn't connected on this host (no google_token.json)")
-    from google.oauth2.credentials import Credentials  # noqa: PLC0415
-    from googleapiclient.discovery import build        # noqa: PLC0415
-    return build(api, version, credentials=Credentials.from_authorized_user_file(path),
-                 cache_discovery=False)
+    return _shared_google_service(api, version)
 
 
 def _attachment_parts(payload) -> list:
@@ -312,15 +313,17 @@ def _attachment_bytes(service, mid: str, part: dict) -> bytes:
     return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
 
 
-def _fetch_attachments(service, mid: str) -> list:
+def _fetch_attachments(service, mid: str, payload=None) -> list:
     """One message → its attachment rows, ready to hang on the normalized email.
 
     EVERY attachment is named. The first MAX_ATTACHMENTS_PER_EMAIL that are also under
     MAX_ATTACHMENT_BYTES are fetched and converted; the rest are named with the reason they weren't
     ("too large to read", "over the 3-attachment limit"). A message with no attachments costs
     nothing beyond the one metadata call and returns []."""
-    msg = service.users().messages().get(userId="me", id=str(mid), format="full").execute()
-    parts = _attachment_parts((msg or {}).get("payload") or {})
+    if payload is None:
+        msg = service.users().messages().get(userId="me", id=str(mid), format="full").execute()
+        payload = (msg or {}).get("payload") or {}
+    parts = _attachment_parts(payload)
     rows, converted = [], 0
     for part in parts:
         name = part["filename"]
@@ -341,7 +344,7 @@ def _fetch_attachments(service, mid: str) -> list:
     return rows
 
 
-def _attachments_for(mids: list) -> dict:
+def _attachments_for(mids: list, payloads=None) -> dict:
     """{message_id: [attachment rows]} for the bodies-cohort inbox messages that have any.
 
     NEVER RAISES. Google not connected, the client libs missing, an API error, one bad message —
@@ -357,7 +360,9 @@ def _attachments_for(mids: list) -> dict:
         service = None
         try:
             service = _gmail_service()
-            return mid, _fetch_attachments(service, mid)
+            payload = (payloads or {}).get(mid)
+            return mid, (_fetch_attachments(service, mid, payload) if payload is not None
+                         else _fetch_attachments(service, mid))
         except Exception:  # noqa: BLE001
             return mid, []
         finally:
@@ -393,7 +398,9 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
     # snippet-only is not one the brief is reading closely enough to need its files. The fetches
     # run concurrently, then the per-brief budget is spent deterministically in cohort order —
     # concurrency decides when the bytes arrive, never who gets the budget.
-    atts = _attachments_for(mids) if attachments else {}
+    payloads = {mid: msg.get("payload") for mid, msg in full.items()
+                if isinstance(msg, dict) and isinstance(msg.get("payload"), dict)}
+    atts = _attachments_for(mids, payloads) if attachments else {}
     if atts:
         budgeted = apply_attachment_budget([atts.get(m) or [] for m in mids])
         atts = {m: rows for m, rows in zip(mids, budgeted) if rows}
@@ -775,13 +782,6 @@ def history_page(since: int, until: int, page_token: str = '', limit: int = 100,
         raise ValueError('invalid Gmail history window')
     own_service = service is None
     service = service or _gmail_service()
-    def plain(part):
-        if part.get('filename'):
-            return ''
-        if part.get('mimeType') == 'text/plain':
-            raw = part.get('body', {}).get('data', '')
-            return base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)).decode('utf-8', errors='replace') if raw else ''
-        return '\n'.join(filter(None, (plain(p) for p in part.get('parts', []))))
     try:
         params = {'userId': 'me', 'q': f'after:{since} before:{until + 1}', 'maxResults': limit}
         if page_token:
@@ -789,15 +789,11 @@ def history_page(since: int, until: int, page_token: str = '', limit: int = 100,
         page = service.users().messages().list(**params).execute()
         messages = []
         for item in page.get('messages', []):
-            full = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
-            payload = full.get('payload', {})
-            headers = {h['name'].lower(): h.get('value', '') for h in payload.get('headers', [])}
+            full = _native_fetch_message(service, item['id'])
             at = datetime.datetime.fromtimestamp(int(full['internalDate']) / 1000, datetime.timezone.utc)
             if not since <= at.timestamp() < until + 1:
                 continue
-            full.update({'from': headers.get('from', ''), 'to': headers.get('to', ''),
-                         'subject': headers.get('subject', ''), 'body': plain(payload)[:8000],
-                         'date': at.isoformat()})
+            full.update({'body': full.get('body', '')[:8000], 'date': at.isoformat()})
             messages.append(normalize_email(full, full))
         if not allowed('gmail'):
             raise RuntimeError('Gmail consent changed during history read')

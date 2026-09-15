@@ -12,7 +12,9 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
 - **Bridge events** — the Mac app watches iMessage, WhatsApp, and calls and POSTs new rows to
   `/bridge/events` within seconds (`SOTTO_EVENTS_TICK_SECS`, default 3s).
 - **Email** — the container polls Gmail itself every `SOTTO_EMAIL_POLL_SECS` (default 90s) and feeds
-  new mail through the same endpoint. No Mac needed. A smaller `in:sent` lane rides the same poll:
+  new mail through the same endpoint. No Mac needed. Full message bodies use the shared recursive
+  MIME reader, including nested plain text or HTML. A failed read stays unacknowledged for the
+  next poll while successfully read messages continue; a snippet is never substituted as the full body. A smaller `in:sent` lane rides the same poll:
   your OWN outbound mail enters as a silent "signal" (queued, never a nudge, never a model call) —
   it exists so offered email drafts can be graded against what you actually sent and so replies you
   send can close loops.
@@ -27,6 +29,10 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
   standups never mint a change. Decline nudges require explicit participation by the user and
   exactly one other human: group RSVP changes and meetings merely visible on a shared calendar
   stay quiet. Room/resource attendees do not count as people in either the calendar or prep lane.
+  The last complete calendar comparison and acknowledged changes survive restarts. Failed or
+  partial reads cannot prove a cancellation. Calendar permission removal, an account change, or
+  an unknown account identity starts a fresh comparison once the account is known; disabling
+  calendar nudges advances it quietly without replay.
 
 **What arrives is untrusted.** A message's text is written by whoever sent it, so nothing in the
 text can steer Sotto: the deterministic gates below read only metadata (sender, channel, clock,
@@ -302,7 +308,9 @@ One rule governs briefs, digests and nudges: surface an item only when evidence 
 action, decision, preparation need, or meaningful development for this user. The sole policy is
 `sotto-chief-of-staff/_shared/references/relevance.md`; the brief and its critic load it, event
 triage and digest review use it through `relevance.py`, and the nudge skills read it before composing.
-A VIP label or a sender's deadline does not establish relevance. Services and assistant relays can
+A write-up delivered for a requested review or ongoing evaluation can require action without a
+question mark. An unsolicited promise to send a pitch does not establish user interest. Completed
+or declined reviews stay closed. A VIP label or a sender's deadline does not establish relevance. Services and assistant relays can
 carry real obligations; later answers and completion evidence can remove them. No sender/category
 blacklist is added. Explicit consent, mutes and delivery gates still govern what may be considered.
 
@@ -547,7 +555,7 @@ proactive candidates are not counted as delivered, and an intention is not finis
 the scanner considered it. Offers become actionable only after the question was accepted by the
 provider. Declines and outbound writes keep their existing explicit approval requirements.
 
-An earned nudge does not choose an unanswered decision. The shared approval policy requires an open accept/decline choice, or labeled alternative drafts, until the user chooses a direction. It forbids inventing a pass or its rationale from relevance, timing or past preferences. This is an agent instruction; real account writes remain independently gated in code.
+An earned nudge does not choose an unanswered decision. The shared approval policy requires an open accept/decline choice, or labeled alternative drafts, until the user chooses a direction. It forbids inventing a pass or its rationale from relevance, timing or past preferences. Even labeled alternatives may not invent a completed review, team debrief, or past decision. This is an agent instruction; real account writes remain independently gated in code.
 
 
 ### Calendar context and preview (September 9)

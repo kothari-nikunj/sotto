@@ -108,6 +108,7 @@ CACHE_FILENAME = "calendar_today.json"
 # Post-meeting tap: the date-keyed record of event-ends already handled (exactly-once), and the
 # `source` string that IS the contract with triage_event.py's post_meeting branch.
 TAP_STATE_FILENAME = "meeting_taps.json"
+CHANGE_STATE_FILENAME = "calendar_changes.json"
 MEETING_END_SOURCE = "meeting_end"
 # Calendar-diff nudges: the `source` string that IS the contract with triage_event.py's
 # calendar_change branch, and the relevance windows (named constants, not knobs). A change matters
@@ -249,14 +250,16 @@ def _run_calendar_gather():
     valid = observation.get("status") == "ok" and observation.get("complete") is True
     _LAST_RAW["valid"] = valid
     if valid:
-        # RAW IDs and RSVPs remain in memory only; a partial or failed observation never
-        # advances the comparable baseline from which absence could imply cancellation.
+        # The latest raw observation stays in memory; the change detector durably checkpoints only
+        # its bounded, minimal diff fields. A partial or failed observation advances neither.
         _LAST_RAW["events"] = raw
         _LAST_RAW["coverage"] = observation.get("coverage") or {}
         _LAST_RAW['observed_at'] = observation.get('observed_at')
     elif observation.get("status") == "disabled":
         _LAST_RAW.update(events=None, coverage={})
-        _CHANGE_BASELINE["events"] = None
+        # Calendar permission was explicitly removed. Overwrite the old comparable baseline so a
+        # later reconnect cannot diff across the period in which the source was unavailable.
+        _invalidate_change_baseline("disabled", observation.get("observed_at"))
     events = [ev for ev in map(_norm_cal_event, raw)
               if ev and _s(ev.get("_my_response")).lower() != "declined"]
     for ev in events:
@@ -274,7 +277,8 @@ _CAL_LOCK = threading.RLock()
 _CAL_CACHE: dict = {"ts": 0.0, "value": None}
 _LAST_GATHER: dict = {}
 _LAST_RAW: dict = {"events": None}         # the latest gather's RAW events (see _run_calendar_gather)
-_CHANGE_BASELINE: dict = {"events": None}  # the previous change-tick's raw events — the diff's left side
+_CHANGE_BASELINE: dict = {"events": None, "source": None, "account": "", "loaded": False,
+                          "acknowledged": set()}
 
 
 def snapshot() -> dict | None:
@@ -641,12 +645,105 @@ def tap_tick(now_utc: datetime | None = None) -> int:
 # examples that were unbuildable here because nothing watched the diff. Detection ONLY, the tap's
 # exact posture: every interruption question (quiet hours, snooze, mutes) is triage's, reached by
 # pushing a synthetic `source: "calendar_change"` event through the ordinary funnel. Exactly-once
-# is TWO layers: the in-memory baseline advances only when every change dispatched, and the
-# receiver's (source,rowid) seen-ring dedupes any re-detection after a partial failure. A restart
-# only resets the baseline (first tick after boot detects nothing) — it can never replay the day.
+# is TWO layers: this module atomically checkpoints the last complete observation plus successful
+# items from a partial batch, and the receiver's (source,rowid) seen-ring closes the tiny gap between
+# dispatch and checkpoint. The checkpoint is a bounded calendar-window snapshot, not a history.
 
 def calendar_nudges_enabled() -> bool:
     return ((os.environ.get("SOTTO_CALENDAR_NUDGES") or "").strip() or "1") != "0"
+
+
+def change_state_path() -> str:
+    return os.path.join(_root(), CACHE_DIRNAME, CHANGE_STATE_FILENAME)
+
+
+def _invalidate_change_baseline(status: str, observed_at: str = "") -> None:
+    """Atomically make old state non-comparable across a consent or identity boundary."""
+    HOOKS["write_json"](change_state_path(), {
+        "version": 1,
+        "source": {"status": status, "complete": False,
+                   "observed_at": _s(observed_at) or _iso(), "coverage": {}},
+        "account": "", "events": [], "acknowledged": [],
+    })
+    _CHANGE_BASELINE.update(events=None, source=None, account="", loaded=True,
+                            acknowledged=set())
+
+
+def _change_observation() -> dict | None:
+    """The receipt that makes a persisted baseline comparable rather than merely cached data."""
+    observed_at = _s(_LAST_RAW.get("observed_at"))
+    coverage = _LAST_RAW.get("coverage") or {}
+    since = _parse_aware(coverage.get("since")) if isinstance(coverage, dict) else None
+    until = _parse_aware(coverage.get("until")) if isinstance(coverage, dict) else None
+    if _parse_aware(observed_at) is None or since is None or until is None or since >= until:
+        return None
+    return {"status": "ok", "complete": True, "observed_at": observed_at,
+            "coverage": {"since": coverage["since"], "until": coverage["until"]}}
+
+
+def _change_account() -> str:
+    """Stable connected-account identity; attendee inference is deliberately too weak for this."""
+    return _s(os.environ.get("SOTTO_USER_EMAIL")).lower() or _settings_email()
+
+
+def _change_events(events: list) -> list:
+    """Keep only fields the diff consumes; descriptions and links do not belong in durable state."""
+    fields = ("id", "summary", "start", "end", "status", "attendees", "organizer",
+              "my_response")
+    return [{key: ev[key] for key in fields if key in ev}
+            for ev in meeting_events(events) if isinstance(ev, dict)]
+
+
+def _read_change_state() -> tuple[list | None, dict | None, str, set[str]]:
+    """Load only a complete, explicitly sourced baseline; malformed state fails toward silence."""
+    try:
+        with open(change_state_path(), encoding="utf-8") as f:
+            state = json.load(f)
+        source = state.get("source")
+        account = state.get("account")
+        events = state.get("events")
+        acknowledged = state.get("acknowledged", [])
+        if (state.get("version") != 1 or not isinstance(source, dict)
+                or source.get("status") != "ok" or source.get("complete") is not True
+                or _parse_aware(source.get("observed_at")) is None
+                or not isinstance(source.get("coverage"), dict)
+                or _parse_aware(source["coverage"].get("since")) is None
+                or _parse_aware(source["coverage"].get("until")) is None
+                or _parse_aware(source["coverage"]["since"])
+                >= _parse_aware(source["coverage"]["until"])
+                or not isinstance(account, str) or not account.strip()
+                or not isinstance(events, list) or any(not isinstance(e, dict) for e in events)
+                or not isinstance(acknowledged, list)
+                or any(not isinstance(key, str) for key in acknowledged)):
+            return None, None, "", set()
+        return _change_events(events), source, account, set(acknowledged)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None, None, "", set()
+
+
+def _write_change_state(events: list, acknowledged=(), source: dict | None = None) -> None:
+    """Atomically checkpoint the comparable baseline and any changes already handed to triage."""
+    source = source or _change_observation()
+    if source is None:
+        raise ValueError("calendar change baseline requires complete observation coverage")
+    account = _change_account()
+    if not account:
+        raise ValueError("calendar change baseline requires known account identity")
+    HOOKS["write_json"](change_state_path(), {
+        "version": 1,
+        "source": source,
+        "account": account,
+        "events": _change_events(events),
+        "acknowledged": sorted(set(acknowledged)),
+    })
+
+
+def _load_change_baseline() -> None:
+    if _CHANGE_BASELINE.get("loaded"):
+        return
+    events, source, account, acknowledged = _read_change_state()
+    _CHANGE_BASELINE.update(events=events, source=source, account=account,
+                            acknowledged=acknowledged, loaded=True)
 
 
 def _raw_others(ev: dict, self_email: str) -> list:
@@ -787,17 +884,35 @@ def change_event(cand: dict) -> dict:
 
 def change_tick(now_utc: datetime | None = None) -> int:
     """One calendar-diff pass, riding the refresh thread's clock right after the tap. Returns how
-    many changes were dispatched. First tick (or first after restart) only sets the baseline."""
-    if not calendar_nudges_enabled():
-        return 0
+    many changes were dispatched. The last complete baseline and partial-batch acknowledgements
+    survive receiver restarts in one atomically written, bounded state file."""
     current = _LAST_RAW["events"]
-    if _LAST_RAW.get("valid") is False:
+    if _LAST_RAW.get("valid") is not True:
         return 0
     if current is None:
         return 0                              # no gather has run yet this process
+    source = _change_observation()
+    if source is None:
+        return 0                              # incomplete time/coverage cannot support a safe diff
+    account = _change_account()
+    if not account:
+        _invalidate_change_baseline("identity_unknown", source["observed_at"])
+        return 0                              # unknown calendars must never share an identity
+    _load_change_baseline()
     baseline = _CHANGE_BASELINE["events"]
+    if baseline is not None and _CHANGE_BASELINE.get("account", "") != account:
+        baseline = None                       # a different Google account is a new calendar truth
     if baseline is None:
-        _CHANGE_BASELINE["events"] = current
+        _write_change_state(current, source=source)
+        _CHANGE_BASELINE.update(events=current, source=source, account=account,
+                                acknowledged=set())
+        return 0
+    if not calendar_nudges_enabled():
+        # Nudge-disabled observations become the new baseline without dispatch, so re-enabling
+        # cannot replay changes that happened while this notification lane was disabled.
+        _write_change_state(current, source=source)
+        _CHANGE_BASELINE.update(events=current, source=source, account=account,
+                                acknowledged=set())
         return 0
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     self_email = _self_email([e for e in map(_norm_cal_event, current) if e])
@@ -808,7 +923,10 @@ def change_tick(now_utc: datetime | None = None) -> int:
              (since is not None and until is not None and _parse_aware(c["start"]) is not None
               and since <= _parse_aware(c["start"]) < until)]
     dispatched, all_ok = 0, True
+    acknowledged = set(_CHANGE_BASELINE.get("acknowledged") or ())
     for cand in cands:
+        if cand["key"] in acknowledged:
+            continue
         cand['calendar_observed_at'] = _LAST_RAW.get('observed_at')
         try:
             ok = bool(HOOKS["calendar_change"](change_event(cand)))
@@ -817,10 +935,15 @@ def change_tick(now_utc: datetime | None = None) -> int:
             ok = False
         if ok:
             dispatched += 1
+            acknowledged.add(cand["key"])
+            _write_change_state(baseline, acknowledged, _CHANGE_BASELINE.get("source"))
+            _CHANGE_BASELINE["acknowledged"] = acknowledged
         else:
             all_ok = False
     if all_ok:
-        _CHANGE_BASELINE["events"] = current  # every change made it — the diff is settled
+        _write_change_state(current, source=source)
+        _CHANGE_BASELINE.update(events=current, source=source, account=account,
+                                acknowledged=set())
     return dispatched
 
 

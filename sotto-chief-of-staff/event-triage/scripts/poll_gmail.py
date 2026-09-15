@@ -33,6 +33,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SHARED_LIB = os.path.join(_HERE, "..", "..", "_shared", "lib")
 if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
+from gmail_read import fetch_message, gmail_service  # noqa: E402
 
 GMAIL_SEEN_MAX = 1000   # ring size — 20 msgs/poll × ~1h windows leaves plenty of overlap margin
 SEARCH_QUERY = "newer_than:1h in:inbox"
@@ -197,19 +198,32 @@ def poll() -> list:
             continue   # one ring, both lanes — a self-addressed mail is one event, not two
         new.append(it)
         new_ids.add(str(mid))
-    events = []
-    for it in new:
-        mid = str(_pick(it, "id", "message_id", "messageId"))
-        full = {}
-        try:
-            full = _run(api, ["gmail", "get", mid], timeout=30) or {}
-        except Exception:  # noqa: BLE001
-            pass   # snippet-only event is still an event
-        ev = _to_event(it, full)
-        if mid in sent_ids:
-            ev["is_from_me"] = True   # Tier 0 queues these as silent signals, never a nudge
-        events.append(ev)
-    return events
+    if not new:
+        return []
+    service = gmail_service()
+    try:
+        events = []
+        deferred = 0
+        for it in new:
+            mid = str(_pick(it, "id", "message_id", "messageId"))
+            try:
+                full = fetch_message(service, mid)
+            except Exception:  # noqa: BLE001
+                # Successfully read neighbors still flow. This id is absent from the output, so
+                # the receiver cannot ack it and the seen ring retries it next poll.
+                deferred += 1
+                continue
+            ev = _to_event(it, full)
+            if mid in sent_ids:
+                ev["is_from_me"] = True
+            events.append(ev)
+        if deferred:
+            _diag(f"[poll_gmail] deferred {deferred} message(s) after full-read failure")
+        return events
+    finally:
+        close = getattr(service, "close", None)
+        if callable(close):
+            close()
 
 
 def main():

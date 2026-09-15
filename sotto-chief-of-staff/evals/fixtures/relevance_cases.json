@@ -183,5 +183,68 @@
       "ambient"
     ],
     "brief_action": false
+  },
+  {
+    "id": "expected_evaluation_writeup",
+    "sender": "Mira Patel",
+    "context": "The user discussed a company with Mira last week and asked her to send its memo for review. The memo has now arrived; no subsequent review, reply, or pass is recorded.",
+    "messages": [
+      {
+        "text": "Here is the write-up we discussed last week. They are raising a small friends-and-family round; the memo is attached."
+      }
+    ],
+    "expected": [
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "post_demo_interest_followup",
+    "sender": "Sam Rivera",
+    "context": "The user met the founder last week for a product demo. There is no evidence of a subsequent internal debrief or investment decision.",
+    "messages": [
+      {
+        "text": "Thanks for meeting last week. Have you had a chance to debrief with the team? Happy to go deeper on the product and business model if there is interest. What do you think?"
+      }
+    ],
+    "expected": [
+      "actionable"
+    ],
+    "brief_action": true
+  },
+  {
+    "id": "unsolicited_promised_pitch",
+    "sender": "Outbound Founder",
+    "context": "An unsolicited generic fundraising email. The sender previously promised a memo without any response, meeting, request, or active interest from the user.",
+    "messages": [
+      {
+        "text": "As promised, here is our friends-and-family investment memo. Please review and invest before Friday."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
+  },
+  {
+    "id": "reviewed_evaluation_writeup",
+    "sender": "Robin Chen",
+    "context": "An active evaluation whose requested write-up was delivered and then explicitly declined by the user. No new question followed.",
+    "messages": [
+      {
+        "text": "Here is the write-up you asked for after our conversation."
+      },
+      {
+        "text": "Thanks, I reviewed it. We will pass this time.",
+        "is_from_me": true
+      },
+      {
+        "text": "Understood, thanks for taking a look."
+      }
+    ],
+    "expected": [
+      "ignore"
+    ],
+    "brief_action": false
   }
 ]

@@ -30,13 +30,15 @@ the midday digest have their own procedures and share the source, relevance and 
 **The model judges meaning; code governs interruption and action authority.** Native Gemini classifies relevance, and the shared funnel applies cadence, consent, freshness and delivery policy. Hermes still exercises model discretion during interactive conversation; an adapter boundary cannot guarantee the quality of its replies. The funnel is documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
 the seven things that can start a nudge are the producer table at the top of that page.
 
-**Two reads bypass the host CLI, on one shared client.** The Hermes `google-workspace`
-`google_api.py` is installed from upstream, not from this repo, and it lacks two verbs this system
-needs: a Gmail *draft* (`google_action.py`), and message *attachments* — its `gmail get` flattens
-the message to a body and discards the MIME part tree, so filenames aren't reachable through it at
-any price. Both go straight to the Gmail API on the SAME `google_token.json` the CLI authenticates
-with, through one builder — `gather_google._gmail_service`, which `google_action.py` imports rather
-than copying. The attachment half converts what it fetched through
+**One shared Gmail reader and client.** `_shared/lib/gmail_read.py` owns native Google client
+construction on the existing `google_token.json` and recursive Gmail MIME body extraction.
+`poll_gmail.py` and `gather_google.py` use the same full-message reader; nested multipart mail
+retains its plain-text body or readable HTML fallback instead of becoming a search preview.
+Failed message reads remain unacknowledged for the next poll while other messages proceed.
+The gather reuses the full message's MIME tree for attachments. `gather_google._gmail_service`
+remains the compatibility entry point used by `google_action.py`, backed by the shared builder.
+The upstream Hermes CLI still owns the search/calendar command interface.
+The attachment half converts what it fetched through
 [`_shared/lib/attachments.py`](../sotto-chief-of-staff/_shared/lib/attachments.py), the owner of the
 lane's three caps for both the fetch side and the prompt side: *an attachment Sotto can read becomes
 text under its email; one it can't is named, never guessed.* Conversion is in-process and local —
@@ -176,7 +178,7 @@ imports the receiver back.
 | `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the brief schedule (`crons.json`'s `runner: receiver` jobs), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
 | `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
 | `calendar_context.py` (copied from `_shared/lib/` by Docker) | Shared human-attendee normalization and explicit user participation. Explicit context notes with the exact same interval and a unique matching meeting subject attach to that meeting as `supporting_context`; their descriptions remain available for prep, without creating a second busy block or invite. Calendar diffs only nudge for declines in the user's one-to-one meetings; prep and docket exclude resource rooms. |
-| `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel). A meeting the user DECLINED is dropped before the served list (the Today view and the funnel's in-meeting hold never see it) while the raw wire events keep it for the diff |
+| `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector with a durable comparison baseline (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel). A meeting the user DECLINED is dropped before the served list (the Today view and the funnel's in-meeting hold never see it) while the raw wire events keep it for the diff |
 | `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_text`/`write_json`, the one atomic-write helper the whole image uses** |
 | `outbox.py` | The durable delivery outbox — `events/outbox.json`, the idempotency key, the retry backoff, the per-kind expiry, and the drain heartbeat. **Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn instead of dying.** |
 | `retention.py` | THE table of what the volume keeps and for how long — every TTL, the three policies that apply them, and the guard that keeps the graph, the ledger and the corpus off every rule. It owns no clock: `receiver._retention_tick` fires it once a local day from the cron thread. **Retention is machinery, not an instruction a run can decline.** |
@@ -316,6 +318,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/delivery-effects-<run>.json` | shared `delivery_effects.py`, merging procedure contributions transactionally | Receiver result commit and outbox handoff: source/Calendar eligibility, original coverage cutoff, chase/handoff, proactive/intention and offer effects; only delivery-dependent effects activate after provider acceptance |
 | `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` so "what did Sotto send?" isn't answered by a prompt's promise |
 | `cache/calendar_today.json` | calcache | In-meeting hold and delivery eligibility: daily projection, opaque event IDs, actual observation time, status and completeness; an older or failed observation cannot prove a newly observed meeting disappeared |
+| `cache/calendar_changes.json` | calcache | Last complete calendar comparison window and acknowledged changes, persisted across restart; no descriptions or message bodies |
 | `cache/meeting_taps.json` | calcache | calcache (exactly-once tap record) |
 | `cache/research_<date>.json` | skills (`research_attendees.py`) | dashboard (`/api/research` cards), skills (`compose_brief.py` joins it) |
 | `cache/visual-briefs/<id>/*` | shared `visual_brief.py` renderer | receiver gallery delivery; seven-day staged-artifact sweep |
