@@ -632,14 +632,14 @@ inside the actual reservation transaction so concurrent spend cannot race the pr
 The initial window is 42 days; subsequent frozen windows collect new context. Bridge `read_history`
 uses row-id keyset cursors and stable source IDs, separate from live watcher cursors. A blank or
 excluded-message page can advance. Gmail uses its actual API page token and the existing token
-builder, with no attachments or writes. Failed reads/extractions keep the old checkpoint.
+builder, with no attachments or writes. Failed reads and wholly invalid extractions keep the old checkpoint; partially valid extractions advance with explicit rejection counts.
 
 `context_learning.py` binds durable facts to supplied message references. Discussions, decisions,
 commitments and historical asks are not stored; actionable work remains owned by the live ledger. It reviews
 up to 160 direct-message records per page (Gmail pages have up to 100), with at most 1,400 text
 characters per record. Group history contributes to the existing activity/voice readers where
 authorship is known; semantic extraction currently excludes groups. The receipt distinguishes rows
-fetched from messages reviewed. History never enters `events/queue.jsonl` or creates continuity
+fetched from messages reviewed and records rejected person-result counts without private text. Each person is validated as a whole before the shared graph write; invalid people cannot poison unrelated valid results. Duplicate output subjects are rejected together, and conflicting source-reference records fail before model access. The existing history-state file holds last-extraction and cumulative rejection counts; there is no separate repair store or extra model call. History never enters `events/queue.jsonl` or creates continuity
 rows. Current commitments still use the existing live triage/brief/resolve path. Contacts, calendar,
 Granola and other sources keep their existing consumers; this is not an all-source history index.
 

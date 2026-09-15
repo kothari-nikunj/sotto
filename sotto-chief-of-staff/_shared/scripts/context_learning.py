@@ -1,6 +1,7 @@
 """Learn sourced durable facts from observed communications, without feeding the live queue."""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -109,6 +110,12 @@ def learn(records, llm=gemini.call_gemini, now=None):
     records = [r for r in records if allowed(r['source'])]
     if not records:
         return {'reviewed': 0, 'facts': 0}
+    by_ref = {}
+    for record in records:
+        previous = by_ref.get(record['ref'])
+        if previous is not None and previous != record:
+            raise MemoryExtractionError('ambiguous_source_reference')
+        by_ref[record['ref']] = record
     # Gemini expands nested bounded arrays when compiling its response grammar. A
     # page-sized outer maxItems plus per-page enums made valid history requests fail
     # with HTTP 400. Keep the native shape and small inner caps; the single writer
@@ -120,45 +127,57 @@ def learn(records, llm=gemini.call_gemini, now=None):
         raise MemoryExtractionError('invalid_json') from error
     if not isinstance(data, dict) or not isinstance(data.get('people'), list):
         raise MemoryExtractionError('invalid_shape')
-    by_ref = {r['ref']: r for r in records}
-    updates, subjects = [], set()
+    # Validate each person before any graph write. A malformed result cannot invalidate an
+    # unrelated person's evidence, but duplicate output subjects are ambiguous in BOTH entries.
+    subject_counts = Counter(p.get('subject') for p in data['people']
+                             if isinstance(p, dict) and isinstance(p.get('subject'), str))
+    updates, rejected = [], Counter()
     for person in data['people']:
-        if not isinstance(person, dict):
-            raise MemoryExtractionError('invalid_person')
-        subject = person.get('subject')
-        evidence = [r for r in records if r['subject'] == subject]
-        if not evidence:
-            raise MemoryExtractionError('unknown_subject')
-        if subject in subjects:
-            raise MemoryExtractionError('repeated_subject')
-        subjects.add(subject)
-        facts = []
-        entries = person.get('facts')
-        if not isinstance(entries, list) or len(entries) > FACTS_PER_PERSON:
-            raise MemoryExtractionError('invalid_entries')
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise MemoryExtractionError('invalid_entry')
-            refs = entry.get('refs')
-            value = entry.get('text')
-            if not isinstance(value, str) or not value.strip():
-                raise MemoryExtractionError('empty_text')
-            if len(value) > MAX_TEXT_CHARS:
-                raise MemoryExtractionError('text_length')
-            if not isinstance(refs, list) or not refs or len(refs) > MAX_REFS:
-                raise MemoryExtractionError('reference_count')
-            if any(not isinstance(ref, str) or ref not in by_ref for ref in refs):
-                raise MemoryExtractionError('unknown_reference')
-            if any(by_ref[ref]['subject'] != subject for ref in refs):
-                raise MemoryExtractionError('cross_subject_reference')
-            refs = sorted(set(refs))
-            at = max(by_ref[ref]['at'] for ref in refs)
-            facts.append({'fact': value.strip(), 'memory_type': 'context', 'confidence': 0.65,
-                          'source': 'observed_message', 'source_ref': refs[0], 'evidence_refs': refs,
-                          'observed_date': at[:10]})
-        updates.append({'identifier': subject, 'person_name': evidence[-1]['name'], 'facts': facts})
-    # Recheck consent after the model call, before any writer. Invalid output is all-or-nothing.
+        try:
+            if not isinstance(person, dict):
+                raise MemoryExtractionError('invalid_person')
+            subject = person.get('subject')
+            if not isinstance(subject, str):
+                raise MemoryExtractionError('unknown_subject')
+            evidence = [r for r in records if r['subject'] == subject]
+            if not evidence:
+                raise MemoryExtractionError('unknown_subject')
+            if subject_counts[subject] > 1:
+                raise MemoryExtractionError('repeated_subject')
+            facts = []
+            entries = person.get('facts')
+            if not isinstance(entries, list) or len(entries) > FACTS_PER_PERSON:
+                raise MemoryExtractionError('invalid_entries')
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise MemoryExtractionError('invalid_entry')
+                refs = entry.get('refs')
+                value = entry.get('text')
+                if not isinstance(value, str) or not value.strip():
+                    raise MemoryExtractionError('empty_text')
+                if len(value) > MAX_TEXT_CHARS:
+                    raise MemoryExtractionError('text_length')
+                if not isinstance(refs, list) or not refs or len(refs) > MAX_REFS:
+                    raise MemoryExtractionError('reference_count')
+                if any(not isinstance(ref, str) or ref not in by_ref for ref in refs):
+                    raise MemoryExtractionError('unknown_reference')
+                if any(by_ref[ref]['subject'] != subject for ref in refs):
+                    raise MemoryExtractionError('cross_subject_reference')
+                refs = sorted(set(refs))
+                at = max(by_ref[ref]['at'] for ref in refs)
+                facts.append({'fact': value.strip(), 'memory_type': 'context', 'confidence': 0.65,
+                              'source': 'observed_message', 'source_ref': refs[0], 'evidence_refs': refs,
+                              'observed_date': at[:10]})
+            updates.append({'identifier': subject, 'person_name': evidence[-1]['name'], 'facts': facts})
+        except MemoryExtractionError as error:
+            rejected[error.code] += 1
+    if rejected and not updates:
+        raise MemoryExtractionError(next(iter(rejected)))  # no valid subset: preserve the page
+    # Recheck consent after the model call, before any writer, including when only a valid subset remains.
     if any(not allowed(r['source']) for r in records):
         raise RuntimeError('source consent changed during memory extraction')
     knowledge_update.apply({'person_updates': updates}, now=now)
-    return {'reviewed': len(records), 'facts': sum(len(p['facts']) for p in updates)}
+    result = {'reviewed': len(records), 'facts': sum(len(p['facts']) for p in updates)}
+    if rejected:
+        result['rejected_people'] = dict(rejected)  # counts/codes only; never source or model text
+    return result

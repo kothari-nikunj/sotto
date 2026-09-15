@@ -122,6 +122,12 @@ def _run(now, fetch, learn, curate, path):
                 for key in ('error', 'error_stage', 'error_code', 'http_status'):
                     window.pop(key, None)
                 window.pop('extraction_failure', None)
+                window['last_extraction'] = {key: result[key] for key in ('reviewed', 'facts', 'rejected_people')
+                                             if key in result}
+                if result.get('rejected_people'):
+                    counts = window.setdefault('rejected_people', {})
+                    for code, count in result['rejected_people'].items():
+                        counts[code] = counts.get(code, 0) + count
                 results.append({'source': source, **result, 'complete': window['complete']})
             except Exception as error:  # one broken source cannot stop the other connected sources
                 held_reason = (error.reason if isinstance(error, gemini_transport.BackgroundModelHeldError)

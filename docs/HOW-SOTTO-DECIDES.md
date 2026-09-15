@@ -562,17 +562,24 @@ needs your attention right now,” rather than morning wording or an unsupported
 whole inbox.
 
 Background memory uses a constant native response shape with bounded inner evidence arrays.
-Its writer validates supplied subject IDs, text length and source references before any writes.
-Native HTTP 400/422 extraction failures hold the page until the schema, prompt, native client implementation or model route changes;
-other transient failures retain the hourly retry. No page is skipped to make coverage appear complete. Operator receipts
-park an unchanged extraction after two attempts for the same source revision. Each conversation
-candidate is capped at 12 messages, 400 characters per message and 4,800 characters in total.
+The writer validates every subject, citation and text bound, rejects conflicting input references
+before a model call, and never guesses a replacement citation. It validates each person's complete
+result independently: if any fact is invalid, that person's entire result is discarded. All copies
+of a repeated output subject are rejected. Fully valid people can still be applied together after
+consent is rechecked. The existing history checkpoint records the last extraction and cumulative
+rejected-person-result counts by safe error code; reviewed messages are not a claim that every
+proposed fact was stored. No private message or rejected fact text is retained in diagnostics.
+
+A partially valid page advances with explicit rejection counts. Invalid JSON, a malformed top-level
+response, or a nonempty response with no valid people preserves the checkpoint. Native HTTP 400/422
+failures hold the page until the schema, prompt, native client implementation or model route changes;
+other transient failures retain the hourly retry. A wholly invalid extraction parks after two attempts for the same source revision. Empty, valid no-fact responses remain valid reviews.
+Each conversation candidate is capped at 12 messages, 400 characters per message and 4,800 characters
+in total. This isolation adds no repair call, new queue, or weaker evidence check.
 
 Provider acceptance is never repeated while its local state effects run. The outbox makes at most
 five post-delivery effect attempts, then exposes a quarantined failure while retaining the provider
 receipt and replayable effect metadata for recovery.
-identify the failed stage and validation category without storing private source text or raw model
-output in diagnostics. No evidence or consent validation is relaxed to make a checkpoint advance.
 
 Contacts-only access (Apple or Google) is identity metadata, not enough context to trigger a
 personal brief. The setup screen reads the same managed source and messaging gates as scheduling,

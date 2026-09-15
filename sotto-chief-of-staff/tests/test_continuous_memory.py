@@ -395,7 +395,7 @@ def test_extraction_constraints_and_safe_rejection_diagnostics(tmp_path, code):
     elif code == 'repeated_subject':
         invalid['people'] *= 2
     else:
-        invalid['people'].append('bad shape')
+        invalid['people'] = ['bad shape']
     def model(prompt, config, **kwargs):
         assert kwargs['schema'] == learning.SCHEMA
         return json.dumps(invalid)
@@ -469,3 +469,89 @@ def test_unchanged_invalid_extraction_retries_once_then_parks(tmp_path, monkeypa
     state = json.loads(Path(memory_cycle.state_path()).read_text())
     assert len(attempts) == memory_cycle.UNCHANGED_EXTRACTION_ATTEMPTS == 2, state
     assert state['sources']['imessage']['rejected_request_revision'] == learning.request_revision()
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_invalid_person_cannot_poison_unrelated_memory_or_write_partial_facts(tmp_path, reverse):
+    observed = [*records(), {**records()[0], 'ref': 'gmail:other',
+                            'subject': 'other@example.com', 'name': 'Other'}]
+    bad = extraction()['people'][0]
+    bad['facts'].append({'text': 'Wrong attribution must never be saved.', 'refs': ['gmail:other']})
+    good = {'subject': 'other@example.com', 'facts': [
+        {'text': 'Other builds scheduling software.', 'refs': ['gmail:other']}]}
+    people = [bad, good] if not reverse else [good, bad]
+    result = learning.learn(observed, lambda *a, **k: json.dumps({'people': people}), NOW)
+    assert result == {'reviewed': 3, 'facts': 1, 'rejected_people': {'cross_subject_reference': 1}}
+    assert not kg.find_person_file(identifier='alex@example.com')
+    path = Path(kg.find_person_file(identifier='other@example.com'))
+    saved = kg.parse_person_file(path.read_text())
+    assert [f.text for f in saved.facts.values()] == ['Other builds scheduling software.']
+    assert not list(tmp_path.glob('knowledge/continuity/*'))
+
+
+def test_duplicate_output_subjects_are_all_rejected_even_with_valid_other_person():
+    observed = [*records(), {**records()[0], 'ref': 'gmail:other',
+                            'subject': 'other@example.com', 'name': 'Other'}]
+    reply = {'people': [extraction()['people'][0],
+                       {'subject': 'other@example.com', 'facts': []},
+                       extraction()['people'][0]]}
+    result = learning.learn(observed, lambda *a, **k: json.dumps(reply), NOW)
+    assert result['rejected_people'] == {'repeated_subject': 2}
+    assert result['facts'] == 0
+    assert not kg.find_person_file(identifier='alex@example.com')
+
+
+def test_ambiguous_input_reference_rejected_before_spending_or_writing(tmp_path):
+    observed = [records()[0], {**records()[0], 'subject': 'other@example.com'}]
+    with pytest.raises(learning.MemoryExtractionError) as error:
+        learning.learn(observed, lambda *a, **k: pytest.fail('ambiguous input must not call a model'), NOW)
+    assert error.value.code == 'ambiguous_source_reference'
+    assert not list(tmp_path.glob('knowledge/people/*.md'))
+
+
+def test_partial_validity_cannot_bypass_consent_recheck(tmp_path, monkeypatch):
+    reply = extraction()
+    reply['people'].append({'subject': 'invented@example.com', 'facts': []})
+    def revoked(*a, **k):
+        monkeypatch.setattr(learning, 'allowed', lambda _: False)
+        return json.dumps(reply)
+    with pytest.raises(RuntimeError, match='consent changed'):
+        learning.learn(records(), revoked, NOW)
+    assert not list(tmp_path.glob('knowledge/people/*.md'))
+
+
+def test_mixed_extraction_advances_history_and_retains_safe_rejection_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_cycle, 'allowed', lambda source: source == 'gmail')
+    monkeypatch.setattr(memory_cycle, 'resolve_contact_names', lambda value: value)
+    for target, method in ((memory_cycle.prewarm_graph, 'prewarm'), (memory_cycle.style_extract, 'extract'),
+                           (memory_cycle.relationship_pulse, 'observe_history')):
+        monkeypatch.setattr(target, method, lambda *a, **k: None)
+    observed = [*records(), {**records()[0], 'ref': 'gmail:other',
+                            'subject': 'other@example.com', 'name': 'Other'}]
+    monkeypatch.setattr(learning, 'observations', lambda source, rows, now: rows)
+    path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'next_source': 2, 'sources': {'gmail': {
+        'since': 1, 'until': 2, 'cursor': None, 'rejected_request_revision': 'old-contract',
+        'retry_after': int(NOW.timestamp()) + 9999}}}))
+    calls = []
+    def fetch(source, window):
+        calls.append(window['cursor'])
+        return {'status': 'ok', 'rows': observed, 'next_cursor': 'next' if not window['cursor'] else None,
+                'complete': bool(window['cursor'])}
+    def learn(rows, now):
+        bad = extraction()['people'][0]
+        bad['facts'][0]['refs'] = ['gmail:other']
+        people = [bad, {'subject': 'other@example.com', 'facts': []}] if len(calls) == 1 else []
+        return learning.learn(rows, lambda *a, **k: json.dumps({'people': people}), now)
+    quiet = lambda **k: {'reviewed': 0}
+    memory_cycle.run(NOW, fetch, learn, quiet)
+    window = json.loads(path.read_text())['sources']['gmail']
+    assert window['cursor'] == 'next' and window['pages'] == 1
+    assert window['last_extraction']['rejected_people'] == {'cross_subject_reference': 1}
+    assert 'rejected_request_revision' not in window
+    memory_cycle.run(NOW + timedelta(minutes=15), fetch, learn, quiet)
+    window = json.loads(path.read_text())['sources']['gmail']
+    assert calls == [None, 'next'] and window['pages'] == 2 and window['initial_complete']
+    assert window['rejected_people'] == {'cross_subject_reference': 1}
+    assert 'rejected_people' not in window['last_extraction']
+    assert 'example.com' not in path.read_text() and 'Wrong attribution' not in path.read_text()
