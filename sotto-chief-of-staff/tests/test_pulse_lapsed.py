@@ -15,6 +15,13 @@ spec.loader.exec_module(rp)
 NOW = datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
 
 
+def _prior(name="Maya", last="2026-05-01", interactions=12):
+    return {"name": name, "last_contact": last, "interactions": interactions, "trend": "stable",
+            "importance_evidence": {"sent_days": ["2026-05-01", "2026-05-03"],
+                                    "received_days": ["2026-05-02", "2026-05-04"],
+                                    "active_days": ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"]}}
+
+
 def _msg(name, days_ago, from_me):
     ts = (NOW - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
     return {"handle": "+1", "resolved_name": name, "is_from_me": from_me,
@@ -74,7 +81,7 @@ def test_no_history_degrades_cleanly(tmp_path, monkeypatch):
 
 def test_previously_regular_absent_contact_is_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    history = {"Maya": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
+    history = {"Maya": _prior()}
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
     assert len(out["lapsed"]) == 1
     e = out["lapsed"][0]
@@ -102,9 +109,9 @@ def test_one_off_past_contact_is_not_lapsed(tmp_path, monkeypatch):
 
 def test_lapsed_ranked_below_losing_touch(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    msgs = [_msg("Sarah", d, d % 2 == 0) for d in [60, 58, 56, 54, 52, 50, 48, 46]]
+    msgs = [_msg("Sarah", d, i % 2 == 0) for i, d in enumerate([60, 58, 56, 54, 52, 50, 48, 46])]
     msgs.append(_msg("Sarah", 20, False))                         # Sarah = losing_touch
-    history = {"Maya": {"last_contact": "2026-04-01", "interactions": 30, "trend": "stable"}}
+    history = {"Maya": _prior(last="2026-04-01", interactions=30)}
     out = rp.compute(_local(*msgs), NOW, history=history)
     kinds = [q["queue_type"] for q in out["attention_queue"]]
     assert "losing_touch" in kinds and "lapsed" in kinds
@@ -119,7 +126,7 @@ def test_lapsed_carries_graph_context_when_tracked(tmp_path, monkeypatch):
     os.makedirs(people, exist_ok=True)
     with open(os.path.join(people, "maya.md"), "w") as f:
         f.write("---\nschema: 1\ncanonical_id: c_m\nname: Maya\ncompany: Acme\nfacts: {}\n---\n")
-    history = {"Maya": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
+    history = {"Maya": _prior()}
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
     assert out["lapsed"][0]["graph_context"]["company"] == "Acme"
     assert "(Acme)" in out["pulse_markdown"]                      # grounded hook shown, not invented
@@ -127,7 +134,7 @@ def test_lapsed_carries_graph_context_when_tracked(tmp_path, monkeypatch):
 
 def test_history_snapshot_written_and_carried_forward(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    history = {"Maya": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"},
+    history = {"Maya": _prior(),
                "Ancient": {"last_contact": "2024-01-01", "interactions": 40, "trend": "stable"}}
     out = rp.compute(_local(_msg("Bob", 1, True), _msg("Bob", 3, False)), NOW, history=history)
     rp._persist_state(out)
@@ -154,7 +161,7 @@ def test_empty_window_emits_no_lapsed_and_preserves_prior_state(tmp_path, monkey
     # A degraded/empty read (Bridge offline) must NOT mark everyone "fully lost touch" nor
     # overwrite the longitudinal state with an empty snapshot.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    history = {"Maya": {"last_contact": "2026-06-30", "interactions": 12, "trend": "stable"}}
+    history = {"Maya": _prior(last="2026-06-30")}
     # seed prior state on disk
     prior = rp.compute(_local(_msg("Maya", 2, False)), NOW, history=history)
     rp._persist_state(prior)
@@ -201,7 +208,7 @@ def test_persist_state_atomic_no_tmp_left_behind(tmp_path, monkeypatch):
 
 def test_healthy_message_suppressed_when_only_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    history = {"Maya": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
+    history = {"Maya": _prior()}
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
     assert "healthy" not in out["pulse_markdown"].lower()
 

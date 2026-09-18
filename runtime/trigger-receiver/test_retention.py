@@ -8,6 +8,7 @@ is where it stops."""
 import importlib.util
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -16,6 +17,13 @@ HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("retention", os.path.join(HERE, "retention.py"))
 ret = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ret)
+
+log_spec = importlib.util.spec_from_file_location(
+    "sotto_log_retention_test",
+    os.path.join(HERE, "..", "..", "sotto-chief-of-staff", "_shared", "lib", "sotto_log.py"),
+)
+sotto_log = importlib.util.module_from_spec(log_spec)
+log_spec.loader.exec_module(sotto_log)
 
 DAY = 86400.0
 NOW = time.time()
@@ -41,6 +49,29 @@ def _write(root, rel, text="", age_days=0.0):
 def _line(days_ago: float, **extra) -> str:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - days_ago * DAY))
     return json.dumps({"ts": ts, **extra}) + "\n"
+
+
+def test_fallback_atomic_write_closes_fd_and_removes_temp_when_fchmod_fails(
+        _volume, monkeypatch):
+    path = _volume / "events" / "delivery.jsonl"
+    real_mkstemp = ret.tempfile.mkstemp
+    opened = []
+
+    def record_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        opened.append(fd)
+        return fd, name
+
+    monkeypatch.setattr(ret.tempfile, "mkstemp", record_mkstemp)
+    monkeypatch.setattr(ret.os, "fchmod",
+                        lambda _fd, _mode: (_ for _ in ()).throw(OSError("boom")))
+    with pytest.raises(OSError, match="boom"):
+        ret._fallback_write_text(str(path), "private receipt")
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+    assert not path.exists()
+    assert not list(path.parent.glob("delivery.jsonl.tmp.*"))
 
 
 # ── delete-older-than-N-days ─────────────────────────────────────────────────────────────────────
@@ -215,6 +246,34 @@ def test_a_small_log_is_left_exactly_as_it_is(_volume):
     assert not out["swept"]
 
 
+def test_retention_and_child_appender_share_one_rotation_lock(_volume):
+    """A child diagnostic append and the receiver sweep cannot enter their read/rewrite sections
+    together. Whichever wins after the held lock is released, the newly appended record survives."""
+    path = _write(_volume, "logs/compose_brief.log", ("old record\n" * 200))
+    started = threading.Barrier(3)
+
+    def append():
+        started.wait(timeout=5)
+        sotto_log.bounded_append(path, "NEW CHILD RECORD", max_bytes=10_000, keep_lines=200)
+
+    def truncate():
+        started.wait(timeout=5)
+        ret._apply_truncate(path, 500, NOW)
+
+    with sotto_log._log_lock(path):
+        threads = [threading.Thread(target=append), threading.Thread(target=truncate)]
+        for thread in threads:
+            thread.start()
+        started.wait(timeout=5)
+        time.sleep(0.05)
+        assert all(thread.is_alive() for thread in threads)
+
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert "NEW CHILD RECORD\n" in open(path, encoding="utf-8").read()
+
+
 # ── the sweep's failure posture ──────────────────────────────────────────────────────────────────
 
 def test_one_unreadable_entry_is_logged_and_the_rest_still_go(_volume, monkeypatch):
@@ -326,6 +385,10 @@ def test_no_table_entry_even_matches_a_memory_path():
         entry = ret.accounts_for(rel)
         assert isinstance(entry, ret.Exempt), f"{rel} is covered by {entry!r}"
         assert ret.protected(rel) or rel in ("preferences.json", "intentions.jsonl"), rel
+
+
+def test_digest_completion_receipt_is_explicitly_durable():
+    assert isinstance(ret.accounts_for("events/digest_accepted.json"), ret.Exempt)
 
 
 def test_the_never_guard_holds_even_if_a_rule_reaches_past_it(_volume, monkeypatch):

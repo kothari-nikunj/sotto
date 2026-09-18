@@ -59,34 +59,32 @@ def test_continuity_passed_meeting():
     assert not cr.meeting_passed("2026-06-25 10:00", "2026-06-19", "2026-06-23")
 
 
-def test_continuity_camelcase_thread_reply_resolves(tmp_path):
-    # End-to-end: a camelCase action whose emailThreadId was replied to resolves.
+def test_continuity_camelcase_thread_reply_signal_does_not_resolve(tmp_path):
+    # A generic thread reply signal is not task-specific completion evidence.
     os.environ["SOTTO_DATA"] = str(tmp_path)
     payload = {"today": "2026-06-23", "signals": {"replied_thread_ids": ["t-cc"]},
                "new_actions": [{"type": "reply", "channel": "gmail", "contactName": "Sarah",
                                 "contactIdentifier": "sarah@acme.com", "emailThreadId": "t-cc",
                                 "contextSummary": "reply to sarah"}]}
     out = cr.resolve(payload, NOW)
-    assert any(r["resolution"] == "replied" for r in out["resolved"])
+    assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_age_expiry(tmp_path):
-    # An open loop created 8+ days ago with no signal must expire (loops can't pile up forever).
+def test_continuity_age_does_not_expire_an_obligation(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     cr.resolve({"today": "2026-06-10", "new_actions": [
         {"type": "reply", "channel": "imessage", "contactName": "Old", "contactIdentifier": "+14155550000",
          "contextSummary": "Old still owes a reply on the Q3 deck"}]}, datetime(2026, 6, 10, 9, 0, 0))
     out = cr.resolve({"today": "2026-06-23"}, NOW)
-    assert any(e["resolution"] == "expired" for e in out["expired"])
+    assert out["expired"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_deadline_expiry(tmp_path):
-    # Past deadline (2d grace), but created recently so it's the deadline — not age — that expires it.
+def test_continuity_deadline_does_not_expire_an_obligation(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     out = cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "follow_up", "channel": "gmail", "contactName": "DL", "contactIdentifier": "dl@x.com",
          "deadlineDate": "2026-06-19", "contextSummary": "DL owes the signed contract"}]}, NOW)
-    assert any(e["resolution"] == "deadline_passed" for e in out["expired"])
+    assert out["expired"] == [] and len(out["active"]) == 1
 
 
 def test_continuity_snoozed_loop_not_surfaced(tmp_path):
@@ -126,18 +124,17 @@ def test_continuity_meeting_resolves_not_expires(tmp_path):
     assert any(r["resolution"] == "meeting_passed" and r["status"] == "resolved" for r in out["resolved"])
 
 
-def test_continuity_resolve_from_handled(tmp_path):
+def test_continuity_generic_handled_signal_does_not_resolve(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "reply", "channel": "imessage", "contactName": "Han", "contactIdentifier": "+14155551111",
          "contextSummary": "owe a reply"}]}, NOW)
     out = cr.resolve({"today": "2026-06-23",
                       "signals": {"handled": [{"identifier": "4155551111", "channel": "imessage"}]}}, NOW)
-    assert any(r["resolution"] == "brief_handled" for r in out["resolved"])
+    assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_cross_channel_reply_resolves(tmp_path):
-    # Owe Dhruv a REPLY on email; you answer him on iMessage → loop closes (the moat).
+def test_continuity_cross_channel_reply_needs_task_specific_update(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "reply", "channel": "gmail", "contactName": "Dhruv", "contactIdentifier": "dhruv@acme.com",
@@ -147,11 +144,10 @@ def test_continuity_cross_channel_reply_resolves(tmp_path):
                   "imessage": [{"is_from_me": True, "handle": "+14155552222",
                                 "timestamp": "2026-06-23 20:00:00", "text": "sent the LOI"}]}},
         datetime(2026, 6, 24, 9, 0, 0))
-    assert any(r["resolution"] == "replied" for r in out["resolved"])
+    assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_cross_channel_callback_resolves(tmp_path):
-    # Owe Dad a call_back; an outgoing phone call closes it.
+def test_continuity_callback_needs_explicit_task_completion(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "call_back", "channel": "phone", "contactName": "Dad", "contactIdentifier": "+14155559999",
@@ -159,7 +155,7 @@ def test_continuity_cross_channel_callback_resolves(tmp_path):
     out = cr.resolve({"today": "2026-06-24",
         "local": {"calls": [{"is_outgoing": True, "phone": "+14155559999", "timestamp": "2026-06-23 19:00:00"}]}},
         datetime(2026, 6, 24, 9, 0, 0))
-    assert any(r["resolution"] == "called" for r in out["resolved"])
+    assert out["resolved"] == [] and len(out["active"]) == 1
 
 
 def test_continuity_cross_channel_no_false_positive(tmp_path):
@@ -176,23 +172,23 @@ def test_continuity_cross_channel_no_false_positive(tmp_path):
     assert not out["resolved"]
 
 
-def test_continuity_replied_resolves(tmp_path):
+def test_continuity_replied_thread_signal_does_not_resolve(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     payload = {"today": "2026-06-23",
                "signals": {"replied_thread_ids": ["t1"]},
                "new_actions": [{"action_type": "reply", "channel": "email", "contact_name": "Sarah",
                                 "source_thread_id": "t1", "summary": "reply to sarah"}]}
     out = cr.resolve(payload, NOW)
-    assert any(r["resolution"] == "replied" for r in out["resolved"])
+    assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_dedup_bumps_times_surfaced(tmp_path):
+def test_continuity_dedup_does_not_claim_delivery(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     a = {"action_type": "reply", "channel": "email", "contact_name": "Sarah", "source_thread_id": "t9", "summary": "Sarah asked about the term sheet"}
     cr.resolve({"today": "2026-06-23", "new_actions": [a]}, NOW)
     out = cr.resolve({"today": "2026-06-23", "new_actions": [a]}, NOW)
     item = next(i for i in out["active"] if i["anchor_key"] == "thread:t9")
-    assert item["times_surfaced"] == 2
+    assert "times_surfaced" not in item and "delivery_surface" not in item
 
 
 
@@ -240,6 +236,16 @@ def test_style_apply_email_uses_work_email_bucket(tmp_path):
         {"text": "Hi team, here is the Q3 update. Numbers look strong this quarter. Best", "channel": "email", "work": True}]})
     out = sa.apply({"recipient": "unknown@x.com", "channel": "email"})
     assert out["bucket"] == "work_email"
+
+
+def test_style_apply_includes_explicit_tone_notes(tmp_path):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    (tmp_path / "preferences.json").write_text(json.dumps({
+        "explicit": {"tone_notes": ["keep it terse", "no exclamation marks"]}}))
+    out = sa.apply({"recipient": "unknown@x.com", "channel": "imessage"})
+    assert out["tone_notes"] == ["keep it terse", "no exclamation marks"]
+    assert "### Explicit tone instructions" in out["guidance"]
+    assert "- keep it terse" in out["guidance"]
 
 
 def test_style_back_channel_and_capitalization():

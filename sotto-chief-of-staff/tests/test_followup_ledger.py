@@ -55,7 +55,7 @@ def test_commitment_with_email_becomes_follow_up_ledger_item(tmp_path, monkeypat
     it = items[_ganchor("m-acme", "send the deck",
                         source_snippet="Nikunj: I'll send the deck")]
     assert it["action_type"] == "follow_up"                   # the user owes it
-    assert it["status"] == "open" and it["times_surfaced"] == 1
+    assert it["status"] == "open" and "times_surfaced" not in it
     assert it["deadline"] == "2026-07-04"
     assert "send the deck" in it["summary"] and "Acme sync" in it["summary"]
 
@@ -70,7 +70,7 @@ def test_rerun_dedupes_by_anchor_key(tmp_path, monkeypatch):
     assert res["written"] == 0 and res["deduped"] == 1
     items = _ledger_items(tmp_path)
     assert len(items) == 1
-    assert items[_ganchor("m-sync", "send deck")]["times_surfaced"] == 2
+    assert "times_surfaced" not in items[_ganchor("m-sync", "send deck")]
 
 
 def test_distinct_commitments_to_same_email_both_written(tmp_path, monkeypatch):

@@ -7,6 +7,8 @@ Used by morning-brief (load prior knowledge) and the ask/people skills.
 
 Usage:
     knowledge_query.py --person "Sarah Chen"        # one person (name, email, or phone), expanded
+    knowledge_query.py --person "Sarah Chen" --topic "clinic procurement"  # topical facts first
+    knowledge_query.py --person "Sarah Chen" --editable-person  # active ids for a correction
     knowledge_query.py --calendar /tmp/sotto_cal.json --gmail /tmp/sotto_gmail.json   # today's cast
     knowledge_query.py --relevant-days 7            # fallback: everyone updated in last N days
 --person prints JSON { "<canonical_id>": "<packed string>" }.
@@ -32,6 +34,7 @@ from the packed people's `company` field, resolved through knowledge_update's on
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import glob
 import json
 import os
@@ -56,6 +59,11 @@ MAX_COMPANY_ENTRY_CHARS = 600
 MAX_COMPANY_NEWS_LINES = 3   # the file stores news newest-first (knowledge_update inserts at 0)
 
 EMAIL_RE = re.compile(r"[\w.+\-']+@[\w\-]+\.[\w.\-]+")
+TOPIC_WORD_RE = re.compile(r"[a-z0-9]{3,}")
+TOPIC_STOP = frozenset({
+    'about', 'after', 'before', 'from', 'have', 'meeting', 'sync', 'that', 'their', 'them',
+    'this', 'with', 'your',
+})
 
 
 def _fact_text(f: kg.FactMeta, now: datetime) -> str:
@@ -68,7 +76,26 @@ def _fact_text(f: kg.FactMeta, now: datetime) -> str:
     return f.text
 
 
-def pack_person(p: kg.PersonFile, expanded: bool, now: datetime) -> str:
+def _topic_words(value: str) -> set[str]:
+    return {word for word in TOPIC_WORD_RE.findall((value or '').casefold())
+            if word not in TOPIC_STOP}
+
+
+def _rank_facts(facts: list, topic: str) -> list:
+    """Keep authority first, then prefer facts sharing concrete words with the current work."""
+    words = _topic_words(topic)
+    if not words:
+        return facts
+    indexed = list(enumerate(facts))
+    indexed.sort(key=lambda item: (
+        item[1][1].source != 'user_edit',
+        -len(words & _topic_words(item[1][1].text)),
+        item[0],
+    ))
+    return [fact for _, fact in indexed]
+
+
+def pack_person(p: kg.PersonFile, expanded: bool, now: datetime, topic: str = '') -> str:
     lines = []
     identity = f"{p.name} ({p.canonical_id})"
     if p.title and p.company:
@@ -105,7 +132,7 @@ def pack_person(p: kg.PersonFile, expanded: bool, now: datetime) -> str:
     if sentences:
         lines.append("& " + "; ".join(sentences))
 
-    active = kg.sorted_active_facts(p.facts, now)
+    active = _rank_facts(kg.sorted_active_facts(p.facts, now), topic)
     limit = kg.MAX_FACTS_FOR_LLM if expanded else kg.MAX_FACTS_COMPACT
     seven_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
     facts, included = [], set()
@@ -155,6 +182,37 @@ def _calendar_attendee_emails(path: str | None) -> set:
             if isinstance(em, str) and "@" in em:
                 emails.add(em.strip().lower())
     return emails
+
+
+def _calendar_topics(path: str | None) -> dict[str, str]:
+    """Meeting subject/description text by attendee email, for bounded fact retrieval only."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+    events = data.get("events") if isinstance(data, dict) else data
+    topics: dict[str, list[str]] = defaultdict(list)
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        text = ' '.join(str(event.get(key) or '') for key in ('summary', 'title', 'description'))[:1200]
+        if not text.strip():
+            continue
+        for attendee in event.get('attendees') or []:
+            email = attendee.get('email') if isinstance(attendee, dict) else attendee
+            if isinstance(email, str) and '@' in email:
+                topics[email.strip().lower()].append(text)
+    return {email: ' '.join(values)[:2400] for email, values in topics.items()}
+
+
+def editable_person(p: kg.PersonFile, now: datetime, topic: str = '') -> dict:
+    """Bounded active fact inventory used to bind an owner correction to one existing fact."""
+    facts = _rank_facts(kg.sorted_active_facts(p.facts, now), topic)[:kg.MAX_FACTS_FOR_LLM]
+    return {'canonical_id': p.canonical_id, 'name': p.name,
+            'facts': [{'id': fid, 'text': fact.text} for fid, fact in facts]}
 
 
 def _gmail_addresses(path: str | None) -> set:
@@ -245,6 +303,9 @@ def pack_companies(domains, companies) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--person")
+    ap.add_argument("--editable-person", action="store_true",
+                    help="with --person, return active fact ids/text for an explicit correction")
+    ap.add_argument("--topic", default="", help="prefer facts relevant to this subject")
     ap.add_argument("--relevant-days", type=int, default=7)
     ap.add_argument("--calendar", help="gathered calendar JSON; today's attendees pack, and their "
                                        "email domains pull in company context")
@@ -271,13 +332,16 @@ def main():
         out = {}
         if path and os.path.exists(path):
             p = _load(path)
-            out[p.canonical_id or kg.slugify(p.name)] = pack_person(p, True, now)
+            key = p.canonical_id or kg.slugify(p.name)
+            out[key] = editable_person(p, now, args.topic) if args.editable_person else pack_person(
+                p, True, now, args.topic)
         print(json.dumps(out))
         return
 
     cutoff = now - timedelta(days=args.relevant_days)
     from source_context import allowed
     cal_emails = _calendar_attendee_emails(args.calendar) if allowed('calendar') else set()
+    calendar_topics = _calendar_topics(args.calendar) if allowed('calendar') else {}
     local = _input(args.local, 'local') if args.local else {}
     loops = _input(args.loops, 'items') if args.loops else active_loop_participants()
     participants = participant_identifiers(local=local if isinstance(local, dict) else {},
@@ -318,7 +382,8 @@ def main():
                 continue
         if len(person_knowledge) >= MAX_PEOPLE_PACKED:
             continue
-        person_knowledge[p.canonical_id or kg.slugify(p.name)] = pack_person(p, False, now)
+        topic = ' '.join(calendar_topics.get(str(i).strip().lower(), '') for i in identifiers)
+        person_knowledge[p.canonical_id or kg.slugify(p.name)] = pack_person(p, False, now, topic)
         if p.company:
             companies.append(p.company)
 

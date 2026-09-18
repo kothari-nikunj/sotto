@@ -65,6 +65,7 @@ def test_shared_photon_install_preserves_self_host_config_and_is_idempotent(tmp_
     setup = importlib.util.module_from_spec(spec); spec.loader.exec_module(setup)
     lib = tmp_path / 'skills/sotto/_shared/lib'
     lib.mkdir(parents=True); (lib / 'chatfmt.py').write_text('# fixture shared formatter')
+    (lib / 'message_targets.py').write_text('# fixture shared targets')
     original = {'model': {'default': 'my-model'}, 'plugins': {'enabled': ['other-plugin'], 'disabled': ['photon-platform']}}
     (tmp_path / 'config.yaml').write_text(yaml.safe_dump(original))
     (tmp_path / '.env').write_text('KEEP=value\nPHOTON_STREAM_SILENCE_PROBE_MS=600000\n')
@@ -74,4 +75,5 @@ def test_shared_photon_install_preserves_self_host_config_and_is_idempotent(tmp_
     assert cfg['plugins']['enabled'] == ['other-plugin', 'photon-platform']
     assert cfg['plugins']['disabled'] == []
     assert (tmp_path / 'plugins/photon-platform/chatfmt.py').read_text() == '# fixture shared formatter'
+    assert (tmp_path / 'plugins/photon-platform/message_targets.py').read_text() == '# fixture shared targets'
     assert (tmp_path / '.env').read_text() == 'KEEP=value\nPHOTON_STREAM_SILENCE_PROBE_MS=0\n'

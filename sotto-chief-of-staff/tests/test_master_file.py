@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -209,3 +210,18 @@ def test_persona_searches_for_emails_before_asking():
     assert 'knowledge_query.py" --person' in text             # step 1: the graph
     assert "search your Gmail tool" in text                   # step 2: Gmail From/To history
     assert "last resort" in text                              # asking comes third, not first
+
+
+def test_priorities_are_bounded_stable_and_replace_as_a_set(tmp_path):
+    _env(tmp_path)
+    mf.set_section("Priorities", "- Fund close\n- Maya's school")
+    first = mf.priorities()
+    assert [p["text"] for p in first["priorities"]] == ["Fund close", "Maya's school"]
+    assert all(len(p["id"]) == 16 for p in first["priorities"])
+    assert mf.priorities() == first
+    mf.set_section("Priorities", "- Hiring")
+    second = mf.priorities()
+    assert [p["text"] for p in second["priorities"]] == ["Hiring"]
+    assert second["revision"] != first["revision"]
+    with pytest.raises(ValueError, match="at most 3"):
+        mf.set_section("Priorities", "one\ntwo\nthree\nfour")

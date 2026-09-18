@@ -15,7 +15,8 @@ meeting notes — and turns it into a few moments a day that actually matter:
 - **Ask it anything, in chat:** *"prep me for my 2pm"* · *"what am I waiting on?"* · *"draft a reply
   to Sarah"* · *"find 30 min with Alex next week"* · *"who am I losing touch with?"*
 
-Two principles, everywhere: **Sotto drafts, you send** — it never sends a message on its own. And
+Two principles, everywhere: **Sotto drafts; you decide.** It can send an explicitly approved message when the relevant
+connection and send permission are enabled. It never treats a drafted suggestion as approval. And
 **it runs on YOUR infrastructure** — your Railway container, your API key, your Mac. There is no
 Sotto server and no Sotto account: nothing phones home to us, because there is no us to phone.
 And the memory it builds — the people, the open loops, your voice — is markdown and JSON on a
@@ -43,9 +44,9 @@ you ⇄ Telegram / WhatsApp / iMessage
    Sotto agent  — a container YOU deploy (Railway). Runs the brains: briefs, memory,
          │        drafts, schedules. Connects natively to Gmail + Google Calendar.
          │
-   Sotto Bridge — a tiny Mac menu-bar app. READ-ONLY: it reads iMessage, WhatsApp,
-                  calls, contacts, notes locally and streams them to YOUR agent —
-                  with a per-source toggle for anything you'd rather not share.
+   Sotto Bridge — a tiny Mac menu-bar app. Reads your selected local sources.
+                  Per-source toggles control sharing. Sending from your Mac
+                  needs the separate send switch and your explicit request.
 ```
 
 The Bridge **dials out** to your agent (no tunnels, no open ports, nothing to keep alive) and
@@ -145,6 +146,7 @@ local material, and the escape hatch) plus how to add a service:
 | [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
+| [docs/BOUNDED-MODEL-WORK.md](docs/BOUNDED-MODEL-WORK.md) | Direct background composition, durable attempt ownership, usage reports and deployment checks |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: modules, daemon threads, subprocess boundaries, and shared files on the volume |
 | [sotto-chief-of-staff/evals/README.md](sotto-chief-of-staff/evals/README.md) | Developer verification, including the continuous tracking probe and its current gaps |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
@@ -179,7 +181,7 @@ dependencies, in a virtualenv next to this tree — Homebrew's Python refuses sy
 `tools/ship.sh` uses `.venv` when it exists:
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+python3.12 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.txt
 .venv/bin/python sotto-chief-of-staff/tools/verify.py
 ```
 
@@ -188,6 +190,51 @@ pipeline, receiver, adapter, model-proxy tests, shell parsing and available publ
 guards. Tests use synthetic sources and local fixtures; none call paid models or deploy services.
 Some tests bind a local loopback server. Bridge compilation and macOS integration remain a separate
 platform verification step; backend test success alone does not certify the desktop app.
+
+The Docker build also runs [`check_runtime.py`](runtime/trigger-receiver/check_runtime.py) as
+the managed user in the installed filesystem layout. The same contract runs in both deployment
+modes in the receiver suite: a nonempty scheduled scan must produce a nudge receipt, and morning
+and evening briefs must deliver four photos through the real outbox and adapters. It checks
+missing provider IDs, retry recovery, duplicate suppression, completed effects and disabled nudges.
+Synthetic CLI and loopback sidecar fixtures replace only the external transport; no real messages
+or model calls occur. Regression tests deliberately restore the missing-import and rejected-nudge
+bugs and require the gate to fail. These checks prove our delivery contract, not live provider
+availability or device display. GitHub must separately enable required checks to prevent bypassing
+the gate at merge time.
+
+The `.in` dependency manifests hold reviewed direct pins. The generated `.txt` files include
+all transitive pins and package hashes; development uses the same runtime versions as the image.
+Edit the manifests, then run `bash tools/lock-requirements.sh` with `uv` installed and review the
+lock changes. Reproducibility comes from the *existing* `.txt` files, not from the manifests alone
+— `uv pip compile` prefers whatever version they already pin, so running the script with them in
+place regenerates them byte-for-byte; deleting one first (or otherwise running with no lock to
+prefer) lets every unpinned transitive drift to whatever is newest today. The script refuses to run
+against a missing lock unless you pass `--upgrade`, which is also how to deliberately let unpinned
+transitives move to their newest compatible version — a `.in` edit alone always keeps everything
+else exactly where it was.
+
+`verify.py`'s `verify_locks` always rejects a stale direct pin, a missing hash, and runtime/test
+version drift between the lock files, file-based and offline. When its resolver is available, it
+also closes each lock against its manifest; its output states whether that exact check ran:
+- **`uv` available and its local cache can resolve everything offline:** regenerates each lock into
+  a scratch copy (the same command `lock-requirements.sh` runs, plus `--offline`) and requires the
+  result to match the committed file byte-for-byte. It catches an orphaned
+  transitive left behind by a removed direct dependency, an unrequested package hand-added to the
+  lock, an incompatible transitive pin, and a new direct dependency added without resolving its
+  own transitives. Compatible existing pins remain preferred; this is not an upgrade check.
+- **Otherwise** (`uv` missing, or its offline cache can't resolve something): keeps the deterministic
+  file checks above and explicitly reports that the full closure check was skipped. It does not try
+  to reconstruct the graph from installed package metadata: these are universal locks, so dependencies
+  selected only on another platform or by an extra may correctly be absent from this interpreter.
+  Run the gate where `uv` has a warm cache, or regenerate and review the locks, for the exact closure
+  guarantee. Resolver conflicts and malformed inputs fail verification; only an explicit missing-cache
+  diagnostic permits the offline check to be skipped.
+
+These locks cover Sotto's Python dependencies; Hermes manages its own runtime dependencies.
+
+Release CI and the publisher also run `bash tools/verify-public-image.sh <distribution-tree>`.
+This requires a running Docker daemon and builds the files that users actually deploy, including
+Hermes compatibility checks. It does not publish an image or start a configured Sotto instance.
 
 (Working in the monorepo? `docs/ADDING-A-SOURCE.md` there covers adding a new Bridge data source —
 it edits Bridge source, so it deliberately doesn't ship in this repo.)

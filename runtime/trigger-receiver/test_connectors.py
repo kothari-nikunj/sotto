@@ -4,11 +4,16 @@ and the /setup 'Connected services' tiles). All HTTP is mocked via the injectabl
 sandbox (and CI) never talks to granola.ai."""
 import hashlib
 import base64
+import concurrent.futures
 import importlib.util
 import json
 import os
+import stat
+import threading
 import time
 import urllib.parse
+
+import pytest
 
 HERE = os.path.dirname(__file__)
 
@@ -58,6 +63,50 @@ def _use(monkeypatch, mod, tmp_path, http):
     monkeypatch.setattr(mod, "DATA", str(tmp_path))
     monkeypatch.setattr(mod, "_http", http)
     return http
+
+
+def test_atomic_writes_use_a_unique_temp_per_thread(tmp_path, monkeypatch):
+    """All receiver handlers share a PID. Force their replace calls to overlap and prove each write
+    owns a separate scratch file; the destination is one complete document and no scratch leaks."""
+    path = tmp_path / "connectors" / "shared.json"
+    payloads = [json.dumps({"writer": i, "body": str(i) * 20_000}) for i in range(8)]
+    rendezvous = threading.Barrier(len(payloads))
+    real_replace = os.replace
+
+    def replace_together(src, dst):
+        rendezvous.wait(timeout=5)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(con.os, "replace", replace_together)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(payloads)) as pool:
+        futures = [pool.submit(con.write_text, str(path), body) for body in payloads]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert path.read_text() in payloads
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(path.parent.glob("shared.json.tmp.*"))
+
+
+def test_atomic_write_closes_fd_and_removes_temp_when_fchmod_fails(tmp_path, monkeypatch):
+    path = tmp_path / "connectors" / "shared.json"
+    real_mkstemp = con.tempfile.mkstemp
+    opened = []
+
+    def record_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        opened.append(fd)
+        return fd, name
+
+    monkeypatch.setattr(con.tempfile, "mkstemp", record_mkstemp)
+    monkeypatch.setattr(con.os, "fchmod", lambda _fd, _mode: (_ for _ in ()).throw(OSError("boom")))
+    with pytest.raises(OSError, match="boom"):
+        con.write_text(str(path), "secret")
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+    assert not path.exists()
+    assert not list(path.parent.glob("shared.json.tmp.*"))
 
 
 # ── discovery fallback chain (RFC 9728 → RFC 8414 → OIDC spelling → conventional) ────────────────

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import argparse
 from datetime import datetime
 
 # Shared tz helpers so "today"/age match the brief; shared ledger loader so all the
@@ -75,7 +76,7 @@ def _entry(it: dict, today: datetime, today_str: str) -> dict:
     }
 
 
-def query() -> dict:
+def query(include_parked: bool = False) -> dict:
     today = _now_local(configured_tz() or "+00:00")
     today_str = today.strftime("%Y-%m-%d")
     you_owe, waiting = [], []
@@ -92,6 +93,17 @@ def query() -> dict:
     waiting.sort(key=sort_key)
     out = {"you_owe": you_owe, "waiting_on_them": waiting,
            "counts": {"you_owe": len(you_owe), "waiting_on_them": len(waiting)}}
+    if include_parked:
+        parked = []
+        for it in ledger_io.load_entries():
+            if it.get("status") not in ledger_io.PARKED:
+                continue
+            if ledger_io.normalize_action_type(it.get("action_type")) in ledger_io.MEETING_TYPES:
+                continue
+            parked.append(_entry(it, today, today_str))
+        parked.sort(key=sort_key)
+        out["parked"] = parked
+        out["counts"]["parked"] = len(parked)
     try:
         from sotto_log import diag
         diag(f"[loops_query] {out['counts']['you_owe']} you-owe, {out['counts']['waiting_on_them']} waiting-on")
@@ -101,4 +113,8 @@ def query() -> dict:
 
 
 if __name__ == "__main__":
-    print(json.dumps(query()))
+    parser = argparse.ArgumentParser(description="Read Sotto's open-loop ledger")
+    parser.add_argument("--parked", action="store_true",
+                        help="also return parked obligations for an explicit restore request")
+    args = parser.parse_args()
+    print(json.dumps(query(include_parked=args.parked)))

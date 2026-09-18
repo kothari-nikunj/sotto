@@ -1,26 +1,13 @@
 """Shared Sotto Photon behavior with additional managed tenant guards."""
 import asyncio
 import json
-import re
-import sys
 import os
 from pathlib import Path
 
 
-BUDGET_ERROR = re.compile(r'sotto_budget_exhausted|tenant request budget exhausted', re.IGNORECASE)
-BUDGET_NOTICE = ("Sotto has reached its pilot model allowance. New model work is paused until the allowance "
-                 "is reviewed. Waiting or retrying will not reset it.")
+BUDGET_NOTICE = ("This account has reached its usage allowance. "
+                 "The account owner needs to review the limit before I can continue.")
 TYPING_START_DELAY_SECONDS = 2.0
-
-
-def install_budget_error_reply():
-    # Keep the pinned Hermes error-category adaptation inside its managed adapter.
-    # Its generic 429 response incorrectly tells the user to retry a durable budget cap.
-    for name in ('gateway.run', '__main__'):
-        module = sys.modules.get(name)
-        replies = getattr(module, '_PROVIDER_ERROR_REPLIES', None)
-        if replies is not None and not any(reply == BUDGET_NOTICE for _, reply in replies):
-            module._PROVIDER_ERROR_REPLIES = ((BUDGET_ERROR, BUDGET_NOTICE), *replies)
 
 
 def managed():
@@ -48,9 +35,6 @@ def owner_destination(chat_id):
 def register(ctx):
     from plugins.platforms.photon import adapter as upstream  # noqa: PLC0415 — optional runtime, loaded by Hermes
     from .chatfmt import compact_handled, to_imessage  # noqa: PLC0415 — copied from the shared skill library at boot
-
-    if managed():
-        install_budget_error_reply()
 
     # The upstream scoped-secret reader also consults its persisted .env. Override
     # its single format decision for this managed registration, including CLI sends.
@@ -120,7 +104,7 @@ def register(ctx):
                 self._budget_notice_lock = asyncio.Lock()
                 self._budget_notice_sent = False
             async with self._budget_notice_lock:
-                is_budget = content.strip() == BUDGET_NOTICE or bool(BUDGET_ERROR.search(content))
+                is_budget = content.strip() == BUDGET_NOTICE
                 if is_budget and self._budget_notice_sent:
                     return upstream.SendResult(success=True, raw_response={'suppressed': 'duplicate_budget_notice'})
                 result = await super().send(chat_id, BUDGET_NOTICE if is_budget else content, reply_to, metadata)

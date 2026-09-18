@@ -28,6 +28,7 @@ import ledger_io  # noqa: E402
 import knowledge_edit  # noqa: E402
 import pending_offer  # noqa: E402
 import render_local  # noqa: E402
+from delivery_effects import loop_version  # noqa: E402
 
 BASE = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
 CHECKPOINTS = (0, 1, 7, 15, 28)
@@ -69,9 +70,20 @@ def replay():
             "Gita": "+12025550107", "Hale": "+12025550108", "Ilse": "+12025550109",
             "Jory": "+12025550110",
         }
+        # Exercise the production extraction contract: a second obligation names its observed
+        # request and explicitly distinguishes it from a reminder about the first one.
+        def request(rowid, text, at):
+            message = {"rowid": rowid, "handle": people['Ada'], "is_from_me": False,
+                       "timestamp": _iso(at), "text": text}
+            evidence = [{"sourceType": "imessage", "sourceId": str(rowid), "snippet": text}]
+            return message, evidence
+
+        pricing, pricing_refs = request(101, "Please send the pricing document.", BASE)
+        intro, intro_refs = request(102, "Can you introduce the operations lead?", BASE)
         initial = [
-            _action("Ada", people['Ada'], "Send the pricing document"),
-            _action("Ada", people['Ada'], "Introduce the operations lead"),
+            _action("Ada", people['Ada'], "Send the pricing document", evidence=pricing_refs),
+            _action("Ada", people['Ada'], "Introduce the operations lead",
+                    evidence=intro_refs, newObligation=True),
             _action("Bram", people['Bram'], "Test the staging dashboard and report findings"),
             _action("Cleo", people['Cleo'], "Receive the signed contract", "waiting_on"),
             _action("Dov", people['Dov'], "Receive the supplier quote", "waiting_on"),
@@ -86,7 +98,9 @@ def replay():
                            "observed": observed, "met": expected == observed})
 
         def live(name):
-            return any(r.get('status') in ledger_io.ACTIVE for r in find(name))
+            # Survival is "kept on disk with its history": a parked row (untouched for two weeks,
+            # hidden until touched) is retained, never expired.
+            return any(r.get('status') in ledger_io.ACTIVE | ledger_io.PARKED for r in find(name))
 
         def signal(person, text, sent_at, seen_at, source="imessage", rowid=1):
             assert sent_at <= seen_at <= now, 'The replay must not ingest events from its future'
@@ -113,13 +127,37 @@ def replay():
         for day in range(29):
             now = BASE + timedelta(days=day)
             local, new = {}, initial if day == 0 else []
+            loop_updates = []
+            if day == 0:
+                local = {"imessage": [pricing, intro]}
             if day == 1:
+                sent_pricing = {"rowid": 104, "handle": people['Ada'], "is_from_me": True,
+                                "timestamp": _iso(now), "text": "The pricing document is sent."}
                 local = {
-                    "imessage": [{"handle": people['Ada'], "is_from_me": True,
+                    "imessage": [sent_pricing, {"handle": people['Ada'], "is_from_me": True,
                                   "timestamp": now.strftime('%Y-%m-%d %H:%M:%S'), "text": "Happy birthday!"}],
                     "calendar_events": [{"summary": "Team catch-up", "start": _iso(now + timedelta(hours=1)),
                                          "attendees": [{"displayName": "Bram"}]}],
                 }
+                pricing_loop = next(row for row in find('Ada') if 'pricing' in row.get('ask', '').lower())
+                loop_updates = [{"loopId": pricing_loop['anchor_key'],
+                                 "loopVersion": loop_version(pricing_loop), "status": "resolved",
+                                 "evidence": [{"sourceType": "imessage",
+                                               "sourceId": render_local.message_evidence_id(
+                                                   sent_pricing, "imessage"),
+                                               "snippet": "pricing document is sent"}]}]
+            if day == 2:
+                tested = {"rowid": 105, "handle": people['Bram'], "is_from_me": True,
+                          "timestamp": _iso(now),
+                          "text": "I tested the staging dashboard and sent the findings."}
+                local = {"imessage": [tested]}
+                dashboard_loop = find('Bram')[0]
+                loop_updates = [{"loopId": dashboard_loop['anchor_key'],
+                                 "loopVersion": loop_version(dashboard_loop), "status": "resolved",
+                                 "evidence": [{"sourceType": "imessage",
+                                               "sourceId": render_local.message_evidence_id(
+                                                   tested, "imessage"),
+                                               "snippet": "tested the staging dashboard and sent the findings"}]}]
             if day == 6:
                 cross_key = draft('Gita', 'Can you send the signed agreement this week?', now - timedelta(hours=3))
                 late_key = draft('Hale', 'Can you send the updated implementation plan?', now)
@@ -143,9 +181,13 @@ def replay():
                 signal('Hale', 'Can you send the updated implementation plan?', BASE + timedelta(days=6, hours=1), now, rowid=3)
             if day == 28:
                 # A newly captured ask from this person is not the old fulfilled ask reopened.
-                new = [_action('Ada', people['Ada'], 'Review the new budget')]
+                budget, budget_refs = request(103, 'Please review the new budget.', now)
+                local = {"imessage": [budget]}
+                new = [_action('Ada', people['Ada'], 'Review the new budget',
+                               evidence=budget_refs, newObligation=True)]
 
-            cr.resolve({"today": now.strftime('%Y-%m-%d'), "new_actions": new, "local": local}, now)
+            resolved_pass = cr.resolve({"today": now.strftime('%Y-%m-%d'), "new_actions": new,
+                                        "local": local, "loopUpdates": loop_updates}, now)
             with patch.object(drafts.log_outcome, 'datetime', wraps=datetime) as clock:
                 clock.now.return_value = now
                 drafts.run(now)
@@ -153,8 +195,13 @@ def replay():
             if day == 0:
                 check(day, 'independent_asks', 2, len(find('Ada')))
             if day == 1:
+                check(day, 'evidence_bound_completion_accepted', ['replied'],
+                      [row.get('resolution') for row in resolved_pass['resolved']])
                 check(day, 'birthday_is_not_fulfillment', True, live('Ada'))
                 check(day, 'calendar_is_not_dashboard_review', True, live('Bram'))
+            if day == 2:
+                check(day, 'second_evidence_bound_completion_accepted', ['replied'],
+                      [row.get('resolution') for row in resolved_pass['resolved']])
             if day in (3, 6):
                 row = find('Dov')[0]
                 # Real delivery finalizer, with its normal pending precondition. The global daily
@@ -194,9 +241,14 @@ def replay():
                     {k: r.get(k) for k in ('contact_name', 'ask', 'status', 'resolution', 'chased_count')}
                     for r in ledger_io.load_entries()]})
 
+    first_week = [check for check in checks if check['day'] <= 7]
     return {"schema": 1, "days_advanced": 29,
+            "first_week_gate": {"contracts": len(first_week),
+                                "met": all(check['met'] for check in first_week),
+                                "failed": [check['id'] for check in first_week if not check['met']]},
             "checks": checks, "checkpoints": checkpoints,
             "limitations": ["Synthetic inputs; no LLM extraction or user-judgment score",
+                            "Distinct requests supply observed evidence and the explicit newObligation extraction signal",
                             "Does not test migration",
                             "Does not execute onboarding, brief generation, dashboard, or adapter reply binding",
                             "Reminder selection budget is bypassed to exercise delivered-reminder semantics"]}

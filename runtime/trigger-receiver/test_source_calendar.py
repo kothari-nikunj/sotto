@@ -15,7 +15,7 @@ def calendar(tmp_path, monkeypatch):
     spec.loader.exec_module(cc)
     now = datetime.now(timezone.utc)
     cc.HOOKS.update(data_root=lambda: str(tmp_path), find_script=lambda *a: 'synthetic_gather.py',
-                    local_today=lambda: now.date().isoformat())
+                    local_today=lambda: now.date().isoformat(), event_handled=lambda event: False)
     def write(path, value):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(value))
@@ -35,7 +35,8 @@ def calendar(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(command, 0)
     monkeypatch.setattr(cc.subprocess, 'run', gather)
     changes = []
-    cc.HOOKS['calendar_change'] = lambda event: changes.append(event) or True
+    cc.HOOKS['calendar_change_batch'] = (
+        lambda events: (changes.extend(events), {event['rowid'] for event in events})[1])
     return cc, state, now, changes
 
 
@@ -146,11 +147,15 @@ def test_restart_resumes_partial_batch_without_replaying_acknowledged_change(cal
     cc._CAL_CACHE['ts'] = 0
     assert cc.refresh_once()
     attempts = []
-    cc.HOOKS['calendar_change'] = lambda event: attempts.append(event['summary']) or len(attempts) == 1
+    def partial(events):
+        attempts.extend(event['summary'] for event in events)
+        return {events[0]['rowid']}
+    cc.HOOKS['calendar_change_batch'] = partial
     assert cc.change_tick(now) == 1
     assert attempts == ['First invite', 'Second invite']
     _restart_change_detector(cc)
-    cc.HOOKS['calendar_change'] = lambda event: changes.append(event) or True
+    cc.HOOKS['calendar_change_batch'] = (
+        lambda events: (changes.extend(events), {event['rowid'] for event in events})[1])
     assert cc.change_tick(now) == 1
     assert [change['summary'] for change in changes] == ['Second invite']
     _restart_change_detector(cc)

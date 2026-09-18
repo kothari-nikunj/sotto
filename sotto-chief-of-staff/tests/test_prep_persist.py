@@ -197,6 +197,9 @@ def test_persist_recency_facts_carry_web_research_provenance(tmp_path, monkeypat
     _, p = _person(tmp_path)
     by_text = {f.text: f for f in p.facts.values()}
     assert len(by_text) == 3                                   # bio + activity + personal
+    # All three are DURABLE and unrelated: the shared "Per web search" preamble must not make a
+    # short recency item look like a restatement of the bio and archive it on the way in.
+    assert all(f.status == "active" for f in by_text.values())
     bio = by_text["Per web search: CEO at Acme — Leads Acme's platform org."]
     assert bio.source == "web_research" and bio.conf == 0.55
     act = by_text["Per web search (late July 2026): Published an agent-memory piece."]

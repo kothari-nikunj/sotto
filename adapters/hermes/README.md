@@ -17,6 +17,7 @@ Wires the portable Sotto backend into a [Hermes](https://hermes-agent.nousresear
 | `managed_exec.py` · `control_vault.py` | Managed unprivileged process launch, nondumpable receiver and process-private control credential |
 | `managed_volume.py` · `recovery.py` | Managed mount identity and verified offline tenant recovery; see [RECOVERY.md](RECOVERY.md) |
 | `model_lease.py` | Existing receiver heartbeat renews the proxy model lease; sanitized expiry receipt only |
+| `provider_error_compat.py` | Hash-checked pinned Hermes gateway adaptation: one plain-language provider failure at the shared chat boundaries, never the raw provider payload (see [Provider-error gateway pin](#provider-error-gateway-pin)) |
 | `managed_config.py` · `photon_setup.py` · `photon_probe_compat.py` · `sotto_photon/` | Managed model/channel reconciliation and the pinned Photon adapter compatibility seam |
 | `wa_pair.py` | drives `hermes whatsapp` non-interactively under a PTY (headless/cloud QR pairing) |
 
@@ -30,7 +31,41 @@ Hermes still owns interactive chat and tool discretion; its generic one-shot bou
 `SOTTO_RUN_SKILL="hermes -z"`. Standalone adapter installs retain their host scheduler and are not a
 claim of receiver-level durable delivery parity.
 
-Both the container boot and local installer reconcile Hermes' per-platform
+## Provider-error gateway pin
+
+`provider_error_compat.py` edits two files inside the third-party Hermes checkout —
+`gateway/run.py` and `gateway/run_turn_runner.py` — and refuses to touch either unless its
+whole-file SHA256 matches `PINNED_SOURCE_SHA256` / `PINNED_TURN_RUNNER_SHA256`. **Those two
+hashes are the gateway files of the Hermes commit in [`hermes.commit`](hermes.commit)**
+(`245e4800`); changing that commit invalidates both.
+
+`provider_error_pinned_excerpt.py.txt` and `provider_error_turn_runner_excerpt.py.txt` are
+**hand-written test fixtures, not the pinned bytes.** They reproduce only the functions this seam
+patches, so the tests can exercise the patched behaviour in a container that has no Hermes source.
+They have their own hashes in `test_provider_error_compat.py`. The only test that touches the real
+pin is `test_actual_checkout_matches_declared_pin_when_available`, which skips unless
+`$HERMES_PINNED_CHECKOUT` (or `/usr/local/lib/hermes-agent`) holds a full reviewed checkout.
+
+Three places enforce the pin: the image build (`Dockerfile`, `--check`), container boot
+(`start.sh`) and the local installer (`install.sh`). The build check exists so that a pin bump
+fails the image rather than crash-looping every container.
+
+When bumping `hermes.commit`:
+
+1. `python3 adapters/hermes/provider_error_compat.py --check <new-checkout>/gateway/run.py` —
+   it names the expected and found hashes for whichever file moved.
+2. Re-read both `gateway/run.py` and `gateway/run_turn_runner.py` in the new checkout: the
+   upstream classifier, its reply table and the stream finalizer must still mean what this seam
+   assumes before the patch is re-applied.
+3. Update `PINNED_SOURCE_SHA256` / `PINNED_TURN_RUNNER_SHA256`, and the `OLD_*` anchor constants
+   if the surrounding code moved. `--check` fails loudly for a hash that matches with an anchor
+   that no longer resolves.
+4. Update the two `.py.txt` fixtures and their hashes in `test_provider_error_compat.py` if the
+   functions they mirror changed.
+5. `HERMES_PINNED_CHECKOUT=<new-checkout> python3 -m pytest adapters/hermes/test_provider_error_compat.py`
+   so the real-pin test runs instead of skipping.
+
+Both the container boot and local installer apply the reviewed provider-error gateway boundary and reconcile Hermes' per-platform
 `gateway_restart_notification: false` for Telegram, Photon and configured channels.
 This suppresses infrastructure lifecycle chatter at its origin, preserving ordinary replies,
 typing, Tapbacks and actionable source/provider failures. The digest procedure invokes

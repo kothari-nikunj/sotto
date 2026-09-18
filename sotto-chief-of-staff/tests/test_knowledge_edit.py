@@ -155,7 +155,7 @@ def test_loop_resolve_writes_resolver_fields(tmp_path):
     assert str(fm["resolved_at"])[:10] == TODAY
     # every other field survives the rewrite
     assert fm["anchor_key"] == "email:reply:name:sarah chen"
-    assert fm["times_surfaced"] == 2 and fm["summary"] == "Reply about the deck"
+    assert fm["times_surfaced"] == 2 and fm["summary"] == "Reply about the deck"  # legacy field stays inert
     assert "_path" not in fm
 
 
@@ -370,7 +370,7 @@ def test_loop_add_writes_a_ledger_entry_in_the_resolver_s_shape(tmp_path):
     assert fm["channel"] == "manual" and fm["source"] == "user_added"
     assert fm["summary"] == "Send Sarah the revised deck"
     assert fm["contact_name"] == "Sarah Chen" and fm["deadline"] == "2026-08-12"
-    assert fm["created_at"] == "2026-08-06 07:00:00" and fm["times_surfaced"] == 1
+    assert fm["created_at"] == "2026-08-06 07:00:00" and "times_surfaced" not in fm
 
 
 def test_loop_add_can_record_something_the_counterpart_owes(tmp_path):
@@ -392,7 +392,7 @@ def test_loop_add_dedupes_the_same_ask_instead_of_forking_a_file(tmp_path):
     assert again["anchor_key"] == first["anchor_key"] and again["created"] is False
     assert len(_loop_files(tmp_path)) == 1
     fm = _loop_fm(tmp_path, _loop_files(tmp_path)[0])
-    assert fm["times_surfaced"] == 2 and fm["deadline"] == "2026-08-20"
+    assert "times_surfaced" not in fm and fm["deadline"] == "2026-08-20"
     # a DIFFERENT ask to the same person is its own loop
     other = ke.op_loop_add("Book the offsite room", contact="Sarah Chen", now=NOW)
     assert other["anchor_key"] != first["anchor_key"] and len(_loop_files(tmp_path)) == 2

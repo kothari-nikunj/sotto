@@ -40,7 +40,7 @@ RESEARCH_CONCURRENCY=5
 for retired in \
   "SOTTO_ESCALATION_WINDOW_MIN=ESCALATION_WINDOW_MIN_DEFAULT (event-triage/scripts/triage_event.py)" \
   "SOTTO_EVENT_MAX_AGE_MIN=EVENT_MAX_AGE_MIN (event-triage/scripts/triage_event.py)" \
-  "SOTTO_VIP_PRIORITY=VIP_PRIORITY_MIN (event-triage/scripts/triage_event.py)" \
+  "SOTTO_VIP_PRIORITY=removed: VIP is a stated name or a family_of relation (event-triage/scripts/triage_event.py)" \
   "SOTTO_VALVE_MAX_AGE_MIN=VALVE_MAX_AGE_MIN (event-triage/scripts/triage_event.py)" \
   "SOTTO_VALVE_MAX_PER_HOUR=VALVE_MAX_PER_HOUR (event-triage/scripts/triage_event.py)" \
   "SOTTO_VALVE_INTERVAL_SECS=VALVE_INTERVAL_SECS_DEFAULT (trigger-receiver/receiver.py)" \
@@ -148,6 +148,16 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "$(cat /app/hermes-image-commit.txt)" \
     || { echo "[sotto] managed Hermes commit mismatch; refusing to start" >&2; exit 1; }
 fi
+# One shared gateway boundary serves Telegram, WhatsApp, Photon/iMessage, and managed Cloud chat.
+# Keep provider diagnostics in logs while chat gets one short, actionable final response.
+# The image build already ran this in --check mode, so reaching the failure branch here means the
+# runtime on this container is not the one the image was built and reviewed against.
+if ! python3 /app/adapters/hermes/provider_error_compat.py \
+     /usr/local/lib/hermes-agent/gateway/run.py; then
+  echo "[sotto] Refusing to start: chat would show raw provider error payloads." >&2
+  echo "[sotto] Set SOTTO_REFRESH_HERMES=1 for one redeploy to adopt the pinned image runtime." >&2
+  exit 1
+fi
 if [ -n "$RUN_HVER" ] && [ -n "$IMG_HVER" ] && [ "$RUN_HVER" != "unknown" ] && \
    [ "$IMG_HVER" != "unknown" ] && [ "$RUN_HVER" != "$IMG_HVER" ]; then
   echo "[sotto] WARNING: running Hermes differs from this image's — the volume seed is stale."
@@ -244,11 +254,14 @@ GKEY="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-${GOOGLE_AI_API_KEY:-}}}"
 if [ -n "$GKEY" ]; then
   export GOOGLE_AI_API_KEY="$GKEY" GEMINI_API_KEY="$GKEY" GOOGLE_API_KEY="$GKEY"
 fi
+# Independent, per-boot chat capability. Keep it out of shared config and the supervisor's
+# exported environment: only the receiver and the attended gateway receive it.
+CHAT_SEND_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-  SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
+  SOTTO_CHAT_SEND_TOKEN="$CHAT_SEND_TOKEN" SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
     python3 /app/adapters/hermes/managed_exec.py receiver /app/trigger-receiver/receiver.py &
 else
-  SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
+  SOTTO_CHAT_SEND_TOKEN="$CHAT_SEND_TOKEN" SOTTO_MCP_TOKEN="${BRIDGE_TOKEN:-}" SOTTO_RUN_SKILL="hermes -z" \
     python3 /app/adapters/hermes/process_group.py python3 /app/trigger-receiver/receiver.py &
 fi
 RECEIVER_PID=$!
@@ -787,9 +800,11 @@ fi
 # Both essential processes belong to the same supervisor, including an unlinked first boot.
 if [ "$START_GATEWAY" = "1" ]; then
   if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-    python3 /app/adapters/hermes/managed_exec.py gateway hermes gateway &
+    SOTTO_CHAT_SEND_TOKEN="$CHAT_SEND_TOKEN" python3 /app/adapters/hermes/managed_exec.py gateway \
+      /usr/local/lib/hermes-agent/venv/bin/python /app/adapters/hermes/chat_gateway.py &
   else
-    env -u SOTTO_CONTROL_TOKEN python3 /app/adapters/hermes/process_group.py hermes gateway &
+    SOTTO_CHAT_SEND_TOKEN="$CHAT_SEND_TOKEN" env -u SOTTO_CONTROL_TOKEN python3 /app/adapters/hermes/process_group.py \
+      /usr/local/lib/hermes-agent/venv/bin/python /app/adapters/hermes/chat_gateway.py &
   fi
   GW_PID=$!
 fi

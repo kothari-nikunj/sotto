@@ -14,14 +14,16 @@ HERE = Path(__file__).parent
 def test_gateway_does_not_inherit_workload_renewal_credential(tmp_path):
     """Execute the shipped launch line against a fake gateway, with a control credential set."""
     launcher = (HERE / 'start.sh').read_text()
-    command = next(line for line in launcher.splitlines()
-                   if 'process_group.py hermes gateway &' in line).strip().removesuffix('&').strip()
+    command = next(line for line in launcher.replace('\\\n', '').splitlines()
+                   if 'process_group.py' in line and 'chat_gateway.py' in line).strip().removesuffix('&').strip()
     command = command.replace('/app/adapters/hermes/process_group.py', shlex.quote(str(HERE / 'process_group.py')))
-    gateway = tmp_path / 'hermes'
-    gateway.write_text('#!/usr/bin/env python3\nimport os\nprint("SOTTO_CONTROL_TOKEN" in os.environ)\n')
+    gateway = tmp_path / 'chat_gateway.py'
+    gateway.write_text('import os\nassert os.environ["SOTTO_CHAT_SEND_TOKEN"] == "test-chat"\nprint("SOTTO_CONTROL_TOKEN" in os.environ)\n')
+    command = command.replace('/usr/local/lib/hermes-agent/venv/bin/python', shlex.quote(sys.executable))
+    command = command.replace('/app/adapters/hermes/chat_gateway.py', shlex.quote(str(gateway)))
     gateway.chmod(0o700)
     env = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ['PATH'],
-               SOTTO_CONTROL_TOKEN='<test-control-token>')
+               SOTTO_CONTROL_TOKEN='<test-control-token>', CHAT_SEND_TOKEN='test-chat')
     result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=5)
     assert result.returncode == 0 and result.stdout.strip() == 'False'
     assert 'RECEIVER_PID=$!' in launcher

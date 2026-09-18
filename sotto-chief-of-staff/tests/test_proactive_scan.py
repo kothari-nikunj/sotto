@@ -109,30 +109,6 @@ def test_dedup_marks_and_skips(tmp_path, monkeypatch):
     assert "bday:jordan" in ps._load_state(date)
 
 
-def test_retune_offer_fires_when_pile_heavy_and_cooldown_ok():
-    now = _at(10)
-    out = ps.scan([], [], {}, "me@x.com", now, stale_count=6, retune_offer_allowed=True)
-    n = [x for x in out["nudges"] if x["kind"] == "retune_offer"]
-    assert n and "6 items" in n[0]["detail"]
-
-
-def test_retune_offer_suppressed_below_threshold_or_in_cooldown():
-    now = _at(10)
-    # below threshold → nothing even if allowed
-    assert not [x for x in ps.scan([], [], {}, "me@x.com", now, 5, True)["nudges"] if x["kind"] == "retune_offer"]
-    # at threshold but still in cooldown → nothing
-    assert not [x for x in ps.scan([], [], {}, "me@x.com", now, 9, False)["nudges"] if x["kind"] == "retune_offer"]
-
-
-def test_retune_cooldown_marker(tmp_path, monkeypatch):
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    assert ps.RETUNE_OFFER_COOLDOWN_DAYS == 7          # the window this test walks
-    assert ps._retune_cooldown_ok("2026-06-25") is True          # never offered → allowed
-    ps._stamp_retune_offer("2026-06-25")
-    assert ps._retune_cooldown_ok("2026-06-28") is False         # 3 days later → still cooling down
-    assert ps._retune_cooldown_ok("2026-07-03") is True          # 8 days later → allowed again
-
-
 def _touch_brief_marker(tmp_path, date, kind, mtime=None):
     briefs = tmp_path / "briefs"
     briefs.mkdir(parents=True, exist_ok=True)
@@ -166,28 +142,6 @@ def test_yesterdays_late_evening_brief_still_counts(tmp_path, monkeypatch):
     assert ps._recent_brief_delivered(now) is True
 
 
-def test_main_suppresses_retune_offer_near_fresh_brief(tmp_path, monkeypatch, capsys):
-    """End-to-end wiring: a heavy stale pile that would fire retune_offer stays silent while a
-    brief marker is fresh, then fires once the 2h window has passed."""
-    import json
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
-    monkeypatch.setenv("SOTTO_QUIET_START", "0")                 # start == end → quiet never
-    monkeypatch.setenv("SOTTO_QUIET_END", "0")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 10)     # pile well over the threshold
-    monkeypatch.setattr(sys, "argv", ["proactive_scan.py"])
-    now = ps._now_local("+00:00")
-    marker = _touch_brief_marker(tmp_path, now.strftime("%Y-%m-%d"), "evening")
-    ps.main()
-    out = json.loads(capsys.readouterr().out)
-    assert not [n for n in out["nudges"] if n["kind"] == "retune_offer"]   # brief just went out
-    old = (now - timedelta(hours=3)).timestamp()
-    os.utime(marker, (old, old))                                 # brief was 3h ago
-    ps.main()
-    out = json.loads(capsys.readouterr().out)
-    assert [n for n in out["nudges"] if n["kind"] == "retune_offer"]      # now the offer fires
-
-
 # ── ONE rulebook: the proactive lane spends the funnel's budget and writes its verdicts ──────────
 
 def _quiet_never(monkeypatch, tmp_path):
@@ -195,7 +149,6 @@ def _quiet_never(monkeypatch, tmp_path):
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
     monkeypatch.setenv("SOTTO_QUIET_START", "0")
     monkeypatch.setenv("SOTTO_QUIET_END", "0")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 0)
 
 
 def _run_main(monkeypatch, capsys, *argv):
@@ -357,7 +310,6 @@ def test_main_reads_the_snooze_from_preferences_and_burns_no_dedup_state(tmp_pat
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
     monkeypatch.setenv("SOTTO_QUIET_START", "0")                 # start == end → quiet never
     monkeypatch.setenv("SOTTO_QUIET_END", "0")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 0)
     now = ps._now_local("+00:00")
     date = now.strftime("%Y-%m-%d")
     local_path = tmp_path / "local.json"
@@ -493,7 +445,6 @@ def test_quiet_hours_record_what_they_suppressed_once_a_day(tmp_path, monkeypatc
     import json
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 0)
     now = ps._now_local("+00:00")
     date = now.strftime("%Y-%m-%d")
     monkeypatch.setenv("SOTTO_QUIET_START", str(now.hour))       # quiet, right now
@@ -567,7 +518,6 @@ def test_a_chase_held_by_the_clock_is_never_counted(tmp_path, monkeypatch, capsy
     finalized = []
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 0)
     now = ps._now_local("+00:00")
     monkeypatch.setenv("SOTTO_QUIET_START", str(now.hour))
     monkeypatch.setenv("SOTTO_QUIET_END", str((now.hour + 1) % 24))
@@ -629,7 +579,8 @@ def test_receiver_run_defers_chase_state_until_the_host_confirms_delivery(
     effects = json.loads((tmp_path / "events" / ("delivery-effects-" + "a" * 24 + ".json")).read_text())
     assert effects["decision_ids"] == [out["nudges"][0]["decision_id"]]
     assert {"kind": "chase", "anchor_key": "email:waiting_on:id:acme"} in effects['effects']
-    assert {e['kind'] for e in effects['effects']} == {'eligibility', 'proactive_seen', 'chase'}
+    assert {e['kind'] for e in effects['effects']} == {
+        'eligibility', 'unsolicited_nudge', 'proactive_seen', 'chase'}
     assert out['nudges'][0]['key'] not in ps._load_state(out['_delivery_date'])
 
 
@@ -698,32 +649,19 @@ def test_a_chased_out_loop_asks_its_own_named_question(tmp_path, monkeypatch):
     assert not [x for x in out["nudges"] if x["kind"] == "retune_offer"]
 
 
-def test_the_named_question_has_its_own_clock_not_the_tidy_ups(tmp_path, monkeypatch):
-    """One unanswered ask deserves the question even on a tidy day — and it is asked the first
-    tick it comes due, whatever the tidy-up offer's 7-day cooldown says: a generic cleanup offer on
-    day 5 used to push Maya's question to day 12 while the loop took a named line in every brief."""
+def test_the_named_question_has_its_own_clock(tmp_path, monkeypatch):
     _handoff_ledger(monkeypatch)
     now = _at(10)
     kinds = lambda **kw: [n["kind"] for n in ps.scan([], [], {}, "me@x.com", now, **kw)["nudges"]]
-    assert kinds(stale_count=0, retune_offer_allowed=False, handoff_allowed=True,
-                 handoff_candidates=ps._handoff_candidates()) == ["handoff"]
-    assert kinds(stale_count=0, retune_offer_allowed=True, handoff_allowed=False,
-                 handoff_candidates=ps._handoff_candidates()) == []
-    # the named question still wins over the pile offer when both are due
-    assert kinds(stale_count=9, retune_offer_allowed=True, handoff_allowed=True,
-                 handoff_candidates=ps._handoff_candidates()) == ["handoff"]
-    # a heavy pile with nothing chased out still gets the generic tidy-up offer
-    assert kinds(stale_count=9, retune_offer_allowed=True, handoff_candidates=[]) == ["retune_offer"]
+    assert kinds(handoff_allowed=True, handoff_candidates=ps._handoff_candidates()) == ["handoff"]
+    assert kinds(handoff_allowed=False, handoff_candidates=ps._handoff_candidates()) == []
+    assert kinds(handoff_allowed=True, handoff_candidates=[]) == []
 
 
-def test_the_named_question_does_not_spend_the_tidy_up_cooldown(tmp_path, monkeypatch, capsys):
-    """The hand-off is owed, not offered: asking it leaves the tidy-up window untouched, and it is
-    asked once because its delivery stamps the row (`handoff_asked_at`), not a shared marker."""
+def test_the_named_question_is_delivery_stamped_and_waits_near_a_brief(tmp_path, monkeypatch, capsys):
     _quiet_never(monkeypatch, tmp_path)
     _handoff_ledger(monkeypatch)
-    date = ps._now_local("+00:00").strftime("%Y-%m-%d")
     assert [n["kind"] for n in _run_main(monkeypatch, capsys)["nudges"]] == ["handoff"]
-    assert ps._retune_cooldown_ok(date) is True                # the tidy-up window is NOT running
     # …and inside the 2h post-brief window the question waits (the brief carried the loop)
     _handoff_ledger(monkeypatch)
     monkeypatch.setattr(ps, "_recent_brief_delivered", lambda now_local, within_hours=2: True)
@@ -803,7 +741,6 @@ def test_a_chase_counts_only_once_it_has_actually_gone_out(tmp_path, monkeypatch
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
     monkeypatch.setenv("SOTTO_QUIET_START", "0")
     monkeypatch.setenv("SOTTO_QUIET_END", "0")
-    monkeypatch.setattr(ps, "_stale_loop_count", lambda: 0)
     cr_spec = importlib.util.spec_from_file_location(
         "cr_e2e", os.path.join(ROOT, "morning-brief", "scripts", "continuity_resolve.py"))
     cr = importlib.util.module_from_spec(cr_spec); cr_spec.loader.exec_module(cr)

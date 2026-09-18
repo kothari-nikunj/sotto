@@ -106,6 +106,7 @@
 </style>
 </head>
 <body>
+<aside style="padding:12px 24px;font-size:13px" id="model-work-summary"></aside>
 
 <!-- THE RULES ISLAND — byte-identical to the one in playground-architecture.html. -->
 <script type="application/json" id="sotto-rules">
@@ -146,9 +147,6 @@
     "start_hour": 21,
     "end_hour": 7
   },
-  "vip": {
-    "min_priority": 10
-  },
   "tier1": {
     "text_max_chars": 1500
   },
@@ -157,7 +155,8 @@
   },
   "freshness": {
     "event_max_age_min": 30,
-    "missed_call_max_age_min": 240
+    "missed_call_max_age_min": 240,
+    "delivery_fresh_nudge_min": 30
   },
   "cooldown": {
     "min": 20
@@ -198,7 +197,8 @@
   },
   "continuity": {
     "deadline_grace_days": 2,
-    "terminal_retention_days": 30
+    "terminal_retention_days": 30,
+    "park_after_days": 14
   },
   "retention": {
     "notes_cache_days": 1,
@@ -247,6 +247,9 @@
     "feedback_limit": 8,
     "source_retry_seconds": 3600,
     "unchanged_extraction_attempts": 2,
+    "unchanged_protocol_attempts": 2,
+    "unchanged_dreamer_attempts": 2,
+    "protocol_recheck_seconds": 86400,
     "conversation_messages": 12,
     "conversation_text_chars": 400,
     "conversation_total_chars": 4800
@@ -286,7 +289,8 @@
       "missed_call",
       "escalation",
       "post_meeting",
-      "calendar_change"
+      "calendar_change",
+      "meeting_prep"
     ],
     "meeting_hold_exempt": [
       "missed_call",
@@ -322,6 +326,7 @@
   },
   "work": {
     "background_max_wait_seconds": 1800,
+    "shutdown_grace_seconds": 10,
     "lease_seconds": 120,
     "max_attempts": 3,
     "max_workers": 2,
@@ -337,6 +342,7 @@
   },
   "brief": {
     "preparation_max_age_minutes": 30,
+    "artifact_max_age_hours": 2,
     "notes_cache_hours": 24,
     "welcome_seed_seconds": 20,
     "followup_retention_days": 7
@@ -349,6 +355,63 @@
   "proxy": {
     "requests_per_window": 60,
     "rate_window_seconds": 60
+  },
+  "model_work": {
+    "retention_days": 90,
+    "attempt_lease_seconds": 900,
+    "interruption_recoveries": 2,
+    "artifact_lock_shards": 256,
+    "notification_context_chars": 48000,
+    "attempts": {
+      "notification": 2,
+      "triage": 2,
+      "digest": 2,
+      "memory_extract": 2,
+      "memory_curate": 2,
+      "brief": 12,
+      "brief_extract": 6,
+      "brief_critic": 3,
+      "brief_revise": 3,
+      "followup": 2,
+      "research": 4
+    },
+    "output": {
+      "notification": 4096,
+      "triage": 2048,
+      "digest": 4096,
+      "memory_extract": 16384,
+      "memory_curate": 8192,
+      "brief": 65536,
+      "brief_extract": 65536,
+      "brief_critic": 65536,
+      "brief_revise": 65536,
+      "followup": 8192,
+      "research": 8192
+    },
+    "low_thinking_tasks": [
+      "notification",
+      "triage",
+      "digest",
+      "memory_extract",
+      "memory_curate",
+      "followup",
+      "research"
+    ],
+    "notification_copy_chars": 1200
+  },
+  "phase2": {
+    "history_stale_hours": 24,
+    "candidate_cooldown_days": 30,
+    "reply_sample_limit": 32,
+    "reply_min_samples": 2,
+    "learned_expiry_days": 60,
+    "confidence_decay_per_week": 0.08,
+    "vip_held_meetings": 3,
+    "vip_held_weeks": 3,
+    "vvip_held_meetings": 6,
+    "vvip_held_weeks": 4,
+    "meeting_attendee_cap": 1,
+    "priority_max": 3
   }
 }
 </script>
@@ -396,6 +459,14 @@
 <script>
 /* ═══════════════ the island, and the one function that reads it ═══════════════ */
 const R = JSON.parse(document.getElementById('sotto-rules').textContent);
+const mw = R.model_work;
+document.getElementById('model-work-summary').innerHTML =
+  '<p>One primary notification per push; templates survive writer failures. Scheduling stays a question until all calendars are covered. No daily dollar cutoff.</p>' +
+  '<table><tr><th>Operation</th><th>Attempts</th><th>Native output ceiling</th><th>Thinking</th></tr>' +
+  Object.entries(mw.attempts).map(([task,attempts]) => `<tr><td>${task}</td><td>${attempts}</td><td>${mw.output[task].toLocaleString('en-US')}</td><td>${mw.low_thinking_tasks.includes(task) ? 'low' : 'unchanged'}</td></tr>`).join('') +
+  '</table>' + `<p>Brief extraction, critic and revision own separate allowances. Stable job IDs preserve retries; later jobs may run again. Interrupted claims remain unknown spend with at most ${mw.interruption_recoveries} replacements after worker death or ${mw.attempt_lease_seconds} seconds. Receipts: ${mw.retention_days} days; lock shards: ${mw.artifact_lock_shards}; notification context: ${mw.notification_context_chars.toLocaleString('en-US')} characters; selected copy: ${mw.notification_copy_chars.toLocaleString('en-US')} characters.</p>` +
+  '<a href="BOUNDED-MODEL-WORK.md">Execution and accounting contract</a>';
+
 
 function fill(s){
   return String(s).replace(/\{([a-z_]+)\.([a-z_]+)(?::([a-z]+))?\}/g, function(m,g,k,fmt){
@@ -445,19 +516,19 @@ const LOOPS = [
       "s": "Observe",
       "name": "Read bounded history",
       "file": "_shared/scripts/memory_cycle.py · context_learning.py",
-      "note": "Resume frozen pages after failure. Only durable cited facts enter the graph; outstanding work remains owned by the live ledger."
+      "note": "Resume frozen pages after failure. An unchanged protocol failure gets {learning.unchanged_protocol_attempts} attempts, then one compatibility probe every {learning.protocol_recheck_seconds:hours}h; an expired Gmail continuation restarts the same frozen window from page one, and may do so again only after an attempt reaches further into the window than the attempt before the last restart did, so paid pages are never replayed twice over. Availability and transient transport failures keep retrying. Only durable cited facts enter the graph; outstanding work remains owned by the live ledger."
     },
     {
       "s": "Curate",
       "name": "The Dreamer",
       "file": "_shared/scripts/dreamer.py → knowledge_update.consolidate",
-      "note": "Select existing fact IDs, check the live file hash, preserve corrections, flag contradictions. No action, permission or code changes."
+      "note": "Select existing fact IDs only when semantic evidence changes; bookkeeping rewrites do not trigger curation. An unchanged malformed response gets {learning.unchanged_dreamer_attempts} attempts, then waits for changed request or evidence; no daily work count is added. Check the live file hash and leave concurrent evidence unreviewed. Preserve corrections and flag contradictions. No action, permission or code changes."
     },
     {
       "s": "Rate",
       "name": "An actual item was useful",
       "file": "_shared/scripts/usefulness_feedback.py → log_outcome.py",
-      "note": "Owner-only useful/not-useful examples bound to an archived brief or offered draft. Neither reactions nor silence imply approval or a sender mute."
+      "note": "Owner-only useful/not-useful ratings identify a unique brief item. A hashed locator resolves a bounded excerpt only while the retained delivered archive and its recorded source permissions remain available. Drafts without provenance are excluded. Neither reactions nor silence imply approval or a sender mute."
     },
     {
       "s": "Use",
@@ -554,7 +625,7 @@ const LOOPS = [
       { s: "Store", name: "style.json", file: "$SOTTO_DATA/style.json (schema v2)", note: "Canonical, recent, per-person and confirmed samples, each with an age and a score. The per-person bucket is keyed by the knowledge graph's <code>canonical_id</code> — the seeded index adopts the person file's id on any identifier overlap, so one human's email voice and texting voice accumulate in one bucket instead of two." },
       { s: "Apply", name: "Into the prompt", file: "_shared/scripts/style_apply.py", note: "Verbatim samples, per-person first, then the bucket, plus master guardrails: capitalization, exclamation habit, openers and closings." },
       { s: "Draft", name: "The draft sounds like you", file: "draft-reply skill · the nudge's ready-to-send reply", note: "Never sent — always a draft behind a tap." },
-      { s: "Confirm", name: "A sample is confirmed", file: "dashboard Voice card → style_extract.py --confirm · draft_outcomes.py on a verbatim send", note: "Floored at {style.confirmed_floor:pct}%, TTL-immune, quoted first, newest {style.confirmed_cap} per register kept. Two voters, one writer: your explicit dashboard vote, or the strongest implicit one — you pressed send on it. (A caveat the page owes you: a verbatim send is text Sotto wrote, so this bucket can reinforce its own register — pressing send is consent to that message, not a vote that the model's voice is yours. The cap and the recency order bound the drift; the edit-diff arc is what would correct it.)" }
+      { s: "Confirm", name: "A sample is confirmed", file: "dashboard Voice card → style_extract.py --confirm · draft_outcomes.py on a verbatim send", note: "Floored at {style.confirmed_floor:pct}%, TTL-immune, quoted first, newest {style.confirmed_cap} per register kept. Style extraction runs before grading, and older executed outcomes retry missing confirmation without duplicate receipts. Two voters, one writer: your explicit dashboard vote, or the strongest implicit one — you pressed send on it. (A caveat the page owes you: a verbatim send is text Sotto wrote, so this bucket can reinforce its own register — pressing send is consent to that message, not a vote that the model's voice is yours. The cap and the recency order bound the drift; the edit-diff arc is what would correct it.)" }
     ]
   },
   {
@@ -586,24 +657,24 @@ const LOOPS = [
     id: "continuity",
     title: "Continuity",
     status: "closed",
-    one: "Commitments → the ledger → every brief until resolved → deterministic resolution before the model ever runs; what you're owed is chased instead of forgotten.",
+    one: "Commitments → the ledger → every brief until resolved (or parked, untouched two weeks, never deleted) → deterministic resolution before the model ever runs; what you're owed is chased instead of forgotten.",
     hub: ["Continuity", "the open-loop ledger"],
-    closes: "Resolution is deterministic and runs <em>before</em> the LLM: replied threads close, passed meetings close, a deadline {continuity.deadline_grace_days:word} days gone expires something YOU owe, terminal items are pruned after {continuity.terminal_retention_days:word} days. Closure never depends on the model noticing.",
+    closes: "The model proposes a task-specific update; code verifies ledger id and revision, source message id, verbatim quote, counterpart, direction and original timestamp. Unique source evidence can recover an existing task if its ID is omitted; a different message alone never creates a task. Age, deadlines, generic replies and calendar contact never close an obligation. Terminal history is pruned after {continuity.terminal_retention_days:word} days.",
     detail: [
-      "Dedup is by <code>anchor_key</code>, so the same ask re-extracted tomorrow lands on the same file and bumps <code>times_surfaced</code> instead of breeding a second one. That counter is what lets the brief say “still open, third day”.",
+      "Dedup folds the same obligation onto its existing anchor. Capture never counts as surfacing: only an accepted brief naming the exact obligation and version writes a delivery key. Legacy counts stay untrusted.",
       "The ledger takes DEBTS, and the bar is checked in code before a row is ever minted, not left to the model's judgment: an action with no summary (“a debt has to say what is owed”), one whose anchor names nobody, and one whose counterpart is a no-reply address are all refused at capture. That is what stops the ledger filling with calendar shadows and newsletter receipts you can never close.",
       "The anchor is an identity, never a label: a group ask is keyed by the group's own platform ID (iMessage's <code>chat_guid</code>, WhatsApp's <code>…@g.us</code> JID, verified against the snapshot the model was shown), a person's ask by the person. Rename the group and it is still the one debt — and a row minted under an invented name re-anchors on the next sweep, its duplicate folding into the older row's age with the newer row's words.",
       "Owning a loop by hand goes through the resolver's own machinery — normalize, compute the anchor, persist — so a hand-added loop is byte-shaped like every other entry and the sweep reads it natively. A hand-added loop carries <code>channel: manual</code> and nothing auto-closes it, because nothing in your inbox corresponds to it.",
-      "A debt you owe closes on your own outbound on ANY channel — an outgoing iMessage, WhatsApp, <strong>email</strong> or call to that person, or a meeting with them now on the books — read off the gather's own data (the <code>in:sent</code> lane for mail), never off a list the agent remembered to write. And every row a brief mints is stamped with the brief that minted it (<code>source_brief_at</code>), which is what lets the evening ask what happened to what the morning flagged.",
-      "Direction decides the ending. Something you OWE has no snooze state — moving the deadline forward is its only “later”, because the resolver expires it {continuity.deadline_grace_days:word} days past that date. Something you're OWED is never expired by a date at all: after {chase.after_days} silent days it is marked chase-due, the watcher delivers one short warm chase, and only a DELIVERED chase is counted — so one that quiet hours swallowed is not one of the {chase.max} this item gets.",
-      "After the {chase.max}nd, Sotto stops guessing and asks in plain words — “I've nudged Maya twice about the contract — nudge her again, or let it go?” — which is the one place the loop hands itself back to you by name. It asks <em>once</em>, and on its own clock — the first watcher tick it comes due, outside the two hours after a brief, never behind the tidy-up offer's weekly cooldown: the delivery is stamped on the row, so the question is never repeated and the loop stops taking a line in every brief — it waits in the count line until you answer."
+      "A debt you owe closes only on a completion proposal the writer verifies against the snapshot — one ledger ID and revision, a source message and its verbatim quote — never on bare contact: an outgoing message, a call or a meeting on the books is not proof of a deliverable. And every row a brief mints is stamped with the brief that minted it (<code>source_brief_at</code>), which is what lets the evening ask what happened to what the morning flagged.",
+      "Direction decides the chase, never whether memory survives. No obligation expires because it is old, overdue or unreachable. Something you OWE that nothing has touched for {continuity.park_after_days} days parks instead — kept with its history, out of the brief and the open count, back on the next capture or a <em>keep</em>. Every parked task first needs an accepted evening warning on an earlier local day; failed or muted warnings leave it active. Keep preserves the original request date; a snooze restarts the park clock on its return day. Something you're OWED becomes chase-due after {chase.after_days} silent days, and only a DELIVERED chase is counted — so one that quiet hours swallowed is not one of the {chase.max} this item gets.",
+      "After the {chase.max}nd, Sotto stops guessing and asks in plain words — “I've nudged Maya twice about the contract — nudge her again, or let it go?” — which is the one place the loop hands itself back to you by name. It asks <em>once</em>, on its own clock, at the first watcher tick it comes due outside the two hours after a brief: the delivery is stamped on the row, so the question is never repeated and the loop stops taking a line in every brief — it waits in the count line until you answer."
     ],
     live: 6,
     stations: [
       { s: "Commit", name: "A commitment appears", file: "the brief's actions[] · followup/scripts/apply_commitments.py · compose_brief._stale_debt_actions", note: "“I'll send the deck Thursday” from a meeting transcript, an action the brief extracted — or an email you sent that nobody answered for {stale.silent_days} days, minted by code as a <code>waiting_on</code> with the recipient as counterpart, when they are somebody you know." },
-      { s: "Anchor", name: "Anchor and dedupe", file: "continuity_resolve.compute_anchor_key", note: "A group ask keys on the group's own ID, a person's on the person; re-adding the same ask bumps times_surfaced rather than making a second file." },
+      { s: "Anchor", name: "Anchor and dedupe", file: "continuity_resolve.compute_anchor_key", note: "A group ask keys on the group ID, a personal ask on the person and evidence. Re-capture updates the same task without counting a delivery." },
       { s: "Store", name: "The ledger", file: "$SOTTO_DATA/knowledge/continuity/*.md (YAML frontmatter)", note: "One markdown file per loop, with status, resolution, deadline and provenance." },
-      { s: "Resolve", name: "Deterministic sweep", file: "morning-brief/scripts/continuity_resolve.py", note: "Answered on any channel (a text, a WhatsApp, a sent email, a call, a meeting now booked) · passed meetings · <em>they replied without delivering</em> restarts a waiting_on's chase clock to the date they named (else {chase.after_days} days) and counts no chase · a deadline {continuity.deadline_grace_days} days past expires what you OWE · what you're OWED is marked chase-due after {chase.after_days} days instead · terminal items pruned after {continuity.terminal_retention_days} days. Runs before the model." },
+      { s: "Resolve", name: "Evidence-bound update", file: "morning-brief/scripts/continuity_resolve.py", note: "The model names one loop id and revision plus a source id and quote. Code verifies counterpart, direction, original timestamp and quote. Generic contact changes nothing; a waiting-on reply may move only that task's chase clock once. Terminal history is pruned after {continuity.terminal_retention_days} days." },
       { s: "Surface", name: "Until it's done", file: "compose_brief via ledger_io · loops_query.py · proactive_scan.py · /app#loops", note: "Every open loop rides every brief — urgent ones by name, the rest as one count line, and one you snoozed not at all; the watcher delivers the one chase that is due and finalizes the count on delivery; the read surfaces never write." },
       { s: "Own it", name: "You close it by hand", file: "knowledge_edit.py --op loop / loop-add / loop-deadline", note: "Resolver-shaped bytes, written with the resolver's own calls — from chat or from the dashboard." }
     ]
@@ -612,9 +683,9 @@ const LOOPS = [
     id: "relationship",
     title: "Relationship",
     status: "closed",
-    one: "Every text and call → the Monday pulse → relationship_state.json → who is waiting on you and who is going quiet reach the brief, the dashboard, and the funnel's VIP floor — a learned signal that changes an interrupt decision.",
+    one: "Every text and call → the Monday pulse → relationship_state.json → who is waiting on you and who is going quiet reach the brief, the dashboard, and Tier 1's one-line “who is this” — a learned signal that changes an interrupt decision.",
     hub: ["Relationship", "the pulse"],
-    closes: "The state re-enters the funnel as machinery: an attention-queue entry whose priority is at or above {vip.min_priority} makes that person a VIP in Tier 0 (<code>triage_event._is_vip</code>), and a VIP's missed call clears quiet hours. The pulse is not only Monday prose.",
+    closes: "The state re-enters the funnel as machinery: a sender’s queue entry becomes the one relationship signal Tier 1 sees in the sender one-liner (<code>triage_event._sender_one_liner</code>), and it changes what the classifier calls an ask. As CONTEXT, never as a gate — it used to make a person a VIP whose missed call cleared quiet hours, which meant four messages and three days of silence bought a 3 a.m. interrupt off a week-stale file (removed Sep 2026). The pulse is not only Monday prose.",
     detail: [
       "Longitudinal, not a snapshot: the pulse keeps per-contact history on the same row, so a previously-regular contact who has gone quiet is detected as <em>lapsed</em> against their own cadence rather than a global threshold — and a degraded (empty-window) read persists nothing, so one bad read never overwrites the history it would be measured against.",
       "One human, one row: the history is keyed by the graph's <code>canonical_id</code>, with last-contact recorded per channel, so a person's texting and calling accumulate as one relationship instead of two strangers.",
@@ -622,11 +693,11 @@ const LOOPS = [
     ],
     live: 6,
     stations: [
-      { s: "Read", name: "Every interaction", file: "relationship_pulse._interactions_by_contact", note: "iMessage, WhatsApp, missed and answered calls from the Bridge, and six weeks of Gmail both directions — who, which direction, when — folded onto one row per canonical id." },
-      { s: "Score", name: "Cadence and drift", file: "relationship_pulse.compute · _cadence_trend · the lapsed pass", note: "<em>waiting_on_you</em> (they sent last), <em>losing_touch</em> (the cadence fell against their own history), <em>lapsed</em> (a regular contact gone fully quiet), each with a priority and a one-line reason." },
-      { s: "Store", name: "relationship_state.json", file: "$SOTTO_DATA/knowledge/relationship_state.json (_persist_state)", note: "The queue, insights and per-contact history include dated reciprocal activity for shared VIP/VVIP gift eligibility, written tmp + replace. A degraded run writes nothing." },
+      { s: "Read", name: "Every interaction", file: "relationship_pulse._interactions_by_contact", note: "iMessage, WhatsApp, connected calls from the Bridge, completed Granola meetings, and six weeks of Gmail both directions — who, which direction, when — folded onto one row per canonical id." },
+      { s: "Score", name: "Cadence and drift", file: "relationship_pulse.compute · _cadence_trend · the lapsed pass", note: "<em>waiting_on_you</em> (they sent last), <em>losing_touch</em> (the cadence fell against their own history), <em>lapsed</em> (a regular contact gone fully quiet), each with an age/cadence rank and a one-line reason. Owner replies add a positive tie-break; research depth adds nothing. At least {phase2.reply_min_samples} completed replies inform each directional signal; at most {phase2.reply_sample_limit} samples persist. Learned weight expires after {phase2.learned_expiry_days} days and decays by {phase2.confidence_decay_per_week} per week." },
+      { s: "Store", name: "relationship_state.json", file: "$SOTTO_DATA/knowledge/relationship_state.json (_persist_state)", note: "The queue, insights and per-contact history include reciprocal activity and eligible small held meetings, which cannot establish importance alone. The same file stores accepted Friday candidate offers with a {phase2.candidate_cooldown_days}-day cooldown; no suggestion writes authority. A degraded pulse writes nothing." },
       { s: "Brief", name: "Into the brief", file: "compose_brief.py → attention_queue · relationship_insights", note: "The daily brief reads the queue when the Bridge payload carries none — the weekly pulse persists it for exactly this; a muted person is filtered out of it before the model sees it." },
-      { s: "Funnel", name: "A learned VIP", file: "triage_event._is_vip · _sender_one_liner", note: "A queue priority at or above {vip.min_priority} makes the sender a VIP in Tier 0 — the same gate the stated VIP list and a typed <code>family_of</code> relation use — and the queue_type rides into Tier 1 as the one relationship signal the classifier sees." },
+      { s: "Funnel", name: "A learned signal", file: "triage_event._sender_one_liner", note: "The queue_type and its reason ride into Tier 1 as the one relationship signal the classifier sees. It is context and nothing more: the interrupt GATE (<code>_is_vip</code>, whose VIP clears quiet hours for a missed call) is the stated list or a typed <code>family_of</code> relation — a choice, never a message count." },
       { s: "See", name: "The People page", file: "dashboard.py → /app#people (ATTENTION_SHOWN)", note: "Who is waiting on you and who is going quiet, rendered from the same file — and the muting and VIP levers beside them write back into the Preferences circuit." }
     ]
   }
@@ -727,7 +798,8 @@ function paint(){
 
 paint();
 </script>
-<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared recovery core</h2><p>One Bridge and skill pack in both modes. Source observations preserve consent and coverage. Accepted work is durable before acknowledgment; the existing outbox remains the only sender. Brief research starts ten minutes early, composition becomes runnable two minutes before delivery, and the outbox releases on schedule. Evidenced asks wait until their deadline is within one day; passed invitations close, while overdue actionable work remains eligible. Provider acceptance activates replayable effects; optional learning cannot hold the brief.</p><p>Interactive Hermes behavior remains model-driven. Read receipts, inferred preferences and silence never authorize an external action.</p></section><section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared calendar and research</h2><p>Explicit context notes attach to a unique meeting with the same subject and exact interval; notes remain available without creating a second commitment. Coming Up is a calendar preview.</p><p>Hermes web tools use the same Sotto research providers as the pipeline. Failed reads and wholly invalid extractions retain their checkpoint. Each person is validated as a whole; invalid results are discarded while unrelated valid people can be learned. Partial pages advance with safe rejection counts in the existing history checkpoint, without storing rejected facts or adding a repair call. Conflicting source references fail before model access, and duplicate output subjects are all rejected. Native HTTP 400/422 extraction failures pause until the schema, prompt, native client implementation or model route changes; transient failures retry. A constant native response shape avoids page-sized grammar expansion; the writer still validates every citation and text bound. Source text is excluded from diagnostics.</p></section>
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared recovery core</h2><p>One Bridge and skill pack in both modes. Source observations preserve consent and coverage. Accepted work is durable before acknowledgment; the existing outbox remains the only sender. Queue opens preserve SQLite journal mode, while one immediate transaction serializes schema migration and mutation. Brief research starts ten minutes early, composition becomes runnable two minutes before delivery, and the outbox releases on schedule. Evidenced asks wait until their deadline is within one day; passed invitations close, while overdue actionable work remains eligible. Composition and saved-result handoff have separate bounded retries; shutdown stops dispatch and gives each worker a fair share of ten seconds to return its lease; a graceful stop refunds its phase, the shutdown refunds any lease its workers could not, and children still running are killed rather than orphaned. Provider acceptance activates replayable effects; an OS lock prevents callbacks overlapping, callback crashes consume the same bounded attempts before quarantine, a quarantined row keeps its receipt, label, run id and reason and drops the effects' addressing, and closed receipts age from settlement. Optional learning cannot hold the brief.</p><p>Interactive Hermes behavior remains model-driven. Read receipts, inferred preferences and silence never authorize an external action.</p></section><section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared calendar and research</h2><p>Explicit context notes attach to a unique meeting with the same subject and exact interval; notes remain available without creating a second commitment. Coming Up is a calendar preview.</p><p>Hermes web tools use the same Sotto research providers as the pipeline. Failed reads and wholly invalid extractions retain their checkpoint. Each person is validated as a whole; invalid results are discarded while unrelated valid people can be learned. Partial pages advance with safe rejection counts in the existing history checkpoint, without storing rejected facts or adding a repair call. Conflicting source references fail before model access, and duplicate output subjects are all rejected. Native HTTP 400/422 extraction failures pause until the schema, prompt, native client implementation or model route changes. Unchanged malformed history and Dreamer responses receive two attempts; history then probes compatibility every 24 hours, while Dreamer waits for changed request or evidence. Availability, network, timeout, HTTP 429 and HTTP 503 failures retry normally. Each background extraction or curation makes one upstream attempt; transient failures wait for the existing cycle instead of an immediate retry chain. Proxy-backed cycles validate the effective primary against advertised native models before reading history; finite exhausted budgets hold, while managed tenants can retain an explicit null budget. A Gmail window may restart again only after deeper progress within that same window. Completed windows never inflate the depth. An older checkpoint with unknown depth can restart once; an already-used reset without progress counts stays consumed across upgrades. No daily work count is added. A constant native response shape avoids page-sized grammar expansion; the writer still validates every citation and text bound. Source text is excluded from diagnostics.</p></section>
 <section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Mac source onboarding</h2><p>Cloud and self-host share the source list and Full Disk Access card. All Mac sources start on for new installs, with visible toggles before the first read. Google sign-in alone does not start collection. Startup and reconnect wait for source confirmation; explicit skip disables every Mac reader. Upgrades keep saved choices. Enabled, accessible and successfully read are separate states. Google handoff generations are durable before credential installation, so a crash cannot allow an older reconnect to restore superseded permissions.</p></section>
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Replay and freshness</h2><p>Archive reasons are separate from fact provenance. Only an exact age-pruned fact revives; explicit and unknown legacy archives stay closed. A closed request does not mute a person: newer source-bound incoming evidence can open a new request. Briefs older than two hours are invalidated at delivery through the existing outbox, with ambiguous acceptance protected from duplicate sends. Replacement compositions have distinct learning receipts and jobs; stale follow-ups cannot consume replacement inputs.</p></section>
 </body>
 </html>

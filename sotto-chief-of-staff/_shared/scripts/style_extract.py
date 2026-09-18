@@ -29,8 +29,11 @@ import re
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from keys import sample_hash, sample_key  # noqa: E402,F401  (shared with the Voice card)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)                                        # action_links
+sys.path.insert(0, os.path.join(_HERE, "..", "lib"))             # keys
+import action_links  # noqa: E402  (owns the offered-drafts ledger path)
+from keys import draft_key, sample_hash, sample_key  # noqa: E402,F401  (shared with the Voice card)
 import jsonstore  # noqa: E402
 from textutil import unwrap_tool_result  # noqa: E402  (shared MCP tool-result unwrap)
 
@@ -406,7 +409,7 @@ def _adapt_gmail(gmail) -> list:
 
 
 # ── Dedup / accumulation (style-profile.ts:581-622, 1106-1111) ───────────────
-# sample_key / sample_hash live in _shared/lib/keys.py — the dashboard's Voice card must
+# sample_key / sample_hash / draft_key live in _shared/lib/keys.py — the dashboard's Voice card must
 # compute the identical hash from the identical fields, and it cannot import this tree.
 
 
@@ -435,7 +438,37 @@ def _cap_confirmed(samples: list) -> list:
     return _newest_first([s for kept in per_bucket.values() for s in kept])
 
 
-def confirm_sample(key: str, now=None) -> dict:
+def _retained_draft_actions() -> set | None:
+    """Action IDs still backed by the bounded offered-drafts ledger, keyed by keys.draft_key —
+    the same id draft_outcomes grades each row under, so a marker and its draft cannot drift apart.
+
+    The ledger's own age sweep and size rotation define this marker's lifecycle. Hold its shared
+    sidecar lock while taking the snapshot so a concurrent append or retention rewrite cannot make
+    us prune from stale state. An unreadable ledger is not proof that its drafts expired.
+    """
+    path = action_links.drafts_path()
+    try:
+        with jsonstore.lock(path):
+            if not os.path.exists(path):
+                return set()
+            actions = set()
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        return None
+                    if not isinstance(row, dict):
+                        return None
+                    actions.add(draft_key(row))
+            return actions
+    except (OSError, UnicodeError):
+        return None
+
+
+def confirm_sample(key: str, now=None, action_id: str = "") -> dict:
     """Move ONE observed sample into style.json's `confirmed` bucket — the deterministic seed of the
     voice loop, and the ONLY writer that bucket has ever had (style_apply.py has always read it:
     "Drafts the user has shipped before (highest signal)").
@@ -447,9 +480,12 @@ def confirm_sample(key: str, now=None) -> dict:
     rebuilds them normally. Idempotent (a second confirm of the same sample is a no-op) and atomic
     (tmp + os.replace, like every other writer on the volume). The bucket is capped at
     CONFIRMED_CAP per register, newest first — the one place it is trimmed, because it is the one
-    place it grows."""
+    place it grows. Automated draft confirmations may also pass an action ID; its hash-only marker
+    lives in this same authoritative state so rotating a prompt sample out cannot confirm it again.
+    The marker and sample update share this function's lock and atomic write."""
     key = (key or "").strip()
-    if not key:
+    action_id = (action_id or "").strip()
+    if not key and not action_id:
         return {"ok": False, "error": "no sample named"}
     path = os.path.join(_root(), "style.json")
     try:
@@ -457,6 +493,13 @@ def confirm_sample(key: str, now=None) -> dict:
             style = jsonstore.read(path, None, strict=True)
             if not isinstance(style, dict):
                 return {"ok": False, "error": "no style fingerprint on file yet"}
+            confirmed_actions = style.get("confirmed_actions")
+            if not isinstance(confirmed_actions, dict):
+                confirmed_actions = {}
+            if action_id and action_id in confirmed_actions:
+                return {"ok": True, "confirmed": len(style.get("confirmed") or []),
+                        "already": True, "action_already": True,
+                        "bucket": ""}
             pool = []
             canonical = style.get("canonical")
             if isinstance(canonical, dict):
@@ -468,6 +511,10 @@ def confirm_sample(key: str, now=None) -> dict:
                 return {"ok": False, "error": "that sample is no longer in the fingerprint"}
             confirmed = [s for s in (style.get("confirmed") or []) if isinstance(s, dict)]
             if any(sample_hash(s) == key for s in confirmed):
+                if action_id:
+                    confirmed_actions[action_id] = True
+                    style["confirmed_actions"] = confirmed_actions
+                    jsonstore.write_atomic(path, style, indent=2)
                 return {"ok": True, "confirmed": len(confirmed), "already": True,
                         "bucket": hit.get("bucket") or ""}
             entry = {**hit, "source": "confirmed"}
@@ -475,6 +522,9 @@ def confirm_sample(key: str, now=None) -> dict:
             entry["confirmed_at"] = _iso(_now(now))
             confirmed.append(entry)
             style["confirmed"] = _cap_confirmed(confirmed)
+            if action_id:
+                confirmed_actions[action_id] = True
+                style["confirmed_actions"] = confirmed_actions
             jsonstore.write_atomic(path, style, indent=2)
             return {"ok": True, "confirmed": len(style["confirmed"]), "already": False,
                     "bucket": entry.get("bucket") or ""}
@@ -616,6 +666,13 @@ def _extract_unlocked(payload: dict, now, gmail, path: str) -> dict:
         "sample_keys": list(seen_keys | set(new_keys))[-500:],
         "preferences": style.get("preferences", []),
     })
+    retained_actions = _retained_draft_actions()
+    confirmed_actions = style.get("confirmed_actions")
+    if isinstance(confirmed_actions, dict):
+        style["confirmed_actions"] = ({key: True for key in confirmed_actions
+                                       if key in retained_actions}
+                                      if retained_actions is not None else
+                                      {key: True for key in confirmed_actions})
     jsonstore.write_atomic(path, style, indent=2)
     return {"messages_analyzed": style["messages_analyzed"],
             "canonical_counts": {b: len(canonical[b]) for b in ALL_BUCKETS},

@@ -16,10 +16,13 @@ Stdlib only (no PyYAML, no sibling imports) — that is what makes the vendoring
   sample_key(s)    — the dedup key of ONE style sample (channel|date|recipient|text[:120]).
   sample_hash(s)   — the short id of that sample (style_extract --confirm ⇄ the Voice card's
                      "confirm this one": both hash the same style.json fields).
+  draft_key(row)   — the id of ONE offered-draft ledger row (draft_outcomes grades by this id ⇄
+                     style_extract prunes confirmed-action markers by it: both read drafts.jsonl).
 """
 from __future__ import annotations
 
 import hashlib
+import json
 
 
 def queue_key(line: str) -> str:
@@ -41,3 +44,8 @@ def sample_key(s: dict) -> str:
 def sample_hash(s: dict) -> str:
     """sha256 of sample_key(s), truncated to 16 hex chars."""
     return hashlib.sha256(sample_key(s).encode("utf-8")).hexdigest()[:16]
+
+
+def draft_key(row: dict) -> str:
+    """sha256 of one drafts.jsonl row's canonical JSON, truncated to 16 hex chars."""
+    return hashlib.sha256(json.dumps(row, sort_keys=True).encode("utf-8")).hexdigest()[:16]

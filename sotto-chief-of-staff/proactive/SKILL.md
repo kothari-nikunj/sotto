@@ -39,6 +39,12 @@ all candidates are resolved or irrelevant, return `NO_NUDGES` instead of padding
 
 > Scripts live under `$HOME/.hermes/skills/sotto/`. Use absolute paths.
 
+Automated receiver runs execute steps 1 and 2 in `procedure_runner.py`, then call
+`_shared/scripts/compose_notification.py` directly for admitted candidates. They do not start an
+agent or repeat discovery; empty results make no model call. The direct renderer follows the
+approval, pending-offer and acknowledged-delivery rules below. Interactive checks follow this
+reference procedure.
+
 1. **Gather (deterministic, fast):**
    - Calendar (next few hours) — `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py" --skip-gmail` → `/tmp/sotto_cal.json` (host-agnostic fallback as in the brief if the CLI isn't this host's Google path).
    - Continuity open-loops — **nothing to do**: `proactive_scan.py` reads the ledger itself through `loops_query` (the only sanctioned read view) and keeps the deadline-bearing loops. Don't run `loops_query.py` here, and never write a `/tmp/sotto_cont.json` — the hand-reshape step is gone (it also collided with the brief's differently-shaped file of the same name).
@@ -93,9 +99,6 @@ all candidates are resolved or irrelevant, return `NO_NUDGES` instead of padding
      and use that person's own `interest`/`preference` facts to suggest ONE concrete idea
      ("Jordan's birthday is Thursday — he's been into film photography; a roll of Portra + a card?").
      No facts on file → say the date and offer to help pick something; never invent an interest.
-   - `retune_offer` → DON'T draft anything. Deliver the one-liner as a light offer ("Your open-loops list
-     is getting heavy — N items keep showing up. Want me to run a quick cleanup?"). If the user says yes,
-     run **`sotto-loops`**' cleanup. If they ignore it, drop it — the cooldown means it won't ask again for days.
    - Keep the whole push SHORT — a nudge, not a brief. Lead with the single most time-sensitive item.
      ONE message for the whole tick — that is what the day's budget was charged for.
    - **Plain words only.** Never say "proactive", "chase", "retune", "ledger", "loop anchor" or any
@@ -122,7 +125,7 @@ all candidates are resolved or irrelevant, return `NO_NUDGES` instead of padding
      --kind meeting_prep --person "Shivani" \
      --question "You're meeting Shivani in ~44 min at Sightglass — want me to pull full prep on her?"
    ```
-   Same for the other kinds (`--kind commitment|chase|handoff|retune_offer|intention`), with the question
+   Same for the other kinds (`--kind commitment|chase|handoff|intention`), with the question
    exactly as it appears in your final response. Receiver runs stage the offer and activate it only
    after the provider accepts the message. Two fresh delivered questions remain separate;
    `get` returns `ambiguous: true` and their questions until the user identifies one. Ask which
@@ -153,17 +156,15 @@ all candidates are resolved or irrelevant, return `NO_NUDGES` instead of padding
   hours** hold everything; a **muted** person is dropped; the **in-meeting hold** queues the rest
   while you're in a room with someone; the **daily interrupt budget** (`SOTTO_NUDGE_BUDGET`,
   default 4) is charged **once per delivered push** — this whole message is one interrupt, not one
-  per kind — and beyond it the push demotes whole to the SAME digest queue. Every verdict, fired or
+  per kind. “Fewer nudges” halves the effective cap, “no nudges” sets zero for every unsolicited
+  path, and “more nudges” restores the configured ceiling. Beyond a nonzero cap the push demotes to
+  the SAME digest queue. Every verdict, fired or
   held, writes the SAME `surfaced.jsonl` row, including the ones the clock suppressed. A `meeting_prep` nudge is also skipped when today's research cache
   already covers that meeting's attendees (a prep or brief run today prepped it); the **lead**
   `birthday` nudge waits 2h after a delivered brief, and the **day-of** one is dropped entirely once
   a brief has delivered today — that brief already carried the 🎂 line and the same tap link.
-- The `retune_offer` nudge fires when ≥`RETUNE_OFFER_MIN` (6) loops are stale, at most once
-  per `RETUNE_OFFER_COOLDOWN_DAYS` (7) — a periodic "want to tidy up?", never a daily nag.
-  The `handoff` question has its own clock, not that cooldown: it is asked the first tick it comes
-  due (outside the 2h post-brief window), once — its delivery stamps the row — and it ignores the
-  threshold: one unanswered ask is worth asking about even on a tidy day, and it is never folded
-  into the generic offer.
+- The `handoff` question is asked the first tick it comes due (outside the 2h post-brief window),
+  once; its delivery stamps the row. One unanswered ask is worth asking about directly.
 - **The chase clock isn't yours.** `continuity_resolve.py` (the brief's Learn step) is the ONE writer of
   the chase fields: it marks at most one waiting-on per local day as chase-pending after
   `SOTTO_CHASE_AFTER_DAYS` (default 3) of silence, and stops after two chases. This skill only *delivers*

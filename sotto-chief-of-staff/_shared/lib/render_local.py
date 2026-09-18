@@ -16,6 +16,8 @@ select_attendees import them from here.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -736,6 +738,30 @@ def _thread_is_known_person(thread, known_emails: set, known_names: list,
 
 
 
+def message_evidence_id(message: dict, channel: str) -> str:
+    """Bind a rendered local message to the same row in the resolver's snapshot.
+
+    Current Bridge snapshots omit database IDs. For those rows use the original message fields,
+    never a display name, extraction time or list position. This is an evidence reference, not a
+    reply address. Native IDs remain usable when a source supplies them.
+    """
+    if channel not in {"imessage", "whatsapp"}:
+        return ""
+    for key in ("source_id", "id", "messageId", "message_id", "guid", "rowid"):
+        value = message.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
+            return str(value)
+    counterpart = _s(message.get("handle") if channel == "imessage" else message.get("contact_jid"))
+    timestamp, body = _s(message.get("timestamp")), _s(message.get("text"))
+    direction = message.get("is_from_me")
+    if not counterpart or not timestamp or not body or not isinstance(direction, bool):
+        return ""
+    fields = [channel, counterpart, _s(message.get("chat_guid")),
+              bool(message.get("is_group_chat")), _s(message.get("sender_jid")), timestamp, direction, body]
+    encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return "msg:v1:" + hashlib.sha256(encoded).hexdigest()[:24]
+
+
 def _format_thread_as_text(thread, channel) -> str:
     group_tag = " [GROUP - no deep link]" if thread.get("is_group_chat") else ""
     identifier = "" if thread.get("is_group_chat") else _s(thread.get("identifier"))
@@ -758,6 +784,9 @@ def _format_thread_as_text(thread, channel) -> str:
             direction = f"[THEY SENT — {_s(m.get('sender_name'))}]"
         else:
             direction = "[THEY SENT]"
+        evidence_id = message_evidence_id(m, channel)
+        if evidence_id:
+            lines.append(f"  source_id: {evidence_id} | timestamp: {_s(m.get('timestamp'))}")
         lines.append(f"  {direction} {_s(m.get('text'))}")
     return "\n".join(lines)
 
@@ -796,6 +825,8 @@ def _trim_email(e, lookup: dict | None = None) -> dict:
     # display name her mail client put in the From header, and the LLM sees two different people.
     resolved_name = (lookup or {}).get(sender_email.lower().strip()) or "" if sender_email else ""
     return {
+        "messageId": next((e.get(key) for key in ("id", "messageId", "message_id", "source_id")
+                           if e.get(key) is not None), None),
         "threadId": e.get("threadId"),
         "from": from_,
         "resolvedName": resolved_name,
@@ -899,14 +930,15 @@ def _format_emails(emails) -> str:
         body = (e.get("body") or "").strip()
         atts = _format_attachments(e.get("attachments"))
         return (f"### {e['subject'] or '(no subject)'}{flag_str}\n{addr}\n"
-                f"Date: {e['date']}\nThreadId: {e['threadId'] or 'none'}"
+                f"Date: {e['date']}\nMessageId: {e.get('messageId') or 'none'}\n"
+                f"ThreadId: {e['threadId'] or 'none'}"
                 + (f"\n\n{body}" if body else "") + (f"\n\n{atts}" if atts else ""))
 
     sections = []
     if active:
         sections.append(f"### Active Emails ({len(active)})\n" + "\n\n".join(fmt(e) for e in active))
     if sent:
-        sections.append(f"### Your Sent Emails ({len(sent)}) — these are YOUR replies, loop is CLOSED for these threads\n"
+        sections.append(f"### Your Sent Emails ({len(sent)}) — these are YOUR replies; close only the specific obligation whose requested work this message proves, using its MessageId and a verbatim snippet\n"
                         + "\n\n".join(fmt(e) for e in sent))
     if archived:
         lines = "\n".join(f"- {e['subject'] or '(no subject)'} "
@@ -1424,9 +1456,7 @@ def _format_past_commitments(local) -> str:
 
 
 def _chase_note(a: dict) -> str:
-    """What Sotto has ALREADY done about this loop, in the model's own input. Without it the brief
-    proposes a first follow-up on day 4, day 8 and day 20 — after two chase nudges already went
-    out. `chased ×1, last Tue` is the whole fix."""
+    """Delivered reminders to the user, never evidence that Sotto contacted the other person."""
     n = 0
     try:
         n = int(a.get("chased_count") or 0)
@@ -1439,7 +1469,7 @@ def _chase_note(a: dict) -> str:
         return (f" [they replied {heard.strftime('%a')}, next check {_s(a.get('chase_after'))[:10]}]"
                 if heard and _s(a.get("chase_after")) else "")
     last = _parse_ts(_s(a.get("last_chased_at")))
-    return (f" [chased ×{n}" + (f", last {last.strftime('%a')}" if last else "")
+    return (f" [reminded you ×{n}" + (f", last {last.strftime('%a')}" if last else "")
             + (f"; they replied {heard.strftime('%a')}, next check {_s(a.get('chase_after'))[:10]}"
                if heard and last and heard > last and _s(a.get("chase_after")) else "") + "]")
 
@@ -1452,11 +1482,15 @@ def _format_action_ledger(local, now=None) -> str:
     if not active:
         return ""
     lines = []
+    from delivery_effects import loop_version
     for a in active:
         age = _action_age(_s(a.get("created_at")), now)
         summary = _norm_escalation_tone(a.get("summary"))
         ask = _norm_escalation_tone(a.get("ask")) if a.get("ask") else ""
-        lines.append(f"- {a.get('action_type')} ({age}){_chase_note(a)}: "
+        lines.append(f"- loop_id: {a.get('anchor_key', '')} | loop_version: {loop_version(a)} | "
+                     f"created: {_s(a.get('created_at'))} | "
+                     f"resolution_mode: {a.get('resolution_mode') or 'observed'} | "
+                     f"{a.get('action_type')} ({age}){_chase_note(a)}: "
                      f"{a.get('contact_name')} via {a.get('channel')}: {summary}"
                      + (f" — {ask}" if ask else ""))
     body = "\n".join(lines)
@@ -1466,16 +1500,20 @@ def _format_action_ledger(local, now=None) -> str:
     return ("## Open Commitments (ACTION LEDGER from previous briefs)\n"
             "These are unresolved action items from previous briefs still awaiting completion.\n"
             "- An entry earns its own line ONLY when it is URGENT: overdue, due within 24 hours, or\n"
-            "  already chased (`[chased ×N]`) with no answer. Those appear exactly once — as an ask with\n"
+            "  already brought to you (`[reminded you ×N]`) with no answer. Those appear exactly once as an ask with\n"
             "  its age, or in Already Handled naming the evidence if today's data shows it fulfilled.\n"
             "- Every OTHER entry below is deliberately NOT written up: code appends one quiet line saying\n"
             "  how many there are and where to see them, and the proactive nudges work them. Listing them\n"
             "  is the wall this brief exists to avoid — do not inventory.\n"
             "- ONE LINE PER PERSON: if someone owes several things, name them once and carry the asks together.\n"
             "- Most of these are older than today's gather window; that is normal and never a reason to omit one\n"
-            "- Do NOT duplicate — if creating a new action for the same person/topic, reference continuity\n"
-            "- `[chased ×N, last <day>]` means Sotto ALREADY nudged about it that many times — name that,\n"
-            "  never propose a first follow-up for something that has already been chased\n\n"
+            "- For the SAME obligation, copy its loop_id into actionItems.loopId; a distinct ask is a separate action.\n"
+            "- Emit loopUpdates only for a specific fulfilled obligation or their specific new promise.\n"
+            "  Copy loop_id and loop_version exactly and cite original source_id plus a verbatim snippet.\n"
+            "  Contact, a generic thanks, a link, or a meeting with the same person does not prove completion.\n"
+            "  Explicit-resolution rows require the user's correction and must not receive loopUpdates.\n"
+            "- `[reminded you ×N, last <day>]` means Sotto reminded YOU that many times. It does not\n"
+            "  mean you or Sotto contacted the other person. Never claim an external follow-up without send evidence.\n\n"
             f"{body}\n")
 
 

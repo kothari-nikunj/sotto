@@ -7,6 +7,7 @@ the pipeline's model path; hosting changes its endpoint and credential, not its 
 
 - How it all fits: [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) (end-to-end data flow, process boundaries) · why you get nudged: [`../docs/HOW-SOTTO-DECIDES.md`](../docs/HOW-SOTTO-DECIDES.md)
 
+
 > The persona + bundle live in `../adapters/hermes/` (`sotto-persona.md`, `sotto.bundle.yaml`), not in the tap root. The tap root only carries `skills.sh.json` + the skill dirs below.
 
 ## Layout
@@ -29,7 +30,7 @@ followup/                            # post-meeting: commitments + ready-to-send
   references/followup-prompt.md      # the followup extraction prompt (grounded-only, verbatim emails)
   scripts/compose_followup.py        # meetings that JUST ended (Granola transcripts) -> commitments + drafts
   scripts/apply_commitments.py       # write extracted commitments straight into the continuity ledger
-proactive/                           # ~15-min watcher: meeting-prep/commitment/chase/birthday/handoff/tidy-up nudges
+proactive/                           # ~15-min watcher: meeting-prep/commitment/chase/birthday/handoff nudges
   SKILL.md
   scripts/proactive_scan.py          # what is due (lead window, dedup) → the funnel decides who hears it
 event-triage/                        # real-time event funnel (Bridge/Gmail events -> act now or stay silent) — skill: sotto-event
@@ -64,9 +65,12 @@ _shared/
   lib/brief_validate.py              # deterministic post-hoc brief validator
   lib/relationship_importance.py     # shared activity-backed VIP/VVIP gift eligibility
   lib/chatfmt.py                     # the ONE markdown→chat-text transform (to_chat) every surface shares
+  lib/message_targets.py             # supported messaging addresses and invalid-link removal shared by builders and delivery
   lib/connector_tokens.py            # read/refresh per-service OAuth tokens from the receiver's /setup
   lib/gemini_transport.py            # identical native Gemini payloads; managed tenant proxy or self-host key
   lib/google_cli.py                  # strict Google CLI JSON decoder, including the empty Gmail-search sentinel
+  lib/model_work.py                 # durable attempts per operation; content-free request receipts
+  lib/usage_accounting.py           # canonical cached-input/thinking-aware estimates; packaged into proxy
   lib/gemini.py                      # direct Gemini REST call (call_gemini) + retryable-error classification + diagnostics
   lib/jsonstore.py                   # locked JSON read/write for shared state files (pending_offer, preferences)
   lib/keys.py                        # queue/style-sample ids — VENDORED byte-identical into runtime/trigger-receiver/
@@ -78,7 +82,11 @@ _shared/
   lib/textutil.py                    # string/identifier/domain normalization primitives
   lib/timeutil.py                    # timezone/date/timestamp helpers (delegates the zone to tzchain)
   lib/tzchain.py                     # THE timezone chain (SOTTO_TIMEZONE → TZ → settings.json → UTC) — one file, vendored into runtime/trigger-receiver/ by the Dockerfile
+  scripts/compose_notification.py    # direct proactive/event renderer and bounded native writer
   scripts/compose_brief.py           # the FLEX extraction engine + critic + tap-links + escalation (PORT: gemini-flex.ts/brief-critic.ts/generate.ts)
+  lib/review_candidates.py           # Friday candidate selection and accepted offer receipts in existing relationship state
+  lib/relationship_importance.py     # reciprocal activity, held meetings and separate decaying reply signals
+  scripts/release_one_proof.py        # read-only retained-history coverage and proposal counters; no model call
   scripts/learn_step.py              # essential knowledge/continuity, then separately queued ancillary writers; one merged receipt
   scripts/memory_cycle.py            # bounded work-driven history progress and changed-person curation
   scripts/context_learning.py        # cited durable facts from consented direct-message history
@@ -124,7 +132,7 @@ evals/                               # brief-quality eval harness
   corpus/                            # NEVER committed, NEVER shipped — real user data, built locally
 tests/                               # pytest: parity fixtures in → expected exhaust out (conftest sets sys.path)
 tools/                               # skill-tree tooling
-  verify.py                          # shared backend/release gate: pipeline, receiver, adapter, proxy, guards
+  verify.py                          # dependency lock check and shared backend/release gate: pipeline, receiver, adapter, proxy, guards
   dry_run.py                         # offline full-loop rehearsal (no LLM, no network; fixtures/brief_bundle.json)
   validate_skills.py                 # SKILL.md lint (one of the checks verify.py runs; also usable on its own)
   forget.py                          # delete the exhaust (snapshot, caches, logs, receipts) — never the memory

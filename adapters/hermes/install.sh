@@ -47,6 +47,27 @@ EOF
   [ "$DRY_RUN" -eq 1 ] || exit 1
 fi
 
+# Apply the same reviewed gateway boundary as container boot. The bundled Hermes
+# installer uses these two source layouts; an unknown or upgraded source is an
+# explicit compatibility failure because editing an unreviewed runtime is unsafe.
+HERMES_SOURCE_ROOT="${HERMES_INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
+if [ ! -f "$HERMES_SOURCE_ROOT/gateway/run.py" ] && [ -f /usr/local/lib/hermes-agent/gateway/run.py ]; then
+  HERMES_SOURCE_ROOT=/usr/local/lib/hermes-agent
+fi
+if [ ! -f "$HERMES_SOURCE_ROOT/gateway/run.py" ]; then
+  echo "Cannot locate the installed Hermes gateway source; provider-error compatibility was not applied." >&2
+  echo "Expected $HERMES_SOURCE_ROOT/gateway/run.py. Reinstall Sotto's pinned Hermes runtime first." >&2
+  [ "$DRY_RUN" -eq 1 ] || exit 1
+elif ! run python3 "$HERE/provider_error_compat.py" "$HERMES_SOURCE_ROOT/gateway/run.py"; then
+  # provider_error_compat.py has already printed one [sotto] FATAL line naming the expected and
+  # found hashes. Say what to do about it from here: this installed Hermes is not the reviewed pin.
+  echo "Nothing was installed. Reinstall the repository's pinned Hermes runtime, then re-run:" >&2
+  echo "  bash \"$HERE/hermes-install.sh\" --commit \"$(cat "$HERE/hermes.commit")\"" >&2
+  echo "If you are deliberately moving to a newer Hermes, follow 'Provider-error gateway pin'" >&2
+  echo "in $HERE/README.md to re-review and regenerate the hashes first." >&2
+  exit 1
+fi
+
 # 1) Model + scheduler.
 #    The brief ALWAYS runs on Gemini via _shared/scripts/compose_brief.py (needs GOOGLE_AI_API_KEY in
 #    the env), so we never touch the user's global model — clean drop-in on an existing agent.

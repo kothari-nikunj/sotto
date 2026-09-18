@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 try:
@@ -97,11 +98,12 @@ def brief_hold(data):
     return None
 
 
-def record_bridge_consent(data, enabled_sources, connected_sources):
+def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=False):
     """The authenticated Bridge reports explicit toggles and successful local reads."""
     from connectors import json_transaction
     allowed = set(BRIDGE_SOURCE_FIELDS)
-    if (not isinstance(enabled_sources, list) or not isinstance(connected_sources, list)
+    if (not isinstance(allow_send, bool)
+            or not isinstance(enabled_sources, list) or not isinstance(connected_sources, list)
             or not all(isinstance(s, str) for s in enabled_sources + connected_sources)
             or set(enabled_sources) - allowed or set(connected_sources) - set(enabled_sources)):
         raise ValueError('Invalid local source consent')
@@ -109,6 +111,9 @@ def record_bridge_consent(data, enabled_sources, connected_sources):
         if state.get('tenant_id') != os.environ['SOTTO_TENANT_ID']:
             state.clear()
         state['tenant_id'] = os.environ['SOTTO_TENANT_ID']
+        # Sending is an independent opt-in, never inferred from permission to read.
+        # Older apps omit it and therefore keep sending disabled.
+        state['allow_send'] = allow_send
         sources = state.setdefault('sources', {})
         for source in allowed:
             consented = source in enabled_sources
@@ -164,8 +169,95 @@ def _tool_payload(result):
     return None
 
 
+def _consented_sources(data):
+    sources = read_state(data, 'managed-capabilities.json').get('sources', {})
+    return {key for key in BRIDGE_SOURCE_FIELDS
+            if isinstance(sources.get(key), dict) and sources[key].get('consented') is True}
+
+
+def _tool_allowed(data, name, arguments):
+    """THE managed allow-decision for one Bridge tool. Both gates read it, so the gate that
+    refuses before the Mac executes and the gate that inspects the result cannot disagree.
+
+    `arguments=None` asks the name-only question ("may this tool ever be called here?"), which
+    is what tools/list filtering needs. Unknown tools are denied. Sending needs its own
+    explicit local opt-in and an operation ID for the Mac's durable receipt.
+
+    An absent/empty `read_local` scope means "everything this Bridge has" to older builds and is
+    how every skill calls it (`read_local(since_hours=...)`). It stays allowed here because the
+    per-field consent check belongs to the result: `validate_tool_response` runs the returned
+    payload through `validate_local_ingress` and withholds the whole result if an unconsented
+    source carried content.
+    """
+    probe = arguments is None          # name-only question; no scope to judge yet
+    if not probe and not isinstance(arguments, dict):
+        return False
+    arguments = {} if probe else arguments
+    allowed = _consented_sources(data)
+    if name == 'send_message':
+        if read_state(data, 'managed-capabilities.json').get('allow_send') is not True:
+            return False
+        if probe:
+            return True
+        from message_targets import normalized_target
+        channel = arguments.get('channel', 'auto')
+        recipient = arguments.get('to')
+        body = arguments.get('body')
+        request_id = arguments.get('request_id')
+        return (channel in ('imessage', 'sms', 'auto')
+                and isinstance(recipient, str)
+                and bool(normalized_target('imessage' if channel == 'auto' else channel, recipient))
+                and isinstance(body, str) and bool(body.strip())
+                and isinstance(request_id, str)
+                and re.fullmatch(r'[A-Za-z0-9_-]{16,128}', request_id) is not None)
+    if name == 'health':
+        return True
+    if name == 'read_history':
+        requested = arguments.get('source')
+        return probe or (isinstance(requested, str) and requested in allowed)
+    if name == 'read_local':
+        requested = arguments.get('sources')
+        if requested is not None and not (isinstance(requested, list)
+                                          and all(isinstance(item, str) for item in requested)):
+            return False
+        return not requested or set(requested) <= allowed
+    if name == 'get_messages':
+        return 'imessage' in allowed
+    if name == 'get_contacts':
+        return 'contacts' in allowed
+    return False
+
+
+def validate_tool_request(data, request):
+    """The pre-execution gate: the relay refuses a denied `tools/call` WITHOUT forwarding it, so the
+    Mac never runs a tool whose result managed mode would then have to throw away — which is no gate
+    at all for a tool that acts (`send_message`)."""
+    if not enabled():
+        return True
+    params = request.get('params') if isinstance(request, dict) else None
+    if not isinstance(params, dict) or request.get('method') != 'tools/call':
+        return False
+    arguments = params.get('arguments', {})
+    if not isinstance(arguments, dict):
+        return False
+    return _tool_allowed(data, params.get('name'), arguments)
+
+
+def filter_tool_list(data, result):
+    """Do not advertise a tool this deployment would refuse; the model should not see a
+    `send_message` it can only be denied."""
+    if not enabled() or not isinstance(result, dict) or not isinstance(result.get('tools'), list):
+        return result
+    return {**result, 'tools': [tool for tool in result['tools'] if isinstance(tool, dict)
+                                and _tool_allowed(data, tool.get('name'), None) is True]}
+
+
 def validate_tool_response(data, request, result):
-    """Authorize content using the pending request and inspect the actual Bridge result."""
+    """Authorize content using the pending request and inspect the actual Bridge result.
+
+    The same `_tool_allowed` decision the relay applied before forwarding runs again here —
+    consent can change while a call is in flight — and then the payload itself is checked.
+    """
     if not enabled():
         return True
     if not isinstance(request, dict):
@@ -178,11 +270,10 @@ def validate_tool_response(data, request, result):
     name, arguments = params.get('name'), params.get('arguments', {})
     if not isinstance(arguments, dict):
         return False
-    sources = read_state(data, 'managed-capabilities.json').get('sources', {})
-    allowed = {key for key in BRIDGE_SOURCE_FIELDS
-               if isinstance(sources.get(key), dict) and sources[key].get('consented') is True}
     if name == 'health':
         return True
+    if _tool_allowed(data, name, arguments) is not True:
+        return False
     payload = _tool_payload(result)
     if payload is None:
         return False
@@ -190,55 +281,15 @@ def validate_tool_response(data, request, result):
         return True
     if name == 'read_history':
         requested = arguments.get('source')
-        if not isinstance(requested, str) or requested not in allowed:
+        if not isinstance(requested, str):
             return False
         permitted = {'source', 'status', 'rows', 'complete', 'since', 'until', 'next_cursor'}
         return payload.get('source') == requested and not any(
             key not in permitted and bool(value) for key, value in payload.items())
-    elif name == 'read_local':
-        requested = arguments.get('sources')
-        if requested is not None and (not isinstance(requested, list)
-                                      or not all(isinstance(item, str) for item in requested)):
-            return False
-        if requested and not set(requested) <= allowed:
-            return False
+    if name == 'read_local':
         try:
             validate_local_ingress(data, {'local_data': payload})
             return True
         except (ValueError, TypeError, AttributeError):
             return False
-    elif name == 'get_messages':
-        return 'imessage' in allowed
-    elif name == 'get_contacts':
-        return 'contacts' in allowed
-    else:
-        return False
-
-
-def validate_tool_request(data, request):
-    """Compatibility helper for request-only callers; responses use validate_tool_response."""
-    if not enabled():
-        return True
-    params = request.get('params') if isinstance(request, dict) else None
-    if not isinstance(params, dict) or request.get('method') != 'tools/call':
-        return False
-    arguments = params.get('arguments', {})
-    if not isinstance(arguments, dict):
-        return False
-    sources = read_state(data, 'managed-capabilities.json').get('sources', {})
-    allowed = {key for key in BRIDGE_SOURCE_FIELDS
-               if isinstance(sources.get(key), dict) and sources[key].get('consented') is True}
-    name = params.get('name')
-    if name == 'health':
-        return True
-    if name == 'read_history':
-        return arguments.get('source') in allowed
-    if name == 'read_local':
-        requested = arguments.get('sources')
-        return (isinstance(requested, list) and bool(requested)
-                and all(isinstance(item, str) and item in allowed for item in requested))
-    if name == 'get_messages':
-        return 'imessage' in allowed
-    if name == 'get_contacts':
-        return 'contacts' in allowed
-    return False
+    return True   # get_messages / get_contacts: consent is the whole decision

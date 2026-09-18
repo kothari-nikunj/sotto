@@ -69,7 +69,14 @@ BANNED_PHRASES = (
 _BANNED_VARIANTS = {"requires your immediate attention": "require your immediate attention"}
 
 COMING_UP_MAX_LINES = 5
-CALENDAR_PREVIEW_NOTE = 'Calendar preview — open Calendar for the full schedule.'
+
+
+def is_calendar_preview_note(line: str) -> bool:
+    """Recognize legacy boilerplate for removal, never a meeting row."""
+    plain = re.sub(r'^[\s*•-]+|[\s*]+$', '', line)
+    return bool(re.fullmatch(r'Calendar preview\s*(?:[—–:-]|\()\s*open Calendar for the full schedule[.)\s:]*',
+                             plain, re.I))
+
 
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$")
 _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
@@ -177,7 +184,7 @@ def _check_coming_up_length(markdown: str, first_run: bool = False) -> list:
             continue
         if _HEADING_RE.match(line) or _is_coming_up_header(line):
             continue                     # the header itself isn't a content line
-        if stripped == CALENDAR_PREVIEW_NOTE:
+        if is_calendar_preview_note(stripped):
             continue
         count += 1
     # First brief: the one-time onboarding note MANDATES one trailing "what you can ask next" line

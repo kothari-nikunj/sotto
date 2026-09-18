@@ -43,8 +43,11 @@ def test_tool_result_consent_comes_from_pending_server_request(tmp_path, monkeyp
     call = lambda name, arguments: {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
     assert managed.validate_tool_request(tmp_path, call('read_history', {'source': 'whatsapp'}))
     assert not managed.validate_tool_request(tmp_path, call('read_history', {'source': 'imessage'}))
-    assert not managed.validate_tool_request(tmp_path, call('read_local', {}))
+    # An unscoped read_local is how every skill calls it (`read_local(since_hours=24)`), so the
+    # pre-execution gate lets it through and the RESULT is filtered field by field below.
+    assert managed.validate_tool_request(tmp_path, call('read_local', {}))
     assert not managed.validate_tool_request(tmp_path, call('read_local', {'sources': ['whatsapp', 'imessage']}))
+    assert not managed.validate_tool_request(tmp_path, call('send_message', {'channel': 'imessage'}))
     assert not managed.validate_tool_request(tmp_path, call('get_messages', {'source': 'whatsapp'}))
     assert not managed.validate_tool_request(tmp_path, call('get_contacts', {}))
     assert managed.validate_tool_request(tmp_path, call('health', {}))
@@ -163,11 +166,10 @@ def test_photon_formats_chat_and_standalone_at_registered_boundary(monkeypatch, 
         assert rejected['message_id'] == 'provider-fixture' and len(sent) == 2
         return  # tenant budget/owner restrictions apply only to managed mode
     assert 'error' in rejected and len(sent) == 1
-    module.install_budget_error_reply()
-    assert len(gateway._PROVIDER_ERROR_REPLIES) == 1
-    pattern, reply = gateway._PROVIDER_ERROR_REPLIES[0]
-    assert pattern.search('API error: sotto_budget_exhausted') and reply == module.BUDGET_NOTICE
-    assert not pattern.search('429: real upstream rate limit')
+    # The rejection is the owner-only guard in `owner_send` (product code), not a provider/gateway
+    # failure — the `gateway.run` fixture above exists only so `register()` can import cleanly, and
+    # this adapter never reads or mutates it.
+    assert rejected['error'] == 'Managed iMessage can only address the tenant owner'
 
     async def exercise_notices():
         nonlocal fail_delivery
@@ -253,3 +255,129 @@ def test_google_address_book_alone_does_not_start_scheduled_briefs(tmp_path, mon
     monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
     managed.record_google_consent(tmp_path, ['https://www.googleapis.com/auth/contacts'])
     assert not managed.has_sources(tmp_path)
+
+
+def _gated_relay(tmp_path, monkeypatch, mode):
+    """A Relay wired the way receiver.py wires it, with a recording forward in place of a Mac."""
+    if mode == 'managed':
+        monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+        monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    else:
+        monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    spec = importlib.util.spec_from_file_location(
+        'relay_gate_' + mode, Path(__file__).resolve().parent / 'relay.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    relay = module.Relay()
+    relay._touch()                     # the Bridge is connected and polling
+    forwarded = []
+
+    def forward(request, timeout):
+        forwarded.append(request)
+        listing = {'tools': [{'name': name} for name in
+                             ('health', 'read_local', 'get_messages', 'send_message')]}
+        return {'jsonrpc': '2.0', 'id': request.get('id'),
+                'result': listing if request.get('method') == 'tools/list'
+                else {'content': [{'type': 'text', 'text': '{}'}], 'isError': False}}
+
+    relay._forward = forward
+    relay.validate_request = lambda request: managed.validate_tool_request(tmp_path, request)
+    relay.filter_tools = lambda result: managed.filter_tool_list(tmp_path, result)
+    return relay, forwarded
+
+
+def _tool_call(name, arguments, rid=1):
+    return {'jsonrpc': '2.0', 'id': rid, 'method': 'tools/call',
+            'params': {'name': name, 'arguments': arguments}}
+
+
+def test_managed_refuses_a_send_before_the_bridge_executes_it(tmp_path, monkeypatch):
+    # The gate that mattered was post-execution: the Mac sent the message and the relay merely
+    # discarded the receipt. Denial must happen before the call is handed to a connected Bridge.
+    relay, forwarded = _gated_relay(tmp_path, monkeypatch, 'managed')
+    state(tmp_path, 'managed-capabilities.json',
+          sources={'imessage': {'consented': True, 'connected': True}})
+    response = relay.mcp_call(_tool_call('send_message', {'channel': 'imessage', 'to': '+15551234567',
+                                                          'body': 'hi'}, rid=4), timeout=1)
+    assert forwarded == []                                  # nothing ever reached the Mac
+    assert response['id'] == 4 and 'result' not in response
+    assert response['error']['code'] == -32002
+    assert 'not permitted' in response['error']['message'] and 'send_message' in response['error']['message']
+    # A consented read is untouched by the gate.
+    allowed = relay.mcp_call(_tool_call('get_messages', {'identifier': '+15551234567'}, rid=5), timeout=1)
+    assert allowed['result']['isError'] is False
+    assert [r['params']['name'] for r in forwarded] == ['get_messages']
+    # ...and an unconsented one is refused without a forward too.
+    assert relay.mcp_call(_tool_call('get_contacts', {}, rid=6), timeout=1)['error']['code'] == -32002
+    assert len(forwarded) == 1
+
+
+def test_self_host_forwards_every_tool_call_as_before(tmp_path, monkeypatch):
+    relay, forwarded = _gated_relay(tmp_path, monkeypatch, 'self-host')
+    for name in ('send_message', 'read_local', 'get_contacts'):
+        assert 'result' in relay.mcp_call(_tool_call(name, {}), timeout=1)
+    assert [r['params']['name'] for r in forwarded] == ['send_message', 'read_local', 'get_contacts']
+    listed = relay.mcp_call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
+    assert 'send_message' in [t['name'] for t in listed['result']['tools']]
+
+
+def test_managed_tools_list_does_not_advertise_a_denied_tool(tmp_path, monkeypatch):
+    relay, _forwarded = _gated_relay(tmp_path, monkeypatch, 'managed')
+    state(tmp_path, 'managed-capabilities.json',
+          sources={'imessage': {'consented': True, 'connected': True}})
+    live = [t['name'] for t in relay.mcp_call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})['result']['tools']]
+    assert live == ['health', 'read_local', 'get_messages']
+    relay._last_poll = float('-inf')                        # Mac asleep: same filter on the cache
+    cached = [t['name'] for t in relay.mcp_call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})['result']['tools']]
+    assert cached == live
+
+
+def test_request_and_response_gates_cannot_disagree(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json',
+          sources={'whatsapp': {'consented': True, 'connected': True}})
+    wrap = lambda value: {'structuredContent': value, 'isError': False}
+    for name, arguments in (('send_message', {'channel': 'imessage', 'to': 'x', 'body': 'y'}),
+                            ('future_write_tool', {}), ('get_contacts', {}),
+                            ('read_history', {'source': 'imessage'}),
+                            ('read_local', {'sources': ['imessage']})):
+        request = {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
+        assert managed.validate_tool_request(tmp_path, request) is False, name
+        assert managed.validate_tool_response(tmp_path, request, wrap({'ok': True})) is False, name
+    for name, arguments in (('health', {}), ('read_history', {'source': 'whatsapp'}),
+                            ('read_local', {'sources': ['whatsapp']})):
+        request = {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
+        assert managed.validate_tool_request(tmp_path, request) is True, name
+
+
+def test_managed_send_requires_separate_opt_in_and_a_bound_operation(tmp_path, monkeypatch):
+    relay, forwarded = _gated_relay(tmp_path, monkeypatch, 'managed')
+    args = {'channel': 'imessage', 'to': '+15551234567', 'body': 'On my way',
+            'request_id': 'request-1234567890'}
+    managed.record_bridge_consent(tmp_path, [], [], allow_send=True)
+    # Sending is independent from reading contacts or message history.
+    assert 'result' in relay.mcp_call(_tool_call('send_message', args))
+    assert len(forwarded) == 1
+    listing = relay.mcp_call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
+    assert 'send_message' in [tool['name'] for tool in listing['result']['tools']]
+    for field, value in (('request_id', ''), ('to', 'ramp_81@rbm.goog'),
+                         ('to', '81'), ('channel', 'whatsapp'), ('body', ' ')):
+        assert not managed.validate_tool_request(tmp_path, _tool_call('send_message', {**args, field: value}))
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'], allow_send=False)
+    assert 'error' in relay.mcp_call(_tool_call('send_message', args))
+    # A legacy app's missing field must not preserve an earlier send grant.
+    managed.record_bridge_consent(tmp_path, [], [], allow_send=True)
+    managed.record_bridge_consent(tmp_path, [], [])
+    assert not managed.validate_tool_request(tmp_path, _tool_call('send_message', args))
+    with pytest.raises(ValueError):
+        managed.record_bridge_consent(tmp_path, [], [], allow_send='true')
+
+
+def test_send_permission_is_tenant_scoped(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    managed.record_bridge_consent(tmp_path, [], [], allow_send=True)
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'another')
+    listing = managed.filter_tool_list(tmp_path, {'tools': [{'name': 'send_message'}]})
+    assert listing == {'tools': []}

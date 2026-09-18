@@ -33,7 +33,10 @@ jobs:
       - name: Install test dependencies
         # Pinned in requirements-dev.txt — a red run means a real regression, never "PyPI shipped
         # something this morning".
-        run: python3 -m pip install --no-cache-dir -r requirements-dev.txt
+        run: python3 -m pip install --no-cache-dir --require-hashes -r requirements-dev.txt
 
       - name: Shared runtime contracts
         run: python3 sotto-chief-of-staff/tools/verify.py
+
+      - name: Build the public image
+        run: tools/verify-public-image.sh .

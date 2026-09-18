@@ -204,7 +204,8 @@ def run_pipeline(name: str) -> dict:
                 return json.dumps({"patches": [], "score": 88, "summary": "ok"})
             if in_.get("_revise"):
                 return json.dumps({"brief_markdown": stub.get("brief_markdown", ""),
-                                   "actions": stub.get("actions", [])})
+                                   "actions": stub.get("actions", []),
+                                   "loop_updates": stub.get("loop_updates", [])})
             return json.dumps(stub)
 
         # 1) build_prompt (folds top-level google/granola into local, resolves names, mutes)
@@ -221,9 +222,20 @@ def run_pipeline(name: str) -> dict:
         }
         result["continuity"] = cr.resolve(cont_payload, base)
         result["malformed_after"] = _read_files(malformed_paths)
+        # Dynamic fixture dates produce a dynamic ledger revision. The fixture supplies the
+        # semantic proposal; only its version placeholder is bound to the seeded snapshot.
+        from delivery_effects import loop_version
+        ledger = cr._load_items()
+        for update in stub.get("loop_updates", []):
+            if update.get("loopVersion") == "$FIXTURE_LEDGER_VERSION":
+                update["loopVersion"] = loop_version(ledger[update["loopId"]])
 
         # 3) compose with the stub LLM + critic=auto → 4) tap-link post-processing (inside compose)
         out = cb.compose(inputs, llm=stub_llm, critic=True)
+        cont_payload["new_actions"] = out.get("actions") or []
+        cont_payload["loop_updates"] = out.get("loop_updates") or []
+        cont_payload["emails"] = inputs.get("google", {}).get("emails", [])
+        result["continuity"] = cr.resolve(cont_payload, base, resolve_existing=False)
         result["out"] = out
         result["critic_ran"] = calls["critic"]
         result["critic_skipped"] = bool(isinstance(out.get("_critic"), dict) and out["_critic"].get("skipped"))
@@ -380,11 +392,11 @@ def chk_edge_muted_person(r):
             "Bob(reason or thread) present OR Carol(reason) absent OR restated-mute missing")
 
 
-def chk_edge_expired_loop(r):
+def chk_edge_old_obligation_retained(r):
     expired = {i.get("contact_name") for i in r["continuity"].get("expired", [])}
     active = {i.get("contact_name") for i in r["continuity"].get("active", [])}
-    ok = "Old Thread" in expired and "Nadia Ops" in active
-    return ("expired_loop_ages_out", ok, f"expired={expired} active={active}")
+    ok = "Old Thread" not in expired and {"Old Thread", "Nadia Ops"} <= active
+    return ("old_obligation_retained", ok, f"expired={expired} active={active}")
 
 
 def chk_edge_empty_google_coverage(r):
@@ -461,7 +473,7 @@ CHECKS = {
     "quiet_day": [chk_no_exception, chk_quiet_critic_skipped, chk_quiet_coverage, chk_quiet_empties,
                   chk_tap_links_wellformed],
     "edge_day": [chk_no_exception, chk_edge_malformed_untouched, chk_edge_muted_person,
-                 chk_edge_expired_loop, chk_edge_empty_google_coverage, chk_edge_unicode,
+                 chk_edge_old_obligation_retained, chk_edge_empty_google_coverage, chk_edge_unicode,
                  chk_edge_phone_only, chk_tap_links_wellformed, chk_edge_group_names_not_invented,
                  chk_edge_group_no_deeplink, chk_edge_group_backward_compat],
 }

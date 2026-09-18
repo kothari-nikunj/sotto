@@ -52,10 +52,17 @@ def run(bundle: dict) -> dict:
     cr = _load("morning-brief/scripts/continuity_resolve.py", "continuity_resolve")
 
     applied = ku.apply(bundle.get("extracted_knowledge", {}))
+    existing = cr._load_items()
+    for row in bundle.get("existing_loops", []):
+        if row["anchor_key"] not in existing:
+            cr._persist(row)
     resolved = cr.resolve({
         "today": bundle.get("today", "2026-06-23"),
         "signals": bundle.get("signals", {}),
         "new_actions": bundle.get("actions", []),
+        "loop_updates": bundle.get("loop_updates", []),
+        "local": bundle.get("local", {}),
+        "emails": bundle.get("emails", []),
     })
     brief = render_brief(bundle.get("actions", []), resolved)
     return {"brief_markdown": brief, "knowledge_applied": applied,

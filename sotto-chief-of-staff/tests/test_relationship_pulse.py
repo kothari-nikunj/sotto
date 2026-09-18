@@ -1,5 +1,6 @@
 """relationship_pulse.py — weekly losing-touch / waiting-on-you detection from read_local history."""
 import importlib.util
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -32,8 +33,8 @@ def test_waiting_on_you():
 def test_losing_touch_when_cadence_widens():
     # Used to talk every ~2 days, now silent 20 days → cadence increasing + 14d+ → losing_touch.
     msgs = []
-    for d in [60, 58, 56, 54, 52, 50, 48, 46]:   # tight early cadence
-        msgs.append(_msg("Sarah", d, d % 2 == 0))
+    for i, d in enumerate([60, 58, 56, 54, 52, 50, 48, 46]):   # tight reciprocal cadence
+        msgs.append(_msg("Sarah", d, i % 2 == 0))
     msgs.append(_msg("Sarah", 20, False))         # then a big gap, last contact 20d ago
     local = {"contacts": [{"name": "Sarah", "phones": ["+1"]}], "imessage": msgs}
     out = rp.compute(local, NOW)
@@ -73,8 +74,8 @@ def test_pulse_markdown_is_chat_formatted_with_no_opener():
 
 def _losing_msgs(name, handle):
     msgs = []
-    for d in [60, 58, 56, 54, 52, 50, 48, 46]:
-        m = _msg(name, d, d % 2 == 0)
+    for i, d in enumerate([60, 58, 56, 54, 52, 50, 48, 46]):
+        m = _msg(name, d, i % 2 == 0)
         m["handle"] = handle
         msgs.append(m)
     last = _msg(name, 20, False)
@@ -83,8 +84,7 @@ def _losing_msgs(name, handle):
     return msgs
 
 
-def test_graph_tracked_person_outranks_untracked(tmp_path):
-    # Two people drifting identically; the one with a rich knowledge-graph file ranks first.
+def test_graph_research_never_changes_rank_or_leaks_talking_points(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     people = os.path.join(str(tmp_path), "knowledge", "people")
     os.makedirs(people, exist_ok=True)
@@ -99,9 +99,11 @@ def test_graph_tracked_person_outranks_untracked(tmp_path):
     out = rp.compute(local, NOW)
     losing = [x for x in out["attention_queue"] if x["queue_type"] == "losing_touch"]
     names = [x["display_name"] for x in losing]
-    assert names and names[0] == "Sarah"                      # graph-weighted to the top
+    assert set(names) == {"Sarah", "Tom"}
     sarah = next(x for x in losing if x["display_name"] == "Sarah")
-    assert sarah["graph_context"]["company"] == "Acme"        # grounded reconnect hook attached
+    assert sarah["priority"] == next(x for x in losing if x["display_name"] == "Tom")["priority"]
+    assert sarah["graph_context"] == {"company": "Acme"}
+    assert "talking_point" not in sarah["graph_context"] and "fact" not in sarah["graph_context"]
     assert "Acme" in out["pulse_markdown"]
     tom = next(x for x in losing if x["display_name"] == "Tom")
     assert "graph_context" not in tom                         # untracked → no fabricated context
@@ -116,6 +118,86 @@ def test_persist_writes_state(tmp_path):
     import json
     state = json.load(open(os.path.join(str(tmp_path), "knowledge", "relationship_state.json")))
     assert state["attention_queue"][0]["display_name"] == "X"
+
+
+def test_persist_preserves_unknown_candidate_metadata(tmp_path):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    rp._persist_state({"attention_queue": [], "relationship_insights": [], "history": {
+        "c_alex": {"name": "Alex", "last_contact": "2026-06-24", "interactions": 2,
+                   "importance_evidence": {}, "engagement": {}}}})
+    path = os.path.join(str(tmp_path), "knowledge", "relationship_state.json")
+    import json
+    state = json.load(open(path))
+    state["history"]["c_alex"]["candidate_offer"] = {"accepted_at": "2026-06-25T12:00:00Z"}
+    with open(path, "w") as f:
+        json.dump(state, f)
+    rp._persist_state({"attention_queue": [], "relationship_insights": [], "history": {
+        "c_alex": {"name": "Alex", "last_contact": "2026-06-25", "interactions": 3,
+                   "importance_evidence": {}, "engagement": {}}}})
+    assert json.load(open(path))["history"]["c_alex"]["candidate_offer"]["accepted_at"]
+
+
+def test_persist_merges_reply_samples_from_separate_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    def engagement(start_days, finish_days, first_id):
+        return rp.engagement_signals({"events": [
+            {"at": NOW-timedelta(days=start_days), "from_me": True,
+             "conversation_id": str(first_id), "native_id": str(first_id)},
+            {"at": NOW-timedelta(days=finish_days), "from_me": False,
+             "conversation_id": str(first_id), "native_id": str(first_id + 1)}]}, {}, NOW)
+    base = {"name": "Alex", "last_contact": NOW.date().isoformat(), "interactions": 2,
+            "importance_evidence": {}, "channels": {}}
+    rp._persist_state({"attention_queue": [], "relationship_insights": [], "history": {
+        "c_alex": {**base, "engagement": engagement(8, 7, 1)}}}, now=NOW)
+    rp._persist_state({"attention_queue": [], "relationship_insights": [], "history": {
+        "c_alex": {**base, "engagement": engagement(4, 2, 3)}}}, now=NOW)
+    saved = json.load(open(tmp_path / "knowledge/relationship_state.json"))["history"]["c_alex"]
+    assert len(saved["engagement"]["reply_samples"]) == 2
+    assert saved["engagement"]["counterpart_reply_lag_days"] == 2
+
+
+def test_only_ended_granola_attendance_counts_as_a_held_meeting():
+    contact = {"name": "Alex", "emails": ["alex@example.com"]}
+    meetings = [{"meeting_id": f"m{i}", "end": (NOW-timedelta(days=d)).isoformat(),
+                 "attendee_emails": ["alex@example.com"]} for i, d in enumerate((1, 8, 15))]
+    meetings.append({"meeting_id": "future", "end": (NOW+timedelta(days=1)).isoformat(),
+                     "attendee_emails": ["alex@example.com"]})
+    meetings.append({"meeting_id": "naive-past", "end": (NOW-timedelta(days=22)).replace(
+        tzinfo=None).isoformat(), "attendee_emails": ["alex@example.com"]})
+    meetings.append({"meeting_id": "unended", "date": (NOW-timedelta(days=29)).date().isoformat(),
+                     "attendee_emails": ["alex@example.com"]})
+    out = rp.compute({"contacts": [contact], "granola_meetings": meetings}, NOW)
+    row = next(v for v in out["history"].values() if v["name"] == "Alex")
+    assert row["importance"]["tier"] == "regular"
+    assert row["importance"]["held_meetings"] == 4
+
+
+def test_owner_comes_from_the_canonical_chain_not_the_env_var_alone(monkeypatch):
+    """With SOTTO_USER_EMAIL unset (the normal managed case) the owner is the connected Google
+    account; reading the env var alone left the owner in every 1:1 and dropped every meeting."""
+    monkeypatch.delenv("SOTTO_USER_EMAIL", raising=False)
+    monkeypatch.setattr(rp, "configured_user_email", lambda: "me@example.com")
+    contacts = [{"name": "Alex", "emails": ["alex@example.com"]}]
+    held = {"meeting_id": "one-on-one", "end": (NOW-timedelta(days=1)).isoformat(),
+            "attendee_emails": ["me@example.com", "alex@example.com"]}
+    out = rp._held_meetings({"contacts": contacts, "granola_meetings": [held]}, NOW)
+    assert len(out) == 1
+    monkeypatch.setattr(rp, "configured_user_email", lambda: "")
+    assert rp._held_meetings({"contacts": contacts, "granola_meetings": [held]}, NOW) == {}
+
+
+def test_group_meetings_and_owner_address_do_not_become_relationship_evidence(monkeypatch):
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@example.com")
+    contacts = [{"name": "Alex", "emails": ["alex@example.com"]}]
+    group = {"meeting_id": "standup", "end": (NOW-timedelta(days=1)).isoformat(),
+             "attendee_emails": ["me@example.com", "alex@example.com", "b@example.com"]}
+    owner_omitted = {"meeting_id": "standup-unknown-owner",
+                     "end": (NOW-timedelta(days=2)).isoformat(),
+                     "attendee_emails": ["alex@example.com", "b@example.com"]}
+    owner_only = {"meeting_id": "solo", "end": (NOW-timedelta(days=1)).isoformat(),
+                  "attendee_emails": ["me@example.com"]}
+    assert rp._held_meetings({"contacts": contacts,
+                              "granola_meetings": [group, owner_omitted, owner_only]}, NOW) == {}
 
 
 def test_daily_brief_merges_persisted_relationship_state(tmp_path):

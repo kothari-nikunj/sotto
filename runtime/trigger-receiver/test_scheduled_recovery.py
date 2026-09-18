@@ -1,4 +1,6 @@
 """Deadline, consent revision, and recovery across the procedure/work/outbox boundary."""
+import fcntl
+import hashlib
 import importlib.util
 import json
 from datetime import datetime, timezone
@@ -328,3 +330,122 @@ def test_invalidated_brief_gets_fresh_generation_even_when_source_or_time_revert
     cache.write_text(json.dumps({'events': [event]}))
     rec._managed_brief('sotto-morning-brief', 'cron:sotto-morning-brief')
     assert requests[-1]['work_key'] != original
+
+
+@pytest.mark.parametrize('waiting_in', ['outbox', 'saved-result'])
+def test_old_brief_recovery_admits_one_fresh_generation(rec, tmp_path, monkeypatch, waiting_in):
+    """Real worker, queue, outbox and replacement admission; only the provider/composer are fake."""
+    import brief_runner
+    import managed
+    import onboarding
+    clock = [datetime(2026, 9, 8, 6, 30, tzinfo=timezone.utc).timestamp()]
+    monkeypatch.setattr(rec.time, 'time', lambda: clock[0])
+    monkeypatch.setattr(rec, '_local_now', lambda: datetime.fromtimestamp(clock[0], timezone.utc))
+    monkeypatch.setattr(managed, 'brief_hold', lambda *a: None)
+    monkeypatch.setattr(onboarding, 'scheduled_hold', lambda *a: False)
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'test:owner')
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda: [
+        ('sotto-morning-brief', '30 6 * * *', '', 'sotto-morning-brief')])
+    box, queue = rec.OUTBOX, rec.WORK_QUEUE
+    monkeypatch.setitem(box.HOOKS, 'local_today', lambda: '2026-09-08')
+    monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: True)
+    archive = tmp_path / 'briefs/2026-09-08_morning.json'
+    archive.parent.mkdir()
+    archive.write_text('{}')
+    attempts, accepted = [], []
+    def send(body, target):
+        attempts.append(body)
+        if body == 'Old brief':
+            return False, 'channel unavailable', {'acceptance': 'rejected'}
+        accepted.append(body)
+        return True, '', {'acceptance': 'accepted', 'message_id': 'fresh-accepted'}
+    monkeypatch.setitem(box.HOOKS, 'send', send)
+    label = 'cron:sotto-morning-brief'
+    old_id = queue.enqueue(str(tmp_path), 'run', {'label': label}, key='old-composition', valid_until=clock[0] + 4 * 3600)
+    old = queue.claim(str(tmp_path), 'initial-worker')
+    old_result = {'text': 'Old brief', 'label': label, 'valid_until': clock[0] + 4 * 3600,
+                  'effects': [{'kind': 'eligibility', 'valid_until': clock[0] + brief_runner.ARTIFACT_MAX_AGE_SECONDS}]}
+    queue.save_result(str(tmp_path), old_id, 'initial-worker', old_result)
+    old['result'] = old_result
+    if waiting_in == 'outbox':
+        rec._work_one(old)
+    clock[0] += 3 * 3600
+    if waiting_in == 'saved-result':
+        recovered = queue.claim(str(tmp_path), 'recovered-worker')
+        assert recovered['id'] == old_id
+        rec._work_one(recovered)
+        # Wait until the old handoff lease settles before retrying replacement admission.
+        assert queue.get(str(tmp_path), old_id)['status'] == 'done'
+        assert box.counts()['effects_pending'] == 1
+        clock[0] += 61
+    box.drain()
+    replacement = queue.active_job(str(tmp_path), 'run', label)
+    assert replacement is not None and replacement['id'] != old_id
+    assert json.loads(replacement['payload']['prompt'])['kind'] == 'morning'
+    assert attempts == (['Old brief'] if waiting_in == 'outbox' else [])
+    monkeypatch.setattr(rec, '_execute_work', lambda job: {
+        'text': 'Fresh brief', 'label': label, 'effects': [{'kind': 'eligibility', 'valid_until': clock[0] + 7200}]})
+    fresh_job = queue.claim(str(tmp_path), 'fresh-worker')
+    assert fresh_job['id'] == replacement['id']
+    rec._work_one(fresh_job)
+    box.drain()
+    assert accepted == ['Fresh brief']
+    assert Path(rec.delivered_marker('2026-09-08', 'morning')).read_text() == fresh_job['id']
+    assert box.counts()['effects_pending'] == 0
+
+
+def test_generation_contention_refunds_attempts_then_delivers_saved_artifact(rec, tmp_path, monkeypatch):
+    """Real child, file lock and work queue, with only the lock wait shortened for the test."""
+    clock = [rec.time.time()]
+    monkeypatch.setattr(rec.time, 'time', lambda: clock[0])
+    request = {'pack': str(PACK), 'kind': 'morning', 'day': '2026-09-08', 'work_key': 'contention'}
+    run_key = hashlib.sha256(request['work_key'].encode()).hexdigest()[:24]
+    scratch = tmp_path / 'events/work-inputs' / ('brief-' + run_key)
+    scratch.mkdir(parents=True)
+    (scratch / 'artifact.json').write_text(json.dumps({
+        'brief_text': 'Fresh saved brief', 'composed_at': clock[0], 'learning_revision': 'current'}))
+    for phase in ('essential', 'ancillary'):
+        (scratch / (phase + '-done.json')).write_text('{"complete": true}')
+    delivered = []
+    monkeypatch.setattr(rec, '_deliver_text', lambda text, *a, **k: delivered.append(text.strip()))
+    monkeypatch.setattr(rec, '_composed_brief_recently', lambda *a: True)
+    real_popen = rec.subprocess.Popen
+    def short_lock_wait(argv, **kwargs):
+        # Use the real CLI/exit-code contract. No provider or script call is mocked.
+        bootstrap = ('import sys, runpy; sys.path.insert(0, sys.argv[1]); '
+                     'import jsonstore; jsonstore.LOCK_TIMEOUT_SECS = 0.05; '
+                     'sys.argv = sys.argv[2:]; runpy.run_path(sys.argv[0], run_name="__main__")')
+        return real_popen([argv[0], '-c', bootstrap, str(PACK / '_shared/lib'), *argv[1:]], **kwargs)
+    monkeypatch.setattr(rec.subprocess, 'Popen', short_lock_wait)
+    queue = rec.WORK_QUEUE
+    identity = queue.enqueue(str(tmp_path), 'run', {
+        'runner': [sys.executable, str(HERE / 'brief_runner.py')],
+        'prompt': json.dumps(request), 'label': 'cron:sotto-morning-brief'},
+        key='contention', valid_until=clock[0] + 3600)
+    with (scratch / 'run.lock').open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        for attempt in range(queue.MAX_ATTEMPTS + 1):
+            job = queue.claim(str(tmp_path), f'worker-{attempt}')
+            assert job['id'] == identity
+            rec._work_one(job)
+            pending = queue.get(str(tmp_path), identity)
+            assert pending['status'] == 'pending' and pending['attempts'] == 0
+            assert pending['due'] == clock[0] + 60
+            assert queue.claim(str(tmp_path), 'too-early') is None
+            assert delivered == []
+            clock[0] += 60
+    recovered = queue.claim(str(tmp_path), 'recovered')
+    rec._work_one(recovered)
+    assert queue.get(str(tmp_path), identity)['status'] == 'done'
+    assert delivered == ['Fresh saved brief']
+
+
+def test_other_runner_tempfail_still_counts_as_failure(rec, tmp_path):
+    queue = rec.WORK_QUEUE
+    identity = queue.enqueue(str(tmp_path), 'run', {
+        'runner': [sys.executable, '-c', 'raise SystemExit(75)'],
+        'label': 'test'}, key='ordinary-failure')
+    rec._work_one(queue.claim(str(tmp_path), 'worker'))
+    failed = queue.get(str(tmp_path), identity)
+    assert failed['status'] == 'pending' and failed['attempts'] == 1
+    assert failed['error'].startswith('worker_exit_75:')

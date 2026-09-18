@@ -13,8 +13,9 @@ import tempfile
 import re
 
 from chatfmt import to_imessage
+from brief_validate import is_calendar_preview_note
 
-VERSION = 10
+VERSION = 12
 MAX_CARDS = 4
 MAX_WORDS = 200
 MAX_PREP_WORDS = 200
@@ -27,7 +28,7 @@ def _heading(line, kind):
     line = line.rstrip(':').strip()
     if kind == 'brief':
         return {'needs attention now': 'Needs you', 'should handle today': 'Today',
-                'coming up': 'Your day', 'already handled': 'Handled', '✅ already handled': 'Handled', 'still open': 'Open loops', 'still pending': 'Open loops', 'what moved today': 'Handled'}.get(line.lower())
+                'coming up': 'Your day', 'already handled': 'Handled', '✅ already handled': 'Handled', 'still open': 'Open loops', 'still pending': 'Open loops', 'weekly review': 'Open loops', 'what moved today': 'Handled'}.get(line.lower())
     if line.lower() == 'the space & why now':
         return 'Context'
     if line.lower() in ('the founder', 'traction & signals'):
@@ -48,9 +49,19 @@ def build(text, kind='brief', preview=False):
     plain = to_imessage(text, normalize_style=False).strip()
     if not plain:
         return None
+    # Preserve explicit source emphasis before converting markdown to plain source text.
+    # No name inference: an unlabelled sentence remains ordinary body text.
+    source_emphasis = {}
+    for raw in text.splitlines():
+        match = re.match(r'^\s*(?:[-•]\s+)?(?P<mark>\*\*|\*)(?P<label>[^*\n]+)(?P=mark)', raw)
+        if match:
+            key = to_imessage(raw, normalize_style=False).strip().lstrip('• ').strip()
+            source_emphasis[key] = len(match['label'])
     lines = plain.splitlines()
     title = lines[0].strip()
     sections, active = [], None
+    agenda_day = ''
+    preamble, filtered = [], False
     for index, raw in enumerate(lines):
         line = raw.strip().lstrip('• ').strip()
         if not line:
@@ -59,15 +70,30 @@ def build(text, kind='brief', preview=False):
         if heading:
             active = {'title': heading, 'blocks': []}
             sections.append(active)
+            agenda_day = ''
         elif line.lower() in ('already handled', '✅ already handled', 'filtered', 'still open',
                               'the founder', 'traction & signals', 'the space & why now'):
             active = None
+            filtered = line.lower() == 'filtered'
         elif active is not None:
+            if kind == 'brief' and active['title'] == 'Your day':
+                if is_calendar_preview_note(line):
+                    continue
+                if re.fullmatch(_DAY, line.rstrip(':'), re.I):
+                    agenda_day = line.rstrip(':')
+                    continue
             # Long paragraphs and links belong in text. Never cut off a qualifier, date or amount.
             if len(line.split()) <= MAX_WORDS and (kind == 'brief' or not re.search(r'https?://|mailto:|/app#', line)):
-                active['blocks'].append({'text': line, 'line': index})
-            elif kind == 'brief' and active['title'] in ('Needs you', 'Today', 'Open loops', 'In the loop'):
+                block = {'text': line, 'line': index}
+                if line in source_emphasis:
+                    block['emphasis_end'] = source_emphasis[line]
+                if agenda_day and active['title'] == 'Your day':
+                    block['day'] = agenda_day
+                active['blocks'].append(block)
+            elif kind == 'brief':
                 return None  # never hide an action merely because it is hard to fit
+        elif kind == 'brief' and index > 0 and not filtered:
+            preamble.append(_display_text(line))
     if kind == 'prep':
         groups = [('Your relationship', ('Your relationship', 'The founder')),
                   ('The business', ('The business',)),
@@ -77,15 +103,15 @@ def build(text, kind='brief', preview=False):
                     for part in sections if part['title'] in titles for b in part['blocks']]}
                     for title, titles in groups]
     else:
-        extras = [dict(b, section=part['title']) for part in sections
-                  if part['title'] in ('Handled', 'Open loops') for b in part['blocks']]
+        extras = [dict(b, section=name) for name in ('Open loops', 'Handled')
+                  for part in sections if part['title'] == name for b in part['blocks']]
         sections = [part for part in sections if part['title'] not in ('Handled', 'Open loops')]
         if extras:
-            sections.append({'title': 'In the loop', 'blocks': extras})
+            sections.append({'title': 'Follow-ups', 'blocks': extras})
     cards = []
     for section in sections:
         blocks, words = [], 0
-        required = kind == 'brief' and section['title'] in ('Needs you', 'Today', 'Open loops', 'In the loop')
+        required = kind == 'brief'
         limit = MAX_PREP_WORDS if kind == 'prep' and section['title'] != 'Your relationship' else MAX_WORDS
         for block in section['blocks']:
             count = len(block['text'].split())
@@ -120,8 +146,10 @@ def build(text, kind='brief', preview=False):
             'full_text': plain, 'cards': cards, 'excerpt': omitted}
     deck['id'] = hashlib.sha256(json.dumps(deck, sort_keys=True).encode()).hexdigest()[:24]
     # Keep the companion text short; dates and links remain selectable in Messages.
-    deck['summary'] = ('Historical preview · ' if preview else '') + _display_text(title)
+    deck['summary'] = ('Historical preview · ' if preview else '') + (_brief_caption(title) if kind == 'brief' else _display_text(title))
     if kind == 'brief':
+        if preamble:
+            deck['summary'] += '\n' + '\n'.join(preamble)
         links = _companion_links(plain)
         if links:
             deck['summary'] += '\n' + '\n'.join(links)
@@ -132,7 +160,7 @@ def build(text, kind='brief', preview=False):
 
 def _companion_links(text):
     links = []
-    for link in re.findall(r'https?://[^\s<>]+|mailto:[^\s<>]+|/app#[^\s<>]+', text):
+    for link in re.findall(r'https?://[^\s<>]+|mailto:[^\s<>]+', text):
         link = link.rstrip('.,;:!?')
         while link and link[-1] in ')]}':
             closer = link[-1]
@@ -161,18 +189,45 @@ def _lines(draw, text, font, width):
     return output
 
 
+def _brief_caption(title):
+    match = re.fullmatch(r'Good (morning|afternoon|evening)\s*[—–-]\s*(.+)', title, re.I)
+    if not match:
+        return _display_text(title)
+    period, date = match.groups()
+    date = re.sub(r'^[A-Za-z]+,\s*', '', date)
+    return f"Good {period.lower()}. Here's your {period.lower()} brief for {date}."
+
+
 def _display_text(text, kind=''):
+    # Old archived briefs may still contain a dashboard-relative link. It is not a chat URL.
+    text = re.sub(r'\s*[—–:-]?\s*see /app#loops\b', ". Ask me what's still open.", text, flags=re.I)
+    text = re.sub(r'(?<![\w/])/app#loops\b', 'your open items', text)
     if kind == 'brief':
         text = re.sub(r'^(.{1,55}?) [—–-] ', r'\1: ', text)
     return text.replace(' — ', ' · ').replace('—', '; ')
 
 
+# Recognize the formats already emitted by the composer, including date-prefixed rows.
+_DAY = (r'(?:Today|Tomorrow|(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|'
+        r'Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)(?:,?\s+[A-Za-z]{3,9}\s+\d{1,2})?'
+        r'|[A-Za-z]{3,9}\s+\d{1,2})')
+
+
 def _agenda_parts(text):
-    match = re.match(r'(?P<time>\d{1,2}:\d{2}\s*[AP]M)\s*[—–-]\s*(?P<event>.+)', text)
+    match = re.fullmatch(
+        rf'(?:(?P<day>{_DAY})[,:]?\s+)?'
+        r'(?P<time>\d{1,2}(?::\d{2})?\s*[AP]M|All day)\s*[:—–-]\s*(?P<event>.+)',
+        text, re.I)
     if not match:
-        return None, _display_text(text), ''
+        return '', None, _display_text(text), ''
     title, delimiter, location = match['event'].partition(' | Location: ')
-    return match['time'], _display_text(title), _display_text(location.strip()) if delimiter else ''
+    if not delimiter:
+        # Only an explicit street address may move out of parentheses. Attendees stay in place.
+        address = re.search(r'\s+\((\d+\s+[^()]*\b(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|'
+                            r'Dr|Drive|Ln|Lane|Way)\b[^()]*)\)$', title, re.I)
+        if address:
+            title, location = title[:address.start()], address[1]
+    return match['day'] or '', match['time'], _display_text(title), _display_text(location.strip())
 
 
 def _emphasis_end(text, kind):
@@ -246,10 +301,6 @@ def render(deck, destination):
             subject = re.split(r' [—–-] ', deck['title'], maxsplit=1)[0]
             company = re.search(r'\(([^()]+)\)', subject)
             title = company.group(1) if company else subject
-        elif len(blocks) == 1:
-            parts = re.split(r' [—–-] ', blocks[0], maxsplit=1)
-            if len(parts) == 2 and len(parts[0]) <= 55:
-                title, blocks[0] = parts
         title = _display_text(title)
         title_lines = _lines(draw, title, heading_font, 870)
         if len(title_lines) > 2:
@@ -269,69 +320,94 @@ def render(deck, destination):
             y += 88
         subtitle = {'Your relationship': 'Relationship & history',
                     'The business': 'Business', 'The founder': 'Founder',
-                    'Questions to ask': 'Questions', 'Your day': 'Schedule'}.get(card['title'], card['title'])
+                    'Questions to ask': 'Questions', 'Your day': 'Calendar highlights',
+                    'Needs you': 'Time-sensitive', 'Today': 'To take care of',
+                    'Follow-ups': 'Still open & handled'}.get(card['title'], card['title'])
         if subtitle != title:
             draw.text((64, y + 9), subtitle, font=label_font, fill='#6E6E73')
-            y += 90
+            y += 54 if deck['kind'] == 'brief' else 90
         else:
             y += 42
         if agenda:
-            rows = []
-            for block in blocks:
-                time, event, location = _agenda_parts(block)
-                birthday = re.fullmatch(r'(?:🎂\s*)?(.+?) · (birthday (?:today|in .+))', event) if not time else None
+            rows, current_day = [], ''
+            for block, source in zip(blocks, card['blocks']):
+                day, time, event, location = _agenda_parts(block)
+                day = day or source.get('day', '')
+                day_label = day if day and day != current_day else ''
+                if day:
+                    current_day = day
+                birthday = re.fullmatch(r'(?:🎂\s*)?(.+?) [·—–-] (birthday (?:today|in .+))', event) if not time else None
                 birthday_label = birthday[2].replace('birthday', 'Birthdays', 1) if birthday else ''
                 if birthday:
                     event = birthday[1]
                 lines = _lines(draw, event, row_font, 702 if time else 902)
                 if location and len(_lines(draw, location, location_font, 702)) > 1:
                     raise ValueError('meeting location exceeds one readable line; use text')
-                padding = 44 if rows and birthday else 0
+                padding = (44 if birthday else 36) if rows and (birthday or day_label) else 0
+                label = ' · '.join(part for part in (day_label, birthday_label) if part)
+                if draw.textlength(label, font=section_font) > 904:
+                    raise ValueError('calendar day label exceeds readable width; use text')
                 height = max(100, len(lines) * 55 + 32 + (42 if location else 0)) if time else len(lines) * 55 + 30
-                rows.append((time, lines, height + padding + (42 if birthday else 0), location, padding, birthday_label))
+                rows.append((time, lines, height + padding + (46 if label else 0), location, padding, label))
             y = _content_top(y, sum(row[2] for row in rows))
-            for time, lines, height, location, padding, birthday_label in rows:
+            for time, lines, height, location, padding, label in rows:
                 y += padding
                 height -= padding
-                if birthday_label:
-                    draw.text((88, y), birthday_label, font=label_font, fill='#6E6E73')
-                    y += 42
-                    height -= 42
+                if label:
+                    draw.text((88, y), label, font=section_font, fill='#6E6E73')
+                    y += 46
+                    height -= 46
                 if time:
                     draw.text((88, y + 5), time, font=time_font, fill='#0066CC')
                     draw.line((300, y + height - 14, 1016, y + height - 14), fill='#DEDEE3', width=1)
                 for offset, line in enumerate(lines):
-                    draw.text((300 if time else 88, y + offset * 55), line, font=row_font,
-                              fill='#1D1D1F' if time else '#6E6E73')
+                    draw.text((300 if time else 88, y + offset * 55), line, font=row_font, fill='#1D1D1F')
                 if location:
                     draw.text((300, y + len(lines) * 55 + 4), location, font=location_font, fill='#6E6E73')
                 y += height
+
         else:
             blocks = [_display_text(block, deck['kind']) for block in blocks]
-            emphasis = [_emphasis_end(block, deck['kind']) for block in blocks]
+            emphasis = [max(_emphasis_end(block, deck['kind']), source.get('emphasis_end', 0))
+                        for block, source in zip(blocks, card['blocks'])]
             bullets = [deck['kind'] == 'prep' and len(blocks) > 1 and not end for end in emphasis]
-            laid_out = [_rich_lines(draw, block, body_font, bold_font, 878 if bullet else 904, end)
-                        for block, bullet, end in zip(blocks, bullets, emphasis)]
+            counts = [bool(re.match(r'^\d+ other open loops?\b', block)) for block in blocks]
+            line_heights = [42 if count else 55 for count in counts]
+            laid_out = [_rich_lines(draw, block, label_font if count else body_font,
+                                    label_font if count else bold_font, 878 if bullet else 904, end)
+                        for block, bullet, end, count in zip(blocks, bullets, emphasis, counts)]
             sections = [b.get('section', '') for b in card['blocks']]
-            merged = card['title'] in ('Your relationship', 'Signals & context', 'In the loop')
+            merged = card['title'] in ('Your relationship', 'Signals & context', 'Follow-ups')
             starts = [merged and name and (i == 0 or name != sections[i-1]) for i, name in enumerate(sections)]
-            height = sum(len(lines) * 55 for lines in laid_out) + max(0, len(blocks)-1) * 24 + 56 + sum(bool(x) for x in starts) * 42
+            # Measure the actual wrapped text, then spend spare height on paragraph gaps.
+            # Dense cards may tighten spacing, but never shrink type or omit a paragraph.
+            gaps = max(0, len(blocks) - 1)
+            section_gap = 12
+            fixed_height = (sum(len(lines) * line_height for lines, line_height in zip(laid_out, line_heights)) + 56
+                            + sum(bool(x) for x in starts) * 46
+                            + sum(bool(x) for x in starts[1:]) * section_gap)
+            available = HEIGHT - 106 - y
+            paragraph_gap = max(12, min(24, (available - fixed_height) // gaps)) if gaps else 24
+            height = fixed_height + gaps * paragraph_gap
             y = _content_top(y, height)
             draw.rounded_rectangle((64, y, 1016, y + height), radius=32, fill='#FFFFFF')
             y += 24
             for position, lines in enumerate(laid_out):
                 if starts[position]:
-                    draw.text((88, y), {'Your relationship': 'Your history', 'The founder': 'Background'}.get(sections[position], sections[position]), font=section_font, fill='#1D1D1F')
-                    y += 42
+                    if position:
+                        y += section_gap
+                    draw.text((88, y), {'Your relationship': 'Your history', 'The founder': 'Background', 'Open loops': 'Still open'}.get(sections[position], sections[position]), font=section_font, fill='#1D1D1F')
+                    y += 46
                 bullet = bullets[position]
                 if bullet:
                     draw.ellipse((88, y + 22, 96, y + 30), fill='#86868B')
                 for line in lines:
                     for word, face, offset in line:
-                        draw.text((88 + (26 if bullet else 0) + offset, y), word, font=face, fill='#1D1D1F')
-                    y += 55
+                        draw.text((88 + (26 if bullet else 0) + offset, y), word, font=face,
+                                  fill='#6E6E73' if counts[position] else '#1D1D1F')
+                    y += line_heights[position]
                 if position < len(laid_out)-1:
-                    y += 24
+                    y += paragraph_gap
         # Keep historical context explicit without repeating a second headline.
         footer = 'Historical preview' if deck['preview'] else ''
         seal_bounds = seal.getbbox()

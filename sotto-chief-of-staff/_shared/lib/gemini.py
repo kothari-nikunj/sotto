@@ -62,7 +62,9 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
                approach research_attendees.py already uses) to pin the response contract.
     """
     import time as _time
-    gen: dict = {"response_mime_type": "application/json", "temperature": 0.4}
+    import model_work
+    gen: dict = {"response_mime_type": "application/json", "temperature": 0.4,
+                 **model_work.generation_config(model)}
     if schema is not None:
         gen["responseSchema"] = schema
     body: dict = {
@@ -93,7 +95,9 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
     if not candidates:
         block = (data.get("promptFeedback") or {}).get("blockReason") or "no candidates"
         raise RuntimeError(f"Gemini {model} returned no candidates (blockReason: {block})")
-    parts = (candidates[0].get("content") or {}).get("parts") or []
+    if candidates[0].get('finishReason') == 'MAX_TOKENS':
+        raise RuntimeError('Gemini response exceeded task output limit (MAX_TOKENS)')
+    parts = [p for p in ((candidates[0].get("content") or {}).get("parts") or []) if not p.get('thought')]
     text = parts[0].get("text") if parts else None
     if not isinstance(text, str):
         finish = candidates[0].get("finishReason") or "unknown"
@@ -185,6 +189,7 @@ def _openai_once(model: str, key: str, prompt: str, label: str = "",
                  system: str | None = None, schema: dict | None = None) -> str:
     import time as _time
     headers = {"Authorization": f"Bearer {key}"} if key else {}
+    headers.update(gemini_transport.attribution_headers(f"{_openai_base()}/chat/completions"))
     sys_text = _schema_system(gemini_transport.writing_system(system), schema)
     messages = ([{"role": "system", "content": sys_text}] if sys_text else []) + \
                [{"role": "user", "content": prompt}]
@@ -198,8 +203,7 @@ def _openai_once(model: str, key: str, prompt: str, label: str = "",
     if m is not None:
         try:
             u = data.get("usage") or {}
-            m.note_response(model, {"promptTokenCount": u.get("prompt_tokens", 0),
-                                    "candidatesTokenCount": u.get("completion_tokens", 0)}, wall, label)
+            m.note_response(model, u, wall, label)
         except Exception:  # noqa: BLE001
             pass
     choices = data.get("choices") or []
@@ -217,7 +221,8 @@ def _anthropic_once(model: str, key: str, prompt: str, label: str = "",
                # long-context beta: enables the 1M window on models that support it; harmlessly
                # ignored elsewhere. Without it a heavy brief cannot fit a 200K default window.
                "anthropic-beta": "context-1m-2025-08-07"}
-    body: dict = {"model": model, "max_tokens": ANTHROPIC_MAX_TOKENS, "temperature": 0.4,
+    ceiling = ANTHROPIC_MAX_TOKENS
+    body: dict = {"model": model, "max_tokens": ceiling, "temperature": 0.4,
                   "messages": [{"role": "user", "content": prompt}]}
     body["system"] = gemini_transport.writing_system(system)
     if schema is not None:
@@ -256,11 +261,13 @@ def model_once(provider: str, model: str, key: str, prompt: str, label: str = ""
         kw["system"] = system
     if schema is not None:
         kw["schema"] = schema
-    if provider == "openai":
-        return _openai_once(model, key, prompt, label=label, **kw)
-    if provider == "anthropic":
-        return _anthropic_once(model, key, prompt, label=label, **kw)
-    return _gemini_once(model, key, prompt, label=label, **kw)
+    import model_work
+    with model_work.attempt(provider, model, prompt, system, schema):
+        if provider == "openai":
+            return _openai_once(model, key, prompt, label=label, **kw)
+        if provider == "anthropic":
+            return _anthropic_once(model, key, prompt, label=label, **kw)
+        return _gemini_once(model, key, prompt, label=label, **kw)
 
 
 def _floor_check(provider: str, model: str) -> None:
@@ -315,13 +322,17 @@ def call_gemini(prompt: str, inputs: dict, system: str | None = None, schema: di
     # SOTTO_BRIEF_MODEL ("provider/model") names the compose model; unset falls through to
     # SOTTO_GEMINI_MODEL, so every existing install behaves exactly as today. Gemini stays the
     # opinionated default — this seam exists so people can bring the family they already pay for.
-    ref = (os.environ.get("SOTTO_BRIEF_MODEL") or "").strip() \
-        or os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
-    provider, model = parse_model_ref(ref)
+    provider, model = gemini_transport.effective_compose_model()
+    if provider not in PROVIDERS:
+        raise RuntimeError(f"unknown model provider {provider!r} — know: {', '.join(PROVIDERS)}")
     key = provider_key(provider)
     if not key and not (provider == "openai" and os.environ.get("SOTTO_OPENAI_BASE_URL")):
         raise RuntimeError(f"{KEY_ENV[provider]} not set (or use SOTTO_LLM_STUB for offline)")
     _floor_check(provider, model)
+    # Background work gets one admitted attempt. Its cycle owns retries, so foreground fallback
+    # configuration cannot redirect it or prevent a valid primary request from running.
+    if gemini_transport.background_learning_active():
+        return model_once(provider, model, key, prompt, system=system, schema=schema)
     # SOTTO_FALLBACK_MODEL: unset → gemini-3-flash-preview on the gemini provider, NO default on
     # any other (a default that crossed families would silently send the user's data to a provider
     # they never configured — privacy boundary, not tuning); set to "" → fallback DISABLED; any

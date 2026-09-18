@@ -31,6 +31,7 @@ def offline_review(monkeypatch):
         return [{"id": c["id"],
                  "class": "actionable" if any(m["prior_class"] in dc.ACTIONABLE_CLASSES
                                                for m in c["messages"]) else "ambient",
+                 "sender_role": "person",
                  "why": "fixture's already-established relevance"} for c in conversations]
     monkeypatch.setattr(dc, "review_conversations", review)
 
@@ -83,6 +84,71 @@ def test_signal_entries_never_count_toward_the_threshold(tmp_path, monkeypatch):
     assert out == {"deliver": False}
 
 
+def test_existing_queued_assistant_items_do_not_trigger_or_enter_digest_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    assistant = _entry(1, sender="Ramp", cls="actionable", text="Submit the receipt today")
+    assistant["event"]["handle"] = "ramp_cf8gd1ek_agent@rbm.goog"
+    assistant["event"]["sender_type"] = "assistant"   # structured provenance; the handle alone is
+    #                                                   the shared RCS transport, not evidence
+    human = _entry(2, sender="Maya's teacher", cls="actionable", text="Please sign Maya's waiver")
+    seen = []
+    monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
+        {"id": row["id"], "class": "actionable", "why": "human waiver remains open"}
+        for row in rows])
+    out = dc.check([assistant, human], min_n=1)
+    assert out["deliver"] is True
+    assert [row["sender"] for row in seen] == ["Maya's teacher"]
+    assert [row["sender"] for row in out["items"]] == ["Maya's teacher"]
+
+
+def test_current_person_and_sender_mutes_exclude_legacy_phone_rows_from_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    (tmp_path / "preferences.json").write_text(json.dumps({"explicit": {
+        "mute_people": ["Poke"], "mute_senders": ["+12025550171"]}}))
+    poke = _entry(1, sender="Poke", cls="actionable", text="I can remind you")
+    instinct = _entry(2, sender="Instinct", cls="actionable", text="I can plan that trip")
+    instinct["event"]["handle"] = "+12025550171"
+    human = _entry(3, sender="Maya's teacher", cls="actionable", text="Please sign the waiver")
+    seen = []
+    monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
+        {"id": row["id"], "class": "actionable", "sender_role": "person",
+         "why": "human waiver remains open"} for row in rows])
+    out = dc.check([poke, instinct, human], min_n=1)
+    assert [row["sender"] for row in seen] == ["Maya's teacher"]
+    assert [row["sender"] for row in out["items"]] == ["Maya's teacher"]
+
+
+def test_a_muted_persons_words_never_reach_the_review_model_or_the_item(tmp_path, monkeypatch):
+    """A mute is about a person, not about a row. In a GROUP thread the digest builds one
+    conversation out of every entry on the thread, so filtering only the candidate list still
+    handed the muted person's text to the review model — and shipped it in the delivered item's
+    `messages` — whenever a colleague on the same thread qualified. The number is muted in the
+    format the user typed it; the entries carry the raw handle."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    (tmp_path / "preferences.json").write_text(json.dumps({"explicit": {
+        "mute_senders": ["+1 (202) 555-0171"]}}))
+    secret = "MUTED-PERSON-PRIVATE-TEXT"
+
+    def _group(i, sender, handle, text, minutes_ago):
+        entry = _entry(i, sender=sender, cls="actionable", minutes_ago=minutes_ago, text=text)
+        entry["event"].update(handle=handle, is_group_chat=True, chat_guid="iMessage;+;chat9")
+        return entry
+
+    muted = _group(1, "Poke", "12025550171@s.whatsapp.net", secret, 40)
+    colleague = _group(2, "Maya's teacher", "+14155559999", "Please sign the waiver", 20)
+    seen = []
+    monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
+        {"id": row["id"], "class": "actionable", "sender_role": "person",
+         "why": "the waiver is still open"} for row in rows])
+    out = dc.check([muted, colleague], min_n=1)
+    assert [row["sender"] for row in seen] == ["Maya's teacher"]
+    assert secret not in json.dumps(seen)                  # never shown to the review model
+    assert out["deliver"] is True
+    assert [it["sender"] for it in out["items"]] == ["Maya's teacher"]
+    assert secret not in json.dumps(out["items"])          # nor carried into what is delivered
+    assert [m["text"] for m in out["items"][0]["messages"]] == ["Please sign the waiver"]
+
+
 def test_items_capped_at_6(tmp_path, monkeypatch):
     """The skill renders at most 6 lines — hand it at most 6 items (Sprint 0 §2d), newest first."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
@@ -91,6 +157,33 @@ def test_items_capped_at_6(tmp_path, monkeypatch):
     out = dc.check(dc.entries_since(dc.read_stamp()))
     assert out["deliver"] is True and len(out["items"]) == 6
     assert [it["sender"] for it in out["items"]] == [f"Person {i}" for i in range(19, 13, -1)]
+
+
+def test_cap_acceptance_drains_without_resending_or_losing_equal_timestamp_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    entries = [_entry(i, sender=f"Person {i}", minutes_ago=5) for i in range(10)]
+    _write_queue(tmp_path, entries)
+    first = dc.run_check(NOW)
+    assert len(first["items"]) == 6 and dc.read_stamp() is None
+    assert dc.accept_items(first["item_ids"])
+    second = dc.run_check(NOW)
+    assert len(second["items"]) == 4
+    assert set(first["item_ids"]).isdisjoint(second["item_ids"])
+    assert dc.accept_items(second["item_ids"])
+    assert dc.run_check(NOW) == {"deliver": False}
+
+
+def test_review_bound_closes_silent_items_so_later_conversations_are_reached(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    entries = [_entry(i, sender=f"Person {i}", minutes_ago=i) for i in range(101)]
+    _write_queue(tmp_path, entries)
+    reviewed = []
+    monkeypatch.setattr(dc, "review_conversations", lambda rows: reviewed.append(len(rows)) or [
+        {"id": row["id"], "class": "ignore", "why": "no action remains"} for row in rows])
+    assert dc.run_check(NOW) == {"deliver": False}
+    assert dc.read_stamp() is None
+    assert dc.run_check(NOW) == {"deliver": False}
+    assert reviewed == [100, 1] and dc.read_stamp() == NOW
 
 
 def test_threshold_env_override(tmp_path, monkeypatch):

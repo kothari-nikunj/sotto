@@ -24,7 +24,7 @@ def test_managed_image_uses_public_runtime_and_hands_root_artifacts_to_workload_
     assert '/root/.local/bin:/root/.hermes/bin' not in docker
     final_handoff = 'find "$HSTATE" -xdev -user root -exec chown sotto:sotto {} +'
     assert start.index('python3 /app/adapters/hermes/web_config.py') < start.index(final_handoff)
-    assert start.index(final_handoff) < start.index('managed_exec.py gateway hermes gateway')
+    assert start.index(final_handoff) < start.index('managed_exec.py gateway')
 
 
 def test_receiver_orders_vault_drop_privilege_and_nondumpable_before_runtime(monkeypatch):

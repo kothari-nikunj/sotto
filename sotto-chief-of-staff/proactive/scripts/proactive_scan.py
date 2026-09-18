@@ -8,7 +8,7 @@ lives here, testable, so the agent only DRAFTS and DELIVERS what this returns. W
 reaches the user is the event funnel's call, below. PRINCIPLE: auto-draft, never auto-send; a nudge
 surfaces a ready draft, it never sends on the user's behalf.
 
-Seven nudge kinds:
+Six nudge kinds:
   - intention     — a one-shot plain-language recipe whose due time has arrived
   - meeting_prep  — an external meeting starting within the lead window that you haven't prepped
                     (deterministic test: none of its external attendees are in TODAY's research
@@ -39,11 +39,6 @@ Seven nudge kinds:
                     tells a first-time user nothing about Maya. ASKED ONCE: the delivery is stamped on the row
                     (`--finalize-handoff`), which both retires the question and ends that loop's
                     claim on a named line in every brief — it is the user's move now.
-  - retune_offer  — the stale pile is getting heavy (you keep seeing items you don't act on); offer
-                    a quick cleanup. Throttled to once per cooldown window, NOT daily — and
-                    suppressed within 2h of a delivered brief (Sprint 0 §6): the brief just told the
-                    user how many loops are open and where to see them, so an immediate "your list
-                    is heavy" is that same sentence a second time.
 
 Inputs (argv JSON files; all optional except --now is derived):
   --calendar /tmp/sotto_cal.json     (gather_google calendar: [{id,summary,start,end,attendees[]}])
@@ -73,7 +68,7 @@ Env: SOTTO_DATA (state dir), SOTTO_TIMEZONE (local day/quiet-hours), SOTTO_QUIET
      SOTTO_BIRTHDAY_LEAD_DAYS (how many days ahead the gift-idea nudge fires, default 3),
      SOTTO_NUDGE_BUDGET (shared daily interrupt cap, default 4).
 Named constants, not knobs (defaults matter — see CLAUDE.md): PROACTIVE_LEAD_MIN (meeting lead
-     window), RETUNE_OFFER_MIN (stale-loop threshold), RETUNE_OFFER_COOLDOWN_DAYS.
+     window).
 
 Output (stdout JSON): {"nudges":[…], "held":[…], "quiet":bool, "reason"?} — `nudges` are the ones to
 deliver, `held` everything the funnel did NOT hand back (queued for the digest, or dropped): deliver
@@ -158,15 +153,9 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-def _retune_marker() -> str:
-    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "proactive", "retune_offer.last")
-
-
 BRIEF_SUPPRESS_HOURS = 2   # a brief within this window just covered the open loops — don't restate
 PROACTIVE_LEAD_MIN = 45    # how long before a meeting the prep nudge fires — enough time to read the
 #                            prep and still walk in, not so early you've forgotten it by then.
-RETUNE_OFFER_MIN = 6       # stale loops it takes before the "want to tidy up?" offer is worth making
-RETUNE_OFFER_COOLDOWN_DAYS = 7   # …and how long before it may be made again — periodic, never a nag
 
 
 def _recent_brief_delivered(now_local: datetime, within_hours: int = BRIEF_SUPPRESS_HOURS) -> bool:
@@ -221,23 +210,6 @@ def _brief_named_keys(now_local: datetime):
         except Exception:  # noqa: BLE001
             return None      # it delivered but we cannot tell what it said — use the time guard
     return keys
-
-
-def _retune_cooldown_ok(today_str: str) -> bool:
-    """True when it's been at least the cooldown window since the last retune offer (or never offered),
-    so we nudge to tidy up periodically rather than every single day."""
-    cooldown = RETUNE_OFFER_COOLDOWN_DAYS
-    try:
-        with open(_retune_marker(), encoding="utf-8") as f:
-            last = f.read().strip()[:10]
-        days = (datetime.strptime(today_str, "%Y-%m-%d") - datetime.strptime(last, "%Y-%m-%d")).days
-        return days >= cooldown
-    except Exception:
-        return True   # never offered → allowed
-
-
-def _stamp_retune_offer(today_str: str):
-    delivery_effects.stamp_retune(today_str)
 
 
 def _funnel():
@@ -309,8 +281,6 @@ def _defer_delivery_effects(fired: list, date=None, result=None) -> bool:
             effects.append({'kind': n['kind'], 'anchor_key': n['anchor_key']})
         if n.get('intention_id'):
             effects.append({'kind': 'intention', 'id': n['intention_id']})
-        if n.get('kind') == 'retune_offer':
-            effects.append({'kind': 'retune_offer', 'date': date})
     return delivery_effects.stage(effects, [n['decision_id'] for n in fired if n.get('decision_id')],
                                   result=result)
 
@@ -530,16 +500,6 @@ def _finish_intention(ident: str) -> None:
         pass
 
 
-def _stale_loop_count() -> int:
-    """Reuse retune_scan's exact stale definition (overdue / 3–7d / repeat-surfaced) so the offer
-    triggers on the same pile the cleanup would act on. Best-effort; 0 on any error."""
-    try:
-        import retune_scan  # noqa: PLC0415  (sibling in _shared/scripts, already on sys.path)
-        return int(retune_scan.scan().get("counts", {}).get("stale", 0))
-    except Exception:
-        return 0
-
-
 def _birthday_importance(local, now):
     from relationship_importance import for_contact  # noqa: PLC0415
     from collections import Counter  # noqa: PLC0415
@@ -579,7 +539,6 @@ def _birthday_importance(local, now):
 
 
 def scan(calendar, continuity, local, user_email, now_local,
-         stale_count: int = 0, retune_offer_allowed: bool = False,
          prepped_emails=None, brief_recent: bool = False,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
          brief_named=None, intentions=None, handoff_allowed: bool = False,
@@ -587,9 +546,8 @@ def scan(calendar, continuity, local, user_email, now_local,
     """Pure decision (no I/O, no gates): given the inputs and the local 'now', return every nudge
     that is DUE now. Whether any of them reaches the user — the snooze, quiet hours, the mutes, the
     in-meeting hold, the daily interrupt budget — is the funnel's call, made in one place, on the
-    bundle main hands it. `stale_count` / `retune_offer_allowed` / `prepped_emails` /
-    `brief_recent` / `brief_today` / `brief_named` / `chase_candidates` / `handoff_candidates` are
-    computed by main (they need disk: the ledger, a cooldown marker, today's research cache, the
+    bundle main hands it. `prepped_emails` / `brief_recent` / `brief_today` / `brief_named` /
+    `chase_candidates` / `handoff_candidates` are computed by main (they need disk: today's research cache, the
     delivered markers and what the delivered brief named).
     """
     lead = PROACTIVE_LEAD_MIN
@@ -735,8 +693,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                     "detail": ("send a quick note" if not days_out
                                else "enough time for a real gift — want me to pull what you know about them?")})
 
-    # 4) The hand-off and the tidy-up. Two shapes, and the NAMED one wins:
-    #    4a) a loop chased its two times with no answer — that is one person and one thing, so the
+    # 4) The hand-off: a loop chased its two times with no answer — that is one person and one thing, so the
     #        nudge says so and asks the binary question. It has its OWN clock (`handoff_allowed`:
     #        just "not inside the 2h post-brief window"), not the tidy-up's 7-day cooldown: the
     #        question is owed, not offered, and it is asked the first tick it comes due — until it
@@ -746,9 +703,6 @@ def scan(calendar, continuity, local, user_email, now_local,
     #        while a delivery never acks (the question never reached the user), the per-day dedup
     #        key bounds it to one attempt a day, which is the right cadence for a question nobody
     #        has received.
-    #    4b) otherwise, the pile itself is heavy — offer a cleanup, throttled by main's multi-day
-    #        cooldown (NOT once a day) so it is a gentle periodic ask, never a daily nag.
-    threshold = RETUNE_OFFER_MIN
     if handoff_allowed and (handoff_candidates or []):
         h = (handoff_candidates or [])[0]         # one question at a time; the rest keep their turn
         nudges.append({"kind": "handoff", "key": _s(h.get("id")) or f"handoff:{today}",
@@ -757,10 +711,6 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "anchor_key": _s(h.get("anchor_key")),
                        "channel": _s(h.get("channel")),
                        "identifier": _s(h.get("identifier"))})
-    elif retune_offer_allowed and stale_count >= threshold:
-        nudges.append({"kind": "retune_offer", "key": "retune_offer",
-                       "title": "Your open-loops list is getting heavy",
-                       "detail": f"{stale_count} items keep showing up without action — want a quick cleanup?"})
     return {"nudges": nudges}
 
 
@@ -790,16 +740,10 @@ def main():
     # google_account_email the Google connect learned (cb re-exports timeutil's one copy of it).
     user_email = args.user_email or configured_user_email()
 
-    # Retune offer: the pile + its multi-day cooldown + the brief-collision window all need disk,
-    # so compute here and pass in. A brief delivered in the last 2h already covered the loop pile —
-    # offering a cleanup right after it is a rerun, so the offer waits for the next scan cycle.
-    # The same 2h window mutes the birthday nudge (the brief carries the 🎂 line).
-    stale_count = _stale_loop_count()
+    # The 2h window mutes birthday/handoff repeats after a brief already covered them.
     brief_recent = _recent_brief_delivered(now_local)
-    retune_ok = _retune_cooldown_ok(date) and not brief_recent
     due = scan(calendar, continuity, local, user_email, now_local,
                birthday_importance=_birthday_importance(local, now_local),
-               stale_count=stale_count, retune_offer_allowed=retune_ok,
                prepped_emails=_research_cache_emails(date), brief_recent=brief_recent,
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
@@ -853,8 +797,6 @@ def main():
         for n in fired:
             if n.get('intention_id'):
                 _finish_intention(n['intention_id'])
-            if n['kind'] == 'retune_offer':
-                _stamp_retune_offer(date)
             if n['kind'] in _FINALIZE_FLAG:
                 _finalize(n['kind'], n.get('anchor_key'))
     try:

@@ -8,8 +8,8 @@ or new memory. It does not improve a weak relevance decision by disguising it as
 Four attachments form the compact native gallery; fewer can cascade down the chat.
 Short updates with too little content stay text, without filler or duplicate images.
 
-Morning and evening cards cover needs-you, today, and calendar highlights. Every selected action paragraph
-must fit; otherwise the whole brief stays text. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Morning briefs also include handled/open-loop detail when present. Individual nudges, pending consent offers,
+Morning and evening cards cover needs-you, today, and calendar highlights. Every action, calendar event, and follow-up paragraph in the composed brief
+must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent offers,
 and unsupported formats/channels remain text. There is no arbitrary text truncation or font
 shrinking; rendering overflow also falls back to the original text before sending.
 
@@ -47,7 +47,7 @@ brief history continues to use the existing archive. Do not promise a special �
 Rendered files live in `$SOTTO_DATA/cache/visual-briefs/<content-id>/` with private permissions.
 They are delivery artifacts, not a second knowledge store. The receiver's existing retention
 sweep removes files after seven days; `forget.py --caches` removes them immediately. No public
-image URLs or additional storage service. The bundled Inter variable font retains its SIL Open Font License. A bundled wax-seal S asset, neutral surfaces, a company/person heading above the section subtitle, and timed agenda rows replace report-style chrome. The seal was generated once at build time; no image-generation service runs for a brief.
+image URLs or additional storage service. The bundled Inter variable font retains its SIL Open Font License. A bundled wax-seal S asset, neutral surfaces, a company heading for prep, consistent section headings for briefs, and timed agenda rows replace report-style chrome. The seal was generated once at build time; no image-generation service runs for a brief.
 
 ## Pilot acceptance
 
@@ -65,8 +65,23 @@ phone check is a separate gate; offline tests cannot validate Apple's gallery pr
 
 Pilot observation: the owner confirmed delivery and readability; Messages on Mac also exposed a single “4 attachments” group. Three images cascaded vertically. All subsequent image briefs therefore require exactly four photos. The final portrait design preserves more complete paragraphs, uses a small, low-opacity seal, and keeps company/person titles above their section subtitles.
 
-Typography uses semibold leading names in briefs and labels ending in a colon in prep. Unlabelled prep points use hanging bullets; source words and paragraph boundaries remain intact. The title and subtitle stay fixed while swiping between cards, aligned to the white panel’s outer left edge. Body text retains its inset and hanging list/calendar indents. Only the body is vertically centered below the header; dense content uses the available height. The subtle wax seal lives in the bottom-left footer beside the historical-preview label. Repeated title/subtitle text is omitted.
+Typography preserves explicitly bold leading names from the source, including names without a following colon or dash. Plain-text leading names followed by a separator and labels ending in a colon are also semibold. Names are never inferred from an unlabelled sentence. Unlabelled prep points use hanging bullets; source words and paragraph boundaries remain intact. Brief titles and subtitles use the same positions on every card; prep keeps its company title and section subtitle fixed while swiping, aligned to the white panel’s outer left edge. Body text retains its inset and hanging list/calendar indents. Only the body is vertically centered below the header; dense content uses the available height. The subtle wax seal lives in the bottom-left footer beside the historical-preview label. Repeated title/subtitle text is omitted.
+
+Calendar cards start directly with their day groups and meetings. Legacy calendar-preview instructions are removed, including colon, dash and parenthesized forms.
 
 Cards and captions use no em dashes; canonical source text remains unchanged. Calendar preview lines may carry ` | Location: <exact event location>`, rendered as one smaller line under the meeting title. The shared composer receives the event location and is instructed to preserve supplied physical locations only. Missing locations remain absent. A location too wide for one readable line falls back to text rather than truncating an address.
 
-Readability: one Inter family, four sizes (76px title, 42px body/meeting title, 32px subtitle/section/time/location, 26px date/footer) and two weights (400, 650). Brief cards carry a fixed time-of-day brief label and the source date. Birthday rows get 44px extra separation after meetings. Text colors meet 4.5:1 against their background; small text never uses the seal’s decorative opacity.
+Readability: one Inter family, four sizes (76px title, 42px body/meeting title, 32px subtitle/section/time/location, 26px date/footer) and two weights (400, 650). Paragraph gaps use 24px where space permits and tighten to no less than 12px based on measured line wrapping. Open-item count lines use the existing 32px supporting-text size; action paragraphs stay at 42px. Section labels are separated from the preceding paragraphs. The four-card gallery remains unchanged. Content that cannot fit at those minimum gaps still falls back to text. Receiver rendering failures emit a content-free `visual_brief_fallback` diagnostic with the error class. Brief cards carry a fixed time-of-day brief label and the source date. Birthday rows get 44px extra separation after meetings. Text colors meet 4.5:1 against their background; small text never uses the seal’s decorative opacity.
+
+Calendar rows recognize date-prefixed times and either colon or dash separators, as well as all-day events.
+Blue time labels, black event titles, explicit day groups, and smaller address lines are preserved across
+card splits. Parenthesized street addresses may move to the address line; attendee names do not.
+Repeated calendar-preview disclosures are normalized once by the composer and represented by the
+card's “Calendar highlights” subtitle, rather than repeated as gray body text.
+
+The gallery caption reads “Good morning. Here's your morning brief for September 16.” (or the
+source greeting's afternoon/evening and date). A source-availability warning before the brief's
+sections stays in the selectable caption; an oversized caption falls back to text. Genuine web links
+remain selectable. Internal dashboard-relative paths such as `/app#loops` are not chat links: new
+briefs say “Ask me what's still open,” and archived paths receive the same presentation correction.
+The immutable manifest still retains the exact source text. These changes are shared by Cloud and self-host.

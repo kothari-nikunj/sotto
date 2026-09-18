@@ -52,7 +52,33 @@ def test_load_explicit_shape_when_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     ex = pr.load_explicit()
     assert ex == {"mute_senders": [], "mute_people": [], "mute_sections": [], "tone_notes": [],
-                  "vip_people": [], "nudge_snooze_until": "", "brief_audio": ""}
+                  "vip_people": [], "nudge_snooze_until": "", "brief_audio": "",
+                  "nudge_budget": ""}
+
+
+def test_nudge_budget_controls_halves_zero_restores_and_clamps(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "5")
+    assert pr.change_nudge_budget("fewer")["nudge_budget"] == "2"
+    assert pr.change_nudge_budget("fewer")["nudge_budget"] == "1"
+    assert pr.change_nudge_budget("fewer")["nudge_budget"] == "0"
+    assert pr.change_nudge_budget("fewer")["nudge_budget"] == "0"
+    assert pr.change_nudge_budget("more")["nudge_budget"] == "5"
+    pr.set_scalar("nudge_budget", "99")
+    assert pr.effective_nudge_budget() == 5
+    assert pr.change_nudge_budget("no")["nudge_budget"] == "0"
+
+
+def test_fewer_computes_from_value_inside_mutation(monkeypatch):
+    """A concurrent `no` that wins the lock first must not be overwritten by stale arithmetic."""
+    def mutation_after_no(apply):
+        explicit = pr.empty_explicit()
+        explicit["nudge_budget"] = "0"
+        apply(explicit)
+        return explicit
+
+    monkeypatch.setattr(pr, "_mutate", mutation_after_no)
+    assert pr.change_nudge_budget("fewer")["nudge_budget"] == "0"
 
 
 

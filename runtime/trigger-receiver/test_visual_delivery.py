@@ -95,3 +95,17 @@ def test_gallery_default_and_capability_fallback(monkeypatch, tmp_path, label):
     assert v.prepare('body', label, 'photon', lambda: visual, lambda: True) is None
     assert seen == ['prep' if 'prep' in label else 'brief']
     assert v.prepare('body', label, 'photon', lambda: pytest.fail('missing capability'), lambda: False) is None
+
+
+def test_render_failure_logs_metadata_without_source_content(monkeypatch, caplog):
+    import types
+    v = rec._load_shared_lib('visual_delivery')
+    monkeypatch.delenv('SOTTO_VISUAL_BRIEFS', raising=False)
+
+    def overflow(*args):
+        raise ValueError('private source content /data/private-file')
+
+    visual = types.SimpleNamespace(build=lambda *args, **kwargs: {'cards': []}, render=overflow)
+    assert v.prepare('private brief', 'cron:sotto-morning-brief', 'photon', lambda: visual, lambda: True) is None
+    assert 'visual_brief_fallback kind=brief error=ValueError' in caplog.text
+    assert 'private' not in caplog.text

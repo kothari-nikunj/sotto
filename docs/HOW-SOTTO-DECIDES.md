@@ -1,5 +1,34 @@
 # How Sotto decides when to interrupt you
 
+After the existing admission rules, a fixed procedure selects one primary notification per push,
+renders a template or makes one direct structured writing call. Omitted items retain coverage.
+Transient writing failures wait for queue backoff; malformed copy gets one repair. Deterministic
+reminders survive writer failures. Scheduling remains a question until all-calendar availability
+can be verified; today's primary-calendar gather is insufficient. No new daily spend limit is added.
+
+| Operation | Attempts | Native Gemini output ceiling | Thinking override |
+|---|---:|---:|---|
+| `notification` | 2 | 4,096 | low |
+| `triage` | 2 | 2,048 | low |
+| `digest` | 2 | 4,096 | low |
+| `memory_extract` | 2 | 16,384 | low |
+| `memory_curate` | 2 | 8,192 | low |
+| `brief` | 12 | 65,536 | unchanged |
+| `brief_extract` | 6 | 65,536 | unchanged |
+| `brief_critic` | 3 | 65,536 | unchanged |
+| `brief_revise` | 3 | 65,536 | unchanged |
+| `followup` | 2 | 8,192 | low |
+| `research` | 4 | 8,192 | low |
+
+Model-work receipts retain **90 days**. An unknown worker claim has a **900-second** lease, with at most **2** interruption replacements per operation. Artifact families use **256** lock shards. Notification context is capped at **48,000 characters**, including instructions and schema.
+Selected notification copy (text plus draft and decline) is limited to **1,200 characters**.
+The brief parent contains extraction/critic/revision allowances; optional evening follow-up is a
+separate child. A held quality stage delivers the draft and says so in the run record, never as
+though it passed. New scheduled jobs
+have separate attempt budgets, but worker retries keep the same identity. Interrupted requests stay
+visible as unknown spend even when replaced. See [bounded model work](BOUNDED-MODEL-WORK.md).
+
+
 Sotto is quiet by default. This page explains, in plain rules, why a message became a nudge — or
 why it didn't. It is a summary: the code is the source of truth, and every rule below lives in
 `sotto-chief-of-staff/event-triage/scripts/triage_event.py` (the funnel),
@@ -108,8 +137,8 @@ is a table lookup, not a code search.
 | **Release valve** (something held earlier, let out now) | `receiver._valve_tick` — every 15 min (`receiver.VALVE_INTERVAL_SECS_DEFAULT`) | `triage_event.release_valve` — re-checks class, sender, age and cooldown, then spends the budget like any nudge |
 | **Post-meeting tap** (a meeting just ended) | `calcache.tap_tick` → `receiver._dispatch_meeting_tap` | `triage_event.triage` as an ordinary event, classified `post_meeting` — its own daily cap, exempt from the interrupt budget |
 | **Calendar diff** (a decline · a last-minute invite · a move · a cancellation of an imminent meeting) | `calcache.change_tick` — the same refresh tick as the tap | `triage_event.triage` as a `calendar_change` event — snooze, quiet hours and mutes still hold it; exempt from the budget, the in-meeting hold and the cooldown, because a change expires with the meeting it's about (per-change deduped at the source) |
-| **Proactive watcher** (intention · meeting prep · commitment · chase · birthday · handoff · retune offer) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
-| **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses, spending exactly one budget unit |
+| **Proactive watcher** (intention · meeting prep · commitment · chase · birthday · handoff) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
+| **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses; the explicit request bypasses the unsolicited budget |
 
 ## The gate order
 
@@ -121,10 +150,19 @@ is a table lookup, not a code search.
    last-minute invite, a move, a cancellation of an imminent meeting) → **nudge**, held only by
    the snooze, quiet hours, and a muted person;
 2. your own outbound → queued as a `signal` (ledger fodder, never a nudge);
-3. an answered or outgoing call → dropped; a missed call from someone you know → **nudge**; from an
+3. from a muted sender or muted person → dropped, on every channel **and before any per-channel
+   branch**, so a muted person's missed call drops exactly like their messages (until Sep 2026 this
+   gate sat after the calls branch, and a muted person's call still nudged — budget-exempt, and
+   VIP-exempt from quiet hours): the funnel's ingress gate, the release valve, a tapped
+   "nudge me now" and the midday digest all ask one predicate
+   (`preferences.proactively_muted`), so "stop surfacing X" can never drop yesterday's queued
+   message and still let today's ring through. A muted phone number matches however either side
+   writes it — "+1 202 555 0171", "(202) 555-0171", "12025550171", or the number inside a WhatsApp
+   identifier — because both go through the same normalizer the rest of Sotto threads by; the
+   number next to it (…0170) is a different person and still reaches you;
+4. an answered or outgoing call → dropped; a missed call from someone you know → **nudge**; from an
    unknown number → queued;
-4. an OTP, shortcode, or system message → dropped silently;
-5. from a muted sender or muted person → dropped;
+5. an OTP, shortcode, or system message → dropped silently;
 6. a formal calendar invite or RSVP notification arriving as **email** → queued: accepting an
    invite is a calendar action, not an email draft, and meeting interrupts belong to the calendar
    lane — a brand-new invite nudges there only when the meeting starts within 4 hours;
@@ -152,14 +190,19 @@ to connect!" never earns an interrupt.
   day, counting the proactive watcher's; beyond it, nudge-worthy events queue with class `budget`.
   The unit is a **message**, not an event: a batch of arrivals is one nudge and costs one unit, and
   so does the watcher's whole push.
-- **The honest version of that sentence** — the budget covers *everything except four exempt
+- **The honest version of that sentence** — the budget covers *everything except five exempt
   classes, which are uncapped*: missed calls (at most one per thread per
   `SOTTO_EVENT_COOLDOWN_MIN`) and cross-channel escalations (at most one per person per
   escalation window) have no daily ceiling at all, post-meeting taps have their own
-  (3/day), and calendar changes are bounded only by your calendar actually changing (each distinct
-  change nudges once, ever). So a worst-case busy day is: 4 budgeted interrupts + 3 taps + however
-  many missed calls, escalations and calendar changes the day actually contains + the midday digest
-  + your two briefs.
+  (3/day), and calendar changes and imminent meeting prep are bounded only by your calendar — each
+  distinct change nudges once, ever, and each meeting is prepped once, because both expire with the
+  meeting they are about and are deduped per key where they are produced. So a worst-case busy day
+  is: 4 budgeted interrupts + 3 taps + however many missed calls, escalations, calendar changes and
+  imminent preps the day actually contains + the midday digest + your two briefs.
+- **“No nudges” is stronger than the normal exemption set** — an explicit effective cap of zero
+  stops every unsolicited nudge at delivery, including missed calls, escalations, taps, calendar
+  changes and meeting prep. Briefs, digests, direct requests and an item you explicitly promote
+  remain available.
 - **Post-meeting taps have their own cap** — at most `SOTTO_TAP_MAX_PER_DAY` (default 3) per local
   day. Taps do not spend the interrupt budget and interrupts do not spend the tap cap: **neither
   eats the other.**
@@ -175,13 +218,19 @@ to connect!" never earns an interrupt.
   `SOTTO_QUIET_END` (default 21:00–07:00; a missed call from a VIP is the one carve-out), and an
   explicit "be quiet until…" snooze holds *everything*, missed calls included. **VIP** is whoever
   you said it is — the stated list (`preferences.explicit.vip_people`, written by "make Sarah a
-  VIP" in chat or the toggle on her dashboard page) is checked first, then two fallbacks: a
-  top-of-queue relationship-pulse priority, or a typed `family_of` relation in their file.
+  VIP" in chat or the toggle on her dashboard page) is checked first, then one fallback: a typed
+  `family_of` relation in their file. Both are a choice, yours or the graph's; **message volume is
+  not one.** A top-of-queue relationship-pulse priority used to qualify too — and since that
+  priority is interactions × days-waiting × type-weight, four messages and three days of silence
+  bought a 3 a.m. interrupt, off a file up to a week stale. It was removed (Sep 2026); the pulse
+  still reaches Tier 1 as the sender one-liner's relationship signal, which is context, not a gate.
 - **In-meeting hold** — while you are inside a timed calendar event with at least one other human,
   would-be nudges queue as `meeting_hold` — except missed calls, escalations, calendar changes
-  and imminent meeting prep. Prep still obeys quiet hours, snooze, mutes, cooldown and the daily
-  interrupt budget; it can arrive during the previous meeting so back-to-back prep does not expire
-  before reaching you. Solo blocks and all-day events never hold, and a calendar
+  and imminent meeting prep. Prep still obeys quiet hours, snooze, mutes and cooldown, but not the
+  daily interrupt budget — it can arrive during the previous meeting so back-to-back prep does not
+  expire before reaching you, and a spent budget must not silence "your pitch starts in 20 minutes"
+  either: the valve never promotes a nudge Sotto planned, so a prep demoted to `budget` had no way
+  back at all. Solo blocks and all-day events never hold, and a calendar
   cache that is stale or from another day never holds — Sotto won't act on a stale belief about
   where you are.
 - **The release valve** — every 15 min, when nothing is holding, up to 2 queued events per tick
@@ -196,9 +245,9 @@ to connect!" never earns an interrupt.
   remains eligible until answered, under the ordinary age, cooldown and budget bounds.
 - **You can release one yourself** — the dashboard's Cadence page lists what is being held and
   offers *"nudge me now"* on each. That is the valve, with one entry: the same promotability rule,
-  the same budget spend, the same ledger row. The two gates it skips are the clock ones (quiet
+  the same ledger row. It skips the unsolicited budget and the clock gates (quiet
   hours and the snooze) — those exist to stop *unprompted* interruptions, and you asked for this
-  one. The room you're in and the day's budget still apply.
+  one. The room you're in still applies.
 - **Undeliverable nudges are never spent** — the valve, the post-meeting tap and the proactive
   watcher all wait for the ACTIVE channel (`SOTTO_CRON_DELIVER`, `telegram` by default) to actually
   be linked before dispatching: WhatsApp's session creds on the volume, Telegram's captured chat id.
@@ -239,7 +288,7 @@ to connect!" never earns an interrupt.
 - **The brief decides, it doesn't inventory** — an open loop earns its own line in a brief only when
   it is **overdue, due within 24 hours, or already chased without an answer**. Every other open loop
   is one quiet line — how many there are and where to see them — and is worked by the nudges (the
-  chase, the commitment reminder, the "nudge her again or let it go?" question, the cleanup offer),
+  chase, the commitment reminder, and the "nudge her again or let it go?" question),
   not by the brief. One line per person, however many things they owe you (past three, the line says
   how many more rather than dropping them). Every open loop is in exactly one of three places: named
   in the brief, printed on its own line, or inside that count — nothing falls between them. A loop
@@ -270,17 +319,27 @@ to connect!" never earns an interrupt.
   call, the prep nudge, or the in-meeting hold. An unanswered invite with somebody else on it
   becomes an `rsvp` ask once it is within 48 hours — minted by code, and closed by the calendar
   (you answer, or it passes), never a ledger row.
-- **A debt you owe closes on your own outbound, on any channel** — an outgoing iMessage, WhatsApp,
-  **email**, or call to that person, or a meeting with them now on the books, closes the loop before
-  the brief is composed; the resolver reads your sent mail off the gather's own `in:sent` lane, not
-  off a list the agent remembered to write. **Never tell you twice** is then measured, not
+- **Contact is not completion.** The brief model may propose a `loopUpdates` change only for one
+  ledger ID and revision, backed by an original source message ID and verbatim quote. Code verifies
+  the counterpart, direction, original timestamp and quote against the snapshot. A generic reply,
+  call, calendar attendee, unrelated link, or appearance in Already Handled cannot close a debt.
+  Missing or ambiguous evidence leaves it open; explicit user corrections remain authoritative.
+- **A loop you closed by hand stays closed** — when tomorrow's extraction reads the same thread
+  again, a loop Sotto itself expired or auto-resolved re-opens (the person coming back is evidence
+  the guess was wrong), but one you dismissed or resolved yourself needs new incoming request evidence after your closure.
+  A new extraction timestamp or a paraphrase is insufficient. Evidence must bind a newer inbound
+  message from that person or group in the source snapshot. iMessage and WhatsApp prompts carry
+  per-message references, derived from the original message fields when Bridge omits native IDs;
+  these references are never reply addresses. Email can also bind a new thread. Legacy date-only closures cover the whole
+  day; new user closures record the instant. **Never tell you twice** is then measured, not
   requested: a person Sotto already nudged you about today (a delivered nudge, correlated by id to
   the channel's receipt) never opens the model's draft and takes **at most 2 lines** in it — one
   status line, plus a Coming Up mention — and the validator hands a violation to the critic's
-  revise pass (the lines the composer itself appends afterwards, the still-open backstop and the
+  revise pass, which a violation forces to run even on a quiet brief the critic would otherwise
+  skip (the lines the composer itself appends afterwards, the still-open backstop and the
   receipts, are read from the record, not written by the model, and are not counted).
-- **What you owe expires quietly; what you're owed gets chased** — an open loop you owe drops off
-  after 7 silent days, but something you're *waiting on* never expires: it closes the moment they
+- **Obligations never expire from age, a passed deadline, or an unreachable counterpart.** Something
+  you're *waiting on* closes only when they
   actually deliver (a substantive reply — a link, a file, or real text, never a bare "ok" or a
   promise to send it later), or after `SOTTO_CHASE_AFTER_DAYS` (default 3) of silence it becomes one
   short, warm chase — at most one chase nudge a day, at most 2 per item. A chase is only counted
@@ -290,11 +349,32 @@ to connect!" never earns an interrupt.
   After the second, Sotto stops and asks you plainly, by name: *"I've nudged Maya twice about
   the contract — nudge her again, or let it go?"* — **once**, and **on its own clock**: the question
   is asked the first watcher tick it comes due (outside the two hours after a brief, which carried
-  the loop), never behind the tidy-up offer's weekly cooldown. That question is asked one time (it is
+  the loop). That question is asked one time (it is
   stamped on the loop when it is delivered, on the same rule as the chase), and from then on the
   loop stops taking a line in every brief: you have been asked, so it waits in the count line and on
   `/app#loops` until you resolve it, drop it, or say keep waiting — which restarts its chases and
-  makes it askable about again.
+  makes it askable about again. Carry-forward and paraphrases reuse the existing loop ID. By
+  default, counterpart plus direction preserves that task across prose changes; when observed
+  request evidence shows a genuinely second task, the model must say `newObligation: true` and
+  code mints a stable source-and-ordinal origin. If extraction omits `loopId`, evidence matching exactly one existing task recovers that row. Shared evidence cannot choose a sibling, and a different message alone does not create a new obligation. Legacy aliases still fold rows sharing their old
+  base, while independently minted task, custom and synthetic keys stay separate. Briefs group
+  open work into one readable entry per person without using display grouping as task identity.
+  The resolver's two-day deadline grace is compatibility for legacy meeting shadows that lack a
+  meeting time; it does not expire or resolve ordinary obligations.
+- **Parked, never deleted.** Something you owe that nothing has touched for **14 days** parks only
+  after its warning is accepted for delivery on an earlier local day,
+  unless its deadline is still ahead, or you confirmed the commitment yourself (`explicit`: only
+  you change its state). A touch is a brief re-capture, a *keep*, or the scheduled end of a snooze.
+  Keep and snooze preserve the original creation date used to verify completion evidence.
+  A parked loop keeps its file and history, leaves the brief, the count line and the chase clock,
+  and comes back on re-capture, keep or snooze without new-request evidence. A verified completion
+  can still resolve it. **What moved today** names every warned task with "parks tomorrow unless
+  you say *keep*." Failed, skipped or muted warnings cannot hide a task; upgrades with old rows
+  and newly overdue tasks wait for the same accepted warning. Re-capture, keep, snooze or a task
+  correction invalidates an old warning. Person, sender and `what_moved_today` section mutes apply.
+  `/app#loops` lists the parked group with a *keep*
+  button, and Friday's review counts them. What you're *waiting on* never parks: it is chased,
+  then handed back to you by name. Nothing is ever deleted by age.
 
 ## Managed Cloud pilot activation
 
@@ -310,29 +390,42 @@ action, decision, preparation need, or meaningful development for this user. The
 triage and digest review use it through `relevance.py`, and the nudge skills read it before composing.
 A write-up delivered for a requested review or ongoing evaluation can require action without a
 question mark. An unsolicited promise to send a pitch does not establish user interest. Completed
-or declined reviews stay closed. A VIP label or a sender's deadline does not establish relevance. Services and assistant relays can
-carry real obligations; later answers and completion evidence can remove them. No sender/category
-blacklist is added. Explicit consent, mutes and delivery gates still govern what may be considered.
+or declined reviews stay closed. A VIP label or a sender's deadline does not establish relevance.
+Proactive surfaces are primarily about people. Proactive use is suppressed only when a structured
+source field marks the sender as an assistant or the relevance judgment classifies the sender role
+as assistant; a business-messaging transport address, such as the RCS `*_agent@rbm.goog` handle a
+bank's fraud alert and a vendor's bot both arrive on, is not that evidence. That judgment labels
+every other sender as a person, assistant, or unknown from conversation evidence and excludes
+software assistants even when their outreach sounds actionable; a vendor you never want to hear
+from is an ordinary mute. Display names are never a blacklist: a human named Poke with an
+unanswered invitation remains eligible, as does an automated school or medical relay of a real
+human obligation unless the evidence identifies the sender itself as an assistant. The source
+conversation remains available to an explicit chat request. Later answers and completion evidence
+can remove human obligations. Explicit consent, mutes and delivery gates still govern what may be
+considered.
 
 The digest's existing eight-event activity threshold now buys a review, not a promise to send, and
 one queued actionable, scheduling or urgent item buys that review on its own, below the threshold.
 One bounded native-model call, given the current local clock, reviews at most 100 conversations with their latest 20 messages
 (up to 400 characters each — `personal_context.CONVERSATION_TEXT_CHARS`, the one cap every
 conversation rendering shares), including outgoing answers, before the six-item delivery cap.
-Existing priority bands decide which conversations fit in that review; the brief remains the
-backstop beyond its bound. Review can retain fewer items or none. Invalid/incomplete judgment or
-provider failure stays silent. The normal digest-window stamp still advances, including silent
-runs; no second state writer, model route, per-item call, or schedule is introduced.
+Within an equal relevance band, an evidenced deadline wins, then a current match against the
+owner's optional priority set (at most three stable IDs at one revision). An edited priority set
+invalidates old matches; priority never manufactures urgency. The brief remains the backstop
+beyond the digest bound. Review can retain fewer items or none. Invalid/incomplete judgment or
+provider failure stays silent. `events/digest_accepted.json` records a conversation version only
+after successful silent review or accepted delivery. Items outside review/output bounds remain
+eligible, and a failed send consumes nothing; no extra model route, per-item call or schedule is introduced.
 
 ## What you get, and when
 
 | | When | What |
 |---|---|---|
 | Morning brief | 6:30 local (or the moment your Mac wakes past 7am) | opens with the time of day and the date in your zone ("Good morning — Saturday, September 6"; good afternoon when the wake path composes it after noon), then your day across messages, email, calendar, plus open loops. One per day, always: if your Mac slept through 6:30 the brief still goes out from the last saved snapshot, and when the Mac wakes later its fresh data is folded into that snapshot instead of composing a second brief — the nudges and the midday digest surface whatever the morning brief couldn't see |
-| Evening brief | 17:30 local | opens with "Good evening — <the date>", then accountability, tomorrow, post-meeting follow-up drafts, and a **What moved today** block — reminders delivered ("Reminded you to chase Maya…" — a reminder to you with a draft behind it, never a message Sotto sent to Maya; a loop reminded today is not listed again under Still open), loops closed, interruptions held, people prepped, follow-ups offered, named where the record has a name. Outcomes only; nothing moved means no block, and it will never tell you how many emails it read. Plus **at most one question**: a *"make that a standing rule?"* confirmation when today's transcripts showed you stating one — your yes writes it to the master file; it is never written unconfirmed. **Automatic mute questions are paused**: the recorded dismissal signals include inferred draft non-use, which does not establish that a person matters less. The producer returns without scanning the ledger or writing a question. Explicit "mute Bob" instructions still work |
+| Evening brief | 17:30 local | opens with "Good evening — <the date>", then accountability, tomorrow, follow-up drafts, and **What moved today**. On Friday only, it adds a short review of up to three stale or repeatedly surfaced obligations plus a count/link for the rest and a count of parked loops. No stale or parked items and no eligible candidate means no review; a stated `weekly_review` section mute suppresses it. It never silently expires them and sends no separate Sunday review message. **At most one review question**, shared with a *"make that a standing rule?"* confirmation when today's transcripts showed you stating one; that confirmation takes precedence. Explicit "mute Bob" instructions still work |
 | Midday digest | 12:30 local | reviews what queued **since the last delivered brief** when at least `SOTTO_DIGEST_MIN` (default 8) known-sender ambient/deferred events justify review; sends only relevant items, otherwise silent. Nudges Sotto raised itself never count toward that 8 (they aren't people), though they may ride along in the message |
-| Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself; a `mailto:` is removed at the delivery seam, so one can never reach you from a scheduled run), every other channel gets a one-tap link — and a phone-shaped link whose number is not dialable (a model-masked `imessage://+141****3682`) is removed at that same seam, because a dead link is worse than none |
-| Proactive nudges | a meeting starting in ~45 min you haven't prepped (the nudge **carries** who they are and the one thing open with them), a commitment due today, one chase for something you're owed, a birthday (`SOTTO_BIRTHDAY_LEAD_DAYS`, default 3, days out for VIP/VVIP gifts and on the day for saved contacts — unless a brief already delivered today), a question about an ask nobody answered twice, an offer to tidy a heavy pile | the whole push spends **one** unit of the daily interrupt budget and obeys the shared mutes, quiet hours and snooze; imminent prep alone bypasses the in-meeting hold so it can arrive before a back-to-back meeting |
+| Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself; a `mailto:` is removed at the delivery seam, so one can never reach you from a scheduled run), every other channel gets a one-tap link — and a tap link is kept only when its recipient validates (a real phone of 7-15 digits, a Messages short code, or an Apple ID email), so a model-masked or non-recipient link (`imessage://+141****3682`, an RCS business handle, a group identifier) is removed at that same seam while the draft text around it stays, because a dead link is worse than none |
+| Proactive nudges | a meeting starting in ~45 min you haven't prepped, a commitment due today, one chase for something you're owed, a birthday, or a question about an ask nobody answered twice | the whole push spends **one** unit of the daily interrupt budget and obeys the shared mutes, quiet hours, snooze and effective nudge cap. “Fewer nudges” halves the cap, “no nudges” sets zero for every unsolicited path, and “more nudges” restores the configured ceiling. Direct requests, briefs and digests remain available |
 | Weekly pulse | Mondays 9:00 local | who is waiting on you and who is going quiet, from six weeks of messages, calls **and email** (a mail you sent is a touch to each recipient, a mail you received a touch from its sender — for people in your Contacts or graph only), with the people you've fully lost touch with ranked below |
 
 The digest window advances after provider acceptance, to the brief's original source cutoff.
@@ -358,7 +451,8 @@ lives where it always did (`crons.json`), but the receiver fires it on its own c
 agent's, so a scheduled brief is written down before the first send attempt and retried like
 everything else — the 6:30 brief no longer disappears because the channel was down at 6:30. A
 scheduled run that dies mid-compose is retried by the durable work queue, with at most three
-execution attempts. A saved completed output is reused for handoff without another model call.
+execution attempts. A saved completed output is reused for at most three handoff attempts without
+another model call. Graceful stops refund the active phase; ambiguous crashes consume an attempt.
 That marker used to be claimed only because
 the skill was told to; on August 30 a run wasn't listening and the evening brief arrived twice, so
 the claim now lives in the machinery every message passes through rather than in an instruction.
@@ -390,12 +484,21 @@ Waiting is not forever, and how long depends on what it is:
 
 | | Waits until | Then |
 |---|---|---|
-| A nudge | it is older than 240 minutes — the same window the release valve refuses to promote a held nudge past | it is dropped, and the reason is written to the Record. A *"meeting in 10 minutes"* ping delivered an hour late is worse than silence |
-| A morning or evening brief (and the weekly pulse) | the end of its local day | it **fails visibly** — a day with no brief is something you should be told about |
+| An ordinary real-time nudge | 30 minutes after the source event | it is dropped rather than delivered as fresh news after it stopped being fresh |
+| An ordinary event waiting in the release valve | 240 minutes after the source event | the valve records one stale drop; the event can still ride the digest or a brief |
+| A nudge held for a meeting | the meeting can run as long as it runs; after release it gets 240 minutes | it is dropped after that post-release window, so Sotto's own hold cannot consume its chance to arrive |
+| A missed call | 240 minutes after the ring | it stays truthful about when the call happened or falls back to the digest/brief |
+| A calendar change | the affected meeting's start | it is dropped once the change can no longer help before that meeting |
+| A morning or evening brief | the end of its local day | it **fails visibly** — a day with no brief is something you should be told about |
+| The weekly pulse (and the midday digest) with no channel to land on | four hours after its minute — the same catch-up window a brief gets, retried every tick | it is not sent; a channel that stays unlinked past the window loses that run, and the boot log says the channel was never linked |
 | The midday digest | the end of its local day, which ends before the next digest window opens | it is dropped: tomorrow's digest covers what it would have said |
 
 Nothing is thrown away quietly: every failure and every expiry is a row in the Record with its
-reason, and the Briefs page carries a line whenever anything is still waiting or has given up.
+reason, and the Briefs page carries a line whenever anything is still waiting or has given up. That
+includes the quietest expiry of all — an ordinary ask the release valve lets age past its promotion
+window leaves one `drop` row of class `stale` naming how old it got, written once (the queue entry
+is marked, so a tick every 15 minutes cannot write it again) while the item itself still rides the
+digest and your briefs.
 
 ### What Sotto did on your behalf — the receipt
 
@@ -464,6 +567,11 @@ nudged about that?", the answer is a row there: *muted sender*, *quiet hours*, *
 budget spent (4 nudges today)*, *in a meeting until 2:30 PM — Sarah Chen*, and so on. Nothing is
 silently discarded without a reason you can read.
 
+A mute is not an exception to that: when the valve would have promoted a held item and only the
+mute stops it, the ledger gets a *dropped — muted* row like the ingress drop does, and tapping
+"nudge me now" on a muted person's item answers with the mute by name ("you asked Sotto to stop
+surfacing Sarah Chen") instead of a generic refusal.
+
 Preferences come from explicit instructions. Draft usage does not relax approval tiers or produce
 mute suggestions; the unused behavioral learner has been removed. Draft matching still records
 outcomes and confirms verbatim voice samples in the Learn step.
@@ -475,10 +583,16 @@ For the managed personal pilot, successful Google consent opens only the Gmail/C
 A Bridge with a local Cloud policy reads only its consented sources and excludes the Sotto iMessage handle before transferring history, unread messages or events. Contacts follow their source consent; source access does not authorize outbound actions.
 
 The shared brief runner executes gather and compose directly; the agent does not choose whether
-they happen. Once a valid brief artifact is staged, essential memory writes continue as durable
-background work after delivery and cannot block that brief. Optional research and ancillary learning
-also cannot gate a valid brief. Terminal work rejects a scheduler replay unless an ingress path
-explicitly admits a fresh retry. A successful empty Gmail search is a
+they happen. If essential memory writes fail, the staged brief can still be delivered and durable
+background work retries those writes. Optional research and ancillary learning are separate from
+initial delivery. A composition older than two hours is invalidated before delivery, including when it waits in the
+saved-result queue or outbox. The existing invalidation path releases only a provably unaccepted
+reservation and admits fresh work; ambiguous acceptance never authorizes a second brief. Every
+replacement gets a distinct learning revision and required-write receipt. Composition and learning
+share the same lock; an old follow-up cannot learn from or delete replacement inputs.
+Recovery can wait behind learning already holding that lock. Acquisition contention requeues the
+job for one minute later without spending a fault attempt, within the existing catch-up deadline.
+Terminal work rejects a scheduler replay unless an ingress path explicitly admits a fresh retry. A successful empty Gmail search is a
 quiet inbox; an unavailable or partial source is reported separately.
 
 
@@ -486,7 +600,12 @@ quiet inbox; an unavailable or partial source is reported separately.
 
 Only an explicit VIP choice or sustained reciprocal activity qualifies a person for proactive gift help. A saved birthday, meeting invitation, graph depth, raw message count or overdue reply alone does not. This policy is shared by Cloud/self-host and every delivery channel. Explicit user requests for gift help are unaffected; no purchase is authorized by an inferred tier.
 
-The relationship pulse is the sole writer of dated `importance_evidence` within each canonical person's history in `knowledge/relationship_state.json`. It combines known-person iMessage, WhatsApp, calls and Gmail touches. The reader deduplicates days and uses a rolling **42-day** window. **VIP:** at least **6 active days across 3 weeks**, including **2 days in each direction**. **VVIP:** at least **12 active days across 4 weeks**, including **4 days in each direction**. This prevents one-way outreach or a single chat burst from qualifying. Missing, stale or ambiguous evidence suppresses a gift prompt; explicit `vip_people` choices remain authoritative. Day-of greetings retain their existing gates. The attention queue's urgency-based quiet-hour VIP rule is unchanged; gift importance grants no extra interrupt permission.
+The relationship pulse is the sole writer of dated `importance_evidence` within each canonical person's history in `knowledge/relationship_state.json`. It combines known-person iMessage, WhatsApp, calls and Gmail touches. The reader deduplicates days and uses a rolling **42-day** window. **VIP:** at least **6 active days across 3 weeks**, including **2 days in each direction**. **VVIP:** at least **12 active days across 4 weeks**, including **4 days in each direction**. Confirmed Granola meetings can strengthen an already reciprocal relationship: **3 held meetings across 3 weeks** for VIP, or **6 across 4 weeks** for VVIP, with at least **2 days in each direction**. These meetings require exactly **1 counterpart** after excluding the owner; multi-counterpart meetings cannot qualify anyone. Scheduled invitations, missed calls and unconnected calls do not count. This prevents one-way outreach or a single chat burst from qualifying. Missing, stale or ambiguous evidence suppresses a gift prompt; explicit `vip_people` choices remain authoritative. Day-of greetings retain their existing gates. The attention queue no longer grants any quiet-hour VIP bypass at all (Sep 2026 — volume is not importance); gift importance likewise grants no extra interrupt permission.
+
+Gmail polling keeps independent inbox and sent-mail bounds, page cursors and pending IDs in the
+version-2 `events/gmail_seen.json`. It resumes bounded oldest-first pages after downtime and advances
+only after receiver acceptance. Fresh or legacy state starts with a defined 24-hour recovery window;
+recovered messages keep their original timestamps and enter as catch-up.
 
 ## Learning before and between briefs
 
@@ -502,9 +621,13 @@ Other sources keep their existing learning paths. The receiver starts a backgrou
 most once every 15 minutes (`receiver.MEMORY_INTERVAL_SECONDS`), never while the previous one is
 still running, and each pass advances at most 3 rotating history pages
 (`memory_cycle.PAGES_PER_RUN`) and one unfinished Dreamer batch; the Dreamer selects useful existing facts for person
-summaries, archives exact duplicates and records contradictions. It cannot change source grants,
+summaries, archives exact duplicates and records contradictions. Facts record `archived_reason`
+separately from their source. Only an exact observation of a fact archived for age (`stale`) may
+revive it. User archives, corrections, superseded facts, duplicates and legacy archives with unknown
+reasons stay archived. It cannot change source grants,
 approvals, priorities, mutes or code. Conflicting evidence stays uncertain; the user's corrections
-win and do not expire. Rereading the same source is not additional confirmation.
+win and do not expire. Rereading the same source or a reference-free repetition is not additional
+confirmation and does not refresh the fact's recency; distinct evidence or an explicit correction can.
 
 Self-host background history and Dreamer calls are held until `SOTTO_MODEL_PROXY_URL` and
 `SOTTO_MODEL_PROXY_TOKEN` select the existing native proxy and that tenant has a finite
@@ -513,15 +636,55 @@ history/curation work for that pass. Foreground chat and ordinary briefs retain 
 behavior. An owner who deliberately accepts unbounded background BYOK spend can set
 `SOTTO_BACKGROUND_UNMETERED=true`; no other value opts in. Managed tenants retain their configured
 policy, including an explicit null budget for the personal pilot.
-Before reading a source, the cycle authenticates to the proxy's versioned, content-free background
-budget capability. A 404 from an older proxy, invalid credential, null budget or exhausted allowance
-holds the cycle; the actual model request repeats the finite-budget requirement for atomic admission.
-History and skipped Dreamer work retain the actual hold reason in their receipts.
+
+Draft learning uses original send timestamps and canonical counterpart identity across channels.
+One observed send can credit at most one offered draft, with the source event identity persisted in
+`outcomes.jsonl`. A late genuine send can repair an inferred old result; explicit user dismissal
+remains final. Missing outbound telemetry and silence are unknown, never rejection or style evidence,
+and only a verified verbatim send confirms a voice sample.
+Before reading a source, proxy-backed cycles authenticate to the versioned, content-free background
+capability and check the effective primary model against its supported native models. An
+unreachable capability, an unsupported model, an invalid credential or an exhausted finite
+allowance holds the cycle. A proxy that predates the model list — one answering without
+`supported_native_models` — holds it too, and is reported as an unsupported proxy capability
+rather than as a budget problem, because during that rollout the owner's budget is fine and the
+proxy is what needs upgrading.
+Self-host also requires a finite budget; managed tenants retain their explicit null-budget option.
+The actual self-host model request repeats the finite-budget requirement for atomic admission.
+Each background extraction or Dreamer call makes one upstream attempt, including with explicit
+unmetered BYOK. Transient failures wait for the existing retry clock; foreground briefs retain
+their immediate retry and fallback behavior.
+History and skipped Dreamer work retain the actual hold reason in their receipts, including when
+the Dreamer's own evidence selection failed underneath a hold — a held cycle reports the hold,
+because the hold is why nothing ran.
+An unchanged malformed history page or nonadvancing cursor gets two attempts, then pauses with one
+compatibility probe every 24 hours so a repaired Bridge resumes without manual state edits. An
+unchanged malformed Dreamer response or native HTTP 400/422 gets two attempts, then waits until its
+prompt/schema/model route or exact candidate evidence changes. Only what the model actually
+returned counts as a malformed response: a transport or configuration fault raised before the
+answer arrives is an ordinary failure and spends none of those attempts. Availability, network,
+timeout, HTTP 429 and HTTP 503 failures keep their ordinary retry behavior. These are retry bounds,
+not a new daily model allowance or work counter.
+Only the Gmail adapter decides that a continuation token is dead: it names a page-token request the
+provider rejected as an invalid argument, and it names it with a code, never with the provider's
+message. Any other deterministic Gmail rejection — a bad query, impossible window bounds, an adapter
+regression — is a broken request and parks like every other protocol failure, with no replay. A dead
+token is retried twice, then its same frozen window restarts from page one; that window may restart
+again only after an attempt reaches further into it than the attempt before the last restart did.
+Depth counts only pages in this window, excluding completed windows from the lifetime totals.
+An older checkpoint without a window baseline can restart once, but its unknown depth cannot earn
+another reset. Older reset markers without both progress counts stay consumed across upgrades.
+A window whose restart budget is spent records
+`continuation_restart_exhausted` and its blocked receipt names that reason, so a stuck window says so
+instead of probing a dead token forever. A completed window clears its marker and starts fresh.
 
 Observed sends and edits are evidence for writing voice; sustained reciprocal activity helps assess
 relationships. Those observations are contextual, not blanket preferences. A stated instruction or
 correction overrides an inferred pattern. Explicit “useful” / “not useful” feedback on an identifiable
-brief item or draft supplies an example for future relevance and writing. No response, an unsent
+retained brief item supplies an example for future relevance and writing. Item ratings remain
+separate within a brief, and ambiguous repeated excerpts require a more specific selection.
+Examples are read only while the archive and its recorded source permissions remain available;
+legacy archives and offered drafts without provenance are not reused as prompt examples. No response, an unsent
 draft or a processing reaction is not a negative rating. A rating never authorizes an action or
 cancels an obligation. Existing relevance and approval rules still govern every nudge and write.
 
@@ -564,8 +727,8 @@ A calendar entry explicitly labelled CONTEXT, prep notes, briefing notes or meet
 supporting material when it uniquely matches a real meeting's subject and exact start/end. It stays
 available for preparation, but does not manufacture a conflict or a second meeting nudge. A shared
 time alone is not sufficient; ambiguous or unrelated meetings remain separate. Sotto never deletes
-or declines an event on this basis. Coming Up is labelled as a preview, with the full agenda in
-Calendar. Its disclosure sits outside the five schedule-line cap. A quiet evening uses “Nothing
+or declines an event on this basis. Coming Up shows up to five schedule lines, without a repeated
+instruction to open Calendar for the full agenda. A quiet evening uses “Nothing
 needs your attention right now,” rather than morning wording or an unsupported claim about the
 whole inbox.
 
@@ -582,12 +745,24 @@ A partially valid page advances with explicit rejection counts. Invalid JSON, a 
 response, or a nonempty response with no valid people preserves the checkpoint. Native HTTP 400/422
 failures hold the page until the schema, prompt, native client implementation or model route changes;
 other transient failures retain the hourly retry. A wholly invalid extraction parks after two attempts for the same source revision. Empty, valid no-fact responses remain valid reviews.
+Malformed history protocol responses likewise park after two unchanged attempts and make one
+compatibility probe every 24 hours. Dreamer response-contract failures park after two attempts for
+the same prompt/model revision and exact semantic evidence batch; changed evidence for the same
+person releases the latch. Transient availability, transport, HTTP 429 and HTTP 503 failures do not
+enter either latch.
+For Gmail, two HTTP 400 rejections of a nonempty continuation token restart the same frozen window
+once. An empty-cursor rejection, or another bad token in that window, stays parked.
 Each conversation candidate is capped at 12 messages, 400 characters per message and 4,800 characters
 in total. This isolation adds no repair call, new queue, or weaker evidence check.
 
 Provider acceptance is never repeated while its local state effects run. The outbox makes at most
-five post-delivery effect attempts, then exposes a quarantined failure while retaining the provider
-receipt and replayable effect metadata for recovery.
+five post-delivery effect attempts, then exposes a quarantined failure that keeps its provider
+receipt, label, run id and the reason it failed, and drops the effects' addressing — nothing
+replays a quarantined row, so it does not keep the identifiers a replay would have needed, and a
+row that stopped there carries no one's phone number or chat id. Process death inside a callback counts as an
+attempt; recovery quarantines an exhausted row before running that callback again. Callbacks are serialized across
+processes, even when they take longer than the retry interval. Closed receipts remain for seven
+days after their last delivery or effect settlement.
 
 Contacts-only access (Apple or Google) is identity metadata, not enough context to trigger a
 personal brief. The setup screen reads the same managed source and messaging gates as scheduling,
@@ -623,3 +798,86 @@ Morning/evening briefs and focused meeting backgrounds default to four-photo gal
 ## Shared writing rule
 
 All Sotto-generated prose uses the same [_shared/references/writing-style.md](../sotto-chief-of-staff/_shared/references/writing-style.md): plain, concrete language, no em dashes, and no canned AI phrasing or filler. The Gemini/OpenAI/Anthropic composition adapters attach it as a system instruction; raw document extraction transport preserves its original instructions; Hermes receives the same file with its persona in managed and self-host installs. The shared chat formatter normalizes prose punctuation while leaving URLs and literal machine text intact. AI-ism avoidance is a generation instruction, not a word-deletion filter.
+
+
+### Execution and checkpoint safety (pending release)
+
+The scheduled and wake proactive checks keep the same cadence and shared relevance rules.
+Gathering, due-item selection, quiet-hour holds and reservations run deterministically before
+Hermes. An empty check makes no composer call; an accepted nudge uses the existing skill and
+approval rules. Delivery still rechecks consent and current eligibility.
+
+One calendar refresh is one triage batch with individual acknowledgments. Post-meeting tap slots
+are reserved before dispatch and count toward the existing cap while pending. Failed checkpoint
+writes do not reset that count. Work ownership and completed queue/drop receipts reconcile after
+restart without another triage. An unreadable checkpoint pauses taps; unresolved pending taps that
+leave the lookback keep their slot until local midnight.
+
+Writing-style extraction precedes draft confirmation. Dreamer reruns for changed fact evidence,
+not bookkeeping-only file updates. Exhausted memory-work buckets wait for the next bucket;
+transient admission failures retain their retry behavior. These changes add no new cadence,
+interrupt allowance, source, or model route.
+
+Rejected completion proposals retain content-free reason counts in the existing continuity Learn
+receipt, even when the pass succeeds. This is one summary per pass, not a log of private evidence.
+
+## Measured learning and personal attention
+
+The operator's read-only `release_one_proof.py --days 30` report uses existing Learn receipts
+and ledger files. It states the retained date range and coverage.
+New Learn receipts count accepted and rejected completion proposals, including zero proposals.
+Older receipts without this field are unknown. A quick dismissal is a review signal, not proof of
+an incorrect capture. Missing rejected-proposal, reopening or manual-resolution links are reported
+as unavailable, never reconstructed from today's status.
+
+A brief includes one plain line when configured older history has failed, is held or is stale after
+**24 hours** without success. A real source failure takes precedence over a spending hold. It
+distinguishes history from today's source feed. Recovery removes the line; unconfigured sources
+and ordinary pending backfill stay silent, and a source whose feed the same brief already reports
+unavailable gets no second line about its history (one cause, one line).
+
+Researching a person cannot raise their relationship rank. Stored-fact count, tracked status,
+job title and talking points supply context only. The pulse orders waiting/drifting relationships
+by their existing age/cadence classification with a positive owner-reply tie-break. Silence does
+not reduce importance. Priorities remain ranking context permanently, never an exclusion filter.
+
+Reply timing needs **2 completed replies** in each direction separately, within the same channel
+and conversation. A burst is one turn. The existing relationship state retains at most **32 reply
+samples** per person; native IDs deduplicate overlapping pages. Completed pairs can accumulate
+across pages, but gaps between pages never manufacture a pair. Calls do not establish reply speeds.
+Learned weight uses the graph's **0.08 weekly decay** and expires after **60 days** without evidence.
+Stated VIP and priority choices never decay. The owner's reply speed helps attention ties; the
+counterpart's speed may extend a default chase only within a future deadline. An overdue
+obligation retains its ordinary cooldown; learning never accelerates a chase. Sparse evidence
+keeps the ordinary chase timing. Explicit promise dates keep their existing authority.
+
+Recapturing or recomposing an obligation never counts as surfacing. The accepted outbox delivery
+records an exact obligation ID and idempotent delivery key in that obligation's existing file.
+Stable obligation identity (anchor, clock start, direction and source message, never wording or
+the evidence list) preserves attribution across restatements by essential learning, and the
+finalizer checks that same identity at the channel's acceptance, quietly skipping a closed row or
+a different debt. Counting never cancels
+a brief. Exact receipt hashes are retained for retry safety; no duplicate numeric count is stored. Person-name mentions and aggregate counts do not count. A narrative line counts when it
+names the person, carries the model's `<!--loop:ID-->` marker for that ask, and shows all of the
+ask's content words; a hidden marker beside words that do not show the ask counts nothing.
+Free paraphrases may undercount rather than credit a different obligation with shared action words.
+Without a marker, the ledger summary must appear verbatim (the still-open backstop's own lines). Newly captured tasks are not counted until a later brief can bind their ledger identity. Legacy capture counters cannot
+trigger a repeated-delivery question; age and overdue status still select stale work.
+
+Friday appends at most one review question. A standing-rule confirmation takes precedence;
+otherwise one repeatedly delivered obligation or supported priority/VIP candidate may use the
+allowance. Quoted questions in messages and open asks do not consume this explicit allowance.
+Reply speed alone proposes nothing: a VIP candidate needs sustained reciprocal importance or a
+user-confirmed family relation, and a priority candidate needs your attention plus contact on at
+least two distinct days in each direction. Sustained reciprocity ranks first, a confirmed relation
+second, an attention priority last, because your own words about a person outrank an inference.
+A candidate that went stale between compose and send never withholds the brief, and its cooldown
+is still recorded at delivery: the question reached the user, and recording that grants no
+authority. Candidate suggestions have a **30-day cooldown**,
+spent only by accepted delivery and stored in the existing relationship state. A suggestion never
+writes a preference. The stated command uses the existing VIP or master-file writer, preserving
+other priorities and refusing additions when the three-priority set is full.
+
+Two audit corrections use existing writers: heard-once facts decay and archive from the same
+first-observation clock, so repeating an unsupported claim cannot refresh confidence or retention; explicit `tone_notes` reach the draft
+writer alongside observed style samples. User-corrected facts retain their authority.

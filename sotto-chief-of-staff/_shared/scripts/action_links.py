@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from urllib.parse import quote
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
+from message_targets import normalized_target  # noqa: E402
 
 # The one action_type with a rule of its own: a decline is `review` tier forever, so it is presented
 # as text and never pre-linked.
@@ -44,10 +46,12 @@ def drafts_path() -> str:
 
 
 def record_draft(channel: str, identifier: str, message: str, action_type: str = "") -> None:
-    """One line per offered draft. Declines are recorded too — they're presented as text, and the
-    matcher still wants to know whether the user sent one. Empty-message links (a bare "open the
-    thread" tap) are not drafts and leave no row."""
-    if not (message or "").strip():
+    """One line per offered draft, including declines — they're presented as text, and the matcher
+    still wants to know whether the user sent one. A draft with no supported recipient (see
+    normalized_identifier) leaves no row: the outcome matcher could never match it back to a real
+    conversation, so recording it would only be a receipt nothing can reconcile against. Empty-
+    message links (a bare "open the thread" tap) are likewise not drafts and leave no row."""
+    if not (message or "").strip() or not normalized_identifier(channel, identifier):
         return
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
@@ -62,51 +66,57 @@ def record_draft(channel: str, identifier: str, message: str, action_type: str =
         pass
 
 
-def _digits(identifier: str) -> str:
-    d = re.sub(r"[^0-9+]", "", identifier or "")
-    return d
-
-
 def normalized_identifier(channel: str, identifier: str) -> str:
     """The identifier EXACTLY as this module's link builders embed it — one per-channel
     normalization, so every builder below (and anything that later has to match a link against a
     real conversation) works from the same string instead of re-deriving it."""
     ch = (channel or "").lower()
-    if ch in ("imessage", "sms", "phone", "facetime", "tel"):
-        return _digits(identifier) or (identifier or "")
-    if ch == "whatsapp":
-        return _digits(identifier).lstrip("+")
-    return (identifier or "").strip()   # email/gmail/apple_mail/mail — mailto: uses it verbatim
+    if ch in ("imessage", "sms", "phone", "facetime", "tel", "whatsapp", "whatsapp_call",
+              "email", "gmail", "apple_mail", "mail"):
+        return normalized_target(ch, identifier)
+    return (identifier or "").strip()
 
 
 def imessage(identifier: str, message: str = "") -> str:
-    base = f"imessage://{normalized_identifier('imessage', identifier)}"
+    target = normalized_identifier('imessage', identifier)
+    if not target:
+        return ''
+    base = f"imessage://{quote(target, safe='@+')}"
     return f"{base}?body={quote(message)}" if message else base
 
 
 def sms(identifier: str, message: str = "") -> str:
     # Messages routes iMessage vs SMS automatically; most chat clients linkify sms: reliably.
-    base = f"sms:{normalized_identifier('sms', identifier)}"
+    target = normalized_identifier('sms', identifier)
+    if not target:
+        return ''
+    base = f"sms:{target}"
     return f"{base}&body={quote(message)}" if message else base
 
 
 def whatsapp(identifier: str, message: str = "") -> str:
     phone = normalized_identifier("whatsapp", identifier)
+    if not phone:
+        return ''
     base = f"https://wa.me/{phone}"  # universal https click-to-chat (reliable in chat clients)
     return f"{base}?text={quote(message)}" if message else base
 
 
 def mailto(email: str, message: str = "", subject: str = "") -> str:
+    target = normalized_identifier('email', email)
+    if not target:
+        return ''
     parts = []
     if subject:
         parts.append(f"subject={quote(subject)}")
     if message:
         parts.append(f"body={quote(message)}")
-    return f"mailto:{email}" + (("?" + "&".join(parts)) if parts else "")
+    return f"mailto:{quote(target, safe='@+')}" + (("?" + "&".join(parts)) if parts else "")
 
 
 def tel(identifier: str) -> str:
-    return f"tel:{normalized_identifier('tel', identifier)}"
+    target = normalized_identifier('tel', identifier)
+    return f"tel:{target}" if target else ''
 
 
 def gmail_thread(thread_id: str) -> str:
@@ -150,9 +160,12 @@ def main():
     action_type = req.get("action_type", "")
     url = link_for(req.get("channel", ""), req.get("identifier", ""),
                    req.get("message", ""), req.get("subject", ""), action_type)
-    label = (f"Open {req.get('channel')} to {req.get('identifier')}" if url
-             else "a decline is never pre-linked — present it as text")
-    print(json.dumps({"url": url, "label": label}))
+    declined = action_type.strip().lower() == DECLINE_ACTION
+    label = (f"Open {req.get('channel')} to {req.get('identifier')}" if url else
+             "A decline is never pre-linked. Present it as text." if declined else
+             "No supported recipient address. Show the draft without a link.")
+    print(json.dumps({"url": url, "label": label,
+                      "status": 'ready' if url else 'review' if declined else 'needs_recipient'}))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,10 @@ per conversation, each message truncated by the shared conversation renderer
 when bounding the review; the brief remains the backstop beyond it. Relevant action/decision items
 lead, meaningful developments follow. No relevant items means completed silence; malformed judgments or provider failure
 means retryable silence with an unchanged coverage window. No sender/category blacklist and no per-item model calls.
+The user's own mutes are the one exception, and they are applied to ENTRIES before any context is
+built (preferences.proactively_muted, the same predicate the funnel's ingress gate and the valve
+use): a muted person's words never reach the review model, nor a delivered item's `messages`, even
+when someone else in their group thread qualifies.
 
   digest_check.py              → the decision JSON (the skill consumes it verbatim);
                                  successful silent reviews advance the window; delivered reviews
@@ -34,18 +38,22 @@ Env: SOTTO_DATA (state dir), SOTTO_DIGEST_MIN (signal threshold, default 8).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SHARED_LIB = os.path.join(_HERE, "..", "..", "_shared", "lib")
-if _SHARED_LIB not in sys.path:
-    sys.path.insert(0, _SHARED_LIB)
+_SHARED_LIB = os.path.realpath(os.path.join(_HERE, "..", "..", "_shared", "lib"))
+_SHARED_SCRIPTS = os.path.realpath(os.path.join(_HERE, "..", "..", "_shared", "scripts"))
+for _path in (_SHARED_LIB, _SHARED_SCRIPTS):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 from textutil import _looks_like_phone_number, _s  # noqa: E402
 from timeutil import _parse_ts  # noqa: E402
 import relevance  # noqa: E402
+import preferences  # noqa: E402
 from personal_context import conversation_key, conversation_message  # noqa: E402
 
 REVIEW_CONVERSATION_CAP = 100
@@ -82,6 +90,32 @@ def queue_path() -> str:
 
 def stamp_path() -> str:
     return os.path.join(_events_dir(), "last_digest.txt")
+
+
+def accepted_path() -> str:
+    return os.path.join(_events_dir(), "digest_accepted.json")
+
+
+def _accepted() -> set[str]:
+    try:
+        with open(accepted_path(), encoding="utf-8") as f:
+            value = json.load(f)
+        return {str(v) for v in value} if isinstance(value, list) else set()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def accept_items(ids: list[str]) -> bool:
+    """Record provider-accepted digest items atomically; concurrent accepts merge."""
+    import jsonstore
+    try:
+        with jsonstore.transaction(accepted_path(), default=[], strict=True) as current:
+            if not isinstance(current, list):
+                raise ValueError("invalid digest acceptance receipt")
+            current[:] = list(dict.fromkeys([*map(str, current), *(str(v) for v in ids if v)]))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _parse_iso(raw):
@@ -215,13 +249,20 @@ def _conversation_key(entry: dict) -> str:
     return conversation_key(entry.get("event") or {})
 
 
+def _item_id(key: str, entries: list[dict]) -> str:
+    """A conversation version: stable on retry, new when another observed message arrives."""
+    from work_queue import event_item_key
+    identities = [event_item_key(e.get("event") or {}) for e in entries[-REVIEW_MESSAGES_CAP:]]
+    return hashlib.sha256((key + "\0" + "\0".join(identities)).encode()).hexdigest()[:32]
+
+
 def _message(entry: dict) -> dict:
     ev = entry.get("event") if isinstance(entry.get("event"), dict) else {}
     return conversation_message(ev, timestamp=_s(entry.get("ts")),
                                 prior_class=_s(entry.get("verdict_class")))
 
 
-def check(entries: list, min_n: int | None = None) -> dict:
+def check(entries: list, min_n: int | None = None, *, track_review: bool = False) -> dict:
     """Activity gate → bounded conversation review → relevance ranking → delivery cap.
 
     All context is read-only. The injectable review_conversations seam tests selection without
@@ -232,8 +273,16 @@ def check(entries: list, min_n: int | None = None) -> dict:
     entries = [e for e in entries if (not delivery_effects.source_for_event(e.get('event') or {})
                 or allowed(delivery_effects.source_for_event(e.get('event') or {})))]
     min_n = _int_env("SOTTO_DIGEST_MIN", 8) if min_n is None else min_n
+    prefs = preferences.load_explicit()
+    # A muted person leaves the review BEFORE anything is built from it — not just the candidate
+    # list. The message context below is assembled per ENTRY, so filtering only candidates still
+    # sent a muted person's words to the review model (and into the delivered item's `messages`)
+    # whenever someone else in their group thread qualified. Per entry sender, once, here.
+    entries = [e for e in entries
+               if not preferences.proactively_muted(_s(e.get("sender")), e.get("event") or {}, prefs)]
     candidates = [e for e in entries if _s(e.get("verdict_class")) != "signal"
-                  and e.get("verdict") != "drop"]
+                  and e.get("verdict") != "drop"
+                  and not relevance.is_automated_assistant(e.get("event") or {})]
     actionable = any((_s(e.get('verdict_class')) in ACTIONABLE_CLASSES
                       or _s(e.get('held_class')) in ('urgent', 'actionable', 'scheduling_ask'))
                      and _s((e.get('event') or {}).get('source')) != PROACTIVE_SOURCE
@@ -242,18 +291,20 @@ def check(entries: list, min_n: int | None = None) -> dict:
         return {"deliver": False}
     # Keep every message as context: newest-per-person alone can hide an ask or its later answer.
     by_sender: dict = {}
+    entries_by_key: dict[str, list[dict]] = {}
+    for entry in entries:
+        entries_by_key.setdefault(_conversation_key(entry), []).append(entry)
     for entry in reversed(candidates):
         key = _conversation_key(entry)
         if key not in by_sender:
             by_sender[key] = entry
         elif _band(entry) < _band(by_sender[key]):
             by_sender[key] = entry
-    ranked = sorted(by_sender.items(), key=lambda pair: _band(pair[1]))[:REVIEW_CONVERSATION_CAP]
-    messages = {key: [] for key, _ in ranked}
-    for entry in entries:
-        key = _conversation_key(entry)
-        if key in messages:
-            messages[key].append(_message(entry))
+    accepted = _accepted()
+    ranked_all = [pair for pair in sorted(by_sender.items(), key=lambda pair: _band(pair[1]))
+                  if _item_id(pair[0], entries_by_key[pair[0]]) not in accepted]
+    ranked = ranked_all[:REVIEW_CONVERSATION_CAP]
+    messages = {key: [_message(entry) for entry in entries_by_key[key]] for key, _ in ranked}
     conversations = [{"id": i, "sender": _item(entry)["sender"],
                       "messages": sorted(messages[key], key=lambda m: delivery_effects.instant(m['ts']) or 0)[-REVIEW_MESSAGES_CAP:]}
                      for i, (key, entry) in enumerate(ranked)]
@@ -265,24 +316,34 @@ def check(entries: list, min_n: int | None = None) -> dict:
                 or any(j.get("class") not in relevance.CLASSES or not _s(j.get("why"))
                        for j in judgments)):
             raise ValueError("incomplete digest relevance review")
-        selected = []
+        selected, reviewed_silent = [], []
         for j in judgments:
-            if j["class"] == "ignore":
+            if j["class"] == "ignore" or j.get("sender_role") == "assistant":
+                i = j["id"]
+                reviewed_silent.append(_item_id(ranked[i][0], entries_by_key[ranked[i][0]]))
                 continue
             i = j["id"]
             entry = ranked[i][1]
             item = _item(entry)
             item.update(relevance=j["class"], why=j["why"], messages=conversations[i]["messages"])
+            for field in ("deadline", "priority_id", "priority_revision"):
+                if j.get(field) is not None:
+                    item[field] = j[field]
+            item["item_id"] = _item_id(ranked[i][0], entries_by_key[ranked[i][0]])
             band = ({"urgent": 0, "actionable": 1, "scheduling_ask": 1}.get(j["class"],
                     2 + int(_band(entry) == 2)))
-            selected.append((band, i, item))
-        selected.sort(key=lambda row: (row[0], row[1]))
+            selected.append((band, relevance.tie_break_key(j), i, item))
+        selected.sort(key=lambda row: (row[0], row[1], row[2]))
         chosen = selected[:ITEM_CAP]
-        items = [item for _, _, item in chosen]
+        items = [item for _, _, _, item in chosen]
         if not items:
-            return {'deliver': False}
+            result = ({'deliver': False} if len(ranked_all) <= REVIEW_CONVERSATION_CAP
+                      else {'deliver': False, '_review_incomplete': True})
+            if track_review:
+                result['_reviewed_silent'] = reviewed_silent
+            return result
         eligibility, deadlines = [], []
-        for _, i, item in chosen:
+        for _, _, i, item in chosen:
             descriptor = delivery_effects.for_bundle({'events': [ranked[i][1]]})
             for effect in descriptor['effects']:
                 # Replies already considered by this review are context. Only a newer observed
@@ -292,8 +353,11 @@ def check(entries: list, min_n: int | None = None) -> dict:
             eligibility.extend(descriptor['effects'])
             if descriptor['valid_until'] is not None:
                 deadlines.append(descriptor['valid_until'])
-        return {'deliver': True, 'items': items, 'effects': eligibility,
-                'valid_until': min(deadlines) if deadlines else None}
+        result = {'deliver': True, 'items': items, 'item_ids': [i['item_id'] for i in items],
+                  'effects': eligibility, 'valid_until': min(deadlines) if deadlines else None}
+        if track_review:
+            result['_reviewed_silent'] = reviewed_silent
+        return result
     except Exception as err:  # noqa: BLE001 — a failed relevance review must never become a digest
         print(f"[digest] relevance review failed ({type(err).__name__}); staying silent", file=sys.stderr)
         return {"deliver": False, "status": "retry", "retryable": True, "error": type(err).__name__}
@@ -303,12 +367,16 @@ def run_check(now: datetime) -> dict:
     """A failed review preserves coverage; a delivered review closes it only on acceptance."""
     entries = [e for e in entries_since(read_stamp())
                if (_parse_iso(e.get('ts')) or now) <= now]
-    result = check(entries)
+    result = check(entries, track_review=True)
     if result.get('retryable'):
         return result
+    reviewed_silent = result.pop('_reviewed_silent', [])
+    if reviewed_silent and not accept_items(reviewed_silent):
+        return {"deliver": False, "status": "retry", "retryable": True,
+                "error": "DigestReceiptError"}
     if result.get('deliver'):
         result['coverage_until'] = now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    else:
+    elif not result.pop('_review_incomplete', False):
         advance_stamp(now)  # successfully reviewed silence is a completed window
     return result
 

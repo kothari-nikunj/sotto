@@ -44,6 +44,7 @@ import glob as _glob
 import json
 import os
 import re
+import tempfile
 import time
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
@@ -82,10 +83,11 @@ def _fallback_write_text(path: str, text: str, mode: int = 0o600) -> None:
     """Import-safe stand-in so this module runs (and tests) without the receiver. The receiver
     replaces it with connectors.write_text, which is the same tmp-then-replace with one owner."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp.",
+                               dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), mode)
             f.write(text)
         os.replace(tmp, path)
     except BaseException:
@@ -175,6 +177,12 @@ class Exempt:
 
 
 SWEEP = (
+    Rule("events/triage-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
+         "validated classifications reuse the same admitted event revision for seven days"),
+    Rule("events/notification-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
+         "validated notification copy survives retries for seven days"),
+    Rule("events/research-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
+         "research batch results coalesce retries; canonical profiles keep their existing freshness"),
     Rule("events/delivery.jsonl", DROP_LINES_OLDER, DELIVERY_RECEIPT_DAYS,
          f"a delivery receipt older than {DELIVERY_RECEIPT_DAYS} days has outlived every question "
          "it answers"),
@@ -229,6 +237,10 @@ SWEEP = (
 )
 
 EXEMPT = (
+    Exempt("events/triage-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
+    Exempt("events/model-work.sqlite3*", "model_work prunes opaque attempt records after 90 days on use"),
+    Exempt("events/notification-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
+    Exempt("events/research-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
     Exempt(".sotto-volume.json", "adapter managed_volume owns the tenant/volume identity receipt"),
     Exempt(".sotto-runtime.lock", "adapter runtime_lock owns the process-lifetime writer lock"),
     Exempt(".sotto-recovery-hold.json", "adapter recovery owns the restore hold and its release"),
@@ -237,6 +249,8 @@ EXEMPT = (
     Exempt("config/source-state.json", "bounded metadata for current source permissions and observations"),
     Exempt("events/outbox.json",
            "outbox.py prunes its own terminal rows after RETENTION_SECS (7 days)"),
+    Exempt("events/outbox.json.effects.lock",
+           "empty persistent coordination file; unlinking an active lock would split its owners"),
     Exempt("events/bundle-*.json",
            "receiver._stage_bundle sweeps them at EVENT_BUNDLE_RETENTION_SECS (7 days)"),
     Exempt("cache/research_*.json",
@@ -262,10 +276,10 @@ EXEMPT = (
     Exempt("cache/hermes-version.json", "one file, written by start.sh at boot"),
     Exempt("events/seen.json", "a bounded idempotency ring, rewritten in place"),
     Exempt("events/gmail_seen.json", "one cursor file, rewritten in place"),
+    Exempt("events/digest_accepted.json", "durable digest completion receipt, rewritten in place"),
     Exempt("events/last.stamp", "one liveness stamp, rewritten in place"),
     Exempt("events/last_digest.txt", "one window stamp, rewritten in place"),
     Exempt("proactive/wake_run.last", "one throttle stamp; its mtime IS the value"),
-    Exempt("proactive/retune_offer.last", "one cooldown stamp, rewritten in place"),
     Exempt("proactive/mute_offers.json",
            "one date per person Sotto has asked to mute; its writer drops entries past the 30-day "
            "cooldown on every write, so it is bounded by the people you keep dismissing"),
@@ -393,11 +407,10 @@ def _apply_drop_lines(path: str, days: int, now: float) -> int:
     mtime."""
     cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - days * 86400))
     # Under the `<path>.lock` sidecar flock (external review, Aug 31: read-then-replace without it
-    # swallowed any line appended in between). The receiver's own appenders and event-triage's
-    # budget writes take the same flock, so those cannot interleave; a skills-side append that runs
-    # unlocked (google_action's receipt line) keeps a NARROW residue of the race — accepted, because
-    # its writers never run at the 03:30 sweep and a fourth lock implementation deadlocked the tree
-    # the day it was tried.
+    # swallowed any line appended in between). Every writer of these ledgers takes the same sidecar
+    # flock — the receiver's own appenders, event-triage's budget writes, google_action's
+    # `bounded_append` receipt line, and forget.py --receipts — so none of them can interleave with
+    # this sweep.
     with HOOKS["jsonl_lock"](path):
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()
@@ -412,18 +425,22 @@ def _apply_truncate(path: str, max_bytes: int, _now: float) -> int:
     """Cut the log to its last `max_bytes`, IN PLACE (same inode: a brief mid-flight holds it open
     in append mode and must keep writing to the same file). Whole lines only — a tail that starts
     mid-line is a line nobody can parse. Returns bytes reclaimed."""
-    size = os.path.getsize(path)
-    if size <= max_bytes:
-        return 0
-    with open(path, "rb") as f:
-        f.seek(size - max_bytes)
-        tail = f.read()
-    cut = tail.find(b"\n")
-    tail = tail[cut + 1:] if cut != -1 else tail
-    with open(path, "r+b") as f:
-        f.write(tail)
-        f.truncate(len(tail))
-    return size - len(tail)
+    # The skills-side diagnostic appender takes this same `<path>.lock`. Holding it across the
+    # size/read/rewrite transaction prevents an append between the tail read and truncation from
+    # disappearing. The receiver supplies connectors.file_lock through this hook.
+    with HOOKS["jsonl_lock"](path):
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            return 0
+        with open(path, "rb") as f:
+            f.seek(size - max_bytes)
+            tail = f.read()
+        cut = tail.find(b"\n")
+        tail = tail[cut + 1:] if cut != -1 else tail
+        with open(path, "r+b") as f:
+            f.write(tail)
+            f.truncate(len(tail))
+        return size - len(tail)
 
 
 _APPLY = {

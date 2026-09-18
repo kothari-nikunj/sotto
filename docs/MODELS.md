@@ -179,7 +179,7 @@ Measured input, stated-assumption output — the formula is shown so you can sub
 | Meeting prep | 1 | 7,000 | 7,000 |
 | **Total input** | | | **~116,000** |
 
-**Output is not measured here** (the brief call sets no `maxOutputTokens`; real counts land in the
+**Output is not measured here** (the brief call sets `maxOutputTokens` to the proxy's own 65,536 ceiling, which is no limit in practice; real counts land in the
 `[brief-cost]` log line). The figures above assume **~25,000 output tokens/day** — two briefs, the
 critic/revise pair, ten grounded research batches (`MAX_OUTPUT_TOKENS` 8,192 each) and one prep.
 

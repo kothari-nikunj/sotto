@@ -15,6 +15,35 @@ def test_imessage_link():
         "imessage://+15551234567?body=On%20my%20way%21"
 
 
+@pytest.mark.parametrize('identifier', [
+    'ramp_cf8gd1ek_agent', 'ramp_cf8gd1ek_agent@rbm.goog', 'contact_14155551234', '81', '123@lid',
+    '120363012345678@g.us', '+1415***1234', '', '+1?body=oops', '1234567890123456',
+])
+@pytest.mark.parametrize('channel', ['imessage', 'sms', 'whatsapp', 'phone', 'email', 'gmail'])
+def test_contact_ids_never_turn_into_phone_numbers(channel, identifier, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    assert al.link_for(channel, identifier, 'Coffee with a colleague') == ''
+    assert not (tmp_path / 'events/drafts.jsonl').exists()
+
+
+def test_messages_email_is_preserved_instead_of_extracting_its_digits():
+    assert al.link_for('imessage', 'alex2026@example.com', 'Hi') == \
+        'imessage://alex2026@example.com?body=Hi'
+    assert al.link_for('imessage', 'alex#1@example.com', 'Hi') == \
+        'imessage://alex%231@example.com?body=Hi'
+    assert al.link_for('sms', 'alex2026@example.com', 'Hi') == ''
+    assert al.link_for('imessage', '15551234567@s.whatsapp.net', 'Hi') == ''
+
+
+def test_real_short_codes_and_whatsapp_phone_jids_work():
+    assert al.link_for('sms', '12345', 'memo') == 'sms:12345&body=memo'
+    assert al.link_for('imessage', '123456', 'memo') == 'imessage://123456?body=memo'
+    assert al.link_for('phone', '12345') == ''
+    assert al.link_for('whatsapp', '15551234567@s.whatsapp.net', 'Hi') == \
+        'https://wa.me/15551234567?text=Hi'
+    assert al.link_for('imessage', '(415) 555-1234', 'Hi') == 'imessage://4155551234?body=Hi'
+
+
 def test_whatsapp_https_form():
     assert al.link_for("whatsapp", "+15551234567", "hi there") == \
         "https://wa.me/15551234567?text=hi%20there"

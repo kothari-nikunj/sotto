@@ -6,8 +6,9 @@ confidence decay, prune, fact-id hashing, .md round-trip.
 import importlib.util
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pytest
 import yaml
 
 HERE = os.path.dirname(__file__)
@@ -52,10 +53,122 @@ def test_low_similarity_is_new():
     assert action == kg.NEW
 
 
-def test_archived_match_skips():
-    facts = {"f_1": kg.FactMeta(text="CTO at Acme Corp", type="milestone", status="archived")}
-    action, _ = kg.find_similar_fact(facts, "CTO at Acme Corp", "milestone", False)
+def test_only_exact_age_prunes_revive():
+    fact = kg.FactMeta(text="CTO at Acme Corp", type="milestone", status="archived",
+                       source="web_research", archived_reason="stale")
+    facts = {"f_1": fact}
+    assert kg.find_similar_fact(facts, "CTO at Acme Corp", "milestone", False) == (kg.BUMP, "f_1")
+    # Even high word overlap does not mean the archived assertion was observed again.
+    assert kg.find_similar_fact(facts, "CEO at Acme Corp", "milestone", False)[0] == kg.SKIP
+    for reason in (None, "user_archived", "user_corrected", "superseded", "duplicate"):
+        fact.archived_reason = reason
+        assert kg.find_similar_fact(facts, fact.text, "milestone", False)[0] == kg.SKIP
+
+
+def test_fuzzy_match_against_an_archived_fact_still_skips():
+    """0.3-0.5 overlap is a guess, not a re-observation — it must not resurrect anything."""
+    facts = {"f_1": kg.FactMeta(text="works at Acme leading platform", type="context",
+                                status="archived", source="web_research")}
+    action, _ = kg.find_similar_fact(facts, "works at Acme running growth partnerships",
+                                     "context", False)   # overlap 2/4 -> the mutable band
     assert action == kg.SKIP
+
+
+def test_research_preamble_words_are_not_content(tmp_path):
+    """Every research fact starts "Per web search", so counting those three words as content put a
+    short recency item in the 0.3-0.5 band against the bio and SUPERSEDED it in the same apply()."""
+    _setup(tmp_path)
+    ext = {"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
+        "updated_by": "web_research", "facts": [
+            {"fact": "Per web search: CEO at Acme — Leads Acme's platform org.",
+             "memory_type": "context", "confidence": 0.55, "source": "web_research",
+             "source_ref": "attendee_research:2026-06-23"},
+            {"fact": "Per web search (2026-09-01): raised a Series B",
+             "memory_type": "context", "confidence": 0.6, "source": "web_research",
+             "source_ref": "https://news.example/series-b"}]}]}
+    ku.apply(ext, NOW)
+    p = kg.parse_person_file(open(kg.find_person_file(identifier="dana@acme.com")).read())
+    assert sorted(f.status for f in p.facts.values()) == ["active", "active"]
+
+
+def test_three_meetings_stay_three_milestones(tmp_path):
+    """granola_graph types every "Met on <date>: <title>" fact `milestone`; while `milestone` was
+    mutable, two date-only meeting facts shared {met, <year>} and superseded each other, so a
+    person's whole meeting history collapsed into one fact carrying the first date."""
+    _setup(tmp_path)
+    ext = {"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
+        "updated_by": "granola_graph", "facts": [
+            {"fact": f"Met on 2026-09-{day}: {title}", "memory_type": "milestone",
+             "confidence": 0.7, "source": "granola_meeting", "source_ref": f"granola:{day}"}
+            for day, title in (("01", "Board sync"), ("08", "Design review"),
+                               ("15", "Pricing debrief"))]}]}
+    r = ku.apply(ext, NOW)
+    assert r["applied"]["new"] == 3 and r["applied"]["superseded"] == 0
+    p = kg.parse_person_file(open(kg.find_person_file(identifier="dana@acme.com")).read())
+    assert len([f for f in p.facts.values() if f.status == "active"]) == 3
+
+
+def _dana_fact(text, ref, source="web_research"):
+    return {"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
+            "updated_by": source, "facts": [{"fact": text, "memory_type": "context",
+            "confidence": 0.8, "source": source, "source_ref": ref}]}]}
+
+
+def _dana():
+    return kg.parse_person_file(open(kg.find_person_file(identifier="dana@acme.com")).read())
+
+
+def test_an_archived_twin_listed_first_does_not_shadow_the_active_fact():
+    """File order is not authority: the dreamer archives the later duplicate, a supersede archives
+    the earlier fact, so either copy can precede the other. The live copy must win the match."""
+    facts = {
+        "f_old": kg.FactMeta(text="CTO at Acme Corporation", type="context", status="archived",
+                             archived_text="CTO at Acme Corporation", archived_reason="duplicate",
+                             source="brief_extraction", first="2026-06-01", last="2026-06-01"),
+        "f_live": kg.FactMeta(text="CTO at Acme Corporation", type="context", status="active",
+                              source="brief_extraction", first="2026-07-01", last="2026-07-01"),
+    }
+    assert kg.find_similar_fact(facts, "CTO at Acme Corporation", "context", False) == (kg.BUMP, "f_live")
+    # History ingestion has its own exact-text path. Exercise the writer, not only similarity.
+    counts = {"new": 0, "confirmed": 0, "superseded": 0}
+    ku._apply_fact(kg.PersonFile(facts=facts), "dana", {
+        "fact": "CTO at Acme Corporation", "memory_type": "context", "source": "observed_message",
+        "source_ref": "imessage:new-message"}, "2026-07-02", counts)
+    assert counts == {"new": 0, "confirmed": 1, "superseded": 0}
+    assert facts["f_live"].last == "2026-07-02"
+    assert facts["f_old"].status == "archived" and facts["f_old"].last == "2026-06-01"
+    # …and with no live twin, a duplicate-archive stays a tombstone (codex's archived_reason rule).
+    del facts["f_live"]
+    assert kg.find_similar_fact(facts, "CTO at Acme Corporation", "context", False) == (kg.SKIP, None)
+
+
+def test_pruned_fact_is_relearned_when_it_is_observed_again(tmp_path):
+    """The 61-day prune archives a one-off. Re-observing it must re-learn it in place, not leave a
+    permanent tombstone that makes the assertion unlearnable."""
+    _setup(tmp_path)
+    ku.apply(_dana_fact("Runs the platform org at Acme", "gmail:one"), NOW)
+    later = datetime(2026, 9, 16, 7, 0, 0)   # >60 days on, so the one-off is pruned
+    ku.apply(_dana_fact("Enjoys sea kayaking", "gmail:two"), later)
+    stale = [f for f in _dana().facts.values() if "platform org" in f.text][0]
+    assert stale.status == "archived" and stale.archived_text == stale.text
+    ku.apply(_dana_fact("Runs the platform org at Acme", "gmail:three"), later)
+    revived = [f for f in _dana().facts.values() if "platform org" in f.text]
+    assert len(revived) == 1                                  # same fact, not a duplicate
+    assert revived[0].status == "active" and revived[0].archived_text is None
+    assert revived[0].seen == 2 and revived[0].last == "2026-09-16"
+
+
+def test_a_fact_the_user_archived_is_never_revived_by_research(tmp_path):
+    _setup(tmp_path)
+    ku.apply(_dana_fact("Runs the platform org at Acme", "user-correction", "user_edit"), NOW)
+    path = kg.find_person_file(identifier="dana@acme.com")
+    p = kg.parse_person_file(open(path).read())
+    fid, fact = next(iter(p.facts.items()))
+    fact.status, fact.archived_text = "archived", fact.text
+    kg.write_person_file(path, p, NOW)
+    ku.apply(_dana_fact("Runs the platform org at Acme", "https://news.example/bio"), NOW)
+    after = _dana().facts
+    assert list(after) == [fid] and after[fid].status == "archived"
 
 
 # ── decay / prune ──────────────────────────────────────────────────────────────
@@ -69,6 +182,19 @@ def test_confidence_floor():
     assert kg.effective_confidence(f, NOW) == kg.CONFIDENCE_FLOOR
 
 
+def test_heard_once_fact_decays_from_first_observation_not_ref_less_refresh():
+    f = kg.FactMeta(text="x", conf=0.95, seen=1, first="2026-06-09", last="2026-06-23")
+    assert abs(kg.effective_confidence(f, NOW) - (0.95 - 2 * 0.08)) < 1e-9
+    f.seen = 2
+    assert abs(kg.effective_confidence(f, NOW) - 0.95) < 1e-9
+
+
+def test_user_edit_confidence_remains_authoritative_regardless_of_age():
+    f = kg.FactMeta(text="x", conf=1.0, seen=1, first="2020-01-01", last="2020-01-01",
+                    source="user_edit")
+    assert kg.effective_confidence(f, NOW) == 1.0
+
+
 def test_prune_one_off_after_60_days():
     facts = {"f_1": kg.FactMeta(text="x", seen=1, status="active", last="2026-01-01")}
     kg.prune_stale_facts(facts, NOW)
@@ -79,6 +205,14 @@ def test_prune_keeps_seen_more_than_once():
     facts = {"f_1": kg.FactMeta(text="x", seen=2, status="active", last="2026-01-01")}
     kg.prune_stale_facts(facts, NOW)
     assert facts["f_1"].status == "active"
+
+
+def test_repeated_one_off_uses_same_clock_for_decay_and_archive():
+    fact = kg.FactMeta(text="uncorroborated", seen=1, conf=0.8, status="active",
+                       first="2026-01-01", last="2026-06-23")
+    assert kg.effective_confidence(fact, NOW) == kg.CONFIDENCE_FLOOR
+    kg.prune_stale_facts({"f_1": fact}, NOW)
+    assert fact.status == "archived" and fact.archived_reason == "stale"
 
 
 def test_prune_never_expires_a_user_correction():
@@ -123,6 +257,80 @@ def test_apply_new_then_bump_increments_seen_and_conf(tmp_path):
     fact = next(iter(p.facts.values()))
     assert fact.seen == 2 and abs(fact.conf - 1.0) < 1e-9  # 0.9 -> min(1.0, 1.0)
 
+
+def test_full_evidence_window_rolls_for_a_new_reference_without_recounting_it(tmp_path):
+    _setup(tmp_path)
+    refs = [f"gmail:{i:02d}" for i in range(64)]
+    update = {"person_updates": [{
+        "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
+        "facts": [{"fact": "CTO at Acme Corp", "memory_type": "milestone",
+                   "confidence": 0.6, "observed_date": "2026-06-23", "evidence_refs": refs}],
+    }]}
+    assert ku.apply(update, NOW)["applied"]["new"] == 1
+
+    fact = update["person_updates"][0]["facts"][0]
+    fact["evidence_refs"] = ["gmail:new-page"]
+    fact["observed_date"] = "2026-06-24"
+    later = NOW + timedelta(days=1)
+    assert ku.apply(update, later)["applied"]["confirmed"] == 1
+    assert ku.apply(update, later)["applied"]["confirmed"] == 0
+
+    person = kg.parse_person_file(open(kg.find_person_file(identifier="sarah@acme.com")).read())
+    stored = next(iter(person.facts.values()))
+    assert len(stored.evidence_refs) == 64
+    assert "gmail:new-page" in stored.evidence_refs
+    assert refs[0] not in stored.evidence_refs
+    assert stored.seen == 2 and stored.last == "2026-06-24" and stored.conf == pytest.approx(0.7)
+
+
+def test_saturated_window_does_not_reboost_evicted_old_evidence(tmp_path):
+    _setup(tmp_path)
+    first = [f"gmail:a:{i:02d}" for i in range(64)]
+    fact = {"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.6,
+            "observed_date": "2026-06-23", "evidence_refs": first}
+    update = {"person_updates": [{"person_name": "Sarah Chen",
+                                   "identifier": "sarah@acme.com", "facts": [fact]}]}
+    assert ku.apply(update, NOW)["applied"]["new"] == 1
+
+    fact["evidence_refs"] = [f"gmail:b:{i:02d}" for i in range(64)]
+    fact["observed_date"] = "2026-06-24"
+    assert ku.apply(update, NOW + timedelta(days=1))["applied"]["confirmed"] == 1
+    fact["evidence_refs"] = first
+    fact["observed_date"] = "2026-06-23"
+    assert ku.apply(update, NOW + timedelta(days=2))["applied"]["confirmed"] == 0
+
+    stored = kg.parse_person_file(open(kg.find_person_file(identifier="sarah@acme.com")).read())
+    stored_fact = next(iter(stored.facts.values()))
+    assert stored_fact.seen == 2 and stored_fact.last == "2026-06-24"
+    assert stored_fact.conf == pytest.approx(0.7)
+
+
+def test_saturated_window_needs_observed_chronology_not_a_later_processing_day(tmp_path):
+    _setup(tmp_path)
+    fact = {"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.6,
+            "evidence_refs": [f"gmail:a:{i:02d}" for i in range(64)]}
+    update = {"person_updates": [{"person_name": "Sarah Chen",
+                                   "identifier": "sarah@acme.com", "facts": [fact]}]}
+    assert ku.apply(update, NOW)["applied"]["new"] == 1
+    fact["evidence_refs"] = ["gmail:undated-new"]
+    assert ku.apply(update, NOW + timedelta(days=1))["applied"]["confirmed"] == 0
+
+    stored = kg.parse_person_file(open(kg.find_person_file(identifier="sarah@acme.com")).read())
+    stored_fact = next(iter(stored.facts.values()))
+    assert "gmail:undated-new" in stored_fact.evidence_refs
+    assert stored_fact.seen == 1 and stored_fact.last == "2026-06-23"
+    assert stored_fact.conf == pytest.approx(0.6)
+
+
+
+def test_replaying_one_oversized_evidence_page_never_confirms_itself(tmp_path):
+    _setup(tmp_path)
+    update = {"person_updates": [{"person_name": "Sarah Chen", "identifier": "sarah@acme.com",
+        "facts": [{"fact": "CTO at Acme Corp", "memory_type": "milestone",
+                   "evidence_refs": [f"gmail:{i:03d}" for i in range(100)]}]}]}
+    assert ku.apply(update, NOW)["applied"]["new"] == 1
+    for _ in range(3):
+        assert ku.apply(update, NOW)["applied"]["confirmed"] == 0
 
 def test_apply_low_confidence_fact_skipped(tmp_path):
     _setup(tmp_path)
@@ -902,3 +1110,42 @@ def test_the_cli_run_as_a_script_writes_relations(tmp_path):
     # and the relation really landed on disk, both ends
     blobs = " ".join(p.read_text() for p in (tmp_path / "knowledge" / "people").glob("*.md"))
     assert "introduced_by" in blobs and "introduced" in blobs
+
+
+def test_real_archive_and_correction_survive_research_and_history_replay(tmp_path):
+    import knowledge_edit as ke
+    _setup(tmp_path)
+    text = "Runs the platform org at Acme"
+    ku.apply(_dana_fact(text, "https://example.test/team"), NOW)
+    path = kg.find_person_file(identifier="dana@acme.com")
+    slug = os.path.basename(path)[:-3]
+    fid = next(iter(_dana().facts))
+    ke.op_archive(slug, fid, NOW)
+    for source in ("web_research", "brief_extraction", "observed_message"):
+        ku.apply(_dana_fact(text, "https://example.test/team", source), NOW)
+        assert _dana().facts[fid].status == "archived"
+        assert _dana().facts[fid].archived_reason == "user_archived"
+    ke.op_correct(slug, fid, "Now advises the growth team at Beta", NOW)
+    for source in ("web_research", "observed_message"):
+        ku.apply(_dana_fact(text, "https://example.test/team", source), NOW)
+    facts = _dana().facts
+    assert facts[fid].status == "archived" and facts[fid].archived_reason == "user_corrected"
+    assert [f.text for f in facts.values() if f.status == "active"] == ["Now advises the growth team at Beta"]
+
+
+def test_history_revives_an_exact_age_prune_but_not_a_user_archive(tmp_path):
+    import knowledge_edit as ke
+    _setup(tmp_path)
+    text = "Runs the platform org at Acme"
+    ku.apply(_dana_fact(text, "gmail:one", "observed_message"), NOW)
+    later = datetime(2026, 9, 16, 7)
+    ku.apply(_dana_fact("Enjoys sea kayaking", "gmail:two"), later)
+    fid = next(fid for fid, f in _dana().facts.items() if f.text == text)
+    assert _dana().facts[fid].archived_reason == "stale"
+    ku.apply(_dana_fact(text, "gmail:three", "observed_message"), later)
+    assert _dana().facts[fid].status == "active"
+    assert _dana().facts[fid].archived_reason is None
+    slug = os.path.basename(kg.find_person_file(identifier="dana@acme.com"))[:-3]
+    ke.op_archive(slug, fid, later)
+    ku.apply(_dana_fact(text, "gmail:four", "observed_message"), later)
+    assert _dana().facts[fid].status == "archived"

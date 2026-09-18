@@ -33,9 +33,14 @@ def log(rec: dict) -> dict:
     if rec.get("outcome") not in VALID:
         raise ValueError(f"invalid outcome: {rec.get('outcome')}")
     os.makedirs(os.path.dirname(_path()), exist_ok=True)
-    with jsonstore.lock(_path()):
+    def append():
         with open(_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
+    # jsonstore.lock is process-reentrant, so callers that already hold this ledger's lock take
+    # the same path as every other writer.  Keeping a lock-bypass flag would let a future caller
+    # append without exclusion merely by asserting that it had locked correctly.
+    with jsonstore.lock(_path()):
+        append()
     return {"logged": True, "outcome": rec["outcome"]}
 
 

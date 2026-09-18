@@ -25,7 +25,7 @@ Donation blast and social chatter.
 def test_quotes_provenance_and_renders_private_readable_cards(tmp_path):
     deck = v.build(BRIEF, preview=True)
     assert deck == v.build(BRIEF, preview=True)
-    assert [c['title'] for c in deck['cards']] == ['Needs you', 'Today', 'Your day', 'In the loop']
+    assert [c['title'] for c in deck['cards']] == ['Needs you', 'Today', 'Your day', 'Follow-ups']
     for card in deck['cards']:
         assert sum(len(b['text'].split()) for b in card['blocks']) <= v.MAX_WORDS
         for b in card['blocks']:
@@ -123,13 +123,49 @@ def test_vertical_centering_keeps_content_inside_header_and_footer():
         v._content_top(top, v.HEIGHT)
 
 
+@pytest.mark.parametrize('handled_count, fits', [(7, True), (8, False)])
+def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path, monkeypatch, handled_count, fits):
+    # A normal-length brief can overflow from names, line wrapping, and paragraph gaps,
+    # even with fewer than 200 words on each card. Keep fixed type and a real gap floor.
+    source = BRIEF.replace('Sam — Replied yesterday.', '\n'.join(
+        f'Alexandra Montgomery {i} - Confirmed the meeting with the project team and shared the notes for next week.'
+        for i in range(handled_count)) + '\nStill open\n'
+        'Jordan Smith - Please review the invitation and reply before Friday.\n'
+        '3 other open loops - see /app#loops')
+    deck = v.build(source)
+    before = json.dumps(deck, sort_keys=True)
+    assert len(deck['cards'][-1]['blocks']) == handled_count + 2
+    from PIL import ImageDraw
+    draw_text = ImageDraw.ImageDraw.text
+    body_sizes = set()
+
+    def record_text(self, xy, text, *args, **kwargs):
+        face = kwargs.get('font')
+        if face is not None and 238 < xy[1] < v.HEIGHT - 106:
+            body_sizes.add(face.size)
+        return draw_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record_text)
+    if fits:
+        manifest = v.render(deck, tmp_path)
+        assert len(manifest['images']) == 4
+        assert manifest['cards'] == deck['cards']
+        assert body_sizes <= {32, 42}
+        assert 42 in body_sizes
+    else:
+        with pytest.raises(ValueError, match='readable height'):
+            v.render(deck, tmp_path)
+        assert not list(tmp_path.rglob('manifest.json'))
+    assert json.dumps(deck, sort_keys=True) == before
+
+
 def test_agenda_locations_and_dash_free_presentation(tmp_path):
     source = BRIEF.replace('12:00 PM — Lunch with Alex', '12:00 PM — Lunch with Alex | Location: 535 Mission St, Suite 800')
     deck = v.build(source, preview=True)
     assert '—' not in deck['summary']
     assert '—' in deck['full_text']
-    assert v._agenda_parts('12:00 PM — Lunch with Alex | Location: 535 Mission St, Suite 800') == ('12:00 PM', 'Lunch with Alex', '535 Mission St, Suite 800')
-    assert v._agenda_parts('10:00 AM — Team meeting') == ('10:00 AM', 'Team meeting', '')
+    assert v._agenda_parts('12:00 PM — Lunch with Alex | Location: 535 Mission St, Suite 800') == ('', '12:00 PM', 'Lunch with Alex', '535 Mission St, Suite 800')
+    assert v._agenda_parts('10:00 AM — Team meeting') == ('', '10:00 AM', 'Team meeting', '')
     assert v._display_text('Alex — Reply before lunch.', 'brief') == 'Alex: Reply before lunch.'
     assert '—' not in v._display_text('A long-term plan—already discussed.')
     assert len(v.render(deck, tmp_path)['images']) == 4
@@ -164,7 +200,9 @@ Two newsletters.
     assert len(v.render(linked, tmp_path)['images']) == 4
     footer = v.build(source.replace('Sam - Reply to the invitation by tomorrow.',
                                     '3 other open loops - see /app#loops'))
-    assert footer and '/app#loops' in footer['summary']
+    assert footer and '/app#loops' not in footer['summary']
+    assert any("Ask me what's still open." in v._display_text(b['text'])
+               for c in footer['cards'] for b in c['blocks'])
     assert len(v.render(footer, tmp_path)['images']) == 4
     assert v.build(source.replace('Sam - Reply to the invitation by tomorrow.',
                                  'Sam - Reply at https://example.com/' + 'x' * 1000)) is None
@@ -175,3 +213,118 @@ def test_companion_links_exclude_prose_punctuation_but_keep_balanced_parentheses
                          'Read https://example.com/wiki/Example_(topic).', normalize_style=False)
     assert v._companion_links(text) == ['https://example.com/invite',
                                        'https://example.com/wiki/Example_(topic)']
+
+
+@pytest.mark.parametrize('source, expected', [
+    ('Thu Sep 17 2:00 PM: Investment Team Meeting', ('Thu Sep 17', '2:00 PM', 'Investment Team Meeting', '')),
+    ('Thursday, September 17 6:00 PM: whim x hwn party (535 Mission St)',
+     ('Thursday, September 17', '6:00 PM', 'whim x hwn party', '535 Mission St')),
+    ('Tomorrow 2 PM - Investment Team Meeting', ('Tomorrow', '2 PM', 'Investment Team Meeting', '')),
+    ('All day - OOO', ('', 'All day', 'OOO', '')),
+    ('12:00 PM - Lunch (Alex)', ('', '12:00 PM', 'Lunch (Alex)', '')),
+])
+def test_calendar_formats_keep_date_time_attendees_and_exact_address(source, expected):
+    assert v._agenda_parts(source) == expected
+
+
+def test_real_calendar_and_followups_presentation(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    source = BRIEF.replace('10:00 AM — Team meeting\n12:00 PM — Lunch with Alex',
+        'Calendar preview - open Calendar for the full schedule.\n'
+        'Calendar preview (open Calendar for the full schedule):\n'
+        'Calendar preview: open Calendar for the full schedule.\n'
+        'Thu Sep 17 2:00 PM: Investment Team Meeting\n'
+        'Thu Sep 17 6:00 PM: whim x hwn party (535 Mission St)\n'
+        'Fri Sep 18 2:00 PM: David & Bri Wedding')
+    source += '\nStill open\nJames Raybould - Send the lunch invitation for September 30.\n3 other open loops - see /app#loops'
+    rendered = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        rendered.append((text, xy, kwargs.get('fill')))
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    deck = v.build(source)
+    assert deck['summary'] == "Good morning. Here's your morning brief for September 14."
+    v.render(deck, tmp_path)
+    assert ('2:00 PM', '#0066CC') in [(t, color) for t, _, color in rendered]
+    assert ('6:00 PM', '#0066CC') in [(t, color) for t, _, color in rendered]
+    assert sum(t == 'Thu Sep 17' for t, _, _ in rendered) == 1
+    assert any(t == 'Fri Sep 18' for t, _, _ in rendered)
+    assert any(t == '535 Mission St' for t, _, _ in rendered)
+    assert not any('/app#loops' in t or 'Calendar preview' in t or t == 'In the loop' for t, _, _ in rendered)
+    text = ' '.join(t for t, _, _ in rendered)
+    assert '3 other open loops' in text
+    assert 'Send the lunch invitation for September 30.' in text
+    assert text.index('Still open') < text.index('Handled')
+    assert [xy for t, xy, _ in rendered if t in ('Needs you', 'Today', 'Your day', 'Follow-ups')] == [(64, 108)] * 4
+
+
+def test_day_group_survives_gallery_splitting(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    source = 'Good evening - Wednesday, September 16\nComing Up\nTomorrow\n' + '\n'.join(
+        f'{hour}:00 PM - Meeting {hour}' for hour in range(1, 5))
+    deck = v.build(source)
+    assert all(c['blocks'][0]['day'] == 'Tomorrow' for c in deck['cards'])
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        drawn.append(text)
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(deck, tmp_path)
+    assert drawn.count('Tomorrow') == 4
+
+
+def test_source_warning_before_sections_survives_in_caption():
+    warning = 'Your Mac is offline; local messages are from yesterday.'
+    deck = v.build(BRIEF.replace('Needs Attention Now', warning + '\nNeeds Attention Now'))
+    assert warning in deck['summary']
+
+
+def test_schedule_overflow_cannot_silently_drop_the_last_event():
+    source = BRIEF.replace('12:00 PM — Lunch with Alex', '12:00 PM - ' + 'meeting ' * (v.MAX_WORDS + 1))
+    assert v.build(source) is None
+
+
+@pytest.mark.parametrize('marker', ['*', '**'])
+def test_original_name_emphasis_survives_without_a_separator(tmp_path, monkeypatch, marker):
+    from PIL import ImageDraw
+    source = BRIEF.replace('Sam — Replied yesterday.',
+        f'{marker}Wesley Chan{marker}<!--id:w@example.com|ch:email--> has not replied to your forward.')
+    deck = v.build(source)
+    block = deck['cards'][-1]['blocks'][0]
+    assert block['emphasis_end'] == len('Wesley Chan')
+    assert block['text'] == 'Wesley Chan has not replied to your forward.'
+    words = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        words.append((text, kwargs.get('font')))
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(deck, tmp_path)
+    faces = {text: face for text, face in words if text in ('Wesley', 'Chan', 'has')}
+    assert faces['Wesley'] is faces['Chan']
+    assert faces['Wesley'] is not faces['has']
+
+
+def test_birthday_cannot_swallow_the_following_meetings_day(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    source = BRIEF.replace('10:00 AM — Team meeting\n12:00 PM — Lunch with Alex',
+        'Tomorrow\n🎂 Alex - birthday in 1 day\n12:00 PM - Lunch with Alex')
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        drawn.append(text)
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(v.build(source), tmp_path)
+    assert 'Tomorrow · Birthdays in 1 day' in drawn
+    assert '12:00 PM' in drawn

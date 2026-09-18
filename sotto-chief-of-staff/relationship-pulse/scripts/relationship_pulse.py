@@ -32,17 +32,18 @@ if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
 from email.utils import getaddresses  # noqa: E402
 from textutil import _arr, _is_likely_automated, _looks_like_phone_number, _s  # noqa: E402
-from timeutil import _parse_ts  # noqa: E402
+from timeutil import _parse_ts, configured_user_email  # noqa: E402
 from render_local import _is_sent_email, resolve_contact_names  # noqa: E402
 from chatfmt import to_chat  # noqa: E402
-from relationship_importance import activity_evidence, classify  # noqa: E402
+from relationship_importance import (activity_evidence, attention_tiebreak, classify,
+                                     engagement_signals, meaningful_relationship,
+                                     relationship_meeting_attendees)  # noqa: E402
 
 WAITING_MIN_DAYS = 3       # relationship_analytics.rs:469
 WAITING_MAX_DAYS = 14
 LOSING_TOUCH_DAYS = 14     # relationship_analytics.rs:494
 MIN_INTERACTIONS_FOR_TREND = 8   # need 8 dates → 7 intervals (rs:1149-1151)
 MAX_QUEUE = 20
-LAPSED_MIN_INTERACTIONS = 5      # "previously regular" = at least this many touches in a past window
 MAX_LAPSED = 10
 HISTORY_MAX_AGE_DAYS = 365       # drop history entries silent for over a year (not a relationship)
 
@@ -66,15 +67,15 @@ def _load_history() -> dict:
         return {}
 
 
-# ── Knowledge-graph importance weighting ──────────────────────────────────────
-# The Mac app ranked the attention queue purely on interaction volume. Here we also weight by how
-# much the user *tracks* a person in the knowledge graph: someone with a people/*.md file is someone
-# worth remembering, and a richer file (facts, talking points, a known company/title) means a more
-# important relationship. So a graph-flagged person going quiet outranks a chatty-but-shallow contact.
-_KG = None  # None=unloaded, False=unavailable, module=loaded
+def _ts(s: str):
+    return _parse_ts(_s(s))
+
+
+_KG = None
 
 
 def _knowledge():
+    """Graph identity/context is useful; it never contributes weight or importance."""
     global _KG
     if _KG is None:
         try:
@@ -86,44 +87,20 @@ def _knowledge():
     return _KG or None
 
 
-def _graph_lookup(name: str, cid: str = "", index=None):
-    """(weight, context) for a person from the knowledge graph. Untracked → (1.0, None), so the
-    weighting is a pure enhancement that degrades to the old volume-only ranking when the graph is
-    empty or unreadable. `context` carries grounded material (company/title/a talking point/a fact)
-    the skill can use to draft a reconnect note WITHOUT improvising."""
+def _graph_context(name: str, cid: str = "", index=None):
     kg = _knowledge()
-    if kg is None:
-        return 1.0, None
+    if not kg:
+        return None
     try:
-        # canonical-id store: files are keyed by cid, so resolve through the identity index
-        # (name form here comes from message resolution — the same Contacts name the store saw).
         path = kg.find_person_file(cid=cid, index=index) if cid else None
         path = path or kg.find_person_file(name=name, index=index)
-        if not path or not os.path.exists(path):
-            return 1.0, None
+        if not path:
+            return None
         with open(path, encoding="utf-8") as f:
-            p = kg.parse_person_file(f.read())
-        active = kg.sorted_active_facts(p.facts)
-        weight = 1.5                          # tracked at all → matters more than a random contact
-        weight += min(len(active), 8) * 0.15  # depth of what we know
-        if p.talking_points:
-            weight += 0.3
-        if p.company or p.title:
-            weight += 0.2
-        ctx = {
-            "company": _s(p.company),
-            "title": _s(p.title),
-            "talking_point": _s(p.talking_points[0]) if p.talking_points else "",
-            "fact": _s(active[0][1].text) if active else "",
-            "summary": _s(p.summary),
-        }
-        return round(weight, 3), {k: v for k, v in ctx.items() if v}
+            person = kg.parse_person_file(f.read())
+        return {k: v for k, v in {"company": _s(person.company), "summary": _s(person.summary)}.items() if v}
     except Exception:
-        return 1.0, None
-
-
-def _ts(s: str):
-    return _parse_ts(_s(s))
+        return None
 
 
 def _interactions_by_contact(local: dict, index=None) -> dict:
@@ -136,7 +113,7 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
     can finally say "last texted yesterday, last emailed never"."""
     people: dict = {}
 
-    def add(name, ts, from_me, channel, cid=""):
+    def add(name, ts, from_me, channel, cid="", conversation_id="", native_id="", engaged=True):
         nm = _s(name).strip()
         # "Unknown" is the resolver's sentinel — merging every unresolved sender into one fake
         # contact would fabricate cadence/waiting signals for a person who doesn't exist.
@@ -150,11 +127,18 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         key = _s(cid).strip() or nm
         p = people.setdefault(key, {"name": nm, "cid": _s(cid).strip(),
                                     "dates": [], "from_me": [], "from_them": [],
-                                    "by_channel": {}})
+                                    "by_channel": {}, "events": [], "engaged_dates": [],
+                                    "engaged_from_me": [], "engaged_from_them": []})
         if _s(cid).strip() and not p["cid"]:
             p["cid"] = _s(cid).strip()
         p["dates"].append(d)
         (p["from_me"] if from_me else p["from_them"]).append(d)
+        if engaged:
+            p["engaged_dates"].append(d)
+            (p["engaged_from_me"] if from_me else p["engaged_from_them"]).append(d)
+        if conversation_id:
+            p["events"].append({"at": d, "from_me": bool(from_me), "channel": channel,
+                                "conversation_id": _s(conversation_id), "native_id": _s(native_id)})
         prev = p["by_channel"].get(channel)
         if prev is None or d > prev:
             p["by_channel"][channel] = d
@@ -163,17 +147,25 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         if m.get("is_group_chat"):
             continue
         add(m.get("resolved_name"), m.get("timestamp"), m.get("is_from_me"),
-            "imessage", m.get("canonical_id"))
+            "imessage", m.get("canonical_id"),
+            m.get("chat_identifier") or m.get("chat_id") or m.get("handle"),
+            m.get("message_id") or m.get("guid") or m.get("id"))
     for m in _arr(local, "whatsapp"):
         if m.get("is_group_chat"):
             continue
         nm = _s(m.get("resolved_name")) or _s(m.get("partner_name"))
-        add(nm, m.get("timestamp"), m.get("is_from_me"), "whatsapp", m.get("canonical_id"))
-    for c in _arr(local, "missed_calls") + _arr(local, "recent_calls"):
-        # Processed call dicts carry direction: "outgoing"|"incoming" (_process_recent_calls),
-        # not is_outgoing — missed calls have no direction and correctly count as inbound.
+        add(nm, m.get("timestamp"), m.get("is_from_me"), "whatsapp", m.get("canonical_id"),
+            m.get("chat_id") or m.get("partner_id"), m.get("message_id") or m.get("id"))
+    for c in _arr(local, "missed_calls"):
+        add(c.get("name"), c.get("timestamp"), False, "calls", c.get("canonical_id"), engaged=False)
+    for c in _arr(local, "recent_calls"):
+        # Processed calls carry direction, while duration proves the call connected.
+        try:
+            connected = bool(c.get("is_answered")) or float(c.get("duration_seconds") or 0) > 0
+        except (TypeError, ValueError):
+            connected = False
         add(c.get("name"), c.get("timestamp"), c.get("direction") == "outgoing",
-            "calls", c.get("canonical_id"))
+            "calls", c.get("canonical_id"), engaged=connected)
     # Email is a relationship channel. A mail you sent counts as a touch to each recipient; a mail
     # you received counts as a touch from its sender — for people you KNOW (contacts or graph),
     # which is the same known-contact gate the message lanes apply. Before this the pulse was
@@ -193,7 +185,8 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
             who = known.get(addr)
             if not who:
                 continue
-            add(who["name"], m.get("date") or m.get("timestamp"), sent, "email", who["cid"])
+            add(who["name"], m.get("date") or m.get("timestamp"), sent, "email", who["cid"],
+                m.get("threadId") or m.get("thread_id"), m.get("id") or m.get("message_id"))
     # A channel that resolves a name but not an id (processed calls) must not split a person in
     # two: fold each name-keyed entry into the cid-keyed entry carrying the same display name —
     # exactly what the old all-name keying did implicitly.
@@ -203,6 +196,10 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         dst["dates"] += src["dates"]
         dst["from_me"] += src["from_me"]
         dst["from_them"] += src["from_them"]
+        dst["events"] += src["events"]
+        dst["engaged_dates"] += src["engaged_dates"]
+        dst["engaged_from_me"] += src["engaged_from_me"]
+        dst["engaged_from_them"] += src["engaged_from_them"]
         for ch, d in src["by_channel"].items():
             if ch not in dst["by_channel"] or d > dst["by_channel"][ch]:
                 dst["by_channel"][ch] = d
@@ -236,18 +233,41 @@ def _email_identities(local: dict, index=None) -> dict:
             if e:
                 out.setdefault(_s(e).lower().strip(), {"name": nm, "cid": _s(c.get("canonical_id"))})
     kg = _knowledge()
-    if kg is not None:
+    if kg:
         try:
             idx = index if index is not None else kg.build_people_index()
-            for key, path in (idx.get("by_identifier") or {}).items():
-                if "@" not in key or key in out:
+            for identifier, path in (idx.get("by_identifier") or {}).items():
+                if "@" not in identifier or identifier in out:
                     continue
                 with open(path, encoding="utf-8") as f:
-                    p = kg.parse_person_file(f.read())
-                if _s(p.name).strip():
-                    out[key] = {"name": _s(p.name).strip(), "cid": _s(p.canonical_id)}
-        except Exception:  # noqa: BLE001 — the graph is a bonus here, never a failure
+                    person = kg.parse_person_file(f.read())
+                if _s(person.name):
+                    out[identifier] = {"name": _s(person.name), "cid": _s(person.canonical_id)}
+        except Exception:
             pass
+    return out
+
+
+def _held_meetings(local: dict, now: datetime, index=None) -> dict:
+    """Ended Granola meetings by known attendee; calendar invitations alone are not attendance."""
+    known, out = _email_identities(local, index), {}
+    now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    # The canonical chain (env override, else the connected Google account) — the same one
+    # granola_graph excludes the owner with. Reading the env var alone left the owner in every
+    # 1:1 whenever it was unset, which is the normal managed case, so no meeting ever counted.
+    user_email = configured_user_email()
+    for meeting in _arr(local, "granola_meetings"):
+        ended = _ts(meeting.get("end"))
+        if ended and ended.tzinfo is None:
+            ended = ended.replace(tzinfo=timezone.utc)
+        if not meeting.get("meeting_id") or not ended or ended > now:
+            continue
+        for email in relationship_meeting_attendees(meeting.get("attendee_emails"), user_email):
+            who = known.get(_s(email).lower().strip())
+            if who:
+                key = who["cid"] or who["name"]
+                row = out.setdefault(key, {"name": who["name"], "cid": who["cid"], "dates": []})
+                row["dates"].append(ended)
     return out
 
 
@@ -273,14 +293,18 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
     now = now or datetime.now(timezone.utc)
     history = history or {}
     local = resolve_contact_names(local)
-    # One snapshot for this calculation: rebuilding every person's graph index makes
-    # a six-week window quadratic in the size of the saved address book.
     try:
         kg = _knowledge()
-        index = kg.build_people_index() if kg is not None else {}
+        index = kg.build_people_index() if kg else {}
     except Exception:
         index = {}
     people = _interactions_by_contact(local, index)
+    meetings = _held_meetings(local, now, index)
+    for key, held in meetings.items():
+        person = people.setdefault(key, {"name": held["name"], "cid": held["cid"], "dates": [],
+            "from_me": [], "from_them": [], "by_channel": {}, "events": [], "engaged_dates": [],
+            "engaged_from_me": [], "engaged_from_them": []})
+        person["dates"].extend(held["dates"])
 
     # Empty/degraded snapshot guard: a window with NO interactions at all means the read failed or
     # the Bridge was offline, not that the user ghosted everyone. Emitting lapsed entries here would
@@ -300,25 +324,29 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         days_since = int((now - last).total_seconds() // 86400)
         last_them = max(p["from_them"]) if p["from_them"] else None
         last_you = max(p["from_me"]) if p["from_me"] else None
-        weight, gctx = _graph_lookup(p["name"], p["cid"], index)
+        prev = history.get(key, {}) if isinstance(history.get(key), dict) else {}
+        person_evidence = {"dates": p["engaged_dates"], "from_me": p["engaged_from_me"],
+            "from_them": p["engaged_from_them"],
+            "held_meetings": (meetings.get(key) or {}).get("dates", [])}
+        evidence = activity_evidence(person_evidence, prev.get("importance_evidence"), now)
+        engagement = engagement_signals(p, prev.get("engagement"), now)
+        context = _graph_context(p["name"], p["cid"], index)
         profiles.append({
             "key": key, "name": p["name"], "cid": p["cid"],
             "interactions": len(p["dates"]), "days_since": days_since,
             "last_from_them": last_them, "last_from_you": last_you,
             "trend": _cadence_trend(p["dates"]),
-            "by_channel": p["by_channel"],
-            "graph_weight": weight, "graph_context": gctx,
+            "by_channel": p["by_channel"], "importance_evidence": evidence,
+            "importance": classify(evidence, now), "engagement": engagement,
+            "graph_context": context,
         })
-
-    # Strength gate: historically meaningful = interaction count at/above the median (bypass if
-    # the population is tiny — percentiles are unstable, rs:448-456).
-    counts = sorted(pp["interactions"] for pp in profiles)
-    median = counts[len(counts) // 2] if counts else 0
-    strength_gate = 0 if len(profiles) < 20 else median
 
     queue = []
     for pp in profiles:
-        w, gctx = pp["graph_weight"], pp["graph_context"]
+        evidence = pp["importance_evidence"]
+        meaningful = meaningful_relationship({
+            "sent_days": people[pp["key"]]["engaged_from_me"],
+            "received_days": people[pp["key"]]["engaged_from_them"]})
         # waiting_on_you: they sent last and you haven't answered (3-14 days)
         lt, ly = pp["last_from_them"], pp["last_from_you"]
         if lt is not None and (ly is None or lt > ly):
@@ -326,17 +354,19 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
             if WAITING_MIN_DAYS <= days <= WAITING_MAX_DAYS:
                 e = {"display_name": pp["name"], "queue_type": "waiting_on_you",
                      "reason": f"Unanswered {days} days" if days >= 7 else f"Waiting {days} days for reply",
-                     "days_waiting": days, "priority": round(pp["interactions"] * min(days, 7) * w, 2)}
-                if gctx:
-                    e["graph_context"] = gctx
+                     "days_waiting": days, "priority": days * 10 + attention_tiebreak(pp["engagement"], now),
+                     "engagement": pp["engagement"]}
+                if pp["graph_context"]:
+                    e["graph_context"] = pp["graph_context"]
                 queue.append(e)
         # losing_touch: drifting apart, historically strong, 14d+ silent
-        if pp["trend"] == "increasing" and pp["interactions"] >= strength_gate and pp["days_since"] >= LOSING_TOUCH_DAYS:
+        if pp["trend"] == "increasing" and meaningful and pp["days_since"] >= LOSING_TOUCH_DAYS:
             e = {"display_name": pp["name"], "queue_type": "losing_touch",
                  "reason": f"Communication declining — last spoke {pp['days_since']} days ago",
-                 "days_waiting": 0, "priority": round(pp["interactions"] * w, 2)}
-            if gctx:
-                e["graph_context"] = gctx
+                 "days_waiting": 0, "priority": pp["days_since"] * 10 + attention_tiebreak(pp["engagement"], now),
+                 "engagement": pp["engagement"]}
+            if pp["graph_context"]:
+                e["graph_context"] = pp["graph_context"]
             queue.append(e)
 
     queue.sort(key=lambda q: q["priority"], reverse=True)
@@ -352,18 +382,21 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         display = _s((h or {}).get("name")) or hkey    # pre-identity entries were keyed by name
         if not isinstance(h, dict) or hkey in current_keys or display in current_names:
             continue   # present this window — under this key, or migrated to a cid key below
-        if int(h.get("interactions") or 0) < LAPSED_MIN_INTERACTIONS:
-            continue   # a one-off back then isn't a lapsed relationship now
+        evidence = h.get("importance_evidence") or {}
+        meaningful = meaningful_relationship(evidence)
+        if not meaningful:
+            continue
         last_known = _s(h.get("last_contact"))
-        weight, gctx = _graph_lookup(display, hkey if hkey != display else "", index)
+        context = _graph_context(display, hkey if hkey != display else "", index)
         reason = "You've fully lost touch — no contact in this whole window"
         if last_known:
             reason += f" (last contact {last_known})"
         e = {"display_name": display, "queue_type": "lapsed", "reason": reason,
              "last_contact": last_known, "days_waiting": 0,
-             "priority": round(int(h.get("interactions") or 0) * weight, 2)}
-        if gctx:
-            e["graph_context"] = gctx
+             "priority": attention_tiebreak(h.get("engagement"), now),
+             "engagement": h.get("engagement") or {}}
+        if context:
+            e["graph_context"] = context
         lapsed.append(e)
     lapsed.sort(key=lambda q: q["priority"], reverse=True)
     lapsed = lapsed[:MAX_LAPSED]
@@ -407,7 +440,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         except (TypeError, ValueError):
             prev_n = 0
         # Keep the PEAK interaction count: a 20-interaction regular who sends one ping must not
-        # reset to 1 (they could then never clear the lapsed >= LAPSED_MIN_INTERACTIONS gate).
+        # reset to 1, which would discard the history needed to recognize a lapsed relationship.
         channels = {}
         for ch, prev_day in ((prev.get("channels") or {}) if isinstance(prev.get("channels"), dict) else {}).items():
             channels[ch] = _s(prev_day)
@@ -417,9 +450,9 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
                 channels[ch] = day
         merged[pp["key"]] = {"name": pp["name"], "last_contact": last.strftime("%Y-%m-%d"),
                              "interactions": max(pp["interactions"], prev_n), "trend": pp["trend"],
-                             "channels": channels,
-                             "importance_evidence": activity_evidence(people[pp["key"]], prev.get("importance_evidence"), now)}
-        merged[pp["key"]]["importance"] = classify(merged[pp["key"]]["importance_evidence"], now)
+                             "channels": channels, "importance_evidence": pp["importance_evidence"],
+                             "engagement": pp["engagement"]}
+        merged[pp["key"]]["importance"] = pp["importance"]
 
     return {"attention_queue": queue + lapsed, "relationship_insights": insights,
             "lapsed": lapsed, "history": merged,
@@ -438,9 +471,9 @@ def _render(queue: list, lapsed: list | None = None) -> str:
         return "Relationships look healthy this week — no one's waiting on you, no one's gone quiet."
     def _line(q):
         who = q["display_name"]
-        co = _s((q.get("graph_context") or {}).get("company"))
-        if co:
-            who = f"{who} ({co})"
+        company = _s((q.get("graph_context") or {}).get("company"))
+        if company:
+            who = f"{who} ({company})"
         return f"- **{who}** — {q['reason'].lower()}"
 
     lines = []
@@ -468,12 +501,20 @@ def _persist_state(result: dict, history_only=False, now=None):
             old = previous.get(key, {})
             left, right = old.get('importance_evidence', {}), row.get('importance_evidence', {})
             evidence = activity_evidence({'dates': right.get('active_days', []),
-                'from_me': right.get('sent_days', []), 'from_them': right.get('received_days', [])}, left, now)
+                'from_me': right.get('sent_days', []), 'from_them': right.get('received_days', []),
+                'held_meetings': right.get('held_meeting_days', [])}, left, now)
             channels = dict(old.get('channels') or {})
             for channel, date in (row.get('channels') or {}).items():
                 channels[channel] = max(channels.get(channel, ''), date)
-            previous[key] = {**row, 'last_contact': max(old.get('last_contact', ''), row.get('last_contact', '')),
-                'channels': channels, 'importance_evidence': evidence, 'importance': classify(evidence, now)}
+            old_engagement = old.get('engagement') if isinstance(old.get('engagement'), dict) else {}
+            row_engagement = row.get('engagement') if isinstance(row.get('engagement'), dict) else {}
+            merged_engagement = {**old_engagement, **row_engagement,
+                'reply_samples': list(old_engagement.get('reply_samples') or [])
+                                 + list(row_engagement.get('reply_samples') or [])}
+            previous[key] = {**old, **row,
+                'last_contact': max(old.get('last_contact', ''), row.get('last_contact', '')),
+                'channels': channels, 'importance_evidence': evidence, 'importance': classify(evidence, now),
+                'engagement': engagement_signals({}, merged_engagement, now)}
             previous[key]['interactions'] = max(int(old.get('interactions') or 0), int(row.get('interactions') or 0))
             if history_only and old:
                 previous[key]['trend'] = old.get('trend', row.get('trend'))

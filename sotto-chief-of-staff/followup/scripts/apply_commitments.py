@@ -15,8 +15,9 @@ Anchoring / dedupe:
   - the extractor may point at an EXISTING open-loop anchor when the current source is clearly the
     same obligation. That bounded LLM judgment is validated against the live ledger and direction;
     an absent, invented or direction-inverted anchor is ignored and a new occurrence is written.
-  - an existing ACTIVE item just gets its times_surfaced bumped; a TERMINAL (resolved/dismissed)
-    item is left alone — we never resurrect something the user already closed.
+  - an existing ACTIVE item is reused without counting a surfacing; only an accepted delivery can
+    increment that provenance. A TERMINAL (resolved/dismissed) item is left alone — we never
+    resurrect something the user already closed.
 
 Direction: the user's own commitments become `follow_up` (you owe); another attendee's become
 `waiting_on` (they owe you) — exactly the split loops_query.py surfaces. Writes files only —
@@ -297,7 +298,6 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
                 if _s(existing.get("status", "open")) in cr.TERMINAL:
                     skipped_terminal += 1    # the user already closed this — never resurrect it
                     continue
-                existing["times_surfaced"] = int(existing.get("times_surfaced", 1)) + 1
                 _attach_source(existing, _source_ref(raw))
                 # A semantic merge must not weaken the source-backed commitment's close policy.
                 # Otherwise the broad email loop we merged into could age out or auto-close on a
@@ -310,7 +310,7 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
                 "anchor_key": ak, "action_type": a.get("action_type"), "channel": a.get("channel"),
                 "contact_name": a.get("contact_name"), "contact_identifier": a.get("contact_identifier"),
                 "canonical_id": a.get("canonical_id"), "status": "open",
-                "created_at": a.get("created_at") or today, "times_surfaced": 1,
+                "created_at": a.get("created_at") or today,
                 "summary": a.get("summary", ""), "ask": a.get("ask"),
                 "meeting_time": a.get("meeting_time"), "deadline": a.get("deadline"),
                 "source_thread_id": a.get("source_thread_id"),

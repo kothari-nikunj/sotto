@@ -120,3 +120,44 @@ def test_main_reads_the_gathered_file(tmp_path, monkeypatch, capsys):
     gg.main()
     assert json.loads(capsys.readouterr().out) == {
         "meetings": 1, "people": 1, "facts": 1, "skipped_large": 0}
+
+
+def test_run_persists_held_meeting_evidence_without_rewriting_attention_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@mine.com")
+    state_path = tmp_path / "knowledge/relationship_state.json"
+    state_path.parent.mkdir(parents=True)
+    queue = [{"display_name": "Keep Me", "queue_type": "waiting_on_you"}]
+    state_path.write_text(json.dumps({"attention_queue": queue, "relationship_insights": [
+        {"display_name": "Keep Me", "insight_type": "gone_silent"}], "history": {}}))
+    meetings = []
+    for index, day in enumerate(("2026-09-02", "2026-09-09", "2026-09-16"), 1):
+        meeting = _meeting(["priya@acmecorp.com"], date=day, mid=f"m{index}")
+        meeting["end"] = day + "T18:00:00+00:00"
+        meetings.append(meeting)
+    payload = {"meetings": meetings}
+    gg.run(payload)
+    gg.run(payload)  # replay must not increase held-meeting evidence
+    state = json.loads(state_path.read_text())
+    priya = next(row for row in state["history"].values() if row["name"] == "Priya")
+    assert priya["importance"]["tier"] == "regular"
+    assert priya["importance_evidence"]["held_meeting_days"] == [
+        "2026-09-02", "2026-09-09", "2026-09-16"]
+    assert state["attention_queue"] == queue
+    assert state["relationship_insights"] == [
+        {"display_name": "Keep Me", "insight_type": "gone_silent"}]
+
+
+def test_run_does_not_persist_owner_omitted_group_as_held_relationship_evidence(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@mine.com")
+    state_path = tmp_path / "knowledge/relationship_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"attention_queue": [], "relationship_insights": [],
+                                      "history": {}}))
+    meeting = _meeting(["priya@acmecorp.com", "sam@othercorp.com"],
+                       date="2026-09-16", mid="standup")
+    meeting["end"] = "2026-09-16T18:00:00+00:00"
+    gg.run({"meetings": [meeting]})
+    assert json.loads(state_path.read_text())["history"] == {}

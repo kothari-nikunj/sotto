@@ -11,12 +11,14 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 import knowledge as kg
 import knowledge_update as ku
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 QUERY = os.path.join(ROOT, "_shared", "knowledge", "knowledge_query.py")
+EDIT = os.path.join(ROOT, "_shared", "knowledge", "knowledge_edit.py")
 
 
 def _run(tmp_path, *args):
@@ -29,6 +31,13 @@ def _run(tmp_path, *args):
 def _cal(tmp_path, *emails):
     p = tmp_path / "cal.json"
     p.write_text(json.dumps([{"summary": "Sync", "attendees": [{"email": e} for e in emails]}]))
+    return str(p)
+
+
+def _topic_cal(tmp_path, email, summary, description):
+    p = tmp_path / "topic-cal.json"
+    p.write_text(json.dumps([{"summary": summary, "description": description,
+                              "attendees": [{"email": email}]}]))
     return str(p)
 
 
@@ -189,3 +198,80 @@ def test_active_loop_participant_packs_without_new_messages(tmp_path, monkeypatc
     loops.write_text(json.dumps({'items': [{'status': 'waiting', 'contact_identifier': 'waiting@example.com'}]}))
     out = _run(tmp_path, '--loops', str(loops), '--gmail', _gmail(tmp_path, 'unrelated@example.com'))
     assert 'ocean research' in '\n'.join(out['person_knowledge'].values())
+
+
+def test_calendar_topic_keeps_older_relevant_memory_inside_compact_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    now = datetime(2026, 9, 7, 12, 0, 0)
+    facts = {
+        f'f_recent_{i}': kg.FactMeta(text=f'Recent unrelated operating note number {i}',
+            type='context', conf=.95, first='2026-09-06', last='2026-09-06')
+        for i in range(8)
+    }
+    facts['f_topic'] = kg.FactMeta(text='Previously evaluated pediatric clinic procurement pilots',
+        type='context', conf=.7, first='2026-01-01', last='2026-01-01')
+    facts['f_owner'] = kg.FactMeta(text='User corrected: Alex advises this company',
+        type='context', conf=1.0, source='user_edit', first='2026-02-01', last='2026-02-01')
+    facts['f_archived'] = kg.FactMeta(text='Pediatric clinic claim that was corrected',
+        type='context', conf=1.0, status='archived', first='2026-08-01', last='2026-08-01')
+    p = kg.PersonFile(canonical_id='c_123456789abc', name='Alex',
+                      identifiers=['alex@example.com'], facts=facts)
+    kg.write_person_file(os.path.join(kg.people_dir(), 'c_123456789abc.md'), p, now)
+
+    ordinary = _run(tmp_path, '--calendar', _cal(tmp_path, 'alex@example.com'))
+    ordinary_text = next(iter(ordinary['person_knowledge'].values()))
+    assert 'pediatric clinic procurement' not in ordinary_text
+
+    focused = _run(tmp_path, '--calendar', _topic_cal(
+        tmp_path, 'alex@example.com', 'Pediatric clinic procurement', 'Review pilot rollout'))
+    focused_text = next(iter(focused['person_knowledge'].values()))
+    assert 'pediatric clinic procurement pilots' in focused_text
+    assert 'User corrected: Alex advises this company' in focused_text
+    assert 'claim that was corrected' not in focused_text
+
+
+def test_editable_person_exposes_bounded_active_ids_for_exact_correction(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ku.apply({'person_updates': [{'person_name': 'Peyton Lewis', 'identifier': 'peyton@example.com',
+        'facts': [{'fact': 'Peyton founded Alive.', 'memory_type': 'context', 'confidence': .9}]}]})
+    person = _run(tmp_path, '--person', 'peyton@example.com', '--editable-person')
+    row = next(iter(person.values()))
+    assert row['canonical_id'].startswith('c_')
+    assert len(row['facts']) == 1
+    assert row['facts'][0]['id'].startswith('f_')
+    assert row['facts'][0]['text'] == 'Peyton founded Alive.'
+
+
+def test_topic_finds_old_wrong_fact_then_exact_correction_replaces_retrieved_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    now = datetime(2026, 9, 7, 12, 0, 0)
+    facts = {
+        f'f_recent_{i}': kg.FactMeta(text=f'Recent unrelated portfolio update number {i}',
+            type='context', conf=.95, first='2026-09-06', last='2026-09-06')
+        for i in range(20)
+    }
+    facts['f_wrong'] = kg.FactMeta(text='Peyton founded Alive.', type='context', conf=.7,
+        first='2025-01-01', last='2025-01-01')
+    p = kg.PersonFile(canonical_id='c_abcdef123456', name='Peyton Lewis',
+                      identifiers=['peyton@example.com'], facts=facts)
+    kg.write_person_file(os.path.join(kg.people_dir(), 'c_abcdef123456.md'), p, now)
+
+    ordinary = next(iter(_run(tmp_path, '--person', 'peyton@example.com',
+                              '--editable-person').values()))
+    assert all(fact['id'] != 'f_wrong' for fact in ordinary['facts'])
+    focused = next(iter(_run(tmp_path, '--person', 'peyton@example.com', '--editable-person',
+                             '--topic', 'founder Alive').values()))
+    assert focused['facts'][0] == {'id': 'f_wrong', 'text': 'Peyton founded Alive.'}
+
+    env = dict(os.environ, SOTTO_DATA=str(tmp_path))
+    corrected = subprocess.run([sys.executable, EDIT, '--slug', 'c_abcdef123456', '--op', 'correct',
+        '--fact-id', 'f_wrong', '--text', 'Peyton serves as chief operating officer at Alive.'],
+        capture_output=True, text=True, env=env)
+    assert corrected.returncode == 0, corrected.stderr
+    retrieved = _run(tmp_path, '--person', 'peyton@example.com', '--topic', 'Alive leadership')
+    packed = next(iter(retrieved.values()))
+    assert 'chief operating officer at Alive' in packed
+    assert 'Peyton founded Alive' not in packed
+    active = next(iter(_run(tmp_path, '--person', 'peyton@example.com', '--editable-person',
+                            '--topic', 'Alive leadership').values()))
+    assert all(fact['id'] != 'f_wrong' for fact in active['facts'])

@@ -1,0 +1,14 @@
+class Fixture:
+    def finish(self, result, stream_consumer, ctx):
+        _final_for_stream = None
+        if (
+            isinstance(result, dict) and not result.get("failed") and not result.get("interrupted")
+            and result.get("completed") is not False
+        ):
+            fr = result.get("final_response")
+            if isinstance(fr, str) and fr.strip() and fr != "(empty)":
+                _final_for_stream = fr
+        if _final_for_stream is None:
+            stream_consumer.finish()
+            return
+        stream_consumer.finish(_final_for_stream)

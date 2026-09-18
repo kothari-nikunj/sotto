@@ -53,13 +53,12 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
    with their last-known contact date, ranked below the going-quiet list). Where a nudge is obvious,
    you may add a short conversational offer ("want me to draft a quick hello to Dhruv?") using the
    names in the list — but keep it light, and don't fabricate anyone who isn't in the output.
-4. **Offer reconnect drafts (grounded only).** For the top 1–3 `losing_touch` (or `lapsed`) entries, you may offer a
-   short reconnect message. Build it **only** from that entry's `graph_context` (company / title /
-   `talking_point` / `fact` / `summary`) — a real, specific hook the user already knows ("saw Acme
-   shipped X — wanted to say hi"). If an entry has **no** `graph_context`, keep the offer generic
-   ("want me to send a quick hello?") and invent nothing. Match the user's voice using the style
-   profile (`$SOTTO_DATA/style.json`) if present. **These are drafts — present them, never auto-send;**
-   honor the user's send-approval tier exactly as the brief's worker dispatch does.
+4. **Offer reconnect drafts (grounded only).** For the top 1–3 `losing_touch` (or `lapsed`) entries,
+   you may offer a short reconnect message. Use only the company context already present on that
+   entry; otherwise keep the offer generic ("want me to send a quick hello?") and invent nothing.
+   Match the user's voice using the style profile (`$SOTTO_DATA/style.json`) if present. **These are
+   drafts — present them, never auto-send;** honor the user's send-approval tier exactly as the
+   brief's worker dispatch does.
 
 ## Notes
 - **Known contacts only.** People who only ever showed up as a raw phone number / shortcode are
@@ -71,15 +70,21 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
   someone you used to talk to regularly — not merely that it's been a few days. Someone you ping
   monthly won't be flagged at day 20.
 - **How `lapsed` is found.** Each run snapshots per-contact last-contact + cadence into
-  `relationship_state.json`'s `history`. Someone previously regular (≥5 touches in a past window) who
+  `relationship_state.json`'s `history`. Someone with repeated contact in both directions who
   is absent from the current window entirely surfaces as `lapsed` instead of silently vanishing when
   they fall off the 6-week read. First run has no history, so no lapsed section.
-- **Graph-weighted ranking.** The queue is ordered by interaction volume *and* knowledge-graph
-  importance: a person you actively track (a `people/*.md` file with facts / talking points / a known
-  company) outranks a chatty-but-shallow contact going quiet. Untracked people fall back to the old
-  volume-only ranking, so the weighting only ever sharpens the order — it never hides anyone.
+- **Evidence-based attention.** Existing age/cadence rules order the queue; observed owner replies
+  supply a small positive tie-break. Research depth, titles and stored-fact counts never raise rank.
+  Same-channel conversation turns supply two distinct signals: your replies inform attention, their
+  replies inform deadline-bounded chase timing. Silence never counts against a person. Learned
+  weight decays; explicit VIP and priority choices stay authoritative.
 - The adapter owns this job's registration from `adapters/hermes/crons.json`. Use its installed
   schedule; do not create a second weekly job from this skill. Missing or unverified schedules
   follow the setup skill's installation check. Personal `user-*` routines are separate.
 
 The same pass stores dated activity evidence for relationship importance: distinct contact days and days in each direction over six weeks. It combines iMessage, WhatsApp, calls and known-person email using the existing identity resolver. Overlapping reads are deduplicated; one noisy conversation does not become a VIP. The shared importance reader classifies VIP/VVIP for gift eligibility and the People skill. Existing attention/quiet-hour policy is separate: an overdue reply is urgency, not proof of closeness.
+
+When available, completed one-to-one Granola meetings contribute dated held-meeting evidence. They can
+strengthen reciprocal relationship evidence but cannot establish importance on their own. A scheduled
+meeting, multi-counterpart meeting, self-attendance, or missed call is not relationship evidence. Reply samples and delivery-confirmed Friday candidate
+cooldowns share `relationship_state.json`; they never create a preference without your words.

@@ -23,6 +23,8 @@ def test_continuous_probe_reports_real_results_and_preserves_parent_data(tmp_pat
     before = sentinel.read_bytes()
     result = probe.replay()
     assert result['days_advanced'] == 29
+    assert result['first_week_gate']['met'] is True
+    assert result['first_week_gate']['failed'] == []
     assert [c['day'] for c in result['checkpoints']] == [0, 1, 7, 15, 28]
     # The state survives across checkpoints, including a user-confirmed disposition on day 7.
     quote = [r for r in result['checkpoints'][-1]['rows'] if r['contact_name'] == 'Dov']
@@ -32,6 +34,24 @@ def test_continuous_probe_reports_real_results_and_preserves_parent_data(tmp_pat
     assert os.environ['SOTTO_DATA'] == str(tmp_path)
     assert os.environ['SOTTO_TIMEZONE'] == 'America/Los_Angeles'
     assert result == probe.replay()
+
+
+def test_all_contracts_survive_continuous_replay():
+    failures = [c for c in probe.replay()['checks'] if not c['met']]
+    assert not failures, failures
+
+
+def test_first_week_gate_includes_a_positive_completion_contract():
+    result = probe.replay()
+    completion = next(c for c in result['checks'] if c['id'] == 'evidence_bound_completion_accepted')
+    assert completion == {"day": 1, "id": "evidence_bound_completion_accepted",
+                          "expected": ["replied"], "observed": ["replied"], "met": True}
+    second = next(c for c in result['checks'] if c['id'] == 'second_evidence_bound_completion_accepted')
+    assert second == {"day": 2, "id": "second_evidence_bound_completion_accepted",
+                      "expected": ["replied"], "observed": ["replied"], "met": True}
+    assert result['first_week_gate']['contracts'] == len(
+        [check for check in result['checks']
+         if check['day'] <= 7])
 
 
 def test_cli_fails_when_contract_is_unmet_and_emits_parseable_json():

@@ -21,6 +21,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from usage_accounting import normalize, estimate, estimate_range, PRICING_VERSION
+
 MODELS = {'gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash-lite'}
 MAX_BODY = 8 * 1024 * 1024
 MAX_OUTPUT = 65536
@@ -42,6 +44,39 @@ def settled_chat_allowance(route, model, created, status, input_tokens):
             and 0 <= input_tokens <= 1048576):
         return min(CALL_ALLOWANCE_CENTS, math.ceil((input_tokens * 75 + MAX_OUTPUT * 375) / 1_000_000))
     return CALL_ALLOWANCE_CENTS
+
+
+
+def request_metadata(headers, payload, lane, tenant=None):
+    """Fixed labels and sizes only; source text and client secrets never enter the ledger."""
+    result = {}
+    for name, header, pattern in (
+        ('workload', 'X-Sotto-Workload', r'[a-z_]{1,40}'),
+        ('operation_id', 'X-Sotto-Operation', r'[a-f0-9]{64}'),
+        ('parent_operation_id', 'X-Sotto-Parent-Operation', r'[a-f0-9]{64}'),
+        ('run_id', 'X-Sotto-Run', r'[a-f0-9]{32}'),
+        ('attempt', 'X-Sotto-Attempt', r'[1-9][0-9]{0,3}'),
+    ):
+        value = headers.get(header, '')
+        if re.fullmatch(pattern, value):
+            result[name] = value
+    result.setdefault('workload', 'unknown')
+    tenant = tenant or {}
+    result['application'] = tenant.get('application', 'sotto')
+    result['deployment'] = tenant.get('deployment', 'unknown')
+    result['proxy_deployment'] = os.environ.get('RAILWAY_DEPLOYMENT_ID', 'unknown')
+    if lane == 'chat':
+        messages = payload.get('messages') or []
+        result['context_chars'] = {
+            'instructions': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') in ('system', 'developer')),
+            'tool_results': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') == 'tool'),
+            'conversation': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') not in ('system', 'developer', 'tool')),
+            'tools': len(json.dumps(payload.get('tools') or []))}
+    else:
+        result['context_chars'] = {'instructions': len(json.dumps(payload.get('systemInstruction') or {})),
+                                   'evidence': len(json.dumps(payload.get('contents') or [])),
+                                   'schema': len(json.dumps((payload.get('generationConfig') or {}).get('responseSchema') or {}))}
+    return result
 
 
 class RateLimitError(RuntimeError):
@@ -68,6 +103,10 @@ class Ledger:
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, route TEXT, '
                        'model TEXT, created REAL, allowance INTEGER NOT NULL, status INTEGER, input_tokens INTEGER, output_tokens INTEGER)')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(calls)')}
+            for column in ('usage_json', 'metadata_json'):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE calls ADD COLUMN {column} TEXT')
             db.execute('CREATE INDEX IF NOT EXISTS calls_tenant_created ON calls(tenant,created)')
             db.execute('CREATE TABLE IF NOT EXISTS model_leases (tenant TEXT NOT NULL, token_hash TEXT NOT NULL, '
                        'expires REAL NOT NULL, PRIMARY KEY(tenant,token_hash))')
@@ -110,7 +149,7 @@ class Ledger:
                        (tenant['id'], tenant['token_sha256'], expires))
         return self.expiry(tenant)
 
-    def reserve(self, tenant, budget, route, model, *, credential=None):
+    def reserve(self, tenant, budget, route, model, *, credential=None, metadata=None):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             now = time.time()
@@ -130,10 +169,13 @@ class Ledger:
                 raise PermissionError('tenant request budget exhausted')
             cursor = db.execute('INSERT INTO calls(tenant,route,model,created,allowance) VALUES(?,?,?,?,?)',
                                 (tenant, route, model, time.time(), CALL_ALLOWANCE_CENTS))
+            db.execute('UPDATE calls SET metadata_json=? WHERE id=?',
+                       (json.dumps(metadata or {}), cursor.lastrowid))
             return cursor.lastrowid
 
     def finish(self, call, status, usage):
         # Missing usage or ambiguous outcomes never release an allowance.
+        usage = usage if isinstance(usage, dict) else {}
         def count(*names):
             for name in names:
                 value = usage.get(name)
@@ -149,6 +191,11 @@ class Ledger:
                        (status, count('promptTokenCount', 'prompt_tokens'),
                         output, call))
             row = db.execute('SELECT route,model,created,status,input_tokens FROM calls WHERE id=?', (call,)).fetchone()
+            counts = normalize(usage)
+            counts.update(estimated_token_cost=estimate(row[1], counts, row[2]) if row else None,
+                          token_cost_range=estimate_range(row[1], counts, row[2]) if row else None,
+                          pricing_version=PRICING_VERSION, provider_fee_status='not_included')
+            db.execute('UPDATE calls SET usage_json=? WHERE id=?', (json.dumps(counts), call))
             if row:
                 db.execute('UPDATE calls SET allowance=? WHERE id=?', (settled_chat_allowance(*row), call))
 
@@ -158,7 +205,8 @@ class Ledger:
                               (tenant,)).fetchone()[0]
         remaining = None if budget is None else max(0, budget - used)
         return {'version': 1, 'finite': budget is not None, 'remaining_cents': remaining,
-                'can_admit': remaining is not None and remaining >= CALL_ALLOWANCE_CENTS}
+                'can_admit': remaining is not None and remaining >= CALL_ALLOWANCE_CENTS,
+                'supported_native_models': sorted(MODELS)}
 
 
 def route(path, payload):
@@ -256,7 +304,9 @@ class Handler(BaseHTTPRequestHandler):
                     and tenant['budget_cents'] is None):
                 raise PermissionError('finite tenant budget required')
             call = self.server.ledger.reserve(tenant['id'], tenant['budget_cents'], lane, model,
-                                              credential=(tenant, digest))
+                                              credential=(tenant, digest), metadata=request_metadata(
+                                                  self.headers, payload, lane,
+                                                  {k: tenant.get(k) for k in ('application', 'deployment')}))
         except AuthenticationError:
             return self.respond(401, {'error': 'unauthorized'})
         except RateLimitError:
@@ -367,6 +417,12 @@ def validate_tenants(tenants):
         if (not isinstance(expiry, (int, float)) or isinstance(expiry, bool)
                 or not math.isfinite(expiry)):
             raise ValueError('tenant expiry is required')
+        for label in ('application', 'deployment'):
+            value = tenant.get(label)
+            # Labels land in every ledger row and the report: a fixed short identifier, never an
+            # email, an account name or a structure.
+            if value is not None and (not isinstance(value, str) or re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value) is None):
+                raise ValueError(f'tenant {label} must be a short identifier')
         if tenant['id'] in ids or token in tokens:
             raise ValueError('tenant ids and bearer hashes must be unique')
         ids.add(tenant['id'])

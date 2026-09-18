@@ -1,8 +1,9 @@
 """One deterministic brief procedure in both modes, with durable preparation and learning.
 
 The receiver owns work admission and delivery. A saved useful artifact survives retries;
-optional research and ancillary learning never sit between that artifact and the outbox.
+optional research and ancillary learning are admitted separately from its initial delivery.
 """
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import os
@@ -11,12 +12,30 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 PREPARATION_MAX_AGE_SECONDS = 30 * 60
+# A saved composition older than this is re-gathered, not resent: its greeting and its "today" have aged.
+ARTIFACT_MAX_AGE_SECONDS = 2 * 3600
 NOTES_CACHE_MAX_AGE_SECONDS = 24 * 3600
 WELCOME_SEED_BUDGET_SECONDS = 20
 FOLLOWUP_RETENTION_SECONDS = 7 * 24 * 3600
+
+
+class BriefBusyError(Exception):
+    """Another generation operation owns the inputs; retry without charging a failed attempt."""
+
+
+@contextmanager
+def _generation_lock(scratch):
+    import jsonstore
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(jsonstore.lock(str(scratch / 'run')))
+        except TimeoutError as error:
+            raise BriefBusyError('brief generation is busy') from error
+        yield  # Timeouts inside the operation are real failures, not lock contention.
 
 
 def run(request):
@@ -92,25 +111,34 @@ def run(request):
             raise RuntimeError('source permission changed; a fresh brief is required')
         delivery_effects.stage([{'kind': 'source_permissions', 'sources': sources,
                                  'coverage_until': artifact.get('_source_cutoff', coverage_until)},
-                                *artifact.get('_calendar_eligibility', [])])
+                                {'kind': 'eligibility', 'valid_until':
+                                 float(artifact.get('composed_at') or 0) + ARTIFACT_MAX_AGE_SECONDS},
+                                *artifact.get('_calendar_eligibility', []),
+                                *artifact.get('_parking_notices', []),
+                                *([artifact['_review_candidate']] if artifact.get('_review_candidate') else [])])
 
     def learn(paths, phase):
         command('_shared/scripts/learn_step.py', '--type', request['kind'], '--day', day,
-                '--phase', phase, '--run-key', run_key,
+                '--phase', phase, '--run-key', learning_key,
                 '--local', paths['local'], '--gmail', paths['gmail'], '--granola', paths['granola'],
                 '--knowledge-out', paths['knowledge_out'], '--continuity', paths['continuity'])
 
     def followup():
         followup_request = {'pack': str(pack), 'kind': request['kind'], 'day': day,
-                            'work_key': key, 'learn_only': True}
+                            'work_key': key, 'learn_only': True, 'learning_revision': artifact.get('learning_revision')}
         return work_queue.enqueue(str(root), 'run', {
             'runner': [sys.executable, str(Path(__file__).resolve())],
-            'prompt': json.dumps(followup_request), 'label': 'background:sotto-learn:' + run_key,
-            'decision_ids': []}, key='brief-learn:' + run_key, priority=work_queue.BACKGROUND_PRIORITY,
+            'prompt': json.dumps(followup_request), 'label': 'background:sotto-learn:' + learning_key,
+            'decision_ids': []}, key='brief-learn:' + learning_key, priority=work_queue.BACKGROUND_PRIORITY,
             valid_until=time.time() + FOLLOWUP_RETENTION_SECONDS)
 
     if request.get('learn_only'):
-        with jsonstore.lock(str(scratch / 'learn')):
+        with _generation_lock(scratch):
+            artifact = load(scratch / 'artifact.json', {})
+            if (not artifact.get('brief_text')
+                    or request.get('learning_revision') != artifact.get('learning_revision')):
+                return 'NO_NUDGES'  # superseded job cannot read or delete the replacement's inputs
+            learning_key = run_key + ':' + artifact['learning_revision'] if artifact.get('learning_revision') else run_key
             if load(scratch / 'ancillary-done.json', {}).get('complete'):
                 return 'NO_NUDGES'
             paths = paths_at(scratch / 'current')
@@ -166,10 +194,24 @@ def run(request):
             save(scratch / 'prepared.json', {'complete': True, 'observed_at': time.time()})
         return 'NO_NUDGES'
 
-    with jsonstore.lock(str(scratch / 'run')):
+    with _generation_lock(scratch):
         artifact = load(scratch / 'artifact.json', {})
+        # A retry hours later must not resend the 6:30 composition: the greeting and every "today"
+        # in it were stamped at compose time, so past ARTIFACT_MAX_AGE_SECONDS the saved artifact is
+        # treated as absent and this run gathers and composes afresh. Still the SAME brief — the
+        # day, the work key, the deliver-once marker and not_before are untouched, and the marker is
+        # claimed at the send seam, so a fresher artifact for an undelivered day cannot double-send.
+        if time.time() - float(artifact.get('composed_at') or 0) > ARTIFACT_MAX_AGE_SECONDS:
+            artifact = {}
         paths = paths_at(scratch / 'current')
         if not isinstance(artifact.get('brief_text'), str) or not artifact['brief_text'].strip():
+            # Retire the old generation before touching its inputs. Learning uses this same lock
+            # and a revision-bound job, so a crash during replacement cannot consume partial files
+            # or mistake old completion receipts for learning the new actions.
+            for name in ('artifact.json', 'essential-done.json', 'ancillary-done.json'):
+                (scratch / name).unlink(missing_ok=True)
+            shutil.rmtree(scratch / 'current', ignore_errors=True)
+            paths = paths_at(scratch / 'current')
             payload_path = request.get('payload_path')
             if payload_path:
                 staged = json.loads(Path(payload_path).read_text())
@@ -241,10 +283,14 @@ def run(request):
                 and event.get('my_response') != 'declined']
             save(paths['knowledge_out'], composed.get('extracted_knowledge') or {})
             continuity['new_actions'] = composed.get('actions') or []
+            continuity['loop_updates'] = composed.get('loop_updates') or []
             save(paths['continuity'], continuity)
             # Persist last: every input needed to resume required writes now exists atomically.
+            composed['composed_at'] = time.time()
+            composed['learning_revision'] = uuid.uuid4().hex
             save(scratch / 'artifact.json', composed)
             artifact = composed
+        learning_key = run_key + ':' + artifact['learning_revision'] if artifact.get('learning_revision') else run_key
         stage_artifact(artifact)
         if not load(scratch / 'essential-done.json', {}).get('complete'):
             try:
@@ -255,6 +301,26 @@ def run(request):
                 # composed brief for delivery; the durable follow-up completes required writes.
                 print(f'[brief_runner] essential learning deferred: {type(error).__name__}',
                       file=sys.stderr)
+        # Count only the exact obligations represented in this saved artifact. Essential learning
+        # may restate bookkeeping; a material change to an obligation invalidates its count.
+        import delivery_effects
+        import ledger_io
+        live = {row.get('anchor_key'): row for row in ledger_io.load_entries()}
+        represented = []
+        for row in artifact.get('_represented_loops', []):
+            current = live.get(row.get('anchor_key'))
+            same_identity = (row.get('loop_identity')
+                             and delivery_effects.loop_identity(current or {}) == row['loop_identity'])
+            legacy_exact = (not row.get('loop_identity') and current
+                            and delivery_effects.loop_version(current) == row.get('loop_version'))
+            if current and current.get('status') in ledger_io.ACTIVE and (same_identity or legacy_exact):
+                # Finalization checks the same identity, so a restatement between staging and the
+                # channel's acceptance (the follow-up merge, a deadline edit, the evening's pass
+                # while a morning brief waits on a slow channel) cannot drop the count either.
+                represented.append({'kind': 'loop_surfaced', 'anchor_key': row['anchor_key'],
+                                    'loop_identity': delivery_effects.loop_identity(current),
+                                    'loop_version': delivery_effects.loop_version(current)})
+        delivery_effects.stage(represented)
         if not load(scratch / 'ancillary-done.json', {}).get('complete'):
             try:
                 followup()  # stable work key; a retry cannot duplicate successful learning
@@ -269,6 +335,9 @@ def run(request):
 if __name__ == '__main__':
     try:
         print(run(json.loads(sys.argv[1])))
+    except BriefBusyError:
+        print('[brief_runner] BriefBusyError', file=sys.stderr)
+        sys.exit(75)  # Receiver refunds only this runner's explicit contention signal.
     except Exception as error:
         print(f'[brief_runner] {type(error).__name__}: {error}', file=sys.stderr)
         sys.exit(1)

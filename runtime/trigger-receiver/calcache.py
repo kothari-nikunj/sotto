@@ -95,9 +95,12 @@ HOOKS = {
     # handed to triage (and so counts against the day's tap cap). The default no-op keeps this
     # module import-safe and makes an unwired process detect nothing, quietly.
     "meeting_tap": lambda ev: False,
-    # Calendar-diff nudge (a decline, a last-minute invite, a move, a cancellation): the receiver
-    # wires the same dispatch the tap uses. Default no-op for import-safety, as above.
-    "calendar_change": lambda ev: False,
+    # Durable event ownership or queue/drop receipts reconcile pending taps and calendar changes
+    # whose final checkpoint failed. None means lookup failed and admissions must remain paused.
+    "event_handled": lambda ev: None,
+    # One refresh is one triage admission. Return the rowids that were durably handled; callers
+    # retain every omitted rowid in the partial-batch checkpoint for replay.
+    "calendar_change_batch": lambda events: set(),
 }
 
 CALENDAR_TTL_SECS = 600                # the plan's 10-minute number, unchanged by the extraction
@@ -278,7 +281,7 @@ _CAL_CACHE: dict = {"ts": 0.0, "value": None}
 _LAST_GATHER: dict = {}
 _LAST_RAW: dict = {"events": None}         # the latest gather's RAW events (see _run_calendar_gather)
 _CHANGE_BASELINE: dict = {"events": None, "source": None, "account": "", "loaded": False,
-                          "acknowledged": set()}
+                          "acknowledged": set(), "detected_at": {}}
 
 
 def snapshot() -> dict | None:
@@ -560,26 +563,42 @@ def ended_meetings(events, now_utc: datetime, today: str = "") -> list:
     return out
 
 
-def _load_tap_state(today: str) -> list:
-    """The event-end keys already handled TODAY. A stamp from another date reads as empty — that IS
-    the day rollover (no cleanup job), and it resets the daily cap at the same instant."""
+def _load_tap_state(today: str) -> tuple[list, list, bool]:
+    """Return (fired, pending, trustworthy) for today.
+
+    Pending keys were checkpointed before dispatch and count against the cap. They are retried
+    until the post-dispatch checkpoint succeeds, which repairs a failed write across restart.
+    A malformed current-day file is not evidence of an empty allowance, so it fails closed.
+    """
+    path = tap_state_path()
     try:
-        with open(tap_state_path(), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             st = json.load(f)
-        if isinstance(st, dict) and _s(st.get("date")) == today:
-            return [k for k in (st.get("fired") or []) if isinstance(k, str)]
+    except FileNotFoundError:
+        return [], [], True
     except (OSError, json.JSONDecodeError, ValueError):
-        pass
-    return []
+        return [], [], False
+    if not isinstance(st, dict):
+        return [], [], False
+    if _s(st.get("date")) != today:
+        return [], [], True
+    fired, pending = st.get("fired", []), st.get("pending", [])
+    if (not isinstance(fired, list) or not isinstance(pending, list)
+            or any(not isinstance(k, str) for k in fired + pending)):
+        return [], [], False
+    return list(dict.fromkeys(fired)), list(dict.fromkeys(pending)), True
 
 
-def _save_tap_state(today: str, fired: list) -> None:
-    """THE atomic write (connectors.write_json) — written after EVERY dispatch, not once per tick,
-    so a crash between two taps can never replay the first one."""
+def _save_tap_state(today: str, fired: list, pending: list) -> bool:
+    """Persist cap ownership before and after every dispatch; failure is part of the result."""
     try:
-        HOOKS["write_json"](tap_state_path(), {"date": today, "fired": fired})
-    except OSError:
-        pass
+        HOOKS["write_json"](tap_state_path(), {
+            "version": 2, "date": today, "fired": fired, "pending": pending,
+        })
+        return True
+    except OSError as e:
+        print(f"[sotto] meeting tap checkpoint failed: {e}", flush=True)
+        return False
 
 
 def tap_event(cand: dict) -> dict:
@@ -606,7 +625,9 @@ def tap_event(cand: dict) -> dict:
 def tap_tick(now_utc: datetime | None = None) -> int:
     """One post-meeting-tap pass, riding the refresh thread's clock. Returns how many taps were
     dispatched. The hook returning False (triage unavailable, channel unhealthy) does NOT mark the
-    end handled — the next tick retries it while it's still inside the lookback window."""
+    end handled — the next tick retries it while it's still inside the lookback window. A pending
+    key that ages beyond the lookback conservatively keeps owning its cap slot until local midnight:
+    losing one optional tap is safer than guessing that a possibly delivered tap never happened."""
     if not taps_enabled():
         return 0
     cap = tap_max_per_day()
@@ -620,23 +641,79 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     cands = ended_meetings(snap.get("events") or [], now_utc, today)
     if not cands:
         return 0
-    fired = _load_tap_state(today)
+    fired, pending, trustworthy = _load_tap_state(today)
+    if not trustworthy:
+        print("[sotto] meeting tap checkpoint is unreadable; admissions paused", flush=True)
+        return 0
     dispatched = 0
-    for cand in cands:
+    by_key = {cand["key"]: cand for cand in cands}
+    ordered = [by_key[k] for k in pending if k in by_key]
+    ordered.extend(cand for cand in cands if cand["key"] not in pending)
+    for cand in ordered:
         cand['calendar_observed_at'] = snap.get('generated_at')
-        if len(fired) >= cap:
+        if len(set(fired + pending)) >= cap and cand["key"] not in pending:
             break                     # the day's tap allowance is spent; the budget is safe
         if cand["key"] in fired:
             continue
+        event = tap_event(cand)
+        if cand["key"] in pending:
+            try:
+                owned = HOOKS["event_handled"](event)
+            except Exception as e:  # noqa: BLE001 — unknown ownership must retain the cap slot
+                print(f"[sotto] meeting tap ownership lookup failed: {e}", flush=True)
+                break
+            if owned is None:
+                print("[sotto] meeting tap ownership is unknown; admissions paused", flush=True)
+                break
+            if owned:
+                fired.append(cand["key"])
+                pending.remove(cand["key"])
+                if not _save_tap_state(today, fired, pending):
+                    fired.pop()
+                    pending.append(cand["key"])
+                continue
+        if cand["key"] not in pending:
+            pending.append(cand["key"])
+            if not _save_tap_state(today, fired, pending):
+                pending.pop()
+                break                 # never dispatch what the durable cap does not yet own
         try:
-            ok = bool(HOOKS["meeting_tap"](tap_event(cand)))
+            ok = bool(HOOKS["meeting_tap"](event))
         except Exception as e:  # noqa: BLE001 — a broken tap must never kill the refresh thread
             print(f"[sotto] meeting tap error: {e}", flush=True)
             ok = False
         if ok:
             fired.append(cand["key"])
-            _save_tap_state(today, fired)
+            pending.remove(cand["key"])
+            if not _save_tap_state(today, fired, pending):
+                # The on-disk pending reservation still owns the cap. Stop until a later tick can
+                # replay/reconcile it; admitting another meeting here could exceed the cap.
+                fired.pop()
+                pending.append(cand["key"])
+                break
             dispatched += 1
+        else:
+            # False can mean triage timed out after durably recording a queue/drop receipt or
+            # accepting agent work. Consult that authority before releasing the reserved slot.
+            try:
+                owned = HOOKS["event_handled"](event)
+            except Exception as e:  # noqa: BLE001
+                print(f"[sotto] meeting tap ownership lookup failed: {e}", flush=True)
+                owned = None
+            if owned:
+                fired.append(cand["key"])
+                pending.remove(cand["key"])
+                if not _save_tap_state(today, fired, pending):
+                    fired.pop()
+                    pending.append(cand["key"])
+                continue
+            if owned is None:
+                break                 # uncertainty keeps the durable reservation and pauses intake
+            pending.remove(cand["key"])
+            if not _save_tap_state(today, fired, pending):
+                # Disk still says pending, which safely owns a slot and will retry after restart.
+                pending.append(cand["key"])
+                break
     return dispatched
 
 
@@ -644,10 +721,12 @@ def tap_tick(now_utc: datetime | None = None) -> int:
 # "Ali Panju just declined your 11am" / "Jake sent a last-minute invite for 11:30" — the two Poke
 # examples that were unbuildable here because nothing watched the diff. Detection ONLY, the tap's
 # exact posture: every interruption question (quiet hours, snooze, mutes) is triage's, reached by
-# pushing a synthetic `source: "calendar_change"` event through the ordinary funnel. Exactly-once
-# is TWO layers: this module atomically checkpoints the last complete observation plus successful
-# items from a partial batch, and the receiver's (source,rowid) seen-ring closes the tiny gap between
-# dispatch and checkpoint. The checkpoint is a bounded calendar-window snapshot, not a history.
+# pushing a synthetic `source: "calendar_change"` event through the ordinary funnel.
+# `change_tick` saves each candidate's `detected_at` before dispatch, preserving its retry identity.
+# Like tap_tick, it consults HOOKS["event_handled"] for accepted work or queue/drop receipts before
+# retrying triage. The receiver's per-request seen-ring is not involved: synthetic dispatch calls
+# triage directly. A crash between a queue append and its receipt can still replay that queue row;
+# recovery requires either durable work ownership or the completed receipt.
 
 def calendar_nudges_enabled() -> bool:
     return ((os.environ.get("SOTTO_CALENDAR_NUDGES") or "").strip() or "1") != "0"
@@ -660,13 +739,13 @@ def change_state_path() -> str:
 def _invalidate_change_baseline(status: str, observed_at: str = "") -> None:
     """Atomically make old state non-comparable across a consent or identity boundary."""
     HOOKS["write_json"](change_state_path(), {
-        "version": 1,
+        "version": 2,
         "source": {"status": status, "complete": False,
                    "observed_at": _s(observed_at) or _iso(), "coverage": {}},
         "account": "", "events": [], "acknowledged": [],
     })
     _CHANGE_BASELINE.update(events=None, source=None, account="", loaded=True,
-                            acknowledged=set())
+                            acknowledged=set(), detected_at={})
 
 
 def _change_observation() -> dict | None:
@@ -694,7 +773,7 @@ def _change_events(events: list) -> list:
             for ev in meeting_events(events) if isinstance(ev, dict)]
 
 
-def _read_change_state() -> tuple[list | None, dict | None, str, set[str]]:
+def _read_change_state() -> tuple[list | None, dict | None, str, set[str], dict[str, str]]:
     """Load only a complete, explicitly sourced baseline; malformed state fails toward silence."""
     try:
         with open(change_state_path(), encoding="utf-8") as f:
@@ -703,7 +782,8 @@ def _read_change_state() -> tuple[list | None, dict | None, str, set[str]]:
         account = state.get("account")
         events = state.get("events")
         acknowledged = state.get("acknowledged", [])
-        if (state.get("version") != 1 or not isinstance(source, dict)
+        detected_at = state.get("detected_at", {})
+        if (state.get("version") not in (1, 2) or not isinstance(source, dict)
                 or source.get("status") != "ok" or source.get("complete") is not True
                 or _parse_aware(source.get("observed_at")) is None
                 or not isinstance(source.get("coverage"), dict)
@@ -714,14 +794,18 @@ def _read_change_state() -> tuple[list | None, dict | None, str, set[str]]:
                 or not isinstance(account, str) or not account.strip()
                 or not isinstance(events, list) or any(not isinstance(e, dict) for e in events)
                 or not isinstance(acknowledged, list)
-                or any(not isinstance(key, str) for key in acknowledged)):
-            return None, None, "", set()
-        return _change_events(events), source, account, set(acknowledged)
+                or any(not isinstance(key, str) for key in acknowledged)
+                or not isinstance(detected_at, dict)
+                or any(not isinstance(key, str) or _parse_aware(value) is None
+                       for key, value in detected_at.items())):
+            return None, None, "", set(), {}
+        return _change_events(events), source, account, set(acknowledged), detected_at
     except (OSError, ValueError, TypeError, AttributeError):
-        return None, None, "", set()
+        return None, None, "", set(), {}
 
 
-def _write_change_state(events: list, acknowledged=(), source: dict | None = None) -> None:
+def _write_change_state(events: list, acknowledged=(), source: dict | None = None,
+                        detected_at: dict[str, str] | None = None) -> None:
     """Atomically checkpoint the comparable baseline and any changes already handed to triage."""
     source = source or _change_observation()
     if source is None:
@@ -730,20 +814,21 @@ def _write_change_state(events: list, acknowledged=(), source: dict | None = Non
     if not account:
         raise ValueError("calendar change baseline requires known account identity")
     HOOKS["write_json"](change_state_path(), {
-        "version": 1,
+        "version": 2,
         "source": source,
         "account": account,
         "events": _change_events(events),
         "acknowledged": sorted(set(acknowledged)),
+        "detected_at": detected_at or {},
     })
 
 
 def _load_change_baseline() -> None:
     if _CHANGE_BASELINE.get("loaded"):
         return
-    events, source, account, acknowledged = _read_change_state()
+    events, source, account, acknowledged, detected_at = _read_change_state()
     _CHANGE_BASELINE.update(events=events, source=source, account=account,
-                            acknowledged=acknowledged, loaded=True)
+                            acknowledged=acknowledged, detected_at=detected_at, loaded=True)
 
 
 def _raw_others(ev: dict, self_email: str) -> list:
@@ -850,7 +935,7 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
 def change_event(cand: dict) -> dict:
     """The synthetic event triage_event.py's calendar_change branch consumes. `text` is the human
     sentence the Record and the agent both read — composed HERE so detection and phrasing can't
-    drift apart. `timestamp` is now: the change just happened, whatever the meeting's time."""
+    drift apart. `timestamp` is when this change was first detected and stays stable across retries."""
     when = _wall(cand["start"])
     title = cand["summary"] or "a meeting"
     kind = cand["kind"]
@@ -867,7 +952,7 @@ def change_event(cand: dict) -> dict:
         "source": CALENDAR_CHANGE_SOURCE,
         "rowid": cand["key"],
         "change": kind,
-        "timestamp": _iso(),
+        "timestamp": cand.get("detected_at") or _iso(),
         "summary": cand["summary"],
         "start": cand["start"],
         "old_start": cand.get("old_start") or "",
@@ -905,14 +990,14 @@ def change_tick(now_utc: datetime | None = None) -> int:
     if baseline is None:
         _write_change_state(current, source=source)
         _CHANGE_BASELINE.update(events=current, source=source, account=account,
-                                acknowledged=set())
+                                acknowledged=set(), detected_at={})
         return 0
     if not calendar_nudges_enabled():
         # Nudge-disabled observations become the new baseline without dispatch, so re-enabling
         # cannot replay changes that happened while this notification lane was disabled.
         _write_change_state(current, source=source)
         _CHANGE_BASELINE.update(events=current, source=source, account=account,
-                                acknowledged=set())
+                                acknowledged=set(), detected_at={})
         return 0
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     self_email = _self_email([e for e in map(_norm_cal_event, current) if e])
@@ -922,28 +1007,50 @@ def change_tick(now_utc: datetime | None = None) -> int:
     cands = [c for c in cands if c["kind"] != "cancelled" or
              (since is not None and until is not None and _parse_aware(c["start"]) is not None
               and since <= _parse_aware(c["start"]) < until)]
-    dispatched, all_ok = 0, True
+    dispatched = 0
     acknowledged = set(_CHANGE_BASELINE.get("acknowledged") or ())
-    for cand in cands:
-        if cand["key"] in acknowledged:
-            continue
+    detected_at = dict(_CHANGE_BASELINE.get("detected_at") or {})
+    pending = [cand for cand in cands if cand["key"] not in acknowledged]
+    for cand in pending:
         cand['calendar_observed_at'] = _LAST_RAW.get('observed_at')
-        try:
-            ok = bool(HOOKS["calendar_change"](change_event(cand)))
-        except Exception as e:  # noqa: BLE001 — a broken dispatch must never kill the refresh thread
-            print(f"[sotto] calendar change error: {e}", flush=True)
-            ok = False
-        if ok:
-            dispatched += 1
-            acknowledged.add(cand["key"])
-            _write_change_state(baseline, acknowledged, _CHANGE_BASELINE.get("source"))
+        detected_at.setdefault(cand["key"], source["observed_at"])
+        cand["detected_at"] = detected_at[cand["key"]]
+    if pending:
+        # Claim each retry identity before dispatch so a timeout after commit can be reconciled.
+        _write_change_state(baseline, acknowledged, _CHANGE_BASELINE.get("source"), detected_at)
+        _CHANGE_BASELINE["detected_at"] = detected_at
+        recovered, events = set(), []
+        for cand in pending:
+            event = change_event(cand)
+            try:
+                owned = HOOKS["event_handled"](event)
+            except Exception as e:  # noqa: BLE001 — unknown ownership must not replay accepted work
+                print(f"[sotto] calendar change ownership lookup failed: {e}", flush=True)
+                return 0
+            if owned is None:
+                print("[sotto] calendar change ownership is unknown; admissions paused", flush=True)
+                return 0
+            if owned:
+                recovered.add(cand["key"])
+            else:
+                events.append(event)
+        handled = set()
+        if events:
+            try:
+                handled = set(HOOKS["calendar_change_batch"](events) or ())
+            except Exception as e:  # noqa: BLE001 — a broken dispatch must never kill the refresh thread
+                print(f"[sotto] calendar change error: {e}", flush=True)
+            handled &= {event["rowid"] for event in events}
+        dispatched = len(handled)
+        handled.update(recovered)
+        if handled:
+            acknowledged.update(handled)
+            _write_change_state(baseline, acknowledged, _CHANGE_BASELINE.get("source"), detected_at)
             _CHANGE_BASELINE["acknowledged"] = acknowledged
-        else:
-            all_ok = False
-    if all_ok:
+    if all(cand["key"] in acknowledged for cand in cands):
         _write_change_state(current, source=source)
         _CHANGE_BASELINE.update(events=current, source=source, account=account,
-                                acknowledged=set())
+                                acknowledged=set(), detected_at={})
     return dispatched
 
 

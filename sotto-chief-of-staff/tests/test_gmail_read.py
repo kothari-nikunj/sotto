@@ -1,5 +1,6 @@
 import base64
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -124,15 +125,20 @@ def test_poll_defers_only_failed_full_reads_and_does_not_mark_them_seen(tmp_path
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(poll_gmail, "_find_google_api", lambda: "/fake/google_api.py")
 
-    def run(_api, args, timeout=60):
-        if args[2] == poll_gmail.SEARCH_QUERY:
-            return [{"id": "ok", "snippet": "thin"}, {"id": "retry", "snippet": "thin"}]
-        return []
-
+    class Execute:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Messages:
+        def list(self, **kwargs):
+            return Execute({"messages": []} if "in:sent" in kwargs["q"] else
+                           {"messages": [{"id": "ok", "snippet": "thin"},
+                                         {"id": "retry", "snippet": "thin"}]})
+    class Users:
+        def messages(self): return Messages()
     class Service:
+        def users(self): return Users()
         def close(self): pass
 
-    monkeypatch.setattr(poll_gmail, "_run", run)
     monkeypatch.setattr(poll_gmail, "gmail_service", Service)
     attempts = []
 
@@ -150,3 +156,182 @@ def test_poll_defers_only_failed_full_reads_and_does_not_mark_them_seen(tmp_path
     assert second == []
     assert attempts == ["ok", "retry", "retry"]
     assert poll_gmail._load_seen() == ["ok"]
+
+
+def test_poll_page_cursor_waits_for_failed_id_and_resumes_next_page_after_restart(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_pages", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(pg, "_find_google_api", lambda: "/fake/google_api.py")
+    pages = {None: ({"messages": [{"id": "a"}, {"id": "b"}], "nextPageToken": "p2"}),
+             "p2": ({"messages": [{"id": "c"}]})}
+    class Execute:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Messages:
+        def list(self, **kwargs):
+            return Execute({"messages": []} if "in:sent" in kwargs["q"]
+                           else pages[kwargs.get("pageToken")])
+    class Users:
+        def messages(self): return Messages()
+    class Service:
+        def users(self): return Users()
+        def close(self): pass
+    monkeypatch.setattr(pg, "gmail_service", Service)
+    failed = {"b"}
+    def fetch(_service, mid):
+        if mid in failed:
+            raise RuntimeError("temporary")
+        return {"id": mid, "from": "a@example.com", "body": "body", "date": "2026-09-15T22:00:00Z"}
+    monkeypatch.setattr(pg, "fetch_message", fetch)
+    monkeypatch.setattr(pg.time, "time", lambda: 1789516800)
+    first = pg.poll()
+    assert [e["rowid"] for e in first] == ["a"] and first[0]["_sotto_catchup"] is True
+    pg.acknowledge(["a"])
+    assert pg._load_state()["lanes"]["inbox"]["page_ids"] == ["a", "b"]
+    failed.clear()
+    assert [e["rowid"] for e in pg.poll()] == ["b"]
+    pg.acknowledge(["b"])
+    assert [e["rowid"] for e in pg.poll()] == ["c"]
+
+
+def test_seen_only_overlap_page_advances_without_receiver_ack(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_overlap", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(pg, "_find_google_api", lambda: "/fake/google_api.py")
+    pg._save_state({"seen": ["known"], "lanes": {}})
+    class Result:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Messages:
+        def list(self, **kwargs):
+            return Result({"messages": []} if "in:sent" in kwargs["q"] else
+                          {"messages": [{"id": "known"}], "nextPageToken": "p2"})
+    class Service:
+        def users(self): return type("Users", (), {"messages": lambda self: Messages()})()
+        def close(self): pass
+    monkeypatch.setattr(pg, "gmail_service", Service)
+    assert pg.poll() == []
+    lane = pg._load_state()["lanes"]["inbox"]
+    assert lane["page_ids"] == [] and lane["page_token"] == "p2"
+
+
+def test_initial_paginated_query_keeps_fixed_bounds_when_clock_advances(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_fixed_query", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(pg, "_find_google_api", lambda: "/fake/google_api.py")
+    clock = {"now": 1789516800}
+    monkeypatch.setattr(pg.time, "time", lambda: clock["now"])
+    inbox_calls = []
+
+    class Result:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Messages:
+        def list(self, **kwargs):
+            if "in:sent" in kwargs["q"]:
+                return Result({"messages": []})
+            inbox_calls.append(kwargs)
+            if kwargs.get("pageToken") == "p2":
+                return Result({"messages": [{"id": "b"}]})
+            return Result({"messages": [{"id": "a"}], "nextPageToken": "p2"})
+    class Service:
+        def users(self): return type("Users", (), {"messages": lambda self: Messages()})()
+        def close(self): pass
+
+    monkeypatch.setattr(pg, "gmail_service", Service)
+    monkeypatch.setattr(pg, "fetch_message", lambda _service, mid: {
+        "id": mid, "from": "a@example.com", "body": "body"})
+    assert [event["rowid"] for event in pg.poll()] == ["a"]
+    initial_cursor = clock["now"] - pg.RECOVERY_LOOKBACK_SECONDS
+    assert pg._load_state()["lanes"]["inbox"]["cursor"] == initial_cursor
+    pg.acknowledge(["a"])
+    clock["now"] += 300
+    assert [event["rowid"] for event in pg.poll()] == ["b"]
+    assert inbox_calls[0]["q"] == inbox_calls[1]["q"]
+    assert inbox_calls[1]["pageToken"] == "p2"
+
+
+def test_established_cursor_covers_a_full_day_per_slice_without_skipping_older_gap(tmp_path,
+                                                                                   monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_long_gap", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(pg, "_find_google_api", lambda: "/fake/google_api.py")
+    cursor = 1789000000
+    now = cursor + 3 * 24 * 3600
+    pg._save_state({"seen": [], "lanes": {"inbox": {"cursor": cursor},
+                                            "sent": {"cursor": now}}})
+    calls = []
+    class Result:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Messages:
+        def list(self, **kwargs):
+            calls.append(kwargs)
+            return Result({"messages": [{"id": "old"}]} if "in:inbox" in kwargs["q"] else
+                          {"messages": []})
+    class Service:
+        def users(self): return type("Users", (), {"messages": lambda self: Messages()})()
+        def close(self): pass
+    monkeypatch.setattr(pg, "gmail_service", Service)
+    monkeypatch.setattr(pg.time, "time", lambda: now)
+    monkeypatch.setattr(pg, "fetch_message", lambda _service, mid: {
+        "id": mid, "from": "a@example.com", "body": "body", "date": str(now * 1000)})
+
+    events = pg.poll()
+    assert [event["rowid"] for event in events] == ["old"]
+    assert events[0]["_sotto_catchup"] is True
+    assert calls[0]["q"] == f"in:inbox after:{cursor} before:{cursor + 24 * 3600 + 1}"
+    pg.acknowledge(["old"])
+    assert pg._load_state()["lanes"]["inbox"]["cursor"] == cursor + 24 * 3600
+
+
+def test_client_without_bounded_pagination_fails_without_advancing_cursor(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_no_legacy_fallback", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(pg, "_find_google_api", lambda: "/fake/google_api.py")
+    pg._save_state({"seen": [], "lanes": {"inbox": {"cursor": 123}, "sent": {}}})
+    monkeypatch.setattr(pg, "gmail_service", lambda: object())
+
+    with pytest.raises(RuntimeError, match="bounded paginated"):
+        pg.poll()
+    assert pg._load_state()["lanes"]["inbox"] == {"cursor": 123}
+
+
+def test_acknowledge_propagates_failed_atomic_save(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_save_failure", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    pg._save_state({"seen": ["old"], "lanes": {}})
+    monkeypatch.setattr(pg.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        pg.acknowledge(["new"])
+    assert pg._load_seen() == ["old"]
+
+
+@pytest.mark.parametrize("contents", [
+    "{not json",
+    json.dumps({"seen": {}, "lanes": {}}),
+    json.dumps({"seen": [], "lanes": {"inbox": []}}),
+    json.dumps({"seen": [], "lanes": {"inbox": {"page_ids": "a"}}}),
+])
+def test_malformed_persisted_state_fails_closed(tmp_path, monkeypatch, contents):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_bad_state", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    path = tmp_path / "events" / "gmail_seen.json"
+    path.parent.mkdir()
+    path.write_text(contents)
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        pg._load_state()

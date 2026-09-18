@@ -33,29 +33,10 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 
-# ── PRICE TABLE ──────────────────────────────────────────────────────────────────────────────────
-# Per-1,000,000-token USD rates: {model: {"in": <prompt $/1M>, "out": <output $/1M>}}.
-# gemini-3.8-flash (the default): INTRODUCTORY rates from Google's Sep 2, 2026 launch — $0.75 in /
-# $3.75 out through Dec 31, 2026; standard $1.50 / $7.50 applies from Jan 1, 2027. ⚠️ Re-check this
-# entry in Jan 2027 — the table states today's price, it does not schedule the change.
-# gemini-3.7-flash (previous default, kept for SOTTO_GEMINI_MODEL overrides): the SAME introductory
-# $0.75 / $3.75 from its Aug 13, 2026 launch, on the same Dec 31, 2026 clock — 3.8 is a capability
-# bump at an unchanged price, so nobody's bill moves on this upgrade.
-# gemini-3.6-flash (kept for SOTTO_GEMINI_MODEL overrides): launch rates from
-# Google's July 21, 2026 announcement — $1.50 in / $7.50 out ($0.15 cached input; caching isn't
-# broken out here, so estimates are an upper bound).
-# gemini-3.5-flash-lite: $0.30 in / $2.50 out (same announcement's pricing page).
-# ⚠️  gemini-3-flash-preview (the brief's automatic fallback) is a preview model with no locked public
-# price yet — $0.50 in / $3.00 out verified 2026-07-06 against Google's Gemini 3 Flash announcement
-# and OpenRouter's listing. Re-check when the model leaves preview. A model NOT in this table yields
-# est=n/a (cost None) — metrics never guesses a price.
-PRICE_TABLE = {
-    "gemini-3.8-flash": {"in": 0.75, "out": 3.75},
-    "gemini-3.7-flash": {"in": 0.75, "out": 3.75},
-    "gemini-3.6-flash": {"in": 1.50, "out": 7.50},
-    "gemini-3-flash-preview": {"in": 0.50, "out": 3.00},
-    "gemini-3.5-flash-lite": {"in": 0.30, "out": 2.50},
-}
+# Compatibility view for callers that already supply uncached input and total billed output.
+# Provider responses use normalize()/estimate(), including cached input and separate thinking.
+from usage_accounting import PRICES  # noqa: E402
+PRICE_TABLE = {model: {'in': prices[0], 'out': prices[2]} for model, prices in PRICES.items()}
 
 
 _lock = threading.Lock()
@@ -96,7 +77,7 @@ def set_phase(phase: str) -> None:
     _phase = phase or "extraction"
 
 
-def record(phase, wall_secs, prompt_tokens, output_tokens, model) -> None:
+def record(phase, wall_secs, prompt_tokens, output_tokens, model, usage=None) -> None:
     """Record one LLM call. Thread-safe (research batches run concurrently). Never raises."""
     try:
         with _lock:
@@ -108,6 +89,7 @@ def record(phase, wall_secs, prompt_tokens, output_tokens, model) -> None:
                 "prompt_tokens": int(prompt_tokens or 0),
                 "output_tokens": int(output_tokens or 0),
                 "model": model or "",
+                "usage": usage,
             })
     except Exception as e:  # noqa: BLE001
         _warn(type(e).__name__)
@@ -120,7 +102,11 @@ def note_response(model, usage_metadata, wall_secs, label: str = "") -> None:
     try:
         phase = "fallback" if "fallback" in (label or "") else _phase
         um = usage_metadata or {}
-        record(phase, wall_secs, um.get("promptTokenCount"), um.get("candidatesTokenCount"), model)
+        from usage_accounting import normalize
+        counts = normalize(um)
+        import model_work
+        model_work.note_usage(model, um)
+        record(phase, wall_secs, counts['input_tokens'], counts['billed_output_tokens'], model, counts)
     except Exception as e:  # noqa: BLE001
         _warn(type(e).__name__)
 
@@ -143,6 +129,7 @@ def summary() -> dict:
     total_wall = 0.0
     cost = 0.0
     priced = True
+    basis = "exact"
     for c in calls:
         ph = phases.setdefault(c["phase"],
                                {"wall_s": 0.0, "prompt_tokens": 0, "output_tokens": 0, "calls": 0})
@@ -153,7 +140,16 @@ def summary() -> dict:
         total_in += c["prompt_tokens"]
         total_out += c["output_tokens"]
         total_wall += c["wall_s"]
-        cc = _cost(c["prompt_tokens"], c["output_tokens"], c["model"])
+        from usage_accounting import estimate, estimate_range
+        cc = (estimate(c['model'], c['usage']) if c.get('usage') is not None
+              else _cost(c["prompt_tokens"], c["output_tokens"], c["model"]))
+        if cc is None and c.get('usage') is not None:
+            # A compatible-chat response carries no cache detail, so the exact figure is unknown;
+            # the footer's number is then the uncached upper bound (what the legacy table always
+            # assumed) and says so, rather than going blank for the whole run.
+            bounds = estimate_range(c['model'], c['usage'])
+            if bounds is not None:
+                cc, basis = bounds['upper'], "upper_bound"
         if cc is None:
             priced = False
         else:
@@ -166,6 +162,7 @@ def summary() -> dict:
         "prompt_tokens": total_in,
         "output_tokens": total_out,
         "est_cost_usd": (round(cost, 4) if (priced and calls) else None),
+        "est_cost_basis": (basis if (priced and calls) else None),
         "phases": phases,
     }
 
@@ -183,7 +180,8 @@ def _fmt_k(n) -> str:
 
 
 def _human_line(date, kind, s: dict, skipped) -> str:
-    est = ("$" + format(s["est_cost_usd"], ".3f")) if s["est_cost_usd"] is not None else "n/a"
+    est = ("$" + format(s["est_cost_usd"], ".3f") + ("≤" if s.get("est_cost_basis") == "upper_bound" else "")
+           if s["est_cost_usd"] is not None else "n/a")
     parts = [f"[brief-cost] kind={kind} date={date}",
              f"total={s['total_wall_s']:.1f}s", f"calls={s['calls']}",
              f"in={_fmt_k(s['prompt_tokens'])}", f"out={_fmt_k(s['output_tokens'])}", f"est={est}"]

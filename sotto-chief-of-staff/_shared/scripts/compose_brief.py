@@ -62,7 +62,7 @@ import brief_validate  # noqa: E402
 from timeutil import (  # noqa: E402
     _date_only, _parse_ts, _tz_offset_minutes,
     configured_tz, configured_user_email, _resolve_tz, _user_tz_offset,
-    _user_local_date, _time_frame,
+    _user_local_date, _time_frame, parse_observed_time,
 )
 from gemini import _diag, call_gemini  # noqa: E402
 from chatfmt import to_chat  # noqa: E402  (the ONE markdown→chat transformation)
@@ -122,7 +122,7 @@ _DATA_SEAM_RE = re.compile(r"(?m)^## DATA PROMPT[ \t]*$")   # legacy seam (pre-c
 
 # Comment prefixes (after "<!--") that are NOT maintainer prose and must survive the strip: the
 # model-facing tap-marker syntax the model is taught to emit, and the split seam token.
-_KEEP_COMMENT_PREFIXES = ("id:", "meeting:", " SYSTEM/USER SPLIT")
+_KEEP_COMMENT_PREFIXES = ("id:", "meeting:", "loop:", " SYSTEM/USER SPLIT")
 
 _STANDALONE_CLOSE_RE = re.compile(r"(?m)^[ \t]*-->[ \t]*$")
 
@@ -204,6 +204,8 @@ _ACTION_ITEM_SCHEMA = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
+        "loopId": {"type": "string"},
+        "newObligation": {"type": "boolean"},
         "type": {"type": "string"},
         "channel": {"type": "string"},
         "sectionType": {"type": "string"},
@@ -247,6 +249,11 @@ BRIEF_RESPONSE_SCHEMA = {
     "properties": {
         "markdown": {"type": "string"},
         "actionItems": {"type": "array", "items": _ACTION_ITEM_SCHEMA},
+        "loopUpdates": {"type": "array", "items": {"type": "object", "properties": {
+            "loopId": {"type": "string"}, "loopVersion": {"type": "string"},
+            "status": {"type": "string", "enum": ["resolved", "waiting"]},
+            "evidence": _ACTION_ITEM_SCHEMA["properties"]["evidence"],
+        }, "required": ["loopId", "loopVersion", "status", "evidence"]}},
         "extractedKnowledge": {"type": "object", "properties": {
             "person_updates": {"type": "array", "items": {"type": "object", "properties": {
                 "canonical_id": {"type": "string"}, "person_name": {"type": "string"},
@@ -256,7 +263,7 @@ BRIEF_RESPONSE_SCHEMA = {
                 "facts": {"type": "array", "items": {"type": "object", "properties": {
                     "fact": {"type": "string"}, "memory_type": {"type": "string"},
                     "confidence": {"type": "number"}, "change_type": {"type": "string"},
-                    "source_ref": {"type": "string"}}}},
+                    "source_ref": {"type": "string"}}, "required": ["fact", "source_ref"]}},
                 "profile_patch": {"type": "object", "properties": {
                     "title": {"type": "string"}, "company": {"type": "string"}}},
                 # Typed edges between two people — closed vocabulary, enforced by
@@ -1273,14 +1280,12 @@ def _greeting_line(inputs: dict) -> str:
 
 
 def _finish_brief_presentation(out: dict) -> dict:
-    """Label the short agenda honestly and keep quiet-day boilerplate time neutral."""
+    """Remove redundant calendar boilerplate and keep quiet-day wording time neutral."""
     md = (out.get('brief_markdown') or '').replace(
         'Nothing needs you this morning; inbox is clear and no loops are open.',
         'Nothing needs your attention right now.')
-    note = brief_validate.CALENDAR_PREVIEW_NOTE
-    if note not in md:
-        md = re.sub(r'^(#{1,6}\s+Coming Up|\*\*Coming Up\*\*)[ \t]*$',
-                    lambda m: m.group(0) + '\n' + note, md, count=1, flags=re.I | re.M)
+    md = ''.join(line for line in md.splitlines(keepends=True)
+                   if not brief_validate.is_calendar_preview_note(line))
     return {**out, 'brief_markdown': md}
 
 
@@ -1319,6 +1324,9 @@ def _format_master_context(inputs: dict | None = None) -> str:
         import master_file  # noqa: PLC0415
         from personal_context import render_feedback
         parts = [master_file.render_for_prompt()]
+        if master_file.priorities()["priorities"]:
+            parts.append("\nExplicit priorities break ties after real urgency, deadlines and commitments. "
+                         "They never suppress an unrelated obligation or manufacture urgency.\n")
         for reader in (render_feedback,):
             try:
                 parts.append(reader())
@@ -1334,9 +1342,15 @@ def build_prompt(template: str, inputs: dict) -> str:
     google = _obj(inputs, "google")
     # A meeting you declined is not on your day: it never reaches the prompt at all.
     events = [e for e in meeting_events(_arr(google, "events")) if not _is_declined(e)]
-    emails_raw = _arr(google, "emails")
+    emails_raw = [e for e in _arr(google, "emails") if not relevance.is_automated_assistant(e)]
 
-    local = resolve_contact_names(_normalize_local(inputs))
+    local = _normalize_local(inputs)
+    # Keep assistant conversations in the connected source for explicit chat lookup, but exclude
+    # them from proactive extraction using the same provenance predicate as triage and digest.
+    for key in ("imessage", "whatsapp", "deferred_unread_imessage", "deferred_unread_whatsapp"):
+        if isinstance(local.get(key), list):
+            local[key] = [row for row in local[key] if not relevance.is_automated_assistant(row)]
+    local = resolve_contact_names(local)
     sa = _obj(local, "_source_availability")
 
     # Explicit user preferences (the sotto-feedback channel): suppress muted people from the
@@ -1533,6 +1547,8 @@ def _normalize_output(parsed: dict) -> dict:
     """Map the FLEX field names (markdown/actionItems/extractedKnowledge) onto the skill's
     normalized brief contract, accepting either naming so native and script paths agree."""
     out = dict(parsed) if isinstance(parsed, dict) else {}
+    for key in ("_represented_loops", "_review_candidate", "_review_question", "_parking_notices"):
+        out.pop(key, None)  # Internal delivery metadata is derived after model output, never trusted.
     # brief_markdown <- markdown
     if "brief_markdown" not in out and "markdown" in out:
         out["brief_markdown"] = out.get("markdown")
@@ -1544,6 +1560,7 @@ def _normalize_output(parsed: dict) -> dict:
         out["extracted_knowledge"] = out.get("extractedKnowledge")
 
     out.setdefault("brief_markdown", "")
+    out.setdefault("loop_updates", out.get("loopUpdates", []))
     out.setdefault("actions", [])
     out.setdefault("meetings_needing_prep", [])
     ek = out.setdefault("extracted_knowledge", {})
@@ -1588,16 +1605,24 @@ def _critic_mode() -> str:
 
 
 
-def _critic_decision(mode: str, payload_chars: int, n_actions: int, first_run: bool = False):
+def _critic_decision(mode: str, payload_chars: int, n_actions: int, first_run: bool = False,
+                     n_violations: int = 0):
     """(run, reason) — deterministic so it's testable and the brief log explains every skip. The
     FIRST brief always gets the second pass: it is the one the user judges Sotto on, and its shape
-    (a thin payload, few actions) is exactly the shape the auto rule would skip."""
+    (a thin payload, few actions) is exactly the shape the auto rule would skip.
+
+    A measured validator violation also always gets it. The revise pass is the ONLY thing that fixes
+    a dropped open loop or a never-tell-twice breach, and the auto rule was skipping the critic on
+    exactly the quiet brief where one is most visible — the violation was logged and never fixed.
+    SOTTO_CRITIC=off still wins: it is answered first, above every override."""
     if mode == "off":
         return False, "SOTTO_CRITIC=off"
     if mode == "always":
         return True, "SOTTO_CRITIC=always"
     if first_run:
         return True, "first brief — always reviewed"
+    if n_violations:
+        return True, f"{n_violations} validator violation(s) to fix"
     if payload_chars < CRITIC_AUTO_MIN_PAYLOAD_CHARS and n_actions <= CRITIC_AUTO_MIN_ACTIONS:
         return False, (f"auto: small brief — payload {payload_chars} < {CRITIC_AUTO_MIN_PAYLOAD_CHARS} chars "
                        f"and {n_actions} actions ≤ {CRITIC_AUTO_MIN_ACTIONS}")
@@ -1760,7 +1785,13 @@ def run_critic(brief_markdown: str, actions: list, manifest: dict, llm=call_gemi
                    + violations_block
                    + "\n\nAnalyze the brief against the manifest. Return JSON only.")
     try:
-        parsed = json.loads(llm(user_prompt, {"_critic": True}))
+        with model_work.brief_stage("critic"):
+            parsed = json.loads(llm(user_prompt, {"_critic": True}))
+    except model_work.ModelWorkHeldError as e:
+        # The gate's attempts are spent: the brief still ships (one per day, always) and the record
+        # says the gate did not run — never "passed". A quality stage may not cost the user a brief.
+        _diag(f"[compose_brief] critic stage held ({str(e)[:120]}) — brief delivered unrevised")
+        return {"patches": [], "score": -1, "summary": "critic held: attempts exhausted", "held": True}
     except Exception as e:  # noqa: BLE001
         _diag(f"[compose_brief] critic pass failed ({type(e).__name__}: {str(e)[:120]}) — brief unrevised")
         return {"patches": [], "score": -1, "summary": "critic unavailable"}
@@ -1777,7 +1808,7 @@ REVISE_SYSTEM = """You wrote the communication brief below. A quality critic fou
 
 A brief that omits a low-stakes thread is CORRECT, not incomplete. Never patch for coverage — fix the flagged issues without adding entries that don't meet the Needs Attention Now bar.
 
-Return JSON: {"brief_markdown":"<corrected brief>","actions":<the same actions[], with any added/fixed/removed per the patches>}."""
+Return JSON: {"brief_markdown":"<corrected brief>","actions":<the same actions[], with any added/fixed/removed per the patches>,"loop_updates":<the current task-specific updates, corrected only from original source evidence>}. Preserve exact loopId, loopVersion and evidence for supported updates. Remove an update if the evidence does not establish fulfillment of that specific task. Never infer completion from a person's name appearing in Already Handled."""
 
 
 
@@ -1797,7 +1828,8 @@ def critique_and_revise(out: dict, inputs: dict, llm=call_gemini, violations: li
             if not any(p["detail"] == v for p in actionable):
                 actionable.append({"type": "validator", "target": None, "detail": v, "severity": "moderate"})
         out["_critic"] = {"score": critic["score"], "summary": critic["summary"],
-                          "patches": len(critic["patches"]), "actionable": len(actionable)}
+                          "patches": len(critic["patches"]), "actionable": len(actionable),
+                          "held": bool(critic.get("held"))}
         if not actionable:
             return out
         patch_lines = "\n".join(f"- [{p['severity']}] {p['type']}: {p['detail']}" for p in actionable)
@@ -1810,13 +1842,18 @@ def critique_and_revise(out: dict, inputs: dict, llm=call_gemini, violations: li
                          + "\n\n## ORIGINAL SOURCE CONTEXT\n" + source_prompt
                          + "\n\n## CURRENT BRIEF\n" + _s(out.get("brief_markdown"))
                          + "\n\n## CURRENT ACTIONS\n" + json.dumps(out.get("actions", []))[:8000]
+                         + "\n\n## CURRENT OBLIGATION UPDATES\n" + json.dumps(out.get("loop_updates", []))
                          + "\n\nReturn the corrected JSON only.")
-        revised = _normalize_output(json.loads(llm(revise_prompt, {"_revise": True})))
+        with model_work.brief_stage("revise"):
+            revised = _normalize_output(json.loads(llm(revise_prompt, {"_revise": True})))
         if revised.get("brief_markdown"):
             revised["_critic"] = out["_critic"]
             revised["extracted_knowledge"] = out.get("extracted_knowledge", revised.get("extracted_knowledge"))
             revised.setdefault("meetings_needing_prep", out.get("meetings_needing_prep", []))
             return revised
+    except model_work.ModelWorkHeldError as e:
+        _diag(f"[compose_brief] revise stage held ({str(e)[:120]}) — delivering draft")
+        out.setdefault("_critic", {})["held"] = True
     except Exception as e:  # noqa: BLE001
         _diag(f"[compose_brief] critic/revise failed ({type(e).__name__}: {str(e)[:120]}) — delivering draft")
     return out
@@ -1955,6 +1992,10 @@ def _tap_target(action: dict, event_links: dict | None = None) -> tuple:
     resolving a calendar event id against the gathered events, and inferring a channel the model
     omitted. Chat-tappable channels throughout (wa.me/mailto:/tel:/sms:, not the Mac app's
     imessage://) because the brief is delivered in chat."""
+    # The one implementation decides what a phone-shaped identifier is (message_targets, the same
+    # rules action_links.link_for builds against) — digit-stripping here used to accept anything
+    # with 7+ digits in it, so a contact id like "contact_14155551234" became "+14155551234".
+    from message_targets import normalized_target  # noqa: PLC0415  (lib dir is on sys.path already)
     ch = _s(action.get("channel")).lower()
     a_type = _s(action.get("type") or action.get("action_type")).lower()
     ident = _s(action.get("contactIdentifier") or action.get("contact_identifier"))
@@ -1962,7 +2003,7 @@ def _tap_target(action: dict, event_links: dict | None = None) -> tuple:
     # treating them as email is how a WhatsApp action wrongly got a mailto: link. Strip the JID to its
     # phone, and only count a '@' as email when it is NOT a JID.
     is_jid = any(ident.endswith(s) for s in ("@s.whatsapp.net", "@g.us", "@lid", "@c.us"))
-    phone_digits = re.sub(r"\D", "", ident.split("@")[0] if is_jid else ident)
+    phone_digits = normalized_target("phone", ident.split("@")[0] if is_jid else ident).lstrip("+")
     email = _s(action.get("emailReplyTo")) or (ident if ("@" in ident and not is_jid) else "")
 
     # Routable guard (port of actionSchemas isRoutableIdentifier): only a real phone (>=7 digits) gets
@@ -2182,15 +2223,125 @@ def _append_procedure_offer(out: dict, inputs: dict) -> dict:
     rule = _s(inputs.get("_procedure_offer"))
     if not rule:
         return out
-    question = f"Heard you say: “{rule}” — make that a standing rule? Say yes and I'll remember it."
+    if out.get("_review_question"):
+        return out
+    question = f"You said: “{rule}”. Make that a standing rule? Say yes and I'll remember it."
     md = _s(out.get("brief_markdown"))
     out["brief_markdown"] = (md.rstrip() + "\n\n" + question + "\n") if md.strip() else question
+    out["_review_question"] = "procedure"
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import pending_offer  # noqa: PLC0415
         pending_offer.set_offer("procedure", question, detail=rule)
     except Exception:  # noqa: BLE001 — the question still lands; an explicit reply still works
         pass
+    return out
+
+
+HISTORY_STALE_HOURS = 24
+
+
+def _append_history_health(out: dict, inputs: dict, now=None) -> dict:
+    """Read the existing history checkpoint, never confuse a paused backfill with live sources."""
+    from pathlib import Path
+    import jsonstore
+    from source_context import allowed
+
+    path = Path(os.environ.get("SOTTO_DATA", "/data")) / "knowledge/history-state.json"
+    if not out.get("brief_markdown"):
+        return out
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        state = jsonstore.read(str(path), {}, strict=True)
+    except (OSError, ValueError, jsonstore.Unreadable):
+        state = None
+    # Managed permission includes connection status. Self-host compatibility defaults to allow,
+    # so require an observed source/checkpoint there before claiming its history should exist.
+    sources = _obj(state, "sources") if isinstance(state, dict) else {}
+    local = _obj(inputs, "local")
+    source_status = _obj(local, "source_status")
+    availability = _obj(local, "_source_availability")
+
+    def current_status(source):
+        # What the consumer derived for THIS brief wins over the Bridge's last status push: a
+        # snapshot that said "ok" yesterday must not outrank today's "unavailable".
+        return availability.get(source, source_status.get(source))
+
+    def status_is(value, accepted):
+        if isinstance(value, dict):
+            if value.get("enabled") is False or value.get("configured") is False:
+                return "negative" in accepted
+            if value.get("enabled") is True or value.get("configured") is True:
+                return "positive" in accepted
+            value = value.get("status")
+        normalized = _s(value).strip().lower()
+        if normalized in {"disabled", "not_configured"}:
+            return "negative" in accepted
+        return normalized in {"ok", "available", "connected", "enabled", "degraded"} \
+            and "positive" in accepted
+
+    def live_feed_down(source):
+        # The brief already tells the user when today's feed from a source is unavailable (a Mac
+        # asleep all weekend, a Bridge that lost the Messages permission). Its older history has
+        # stopped for the same reason, so a second line about the history would say one thing twice.
+        value = current_status(source)
+        return value is not None and not status_is(value, {"positive", "negative"})
+
+    known = {source for source, row in sources.items()
+             if isinstance(row, dict)
+             and (row.get("last_success") or row.get("complete")
+                  or any((row.get(key) or 0) > 0 for key in ("reviewed", "items", "pages")))}
+    known.update(source for source in ("imessage", "whatsapp", "gmail")
+                 if status_is(current_status(source), {"positive"}))
+    known.update(source for source in ("imessage", "whatsapp") if _arr(local, source))
+    if _arr(_obj(inputs, "google"), "emails"):
+        known.add("gmail")
+    known.update(source for source, result in _obj(inputs, "source_results").items()
+                 if isinstance(result, dict) and result.get("status") not in (None, "disabled", "not_configured"))
+    managed = os.environ.get("SOTTO_DEPLOYMENT_MODE") == "managed"
+    connected = [source for source in ("imessage", "whatsapp", "gmail")
+                 if allowed(source) and (managed or (source in known
+                                                     and not status_is(current_status(source), {"negative"})))]
+    if not connected:
+        return out
+    note = ""
+    if not isinstance(state, dict):
+        note = "I couldn't check background history learning, so past context may be incomplete."
+    else:
+        labels = {"imessage": "iMessage", "whatsapp": "WhatsApp", "gmail": "Gmail"}
+        stalled = []
+        for source in connected:
+            row = sources.get(source)
+            if not isinstance(row, dict) or live_feed_down(source):
+                continue
+            failed = bool(row.get("error") or row.get("error_code")
+                          or row.get("rejected_request_revision"))
+            last = parse_observed_time(row.get("last_success"))
+            # A source whose worker stopped also needs disclosure, not just explicit errors.
+            stale = last is not None and (now - last).total_seconds() > HISTORY_STALE_HOURS * 3600
+            if failed or stale:
+                stalled.append(labels[source])
+        if stalled:
+            note = ("Older " + ", ".join(stalled)
+                    + " history isn't up to date, so I may be missing past context.")
+        else:
+            receipt = _obj(state, "receipt")
+            hold = _obj(receipt, "dreamer").get("reason", "")
+            if hold == "background_budget_exhausted":
+                note = "Background history learning is paused at your spending limit."
+            elif hold == "background_budget_not_configured":
+                note = "Background history learning needs a budget or your explicit unlimited choice."
+            elif hold == "background_budget_unavailable":
+                note = "Background history learning is paused until a spending allowance is available."
+            elif hold:
+                note = "Background history learning is paused because its model connection needs attention."
+    if note:
+        # Put it directly below the greeting so both plain text and gallery captions retain it.
+        md = _s(out["brief_markdown"])
+        first, sep, rest = md.partition("\n")
+        out["brief_markdown"] = first + "\n\n" + note + ("\n" + rest if sep else "")
     return out
 
 
@@ -2397,7 +2548,6 @@ def _insert_before_filtered(md: str, block: str) -> str:
 
 
 OPEN_LOOP_ASKS_MAX = 3       # past this, one person's line is a list again — the thing we deleted
-OPEN_LOOPS_PATH = "/app#loops"   # the dashboard view that holds every open loop and its actions
 
 
 def _person_key(e: dict) -> str:
@@ -2421,18 +2571,24 @@ def _open_loop_line(entries: list, now=None) -> str:
     import brief_validate  # noqa: PLC0415  (_shared/lib is on sys.path)
     names = [n for n in (_s(e.get("contact_name")).strip() for e in entries) if n]
     name = next((n for n in names if brief_validate.is_name_shaped(n)), names[0] if names else "")
-    asks, seen = [], set()
+    ask_groups, by_ask = [], {}
     for e in entries:
         ask = _s(e.get("summary")).strip() or _s(e.get("ask")).strip()
-        if ask and ask.lower() not in seen:
-            seen.add(ask.lower())
-            asks.append(ask)
+        normalized = ask.lower()
+        if ask and normalized not in by_ask:
+            by_ask[normalized] = [ask, []]
+            ask_groups.append(by_ask[normalized])
+        if ask:
+            by_ask[normalized][1].append(e)
     oldest = min((_s(e.get("created_at")) for e in entries if _s(e.get("created_at"))), default="")
     age = _action_age(oldest, now)
-    shown, extra = asks[:OPEN_LOOP_ASKS_MAX], max(0, len(asks) - OPEN_LOOP_ASKS_MAX)
-    body = "; ".join(shown + ([f"+{extra} more"] if extra else [])) or "still open"
-    return (f"- {f'**{name}** — ' if name else ''}{body}"
-            + (f" ({age})" if age != "unknown" else ""))
+    shown = ask_groups[:OPEN_LOOP_ASKS_MAX]
+    extra = max(0, len(ask_groups) - OPEN_LOOP_ASKS_MAX)
+    body = "; ".join([group[0] for group in shown] + ([f"+{extra} more"] if extra else [])) or "still open"
+    markers = " ".join(f"<!--loop:{e['anchor_key']}-->" for _ask, rows in shown for e in rows
+                       if e.get("anchor_key"))
+    return (f"- {f'**{name}**: ' if name else ''}{body}"
+            + (f" ({age})" if age != "unknown" else "") + (" " + markers if markers else ""))
 
 
 def _receipt_identity(e: dict) -> str:
@@ -2477,8 +2633,8 @@ def _append_still_open(out: dict, open_ledger: list, now=None, today: str = "",
             grouped.setdefault(_person_key(e), []).append(e)
         lines = [_open_loop_line(entries, now) for entries in grouped.values()]
         if quiet:
-            lines.append(f"- {len(quiet)} other open loop{'' if len(quiet) == 1 else 's'} — "
-                         f"see {OPEN_LOOPS_PATH}")
+            lines.append(f"- {len(quiet)} other open loop{'' if len(quiet) == 1 else 's'}. "
+                         "Ask me what's still open.")
         block = "## Still open\n" + "\n".join(lines) + "\n\n"
         out["brief_markdown"] = _insert_before_filtered(md, block)
         _diag(f"[compose_brief] still-open backstop: {len(missed)} urgent loop(s) the brief dropped "
@@ -2502,6 +2658,56 @@ def _named_loops_path(day: str, kind: str) -> str:
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs", f"{day}.{kind}.named.json")
 
 
+_ASK_STOP_WORDS = frozenset("the a an to of and for with on in at from by your you our my his her their it its "
+                            "this that up out back please about re over".split())
+
+
+def _ask_is_visible(summary: str, visible: str) -> bool:
+    """Count only visible wording of the whole ask; shared verbs cannot prove its deliverable."""
+    words = {w for w in re.findall(r"[a-z0-9']+", summary) if w not in _ASK_STOP_WORDS}
+    shown = set(re.findall(r"[a-z0-9']+", visible))
+    return bool(words) and words <= shown
+
+
+def _represented_loop_rows(open_ledger: list, markdown: str) -> list:
+    """Exact obligation attribution; a contact marker cannot stand for all of their asks."""
+    def normalized(value):
+        return " ".join(re.sub(r"<!--.*?-->|[*_]", "", _s(value)).casefold().split())
+
+    import ledger_io
+    entries = [row for row in open_ledger or []
+               if isinstance(row, dict) and row.get("status") in ledger_io.ACTIVE]
+    signatures = {}
+    for row in entries:
+        signature = (normalized(row.get("contact_name")), normalized(row.get("summary")))
+        signatures[signature] = signatures.get(signature, 0) + 1
+    represented = {}
+    for line in _s(markdown).splitlines():
+        visible = normalized(line)
+        if not visible.strip(" -•#"):
+            continue  # A hidden marker on its own says nothing to the user.
+        markers = set(re.findall(r"<!--loop:([^<>\s]+)-->", line))
+        for row in entries:
+            key = _s(row.get("anchor_key"))
+            if not key:
+                continue
+            name, summary = normalized(row.get("contact_name")), normalized(row.get("summary"))
+            identity = bool(name and brief_validate._token_present(name, visible))
+            identity = identity or bool(brief_validate._entry_identifiers(row)
+                                        & brief_validate._brief_marker_ids(line))
+            if not identity:
+                continue
+            # Two ways a line counts as showing THIS ask, and both need the ask itself on the page.
+            # With the model's marker (`<!--loop:ID-->`), all of the ask's content words must be
+            # visible on that line: a hidden marker beside a birthday greeting shows nobody an
+            # agreement. Without a marker, the line quotes the ledger summary verbatim and that
+            # summary is unique for the person (the still-open backstop's own lines).
+            quoted = len(summary.split()) >= 2 and summary in visible
+            if (key in markers and _ask_is_visible(summary, visible)) or (quoted and signatures[(name, summary)] == 1):
+                represented[key] = row
+    return list(represented.values())
+
+
 def _record_named_loops(open_ledger: list, markdown: str, day: str, kind: str) -> None:
     """Record the anchor_keys of the open loops THIS brief named — the ones its narrative surfaced
     plus the ones the Still-open backstop printed. Best-effort and silent: without $SOTTO_DATA there
@@ -2510,11 +2716,13 @@ def _record_named_loops(open_ledger: list, markdown: str, day: str, kind: str) -
     if not os.environ.get("SOTTO_DATA"):
         return
     try:
-        import brief_validate  # noqa: PLC0415  (_shared/lib is on sys.path)
-        md = _s(markdown)
-        counted = {id(e) for e in brief_validate.unsurfaced_open_loops(md, open_ledger, day)}
-        keys = sorted({_s(e.get("anchor_key")).strip() for e in brief_validate.open_entries(open_ledger)
-                       if id(e) not in counted and _s(e.get("anchor_key")).strip()})
+        # Suppression stays intentionally conservative: identity in the delivered brief is enough
+        # to avoid telling the user about the same loop again that day. Delivery counting uses the
+        # stricter obligation matcher above and must remain a separate decision.
+        quiet = {id(row) for row in brief_validate.unsurfaced_open_loops(markdown, open_ledger, day)}
+        keys = sorted({_s(row.get("anchor_key")).strip()
+                       for row in brief_validate.open_entries(open_ledger)
+                       if id(row) not in quiet and _s(row.get("anchor_key")).strip()})
         path = _named_loops_path(day, kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -2645,6 +2853,53 @@ def _ledger_receipts(day: str) -> tuple:
     return chased, closed
 
 
+def _parking_tomorrow(day: str) -> list:
+    """Unwarned loops that would be parkable tomorrow, including an upgrade backlog.
+
+    Read-only: provider acceptance records the notice later. Exact candidate and notice-current
+    predicates live in ledger_io beside the resolver so composition cannot drift from mutation."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ledger_io  # noqa: PLC0415
+        tz = _resolve_tz(configured_tz() or "+00:00") or timezone.utc
+        today = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz)
+        entries = ledger_io.load_active(now=today)
+    except Exception:  # noqa: BLE001
+        return []
+    tomorrow = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    prefs = explicit_prefs()
+    muted_sections = {_s(value).lower().strip().replace(" ", "_")
+                      for value in prefs.get("mute_sections", [])}
+    if "what_moved_today" in muted_sections or "parking_notice" in muted_sections:
+        return []
+    return [e for e in entries
+            if ledger_io.park_candidate(e, tomorrow)
+            and not ledger_io.parking_notice_current(e)
+            and not _name_muted(e.get("contact_name"), prefs.get("mute_people", []))
+            and not _sender_is_muted(e.get("contact_identifier", ""),
+                                     prefs.get("mute_senders", []))]
+
+
+def _parking_line(entries: list) -> str:
+    """The actionable warning text, naming every row that may be acknowledged on delivery."""
+    return _parking_notice(entries)[0]
+
+
+def _parking_notice(entries: list) -> tuple[str, list]:
+    """Return (line, represented rows); only represented rows may become delivery effects."""
+    clauses = []
+    represented = []
+    for e in entries:
+        name, what = _s(e.get("contact_name")).strip(), _receipt_what(e)
+        clause = f"{name}: {what}" if name and what else (name or what)
+        if clause:
+            clauses.append(clause)
+            represented.append(e)
+    if not clauses:
+        return "", []
+    return "Parks tomorrow unless you say *keep*: " + "; ".join(clauses) + ".", represented
+
+
 def _held_count(day: str, tz: str) -> int:
     """How many interruptions Sotto held back today — surfaced.jsonl rows whose verdict was `queue`
     with a deliberate hold class. Count only: the waiting room already carries every detail, and a
@@ -2700,7 +2955,7 @@ def _has_meetings_on(events: list, day: str, tz: str) -> bool:
     return False
 
 
-def _receipt_lines(inputs: dict, day: str, tz: str) -> list:
+def _receipt_lines(inputs: dict, day: str, tz: str, parking_entries=None) -> list:
     """The block's lines, each rendered ONLY when its number is nonzero. Deliberately NOT here: a
     'Sotto nudged you N times' line. Today's delivered nudges already reach the user twice — on
     their phone at the time, and compressed into the brief by the Already Nudged Today block — so a
@@ -2723,6 +2978,13 @@ def _receipt_lines(inputs: dict, day: str, tz: str) -> list:
     if held:
         lines.append(f"Held {held} interruption{'' if held == 1 else 's'} until a better moment.")
 
+    # The day-before warning: a loop you owe parks tomorrow, and one word keeps it. Nothing has
+    # moved on it — that is the point — but the block is the one place the evening speaks about
+    # the ledger, and a silent park is the auto-expiry this replaced.
+    parking = _parking_line(_parking_tomorrow(day) if parking_entries is None else parking_entries)
+    if parking:
+        lines.append(parking)
+
     # Prep is only a receipt when there is something it prepped FOR: research runs on a horizon, so
     # a count with no meetings tomorrow would be a claim about work nobody is about to need.
     tomorrow = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -2741,6 +3003,9 @@ def _append_receipts(out: dict, inputs: dict, now=None) -> dict:
     """Append `## What moved today` to the EVENING brief, just before the Filtered section (after
     Still open, which lands at the same seam first). Never suppresses or delays the brief: any
     failure — unreadable ledger, missing cache, malformed day — renders nothing at all."""
+    # `_normalize_output` intentionally preserves unknown model fields. This field alone authorizes
+    # a post-acceptance ledger write, so only the deterministic candidate read below may create it.
+    out.pop("_parking_notices", None)
     try:
         if (_s(inputs.get("type")) or "morning") != "evening":
             return out
@@ -2748,14 +3013,96 @@ def _append_receipts(out: dict, inputs: dict, now=None) -> dict:
         if not md:
             return out
         tz = _brief_tz(inputs)
-        lines = _receipt_lines(inputs, _brief_day(tz, now), tz)
+        day = _brief_day(tz, now)
+        parking_entries = _parking_tomorrow(day)
+        parking, represented = _parking_notice(parking_entries)
+        lines = _receipt_lines(inputs, day, tz, parking_entries=parking_entries)
         if not lines:
             return out                      # nothing moved → no block (see the note above)
+        import ledger_io  # noqa: PLC0415
+        import delivery_effects  # noqa: PLC0415
         block = "## What moved today\n" + "\n".join(f"- {ln}" for ln in lines) + "\n\n"
+        if parking:
+            out["_parking_notices"] = [{"kind": "parking_notice",
+                                         "anchor_key": row["anchor_key"],
+                                         "loop_version": delivery_effects.loop_version(row),
+                                         "touch": ledger_io.last_touch_day(row)}
+                                        for row in represented if row.get("anchor_key")]
         out["brief_markdown"] = _insert_before_filtered(md, block)
         _diag(f"[compose_brief] what-moved receipts: {len(lines)} line(s)")
     except Exception:  # noqa: BLE001
         pass
+    return out
+
+
+def _append_weekly_review(out: dict, inputs: dict, now=None) -> dict:
+    """A short review within Friday's evening artifact, with the same mute/correction controls."""
+    out.pop("_review_candidate", None)
+    if inputs.get("type") != "evening" or not out.get("brief_markdown"):
+        return out
+    day = datetime.strptime(_brief_day(_brief_tz(inputs), now), "%Y-%m-%d").replace(
+        tzinfo=_resolve_tz(_brief_tz(inputs)) or timezone.utc)
+    if day.weekday() != 4:
+        return out
+    prefs = explicit_prefs()
+    muted = {str(value).lower().replace(" ", "_") for value in prefs.get("mute_sections", [])}
+    if "weekly_review" in muted:
+        return out
+    try:
+        import retune_scan
+        import ledger_io
+        live = {row.get("anchor_key"): row for row in ledger_io.load_active(now=day)}
+        rows = [row for row in retune_scan.scan(now=day)["stale_loops"]
+                if not _name_muted(row["name"], prefs.get("mute_people", []))
+                and not _sender_is_muted(live.get(row["anchor_key"], {}).get("contact_identifier", ""),
+                                         prefs.get("mute_senders", []))]
+        # Parked rows are not in load_active (that is what parked means); the review counts them
+        # once a week so nothing kept is ever invisible.
+        parked = sum(1 for row in ledger_io.load_entries()
+                     if row.get("status") in ledger_io.PARKED
+                     and not _name_muted(row.get("contact_name"), prefs.get("mute_people", []))
+                     and not _sender_is_muted(row.get("contact_identifier", ""),
+                                              prefs.get("mute_senders", [])))
+    except (OSError, ValueError, TypeError):
+        return out
+    candidate = None
+    question_available = not out.get("_review_question")
+    repeated = next((row for row in rows if row.get("times_surfaced", 0) >= retune_scan.STALE_SURFACED
+                     and row.get("surface_count_provenance") == "accepted_delivery"), None)
+    if question_available and not inputs.get("_procedure_offer") and repeated is None:
+        import review_candidates
+        candidate = review_candidates.choose(now or datetime.now(timezone.utc), prefs)
+    if not rows and not parked and not candidate:
+        return out
+    shown = rows[:3]
+    if repeated and repeated not in shown:
+        shown = [repeated, *shown[:2]]
+    lines = [f"- **{row['name']}**: {row['what']} <!--loop:{row['anchor_key']}-->" for row in shown]
+    if len(rows) > 3:
+        lines.append(f"- {len(rows) - 3} more to review. Ask me what's still open.")
+    if parked:
+        lines.append(f"- {parked} parked because nothing touched "
+                     f"{'it' if parked == 1 else 'them'} in {ledger_io.PARK_AFTER_DAYS} days. "
+                     "Say *keep* to bring one back.")
+    if question_available and not inputs.get("_procedure_offer") and repeated:
+        question = (f"I've included {repeated['name']}'s request in {repeated['times_surfaced']} "
+                    "brief deliveries. Keep it, snooze it, or let it go?")
+        lines.append(question)
+        out["_review_question"] = "weekly_repeated"
+        import pending_offer
+        pending_offer.set_offer("handoff", question, person=repeated["name"],
+                                detail=repeated["what"], anchor_key=repeated["anchor_key"])
+    elif question_available and candidate:
+        action = (f"make {candidate['name']} a VIP" if candidate["candidate_type"] == "vip"
+                  else f"make staying in touch with {candidate['name']} a priority")
+        lines.append(f"Would you like to {action}? {candidate['explanation']} "
+                     f"Say “{candidate['command']}” to confirm.")
+        out["_review_candidate"] = candidate["effect"]
+        out["_review_question"] = "weekly_candidate"
+    elif rows or parked:
+        lines.append("Keep, snooze or dismiss any of these when you are ready.")
+    out["brief_markdown"] = _insert_before_filtered(out["brief_markdown"],
+        "## Weekly review\n" + "\n".join(lines) + "\n\n")
     return out
 
 
@@ -2827,6 +3174,59 @@ def _append_update_notice(out: dict) -> dict:
     return out
 
 
+def _bind_brief_fact_evidence(out: dict, inputs: dict) -> None:
+    """A generated reference cannot count as independent evidence unless this snapshot has it."""
+    from render_local import message_evidence_id
+    refs = {}
+    local = unwrap_tool_result(inputs.get("local") or {})
+    lanes = [(source, records) for source, records in local.items() if isinstance(records, list)]
+    lanes.extend((source, _arr(_obj(inputs, "google"), key))
+                 for source, key in (("gmail", "emails"), ("calendar", "events")))
+    granola = inputs.get("granola")
+    lanes.append(("granola", granola if isinstance(granola, list) else _arr(granola or {}, "meetings")))
+    for source, records in lanes:
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            ids = {_s(record.get(key)) for key in ("source_id", "id", "messageId", "message_id", "guid", "rowid", "threadId")}
+            if source in ("imessage", "whatsapp"):
+                ids.add(message_evidence_id(record, source))
+            observed_at = parse_observed_time(record.get("timestamp") or record.get("date")
+                                              or record.get("internalDate"))
+            observed = observed_at.date().isoformat() if observed_at else ""
+            for ident in ids - {""}:
+                refs[ident] = observed
+                refs[f"{source}:{ident}"] = observed
+    evidence_counts = {"accepted": 0, "rejected": 0}
+    for person in _arr(out.get("extracted_knowledge") or {}, "person_updates"):
+        if not isinstance(person, dict):
+            continue
+        supported = []
+        for fact in person.get("facts") or []:
+            if not isinstance(fact, dict):
+                evidence_counts["rejected"] += 1
+                continue
+            ref = _s(fact.get("source_ref"))
+            if not ref or ref not in refs:
+                evidence_counts["rejected"] += 1
+                continue
+            fact.pop("evidence_refs", None)  # this brief contract has one observed reference per fact
+            fact.pop("observed_date", None)  # observation time belongs to the source, not the model
+            if ref and re.fullmatch(r"\d{4}-\d{2}-\d{2}", refs[ref]):
+                fact["observed_date"] = refs[ref]
+            supported.append(fact)
+            evidence_counts["accepted"] += 1
+        person["facts"] = supported
+    out["learning_evidence"] = evidence_counts
+    if evidence_counts["rejected"]:
+        _diag(f"[compose_brief] learning evidence: {evidence_counts['accepted']} accepted, "
+              f"{evidence_counts['rejected']} rejected (unobserved source reference)")
+
+
+import model_work  # noqa: E402
+
+
+@model_work.procedure('brief')
 def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     """Run the FULL FLEX extraction. The static policy half of the template goes out as Gemini's
     systemInstruction (byte-stable → implicit prefix caching) with the three-field responseSchema
@@ -2834,7 +3234,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     user prompt plus the original inputs dict; an llm that accepts system=/schema= kwargs (the real
     call_gemini) also gets those. With critic=True, the second-pass critic+revise quality gate runs
     per SOTTO_CRITIC ("auto" default / "always" / "off" — see _critic_decision); critic=False never
-    runs it. brief_validate runs post-extraction on every path (log-only; feeds the critic)."""
+    runs it. brief_validate runs post-extraction on every path; its prose violations never fail a brief,
+    they are handed to the revise pass — and a violation is itself enough to make that pass run."""
     try:
         metrics.start_run()                                # cost/latency accumulator for THIS run
     except Exception:  # noqa: BLE001
@@ -2870,7 +3271,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     # Retry extraction once with the identical full context; fail before the invalid output
     # reaches the critic or post-compose learning/archive. Short quiet-day briefs remain valid.
     for attempt in range(2):
-        raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
+        with model_work.brief_stage("extract"):
+            raw = _invoke_llm(llm, prompt, inputs, system=system_text, schema=BRIEF_RESPONSE_SCHEMA)
         try:
             out = _normalize_output(json.loads(raw))
         except (ValueError, TypeError):
@@ -2925,7 +3327,8 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     if critic:
         payload_chars = max(0, len(prompt) - len(user_template))  # the rendered source data, sans template
         run, reason = _critic_decision(_critic_mode(), payload_chars, len(out.get("actions") or []),
-                                       first_run=_is_first_run(inputs, {}))
+                                       first_run=_is_first_run(inputs, {}),
+                                       n_violations=len(violations))
         _diag(f"[compose_brief] critic {'ran' if run else 'skipped'} ({reason})")
         if run:
             out = critique_and_revise(out, inputs, llm, violations=violations, source_prompt=prompt)
@@ -2933,18 +3336,19 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
             out["_critic"] = {"skipped": True, "reason": reason}
     # The greeting goes on first — after the validator and the critic have judged the prose, so
     # neither ever sees a heading with nothing under it.
+    _bind_brief_fact_evidence(out, inputs)
     out = _finish_brief_presentation(out)
     out = _prepend_greeting(out, inputs)
+    out = _append_history_health(out, inputs, _brief_now(inputs))
     # Last line of defence for the open-items contract (runs after the critic's retry had its chance)
     if inputs.get("type") != "welcome":
         out = _append_still_open(out, open_ledger, _brief_now(inputs), brief_day,
                                  reported=_reported_chase_keys(inputs, brief_day))
     # …and the record of which loops that left NAMED, so the chase lane can tell a genuine
     # double-tell from a nudge about something this brief never mentioned.
-    _record_named_loops(open_ledger, out.get("brief_markdown"), brief_day,
-                        _s(inputs.get("type")) or "morning")
     # …and then the evening's outcome receipts, read from the record rather than written by a model.
     out = _append_receipts(out, inputs, _brief_now(inputs))
+    out = _append_weekly_review(out, inputs, _brief_now(inputs))
     # …and last, the one-line "a newer Sotto is published" notice — housekeeping, once per version.
     if inputs.get("type") != "welcome":
         out = _append_update_notice(out)
@@ -2955,6 +3359,14 @@ def compose(inputs: dict, llm=call_gemini, critic: bool = False) -> dict:
     # chat-tappable wa.me/mailto:/tel:/sms: link per action; calendar actions resolve via the event
     # map. LAST, so the critic's own rewrites are held to the same allowlist as the first draft.
     result = _attach_tap_links(out, event_links, allowlist)
+    import delivery_effects
+    represented = _represented_loop_rows(open_ledger, result.get("brief_markdown"))
+    result["_represented_loops"] = [{"anchor_key": row["anchor_key"],
+                                     "loop_identity": delivery_effects.loop_identity(row),
+                                     "loop_version": delivery_effects.loop_version(row)}
+                                    for row in represented]
+    _record_named_loops(open_ledger, result.get("brief_markdown"), brief_day,
+                        _s(inputs.get("type")) or "morning")
     # The chat-deliverable text: markers stripped, WhatsApp-safe formatting (chatfmt.to_chat is the
     # ONE such transformation). Deterministic here so delivery never depends on the agent
     # remembering to sed the markers out. brief_markdown stays untouched for records/critic/actions.

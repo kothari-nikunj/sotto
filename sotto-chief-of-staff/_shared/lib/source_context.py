@@ -18,6 +18,24 @@ SOURCE_STATUSES = frozenset({'ok', 'partial', 'unavailable', 'disabled', 'skippe
 CONTEXT_SOURCES = tuple(SOURCE_FIELDS) + ('gmail', 'calendar', 'granola')
 
 
+class HistoryProtocolError(ValueError):
+    """An authenticated history response violates the paging contract."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+class HistoryContinuationError(HistoryProtocolError):
+    """Only the continuation token this window is holding is dead; the window itself is valid.
+
+    Carries a code and nothing else: a provider reason phrase must never reach a state file.
+    """
+
+    def __init__(self, code='expired_continuation_token'):
+        super().__init__(code)
+
+
 def permission_fingerprint():
     """Stable work identity: a source toggle starts a new brief instead of reusing old text."""
     permissions = {source: allowed(source) for source in CONTEXT_SOURCES}
@@ -172,9 +190,9 @@ def history_page(source, since, until, before=0, limit=500):
         raise RuntimeError('source consent changed during history read')
     if (not isinstance(result, dict) or result.get('source') != source
             or result.get('status') != 'ok' or not isinstance(result.get('rows'), list)):
-        raise RuntimeError('history requires a connected source and an updated Bridge')
+        raise HistoryProtocolError('invalid_history_page')
     cursor = result.get('next_cursor')
     if result.get('complete') is not True and (not isinstance(cursor, int) or isinstance(cursor, bool)
                                               or cursor <= 0 or (before and cursor >= before)):
-        raise ValueError('history cursor did not advance')
+        raise HistoryProtocolError('history_cursor_did_not_advance')
     return result

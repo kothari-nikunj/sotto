@@ -767,26 +767,61 @@ def normalize_mcp(gmail_raw_path, cal_raw_path, sent_raw_path=None):
     return merge_sent(emails, sent), events
 
 
+CONTINUATION_REJECTED_REASONS = frozenset({
+    'INVALID_ARGUMENT', 'FAILED_PRECONDITION', 'invalidArgument', 'failedPrecondition',
+    'invalid', 'badRequest'})
+
+
+def _continuation_rejected(error, page_token) -> bool:
+    """Google rejected the page token we resumed from: the window is fine, its cursor is dead.
+
+    Read only the structured status/reason — a provider message can quote private content, so it
+    never leaves this function. Without a page token nothing in the request can have gone stale,
+    so a 400 there is an ordinary deterministic rejection of the request itself.
+    """
+    if not page_token:
+        return False
+    status = getattr(getattr(error, 'resp', None), 'status', None)
+    status = status if status is not None else getattr(error, 'status_code', None)
+    try:
+        if int(status) != 400:
+            return False
+        detail = json.loads(getattr(error, 'content', None) or b'{}').get('error') or {}
+        reasons = {str(detail.get('status') or '')}
+        reasons.update(str(item.get('reason') or '') for item in detail.get('errors') or []
+                       if isinstance(item, dict))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(reasons & CONTINUATION_REJECTED_REASONS)
+
+
 def history_page(since: int, until: int, page_token: str = '', limit: int = 100, service=None, now=None):
     """Frozen-window Gmail history through the existing credential builder; resume real API pages.
 
     Both directions are searched together. No attachments or writes. A failed get fails the page,
     so the caller never advances its checkpoint over missing messages.
     """
-    from source_context import allowed
+    from source_context import HistoryContinuationError, HistoryProtocolError, allowed
     if not allowed('gmail'):
         raise RuntimeError('Gmail history is not enabled')
     epoch = int((now or datetime.datetime.now(datetime.timezone.utc)).timestamp())
     if (not all(isinstance(v, int) and not isinstance(v, bool) for v in (since, until, limit))
             or not 1 <= limit <= 100 or since > until or since < epoch - 366*86400 or until > epoch + 60):
-        raise ValueError('invalid Gmail history window')
+        # The same typed rejection the Bridge adapter raises, so one deterministic protocol
+        # failure has one implementation and the caller parks it instead of retrying hourly.
+        raise HistoryProtocolError('invalid_history_window')
     own_service = service is None
     service = service or _gmail_service()
     try:
         params = {'userId': 'me', 'q': f'after:{since} before:{until + 1}', 'maxResults': limit}
         if page_token:
             params['pageToken'] = page_token
-        page = service.users().messages().list(**params).execute()
+        try:
+            page = service.users().messages().list(**params).execute()
+        except Exception as error:
+            if _continuation_rejected(error, page_token):
+                raise HistoryContinuationError() from error
+            raise
         messages = []
         for item in page.get('messages', []):
             full = _native_fetch_message(service, item['id'])

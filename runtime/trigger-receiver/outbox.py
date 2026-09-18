@@ -23,7 +23,9 @@ WHAT THE CHANNEL ACKNOWLEDGES. The shared Hermes adapter requires structured suc
 provider message ID. CLI exit zero alone is insufficient. The outbox retains this acceptance
 receipt, then applies the delivery effects. Acceptance does not prove device arrival or reading;
 a spawned model run exiting zero says nothing about delivery. Failed effects retry five times
-without sending the message again, then quarantine with their recovery evidence retained.
+without sending the message again, then quarantine: the acceptance receipt, the label, the run id
+and the reason stay on file, and the effects' per-source addressing leaves it exactly as it does on
+the applied path — a row that will never replay has no use for a handle or a thread id.
 
 WHERE THE CHANNEL-HEALTH GATE STAYS. `receiver._delivery_channel_ready` is an on-disk probe (are
 there WhatsApp creds?), and by its own docstring it cannot tell a live channel from a dead one. It
@@ -93,6 +95,7 @@ import os
 import sys
 import threading
 import time
+import fcntl
 
 # The tree's ONE content-id scheme (sha256 of a line, 16 hex). keys.py is the byte-identical
 # vendored copy the receiver image carries; the outbox's idempotency key is that scheme applied to
@@ -172,6 +175,7 @@ RETENTION_SECS = 7 * 24 * 3600   # terminal rows linger a week so "what failed?"
 _DRAIN_LOCK = threading.Lock()   # one drain at a time, whatever calls it
 _INFLIGHT: set = set()           # ids being sent right now — the check-through-accept claim
 _INFLIGHT_LOCK = threading.Lock()
+_EFFECT_LOCK_STATE = threading.local()
 
 
 def _root() -> str:
@@ -232,7 +236,7 @@ def _prune(rows: list, now: float) -> list:
     transition may end a row's life — that is the whole promise)."""
     return [r for r in rows
             if r.get("status") not in TERMINAL or r.get("effects_pending")
-            or (now - float(r.get("created_at") or 0)) <= RETENTION_SECS]
+            or (now - float(r.get("finished_at") or r.get("created_at") or 0)) <= RETENTION_SECS]
 
 
 def _find(rows: list, key: str):
@@ -250,7 +254,26 @@ def _close(row: dict) -> dict:
     the Record need — and nothing a person said. Storing a delivered brief's text for a week would
     be exactly the situational keeping the standing bars forbid."""
     payload = dict(row.get("payload") or {})
+    row.setdefault("finished_at", time.time())
     row["payload"] = {"label": payload.get("label") or ""}
+    return payload
+
+
+def _quarantine(row: dict) -> dict:
+    """End a row whose post-delivery effects gave up, and hand its payload to the caller.
+
+    The message itself already went out; what stays on file for RETENTION_SECS is only what a human
+    needs to diagnose the quarantine — the label, the reason, the run id. The effects the row was
+    carrying are per-source ADDRESSING (handle, chat id, phone, email, thread id), and a row that
+    will never be replayed has no more use for them than a delivered one does, so it closes on the
+    same terms the applied path closes on."""
+    row["effects_pending"] = False
+    row["effects_status"] = "quarantined"
+    row["effects_error"] = "post-delivery effect failed permanently"
+    row["finished_at"] = time.time()    # retention on a quarantine ages from the quarantine
+    payload = _close(row)
+    if payload.get("run_id"):
+        row["payload"]["run_id"] = payload["run_id"]
     return payload
 
 
@@ -511,16 +534,49 @@ def _attempt(key: str) -> bool:
 
 
 def _apply_effects(key):
+    # An invalidation callback may synchronously enqueue and settle its replacement. It is already
+    # inside the one OS-locked effect lane, so permit that same thread to apply the nested row.
+    if getattr(_EFFECT_LOCK_STATE, 'held', False):
+        return _apply_effects_locked(key)
+    # One independent lock serializes callbacks without holding the outbox JSON transaction. A
+    # crashed process releases flock automatically; a busy callback makes another pass skip rather
+    # than wait behind user-facing work.
+    lock_fd = os.open(path() + '.effects.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        _EFFECT_LOCK_STATE.held = True
+        try:
+            return _apply_effects_locked(key)
+        finally:
+            _EFFECT_LOCK_STATE.held = False
+    finally:
+        os.close(lock_fd)
+
+
+def _apply_effects_locked(key):
     now = time.time()
+    exhausted = None
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
         if not row or not row.get('effects_pending') or now < row.get('effects_next_at', 0):
             return False
-        row['effects_next_at'] = now + 60
-        row['effects_attempts'] = int(row.get('effects_attempts') or 0) + 1
-        attempt = row['effects_attempts']
         payload = dict(row.get('payload') or {})
         phase = row.get('effect_phase', 'accepted')
+        # The attempt is persisted before invoking external effect code so a process death counts.
+        # On recovery, quarantine an already exhausted row before calling that crashing code again.
+        attempt = int(row.get('effects_attempts') or 0)
+        if attempt >= MAX_EFFECT_ATTEMPTS:
+            exhausted = _quarantine(row)
+        else:
+            attempt += 1
+            row['effects_next_at'] = now + 60
+            row['effects_attempts'] = attempt
+    if exhausted is not None:
+        _record_effect_quarantine(exhausted, phase)
+        return False
     try:
         # None is the legacy hook's successful return; explicit False is a retryable failure.
         ok = HOOKS['on_invalid' if phase == 'invalidate' else 'on_delivered'](payload) is not False
@@ -533,28 +589,31 @@ def _apply_effects(key):
             if row and row.get('status') in (STATUS_DELIVERED, STATUS_SUPERSEDED):
                 row['effects_pending'] = False
                 row['effects_status'] = 'applied'
+                row['finished_at'] = time.time()
                 _close(row)
     elif attempt >= MAX_EFFECT_ATTEMPTS:
         quarantined = None
         with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
             row = _find(_rows(doc), key)
             if row and row.get('effects_pending'):
-                row['effects_pending'] = False
-                row['effects_status'] = 'quarantined'
-                row['effects_error'] = 'post-delivery effect failed permanently'
-                quarantined = dict(row.get('payload') or {})
+                quarantined = _quarantine(row)
         print(f'[sotto] outbox: effects quarantined after {MAX_EFFECT_ATTEMPTS} attempts', flush=True)
         if quarantined is not None:
-            # A print line is not a receipt: the message DID go out, and the Record must say that
-            # what was supposed to follow it (a chase counted, an offer armed, a hand-off stamped)
-            # never happened — otherwise "why did Sotto never notice my yes?" has no answer.
-            detail = (f'superseded, but releasing its reservation for a fresh brief failed '
-                      f'permanently after {MAX_EFFECT_ATTEMPTS} attempts (quarantined)'
-                      if phase == 'invalidate' else
-                      f'delivered, but its follow-up effects failed permanently after '
-                      f'{MAX_EFFECT_ATTEMPTS} attempts (quarantined)')
-            _payload_receipt(quarantined, STATUS_FAILED, detail)
+            _record_effect_quarantine(quarantined, phase, announce=False)
     return ok
+
+
+def _record_effect_quarantine(payload, phase, announce=True):
+    if announce:
+        print(f'[sotto] outbox: effects quarantined after {MAX_EFFECT_ATTEMPTS} attempts', flush=True)
+    # A print line is not a receipt: the message DID go out, and the Record must say that what was
+    # supposed to follow it never happened — otherwise recovery has no durable explanation.
+    detail = (f'superseded, but releasing its reservation for a fresh brief failed '
+              f'permanently after {MAX_EFFECT_ATTEMPTS} attempts (quarantined)'
+              if phase == 'invalidate' else
+              f'delivered, but its follow-up effects failed permanently after '
+              f'{MAX_EFFECT_ATTEMPTS} attempts (quarantined)')
+    _payload_receipt(payload, STATUS_FAILED, detail)
 
 
 # ── The three public entry points ────────────────────────────────────────────────────────────────

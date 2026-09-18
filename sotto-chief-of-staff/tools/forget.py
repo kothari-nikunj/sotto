@@ -38,6 +38,10 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "_shared", "lib"))
+import jsonstore  # noqa: E402
+
 # Never a target, whatever a future verb asks for. Checked per path, not per verb, so a typo'd
 # glob can't reach the graph either.
 PROTECTED = ("knowledge/people", "knowledge/companies", "knowledge/continuity")
@@ -69,6 +73,9 @@ def _targets(verbs: set) -> list:
         add("knowledge/last_local_snapshot.json", "deleted")
     if "caches" in verbs:
         add("cache/research_*.json", "deleted")
+        add("events/notification-artifacts/*.json", "deleted")
+        add("events/triage-artifacts/*.json", "deleted")
+        add("events/research-artifacts/*.json", "deleted")
         add("cache/calendar_today.json", "deleted")
         add("cache/visual-briefs/*/*", "deleted")
     if "logs" in verbs:
@@ -95,12 +102,24 @@ def forget(verbs) -> dict:
             continue
         path = os.path.join(root, *rel.split("/"))
         try:
-            size = os.path.getsize(path)
             if action == "truncated":
-                with open(path, "w"):
-                    pass
+                # Coordinate only this file operation with diagnostic append/rotation. Other
+                # requested deletions remain independent and never wait behind the log writer.
+                with jsonstore.lock(path):
+                    size = os.path.getsize(path)
+                    with open(path, "w"):
+                        pass
             else:
-                os.remove(path)
+                # Receipt writers and retention rewrites use this same sidecar. Hold it across
+                # stat+unlink so a rewrite that already read the ledger cannot replace it after
+                # erasure and resurrect the user's history.
+                if rel in ("events/delivery.jsonl", "events/sends.jsonl"):
+                    with jsonstore.lock(path):
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                else:
+                    size = os.path.getsize(path)
+                    os.remove(path)
         except OSError as e:
             errors.append({"path": rel, "error": f"{type(e).__name__}: {e}"})
             continue

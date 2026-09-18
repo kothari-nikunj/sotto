@@ -117,6 +117,7 @@
 </style>
 </head>
 <body>
+<aside style="padding:12px 24px;font-size:13px" id="model-work-summary"></aside>
 
 <!-- THE RULES ISLAND — one shape, in both playgrounds. test_docs_drift.py compares every field
      below against the code constant that owns it. This is the only place a number is written. -->
@@ -158,9 +159,6 @@
     "start_hour": 21,
     "end_hour": 7
   },
-  "vip": {
-    "min_priority": 10
-  },
   "tier1": {
     "text_max_chars": 1500
   },
@@ -169,7 +167,8 @@
   },
   "freshness": {
     "event_max_age_min": 30,
-    "missed_call_max_age_min": 240
+    "missed_call_max_age_min": 240,
+    "delivery_fresh_nudge_min": 30
   },
   "cooldown": {
     "min": 20
@@ -210,7 +209,8 @@
   },
   "continuity": {
     "deadline_grace_days": 2,
-    "terminal_retention_days": 30
+    "terminal_retention_days": 30,
+    "park_after_days": 14
   },
   "retention": {
     "notes_cache_days": 1,
@@ -259,6 +259,9 @@
     "feedback_limit": 8,
     "source_retry_seconds": 3600,
     "unchanged_extraction_attempts": 2,
+    "unchanged_protocol_attempts": 2,
+    "unchanged_dreamer_attempts": 2,
+    "protocol_recheck_seconds": 86400,
     "conversation_messages": 12,
     "conversation_text_chars": 400,
     "conversation_total_chars": 4800
@@ -298,7 +301,8 @@
       "missed_call",
       "escalation",
       "post_meeting",
-      "calendar_change"
+      "calendar_change",
+      "meeting_prep"
     ],
     "meeting_hold_exempt": [
       "missed_call",
@@ -334,6 +338,7 @@
   },
   "work": {
     "background_max_wait_seconds": 1800,
+    "shutdown_grace_seconds": 10,
     "lease_seconds": 120,
     "max_attempts": 3,
     "max_workers": 2,
@@ -349,6 +354,7 @@
   },
   "brief": {
     "preparation_max_age_minutes": 30,
+    "artifact_max_age_hours": 2,
     "notes_cache_hours": 24,
     "welcome_seed_seconds": 20,
     "followup_retention_days": 7
@@ -361,6 +367,63 @@
   "proxy": {
     "requests_per_window": 60,
     "rate_window_seconds": 60
+  },
+  "model_work": {
+    "retention_days": 90,
+    "attempt_lease_seconds": 900,
+    "interruption_recoveries": 2,
+    "artifact_lock_shards": 256,
+    "notification_context_chars": 48000,
+    "attempts": {
+      "notification": 2,
+      "triage": 2,
+      "digest": 2,
+      "memory_extract": 2,
+      "memory_curate": 2,
+      "brief": 12,
+      "brief_extract": 6,
+      "brief_critic": 3,
+      "brief_revise": 3,
+      "followup": 2,
+      "research": 4
+    },
+    "output": {
+      "notification": 4096,
+      "triage": 2048,
+      "digest": 4096,
+      "memory_extract": 16384,
+      "memory_curate": 8192,
+      "brief": 65536,
+      "brief_extract": 65536,
+      "brief_critic": 65536,
+      "brief_revise": 65536,
+      "followup": 8192,
+      "research": 8192
+    },
+    "low_thinking_tasks": [
+      "notification",
+      "triage",
+      "digest",
+      "memory_extract",
+      "memory_curate",
+      "followup",
+      "research"
+    ],
+    "notification_copy_chars": 1200
+  },
+  "phase2": {
+    "history_stale_hours": 24,
+    "candidate_cooldown_days": 30,
+    "reply_sample_limit": 32,
+    "reply_min_samples": 2,
+    "learned_expiry_days": 60,
+    "confidence_decay_per_week": 0.08,
+    "vip_held_meetings": 3,
+    "vip_held_weeks": 3,
+    "vvip_held_meetings": 6,
+    "vvip_held_weeks": 4,
+    "meeting_attendee_cap": 1,
+    "priority_max": 3
   }
 }
 </script>
@@ -426,6 +489,14 @@
 <script>
 /* ═══════════════ the island, and the one function that reads it ═══════════════ */
 const R = JSON.parse(document.getElementById('sotto-rules').textContent);
+const mw = R.model_work;
+document.getElementById('model-work-summary').innerHTML =
+  '<p>One primary notification per push; templates survive writer failures. Scheduling stays a question until all calendars are covered. No daily dollar cutoff.</p>' +
+  '<table><tr><th>Operation</th><th>Attempts</th><th>Native output ceiling</th><th>Thinking</th></tr>' +
+  Object.entries(mw.attempts).map(([task,attempts]) => `<tr><td>${task}</td><td>${attempts}</td><td>${mw.output[task].toLocaleString('en-US')}</td><td>${mw.low_thinking_tasks.includes(task) ? 'low' : 'unchanged'}</td></tr>`).join('') +
+  '</table>' + `<p>Brief extraction, critic and revision own separate allowances. Stable job IDs preserve retries; later jobs may run again. Interrupted claims remain unknown spend with at most ${mw.interruption_recoveries} replacements after worker death or ${mw.attempt_lease_seconds} seconds. Receipts: ${mw.retention_days} days; lock shards: ${mw.artifact_lock_shards}; notification context: ${mw.notification_context_chars.toLocaleString('en-US')} characters; selected copy: ${mw.notification_copy_chars.toLocaleString('en-US')} characters.</p>` +
+  '<a href="BOUNDED-MODEL-WORK.md">Execution and accounting contract</a>';
+
 
 /** `{group.key}` -> the island's value. Formats: :min (secs->min), :mb (bytes->MB), :pct, :word, :slash, :list. */
 function fill(s){
@@ -492,10 +563,10 @@ const N = [
    d:'<p>A meeting that just ended becomes a synthetic <code>meeting_end</code> event, exactly once, {tap.grace_min} minutes after it wraps. It has its own daily cap ({tap.max_per_day}/day) rather than the shared interrupt budget, so taps and nudges never eat each other.</p>'},
   {id:'p-caldiff', l:'Calendar diff', s:'calcache.change_tick', x:574, w:126, layer:'producers',
    k:'Producer', file:'runtime/trigger-receiver/calcache.py',
-   d:'<p>Each refresh tick diffs the raw calendar against the last: a decline in your one-to-one meeting (within {calendar.decline_window_hours}h; group RSVPs and meetings you are not part of stay quiet), a last-minute invite (only within {calendar.invite_soon_hours}h — a next-day invite is scheduling, not an interrupt; plus a {calendar.invite_grace_min}-min grace for a meeting that just started), a move, a cancellation (each within {calendar.change_window_hours}h) — each distinct change becomes one synthetic <code>calendar_change</code> event, once, ever.</p><p>Room resources never count as people. Solo blocks, all-day events and internal standups never count. In the funnel the class is exempt from the budget, the in-meeting hold and the cooldown — a change expires with the meeting it is about — but snooze, quiet hours and mutes still hold it.</p><p><strong>The complete comparison baseline and accepted changes survive restart in <code>cache/calendar_changes.json</code>. Partial reads cannot prove cancellations; removed Calendar consent or an account change starts fresh. This lane is the only one allowed to interrupt you about a meeting.</strong> Google and Outlook also mail you a copy of every invite and RSVP; Tier 0\'s gate 4b queues those on sight, so one calendar change can never arrive twice.</p>'},
+   d:'<p>Each refresh tick diffs the raw calendar against the last: a decline in your one-to-one meeting (within {calendar.decline_window_hours}h; group RSVPs and meetings you are not part of stay quiet), a last-minute invite (only within {calendar.invite_soon_hours}h — a next-day invite is scheduling, not an interrupt; plus a {calendar.invite_grace_min}-min grace for a meeting that just started), a move, a cancellation (each within {calendar.change_window_hours}h) — each distinct change becomes a synthetic <code>calendar_change</code> event. One refresh enters triage as one batch, with individual durable acknowledgments for partial replay.</p><p>Room resources never count as people. Solo blocks, all-day events and internal standups never count. In the funnel the class is exempt from the budget, the in-meeting hold and the cooldown — a change expires with the meeting it is about — but snooze, quiet hours and mutes still hold it.</p><p><strong>The complete comparison baseline and accepted changes survive restart in <code>cache/calendar_changes.json</code>. Partial reads cannot prove cancellations; removed Calendar consent or an account change starts fresh. This lane is the only one allowed to interrupt you about a meeting.</strong> Google and Outlook also mail you a copy of every invite and RSVP; Tier 0\'s gate 4b queues those on sight, so one calendar change can never arrive twice.</p>'},
   {id:'p-proactive', l:'Proactive watcher', s:'proactive_scan.py', x:710, w:150, layer:'producers',
    k:'Producer · */{cron.proactive_min} cron', file:'proactive/scripts/proactive_scan.py',
-   d:'<p>Every {cron.proactive_min} minutes it asks what is genuinely due <em>now</em>: a one-shot intention, a meeting you haven\'t prepped, a commitment due today, one chase for something you\'re owed, a VIP/VVIP gift opportunity {birthday.lead_days} days out and a saved-contact greeting on the day, the plain question after an ask nobody answered {chase.max} times, or an offer to tidy a heavy pile.</p><p><strong>It is not a second lane.</strong> It decides only WHAT is due, then hands the tick to <code>triage()</code> in-process as one bundle — so it passes the same gates because it is the same code, and spends one budget unit for the whole push.</p>'},
+   d:'<p>The receiver gathers and scans before composing; empty results make no composer call. Eligible results use deterministic templates or the bounded direct writer. Accepted candidates share one work ID through composition, retries and delivery. Every {cron.proactive_min} minutes it asks what is due <em>now</em>: a one-shot intention, a meeting you haven\'t prepped, a commitment due today, one chase for something you\'re owed, a VIP/VVIP gift opportunity {birthday.lead_days} days out and a saved-contact greeting on the day, the plain question after an ask nobody answered {chase.max} times, or an offer to tidy a heavy pile.</p><p><strong>It is not a second lane.</strong> It decides only WHAT is due, then hands the tick to <code>triage()</code> in-process as one bundle — so it passes the same gates because it is the same code, and spends one budget unit for the whole push.</p>'},
   {id:'p-now', l:'Nudge me now', s:'dashboard → --promote', x:870, w:136, layer:'producers',
    k:'Producer · you', file:'runtime/trigger-receiver/dashboard.py',
    d:'<p>The Cadence page\'s waiting room: you pick something the funnel held and release it yourself. Routed through <code>triage_event.py --promote</code>, so even a human override rides the one funnel.</p>'},
@@ -510,7 +581,7 @@ const N = [
    d:'<p>Sessions, CSRF, CSP, lockout, the JSON API, and every write lever — facts, loops, prefs, cadence, graph, voice, run-now, golden labels.</p><p><strong>Every one of them shells out to the CLI chat uses</strong>, on one subprocess policy with a {intervals.dashboard_cli_fork_secs}-second budget. A tap on the dashboard and the same instruction typed in chat are byte-identical — which is what lets the dashboard be a complete alternative to chat without becoming a second implementation of the product.</p>'},
   {id:'m-cal', l:'calcache.py', s:'the ONE calendar cache', x:380, w:158, layer:'receiver',
    k:'Module', file:'runtime/trigger-receiver/calcache.py',
-   d:'<p>The gather fork, its {calendar.ttl_secs:min}-minute TTL, the refresh thread, the post-meeting tap detector, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → <code>calendar_change</code>).</p><p>The funnel refuses to hold on a snapshot older than {calendar.stale_intervals:word} refresh intervals, or one stamped with any day but the local today. <strong>Never act on a stale belief about where you are.</strong></p>'},
+   d:'<p>The gather fork, its {calendar.ttl_secs:min}-minute TTL, the refresh thread, the post-meeting tap detector with durable fired/pending cap reservations, and the calendar-diff detector (declines, last-minute invites, moves, cancellations → <code>calendar_change</code>).</p><p>The funnel refuses to hold on a snapshot older than {calendar.stale_intervals:word} refresh intervals, or one stamped with any day but the local today. <strong>Never act on a stale belief about where you are.</strong></p>'},
   {id:'m-conn', l:'connectors.py', s:'OAuth 2.1 + write_json', x:554, w:162, layer:'receiver',
    k:'Module', file:'runtime/trigger-receiver/connectors.py',
    d:'<p>The connector registry, both kinds. <code>SERVICES</code> are the ones with an auth server to click through (Granola). <code>KEY_PROVIDERS</code> are the ones without (Exa · Parallel · Browser Use Cloud · Gemini grounding) — rendered read-only beside them.</p><p>Its second job is the receiver\'s shared snapshot writer: <code>write_json</code>, tmp-at-0600 then <code>os.replace</code>. Skill-owned transaction files use the same replace pattern in their owning script.</p>'},
@@ -521,8 +592,8 @@ const N = [
   // ── the funnel ──
   {id:'f-t0', l:'Tier 0', s:'deterministic, free', x:30, w:158, layer:'funnel',
    k:'The funnel', file:'event-triage/scripts/triage_event.py',
-   d:'<p>In code order, and every gate is one sentence a stranger can check: a meeting that just ended · your own outbound · an answered call · an automated counterpart · a muted sender · a calendar-invite email · your own snooze · quiet hours ({quiet.start_hour}:00–{quiet.end_hour}:00) · a group that never named you · an unknown 1:1 · an event older than {freshness.event_max_age_min} minutes (missed calls keep a longer leash: they ring up to {freshness.missed_call_max_age_min} minutes after the call, then go to the digest/brief).</p><p>Sub-second and free. Most of the day\'s traffic never reaches a model at all.</p>',
-   pts:['<b>Gate 4b — an invite is a calendar action, not an email draft</b>: an <code>Invitation:</code> / <code>Accepted:</code> / <code>Canceled event:</code> subject queues as class <code>calendar_invite</code> <em>before</em> any Tier-1 call, so no model call is ever spent drafting “thanks for setting this up!”','<b>One owner for meeting interrupts</b> — the calendar lane, not the mail lane. A brand-new invite can only interrupt through <code>calcache</code>, and only when the meeting starts within {calendar.invite_soon_hours}h','<b>VIP is three checks, in this order</b> — the list you stated, an attention-queue priority of {vip.min_priority}+, then a typed <code>family_of</code> relation on their person file. Typed, not a word-grep: the old <code>\\bfamily\\b</code> scan over the raw file made anyone whose notes said “family office” your sibling']},
+   d:'<p>In code order, and every gate is one sentence a stranger can check: a meeting that just ended · your own outbound · an automated counterpart · a muted sender (before the per-channel branches, so a muted person's missed call drops too) · an answered call · a calendar-invite email · your own snooze · quiet hours ({quiet.start_hour}:00–{quiet.end_hour}:00) · a group that never named you · an unknown 1:1 · an event older than {freshness.event_max_age_min} minutes (missed calls keep a longer leash: they ring up to {freshness.missed_call_max_age_min} minutes after the call, then go to the digest/brief).</p><p>Sub-second and free. Most of the day\'s traffic never reaches a model at all.</p>',
+   pts:['<b>Gate 4b — an invite is a calendar action, not an email draft</b>: an <code>Invitation:</code> / <code>Accepted:</code> / <code>Canceled event:</code> subject queues as class <code>calendar_invite</code> <em>before</em> any Tier-1 call, so no model call is ever spent drafting “thanks for setting this up!”','<b>One owner for meeting interrupts</b> — the calendar lane, not the mail lane. A brand-new invite can only interrupt through <code>calcache</code>, and only when the meeting starts within {calendar.invite_soon_hours}h','<b>VIP is two checks, in this order</b> — the list you stated, then a typed <code>family_of</code> relation on their person file. Both are a CHOICE; message volume is not one, so the weekly pulse’s attention-queue priority no longer qualifies anyone — four messages and three days of silence must not clear quiet hours at 3 a.m. off a week-stale file. Typed, not a word-grep either: the old <code>\\bfamily\\b</code> scan over the raw file made anyone whose notes said “family office” your sibling']},
   {id:'f-t1', l:'Tier 1', s:'one cheap model call', x:204, w:170, layer:'funnel',
    k:'The funnel', file:'event-triage/scripts/triage_event.py',
    d:'<p>One small call on whatever survived Tier 0, capped at {tier1.text_max_chars} characters of text. It answers one question — is this an ask worth a person's attention — and these are the ask classes: {classes.tier1_nudge}. Only <code>urgent</code> nudges at once; the other two queue, and only the release valve can turn one into a nudge.</p><p><strong>Any Tier-1 error queues.</strong> The funnel fails toward silence, never toward noise.</p>'},
@@ -549,12 +620,12 @@ const N = [
    d:"<p>Checks structure, identifiers and deterministic obligations before delivery. Critic/revision uses these findings; the checks do not prove every claim or relevance judgment.</p><p>A person already nudged today, correlated to a delivery receipt, may not open the brief and takes at most {surfacing.already_nudged_max_lines} lines. Violations guide revision.</p>"},
   {id:'s-deliver', l:'deliver', s:'the deliver-once claim', x:542, w:164, layer:'skills',
    k:'Spine 04', file:'_shared/scripts/brief_marker.py',
-   d:"<p>Required knowledge and continuity writes precede outbox handoff. The outbox holds early composition until due, rechecks current eligibility, then claims the daily marker. Structured provider acceptance and a message ID complete delivery; this is not proof of reading.</p><p>The digest advances only to the accepted artifact\u2019s original coverage cutoff. An uncertain send can still duplicate if acceptance occurred before a crash and the provider has no idempotency contract.</p>",
+   d:"<p>Required knowledge and continuity writes precede outbox handoff. The outbox holds early composition until due, rechecks current eligibility, then claims the daily marker. Structured provider acceptance and a message ID complete delivery; this is not proof of reading.</p><p>Parking uses the same accepted-delivery effects: a task untouched for {continuity.park_after_days} days may leave the active list only after its named warning was accepted on an earlier local day. A changed task invalidates the notice; skipped or muted warnings leave it active. Keep and snooze preserve the original request date, and snooze restarts the parking clock on its return date.</p><p>The digest advances only to the accepted artifact\u2019s original coverage cutoff. An uncertain send can still duplicate if acceptance occurred before a crash and the provider has no idempotency contract.</p>",
    pts:['Before it claims at all, the row must have a composed brief behind it — an archive of today\'s <code>briefs/&lt;date&gt;_&lt;kind&gt;.json</code> less than {outbox.composed_brief_max_age_hours}h old — or it fails on the spot as <code>not_a_brief</code>, unclaimed, so a lane that can still compose is not stood down by an improvised recap','Accepted work has at most {work.max_attempts} attempts, a renewable {work.lease_seconds}s lease and a durable completed artifact','Required memory writes precede handoff; ancillary failures remain visible in the same Learn receipt']},
   {id:'s-learn', l:'learn', s:'one command, one receipt, every brief', x:722, w:168, layer:'skills',
    k:'Spine 05', file:'_shared/scripts/learn_step.py',
    d:"<p><code>learn_step.py</code> has two phases and one merged <code>briefs/&lt;date&gt;.&lt;kind&gt;.learned.json</code> receipt. Essential knowledge and continuity writes gate handoff; draft outcomes, voice, meeting-note learning and Contacts synchronization run as a durable ancillary job.</p><p>The receipt distinguishes queued, skipped, successful and failed writers. Ancillary failure retains inputs for retry without suppressing valid text. The standalone default still runs all six writers. Each writer has its existing {learn.step_timeout_secs:min}-minute bound.</p>",
-   pts:['<b>First useful look</b> — onboarding.py reserves once, seeds recent voice, and completes on delivery acknowledgement','<b>Between briefs</b> — memory_cycle.py reviews {learning.history_days} days progressively, storing only durable cited facts and never historical asks; self-host background model calls wait for the existing proxy with a finite tenant budget unless the owner explicitly enables unmetered BYOK','<b>Work-driven Dreamer</b> — one bounded changed-person batch per heartbeat selects evidence, archives duplicates and records unresolved conflicts','<b>Explicit usefulness</b> — bounded item examples reach relevance and drafting; silence never becomes a negative rating','<b>knowledge_update.py</b> — the brief\'s extracted facts','<b>continuity_resolve.py --merge-only</b> — the debts it found, each stamped with the brief that minted it so the evening can ask what happened to it','<b>draft_outcomes.py</b> — draft usage recorded and verbatim voice samples confirmed','<b>style_extract.py</b> — what you actually sent','<b>granola_graph.py</b> — one dated <code>Met on …</code> fact per attendee of every meeting of 8 or fewer','<b>prewarm_graph.py --sync-contacts</b> — every email and phone on a Contacts card as an identifier, plus the card\'s note and birthday']},
+   pts:['<b>First useful look</b> — onboarding.py reserves once, seeds recent voice, and completes on delivery acknowledgement','<b>Between briefs</b> — memory_cycle.py reviews {learning.history_days} days progressively, storing only durable cited facts and never historical asks; unchanged protocol failures get {learning.unchanged_protocol_attempts} attempts then one compatibility probe every {learning.protocol_recheck_seconds:hours}h, while transient failures retry normally','<b>Work-driven Dreamer</b> — one bounded changed-person batch per heartbeat selects evidence, archives duplicates and records unresolved conflicts; an unchanged malformed response gets {learning.unchanged_dreamer_attempts} attempts then waits for changed request or evidence, without a new daily count','<b>Explicit usefulness</b> — bounded item examples reach relevance and drafting; silence never becomes a negative rating','<b>knowledge_update.py</b> — the brief\'s extracted facts','<b>continuity_resolve.py --merge-only</b> — the debts it found, each stamped with the brief that minted it so the evening can ask what happened to it','<b>draft_outcomes.py</b> — draft usage recorded and verbatim voice samples confirmed','<b>style_extract.py</b> — what you actually sent','<b>granola_graph.py</b> — one dated <code>Met on …</code> fact per attendee of every meeting of 8 or fewer','<b>prewarm_graph.py --sync-contacts</b> — every email and phone on a Contacts card as an identifier, plus the card\'s note and birthday']},
 
   // ── memory ──
   {id:'k-graph', l:'knowledge_update', s:'the people & company graph', x:30, w:190, layer:'memory',
@@ -563,7 +634,7 @@ const N = [
    pts:['<b>The graph is the register</b> — a seeded contact index adopts a person file\'s canonical id on any identifier overlap; it never mints a second one and forks the human','<b>Your words outrank the pipeline</b> — a <code>user_edit</code> fact is exempt from stale-pruning and an About you corrected is one research declines to overwrite','<b>A dismissed merge stays dismissed</b> — “these really are two people” tombstones the pair, newest 100 kept, and it is never suggested again']},
   {id:'k-cont', l:'continuity_resolve', s:'knowledge/continuity/*.md', x:236, w:186, layer:'memory',
    k:'Memory · the one writer', file:'morning-brief/scripts/continuity_resolve.py',
-   d:'<p>The open-loop ledger. All mutation paths use its lock and atomic replace. Ordinary replies close what you owe; they never close what someone owes you. A future deadline prevents age expiry, and source-backed Granola commitments require an explicit close.</p><p>Before a Granola write, code checks the meeting id, copied quote, named owner and action/deliverable words against the gathered source; ambiguity drops instead of opening a loop. Occurrence identity is meeting id + direction + verbatim source snippet. The model may suggest one existing anchor; code accepts only a live same-direction match, so no fuzzy matcher is needed.</p>',
+   d:'<p>The obligation ledger keeps separate asks separate and groups them only for readable presentation. Unique source evidence can recover an existing task if its ID is omitted; a different message alone never creates a task. Age, a passed deadline, an unreachable counterpart, a generic reply, or a calendar attendee never closes one.</p><p>The brief model may propose a loop update bound to one ledger id and revision plus the source message id and verbatim quote. Code verifies counterpart, direction, original timestamp and quote against the snapshot; missing or ambiguous evidence leaves the obligation open, and explicit user corrections win.</p>',
    pts:['Owed to you: chase-due after {chase.after_days} silent days, at most {chase.max} chases','Only a DELIVERED chase counts — one quiet hours swallowed is not one of them','After the last one it asks you in plain words, once']},
   {id:'k-prefs', l:'preferences.json', s:'stated preferences', x:438, w:164, layer:'memory',
    k:'Memory · the one shared-write file', file:'_shared/scripts/preferences.py',
@@ -579,7 +650,7 @@ const N = [
   // ── delivery ──
   {id:'d-spawn', l:'_spawn_and_deliver', s:'the ONE place a skill runs', x:30, w:196, layer:'delivery',
    k:'Delivery', file:'runtime/trigger-receiver/receiver.py',
-   d:'<p>Runs the skill one-shot (<code>$SOTTO_RUN_SKILL</code>, default <code>hermes -z</code>) on a daemon thread, then hands its final text to <code>hermes send</code>. <strong>Every lane starts here</strong> — including the two briefs, since their schedule moved onto the receiver\'s own clock: there is no second path that composes and delivers a brief outside the outbox.</p><p>Each verdict carries a <code>decision_id</code>. A proactive chase leaves one run-scoped effects file; the receiver applies it only after the host send succeeds, then deletes it either way. A failed send cannot count as “already nudged” or consume a chase.</p>'},
+   d:'<p>Runs a bounded durable work job: direct procedures for briefs, digest, pulse and proactive notifications. Proactive and event notifications use templates or the bounded direct writer; the adapter-owned agent handles conversational skill jobs. The existing outbox owns sending. <strong>Every lane starts here</strong> — including the two briefs, since their schedule moved onto the receiver\'s own clock: there is no second path that composes and delivers a brief outside the outbox.</p><p>Each verdict carries a <code>decision_id</code>. A proactive chase leaves one run-scoped effects file; the receiver applies it only after the host send succeeds, then deletes it either way. A failed send cannot count as “already nudged” or consume a chase. Exact represented loop IDs count only after accepted delivery; obsolete bookkeeping never cancels a brief; Friday candidate offers use the same effects with a {phase2.candidate_cooldown_days}-day cooldown. Existing history checkpoints supply a plain brief line after {phase2.history_stale_hours} stale hours; no new timer or store is added.</p>'},
   {id:'d-send', l:'hermes send', s:'--to $SOTTO_CRON_DELIVER', x:242, w:172, layer:'delivery',
    k:'Delivery', file:'adapters/hermes/start.sh',
    d:'<p>Pipes text to whichever platform Hermes is already configured for, targeting the home channel — <strong>the same variable every scheduled job delivers to</strong>, so a nudge and a brief can never land in different places.</p><p>An empty run is recorded and never sent. Silence is the correct, common output for every one of these skills.</p>'},
@@ -680,6 +751,11 @@ const VIEWS = [
    the other. Keep the array shape — the guard reads it with a regex. */
 // Managed pilot holds scheduled and wake-triggered briefs until first owner DM and a consented connected source.
 const SHARED_FILES = [
+  ["events/model-work.sqlite3", "shared model_work.py", "opaque attempt claims and usage; 90-day pruning on use"],
+  ["events/notification-artifacts/", "compose_notification.py", "validated notification copy and bounded lock shards; seven-day output retention"],
+  ["events/research-artifacts/", "research_attendees.py", "coalesced batch results and bounded lock shards; seven-day output retention"],
+  ["events/triage-artifacts/", "relevance.py", "validated event classifications and bounded lock shards; seven-day output retention"],
+
   [".sotto-volume.json", "managed_volume.py initialize", "managed boot and recovery verify the mounted tenant identity"],
   [".sotto-runtime.lock", "runtime_lock.py", "supervisor and offline recovery refuse concurrent writers"],
   [".sotto-recovery-hold.json", "recovery.py restore", "managed boot holds a restored tenant until explicit activation"],
@@ -688,7 +764,7 @@ const SHARED_FILES = [
   ["config/model-lease.json", "model_lease.py", "receiver renewal heartbeat and operator recovery diagnostics"],
   ["config/cloud-pairing.sqlite", "cloud_pairing.py", "device grant redemption, authentication, listing and revocation"],
   ["config/source-state.json", "source_context.py", "consent-aware source readers and history learning"],
-  ["knowledge/history-state.json", "memory_cycle.py", "setup/diagnostics; actual per-source coverage and bounded work receipt"],
+  ["knowledge/history-state.json", "memory_cycle.py", "setup/diagnostics; per-source coverage, two-attempt protocol/Dreamer latches, Gmail resets guarded by progress within each window, 24-hour compatibility probe and bounded work receipt"],
   ["knowledge/dreamer.json", "dreamer.py", "changed-file selection"],
   ["knowledge/conflicts.json", "knowledge_update.consolidate", "knowledge_query; unresolved active fact pairs"],
   ["config/photon-activation.json", "managed Photon adapter (first owner DM)", "managed receiver gate and owner destination check"],
@@ -699,21 +775,23 @@ const SHARED_FILES = [
   ["config/settings.json", "receiver (/setup/timezone)", "receiver, dashboard, start.sh, skills"],
   ["briefs/&lt;date&gt;.&lt;kind&gt;.claim · briefs/&lt;date&gt;.&lt;kind&gt;.delivered", "receiver (and skills, brief_marker.py --claim)", "receiver (trigger dedup + the send seam's deliver-once gate)"],
   ["briefs/&lt;date&gt;.&lt;kind&gt;.payload.json", "receiver", "skills (compose_brief.py)"],
-  ["briefs/&lt;date&gt;_&lt;kind&gt;.json", "skills", "dashboard"],
+  ["briefs/&lt;date&gt;_&lt;kind&gt;.json", "skills", "dashboard; consent-aware item feedback"],
   ["briefs/&lt;date&gt;.&lt;kind&gt;.named.json", "skills (compose_brief.py)", "skills (proactive_scan.py — which loops that brief NAMED)"],
   ["briefs/&lt;date&gt;.&lt;kind&gt;.learned.json", "skills (learn_step.py — essential and ancillary receipt)", "receiver diagnostics; durable background learning may finish after delivery"],
   ["events/seen.json", "receiver", "receiver (idempotency ring — Bridge events)"],
-  ["events/gmail_seen.json", "skills (poll_gmail.py)", "skills (poll_gmail.py) — the same ring for polled Gmail"],
+  ["events/gmail_seen.json", "receiver via poll_gmail.py --ack", "skills — v2 inbox/sent query bounds, page cursors and pending IDs"],
   ["events/work.sqlite3", "work_queue.py", "receiver workers lease bounded accepted work and retain terminal results"],
   ["events/work-inputs/brief-&lt;run&gt;/", "brief_runner.py", "resumable brief and background learning procedures"],
   ["events/usage-&lt;job&gt;.json", "model metrics writer", "receiver attaches content-free usage to delivery receipts"],
   ["events/last.stamp", "receiver", "receiver (/setup liveness line)"],
   ["events/bundle-&lt;random&gt;.json", "receiver", "skills (the event one-shot)"],
   ["events/last_digest.txt", "skills (digest_check.py --stamp, and the brief that wins the claim)", "skills (the digest window), dashboard (/api/cadence)"],
+  ["events/digest_accepted.json", "skills after silent review; receiver after accepted delivery", "skills — durable conversation-version coverage"],
   ["events/queue.jsonl · events/surfaced.jsonl", "skills (triage_event.py)", "dashboard (the Record + the waiting room), skills (compose_brief.py)"],
   ["events/drafts.jsonl", "skills (action_links.py — every tap link built with a draft)", "skills (draft_outcomes.py, run directly by learn_step.py each brief)"],
   ["events/delivery.jsonl", "receiver (the ONE writer)", "dashboard (the Record, source: delivery) — closing rows carry a usage object"],
   ["events/outbox.json", "outbox.py (the ONE writer)", "receiver (the retry drain), dashboard (/api/runs pending·failed) — written before the first send attempt, flipped to delivered only on the channel's ack"],
+  ["events/outbox.json.effects.lock", "outbox.py", "Empty persistent OS lock serializing delivery effects; process exit releases ownership"],
   ["events/delivery-effects-&lt;run&gt;.json", "skills (proactive_scan.py, one receiver-scoped run)", "receiver — carried on the outbox row, applied once the message is acknowledged, then deleted"],
   ["events/sends.jsonl", "skills (google_action.py)", "you — one line per real-effect attempt (send, reply, calendar write), allowed or refused, with the payload's sha256"],
   ["cache/calendar_today.json", "calcache", "skills (the in-meeting hold)"],
@@ -733,12 +811,11 @@ const SHARED_FILES = [
   ["knowledge/last_local_snapshot.json", "skills (compose_brief.py)", "skills — the RAW Bridge payload, kept until deleted"],
   ["knowledge/snapshots/&lt;date&gt;.json", "skills (compose_brief.py — dated archive, last write of the day wins, pruned after 60d)", "build_golden_corpus.py — the corpus's message history"],
   ["corpus/&lt;version&gt;/", "build_golden_corpus.py (--out), dashboard Labels page (labels.yaml only)", "run_golden.py (scoring), dashboard Labels page — confidential regardless, never leaves the volume"],
-  ["knowledge/relationship_state.json", "skills (relationship_pulse.py)", "skills (compose_brief.py, the VIP floor), dashboard (attention queue)"],
+  ["knowledge/relationship_state.json", "skills (relationship_pulse.py)", "skills (compose_brief.py, engagement timing and gift importance), dashboard (attention queue)"],
   ["knowledge/&lt;kind&gt;/*.md · style.json · outcomes.jsonl", "skills", "dashboard (read), skills"],
   ["logs/compose_brief.log", "skills", "receiver (/debug/brief-log)"],
   ["proactive/&lt;date&gt;.json", "skills (proactive_scan.py)", "skills — the once-per-day nudge dedup, under the funnel's lock"],
   ["proactive/wake_run.last", "receiver (handle_proactive_wake)", "receiver — its mtime IS the sleep→wake throttle"],
-  ["proactive/retune_offer.last", "skills (proactive_scan.py)", "skills — the retune-offer cooldown stamp"],
   ["proactive/mute_offers.json", "legacy file — no current writer", "no current reader; automatic mute offers are paused"],
   ["proactive/pending_offer.json", "skills (pending_offer.py set — the ONE writer, the proactive lane after a push that asked something)", "the gateway (get, then clear) — the bare &quot;sure&quot; lands in a session that never saw the question; accepted question and provider receipt; ambiguous multiple offers require clarification"],
   ["intentions.jsonl", "skills (schedule_wakeup.py)", "skills (proactive_scan.py), dashboard (/api/cadence) — one-shot recipes, optionally tied to an open loop"],
@@ -963,10 +1040,11 @@ window.addEventListener('resize', fit);
 fit();
 </script>
 <p>Cloud and self-host briefs: durable work → gather/resolve → composer → essential memory → timed outbox release. Ancillary learning runs afterward. Hermes owns interactive chat and outbound transport.</p>
-<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared recovery core</h2><p>One Bridge and skill pack in both modes. Source observations preserve consent and coverage. Accepted work is durable before acknowledgment; the existing outbox remains the only sender. Brief research starts ten minutes early, composition becomes runnable two minutes before delivery, and the outbox releases on schedule. Provider acceptance activates replayable effects; optional learning cannot hold the brief.</p><p>Interactive Hermes behavior remains model-driven. Read receipts, inferred preferences and silence never authorize an external action.</p></section><section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared calendar and research</h2><p>Explicit context notes attach to a unique meeting with the same subject and exact interval; notes remain available without creating a second commitment. Coming Up is a calendar preview.</p><p>Hermes web tools use the same Sotto research providers as the pipeline. Failed reads and wholly invalid extractions retain their checkpoint. Each person is validated as a whole; invalid results are discarded while unrelated valid people can be learned. Partial pages advance with safe rejection counts in the existing history checkpoint, without storing rejected facts or adding a repair call. Conflicting source references fail before model access, and duplicate output subjects are all rejected. Native HTTP 400/422 extraction failures pause until the schema, prompt, native client implementation or model route changes; transient failures retry. A constant native response shape avoids page-sized grammar expansion; the writer still validates every citation and text bound. Source text is excluded from diagnostics.</p></section>
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared recovery core</h2><p>One Bridge and skill pack in both modes. Source observations preserve consent and coverage. Accepted work is durable before acknowledgment; the existing outbox remains the only sender. Queue opens preserve SQLite journal mode, while one immediate transaction serializes schema migration and mutation. Brief research starts ten minutes early, composition becomes runnable two minutes before delivery, and the outbox releases on schedule. Composition and saved-result handoff have separate bounded retries; shutdown stops dispatch and gives each worker a fair share of ten seconds to return its lease; a graceful stop refunds its phase, the shutdown refunds any lease its workers could not, and children still running are killed rather than orphaned. Provider acceptance activates replayable effects; an OS lock prevents callbacks overlapping, callback crashes consume the same bounded attempts before quarantine, a quarantined row keeps its receipt, label, run id and reason and drops the effects' addressing, and closed receipts age from settlement. Optional learning cannot hold the brief.</p><p>Interactive Hermes behavior remains model-driven. Read receipts, inferred preferences and silence never authorize an external action.</p></section><section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Shared calendar and research</h2><p>Explicit context notes attach to a unique meeting with the same subject and exact interval; notes remain available without creating a second commitment. Coming Up is a calendar preview.</p><p>Hermes web tools use the same Sotto research providers as the pipeline. Failed reads and wholly invalid extractions retain their checkpoint. Each person is validated as a whole; invalid results are discarded while unrelated valid people can be learned. Partial pages advance with safe rejection counts in the existing history checkpoint, without storing rejected facts or adding a repair call. Conflicting source references fail before model access, and duplicate output subjects are all rejected. Native HTTP 400/422 extraction failures pause until the schema, prompt, native client implementation or model route changes. Unchanged malformed history and Dreamer responses receive two attempts; history then probes compatibility every 24 hours, while Dreamer waits for changed request or evidence. Availability, network, timeout, HTTP 429 and HTTP 503 failures retry normally. Each background extraction or curation makes one upstream attempt; transient failures wait for the existing cycle instead of an immediate retry chain. Proxy-backed cycles validate the effective primary against advertised native models before reading history; finite exhausted budgets hold, while managed tenants can retain an explicit null budget. A Gmail window may restart again only after deeper progress within that same window. Completed windows never inflate the depth. An older checkpoint with unknown depth can restart once; an already-used reset without progress counts stays consumed across upgrades. No daily work count is added. A constant native response shape avoids page-sized grammar expansion; the writer still validates every citation and text bound. Source text is excluded from diagnostics.</p></section>
 <section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Mac source onboarding</h2><p>Cloud and self-host share the source list and Full Disk Access card. All Mac sources start on for new installs, with visible toggles before the first read. Google sign-in alone does not start collection. Startup and reconnect wait for source confirmation; explicit skip disables every Mac reader. Upgrades keep saved choices. Enabled, accessible and successfully read are separate states. Google handoff generations are durable before credential installation, so a crash cannot allow an older reconnect to restore superseded permissions.</p></section>
 <!-- Optional visual brief pilot: receiver presentation only; shared visual_brief.py templates,
 private cache/visual-briefs artifacts, same outbox validity and acknowledgement. See VISUAL-BRIEFS.md. -->
 <!-- Shared prose policy: sotto-chief-of-staff/_shared/references/writing-style.md feeds existing provider system instructions and the Hermes persona in both hosting modes. -->
+<section style="margin:32px auto;max-width:960px;padding:24px;border:1px solid currentColor;border-radius:12px"><h2>Replay and freshness</h2><p>Archive reasons are separate from fact provenance. Only an exact age-pruned fact revives; explicit and unknown legacy archives stay closed. A closed request does not mute a person: newer source-bound incoming evidence can open a new request. Briefs older than two hours are invalidated at delivery through the existing outbox, with ambiguous acceptance protected from duplicate sends. Replacement compositions have distinct learning receipts and jobs; stale follow-ups cannot consume replacement inputs.</p></section>
 </body>
 </html>

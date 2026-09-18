@@ -58,7 +58,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402
 
-KINDS = ("meeting_prep", "commitment", "chase", "handoff", "retune_offer", "procedure", "intention")
+KINDS = ("meeting_prep", "commitment", "chase", "handoff", "procedure", "intention")
 DEFAULT_TTL_MIN = 180   # a question goes stale in three hours; a named constant, not a knob
 
 # Declining an offer is not cancelling its obligation. Only explicit completion/cancellation
@@ -199,8 +199,8 @@ def claim_offer(offer_id: str, action: str, payload_sha256: str) -> tuple[dict, 
 def _fresh_offer(data) -> dict:
     if not isinstance(data, dict) or not data.get("question"):
         return {}
-    # A mute offer left by the old inference path is not fresh authorization after an upgrade.
-    if data.get("kind") == "mute":
+    # Retired inference/tune-up lanes are not fresh authorization after an upgrade.
+    if data.get("kind") in ("mute", "retune_offer"):
         return {}
     expires = _parse(data.get("expires_at", ""))
     if expires is None or _now() >= expires:

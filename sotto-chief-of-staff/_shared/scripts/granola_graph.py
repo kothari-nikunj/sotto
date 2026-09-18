@@ -32,6 +32,7 @@ Missing/empty/unparseable input is a no-op that exits 0 (fail toward silence).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -43,6 +44,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "lib"))
 sys.path.insert(0, os.path.join(_HERE, "..", "knowledge"))
 import knowledge as kg  # noqa: E402
 import knowledge_update as ku  # noqa: E402
+from relationship_importance import relationship_meeting_attendees  # noqa: E402
 from textutil import _arr, _is_excluded_domain, _is_likely_automated, _base_domain, _s  # noqa: E402
 from timeutil import configured_user_email  # noqa: E402
 
@@ -155,6 +157,20 @@ def run(granola: dict) -> dict:
     updates, skipped_large = build_updates(meetings)
     if updates:
         ku.apply({"person_updates": updates})
+        # The graph apply runs first so relationship_pulse can resolve attendee emails to the
+        # canonical people it just learned. Reuse this gather; history_only preserves the queue.
+        represented = {str(update["facts"][0].get("source_ref") or "") for update in updates}
+        user_email = configured_user_email()
+        observed = [{**meeting, "attendee_emails": relationship_meeting_attendees(
+                        meeting.get("attendee_emails"), user_email)}
+                    for meeting in meetings if _source_ref(meeting) in represented
+                    and relationship_meeting_attendees(meeting.get("attendee_emails"), user_email)]
+        pulse_path = os.path.join(_HERE, "..", "..", "relationship-pulse", "scripts",
+                                  "relationship_pulse.py")
+        spec = importlib.util.spec_from_file_location("granola_relationship_pulse", pulse_path)
+        pulse = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pulse)
+        pulse.observe_history({"granola_meetings": observed})
     return {"meetings": len(meetings), "people": len({u["identifier"] for u in updates}),
             "facts": len(updates), "skipped_large": skipped_large}
 

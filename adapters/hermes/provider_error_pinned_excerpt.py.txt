@@ -1,0 +1,97 @@
+import re
+from typing import Any, Optional
+
+INTERRUPT_WAITING_FOR_MODEL_PREFIX = "__interrupted__"
+
+def _gateway_platform_value(platform: Any) -> str:
+    return str(getattr(platform, "value", platform) or "").strip().lower()
+
+_GATEWAY_RAW_TEXT_PLATFORMS = frozenset({"local", "api_server", "webhook", "msgraph_webhook"})
+
+def _gateway_surface_passes_raw_text(platform: Any) -> bool:
+    return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+_GATEWAY_PROVIDER_POLICY_RE = re.compile(
+    r"(cybersecurity\s+risk|security\s+policy|safety\s+policy|policy\s+violation"
+    r"|violat(?:e|es|ed|ion)|blocked\s+(?:because|by|under)"
+    r"|request\s+(?:was\s+)?(?:blocked|rejected)|disallowed|moderation)", re.IGNORECASE)
+_GATEWAY_AUTH_ERROR_RE = re.compile(
+    r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key|\b401\b)",
+    re.IGNORECASE)
+_GATEWAY_RATE_LIMIT_RE = re.compile(
+    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)", re.IGNORECASE)
+_CONNECTION_ERROR_MARKERS = (
+    r"(?:\w+\.)?(?:api\s*)?connection\s*(?:error|timeout)", r"(?:\w+\.)?connect\s*(?:error|timeout)",
+    r"connection\s+refused", r"connection\s+reset", r"connection\s+aborted", r"actively\s+refused",
+    r"winerror\s+10061", r"errno\s+111", r"no\s+route\s+to\s+host", r"network\s+is\s+unreachable",
+    r"cannot\s+connect", r"failed\s+to\s+establish", r"could\s+not\s+connect")
+_GATEWAY_CONNECTION_ERROR_RE = re.compile("(" + "|".join(_CONNECTION_ERROR_MARKERS) + ")", re.IGNORECASE)
+
+_PROVIDER_ERROR_REPLIES = (
+    (_GATEWAY_AUTH_ERROR_RE, "⚠️ Provider authentication failed. Check the configured credentials; "
+                             "raw provider details are in the gateway logs."),
+    (_GATEWAY_PROVIDER_POLICY_RE, "⚠️ The model provider rejected the request. I kept the raw provider "
+                                  "error out of chat; check gateway logs for details or try rephrasing."),
+    (_GATEWAY_RATE_LIMIT_RE, "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."),
+    (_GATEWAY_CONNECTION_ERROR_RE, "⚠️ The model server is not responding — it looks like the configured "
+                                   "model endpoint is not running or is unreachable."))
+
+def _gateway_provider_error_reply(text: str) -> str:
+    for pattern, reply in _PROVIDER_ERROR_REPLIES:
+        if pattern.search(text):
+            return reply
+    return (
+        "⚠️ The model provider failed after retries. I kept raw provider details "
+        "out of chat; check gateway logs for diagnostics.")
+
+_PROVIDER_ERROR_MARKERS = (
+    r"api\s+(?:call\s+)?failed", r"provider\s+authentication\s+failed", r"non-retryable\s+error",
+    r"rate\s+limited\s+after\s+\d+\s+retries", r"error\s+code\s*:", r"http\s*\d{3}\b",
+    r"incorrect\s+api\s+key", r"invalid\s+api\s+key")
+_GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
+    r"^\s*(\W*\s*)?(" + "|".join(
+        _PROVIDER_ERROR_MARKERS + _CONNECTION_ERROR_MARKERS[:8]
+        + (r"all\s+connection\s+attempts\s+failed",)) + ")", re.IGNORECASE)
+
+def _looks_like_gateway_provider_error(text: str) -> bool:
+    if not text:
+        return False
+    body = str(text).strip()
+    if len(body) > 400 or body.count("\n") > 4:
+        return False
+    return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+
+def _redact_gateway_user_facing_secrets(text: str) -> str:
+    return str(text or "")
+
+def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+    if not text or _gateway_surface_passes_raw_text(platform):
+        return text
+    from agent.message_sanitization import _sanitize_surrogates
+    text = _sanitize_surrogates(str(text))
+    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return ""
+    redacted = _redact_gateway_user_facing_secrets(str(text))
+    if _looks_like_gateway_provider_error(redacted):
+        return _gateway_provider_error_reply(redacted)
+    return redacted
+
+_TELEGRAM_NOISY_STATUS_RE = re.compile(r"(?!x)x")
+_COMPRESSION_PROGRESS_STATUS_RE = re.compile(r"(?!x)x")
+def _gateway_compression_progress_notices_enabled():
+    return False
+
+def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    if _gateway_surface_passes_raw_text(platform):
+        return text
+    text = _redact_gateway_user_facing_secrets(text)
+    if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
+        _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
+    ):
+        return None
+    if _looks_like_gateway_provider_error(text):
+        return _gateway_provider_error_reply(text)
+    return text

@@ -35,7 +35,9 @@ CONFIDENCE_DECAY_PER_WEEK = 0.08
 CONFIDENCE_FLOOR = 0.4
 
 # Mutable fact types that may be superseded on medium similarity (knowledge_files.rs:1276)
-MUTABLE_TYPES = {"relationship_change", "working_style", "milestone", "context"}
+# "milestone" is NOT here: a milestone is a dated event that happened, so a second one never
+# replaces the first ("Met on <date>" x3 collapsed into one fact carrying the earliest date).
+MUTABLE_TYPES = {"relationship_change", "working_style", "context"}
 
 # ── Relations ─────────────────────────────────────────────────────────────────
 # ONE sentence: a relation is a typed edge between two people Sotto knows, stored on both ends,
@@ -72,12 +74,16 @@ _MONTHS = ("January", "February", "March", "April", "May", "June",
            "July", "August", "September", "October", "November", "December")
 
 # Dedup stop-words (knowledge_files.rs:1248-1254)
+# "per"/"web"/"search"/"met" are OURS, not the Rust port's: they are the fixed preamble every
+# writer stamps on its facts ("Per web search: …", "Met on …"), so counting them as content made
+# two unrelated facts about one person look like the same assertion.
 STOP_WORDS = {
     "the", "is", "are", "was", "were", "been", "being",
     "has", "have", "had", "does", "did", "will", "would", "could",
     "should", "may", "might", "shall", "can", "for",
     "with", "from", "and", "but", "not", "that",
     "this", "its", "their", "his", "her", "they", "she",
+    "per", "web", "search", "met",
 }
 
 # Company-name suffixes stripped during normalization (knowledge_files.rs:246-251)
@@ -146,6 +152,7 @@ def safe_path(directory: str, slug: str) -> str:
 class FactMeta:
     text: str = ""
     archived_text: Optional[str] = None
+    archived_reason: Optional[str] = None
     type: str = ""
     status: str = "active"
     seen: int = 1
@@ -161,6 +168,8 @@ class FactMeta:
         d: dict = {"text": self.text}
         if self.archived_text is not None:
             d["archived_text"] = self.archived_text
+        if self.archived_reason is not None:
+            d["archived_reason"] = self.archived_reason
         d["type"] = self.type
         d["status"] = self.status
         d["seen"] = self.seen
@@ -178,6 +187,7 @@ class FactMeta:
         return FactMeta(
             text=d.get("text", ""),
             archived_text=d.get("archived_text"),
+            archived_reason=d.get("archived_reason"),
             type=d.get("type", ""),
             status=d.get("status", "active"),
             seen=int(d.get("seen", 1)),
@@ -289,12 +299,21 @@ def make_dedupe_key(fact: str) -> set:
 BUMP, SUPERSEDE, NEW, SKIP = "bump", "supersede", "new", "skip"
 
 
+def can_revive_fact(fact: FactMeta, text: str) -> bool:
+    return (fact.status == "archived" and fact.archived_reason == "stale"
+            and fact.source != "user_edit"
+            and " ".join(fact.text.split()).casefold() == " ".join(text.split()).casefold())
+
+
 def find_similar_fact(facts: dict, new_text: str, new_type: str, force_correction: bool):
     """Returns (action, existing_id|None). Mirrors find_similar_fact()."""
     new_words = make_dedupe_key(new_text)
     if not new_words:
         return (NEW, None)
-    for fid, existing in facts.items():
+    # Active facts first: the first match wins below, and a tombstone that happens to sit before its
+    # active twin in file order (the dreamer archives the LATER copy of a duplicate, but a supersede
+    # archives the earlier one) would otherwise answer SKIP for an assertion that is alive.
+    for fid, existing in sorted(facts.items(), key=lambda kv: kv[1].status == "archived"):
         existing_words = make_dedupe_key(existing.text)
         if not existing_words:
             continue
@@ -307,7 +326,10 @@ def find_similar_fact(facts: dict, new_text: str, new_type: str, force_correctio
             if existing.status == "archived":
                 if force_correction:
                     continue
-                return (SKIP, None)
+                # Provenance says who supplied the assertion, not who removed it. Only a
+                # known age-prune may revive, and only for the exact assertion. Unknown legacy
+                # archives and superseded/corrected/duplicate facts remain tombstones.
+                return (BUMP, fid) if can_revive_fact(existing, new_text) else (SKIP, None)
             # High overlap is normally the SAME assertion re-observed → bump. But an explicit
             # correction shares most of its words with the fact it corrects ("is NOT the
             # founder of…"), and bumping would STRENGTHEN the wrong fact (+0.1 conf, decay
@@ -334,12 +356,22 @@ def generate_canonical_id(seed: str) -> str:
 
 
 # ── Decay / prune (knowledge_files.rs:507-525) ────────────────────────────────
+def fact_observation_date(fact: FactMeta) -> str:
+    """One evidence clock for confidence and retention; a repeated assertion is not corroboration."""
+    return fact.first if fact.seen <= 1 and fact.first else fact.last
+
+
 def effective_confidence(fact: FactMeta, now: Optional[datetime] = None) -> float:
     if fact.source == 'user_edit':
         return fact.conf
     today = (now or datetime.now()).date()
+    # A fact heard once has no corroboration clock to refresh. Older writers could advance `last`
+    # on a repeated/ref-less extraction, making the same unsupported assertion look young forever;
+    # age one-off facts from the first observation. Independently corroborated facts (seen > 1)
+    # still age from their latest evidence.
+    anchor = fact_observation_date(fact)
     try:
-        last = datetime.strptime(fact.last, "%Y-%m-%d").date()
+        last = datetime.strptime(anchor, "%Y-%m-%d").date()
     except (ValueError, TypeError):
         last = today
     days_since = max((today - last).days, 0)
@@ -355,9 +387,10 @@ def prune_stale_facts(facts: dict, now: Optional[datetime] = None) -> None:
         # outlive the correction. User words don't expire.
         if fact.source == "user_edit":
             continue
-        if fact.status == "active" and fact.seen <= 1 and fact.last < cutoff:
+        if fact.status == "active" and fact.seen <= 1 and fact_observation_date(fact) < cutoff:
             fact.status = "archived"
             fact.archived_text = fact.text
+            fact.archived_reason = "stale"
 
 
 def sorted_active_facts(facts: dict, now: Optional[datetime] = None):

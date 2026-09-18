@@ -133,3 +133,15 @@ def test_stubbed_compose_emits_brief_cost_line(tmp_path, monkeypatch):
     assert "est=n/a" in log                               # stub is unpriced
     assert "extract=" in log and "skipped=critic,revise" in log
     assert not (tmp_path / "logs" / "brief_metrics.jsonl").exists()
+
+
+def test_chat_usage_without_cache_detail_prices_the_upper_bound_and_says_so():
+    metrics.start_run()
+    metrics.set_phase("extraction")
+    metrics.note_response("gemini-3.8-flash", {"prompt_tokens": 1000, "completion_tokens": 300}, 1.0)
+    s = metrics.summary()
+    assert s["est_cost_usd"] == round(.001875, 4) and s["est_cost_basis"] == "upper_bound"
+    assert "$0.002≤" in metrics._human_line("2026-09-18", "morning", s, [])
+    metrics.note_response("gemini-3.8-flash", {"promptTokenCount": 1000, "cachedContentTokenCount": 0,
+                                               "candidatesTokenCount": 300, "thoughtsTokenCount": 0}, 1.0)
+    assert metrics.summary()["est_cost_basis"] == "upper_bound"   # one bounded call bounds the run

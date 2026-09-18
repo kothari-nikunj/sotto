@@ -46,10 +46,12 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
         if name == 'compose_brief.py':
             assert json.loads(path('--local').read_text())['imessage'][0]['text'] == 'fixture'
             out = json.dumps({'brief_text': 'Exact composed brief', 'actions': [{'summary': 'fixture debt'}],
-                              'extracted_knowledge': {'person_updates': []}})
+                              'extracted_knowledge': {'person_updates': []},
+                              'loop_updates': [{'loopId': 'fixture', 'status': 'resolved'}]})
         if name == 'learn_step.py':
             assert argv[argv.index('--phase')+1] == 'essential'
             assert json.loads(path('--continuity').read_text())['new_actions'] == [{'summary': 'fixture debt'}]
+            assert json.loads(path('--continuity').read_text())['loop_updates'] == [{'loopId': 'fixture', 'status': 'resolved'}]
             assert json.loads(path('--knowledge-out').read_text()) == {'person_updates': []}
         return SimpleNamespace(returncode=0, stdout=out, stderr='')
 
@@ -149,6 +151,30 @@ def test_essential_failure_retries_writes_without_paying_for_composition_again(p
     assert sum(phase == 'essential' for _, phase, _ in state['calls']) == 2
 
 
+def test_an_artifact_past_its_window_is_recomposed_and_a_fresh_one_is_reused(procedure, tmp_path):
+    """A saved composition is the day's brief only while it is still today's news. The greeting and
+    every "today" in it are stamped at compose time, so a retry hours later must re-gather rather
+    than resend a "good morning" with hours-old content — while a retry minutes later still costs
+    nothing. Same day, same work key, same marker: only the words are fresher."""
+    request, state = procedure
+    assert brief_runner.run(request) == 'A useful brief'
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    assert artifact['composed_at'] > 0
+    assert brief_runner.run(request) == 'A useful brief'
+    assert [name for name, _, _ in state['calls']].count('compose_brief.py') == 1, 'fresh: reused'
+    artifact['composed_at'] -= brief_runner.ARTIFACT_MAX_AGE_SECONDS + 1
+    (scratch / 'artifact.json').write_text(json.dumps(artifact))
+    assert brief_runner.run(request) == 'A useful brief'
+    names = [name for name, _, _ in state['calls']]
+    assert names.count('compose_brief.py') == 2 and names.count('gather_google.py') == 2
+    assert json.loads((scratch / 'artifact.json').read_text())['composed_at'] > artifact['composed_at']
+    # …and one written before this field existed carries no age it can prove: recompose.
+    (scratch / 'artifact.json').write_text(json.dumps({'brief_text': 'A stale brief'}))
+    assert brief_runner.run(request) == 'A useful brief'
+    assert [name for name, _, _ in state['calls']].count('compose_brief.py') == 3
+
+
 @pytest.mark.parametrize('failure', [OSError('volume unavailable'), json.JSONDecodeError('bad', 'x', 0)])
 def test_non_runtime_essential_failure_also_defers_after_delivery_security_gate(
         procedure, monkeypatch, failure):
@@ -239,6 +265,127 @@ def test_source_and_calendar_manifest_survives_retry_and_revocation_blocks_old_t
     assert len([c for c in state['calls'] if c[0] == 'compose_brief.py']) == composes + 1
 
 
+def test_saved_parking_notices_reach_outbox_effects_on_initial_run_and_retry(procedure, tmp_path, monkeypatch):
+    request, state = procedure
+    invoke = brief_runner.subprocess.run
+    notice = {'kind': 'parking_notice', 'anchor_key': 'owed-task',
+              'loop_version': 'b' * 64, 'touch': '2026-08-01'}
+
+    def with_notice(argv, **kwargs):
+        result = invoke(argv, **kwargs)
+        if Path(argv[1]).name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            value = json.loads(result.stdout)
+            value['_parking_notices'] = [notice]
+            result.stdout = json.dumps(value)
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', with_notice)
+    assert brief_runner.run(request) == 'A useful brief'
+    manifest = tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')
+    assert notice in json.loads(manifest.read_text())['effects']
+    before = list(state['calls'])
+    manifest.unlink()  # Simulate a new delivery attempt reusing the saved composition.
+    assert brief_runner.run(request) == 'A useful brief'
+    assert state['calls'] == before
+    assert notice in json.loads(manifest.read_text())['effects']
+
+
+def _write_loop(tmp_path, row):
+    import yaml
+    path = tmp_path / 'knowledge/continuity/represented-loop.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('---\n' + yaml.safe_dump(row, sort_keys=True) + '---\n')
+    return path
+
+
+@pytest.mark.parametrize('change, expected', [('bookkeeping', True), ('restatement', True),
+                                               ('new_obligation', False)])
+def test_represented_loop_is_bound_to_post_learning_material_version(
+        procedure, tmp_path, monkeypatch, change, expected):
+    request, state = procedure
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    monkeypatch.syspath_prepend(str(PACK / '_shared/scripts'))
+    import delivery_effects
+    import ledger_io
+
+    row = {'anchor_key': 'contact:reply:thread-1', 'status': 'open',
+           'summary': 'Send the revised proposal', 'action_type': 'reply',
+           'contact_name': 'Jordan', 'created_at': '2026-09-01T12:00:00Z'}
+    _write_loop(tmp_path, row)
+    represented = {'anchor_key': row['anchor_key'],
+                   'loop_version': delivery_effects.loop_version(row),
+                   'loop_identity': delivery_effects.loop_identity(row)}
+    invoke = brief_runner.subprocess.run
+
+    def with_represented_loop(argv, **kwargs):
+        result = invoke(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            value = json.loads(result.stdout)
+            value['_represented_loops'] = [represented]
+            result.stdout = json.dumps(value)
+        if name == 'learn_step.py' and argv[argv.index('--phase') + 1] == 'essential':
+            changed = ledger_io.load_entries()[0]
+            if change == 'bookkeeping':
+                changed['source_brief_at'] = '2026-09-08T09:00:00-07:00'
+            elif change == 'restatement':
+                changed['summary'] = 'Send the revised proposal and pricing appendix'
+            else:
+                changed['created_at'] = '2026-09-08T09:00:00-07:00'
+                changed['source_message_id'] = 'new-message'
+            _write_loop(tmp_path, changed)
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', with_represented_loop)
+    assert brief_runner.run({**request, 'work_key': f'represented-{change}'}) == 'A useful brief'
+    manifest_path = tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')
+    effects = json.loads(manifest_path.read_text())['effects']
+    surfaced = [effect for effect in effects if effect.get('kind') == 'loop_surfaced']
+    assert bool(surfaced) is expected
+    if expected:
+        assert surfaced == [{'anchor_key': row['anchor_key'], 'kind': 'loop_surfaced',
+                             'loop_identity': delivery_effects.loop_identity(
+                                 ledger_io.load_entries()[0]),
+                             'loop_version': delivery_effects.loop_version(
+                                 ledger_io.load_entries()[0]), 'delivery_id': 'a' * 32}]
+        assert delivery_effects.finalize(surfaced, {'accepted_at': 1788883200.0})
+        assert delivery_effects.finalize(surfaced, {'accepted_at': 1788883200.0})
+        saved = ledger_io.load_entries()[0]
+        assert delivery_effects.delivered_surface_count(saved) == 1
+
+        before = list(state['calls'])
+        assert brief_runner.run({**request, 'work_key': f'represented-{change}'}) == 'A useful brief'
+        assert state['calls'] == before
+        effects = json.loads(manifest_path.read_text())['effects']
+        assert [effect for effect in effects if effect.get('kind') == 'loop_surfaced'] == surfaced
+
+
+def test_saved_review_candidate_is_staged_with_delivery_identity(procedure, tmp_path, monkeypatch):
+    request, state = procedure
+    candidate = {'kind': 'review_candidate_offer', 'canonical_id': 'c_aaa111bbb222',
+                 'candidate_type': 'preferred_channel', 'payload_hash': 'b' * 64}
+    invoke = brief_runner.subprocess.run
+
+    def with_candidate(argv, **kwargs):
+        result = invoke(argv, **kwargs)
+        if Path(argv[1]).name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            value = json.loads(result.stdout)
+            value['_review_candidate'] = candidate
+            result.stdout = json.dumps(value)
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', with_candidate)
+    assert brief_runner.run({**request, 'work_key': 'review-candidate'}) == 'A useful brief'
+    manifest_path = tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')
+    effects = json.loads(manifest_path.read_text())['effects']
+    assert {**candidate, 'delivery_id': 'a' * 32} in effects
+    before = list(state['calls'])
+    assert brief_runner.run({**request, 'work_key': 'review-candidate'}) == 'A useful brief'
+    assert state['calls'] == before
+    effects = json.loads(manifest_path.read_text())['effects']
+    assert effects.count({**candidate, 'delivery_id': 'a' * 32}) == 1
+
+
 def test_learning_admission_failure_does_not_withhold_validated_brief(procedure, tmp_path, monkeypatch, capsys):
     request, state = procedure
     monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
@@ -260,3 +407,97 @@ def test_learning_admission_failure_does_not_withhold_validated_brief(procedure,
     assert brief_runner.run(request) == 'A useful brief'
     assert work_queue.claim(str(tmp_path), 'worker') is not None
     assert sum(name == 'compose_brief.py' for name, _, _ in state['calls']) == 1
+
+
+@pytest.mark.parametrize('followup_completed', [False, True])
+def test_recomposition_learns_new_generation_and_fences_old_followup(procedure, tmp_path, followup_completed):
+    import work_queue
+    request, state = procedure
+    assert brief_runner.run(request) == 'A useful brief'
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    old_job = work_queue.claim(str(tmp_path), 'old-learner')
+    old_request = json.loads(old_job['payload']['prompt'])
+    if followup_completed:
+        assert brief_runner.run(old_request) == 'NO_NUDGES'
+        work_queue.finish(str(tmp_path), old_job['id'], 'old-learner')
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    artifact['composed_at'] -= brief_runner.ARTIFACT_MAX_AGE_SECONDS + 1
+    (scratch / 'artifact.json').write_text(json.dumps(artifact))
+    assert brief_runner.run(request) == 'A useful brief'
+    assert sum(phase == 'essential' for _, phase, _ in state['calls']) == 2
+    before = list(state['calls'])
+    assert brief_runner.run(old_request) == 'NO_NUDGES'
+    assert state['calls'] == before and (scratch / 'current').exists()
+    if not followup_completed:
+        work_queue.finish(str(tmp_path), old_job['id'], 'old-learner')
+    new_job = work_queue.claim(str(tmp_path), 'new-learner')
+    new_request = json.loads(new_job['payload']['prompt'])
+    assert new_job['id'] != old_job['id']
+    assert new_request['learning_revision'] != old_request['learning_revision']
+    assert brief_runner.run(new_request) == 'NO_NUDGES'
+    assert not (scratch / 'current').exists()
+
+
+def test_failed_recomposition_never_exposes_partial_inputs_to_old_learner(procedure, tmp_path, monkeypatch):
+    import work_queue
+    request, state = procedure
+    brief_runner.run(request)
+    old_job = work_queue.claim(str(tmp_path), 'old')
+    old_request = json.loads(old_job['payload']['prompt'])
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    artifact['composed_at'] = 1
+    (scratch / 'artifact.json').write_text(json.dumps(artifact))
+    original = brief_runner.subprocess.run
+    def crash(argv, **kwargs):
+        if Path(argv[1]).name == 'compose_brief.py':
+            raise RuntimeError('synthetic composition interruption')
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', crash)
+    with pytest.raises(RuntimeError, match='synthetic composition'):
+        brief_runner.run(request)
+    assert not (scratch / 'artifact.json').exists()
+    before = list(state['calls'])
+    assert brief_runner.run(old_request) == 'NO_NUDGES'
+    assert state['calls'] == before
+    monkeypatch.setattr(brief_runner.subprocess, 'run', original)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert sum(phase == 'essential' for _, phase, _ in state['calls']) == 2
+
+
+def test_composition_age_is_staged_for_every_delivery_attempt(procedure, tmp_path):
+    import delivery_effects
+    request, _ = procedure
+    brief_runner.run(request)
+    manifest = json.loads((tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    expiry = artifact['composed_at'] + brief_runner.ARTIFACT_MAX_AGE_SECONDS
+    assert delivery_effects.valid(manifest['effects'], expiry - 1)
+    assert not delivery_effects.valid(manifest['effects'], expiry)
+
+
+def test_pre_upgrade_artifact_can_still_admit_its_legacy_learning_job(procedure, tmp_path):
+    import work_queue
+    request, state = procedure
+    brief_runner.run(request)
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    artifact.pop('learning_revision')  # the persisted shape before this change
+    (scratch / 'artifact.json').write_text(json.dumps(artifact))
+    before = list(state['calls'])
+    assert brief_runner.run(request) == 'A useful brief'
+    assert state['calls'] == before
+    run_key = hashlib.sha256(request['work_key'].encode()).hexdigest()[:24]
+    legacy = work_queue.get(str(tmp_path), work_queue.job_id_for('run', 'brief-learn:' + run_key))
+    assert legacy is not None
+    followup = json.loads(legacy['payload']['prompt'])
+    followup.pop('learning_revision', None)  # pre-upgrade queued requests omitted it as well
+    assert brief_runner.run(followup) == 'NO_NUDGES'
+    assert not (scratch / 'current').exists()
+
+
+def test_generation_body_timeout_is_not_classified_as_contention(tmp_path):
+    with pytest.raises(TimeoutError, match='operation timed out'):
+        with brief_runner._generation_lock(tmp_path):
+            raise TimeoutError('operation timed out')

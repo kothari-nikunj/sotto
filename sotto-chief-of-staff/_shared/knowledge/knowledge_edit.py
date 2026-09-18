@@ -37,8 +37,9 @@ so a hand-added loop is byte-shaped like every other ledger entry and the brief'
 loops_query and the dashboard read it natively. A hand-added loop carries `channel: manual` and
 `source: user_added`. A `you` item has no source thread to auto-close it; a `them` item with a known
 identifier may still close when that person delivers, because direction—not source—owns resolution.
-Re-adding the same ask on the same day dedupes onto the same anchor (times_surfaced bumps) rather
-than making a second file. `loop-deadline` writes the ONE field, which is also how a loop is
+Re-adding the same ask on the same day dedupes onto the same anchor rather than making a second
+file. Capture never counts as surfacing; only an accepted delivery receipt does. `loop-deadline`
+writes the ONE field, which is also how a loop is
 snoozed: the deterministic resolver expires a loop 2 days past its deadline, so moving the deadline
 forward is the only "later" the ledger has — there is no second snooze state to invent.
 
@@ -198,9 +199,10 @@ def op_correct(slug: str, fact_id: str, text: str, now: datetime | None = None) 
     today = kg.today_str(now)
     changed = False
     tgt = p2.facts.get(fact_id)
-    if tgt is not None and tgt.status != "archived":
+    if tgt is not None and (tgt.status != "archived" or tgt.archived_reason != "user_corrected"):
         tgt.status = "archived"
         tgt.archived_text = tgt.text
+        tgt.archived_reason = "user_corrected"
         changed = True
     if not any(f.status != "archived" and f.text == text for f in p2.facts.values()):
         fid = kg.generate_fact_id(p2.canonical_id, text, today)
@@ -220,9 +222,10 @@ def op_archive(slug: str, fact_id: str, now: datetime | None = None) -> dict:
     fact = p.facts.get(fact_id)
     if fact is None:
         raise EditError(f"fact not found: {fact_id}")
-    if fact.status != "archived":       # already archived → idempotent no-op rewrite-free
+    if fact.status != "archived" or fact.archived_reason != "user_archived":
         fact.status = "archived"
         fact.archived_text = fact.text  # mirror SUPERSEDE's history-keeping
+        fact.archived_reason = "user_archived"
         kg.write_person_file(path, p, now)
     return _result(path, p)
 
@@ -444,8 +447,8 @@ def _validated_deadline(deadline: str, allow_empty: bool = True) -> str:
 def _op_loop_add_unlocked(text: str, contact: str = "", identifier: str = "", deadline: str = "",
                           direction: str = "you", now: datetime | None = None, cr=None) -> dict:
     """Add ONE loop by hand, through continuity_resolve's own write path (see module docstring).
-    Anchored on a content hash of contact+text+day, so re-adding the same ask today bumps
-    times_surfaced instead of forking a second file; an entry the user already closed is never
+    Anchored on a content hash of contact+text+day, so re-adding the same ask today reuses the
+    existing file without counting another surfacing; an entry the user already closed is never
     resurrected (same rule apply_commitments applies)."""
     import hashlib
     text = _validated_text(text)
@@ -479,7 +482,6 @@ def _op_loop_add_unlocked(text: str, contact: str = "", identifier: str = "", de
     if existing is not None:
         if str(existing.get("status", "open")) in cr.TERMINAL:
             raise EditError("that loop was already closed — reopening isn't a thing; add a new one")
-        existing["times_surfaced"] = int(existing.get("times_surfaced", 1) or 1) + 1
         if deadline:
             existing["deadline"] = deadline
         cr._persist(existing)
@@ -488,7 +490,7 @@ def _op_loop_add_unlocked(text: str, contact: str = "", identifier: str = "", de
         "anchor_key": ak, "action_type": a.get("action_type"), "channel": a.get("channel"),
         "contact_name": a.get("contact_name"), "contact_identifier": a.get("contact_identifier"),
         "canonical_id": a.get("canonical_id"), "status": "open",
-        "created_at": created_at, "times_surfaced": 1,
+        "created_at": created_at,
         "summary": a.get("summary", ""), "ask": a.get("ask"),
         "meeting_time": a.get("meeting_time"), "deadline": a.get("deadline"),
         "source_thread_id": a.get("source_thread_id"),
@@ -546,12 +548,10 @@ def op_loop_retarget(anchor: str, text: str, contact: str = "", identifier: str 
                 "anchor_key": replacement_key, "action_type": action.get("action_type"),
                 "channel": action.get("channel"), "contact_name": action.get("contact_name"),
                 "contact_identifier": action.get("contact_identifier"), "status": "open",
-                "created_at": created_at, "times_surfaced": 1, "summary": text,
+                "created_at": created_at, "summary": text,
                 "deadline": action.get("deadline"), "source_thread_id": action.get("source_thread_id"),
                 "source": "user_correction", "corrected_from": anchor,
             }
-        else:
-            replacement["times_surfaced"] = int(replacement.get("times_surfaced", 1) or 1) + 1
         cr._persist(replacement)                  # obligation remains live before the old row retires
         cr._terminate(old, "dismissed", "user_retargeted", today)
         old["retargeted_to"] = replacement_key
@@ -561,9 +561,10 @@ def op_loop_retarget(anchor: str, text: str, contact: str = "", identifier: str 
 
 
 def op_loop_deadline(anchor: str, deadline: str) -> dict:
-    """Set (or clear) ONE loop's deadline — which is also how a loop is snoozed: the resolver
-    expires a loop 2 days past its deadline, so a later date IS "not yet". Persists the full
-    frontmatter back through the same yaml.safe_dump(sort_keys=False) shape op_loop uses."""
+    """Set (or clear) ONE loop's deadline. A deadline orders the brief and marks the row overdue;
+    nothing expires a loop (a loop you owe parks after 14 untouched days instead, and `keep`
+    brings it back). Persists the full frontmatter back through the same
+    yaml.safe_dump(sort_keys=False) shape op_loop uses."""
     if not ANCHOR_RE.match(anchor or ""):
         raise EditError("invalid anchor key")
     deadline = _validated_deadline(deadline)

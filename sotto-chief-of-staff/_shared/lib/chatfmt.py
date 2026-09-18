@@ -26,6 +26,11 @@ from __future__ import annotations
 
 import re
 
+try:  # Photon installs these shared modules inside its plugin package.
+    from .message_targets import strip_invalid_links
+except ImportError:
+    from message_targets import strip_invalid_links
+
 _MARKER_RE = re.compile(r"<!--.*?-->", re.S)
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$", re.M)
 _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
@@ -46,7 +51,7 @@ def prose_punctuation(text):
 
 def to_chat(text) -> str:
     """markdown-ish text → the chat-deliverable form (see module docstring). None/non-str → ''."""
-    t = prose_punctuation(_s(text))
+    t = strip_invalid_links(prose_punctuation(_s(text)))
     t = _MARKER_RE.sub("", t)
     t = _HEADING_RE.sub(lambda m: f"*{m.group(1)}*", t)
     t = _BOLD_RE.sub(r"*\1*", t)
@@ -64,6 +69,7 @@ def to_imessage(text, *, normalize_style=True) -> str:
     Idempotent because Hermes formats both before retries and at the send boundary.
     """
     source = prose_punctuation(_s(text)) if normalize_style else _s(text)
+    source = strip_invalid_links(source)
     t = _MARKER_RE.sub("", source)
     # Balanced parentheses occur in real web links (e.g. Wikipedia article names).
     link = re.compile(r"!?\[([^\]\n]+)\]\(")

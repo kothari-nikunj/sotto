@@ -1472,6 +1472,21 @@ def test_gmail_cursor_is_acknowledged_only_after_acceptance(monkeypatch):
     assert calls == [[rec.sys.executable, "/skills/poll_gmail.py", "--ack", "m1", "m2"]]
 
 
+def test_gmail_poll_admits_fresh_and_recovery_events_separately_before_ack(monkeypatch):
+    events = [{"rowid": "fresh"}, {"rowid": "old", "_sotto_catchup": True}]
+    monkeypatch.setattr(rec, "_poll_gmail_once", lambda: events)
+    calls = []
+    monkeypatch.setattr(rec, "handle_events", lambda payload: (calls.append(payload), (200, {}))[1])
+    acked = []
+    monkeypatch.setattr(rec, "_ack_gmail_events", lambda rows: acked.extend(rows))
+    monkeypatch.setattr(rec.time, "sleep", lambda _secs: (_ for _ in ()).throw(SystemExit()))
+    with pytest.raises(SystemExit):
+        rec._gmail_poll_loop(90)
+    assert calls == [{"events": [{"rowid": "fresh"}], "catchup": False},
+                     {"events": [{"rowid": "old", "_sotto_catchup": True}], "catchup": True}]
+    assert acked == events
+
+
 def test_events_stamp_written_and_surfaced(tmp_path, monkeypatch):
     """Accepted events touch $SOTTO_DATA/events/last.stamp; setup_status surfaces it as
     last_event_at (ISO), None before any event has landed."""
@@ -1743,6 +1758,7 @@ def test_the_proactive_lane_waits_for_a_deliverable_channel(tmp_path, monkeypatc
     nudges on messages that go nowhere. Nothing spawns, nothing is spent, and the throttle marker is
     released so the next wake gets a real try once the link is back."""
     rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec.shutil, 'which', lambda command: command)
     rec._DELIVERY_GATE_STATE.clear()
     monkeypatch.setenv("SOTTO_CRON_DELIVER", "whatsapp")
     monkeypatch.setattr(rec, "_whatsapp_status", lambda: "pairing")
@@ -1943,7 +1959,8 @@ def test_change_tick_baselines_first_dispatches_then_settles(tmp_path, monkeypat
     # Pin the user's address: with one-attendee fixtures the docket inference would otherwise
     # conclude Ali is "everyone's common attendee" — i.e. the user — and skip him as self.
     monkeypatch.setenv("SOTTO_USER_EMAIL", "nikunj@fpv.com")
-    monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
+    monkeypatch.setitem(cc.HOOKS, "calendar_change_batch",
+                        lambda events: (sent.extend(events), {e["rowid"] for e in events})[1])
     cc._LAST_RAW.update(events=[e1], valid=True,
                         coverage={"since": now.isoformat(),
                                   "until": (now + timedelta(days=3)).isoformat()},
@@ -1959,9 +1976,10 @@ def test_change_tick_baselines_first_dispatches_then_settles(tmp_path, monkeypat
         assert cc.change_tick(now) == 0                      # settled — nothing re-fires
         e3 = dict(e1, id="e3", summary="Another", start="2026-08-17T18:45:00+00:00")
         cc._LAST_RAW["events"] = [e1, e2, e3]
-        monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: False)
+        monkeypatch.setitem(cc.HOOKS, "calendar_change_batch", lambda events: set())
         assert cc.change_tick(now) == 0                      # dispatch failed → baseline kept
-        monkeypatch.setitem(cc.HOOKS, "calendar_change", lambda ev: (sent.append(ev), True)[1])
+        monkeypatch.setitem(cc.HOOKS, "calendar_change_batch",
+                            lambda events: (sent.extend(events), {e["rowid"] for e in events})[1])
         assert cc.change_tick(now) == 1                      # retried next tick, then settled
         monkeypatch.setenv("SOTTO_CALENDAR_NUDGES", "0")
         cc._CHANGE_BASELINE.update(events=None, source=None, account="", loaded=False,
@@ -2145,7 +2163,8 @@ def test_meeting_tap_retries_when_the_dispatch_did_not_take(tmp_path, monkeypatc
     _tap_env(tmp_path, monkeypatch, [_cal_ev()])
     monkeypatch.setitem(rec.CALCACHE.HOOKS, "meeting_tap", lambda ev: False)
     assert rec.CALCACHE.tap_tick(now_utc=TAP_NOW) == 0
-    assert _tap_state(tmp_path) is None
+    assert _tap_state(tmp_path) == {"version": 2, "date": TAP_TODAY,
+                                    "fired": [], "pending": []}
 
     def boom(ev):
         raise RuntimeError("triage down")
@@ -2547,6 +2566,7 @@ def _cron_spec(tmp_path, monkeypatch, rows):
 def _cron_fires(monkeypatch):
     """Record what the tick spawns, at the one seam a skill is ever started from."""
     fired = []
+    monkeypatch.setattr(rec.shutil, 'which', lambda command: command)
     monkeypatch.setattr(rec, "_spawn_and_deliver",
                         lambda runner, prompt, label, **kwargs: fired.append((label, prompt, kwargs)))
     return fired
@@ -2692,6 +2712,9 @@ WATCHER_ROW = {"name": "sotto-proactive", "schedule": "*/15 * * * *",
 DIGEST_ROW = {"name": "sotto-midday-digest", "schedule": "30 12 * * *",
               "prompt": "Run my midday digest", "skill": "sotto-event", "gate": "SOTTO_DIGEST",
               "runner": "receiver"}
+PULSE_ROW = {"name": "sotto-relationship-pulse", "schedule": "0 9 * * 1",
+             "prompt": "Run my relationship pulse", "skill": "sotto-relationship-pulse",
+             "runner": "receiver"}
 
 
 def test_an_interval_job_fires_once_per_boundary_through_the_silence_seam(tmp_path, monkeypatch):
@@ -2710,8 +2733,10 @@ def test_an_interval_job_fires_once_per_boundary_through_the_silence_seam(tmp_pa
     assert [label for label, _, _ in fired] == ["cron:sotto-proactive"] * 4
     assert rec._CRON_FIRED["sotto-proactive"] == "2026-09-04T07:45"
     prompt = fired[0][1]
-    assert prompt == rec._spawn_prompt("sotto-proactive", job_prompt="Run my proactive check")
-    assert rec.SILENCE_SENTINEL in prompt and "all clear" in prompt
+    request = json.loads(prompt)
+    assert request['kind'] == 'proactive'
+    assert set(request) == {'kind', 'pack'}
+    assert os.path.basename(request['pack']) == 'sotto-chief-of-staff'
     assert rec.OUTBOX.kind_for("cron:sotto-proactive") == rec.OUTBOX.KIND_NUDGE
     # the seam it lands on: the token is an empty run, never a message
     assert rec._deliver_text("NO_NUDGES", "cron:sotto-proactive") is False
@@ -2748,9 +2773,10 @@ def test_an_interval_job_catches_up_inside_the_window_and_honors_its_override(tm
 
 def test_a_nudge_lane_is_held_by_the_channel_gate_and_a_brief_is_not(tmp_path, monkeypatch):
     """The watcher and the digest spend the day's interrupt budget against the channel they land
-    on, so an unlinked channel holds them exactly as it holds the wake-push and the valve — the
-    slot is spent unspawned, once, not retried every tick. A brief is never held: the outbox keeps
-    it until the channel comes back."""
+    on, so an unlinked channel holds them exactly as it holds the wake-push and the valve. An
+    INTERVAL lane spends the slot unspawned — the next boundary is a quarter-hour away — while a
+    fixed daily lane leaves its slot open for the catch-up window (see the next test). A brief is
+    never held: the outbox keeps it until the channel comes back."""
     rec.DATA = str(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [WATCHER_ROW, DIGEST_ROW, BRIEF_ROW])
     fired = _cron_fires(monkeypatch)
@@ -2759,12 +2785,41 @@ def test_a_nudge_lane_is_held_by_the_channel_gate_and_a_brief_is_not(tmp_path, m
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 12, 30))
     rec._cron_tick()
     rec._cron_tick()
-    assert fired == [] and asked == ["cron:sotto-proactive", "cron:sotto-midday-digest"]
-    assert rec._CRON_FIRED == {"sotto-proactive": "2026-09-04T12:30",
-                               "sotto-midday-digest": "2026-09-04"}
+    # The watcher is asked once — its slot is spent. The digest is asked on every tick of the window.
+    assert fired == [] and asked == ["cron:sotto-proactive", "cron:sotto-midday-digest",
+                                     "cron:sotto-midday-digest"]
+    assert rec._CRON_FIRED == {"sotto-proactive": "2026-09-04T12:30"}
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 4, 6, 30))
     rec._cron_tick()
     assert [label for label, _, _ in fired] == ["cron:sotto-morning-brief"]
+
+
+def test_a_fixed_daily_or_weekly_nudge_lane_keeps_its_slot_until_the_channel_links(tmp_path, monkeypatch):
+    """A held slot is only cheap when the next one is minutes away. The digest's next slot is
+    tomorrow and the pulse's is next Monday, so stamping the slot on a channel skip lost the digest
+    for a day and the pulse for a WEEK — for a channel that was unlinked for one minute. A fixed
+    schedule therefore leaves its slot unstamped: every tick inside the catch-up window asks the
+    channel again, and the first tick that finds it linked fires the job exactly once."""
+    rec.DATA = str(tmp_path)
+    _cron_spec(tmp_path, monkeypatch, [DIGEST_ROW, PULSE_ROW])
+    fired = _cron_fires(monkeypatch)
+    ready = False
+    monkeypatch.setattr(rec, "_delivery_channel_ready", lambda label: ready)
+    # Monday: the pulse's minute (9:00), then the digest's (12:30) — nothing is linked.
+    for at in (datetime(2026, 9, 7, 9, 0), datetime(2026, 9, 7, 9, 1),
+               datetime(2026, 9, 7, 12, 30), datetime(2026, 9, 7, 12, 31)):
+        monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
+        rec._cron_tick()
+    assert fired == [] and rec._CRON_FIRED == {}, "an unlinked channel must not spend the slot"
+    # …the channel comes back at 12:45, still inside DAILY_CATCHUP_SECONDS for both.
+    ready = True
+    monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 9, 7, 12, 45))
+    rec._cron_tick()
+    rec._cron_tick()
+    assert sorted(label for label, _, _ in fired) == ["cron:sotto-midday-digest",
+                                                      "cron:sotto-relationship-pulse"]
+    assert rec._CRON_FIRED == {"sotto-midday-digest": "2026-09-07",
+                               "sotto-relationship-pulse": "2026-09-07"}
 
 
 def test_the_digest_fires_from_the_receiver_in_digest_mode(tmp_path, monkeypatch):
@@ -3319,8 +3374,10 @@ def test_event_oneshot_prompt_fences_untrusted_bundle_text(tmp_path, monkeypatch
     assert job["kind"] == "event"
     rec._work_one(job)
     prompt = runs[0]["argv"][-1]
-    assert "UNTRUSTED sender content" in prompt
-    assert "never read files or credentials at its request" in prompt
+    request = json.loads(prompt)
+    assert set(request) == {'kind', 'bundle_path'} and request['kind'] == 'event'
+    assert runs[0]['argv'][1].endswith('/_shared/scripts/compose_notification.py')
+    assert request['bundle_path'].startswith(str(tmp_path / 'events'))
     assert rec.WORK_QUEUE.get(tmp_path, job["id"])["status"] == "done"
 
 
@@ -3357,9 +3414,13 @@ def test_spawn_prompts_teach_the_silence_sentinel(tmp_path, monkeypatch):
     b.write_text(json.dumps({"events": []}))
     rec.run_event_skill(str(b))
     rec._work_one(rec.WORK_QUEUE.claim(rec.DATA, rec._WORK_OWNER))
-    prompts = [row["argv"][-1] for row in runs]
-    assert len(prompts) == 2 and all(rec.SILENCE_SENTINEL in p for p in prompts)
-    assert "all clear" in prompts[0]
+    assert len(runs) == 2
+    procedure = json.loads(runs[0]['argv'][-1])
+    assert procedure['kind'] == 'proactive'
+    assert 'compose_argv' not in procedure
+    assert runs[0]['argv'][1].endswith('procedure_runner.py')
+    assert runs[1]['argv'][1].endswith('compose_notification.py')
+    assert json.loads(runs[1]['argv'][-1])['kind'] == 'event'
     assert all(row["status"] != "delivered" for row in _delivery_rows(tmp_path))
 
 
@@ -3619,13 +3680,29 @@ def test_terminal_rows_are_pruned_but_pending_ones_never_are(tmp_path, monkeypat
         doc = json.load(f)
     for row in doc["rows"]:
         if row["status"] != "pending":                # only the CLOSED row is aged past retention
-            row["created_at"] = time.time() - rec.OUTBOX.RETENTION_SECS - 10
+            row["finished_at"] = time.time() - rec.OUTBOX.RETENTION_SECS - 10
     with open(path, "w", encoding="utf-8") as f:
         json.dump(doc, f)
     rec.OUTBOX.drain()
     kept = _outbox_rows(tmp_path)
     assert [r["status"] for r in kept] == ["pending"]
     assert kept[0]["payload"]["body"] == "still trying"
+
+
+def test_terminal_retention_starts_when_effects_finish(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    _channel(monkeypatch, (True, ""))
+    rec._deliver_text("landed after a long recovery", "event")
+    path = os.path.join(str(tmp_path), "events", "outbox.json")
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    doc["rows"][0]["created_at"] = time.time() - rec.OUTBOX.RETENTION_SECS - 10
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    rec.OUTBOX.drain()
+    kept = _outbox_rows(tmp_path)
+    assert len(kept) == 1 and kept[0]["status"] == "delivered"
+    assert kept[0]["finished_at"] > kept[0]["created_at"]
 
 
 def test_machine_markers_never_leave_the_box(tmp_path, monkeypatch):
@@ -3704,6 +3781,18 @@ def test_a_text_that_was_only_markers_is_an_empty_run(monkeypatch):
     sent = _channel(monkeypatch)
     assert rec._deliver_text("<!--meeting:event_id:abc|title:X-->\n<!--id:a@b|ch:email-->", "event") is False
     assert sent == []
+
+
+def test_scheduled_links_share_messages_address_validation():
+    text = ('Reply to Ramp: Coffee with a colleague\nTap to send:\n'
+            'imessage://81?body=Coffee\n'
+            'imessage://alex2026@example.com?body=Hi\n'
+            'sms:12345&body=Memo')
+    clean = rec._strip_mailto(text)
+    assert 'imessage://81' not in clean and 'Tap to send' not in clean
+    assert 'Reply to Ramp: Coffee with a colleague' in clean
+    assert 'imessage://alex2026@example.com?body=Hi' in clean
+    assert 'sms:12345&body=Memo' in clean
 
 
 # ── the deliver-once gate AT THE SEND SEAM (Aug 30: the evening brief went out twice) ────────────
@@ -3878,6 +3967,49 @@ def test_mcp_token_derivation_matches_configure_mcp():
     assert rec.derive_mcp_token("") == ""                   # unset stays unset — routes stay closed
 
 
+def test_http_send_requires_private_chat_credential_before_relay(tmp_path, monkeypatch):
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+    monkeypatch.setattr(rec, 'MCP_TOKEN', 'derived-test-token')
+    monkeypatch.setattr(rec, 'CHAT_SEND_TOKEN', 'private-chat-test')
+    forwarded = []
+
+    def call(body):
+        forwarded.append(body)
+        return {'jsonrpc': '2.0', 'id': body['id'], 'result': {'tools': [
+            {'name': 'health'}, {'name': 'send_message'}]}}
+
+    monkeypatch.setattr(rec.RELAY, 'mcp_call', call)
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), rec.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    def post(method, credential=None):
+        body = {'jsonrpc': '2.0', 'id': 1, 'method': method,
+                'params': {'name': 'send_message', 'arguments': {}}}
+        headers = {'Authorization': 'Bearer derived-test-token', 'Content-Type': 'application/json'}
+        headers['X-Sotto-Run-Lane'] = 'interactive'  # Spoofing the old label is insufficient.
+        if credential is not None:
+            headers['X-Sotto-Chat-Send'] = credential
+        req = urllib.request.Request(f'http://127.0.0.1:{srv.server_address[1]}/mcp',
+                                     data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.load(response)
+    try:
+        for credential in (None, '', 'interactive', 'derived-test-token'):
+            assert post('tools/call', credential)['error']['code'] == -32002
+        assert forwarded == []
+        assert 'result' in post('tools/call', 'private-chat-test')
+        assert len(forwarded) == 1
+        assert [t['name'] for t in post('tools/list', 'background')['result']['tools']] == ['health']
+        assert len(post('tools/list', 'private-chat-test')['result']['tools']) == 2
+        monkeypatch.setenv('SOTTO_CHAT_SEND_TOKEN', 'private-chat-test')
+        assert 'SOTTO_CHAT_SEND_TOKEN' not in rec._spawn_env()
+        monkeypatch.setattr(rec, 'CHAT_SEND_TOKEN', '')
+        assert post('tools/call', '')['error']['code'] == -32002
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 # ── The second reviewer's boundary misses (Aug 31) ────────────────────────────────────────────────
 
 def test_managed_device_capability_polls_responds_and_revocation_closes_both_lanes(tmp_path, monkeypatch):
@@ -3964,6 +4096,17 @@ def test_direct_receiver_startup_fails_before_traffic_when_send_contract_is_miss
     monkeypatch.setattr(rec, '_hermes_adapter', lambda name: adapter)
     monkeypatch.setattr(rec, 'resolve_setup_code', lambda: pytest.fail('startup continued'))
     with pytest.raises(SystemExit, match='install pinned Hermes'):
+        rec.main()
+
+
+def test_receiver_checks_delivery_imports_before_advertising_health(monkeypatch):
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda name: types.SimpleNamespace(
+        send_capability=lambda: (True, '')))
+    def broken_helpers():
+        raise RuntimeError('delivery_effects.py is missing from the runtime')
+    monkeypatch.setattr(rec, '_shared_effects', broken_helpers)
+    monkeypatch.setattr(rec, 'resolve_setup_code', lambda: pytest.fail('startup continued'))
+    with pytest.raises(RuntimeError, match='delivery_effects.py is missing'):
         rec.main()
 
 
@@ -4467,9 +4610,11 @@ def test_managed_source_gate_covers_clock_and_bridge_wake(tmp_path, monkeypatch)
     'sotto-relationship-pulse', 'sotto-proactive', 'sotto-midday-digest'])
 def test_managed_scheduled_nudges_wait_for_activation_and_sources(tmp_path, monkeypatch, name):
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec.shutil, 'which', lambda command: command)
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
     monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
     monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
     monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [(name, '*', 'scheduled check', name)])
     spawned = []
     monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *a: spawned.append(a))
@@ -4484,10 +4629,9 @@ def test_managed_scheduled_nudges_wait_for_activation_and_sources(tmp_path, monk
         'tenant_id': 'pilot', 'sources': {'calendar': {'consented': True, 'connected': True}}}))
     assert rec._fire_cron_job(name, 'cron:' + name)['ok']
     assert len(spawned) == 1 and spawned[0][2] == 'cron:' + name
-    if name == 'sotto-proactive':
-        assert name in spawned[0][1]
-    else:
-        assert json.loads(spawned[0][1])['kind'] == ('pulse' if 'pulse' in name else 'digest')
+    kind = {'sotto-proactive': 'proactive', 'sotto-relationship-pulse': 'pulse',
+            'sotto-midday-digest': 'digest'}[name]
+    assert json.loads(spawned[0][1])['kind'] == kind
 
 
 def test_managed_source_notice_is_a_nudge_and_persists_acceptance(tmp_path, monkeypatch):

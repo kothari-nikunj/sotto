@@ -72,9 +72,9 @@ based on failure shapes from the September 4 investigation, not an exported or p
 private corpus. It ignores inherited `SOTTO_DATA`, restores the environment and makes no network
 calls. No labeling session is needed.
 
-**Exit 1 means a proposed contract is unmet, and is currently expected.** The report lists each
-expected and observed result; it is a diagnostic, not a quality score. The pytest tests validate
-isolation/reporting, not implementation of the redesign. There is no legacy mode: seeding old rows
+**Exit 1 means a contract is unmet.** The report lists each expected and observed result; it is
+a diagnostic, not a quality score. The pytest gate covers every replay contract, including the
+first-week reminder-versus-chase distinction. No known failure is exempted. There is no legacy mode: seeding old rows
 without running a migration adds no migration assurance.
 The JSON report includes every expected/observed result and five persisted-state snapshots. It
 does not evaluate extraction quality, onboarding, actual brief/dashboard rendering, adapter reply
@@ -227,3 +227,14 @@ one batched digest review, one brief extraction). It exits nonzero on any mismat
 checks the rendered attention sections, allowing substantial completed outcomes in Already Handled. The event
 counterexamples explicitly supply thread context: this tests judgment given evidence, not the
 completeness of realtime context gathering. It does not replace the broader private Golden Corpus.
+
+### Phase-2 proof and first-week checks
+
+`python3 _shared/scripts/release_one_proof.py --days 30` reads retained volume state without a model
+call or write. It reports coverage and unavailable correlations explicitly. Capture this baseline
+before deploying ranking changes; a receipt lacking the new exact proposal field is unknown.
+
+The continuous replay now adds two positive evidence-bound completion cases and a first-week
+gate under `tests/test_replay_tracking.py`. A delivered reminder is described as a reminder to the
+user, not evidence of contacting the other person. All first-week and full-month contracts must
+pass. These synthetic checks do not measure live model quality.

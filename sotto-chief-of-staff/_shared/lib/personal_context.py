@@ -1,14 +1,71 @@
 """Bounded observed context and explicit examples, shared by every relevance/draft consumer."""
 from __future__ import annotations
 
+import hashlib
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 
 FEEDBACK_DAYS = 42
 FEEDBACK_LIMIT = 8
+FEEDBACK_EXCERPT_CHARS = 320
+
+
+def archived_output(reference):
+    """Return an output only while its authorized archive still exists."""
+    root = Path(os.environ.get('SOTTO_DATA', '/data'))
+    if str(reference).startswith('draft:'):
+        # Offered-draft rows predate source provenance. Do not reuse their prose in future prompts
+        # until the archive can prove which current source permission governs it.
+        return None
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2})_(morning|evening|welcome)', str(reference or ''))
+    if not match or not (root / 'briefs' / f'{match[1]}.{match[2]}.delivered').exists():
+        return None
+    try:
+        value = json.loads((root / 'briefs' / f'{match[1]}_{match[2]}.json').read_text())
+        sources = value.get('_source_permissions')
+        if not isinstance(sources, list):
+            return None
+        from source_context import allowed
+        if any(not isinstance(source, str) or not allowed(source) for source in sources):
+            return None
+        return str(value.get('brief_text') or value.get('brief_markdown') or '') or None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def item_locator(text, excerpt):
+    """Locate one rated item without persisting its private prose."""
+    if not excerpt:
+        return 'output'
+    # Lookahead, not a plain search: re.finditer skips overlapping hits, so "aa" would look unique
+    # in "aaa" and the locator would point at one of two equally valid items.
+    starts = [match.start() for match in re.finditer('(?=' + re.escape(excerpt) + ')', text)]
+    if not starts:
+        raise ValueError('excerpt must appear verbatim in the referenced output')
+    if len(starts) != 1:
+        raise ValueError('excerpt must identify exactly one item in the referenced output')
+    start = starts[0]
+    digest = hashlib.sha256(excerpt.encode()).hexdigest()[:20]
+    return f'excerpt:{start}:{len(excerpt)}:{digest}'
+
+
+def resolve_item(reference, locator):
+    text = archived_output(reference)
+    if not text or not str(locator).startswith('excerpt:'):
+        return None
+    try:
+        _, start, length, want = str(locator).split(':', 3)
+        start, length = int(start), int(length)
+    except (ValueError, TypeError):
+        return None
+    if length < 1 or length > FEEDBACK_EXCERPT_CHARS:
+        return None
+    candidate = text[start:start + length]
+    return candidate if hashlib.sha256(candidate.encode()).hexdigest()[:20] == want else None
 
 
 def rows(path, limit=2000):
@@ -44,9 +101,18 @@ def feedback(now=None):
                 continue
         except (KeyError, ValueError, TypeError):
             continue
-        key = row.get('reference')
+        locator = row.get('item_locator') or 'output'
+        key = (row.get('reference'), locator)
         recent.pop(key, None)
+        if locator == 'output' and archived_output(row.get('reference')) is None:
+            continue
+        item = None if locator == 'output' else resolve_item(row.get('reference'), locator)
+        if locator != 'output' and item is None:
+            continue
         recent[key] = {k: str(row.get(k) or '')[:200] for k in ('outcome', 'reference')}
+        recent[key]['item_locator'] = locator
+        if item is not None:
+            recent[key]['item'] = item
     return list(recent.values())[-FEEDBACK_LIMIT:]
 
 

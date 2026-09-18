@@ -9,9 +9,12 @@ Two claims are worth a test, and they are the two a user is trusting:
 """
 import importlib.util
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -28,6 +31,11 @@ def _load():
 
 
 fg = _load()
+
+LOG_SPEC = importlib.util.spec_from_file_location(
+    "sotto_log_forget_test", os.path.join(PACK, "_shared", "lib", "sotto_log.py"))
+sotto_log = importlib.util.module_from_spec(LOG_SPEC)
+LOG_SPEC.loader.exec_module(sotto_log)
 
 # name → (relative path, contents). One byte count per file so a summary can be checked by size.
 EXHAUST = {
@@ -77,6 +85,17 @@ def _seed(root):
         _write(root, rel, body)
 
 
+def _locked_receipt_rewrite(path, writer_has_lock, let_writer_finish):
+    """Spawn-safe model of retention's read/replace transaction on a receipt ledger."""
+    with fg.jsonstore.lock(path):
+        with open(path, encoding="utf-8") as stream:
+            old = stream.read()
+        writer_has_lock.set()
+        if not let_writer_finish.wait(timeout=5):
+            raise TimeoutError("test did not release receipt writer")
+        fg.jsonstore.write_atomic(path, {"preserved": old})
+
+
 def _present(root):
     out = set()
     for dirpath, _dirs, files in os.walk(root):
@@ -108,8 +127,9 @@ def test_each_verb_removes_exactly_its_own_files(vol, verb):
 
     after = _present(vol)
     if verb == "logs":
-        # truncate, not unlink — the file must still be there, and empty
-        assert after == before
+        # Truncate, not unlink. The shared sidecar lock is durable by protocol; deleting a lock
+        # inode after release could split future lockers across two different inodes.
+        assert after == before | {"logs/compose_brief.log.lock"}
         assert os.path.getsize(os.path.join(vol, "logs", "compose_brief.log")) == 0
     else:
         assert before - after == set(VERB_FILES[verb])
@@ -125,6 +145,76 @@ def test_byte_counts_are_the_sizes_that_were_actually_freed(vol):
     assert {r["path"]: r["bytes"] for r in summary["removed"]} == sizes
     assert summary["bytes"] == sum(sizes.values())
     assert summary["count"] == len(sizes)
+
+
+def test_log_forget_and_rotation_cannot_restore_erased_history(vol):
+    path = os.path.join(vol, "logs", "compose_brief.log")
+    old = "PRIVATE OLD DIAGNOSTIC\n" * 500
+    _write(vol, "logs/compose_brief.log", old)
+    start = threading.Barrier(3)
+
+    def rotate_and_append():
+        start.wait(timeout=5)
+        sotto_log.bounded_append(path, "NEW DIAGNOSTIC", max_bytes=100, keep_lines=2)
+
+    def erase():
+        start.wait(timeout=5)
+        fg.forget({"logs"})
+
+    # Queue both operations behind the real sidecar lock, then release them together. Either legal
+    # order may win; neither may rewrite the old tail after the user's erase.
+    with sotto_log._log_lock(path):
+        threads = [threading.Thread(target=rotate_and_append), threading.Thread(target=erase)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        time.sleep(0.05)
+        assert all(thread.is_alive() for thread in threads)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    body = open(path, encoding="utf-8").read()
+    assert "PRIVATE OLD DIAGNOSTIC" not in body
+    assert body in ("", "NEW DIAGNOSTIC\n")
+
+
+@pytest.mark.parametrize("name", ("delivery.jsonl", "sends.jsonl"))
+def test_receipt_forget_waits_for_locked_rewrite_then_removes_it(vol, name):
+    path = os.path.join(vol, "events", name)
+    process_context = multiprocessing.get_context("spawn")
+    writer_has_lock = process_context.Event()
+    let_writer_finish = process_context.Event()
+    # Use a separate process to exercise the real cross-process flock contract. Spawn avoids
+    # forking pytest after it has started background threads.
+    writer = process_context.Process(
+        target=_locked_receipt_rewrite,
+        args=(path, writer_has_lock, let_writer_finish),
+    )
+    eraser = None
+    writer.start()
+    try:
+        assert writer_has_lock.wait(timeout=5)
+        result = {}
+        eraser = threading.Thread(target=lambda: result.update(fg.forget({"receipts"})))
+        eraser.start()
+        time.sleep(0.05)
+        assert eraser.is_alive(), "erasure bypassed the receipt ledger lock"
+        let_writer_finish.set()
+        writer.join(timeout=5)
+        eraser.join(timeout=5)
+        assert not writer.is_alive() and not eraser.is_alive()
+        assert writer.exitcode == 0
+        assert not os.path.exists(path)
+        assert any(row["path"] == f"events/{name}" for row in result["removed"])
+    finally:
+        let_writer_finish.set()
+        writer.join(timeout=5)
+        if writer.is_alive():
+            writer.terminate()
+            writer.join(timeout=5)
+        if eraser is not None:
+            eraser.join(timeout=12)
 
 
 def test_all_removes_every_exhaust_file_and_no_memory_file(vol):

@@ -49,6 +49,44 @@ def test_notification_returns_none():
     assert r.mcp_call({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
 
 
+def test_queued_send_is_refused_if_permission_changes_before_poll():
+    r = relay.Relay()
+    r._touch()
+    allowed = [True]
+    r.validate_request = lambda request: allowed[0]
+    replies = []
+    thread = threading.Thread(target=lambda: replies.append(r.mcp_call({
+        'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+        'params': {'name': 'send_message', 'arguments': {}}}, timeout=2)))
+    thread.start()
+    deadline = time.monotonic() + 1
+    while r._q.empty() and time.monotonic() < deadline:
+        time.sleep(.001)
+    assert not r._q.empty()
+    allowed[0] = False
+    assert r.poll(timeout=.05) is None
+    thread.join(timeout=1)
+    assert replies[0]['error']['code'] == -32002
+    assert not thread.is_alive()
+
+
+def test_revoked_poll_cancels_call_without_requeue_or_timeout():
+    r = relay.Relay()
+    r._touch()
+    replies = []
+    thread = threading.Thread(target=lambda: replies.append(r.mcp_call({
+        'jsonrpc': '2.0', 'id': 9, 'method': 'tools/call',
+        'params': {'name': 'send_message', 'arguments': {}}}, timeout=2)))
+    thread.start()
+    request = r.poll(timeout=1)
+    assert request is not None
+    r.cancel(request, 'Bridge connection was revoked before execution.')
+    r.cancel(None, 'empty poll')
+    thread.join(timeout=1)
+    assert replies[0]['id'] == 9 and replies[0]['error']['code'] == -32002
+    assert r._q.empty()
+
+
 def test_full_forward_cycle_with_a_bridge():
     r = relay.Relay()
 

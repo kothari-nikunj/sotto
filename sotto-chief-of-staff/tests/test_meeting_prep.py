@@ -270,7 +270,8 @@ def test_group_chats_and_unmatched_attendees_degrade_silently(monkeypatch):
 def test_loop_line_from_continuity_ledger(monkeypatch):
     monkeypatch.setattr(mp, "_active_loops", lambda: [
         {"contact_identifier": "taylor@startup.com", "contact_name": "Taylor Reed",
-         "status": "open", "summary": "you said you'd send the deck", "times_surfaced": 2,
+         "status": "open", "summary": "you said you'd send the deck", "times_surfaced": 99,
+         "delivery_surface": {"schema": 1, "count": 2, "delivery_keys": ["a", "b"]},
          "action_type": "follow_up"},
         {"contact_identifier": "other@x.com", "status": "open", "summary": "unrelated"}])
     ctx, _ = mp.build_context(_taylor_inputs())

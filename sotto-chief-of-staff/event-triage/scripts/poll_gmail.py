@@ -4,20 +4,21 @@ poll_gmail.py — cloud-side email events for the Phase 2 funnel (no Pub/Sub set
 
 The receiver's Gmail poll thread runs this every SOTTO_EMAIL_POLL_SECS. One run:
   1. locate the google-workspace `google_api.py` CLI (same discovery as gather_google.py),
-  2. `gmail search "newer_than:1h in:inbox" --max 20` — plus a smaller `in:sent` lane (SENT_QUERY):
+  2. page through fixed, at-most-24-hour inbox slices (70 messages/pass), plus a
+     smaller sent lane (30/pass):
      the user's OWN outbound mail, marked `is_from_me: true`, which Tier 0 queues as a silent
      "signal" (never a nudge, never Tier-1) — the email half of what the Bridge's is_from_me rows
      already provide for texts. It exists so the draft→outcome matcher can grade email drafts and
      deterministic loop resolution can see email replies; a sent-lane failure never costs the
      inbox lane,
-  3. dedupe against the capped ring $SOTTO_DATA/events/gmail_seen.json (one ring, both lanes),
+  3. persist each page and dedupe against $SOTTO_DATA/events/gmail_seen.json (one state, both lanes),
   4. fetch full bodies for the NEW ids only (gather_google's per-message `gmail get` pattern),
   5. print the events JSON the triage funnel expects:
        [{"source":"email","rowid":"<gmail id>","from":…,"to":…,"cc":…,"subject":…,"body":…,…}]
 
-The poll command is CLAIM-FREE: it does not advance gmail_seen.json. The receiver acknowledges the
-returned message ids with `--ack` only after its event pipeline returns 200. A fetch/parse failure
-exits non-zero so the receiver can distinguish a broken lane from a genuinely quiet inbox.
+The poll command may persist its current page, but never advances beyond it. The receiver
+acknowledges returned message ids with `--ack` only after its event pipeline returns 200; only a
+fully acknowledged page advances the cursor or page token. A failed full read stays on that page.
 
 Env: SOTTO_DATA (state dir), HERMES_HOME (optional install root override).
 """
@@ -28,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SHARED_LIB = os.path.join(_HERE, "..", "..", "_shared", "lib")
@@ -36,10 +38,13 @@ if _SHARED_LIB not in sys.path:
 from gmail_read import fetch_message, gmail_service  # noqa: E402
 
 GMAIL_SEEN_MAX = 1000   # ring size — 20 msgs/poll × ~1h windows leaves plenty of overlap margin
-SEARCH_QUERY = "newer_than:1h in:inbox"
-SEARCH_MAX = 20
-SENT_QUERY = "newer_than:1h in:sent"
-SENT_MAX = 15
+SEARCH_QUERY = "in:inbox"
+SEARCH_MAX = 70
+SENT_QUERY = "in:sent"
+SENT_MAX = 30
+RECOVERY_LOOKBACK_SECONDS = 24 * 3600
+GAP_SLICE_SECONDS = 24 * 3600
+FRESH_GAP_SECONDS = 3600
 
 
 def _diag(msg: str) -> None:
@@ -107,26 +112,51 @@ def _seen_path() -> str:
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "gmail_seen.json")
 
 
-def _load_seen() -> list:
+def _load_state() -> dict:
     try:
         with open(_seen_path(), encoding="utf-8") as f:
             v = json.load(f)
-        return [str(x) for x in v] if isinstance(v, list) else []
-    except Exception:  # noqa: BLE001
-        return []
+    except FileNotFoundError:
+        return {"seen": [], "lanes": {}}
+    if isinstance(v, list):  # safe migration from the original seen-only ring
+        return {"seen": [str(x) for x in v], "lanes": {}}
+    if not isinstance(v, dict):
+        raise ValueError("gmail state must be an object or legacy seen-id list")
+    seen = v.get("seen", [])
+    lanes = v.get("lanes", {})
+    if not isinstance(seen, list) or not isinstance(lanes, dict):
+        raise ValueError("gmail state has invalid seen or lanes shape")
+    if any(not isinstance(lane, dict) for lane in lanes.values()):
+        raise ValueError("gmail state lane must be an object")
+    for lane in lanes.values():
+        if "page_ids" in lane and not isinstance(lane["page_ids"], list):
+            raise ValueError("gmail state page_ids must be a list")
+    return {"seen": [str(x) for x in seen], "lanes": lanes}
 
 
-def _save_seen(ids: list) -> None:
+def _load_seen() -> list:
+    return _load_state()["seen"]
+
+
+def _save_state(state: dict) -> None:
     """Capped ring, atomic write — mirrors the receiver's seen.json handling."""
-    try:
-        path = _seen_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(ids[-GMAIL_SEEN_MAX:], f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    path = _seen_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        state["seen"] = state.get("seen", [])[-GMAIL_SEEN_MAX:]
+        json.dump(state, f, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _complete_page(lane: dict) -> None:
+    lane["page_ids"] = []
+    if lane.get("next_page_token"):
+        lane["page_token"] = lane.pop("next_page_token")
+    else:
+        lane["cursor"] = lane.get("query_end", lane.get("cursor", 0))
+        for key in ("query_end", "query_catchup", "page_token", "next_page_token"):
+            lane.pop(key, None)
 
 
 def acknowledge(ids: list[str]) -> int:
@@ -139,7 +169,8 @@ def acknowledge(ids: list[str]) -> int:
     clean = [str(v).strip() for v in ids if str(v).strip()]
     if not clean:
         return 0
-    seen = _load_seen()
+    state = _load_state()
+    seen = state["seen"]
     known = set(seen)
     fresh = []
     for v in clean:
@@ -147,7 +178,15 @@ def acknowledge(ids: list[str]) -> int:
             known.add(v)
             fresh.append(v)
     if fresh:
-        _save_seen(seen + fresh)
+        state["seen"] = seen + fresh
+    # A page advances only when every id it exposed was durably accepted. A failed full read or
+    # receiver failure therefore pins the page across restarts instead of moving beyond a hole.
+    known.update(fresh)
+    for lane in state["lanes"].values():
+        page_ids = lane.get("page_ids") or []
+        if page_ids and all(str(v) in known for v in page_ids):
+            _complete_page(lane)
+    _save_state(state)
     return len(fresh)
 
 
@@ -172,22 +211,72 @@ def _to_event(item: dict, full: dict) -> dict:
     }
 
 
+def _page(service, lane: dict, query: str, maximum: int, now: int, api=None) -> list[dict]:
+    if lane.get("page_ids"):
+        return [{"id": str(v)} for v in lane["page_ids"]]
+    cursor = int(lane.get("cursor") or (now - RECOVERY_LOOKBACK_SECONDS))
+    lane["cursor"] = cursor
+    end = int(lane.get("query_end") or min(cursor + GAP_SLICE_SECONDS, now))
+    lane["query_end"] = end
+    # Recovery is a property of the fixed query, not of each message's wall-clock age. Persist it
+    # with the bounds so every page in a downtime gap receives the same treatment even when the
+    # clock advances between polls.
+    lane.setdefault("query_catchup", now - cursor > FRESH_GAP_SECONDS)
+    params = {"userId": "me", "q": f"{query} after:{cursor} before:{end + 1}",
+              "maxResults": maximum}
+    if lane.get("page_token"):
+        params["pageToken"] = lane["page_token"]
+    if not hasattr(service, "users"):
+        # The CLI search verb cannot express after/before or page tokens. Using it while advancing
+        # this cursor would turn an unbounded read into a false coverage claim and skip older mail.
+        raise RuntimeError("Gmail client lacks bounded paginated list support")
+    result = service.users().messages().list(**params).execute()
+    items = result.get("messages") or []
+    lane["page_ids"] = [str(v.get("id")) for v in items if isinstance(v, dict) and v.get("id")]
+    lane["next_page_token"] = result.get("nextPageToken") or ""
+    if not lane["page_ids"]:  # an empty page is complete without an acknowledgement
+        if lane["next_page_token"]:
+            lane["page_token"] = lane.pop("next_page_token")
+        else:
+            lane["cursor"] = end
+            for key in ("query_end", "query_catchup", "page_token", "next_page_token"):
+                lane.pop(key, None)
+    return items
+
+
 def poll() -> list:
     api = _find_google_api()
     if not api:
         raise RuntimeError("google_api.py not found — google-workspace skill missing")
-    items = _as_list(_run(api, ["gmail", "search", SEARCH_QUERY, "--max", str(SEARCH_MAX)]))
-    sent_ids = set()
+    state = _load_state()
+    now = int(time.time())
+    service = gmail_service()
+    lanes = state["lanes"]
+    inbox = lanes.setdefault("inbox", {})
+    sent = lanes.setdefault("sent", {})
+    items = _page(service, inbox, SEARCH_QUERY, SEARCH_MAX, now, api)
+    sent_items = []
     try:
-        # The sent lane is additive and fail-silent ON ITS OWN: a broken in:sent search must never
-        # cost the inbox lane (the funnel's whole email intake).
-        for it in _as_list(_run(api, ["gmail", "search", SENT_QUERY, "--max", str(SENT_MAX)])):
-            if isinstance(it, dict) and _pick(it, "id", "message_id", "messageId"):
-                sent_ids.add(str(_pick(it, "id", "message_id", "messageId")))
-                items.append(it)
-    except Exception:  # noqa: BLE001
+        sent_items = _page(service, sent, SENT_QUERY, SENT_MAX, now, api)
+    except Exception:  # noqa: BLE001 — sent outcomes never cost inbox intake
         pass
-    seen = _load_seen()
+    sent_ids = {str(v.get("id")) for v in sent_items if isinstance(v, dict) and v.get("id")}
+    catchup_ids = {
+        str(v.get("id"))
+        for lane, lane_items in ((inbox, items), (sent, sent_items))
+        if lane.get("query_catchup")
+        for v in lane_items
+        if isinstance(v, dict) and v.get("id")
+    }
+    items.extend(sent_items)
+    known = set(state["seen"])
+    # A page can consist entirely of overlap already accepted on an earlier page/run. There is
+    # nothing for the receiver to acknowledge, so close it here or the cursor pins forever.
+    for lane in (inbox, sent):
+        if lane.get("page_ids") and all(str(v) in known for v in lane["page_ids"]):
+            _complete_page(lane)
+    _save_state(state)  # persist the page claim before any full-message read
+    seen = state["seen"]
     seen_set = set(seen)
     new, new_ids = [], set()
     for it in items:
@@ -200,7 +289,6 @@ def poll() -> list:
         new_ids.add(str(mid))
     if not new:
         return []
-    service = gmail_service()
     try:
         events = []
         deferred = 0
@@ -214,6 +302,8 @@ def poll() -> list:
                 deferred += 1
                 continue
             ev = _to_event(it, full)
+            if mid in catchup_ids:
+                ev["_sotto_catchup"] = True
             if mid in sent_ids:
                 ev["is_from_me"] = True
             events.append(ev)

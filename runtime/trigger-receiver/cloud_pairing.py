@@ -228,7 +228,8 @@ def handle(handler, path, root, adapter=None, *, adapter_factory=None):
         if path == '/cloud/status':
             return handler._send(200, managed.connection_status(root))
         if path == '/cloud/consent':
-            managed.record_bridge_consent(root, body['enabled'], body['connected'])
+            managed.record_bridge_consent(root, body['enabled'], body['connected'],
+                                          body.get('allow_send', False))
             return handler._send(200, {'ok': True})
         if path == '/cloud/bootstrap' and adapter_factory is not None:
             adapter = adapter_factory()

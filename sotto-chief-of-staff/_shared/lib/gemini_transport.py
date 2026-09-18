@@ -22,6 +22,7 @@ def writing_system(system=None):
 
 
 _BACKGROUND_PROXY = ContextVar('sotto_background_proxy', default=False)
+_BACKGROUND_ACTIVE = ContextVar('sotto_background_active', default=False)
 
 
 class BackgroundModelHeldError(RuntimeError):
@@ -36,6 +37,20 @@ def background_proxy_required():
     return _BACKGROUND_PROXY.get()
 
 
+def background_learning_active():
+    return _BACKGROUND_ACTIVE.get()
+
+
+def effective_compose_model():
+    """Resolve the effective primary into provider/model for admission and dispatch."""
+    ref = ((os.environ.get('SOTTO_BRIEF_MODEL') or '').strip()
+           or os.environ.get('SOTTO_GEMINI_MODEL', 'gemini-3.8-flash')).strip()
+    if '/' not in ref:
+        return 'gemini', ref
+    provider, model = ref.split('/', 1)
+    return provider.strip().lower(), model.strip()
+
+
 def _proxy_base():
     base = os.environ['SOTTO_MODEL_PROXY_URL'].strip().rstrip('/')
     parsed = urllib.parse.urlsplit(base)
@@ -47,8 +62,8 @@ def _proxy_base():
     return base
 
 
-def _background_budget_preflight():
-    """Require authenticated versioned proof that the next conservative reservation can fit."""
+def _background_capability_preflight(require_finite):
+    """Authenticate the route/model before source access; require budget only for self-host."""
     token = os.environ['SOTTO_MODEL_PROXY_TOKEN'].strip()
     request = urllib.request.Request(
         _proxy_base() + '/v1/capabilities/background-budget',
@@ -60,40 +75,54 @@ def _background_budget_preflight():
         raise BackgroundModelHeldError(
             'background_budget_capability_unavailable',
             'background budget capability is unavailable') from error
-    if (not isinstance(result, dict) or result.get('version') != 1
-            or result.get('finite') is not True or result.get('can_admit') is not True):
+    models = result.get('supported_native_models') if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get('version') != 1 or not isinstance(models, list):
+        # A pre-upgrade proxy answers without the model list. That is a proxy capability
+        # problem, not a budget problem, and the operator must be told which one it is.
+        raise BackgroundModelHeldError(
+            'background_capability_unsupported',
+            'background capability version is not supported by this proxy')
+    provider, model = effective_compose_model()
+    if provider != 'gemini' or model not in models:
+        raise BackgroundModelHeldError(
+            'background_model_unsupported', 'background model is not supported by the proxy')
+    if ((require_finite and result.get('finite') is not True)
+            or (result.get('finite') is True and result.get('can_admit') is not True)):
         raise BackgroundModelHeldError(
             'background_budget_unavailable', 'background budget is not finite and available')
 
 
 def _background_provider_preflight():
-    """Background proxy supports Gemini's native surface; reject configured family escapes early."""
-    for name in ('SOTTO_BRIEF_MODEL', 'SOTTO_FALLBACK_MODEL'):
-        ref = os.environ.get(name, '').strip()
-        if '/' in ref and ref.split('/', 1)[0].strip().lower() != 'gemini':
-            raise BackgroundModelHeldError(
-                'background_provider_unsupported',
-                f'{name} must use Gemini for metered background learning')
+    """Background proxy supports Gemini's native surface; fallback is disabled for this cycle."""
+    provider, _ = effective_compose_model()
+    if provider != 'gemini':
+        raise BackgroundModelHeldError(
+            'background_provider_unsupported',
+            'The effective background model must use Gemini')
 
 
 @contextmanager
 def background_learning():
     """Select the owner's background-spend policy for one memory-cycle invocation."""
-    if managed() or os.environ.get('SOTTO_BACKGROUND_UNMETERED') == 'true':
-        yield
-        return
-    if not (os.environ.get('SOTTO_MODEL_PROXY_URL', '').strip()
-            and os.environ.get('SOTTO_MODEL_PROXY_TOKEN', '').strip()):
-        raise BackgroundModelHeldError(
-            'background_budget_not_configured',
-            'background model proxy and tenant credential are not configured')
-    _background_provider_preflight()
-    _background_budget_preflight()
-    token = _BACKGROUND_PROXY.set(True)
+    active_token = _BACKGROUND_ACTIVE.set(True)
     try:
-        yield
+        if os.environ.get('SOTTO_BACKGROUND_UNMETERED') == 'true' and not managed():
+            yield
+            return
+        if not (os.environ.get('SOTTO_MODEL_PROXY_URL', '').strip()
+                and os.environ.get('SOTTO_MODEL_PROXY_TOKEN', '').strip()):
+            raise BackgroundModelHeldError(
+                'background_budget_not_configured',
+                'background model proxy and tenant credential are not configured')
+        _background_provider_preflight()
+        _background_capability_preflight(require_finite=not managed())
+        proxy_token = _BACKGROUND_PROXY.set(not managed())
+        try:
+            yield
+        finally:
+            _BACKGROUND_PROXY.reset(proxy_token)
     finally:
-        _BACKGROUND_PROXY.reset(token)
+        _BACKGROUND_ACTIVE.reset(active_token)
 
 
 def managed():
@@ -119,8 +148,19 @@ def endpoint(model, key=None):
     return (f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={token}', {})
 
 
+def attribution_headers(url):
+    """The workload/operation headers, for any request that reaches the Sotto proxy — native or
+    compatible-chat. A request bound elsewhere carries none (they would be meaningless there)."""
+    import model_work
+    proxy = os.environ.get('SOTTO_MODEL_PROXY_URL', '').strip().rstrip('/')
+    if managed() or background_proxy_required() or (proxy and str(url).startswith(proxy)):
+        return model_work.headers()
+    return {}
+
+
 def request(model, body, key=None):
     url, headers = endpoint(model, key)
+    headers.update(attribution_headers(url))
     if background_proxy_required():
         headers['X-Sotto-Require-Finite-Budget'] = 'true'
     return urllib.request.Request(url, data=json.dumps(body).encode(),

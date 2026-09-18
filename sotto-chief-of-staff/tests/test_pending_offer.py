@@ -187,7 +187,7 @@ def test_a_second_set_replaces_the_first(tmp_path, monkeypatch):
 
 def test_clear_removes_the_offer_and_is_idempotent(tmp_path, monkeypatch):
     path = _data(tmp_path, monkeypatch)
-    po.set_offer("retune_offer", "Want me to run a quick cleanup?")
+    po.set_offer("meeting_prep", "Want me to pull a quick prep?")
     assert po.clear_offer() is True
     assert not os.path.exists(path)
     assert po.get_offer() == {}
@@ -305,8 +305,16 @@ def test_cli_rejects_a_kind_no_lane_produces(tmp_path):
                         "--question", "?"], env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode != 0
     # Only active producers can set an offer. Legacy mute files are handled on read.
-    assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff", "retune_offer",
+    assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff",
                              "procedure", "intention"}
+
+
+def test_legacy_retune_offer_is_not_returned(tmp_path):
+    path = tmp_path / "proactive" / "pending_offer.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"kind": "retune_offer", "question": "Want a cleanup?",
+                                "expires_at": "2099-01-01T00:00:00+00:00"}))
+    assert json.loads(_cli(tmp_path, "get")) == {}
 
 
 @pytest.mark.parametrize("reply", ["no", "done", "skip it"])

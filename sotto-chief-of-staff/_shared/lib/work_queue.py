@@ -31,18 +31,26 @@ def _db(root):
     db = sqlite3.connect(path, timeout=15, isolation_level=None)
     os.chmod(path, 0o600)
     try:
-        db.execute('PRAGMA journal_mode=WAL')
+        # Preserve the database's journal mode. Concurrent first opens can collide while switching
+        # to WAL before BEGIN IMMEDIATE acquires the write reservation. New stores use SQLite's
+        # rollback journal; existing WAL stores stay WAL. Both retain FULL durability below.
         db.execute('PRAGMA synchronous=FULL')
         db.row_factory = sqlite3.Row
+        # Schema creation and migrations share the same write reservation as queue mutations. Two
+        # first opens of a legacy volume must not both observe a missing column and race ALTER.
+        db.execute('BEGIN IMMEDIATE')
         db.execute('''CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
             status TEXT NOT NULL, created REAL NOT NULL, due REAL NOT NULL,
             valid_until REAL, priority INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-            owner TEXT, lease_until REAL, result TEXT, error TEXT, finished REAL)''')
+            owner TEXT, lease_until REAL, result TEXT, error TEXT, finished REAL,
+            handoff_attempts INTEGER NOT NULL DEFAULT 0)''')
+        columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
+        if 'handoff_attempts' not in columns:
+            db.execute('ALTER TABLE jobs ADD COLUMN handoff_attempts INTEGER NOT NULL DEFAULT 0')
         db.execute('''CREATE TABLE IF NOT EXISTS work_items (
             kind TEXT NOT NULL, item_key TEXT NOT NULL, job_id TEXT NOT NULL,
             PRIMARY KEY(kind,item_key))''')
-        db.execute('BEGIN IMMEDIATE')
         yield db
         db.commit()
     except BaseException:
@@ -56,6 +64,14 @@ def job_id_for(kind, key) -> str:
     """The durable identity of an admitted request: what `enqueue` dedupes on, and what a caller
     asking "is THIS request already admitted?" compares against."""
     return hashlib.sha256(f'{kind}:{key}'.encode()).hexdigest()[:32]
+
+
+def event_item_key(event) -> str:
+    """Canonical durable identity for one provider event, independent of batch grouping."""
+    stable = {k: event[k] for k in ('source', 'rowid', 'source_id', 'id', 'timestamp') if k in event}
+    if len(stable) < 2:
+        stable = event
+    return 'event:' + hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
 def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, priority=20,
@@ -87,8 +103,8 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
             if terminal_keys and not retry_terminal:
                 raise RuntimeError(f"work request is terminal ({ownership[terminal_keys[0]][1]})")
             if retry_terminal:
-                db.execute("""DELETE FROM work_items WHERE kind=? AND job_id IN
-                           (SELECT id FROM jobs WHERE status IN ('failed','expired'))""", (kind,))
+                db.executemany('DELETE FROM work_items WHERE kind=? AND item_key=?',
+                               [(kind, key) for key in terminal_keys])
                 ownership = {k: v for k, v in ownership.items() if v[1] not in ('failed', 'expired')}
             owned = {k: v[0] for k, v in ownership.items()}
             fresh = [i for i, k in enumerate(keys) if k not in owned]
@@ -112,7 +128,7 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
         if terminal and terminal['status'] in ('failed', 'expired'):
             db.execute('''UPDATE jobs SET kind=?,payload=?,status='pending',created=?,due=?,
                        valid_until=?,priority=?,attempts=0,owner=NULL,lease_until=NULL,result=NULL,
-                       error=NULL,finished=NULL WHERE id=?''',
+                       handoff_attempts=0,error=NULL,finished=NULL WHERE id=?''',
                        (kind, encoded, now, now if not_before is None else not_before,
                         valid_until, priority, job_id))
         if item_keys is not None:
@@ -157,24 +173,33 @@ def claim(root, owner, now=None):
         # Continuous event traffic otherwise starves memory indefinitely. Once maintenance has
         # waited 30 minutes since it became runnable, admit the oldest such job before another
         # foreground job. This never preempts work or fills the foreground's reserved slot.
-        row = None
-        if ceiling > BACKGROUND_PRIORITY:
-            row = db.execute("""SELECT * FROM jobs WHERE status IN ('pending','ready') AND due<=?
-                              AND priority>=? AND max(created,due)<=?
-                              ORDER BY max(created,due),created LIMIT 1""",
-                             (now, BACKGROUND_PRIORITY, now - BACKGROUND_MAX_WAIT_SECONDS)).fetchone()
-        if row is None:
-            row = db.execute("""SELECT * FROM jobs WHERE status IN ('pending','ready') AND due<=?
-                              AND priority<? ORDER BY priority,due,created LIMIT 1""", (now, ceiling)).fetchone()
-        if row is None:
-            return None
-        # Crashes count as attempts too; a repeatedly killed model call cannot run forever.
-        if row['result'] is None and row['attempts'] >= MAX_ATTEMPTS:
-            db.execute("UPDATE jobs SET status='failed',payload='{}',finished=? WHERE id=?", (now, row['id']))
-            return None
+        while True:
+            row = None
+            if ceiling > BACKGROUND_PRIORITY:
+                row = db.execute("""SELECT * FROM jobs WHERE status IN ('pending','ready') AND due<=?
+                                  AND priority>=? AND max(created,due)<=?
+                                  ORDER BY max(created,due),created LIMIT 1""",
+                                 (now, BACKGROUND_PRIORITY, now - BACKGROUND_MAX_WAIT_SECONDS)).fetchone()
+            if row is None:
+                row = db.execute("""SELECT * FROM jobs WHERE status IN ('pending','ready') AND due<=?
+                                  AND priority<? ORDER BY priority,due,created LIMIT 1""", (now, ceiling)).fetchone()
+            if row is None:
+                return None
+            # Composition and its delivery handoff have independent bounded budgets: a saved result
+            # never recomposes, but it also cannot retry a broken handoff forever.
+            exhausted = (row['attempts'] >= MAX_ATTEMPTS if row['result'] is None
+                         else row['handoff_attempts'] >= MAX_ATTEMPTS)
+            if not exhausted:
+                break
+            diagnostic = ('composition attempts exhausted' if row['result'] is None
+                          else 'delivery handoff attempts exhausted')
+            db.execute("""UPDATE jobs SET status='failed',payload='{}',result=NULL,error=?,
+                       finished=?,owner=NULL,lease_until=NULL WHERE id=?""",
+                       (diagnostic, now, row['id']))
         db.execute("""UPDATE jobs SET status='leased',owner=?,lease_until=?,
-                   attempts=attempts+? WHERE id=?""",
-                   (owner, now + LEASE_SECONDS, int(row['result'] is None), row['id']))
+                   attempts=attempts+?,handoff_attempts=handoff_attempts+? WHERE id=?""",
+                   (owner, now + LEASE_SECONDS, int(row['result'] is None),
+                    int(row['result'] is not None), row['id']))
         return _decode(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone())
 
 
@@ -185,9 +210,10 @@ def renew(root, job_id, owner, now=None):
 
 
 def save_result(root, job_id, owner, result):
-    """Keep the lease through the handoff; the exact output is recoverable on expiry."""
+    """Keep the lease through the first handoff; the exact output is recoverable on expiry."""
     with _db(root) as db:
-        if not db.execute("UPDATE jobs SET result=? WHERE id=? AND owner=? AND status='leased'",
+        if not db.execute("""UPDATE jobs SET result=?,handoff_attempts=handoff_attempts+1
+                          WHERE id=? AND owner=? AND status='leased' AND result IS NULL""",
                           (json.dumps(result), job_id, owner)).rowcount:
             raise RuntimeError('work lease lost before result commit')
 
@@ -205,11 +231,15 @@ def fail(root, job_id, owner, error, now=None):
         row = db.execute("SELECT * FROM jobs WHERE id=? AND owner=? AND status='leased'", (job_id, owner)).fetchone()
         if row is None:
             return
-        terminal = row['result'] is None and row['attempts'] >= MAX_ATTEMPTS
-        db.execute('''UPDATE jobs SET status=?,due=?,owner=NULL,error=?,finished=?,payload=? WHERE id=?''',
+        terminal = (row['attempts'] >= MAX_ATTEMPTS if row['result'] is None
+                    else row['handoff_attempts'] >= MAX_ATTEMPTS)
+        diagnostic = ('delivery handoff attempts exhausted'
+                      if terminal and row['result'] is not None else str(error)[:120])
+        db.execute('''UPDATE jobs SET status=?,due=?,owner=NULL,error=?,finished=?,payload=?,result=? WHERE id=?''',
                    ('failed' if terminal else ('ready' if row['result'] else 'pending'),
-                    now + min(900, 60 * 2 ** max(0, row['attempts'] - 1)), str(error)[:120],
-                    now if terminal else None, '{}' if terminal else row['payload'], job_id))
+                    now + min(900, 60 * 2 ** max(0, max(row['attempts'], row['handoff_attempts']) - 1)), diagnostic,
+                    now if terminal else None, '{}' if terminal else row['payload'],
+                    None if terminal else row['result'], job_id))
 
 
 def release(root, job_id, owner, now=None):
@@ -221,6 +251,7 @@ def release(root, job_id, owner, now=None):
     with _db(root) as db:
         return db.execute('''UPDATE jobs SET status=CASE WHEN result IS NULL THEN 'pending' ELSE 'ready' END,
                           attempts=max(0, attempts - CASE WHEN result IS NULL THEN 1 ELSE 0 END),
+                          handoff_attempts=max(0, handoff_attempts - CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END),
                           owner=NULL, lease_until=NULL, due=? WHERE id=? AND owner=? AND status='leased'
                           ''', (now, job_id, owner)).rowcount == 1
 

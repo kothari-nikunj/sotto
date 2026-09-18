@@ -161,3 +161,40 @@ def test_context_floor_refuses_known_small_models(monkeypatch):
     monkeypatch.setenv("SOTTO_BRIEF_MODEL", "openai/mystery-1m")
     monkeypatch.setattr(gem, "_openai_once", lambda *a, **k: "{}")
     assert gem.call_gemini("p", {}) == "{}"
+
+
+@pytest.mark.parametrize('task', ['notification', 'triage', 'brief'])
+def test_native_policies_do_not_change_other_provider_request_limits(task):
+    import model_work
+    with pytest.MonkeyPatch.context() as monkeypatch, model_work.scope(task, 'test'):
+        calls = _capture_http(monkeypatch, {'choices': [{'message': {'content': '{}'}}]})
+        gem._openai_once('gpt-big', 'test', 'evidence')
+        assert 'max_completion_tokens' not in calls[0]['body']
+        calls = _capture_http(monkeypatch, {'content': [{'type': 'tool_use', 'input': {}}]})
+        gem._anthropic_once('claude-big', 'test', 'evidence', schema={'type': 'object'})
+        assert calls[0]['body']['max_tokens'] == 16384
+
+
+def test_compatible_chat_requests_to_the_proxy_carry_the_same_attribution_headers(monkeypatch):
+    import gemini
+    import gemini_transport
+    import model_work
+    monkeypatch.setenv("SOTTO_MODEL_PROXY_URL", "https://proxy.example.test")
+    monkeypatch.setenv("SOTTO_OPENAI_BASE_URL", "https://proxy.example.test/v1")
+    monkeypatch.delenv("SOTTO_DEPLOYMENT_MODE", raising=False)
+    seen = {}
+
+    def fake_post(url, body, headers):
+        seen.update(headers)
+        return {"choices": [{"message": {"content": "{}"}}], "usage": {}}
+    monkeypatch.setattr(gemini, "_post_json", fake_post)
+    with model_work.scope("notification", ["evidence"]):
+        gemini._openai_once("gemini-3.8-flash", "k", "prompt")
+    assert seen["X-Sotto-Workload"] == "notification" and len(seen["X-Sotto-Operation"]) == 64
+    # …and none when the compatible endpoint is not the Sotto proxy
+    seen.clear()
+    monkeypatch.setenv("SOTTO_OPENAI_BASE_URL", "https://api.openai.com/v1")
+    with model_work.scope("notification", ["evidence"]):
+        gemini._openai_once("gemini-3.8-flash", "k", "prompt")
+    assert not any(k.startswith("X-Sotto") for k in seen)
+    assert gemini_transport.attribution_headers("https://elsewhere.test") == {}

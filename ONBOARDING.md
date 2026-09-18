@@ -210,7 +210,8 @@ From here it's all conversation:
 - *"what can you do?"* — the full map, any time
 
 And if a brief ever looks thin or wrong: say **"that's wrong about X"** (fixes its memory), **"stop
-surfacing newsletters"** (mutes), or **"clean up stale loops"** (retunes).
+surfacing newsletters"** (mutes), or **"clean up stale loops"**. Friday evening briefs also include
+a short unfinished-work review when anything stale remains; there is no separate Sunday message.
 
 ## Your dashboard
 

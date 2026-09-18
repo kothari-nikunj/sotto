@@ -22,8 +22,8 @@ Usage:
 Steps, in order (a step whose input file is absent is recorded `skipped`, never `failed`):
   knowledge    knowledge_update.py <knowledge-out>        the brief's extracted_knowledge
   continuity   continuity_resolve.py --merge-only <cont>  the brief's actions[] → the ledger
-  drafts       draft_outcomes.py                          drafts matched to sends → outcomes + voice confirms
   style        style_extract.py <local> --gmail <gmail>   what you actually sent
+  drafts       draft_outcomes.py                          drafts matched to sends → outcomes + voice confirms
   granola      granola_graph.py --granola <granola>       who you actually sat with
   contacts     prewarm_graph.py --sync-contacts           identifiers, notes, birthdays
 
@@ -54,12 +54,13 @@ STEPS = (
      lambda a: [a.knowledge_out] if a.knowledge_out else None),
     ("continuity", ("morning-brief", "scripts", "continuity_resolve.py"),
      lambda a: ["--merge-only", a.continuity] if a.continuity else None),
-    ("drafts", ("_shared", "scripts", "draft_outcomes.py"),
-     lambda a: []),
     # --gmail is OPTIONAL to style: a missing sent-mail file (a Gmail-less day, a failed gather)
     # must not skip the whole voice writer — style_extract itself tolerates the absent file.
     ("style", ("_shared", "scripts", "style_extract.py"),
      lambda a: ([a.local] + (["--gmail", a.gmail] if _present(a.gmail) else [])) if a.local else None),
+    # Grade only after extraction: a newly observed verbatim send can be confirmed in this pass.
+    ("drafts", ("_shared", "scripts", "draft_outcomes.py"),
+     lambda a: []),
     ("granola", ("_shared", "scripts", "granola_graph.py"),
      lambda a: ["--granola", a.granola] if a.granola else None),
     ("contacts", ("_shared", "scripts", "prewarm_graph.py"),
@@ -85,7 +86,30 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
         return {"status": "failed", "detail": f"{type(e).__name__}: {e}"}
     tail = (r.stderr or r.stdout or "").strip().splitlines()
     detail = tail[-1][:300] if tail else ""
-    return {"status": "ok" if r.returncode == 0 else "failed", "exit": r.returncode, "detail": detail}
+    proof = None
+    if r.returncode == 0 and os.path.basename(script) == "continuity_resolve.py":
+        # The CLI ends with a generic open/resolved count. Preserve the preceding content-free
+        # rejection summary in the existing receipt so a successful run cannot hide refused work.
+        detail = next((line[:300] for line in reversed(tail)
+                       if line.startswith("[continuity_resolve] rejected loop updates: ")), detail)
+        prefix = "[continuity_resolve] loop update outcomes: "
+        summary = next((line[len(prefix):] for line in reversed(tail) if line.startswith(prefix)), "")
+        if summary:
+            try:
+                parsed = json.loads(summary)
+                if (isinstance(parsed, dict)
+                        and all(isinstance(parsed.get(k), int) and parsed[k] >= 0
+                                for k in ("total", "accepted", "rejected"))
+                        and parsed["total"] == parsed["accepted"] + parsed["rejected"]
+                        and isinstance(parsed.get("rejected_by_reason", {}), dict)):
+                    proof = {"loop_updates": parsed, "coverage": "exact_resolver_outcomes"}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    result = {"status": "ok" if r.returncode == 0 else "failed", "exit": r.returncode,
+              "detail": detail}
+    if proof is not None:
+        result["proof"] = proof
+    return result
 
 
 def learn(args, run=subprocess.run, now=None) -> dict:

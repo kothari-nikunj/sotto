@@ -271,14 +271,17 @@ def test_background_budget_capability_is_authenticated_content_free_and_tracks_s
     assert get(http, '/v1/capabilities/background-budget', token='wrong')[0] == 401
     status, capability = get(http, '/v1/capabilities/background-budget')
     assert status == 200 and capability == {
-        'version': 1, 'finite': True, 'remaining_cents': 200, 'can_admit': True}
+        'version': 1, 'finite': True, 'remaining_cents': 200, 'can_admit': True,
+        'supported_native_models': sorted(server.MODELS)}
     assert calls == []
     assert post(http)[0] == 200
     assert get(http, '/v1/capabilities/background-budget')[1] == {
-        'version': 1, 'finite': True, 'remaining_cents': 0, 'can_admit': False}
+        'version': 1, 'finite': True, 'remaining_cents': 0, 'can_admit': False,
+        'supported_native_models': sorted(server.MODELS)}
     http.tenants[0]['budget_cents'] = None
     assert get(http, '/v1/capabilities/background-budget')[1] == {
-        'version': 1, 'finite': False, 'remaining_cents': None, 'can_admit': False}
+        'version': 1, 'finite': False, 'remaining_cents': None, 'can_admit': False,
+        'supported_native_models': sorted(server.MODELS)}
 
 
 @pytest.mark.parametrize('change', [
@@ -296,6 +299,10 @@ def test_invalid_tenant_policy_cannot_become_an_implicit_bypass(tmp_path, change
 def test_tenant_ids_and_bearers_are_unique_and_unlimited_is_explicit(tmp_path):
     tenant = {'id': 'a', 'token_sha256': hashlib.sha256(b'a-token').hexdigest(),
               'budget_cents': None, 'enabled': True, 'expires_at': time.time() + 3600}
+    for bad in ({**tenant, 'deployment': 'owner@example.com'}, {**tenant, 'application': {'x': 1}},
+                {**tenant, 'deployment': 'x' * 65}):
+        with pytest.raises(ValueError):
+            server.validate_tenants([bad])
     server.validate_tenants([tenant])
     with pytest.raises(ValueError, match='unique'):
         server.validate_tenants([tenant, {**tenant, 'id': 'b'}])
@@ -347,3 +354,14 @@ def test_upstream_receives_only_validated_canonical_json(proxy):
     body = {'contents': [{'parts': [{'text': 'hello'}]}]}
     assert post(http, body=body)[0] == 200
     assert calls[0].data == json.dumps(body, allow_nan=False, separators=(',', ':')).encode()
+
+
+def test_internal_workload_headers_stay_at_the_proxy(proxy):
+    http, calls = proxy
+    headers = {'X-Sotto-Workload': 'notification', 'X-Sotto-Operation': 'a' * 64,
+               'X-Sotto-Run': 'b' * 32, 'X-Sotto-Attempt': '1'}
+    assert post(http, headers=headers)[0] == 200
+    assert not any(name.lower().startswith('x-sotto') for name in calls[0].headers)
+    with http.ledger.connect() as db:
+        metadata = json.loads(db.execute('SELECT metadata_json FROM calls').fetchone()[0])
+    assert metadata['workload'] == 'notification' and metadata['operation_id'] == 'a' * 64

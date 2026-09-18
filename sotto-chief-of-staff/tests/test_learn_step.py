@@ -37,8 +37,8 @@ def test_every_writer_runs_in_order_and_the_receipt_says_what_ran(tmp_path, monk
                  granola=_touch(tmp_path, "granola.json"), knowledge_out=_touch(tmp_path, "know.json"),
                  continuity=_touch(tmp_path, "cont.json"))
     receipt = ls.learn(args, run=fake_run)
-    assert calls == ["knowledge_update.py", "continuity_resolve.py", "draft_outcomes.py",
-                     "style_extract.py", "granola_graph.py", "prewarm_graph.py"]
+    assert calls == ["knowledge_update.py", "continuity_resolve.py", "style_extract.py",
+                     "draft_outcomes.py", "granola_graph.py", "prewarm_graph.py"]
     assert receipt["ok"] is False and receipt["day"] == "2026-09-04" and receipt["kind"] == "morning"
     assert receipt["steps"]["granola"] == {"status": "failed", "exit": 3, "detail": "boom"}
     assert {k: v["status"] for k, v in receipt["steps"].items() if k != "granola"} == {
@@ -79,6 +79,39 @@ def test_a_missing_gmail_file_never_skips_the_voice_writer(tmp_path, monkeypatch
     assert style == [style[0], local] and receipt["steps"]["style"]["status"] == "ok"
 
 
+def test_continuity_exact_proposal_outcomes_reach_the_learn_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    continuity = _touch(tmp_path, "continuity.json")
+
+    def fake_run(argv, **kw):
+        stderr = ""
+        if argv[1].endswith("continuity_resolve.py"):
+            stderr = ('[continuity_resolve] loop update outcomes: '
+                      '{"accepted": 1, "rejected": 2, "rejected_by_reason": '
+                      '{"stale_revision": 1, "unsupported_evidence": 1}, "total": 3}\n')
+        return types.SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+
+    receipt = ls.learn(_args(tmp_path, continuity=continuity), run=fake_run)
+    assert receipt["steps"]["continuity"]["proof"] == {
+        "coverage": "exact_resolver_outcomes",
+        "loop_updates": {"accepted": 1, "rejected": 2,
+                         "rejected_by_reason": {"stale_revision": 1,
+                                                "unsupported_evidence": 1}, "total": 3},
+    }
+
+
+def test_malformed_proposal_summary_is_not_claimed_as_proof():
+    def fake_run(argv, **kw):
+        return types.SimpleNamespace(
+            returncode=0, stdout="",
+            stderr=('[continuity_resolve] loop update outcomes: '
+                    '{"accepted": 2, "rejected": 1, "rejected_by_reason": {}, "total": 2}\n'))
+
+    result = ls._run_one("/tmp/continuity_resolve.py", [], run=fake_run)
+    assert result["status"] == "ok"
+    assert "proof" not in result
+
+
 def test_the_cli_runs_the_real_writers_end_to_end(tmp_path, monkeypatch):
     """The whole step on an empty volume with minimal inputs: six real scripts, exit 0, a receipt.
     This is the run a brief makes on its first quiet day."""
@@ -114,7 +147,9 @@ def test_learn_grades_drafts_without_rewriting_preferences(tmp_path, monkeypatch
         "identifier": "+14155551234", "text": text}) + "\n")
     (events / "queue.jsonl").write_text(json.dumps({
         "ts": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), "verdict_class": "signal",
-        "event": {"source": "imessage", "handle": "+14155551234", "text": text, "is_from_me": True}}) + "\n")
+        "event": {"source": "imessage", "id": "sent-1", "handle": "+14155551234",
+                  "timestamp": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "text": text, "is_from_me": True}}) + "\n")
     prefs = tmp_path / "preferences.json"
     history = '{"approval_defaults":{"Maya|reply":"one_tap"},"explicit":{"mute_people":["Bob"]}}'
     prefs.write_text(history)
@@ -125,6 +160,74 @@ def test_learn_grades_drafts_without_rewriting_preferences(tmp_path, monkeypatch
     assert receipt["steps"]["drafts"]["status"] == "ok"
     assert json.loads((tmp_path / "outcomes.jsonl").read_text())["outcome"] == "executed"
     assert prefs.read_text() == history
+
+
+def test_first_observed_verbatim_send_is_extracted_then_confirmed(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    now = datetime.now(timezone.utc)
+    events = tmp_path / "events"
+    events.mkdir()
+    text = "sounds good, sending the deck over tonight"
+    handle = "+14155551234"
+    sent_at = now - timedelta(hours=1)
+    (events / "drafts.jsonl").write_text(json.dumps({
+        "ts": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "channel": "imessage", "identifier": handle, "text": text}) + "\n")
+    (events / "queue.jsonl").write_text(json.dumps({
+        "ts": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "verdict_class": "signal",
+        "event": {"source": "imessage", "id": "sent-1", "handle": handle,
+                  "timestamp": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "text": text,
+                  "is_from_me": True}}) + "\n")
+    local = _touch(tmp_path, "local.json", json.dumps({
+        "contacts": [{"name": "Sarah Chen", "phones": [handle]}],
+        "imessage": [{"handle": handle, "is_from_me": True,
+                      "timestamp": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      "text": text, "is_group_chat": False}]}))
+    result = subprocess.run([sys.executable, SCRIPT, "--local", local, "--day", "2026-09-04"],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["steps"]["style"]["status"] == "ok"
+    assert receipt["steps"]["drafts"]["status"] == "ok"
+    style = json.loads((tmp_path / "style.json").read_text())
+    assert any(sample.get("text") == text for sample in style.get("confirmed", []))
+
+
+def test_previously_graded_verbatim_send_retries_only_style_confirmation(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import draft_outcomes
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    now = datetime.now(timezone.utc)
+    events = tmp_path / "events"
+    events.mkdir()
+    text, handle = "I will send it this afternoon.", "+14155551234"
+    draft = {"ts": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "channel": "imessage", "identifier": handle, "text": text}
+    (events / "drafts.jsonl").write_text(json.dumps(draft) + "\n")
+    (events / "queue.jsonl").write_text(json.dumps({
+        "ts": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verdict_class": "signal", "event": {"source": "imessage", "id": "sent-1",
+        "handle": handle, "timestamp": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "text": text, "is_from_me": True}}) + "\n")
+    (tmp_path / "outcomes.jsonl").write_text(json.dumps({
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "action_id": draft_outcomes._draft_key(draft),
+        "outcome": "executed", "source_event_id": "imessage:sent-1",
+        "source_event_ts": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}) + "\n")
+    local = _touch(tmp_path, "local.json", json.dumps({"imessage": [{
+        "handle": handle, "is_from_me": True,
+        "timestamp": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "text": text, "is_group_chat": False}]}))
+    result = subprocess.run([sys.executable, SCRIPT, "--local", local, "--day", "2026-09-04"],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert len((tmp_path / "outcomes.jsonl").read_text().splitlines()) == 1
+    style = json.loads((tmp_path / "style.json").read_text())
+    assert any(sample.get("text") == text for sample in style.get("confirmed", []))
+    repeated = draft_outcomes.run(now=now)
+    assert repeated["style_confirmed"] == 0
+    assert repeated["graded"] == 0
+    assert len((tmp_path / "outcomes.jsonl").read_text().splitlines()) == 1
 
 
 def test_required_and_ancillary_phases_merge_one_receipt_without_losing_required_success(tmp_path, monkeypatch):
@@ -144,7 +247,7 @@ def test_required_and_ancillary_phases_merge_one_receipt_without_losing_required
     calls.clear()
     args.phase = 'ancillary'
     receipt = ls.learn(args, run=fake_run)
-    assert calls == ['draft_outcomes.py', 'style_extract.py', 'prewarm_graph.py']
+    assert calls == ['style_extract.py', 'draft_outcomes.py', 'prewarm_graph.py']
     assert not receipt['ok'] and receipt['required_ok']
     assert receipt['steps']['knowledge']['status'] == 'ok'
     assert receipt['steps']['drafts']['status'] == 'failed'

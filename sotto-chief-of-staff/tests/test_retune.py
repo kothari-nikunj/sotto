@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+from datetime import datetime, timezone
 
 import yaml
 
@@ -45,6 +46,16 @@ def test_scan_flags_stale_and_classifies(tmp_path, monkeypatch):
     wait = next(s for s in out["stale_loops"] if s["anchor_key"] == "k2")
     assert owe["direction"] == "you_owe" and owe["suggestion"] == "do it or dismiss"
     assert wait["direction"] == "waiting_on_them" and wait["suggestion"] == "nudge or drop"
+
+
+def test_scan_clock_is_deterministic_and_retains_old_active_obligations(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _loop(tmp_path, "old", contact_name="Maria", created_at="2026-01-01")
+    _loop(tmp_path, "new", contact_name="Fresh", created_at="2026-09-15", times_surfaced=1)
+    now = datetime(2026, 9, 16, 18, tzinfo=timezone.utc)
+    out = scan.scan(now=now)
+    assert [row["anchor_key"] for row in out["stale_loops"]] == ["old"]
+    assert out["stale_loops"][0]["age_days"] == 258
 
 
 def test_scan_ignores_legacy_deprioritization_without_changing_explicit_mutes(tmp_path, monkeypatch):
@@ -121,14 +132,14 @@ def test_keep_on_a_waiting_on_resets_the_chase_not_the_age_clock(tmp_path, monke
     assert scan.scan()["stale_loops"][0]["suggestion"] == "nudge or drop"   # chaseable again
 
 
-def test_keep_and_snooze_still_reset_the_age_clock_on_what_the_user_owes(tmp_path, monkeypatch):
+def test_keep_resets_the_park_clock_without_rewriting_request_age(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_TIMEZONE", "+00:00")
     today = scan._now_local("+00:00").strftime("%Y-%m-%d")
     _loop(tmp_path, "k", contact_name="Maria", action_type="reply", created_at="2026-01-01")
     ap.apply("keep", "k")
     fm = yaml.safe_load((tmp_path / "knowledge" / "continuity" / "k.md").read_text().split("---")[1])
-    assert fm["created_at"] == today
+    assert fm["created_at"] == "2026-01-01" and fm["reopened_at"] == today
     # …and a snoozed waiting_on keeps its real age too
     _loop(tmp_path, "w", contact_name="Acme", action_type="waiting_on", created_at="2026-01-01")
     ap.apply("snooze", "w", 7)

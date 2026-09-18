@@ -26,6 +26,16 @@ import re
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
 PROMPT_PATH = os.path.join(ROOT, "morning-brief", "references", "extraction-prompt.md")
+
+
+def test_obligation_updates_are_a_standalone_section_after_complete_action_fields():
+    prompt = open(PROMPT_PATH, encoding="utf-8").read()
+    assert prompt.count("#### Obligation updates") == 1
+    contact = prompt.index("- contactName: the person's name exactly as the data gives it")
+    fields_end = prompt.index("For calendar actions:", contact)
+    updates = prompt.index("#### Obligation updates")
+    assert contact < fields_end < updates < prompt.index("## Stale Thread Detection")
+    assert "group's name exactly as its `## <name>` header" in prompt[contact:fields_end]
 RENDER_PATH = os.path.join(ROOT, "_shared", "lib", "render_local.py")
 
 with open(PROMPT_PATH, encoding="utf-8") as f:
@@ -80,6 +90,14 @@ def test_phantom_section_names_are_gone():
     assert "Open Commitments for Key People" not in PROMPT
     # ...and render_local no longer instructs against a section that doesn't exist.
     assert "TRACKED OPEN LOOPS" not in RENDER_SRC
+
+
+def test_open_loop_prompt_keeps_natural_prose_and_reminder_semantics():
+    assert "full ledger summary verbatim" not in PROMPT
+    assert "describe that specific ask\nclearly in natural editorial prose" in PROMPT
+    assert "[reminded you ×N, last <day>]" in PROMPT
+    assert "[chased ×N" not in PROMPT
+    assert "You've nudged" not in PROMPT
 
 
 def _example_region():
@@ -156,7 +174,8 @@ def test_every_html_comment_is_classified():
         ok = (comment == SEAM
               or comment.startswith("<!-- MAINTAINER:")
               or comment.startswith("<!--id:")
-              or comment.startswith("<!--meeting:"))
+              or comment.startswith("<!--meeting:")
+              or comment.startswith("<!--loop:"))
         assert ok, f"unclassified HTML comment in extraction-prompt.md: {comment[:80]!r}"
 
 

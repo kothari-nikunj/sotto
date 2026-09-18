@@ -587,29 +587,37 @@ def _build_focus_prompt(a: dict, context_summary: str, known: str,
 
 def _gemini_grounded(prompt: str, key: str, use_schema: bool, schema: dict = SCHEMA,
                      timeout: int = PER_BATCH_TIMEOUT, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
-    gen = {"maxOutputTokens": max_tokens}
+    import model_work
+    gen = {**model_work.generation_config(MODEL), "maxOutputTokens": max_tokens}
     if use_schema:
         gen["responseMimeType"] = "application/json"
         gen["responseSchema"] = schema
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "tools": [{"google_search": {}}], "generationConfig": gen}
-    req = gemini_transport.request(MODEL, body, key)
     import time as _time
     t0 = _time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read())
+    with model_work.attempt("gemini", MODEL, prompt, schema=body["generationConfig"]):
+        req = gemini_transport.request(MODEL, body, key)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        model_work.note_usage(MODEL, data.get("usageMetadata"))
+        if (data.get("candidates") or [{}])[0].get("finishReason") == "MAX_TOKENS":
+            raise ValueError("research output truncated")   # inside the claim: a truncated batch is a failed attempt
     m = _metrics()                        # tag this grounded batch as the 'research' phase (thread-safe)
     if m is not None:
         # Guard the CALL itself (not just metrics' internals): a foreign 'metrics' shadow via sys.modules
         # could raise here AFTER the billed batch succeeded and fail research for the whole brief.
         try:
             um = data.get("usageMetadata") or {}
+            from usage_accounting import normalize
+            counts = normalize(um)
             m.record("research", _time.monotonic() - t0,
-                     um.get("promptTokenCount"), um.get("candidatesTokenCount"), MODEL)
+                     counts["input_tokens"], counts["billed_output_tokens"], MODEL, counts)
         except Exception:
             pass
     cand = (data.get("candidates") or [{}])[0]
-    return "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or []))
+    return "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])
+                   if not p.get("thought"))
 
 
 def _gemini_json(prompt: str, key: str, schema: dict, timeout: int, max_tokens: int,
@@ -635,7 +643,29 @@ def _gemini_json(prompt: str, key: str, schema: dict, timeout: int, max_tokens: 
     return None
 
 
-def _grounded_json(prompt: str, key: str, schema: dict, timeout: int, max_tokens: int,
+
+def _grounded_json(prompt, key, schema, timeout, max_tokens, fallback_shape, tag):
+    # This operation is one predeclared profile/recency/focus batch. Provider fallback cannot
+    # restart it on a worker retry. Serialize identical concurrent batches and reuse their result.
+    import model_work
+    import jsonstore
+    from pathlib import Path
+    evidence = [prompt, schema, MODEL, max_tokens, tag, wr.provider_chain('deep_research')]
+    with model_work.scope('research', evidence) as operation:
+        root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'events/research-artifacts'
+        root.mkdir(parents=True, exist_ok=True)
+        path = str(root / (operation['id'] + '.json'))
+        with jsonstore.lock(model_work.artifact_lock_path(root, operation['id'])):
+            cached = jsonstore.read(path, default=None, strict=True)
+            if cached is not None:
+                return cached
+            rows = _grounded_json_once(prompt, key, schema, timeout, max_tokens, fallback_shape, tag)
+            if rows:
+                jsonstore.write_atomic(path, rows)
+            return rows
+
+
+def _grounded_json_once(prompt: str, key: str, schema: dict, timeout: int, max_tokens: int,
                    fallback_shape: str, tag: str) -> list:
     """One structured, grounded research batch through THE search seam
     (`web_research.deep_research`: Parallel → Exa → Gemini grounding, by key presence — see that
@@ -852,6 +882,8 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
 
     profile_rows, deep_rows, focus_rows = [], [], []
     n_futs = len(batches) + len(deep_batches) + (1 if focus_target else 0)
+    _diag(f"[research-plan] profile={len(batches)} recency={len(deep_batches)} "
+          f"focus={int(focus_target is not None)} batches={n_futs} max_attempts={4 * n_futs}")
     with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENCY, n_futs or 1)) as ex:
         futs = {ex.submit(_research_batch, b, context_summary, key, comms_by_email,
                           known_by_email): ("profile", b) for b in batches}

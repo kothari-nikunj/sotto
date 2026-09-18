@@ -18,6 +18,10 @@ tools/list from a cache primed on the first Bridge connection), so Hermes ALWAYS
 server — even while the Mac is asleep. Only `tools/call` needs the Bridge; if it's offline, the call returns a clear error the
 skills already handle ("Bridge offline"), and it reconnects automatically when the Mac comes back.
 No tunnel, no domain, no inbound port exposing chat.db. Stdlib only.
+
+Policy lives in three hooks the receiver installs (all default-allow, so self-host is unchanged):
+`validate_request` refuses a `tools/call` before it is forwarded, `filter_tools` hides denied tools
+from `tools/list`, and `validate_response` withholds a result whose content isn't permitted.
 """
 from __future__ import annotations
 
@@ -67,7 +71,14 @@ class Relay:
         self._last_poll = float("-inf")
         self._bridge_timeout = bridge_timeout
         self.on_response = lambda request, result: None
+        # Both hooks default to ALLOW, so self-host forwards exactly what it always did. The
+        # receiver points them at the managed gates, which share one allow-decision.
+        # validate_request is the PRE-execution gate: a denied tools/call is refused here and
+        # never reaches the Mac (validate_response can only discard a result the Bridge already
+        # produced, which is not a gate at all for a tool that acts, e.g. send_message).
+        self.validate_request = lambda request: True
         self.validate_response = lambda request, result: True
+        self.filter_tools = lambda result: result   # tools/list: don't advertise a denied tool
         self._tools_cache = None                    # last good tools/list result (primed on connect)
 
     # ---- status -----------------------------------------------------------
@@ -96,14 +107,21 @@ class Relay:
             # every ~3 minutes, all night. Offline-ness belongs in tool RESULTS (health), not here.
             return _ok(rid, {})
         if method == "tools/list":
-            # Answer from cache so the toolset stays visible even when the Mac is asleep.
+            # Answer from cache so the toolset stays visible even when the Mac is asleep. The
+            # cache keeps the Bridge's raw listing; filtering happens on the way out, so a
+            # consent change is reflected without waiting for the Mac to re-list.
             if self.bridge_connected():
                 resp = self._forward(req, timeout=20.0)
                 if resp and "result" in resp:
                     self._tools_cache = resp["result"]
-                    return resp
-            return _ok(rid, self._tools_cache or {"tools": _FALLBACK_TOOLS})
+                    return _ok(rid, self.filter_tools(resp["result"]))
+            return _ok(rid, self.filter_tools(self._tools_cache or {"tools": _FALLBACK_TOOLS}))
         if method == "tools/call":
+            # Ask BEFORE forwarding, and before the connectivity check: "not permitted" is a
+            # property of the call, not of whether the Mac happens to be awake.
+            if self.validate_request(req) is not True:
+                name = (req.get("params") or {}).get("name")
+                return _err(rid, -32002, f"tool not permitted for this connection: {name}")
             if not self.bridge_connected():
                 name = (req.get("params") or {}).get("name")
                 if name == "health":
@@ -159,9 +177,23 @@ class Relay:
             except queue.Empty:
                 return None
             if request_deadline > time.monotonic():
+                # Consent may have changed while this call waited for a poll.
+                if req.get('method') == 'tools/call' and self.validate_request(req) is not True:
+                    self.cancel(req, 'Bridge permission changed before execution.')
+                    continue
                 return req
             # The Hermes caller has already timed out. Never execute its stale tool call when the
             # Mac reconnects; continue within the original long-poll budget for a live request.
+
+    def cancel(self, request, reason):
+        """Refuse a dequeued call before execution, waking its caller without a timeout."""
+        if not isinstance(request, dict):
+            return
+        with self._lock:
+            slot = self._waiters.get(request.get('id'))
+            if slot is not None:
+                slot['value'] = _err(slot['external_id'], -32002, reason)
+                slot['event'].set()
 
     def respond(self, resp: dict):
         """Deliver the Bridge's result for a request id back to the waiting Hermes call."""

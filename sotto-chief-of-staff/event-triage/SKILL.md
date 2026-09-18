@@ -15,7 +15,12 @@ required_environment_variables:
 
 # Sotto — Event nudge (Tier 2 of the triage funnel)
 
-The agent end of event-driven proactivity: the Bridge/email poller pushes events within seconds, the
+Automated event bundles are composed directly by `_shared/scripts/compose_notification.py` after
+admission; scheduled digests use `digest_check.py` through `procedure_runner.py`. Neither starts
+a general agent session. The procedure below remains the behavior and approval reference for
+explicit adapter invocations.
+
+The composition end of event-driven proactivity: the Bridge/email poller pushes events within seconds, the
 deterministic triage funnel (`triage_event.py`, Tier 0 + a Flash-Lite Tier 1) has ALREADY decided this
 one deserves the user's attention — your job is only to say it well. **ONE short message, a draft
 ready, never auto-sent.** Everything that didn't reach you was dropped or queued on purpose; do not go

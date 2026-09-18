@@ -6,7 +6,7 @@ truth; it never treats a stale or failed calendar read as a cancellation.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -20,9 +20,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 import jsonstore  # noqa: E402
 
 MAX_PENDING_SECONDS = 4 * 3600
+FRESH_NUDGE_VALID_SECONDS = 30 * 60
 CALENDAR_MIN_FRESH_SECONDS = 600
 POST_MEETING_VALID_SECONDS = 30 * 60
-LOOP_FIELDS = ('status', 'title', 'action_type', 'deadline', 'due', 'identifier', 'thread_id')
+# These classes already carry a semantic deadline at admission: missed calls use the event
+# funnel's 240-minute envelope, while calendar changes expire at the affected meeting. Applying
+# the generic message-freshness deadline here would silently shorten both contracts to 30 minutes.
+FRESH_NUDGE_EXEMPT_CLASSES = frozenset({'missed_call', 'calendar_change'})
+LOOP_FIELDS = ('anchor_key', 'status', 'summary', 'ask', 'source_refs', 'contact_identifier',
+               'canonical_id', 'contact_name', 'group_id', 'source_thread_id', 'source_message_id',
+               'created_at', 'snoozed_until', 'resolution_mode', 'action_type', 'channel',
+               'meeting_time', 'deadline', 'due')
+# The obligation's identity: what makes it THIS debt rather than a restatement of it. Summary,
+# ask and deadline are wording (Learn restates them); `source_refs` is evidence (the follow-up merge
+# appends to it) — neither belongs here, or a loop that gained wording or evidence between compose
+# and delivery would lose its count for exactly the day it moved.
+LOOP_IDENTITY_FIELDS = ('anchor_key', 'created_at', 'action_type', 'origin_key', 'source',
+                        'source_thread_id', 'source_message_id')
 
 
 def _root():
@@ -45,7 +59,12 @@ def stage(effects, decision_ids=None, run_id=None, result=None):
         return False
     with jsonstore.transaction(_path(ident), default={}, strict=True) as doc:
         merged = doc.setdefault('effects', [])
-        for effect in effects:
+        for raw_effect in effects:
+            effect = dict(raw_effect)
+            if effect.get('kind') in ('loop_surfaced', 'review_candidate_offer'):
+                # The outbox/run identity is durable before provider I/O and survives effect
+                # retries even on legacy accepted transports that return no provider message ID.
+                effect['delivery_id'] = ident
             if effect not in merged:
                 merged.append(effect)
         doc['decision_ids'] = sorted(set(doc.get('decision_ids', [])) | set(decision_ids or []))
@@ -68,6 +87,23 @@ def cached_result():
         if saved is not None:
             return saved
     return None
+
+
+def notification_selection(selected, proactive=None):
+    """Only rendered candidates earn delivery receipts; omitted candidates retain their state."""
+    ident = run_id()
+    if not ident:
+        return
+    with jsonstore.transaction(_path(ident), default={}, strict=True) as doc:
+        doc['notification_decision_ids'] = sorted(set(selected))
+        if proactive is not None:
+            keys = {n.get('key') for n in proactive}
+            anchors = {(n.get('kind'), n.get('anchor_key')) for n in proactive}
+            intentions = {n.get('intention_id') for n in proactive}
+            doc['effects'] = [e for e in doc.get('effects', [])
+                if (e.get('kind') != 'proactive_seen' or e.get('key') in keys)
+                and (e.get('kind') not in ('chase', 'handoff') or (e.get('kind'), e.get('anchor_key')) in anchors)
+                and (e.get('kind') != 'intention' or e.get('id') in intentions)]
 
 
 def proactive_path(date):
@@ -99,7 +135,25 @@ def _loops():
 
 def loop_version(row):
     return hashlib.sha256(json.dumps({k: row.get(k) for k in LOOP_FIELDS},
-                                    sort_keys=True).encode()).hexdigest()
+                                    sort_keys=True, default=str).encode()).hexdigest()
+
+
+def loop_identity(row):
+    """Stable obligation identity across Learn restatements; never a fuzzy content match."""
+    identity = {key: row.get(key) for key in LOOP_IDENTITY_FIELDS}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def delivered_surface_count(row):
+    """Trusted number of distinct accepted deliveries that actually named this loop."""
+    provenance = row.get('delivery_surface') if isinstance(row, dict) else None
+    keys = provenance.get('delivery_keys') if isinstance(provenance, dict) else None
+    if not isinstance(provenance, dict) or provenance.get('schema') != 1 or not isinstance(keys, list):
+        return 0
+    try:
+        return len({key for key in keys if isinstance(key, str)})
+    except (TypeError, ValueError):
+        return 0
 
 
 def source_for_event(event):
@@ -114,12 +168,32 @@ def source_for_event(event):
 def for_bundle(bundle):
     """Capture minimal eligibility facts; exact identity survives formatting and worker retries."""
     effects, deadlines = [], []
+    # Re-read immediately before delivery. Zero means every unsolicited nudge, including classes
+    # that ordinarily bypass accounting; scheduled briefs/digests never use this bundle helper.
+    unsolicited = (bundle.get('_user_requested_delivery') is not True
+                   and any('verdict_class' not in row for row in bundle.get('events', [])
+                           if isinstance(row, dict)))
+    generated = instant(bundle.get('generated_at'))
+    if unsolicited:
+        effects.append({'kind': 'unsolicited_nudge'})
     loops = None
     for row in bundle.get('events', []):
         event = row.get('event') or row
+        delivery_class = str(row.get('class') or '')
         source = source_for_event(event)
         effect = {'kind': 'eligibility', 'source': source}
         deadline = instant(event.get('valid_until'))
+        relevance_deadline = instant(row.get('relevance_deadline'))
+        # An evidenced future deadline narrows delivery. An already-overdue actionable obligation
+        # remains useful; treating its past due time as expiry would discard the held reminder.
+        if deadline is None and relevance_deadline is not None and (
+                generated is None or relevance_deadline > generated):
+            deadline = relevance_deadline
+        if (deadline is None and unsolicited and not row.get('deferred_class')
+                and delivery_class not in FRESH_NUDGE_EXEMPT_CLASSES):
+            observed = instant(event.get('timestamp') or event.get('date'))
+            if observed is not None:
+                deadline = observed + FRESH_NUDGE_VALID_SECONDS
         if deadline is None and event.get('source') == 'meeting_end':
             ended = instant(event.get('end') or event.get('timestamp'))
             deadline = ended + POST_MEETING_VALID_SECONDS if ended else None
@@ -162,9 +236,27 @@ def valid(effects, now=None):
     loops = None
     conversation = None   # the local snapshot, parsed at most once per call (it is multi-MB)
     for effect in effects:
+        if effect.get('kind') == 'unsolicited_nudge':
+            import preferences
+            if preferences.effective_nudge_budget() == 0:
+                return False
+            continue
         if effect.get('kind') == 'source_permissions':
             if not all(allowed(source) for source in effect.get('sources', [])):
                 return False
+            continue
+        if effect.get('kind') == 'parking_notice':
+            loops = _loops() if loops is None else loops
+            if not parking_notice_valid(effect, now, rows=loops):
+                return False
+            continue
+        if effect.get('kind') == 'loop_surfaced':
+            # Bookkeeping cannot withhold a composed brief. Finalization re-reads the ledger and
+            # quietly declines stale/closed effects after the transport accepts the text.
+            continue
+        if effect.get('kind') == 'review_candidate_offer':
+            # Bookkeeping cannot withhold the Friday brief. Once the question is accepted,
+            # finalization records its cooldown even if eligibility changed after composition.
             continue
         if effect.get('kind') != 'eligibility':
             continue
@@ -216,6 +308,38 @@ def valid(effects, now=None):
     return True
 
 
+def parking_notice_valid(effect, now=None, *, rows=None):
+    """A rendered warning must still describe the exact live, unmuted obligation at send time."""
+    now = time.time() if now is None else now
+    import ledger_io
+    import preferences
+    from timeutil import configured_tz, _resolve_tz
+    loops = _loops() if rows is None else rows
+    row = loops.get(str(effect.get('anchor_key') or ''))
+    if (not row or loop_version(row) != effect.get('loop_version')
+            or ledger_io.last_touch_day(row) != effect.get('touch')
+            or ledger_io.parking_notice_current(row)):
+        return False
+    zone = _resolve_tz(configured_tz() or '+00:00') or timezone.utc
+    tomorrow = (datetime.fromtimestamp(now, timezone.utc).astimezone(zone).date()
+                + timedelta(days=1)).isoformat()
+    if not ledger_io.park_candidate(row, tomorrow):
+        return False
+    explicit = preferences.load_explicit()
+    muted_sections = {str(value).lower().strip().replace(' ', '_')
+                      for value in explicit.get('mute_sections', [])}
+    if 'what_moved_today' in muted_sections or 'parking_notice' in muted_sections:
+        return False
+    name = str(row.get('contact_name') or '').strip().lower()
+    if name and any(name == str(value).strip().lower()
+                    for value in explicit.get('mute_people', [])):
+        return False
+    if preferences.sender_is_muted(str(row.get('contact_identifier') or ''),
+                                   explicit.get('mute_senders', [])):
+        return False
+    return True
+
+
 def finalize(effects, receipt):
     """Apply only our effect kinds. Replays must succeed without another provider send."""
     if not receipt.get('accepted_at'):
@@ -234,20 +358,21 @@ def finalize(effects, receipt):
         elif kind == 'pending_offer':
             import pending_offer
             pending_offer.activate_offer(effect['offer'], receipt)
-        elif kind == 'retune_offer':
-            stamp_retune(effect['date'])
+        elif kind == 'parking_notice':
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'morning-brief/scripts'))
+            import continuity_resolve
+            if not continuity_resolve.acknowledge_parking_notice(effect, receipt['accepted_at']):
+                return False
+        elif kind == 'loop_surfaced':
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'morning-brief/scripts'))
+            import continuity_resolve
+            if not continuity_resolve.acknowledge_loop_surfaced(effect, receipt):
+                return False
+        elif kind == 'review_candidate_offer':
+            import review_candidates
+            # The question reached the user whether or not the candidate is still eligible by send
+            # time, so the cooldown is always recorded: it records delivery and grants no authority.
+            # Skipping it let the same question come back the next Friday.
+            if not review_candidates.mark_offered(effect, receipt):
+                return False
     return True
-
-
-def stamp_retune(date):
-    path = str(_root() / 'proactive' / 'retune_offer.last')
-    with jsonstore.lock(path):
-        try:
-            previous = Path(path).read_text().strip()
-        except FileNotFoundError:
-            previous = ''
-        if previous < date:
-            tmp = path + f'.tmp.{os.getpid()}'
-            with open(tmp, 'w', encoding='utf-8') as stream:
-                stream.write(date)
-            os.replace(tmp, path)

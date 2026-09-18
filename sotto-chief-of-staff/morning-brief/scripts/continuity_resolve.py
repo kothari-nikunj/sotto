@@ -1,95 +1,18 @@
 #!/usr/bin/env python3
-"""
-continuity_resolve.py — deterministic resolution of open loops across briefs.
+"""One ledger row per obligation, across channels.
 
-PORT SOURCE: app/src-tauri/src/database/continuity.rs (+ pipeline/deterministic.ts, reconciler.ts)
-Runs on Hermes (execute_code) over knowledge/continuity/*.md on $SOTTO_DATA, BEFORE the LLM.
-Resolves passed meetings / replied emails / expired items, dedupes by anchor_key, bumps
-times_surfaced, and prunes terminal items past retention.
-
-A ROW IS A DEBT, AND IT IS KEYED BY WHO — NOT BY WHAT THE EXTRACTOR TYPED (Step 2.9). Two halves of
-one rule. `not_a_debt` is the entry gate: no words, names nobody, or a no-reply counterpart, and no
-row is minted (the judgment half — ask vs FYI vs cold pitch — is the extraction prompt's "The Debt
-Test", because it is a question about what a message MEANS). And the anchor no longer trusts the
-model's vocabulary: `action_family` is a CLOSED set whose default is the owed-by-you family, the
-channel is dropped once a verified identity exists (a person's debt is one debt on every channel),
-the calendar-shadow skip is keyed on the family rather than two spellings, and rows already on the
-volume that name nobody are retired rather than left to collide on the single `…:name:` anchor.
-
-DIRECTION MATTERS (Step 2.7 item 1): what you OWE expires quietly after AGE_EXPIRY_DAYS, or
-DEADLINE_GRACE_DAYS past its due date. What you're OWED (`waiting_on`) expires on NEITHER clock —
-a due date makes a debt owed to the user more urgent, not more disposable, so a passed deadline
-only makes it chase-eligible at once. It leaves by delivery (the inbound branch of
-`_check_action_resolution`), by the user's hand in sotto-loops, or — when there is no
-contact_identifier to chase through at all — as `unreachable` once its chases are spent. The chase
-clock (`chase_pending` → `chased_count` / `last_chased_at` / `chase_after`) is written here and
-nowhere else: this file is the ONLY writer of chase state, as it is of every other ledger field.
-
-The new_actions may be the brief's raw `actions[]` (camelCase `actionItems`: type, channel,
-contactName, contactIdentifier, emailThreadId, meetingTime, deadlineDate, contextSummary…) OR the
-internal snake_case shape — `_normalize_action` accepts both, mirroring the Mac pipeline's
-ActionItem mapping before continuity.rs sees it.
-
-Stdin/arg JSON: { "today": "2026-06-23",
-                  "signals": { "replied_thread_ids": [...],
-                               "handled": [ {identifier, channel} ] },   # Already-Handled section
-                  "new_actions": [ <brief actions[] or snake_case actions> ] }
-Prints { "resolved":[...], "expired":[...], "active":[...] }
-
-TWO PASSES, ONE FILE. The brief must reason about a ledger resolved as of THIS run, and only the
-merge needs the brief's output — so the pass splits:
-    continuity_resolve.py --resolve-only <payload>   # BEFORE compose: resolve + stamp the chase
-    continuity_resolve.py --merge-only   <payload>   # AFTER compose: ingest the brief's actions[]
-    continuity_resolve.py <payload>                  # both, unchanged (on-demand / back-compat)
-
-CHASE, IN TWO PHASES — one extra field, `chase_pending`. `_stamp_chase` writes
-`chase_pending: <today>` and touches nothing else: a chase counts only once it was actually
-DELIVERED. proactive_scan keys its candidates on `chase_pending == today` and, on its FIRED path,
-shells back to
-    continuity_resolve.py --finalize-chase <anchor_key>
-which is what increments `chased_count`, stamps `last_chased_at`/`chase_after` and clears the
-pending stamp. This file therefore remains the ONLY writer of ledger state. An un-fired pending
-stamp expires at day end (the next resolve drops it without counting it) — nothing burns
-undelivered. The hand-off that ENDS the lane obeys the same rule: proactive_scan shells
-`--finalize-handoff <anchor_key>` once that question has actually gone out, and the
-`handoff_asked_at` it stamps is what stops the loop earning a named line in every brief and stops
-the question being asked twice. Neither finalize ever writes to a TERMINAL row — it follows
-`merged_into` to the live debt, or declines. The whole story is still one sentence: Sotto nudges
-them twice, then asks you once.
-
-IDENTITY IS NEVER WHAT THE MODEL TYPED. A group ask is keyed by the GROUP'S OWN ID — iMessage's
-`chat_guid`, WhatsApp's `…@g.us` JID, both carried in LocalData and both now shown to the model as
-`group_id:` — and a person ask by the person (canonical_id > identifier > name). A group used to be
-the one counterpart with no identifier at all, so its anchor fell back to
-`name:<whatever the extractor called the group that day>`; rename the group in one brief and the
-same debt opened a second row. An id only counts when THIS snapshot contains it
-(`canonicalize_counterpart`, source-verified — never model-asserted), and `_migrate_identity` heals
-the rows a label already minted: one idempotent re-anchor per resolve, and two rows that turn out to
-be one debt fold (older age, the chases both rows have spent, newer words, loser terminal
-as `merged_duplicate`, which renders as nothing — a dedupe is bookkeeping, not an outcome that moved).
-
-A PERSON IS RESOLVED BEFORE THEY ARE ANCHORED, and a THREAD IS NOT A DEBT. Two more shapes of the
-same disease: one capture carrying only "Spencer Schneier" and one carrying his email used to fork
-`name:` against `id:`, and three email threads from one person used to open three rows because the
-thread id outranked the person. So an action with no `canonical_id` is resolved through the
-knowledge graph first (`knowledge.find_person_file` — the graph's own exact index, never a second
-matcher and never its fuzzy name tail: an identifier the graph doesn't know resolves to NOBODY
-rather than to whoever shares the name), and a
-thread id keys the anchor only where it is the whole identity: a SYNTHETIC anchor Sotto minted
-itself (`thread:commitment:<sha>` from apply_commitments, `thread:manual:<sha>` from a hand-added
-loop — content hashes whose collapse would silently drop a distinct commitment), or an action with
-no counterpart at all. A person-directed debt anchors on the person, so a second thread from the
-same person on the same channel MERGES into the one row instead of forking.
-
-ANCHOR MIGRATION (direction split). `waiting_on` used to share the `follow_up` anchor family, so a
-reply the user owed and a debt owed TO the user on the same thread collapsed into one item whose
-direction was whichever was captured first. They are two debts and now get two anchors. Pre-split
-anchors keep working exactly as they are — nothing is rewritten — while new captures fork onto the
-direction-correct key and the old one leaves by its own resolution/expiry route.
+The pre-compose pass migrates exact duplicate identities, resolves legacy calendar shadows and
+stamps eligible chases. The post-compose pass merges actions and applies the existing brief
+model's task-specific completion proposals, bound to a ledger revision and real source message.
+Contact, a word count, a URL and a calendar attendee are never proof of a deliverable.
+Obligations stay until observed completion or a user correction, regardless of age or deadline.
+Something the user owes that nothing has touched for PARK_AFTER_DAYS parks instead: kept on disk,
+out of every view, revived by the next touch (a re-capture, a `keep`, a completion proposal).
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import fcntl
 import os
 import re
@@ -111,15 +34,16 @@ from textutil import _is_likely_automated, unwrap_tool_result  # noqa: E402
 from timeutil import _env_tz, _now_local, _resolve_tz, configured_tz  # noqa: E402
 
 TERMINAL_RETENTION_DAYS = 30          # continuity.rs:13
-AGE_EXPIRY_DAYS = 7                   # continuity.rs:973 (expiry_7d) — you-owe loops only
-DEADLINE_GRACE_DAYS = 2              # continuity.rs:975 (expiry_2d_date)
+DEADLINE_GRACE_DAYS = 2              # legacy undated meeting-shadow retirement grace
 CHASE_AFTER_DAYS = 3                 # default for SOTTO_CHASE_AFTER_DAYS (deadline-less waiting_ons)
 CHASE_MAX = ledger_io.CHASE_MAX      # after two chases, stop nudging and hand it to sotto-loops
-# The one direction that is chased instead of expired — defined once, in ledger_io, so the
-# resolver, loops_query and retune_scan can never disagree about which way a debt points.
+# The direction eligible for reminder chases — defined once in ledger_io so the resolver,
+# loops_query and retune_scan cannot disagree about which way an obligation points.
 is_waiting_on = ledger_io.is_waiting_on
 ACTIVE = ledger_io.ACTIVE             # continuity.rs:227 — single source in ledger_io
 TERMINAL = ledger_io.TERMINAL         # continuity.rs:230 (apply_commitments uses cr.TERMINAL)
+PARKED = ledger_io.PARKED             # kept, hidden, revived by a touch — defined once in ledger_io
+PARK_AFTER_DAYS = ledger_io.PARK_AFTER_DAYS
 # The closed family vocabulary lives in ledger_io beside WAITING_ON_TYPES — one owner for "which
 # words are which kind of debt", read here and by every future reader.
 MEETING_TYPES = ledger_io.MEETING_TYPES                 # continuity.rs:1001
@@ -156,6 +80,8 @@ def _normalize_action(a: dict) -> dict:
     without this shim every field reads None and all anchor keys collapse to "::"."""
     g = a.get
     return {
+        "loop_id": g("loop_id") or g("loopId"),
+        "new_obligation": g("new_obligation") is True or g("newObligation") is True,
         "action_type": g("action_type") or g("type"),
         "channel": g("channel"),
         "canonical_id": g("canonical_id"),
@@ -163,6 +89,7 @@ def _normalize_action(a: dict) -> dict:
         "contact_name": g("contact_name") or g("contactName") or "",
         "group_id": g("group_id") or g("groupId"),
         "source_thread_id": g("source_thread_id") or g("emailThreadId"),
+        "source_message_id": g("source_message_id") or g("emailMessageId"),
         "summary": g("summary") or g("contextSummary") or g("prose") or "",
         "ask": g("ask") or g("contextAsk"),
         "meeting_time": g("meeting_time") or g("meetingTime"),
@@ -189,15 +116,15 @@ _normalize_action_type = ledger_io.normalize_action_type
 def action_family(t: str) -> str:
     """The debt's family — the CLOSED set, so a word the extractor invents can never fork a row.
 
-    continuity.rs:521-528 grouped related types so reply≠follow_up≠call_back stopped duplicating per
-    person, but it returned an UNRECOGNIZED type verbatim, which made the family as open-ended as the
+    continuity.rs:521-528 grouped related type spellings, but it returned an UNRECOGNIZED type
+    verbatim, which made the family as open-ended as the
     model's vocabulary: one real ledger carried `action`, `task`, `review`, `read`, `info`,
     `reminder`, `document_mention`, `action_required` and `email_follow` alongside the documented
-    types, and every one of them opened its own row for a debt that already had one. The default
-    closes it — in one sentence, a debt Sotto cannot name the type of is still a debt the user owes.
+    types. The default closes that vocabulary: an obligation Sotto cannot classify still belongs
+    to the ordinary follow-up family. Task identity is decided separately below.
 
     DIRECTION IS ITS OWN FAMILY: a reply you owe them and a deliverable they owe you are two debts
-    even when they live on one thread, and merging them silently inverts expiry, resolution and the
+    even when they live on one thread, and merging them silently inverts resolution and the
     chase. So `waiting_on` anchors apart from the follow_up family it used to share — and it is the
     ONE family the default may never swallow, which is why it is tested first.
     """
@@ -264,8 +191,8 @@ def has_counterpart(a: dict) -> bool:
 
 
 def _thread_key(a: dict, tid: str) -> str:
-    # A thread can carry one debt in EACH direction, so the waiting_on side takes a suffixed key
-    # (every pre-split anchor keeps its exact shape; only the new direction forks).
+    # Legacy/base thread key. Direction separates the historical shapes; `_obligation_key` adds a
+    # task digest when the same thread contains more than one obligation.
     fam = action_family(a.get("action_type", ""))
     return f"thread:{tid}:{fam}" if fam in ledger_io.WAITING_ON_TYPES else f"thread:{tid}"
 
@@ -281,16 +208,12 @@ def _is_strong_anchor(anchor: str) -> bool:
 
 
 def _counterpart_key(a: dict) -> str:
-    """ONE SENTENCE: when we know WHO the debt is with, the channel is not part of who — so a
-    verified identity keys the debt on its own, and only the guessed `name:` fallback still carries
-    the channel to keep two same-named strangers apart.
+    """The counterpart-family BASE for an obligation key, not the full obligation identity.
 
-    HOW-SOTTO-DECIDES already promises "one debt per counterpart… rename a group, write the same ask
-    up differently tomorrow, or answer across three email threads, and it is still the one open
-    debt". The channel prefix was quietly contradicting it: the extractor picks the channel per run,
-    and one real ledger showed the same group ask filed under `imessage` AND `slack`, and one call
-    request under `imessage` AND `whatsapp` — three rows for a debt a human would never call more
-    than one. Direction still forks (waiting_on has its own family); the channel no longer does."""
+    A verified identity is stable across channels; only the guessed `name:` fallback retains the
+    channel to keep same-named strangers apart. `_obligation_key` carries an exact same task onto an
+    existing row, honors an explicit loopId for a paraphrase, and adds a task digest when this
+    counterpart has a distinct obligation. Direction remains part of the base family."""
     anchor = contact_anchor(a.get("canonical_id"), a.get("contact_identifier"),
                             a.get("contact_name", ""), a.get("group_id"))
     fam = action_family(a.get("action_type", ""))
@@ -300,17 +223,52 @@ def _counterpart_key(a: dict) -> str:
 
 
 def compute_anchor_key(a: dict) -> str:
-    """continuity.rs:284-304, with the thread demoted. ONE SENTENCE: a debt is keyed by WHO it is
-    with, and only falls back to the thread when there is no who — a synthetic anchor Sotto minted
-    itself, or an action carrying no group, no resolved person and no identifier.
+    """Return the legacy/base key used before task-specific disambiguation.
 
-    A thread used to win outright, so three email threads from the same person opened three rows for
-    one debt (the owner's brief showed Spencer three times). A verified GROUP already never lost to
-    a thread; now no counterpart does."""
+    The base identifies counterpart plus direction-family. A synthetic thread minted for a
+    standalone commitment, or a real thread with no known counterpart, supplies that base instead.
+    Callers creating or matching obligations must use `_obligation_key`; this helper alone does not
+    mean every task for one counterpart is the same obligation."""
     tid = _s(a.get("source_thread_id")).strip()
     if tid and not _s(a.get("group_id")).strip() and (_is_synthetic_thread(tid) or not has_counterpart(a)):
         return _thread_key(a, tid)
     return _counterpart_key(a)
+
+
+def _same_counterpart(a: dict, b: dict) -> bool:
+    return _counterpart_key(a) == _counterpart_key(b)
+
+
+def _obligation_key(a: dict, items: dict, origin_key: str = "") -> str:
+    named = _s(a.get("loop_id"))
+    if named:
+        row = items.get(named)
+        if row and _same_counterpart(a, row):
+            return named
+    base = compute_anchor_key(a)
+    if origin_key:
+        for key, row in items.items():
+            if _s(row.get("origin_key")) == origin_key and _same_counterpart(a, row):
+                return key
+        # The first observed obligation for a counterpart owns the stable base while retaining its
+        # origin identity. That lets an ordinary paraphrase and a later flagged replay converge on
+        # the same row; only explicit siblings need origin-suffixed keys.
+        if base not in items:
+            return base
+        digest = hashlib.sha256(origin_key.encode()).hexdigest()[:16]
+        return f"{base}:origin:{digest}"
+    # A unique known source recovers the right active task or tombstone if extraction omits its
+    # loopId. One message can contain several asks, so shared evidence cannot choose between them.
+    # Disjoint evidence alone never creates a task: a later message may simply repeat an old ask.
+    refs = _request_evidence(a)
+    if refs:
+        matches = [key for key, row in items.items()
+                   if _same_counterpart(a, row) and refs & _request_evidence(row)]
+        if len(matches) == 1:
+            return matches[0]
+    # Ordinary extraction is deliberately stable across prose changes. A second obligation must
+    # opt in with validated source evidence; otherwise a daily paraphrase updates this base row.
+    return base
 
 
 def _prior_anchor_keys(a: dict) -> set:
@@ -337,9 +295,9 @@ def _prior_anchor_keys(a: dict) -> set:
 # ── Is this a DEBT? (the ledger's one entry gate) ─────────────────────────────
 # A ledger row is a DEBT: something a person is waiting on from the user, or something the user
 # promised. Not everything that mentions them. The ledger used to accept whatever the extractor
-# handed it, and on the owner's real volume that meant more debts died of old age (121 expired) than
-# were ever closed (80) — receipt reminders, benefits enrollment, a badge-setup invite, cold pitches
-# from strangers, and rows with no summary at all.
+# handed it, which admitted receipt reminders, benefits enrollment, a badge-setup invite, cold
+# pitches from strangers, and rows with no summary at all. Active obligations now remain until
+# source-bound completion or a user correction, so the entry gate must reject non-obligations.
 #
 # THREE TESTS, TWO OF WHICH NEED NO JUDGMENT and therefore live here rather than in the extraction
 # prompt (a model skips instructions; code doesn't):
@@ -392,7 +350,8 @@ except Exception:  # noqa: BLE001  # pragma: no cover — renderer is always imp
 # A person file IS the store of "these identifiers, this name, one human", and the graph's own index
 # answers "who is this?" — canonical_id → identifier → exact name slug. Continuity asks THAT index
 # rather than growing a second matcher, so a capture carrying only "Spencer Schneier" and one
-# carrying his email land on the same `cid:` anchor. What it deliberately does NOT use is
+# carrying his email share a counterpart base while distinct tasks still separate. What it
+# deliberately does NOT use is
 # knowledge_update's dedup-lite fuzzy tail (containment / similarity): a merge SUGGESTION a human
 # confirms is not the same act as silently re-keying somebody's debt (see resolve_canonical_id).
 # Import-guarded like the renderer: no graph, no resolution, today's behavior — never a failed
@@ -509,10 +468,11 @@ def _identifiers_match(a: str, b: str) -> bool:
     return bool(na and nb and na == nb)
 
 
-# ── Cross-channel reply detection (continuity.rs:1089-1295) ───────────────────
-# THE MOAT: an open loop is resolved when the user answered the person on ANY
-# channel — outgoing iMessage/WhatsApp/call, or a calendar event now on the books —
-# not just the original thread. Matches by phone last-10 / email / JID across channels.
+# ── Source-bound cross-channel evidence ────────────────────────────────────────────
+# The brief may propose completion only for a named loop revision and a cited source message. The
+# validator below confirms direction, timestamp, verbatim text and counterpart identity across
+# email, iMessage and WhatsApp. Mere contact, any generic reply, a call or a calendar event closes
+# nothing.
 
 def _digits(s: str) -> str:
     return "".join(c for c in (s or "") if c.isdigit())
@@ -538,55 +498,13 @@ def _jid_matches_phone(jid: str, phone: str) -> bool:
 
 
 def _collect_all_identifiers(primary: str, contact_name: str, local: dict) -> list:
-    """Primary identifier + the contact's other emails/phones (so a reply via a different address
-    still resolves). Port of collect_all_identifiers."""
+    """Expand only a contact card containing the primary identifier; a shared name proves nothing."""
     ids = [primary] if primary else []
-    name_lower = (contact_name or "").lower()
-    if not name_lower:
-        return ids
-    for c in (local.get("contacts") or []):
-        if (c.get("name") or "").lower() != name_lower:
-            continue
-        for e in (c.get("emails") or []):
-            if e and not any(i.lower() == e.lower() for i in ids):
-                ids.append(e)
-        for p in (c.get("phones") or []):
-            if p and p not in ids:
-                ids.append(p)
-        break
-    return ids
-
-
-def _check_outgoing_message(identifiers: list, after: str, local: dict):
-    for m in (local.get("imessage") or []):
-        if not m.get("is_from_me"):
-            continue
-        if (m.get("timestamp") or "") <= (after or ""):
-            continue
-        handle = m.get("handle") or ""
-        if any(_handle_matches(handle, i) for i in identifiers):
-            return ("replied", f"Outgoing iMessage to {handle}")
-    for m in (local.get("whatsapp") or []):
-        if not m.get("is_from_me"):
-            continue
-        if (m.get("timestamp") or "") <= (after or ""):
-            continue
-        jid = m.get("contact_jid") or ""
-        if any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers):
-            return ("replied", f"Outgoing WhatsApp to {jid}")
-    # Email is a channel: the gather's `in:sent` lane lands in local["emails"] flagged isSent, and a
-    # debt closes on the user's own outbound on ANY channel. Before this branch the only email path
-    # was `signals.replied_thread_ids` — a list the agent hand-assembled — so a reply sent from the
-    # phone at 11pm was still "open" at 6:30 and got a draft of the mail already sent (Day-4
-    # simulation, Sep 2026).
-    for m in (local.get("emails") or []):
-        if not _is_sent_email(m) or not _message_is_after(m.get("date") or m.get("timestamp"), after):
-            continue
-        rcpts = _email_recipients(m)
-        hit = next((r for r in rcpts if any(_handle_matches(r, i) for i in identifiers)), "")
-        if hit:
-            return ("replied", f"Outgoing email to {hit}")
-    return None
+    for contact in local.get("contacts") or []:
+        values = [*(contact.get("emails") or []), *(contact.get("phones") or [])]
+        if primary and any(_handle_matches(primary, _s(value)) for value in values):
+            ids.extend(_s(value) for value in values if value)
+    return list(dict.fromkeys(ids))
 
 
 def _is_sent_email(m: dict) -> bool:
@@ -604,40 +522,29 @@ def _email_recipients(m: dict) -> list:
     return [addr.lower() for _name, addr in getaddresses(raw) if addr]
 
 
-# ── Inbound delivery (the mirror of the outgoing check, for `waiting_on`) ─────
-# A waiting_on closes when THEY deliver, not when you speak. Same identifier machinery
-# (_handle_matches / _jid_matches_phone / _collect_all_identifiers), direction flipped.
-#
-# THE HEURISTIC (deliberately conservative — chasing someone who already delivered is how this
-# feature loses trust, but SILENTLY closing a debt they never paid is worse): an inbound message
-# counts as delivery only when it carries substance — a link or a file name (the local snapshot
-# drops attachment-only rows, so a real attachment reaches us as a link or not at all), or at
-# least SUBSTANCE_CHARS of text — AND does not read as a promise to send it later. A bare "ok",
-# a thumbs-up, and "will send it tomorrow" all leave the loop open. When unsure we do NOT resolve:
-# a stale chase candidate the user dismisses beats a debt closed behind their back.
-SUBSTANCE_CHARS = 40
-_DELIVERY_HINT = re.compile(
-    r"https?://|www\.|\.(pdf|docx?|xlsx?|pptx?|csv|zip|png|jpe?g|key|numbers)\b", re.I)
-_PROMISE_HINT = re.compile(
-    r"\b(i'?ll|i will|we'?ll|we will|going to|gonna|will)\b[^.?!]{0,40}\b"
-    r"(send|share|get|shoot|forward|email|ping|upload|revert|circle back)\b"
-    r"|\b(not yet|still working|working on it|still has it|haven'?t|sorry for the delay|"
-    r"by (eod|eow|tomorrow|end of|the end of|the \d{1,2}(st|nd|rd|th)?|next week|"
-    r"(mon|tues?|wednes|thurs?|fri|satur|sun)day))\b", re.I)
+# Bare pleasantries are not new requests. This gate is only for reopening a closed request;
+# completion itself uses a task-specific, source-bound proposal, never a text-length heuristic.
+_CONTACT_ONLY_HINT = re.compile(
+    r"^\W*(?:happy\s+\w+(?:\s+\w+)?|merry\s+\w+|congrat\w*|good\s+luck|well\s+done|thinking\s+of\s+you|"
+    r"miss(?:ing)?\s+you|hope\s+you(?:'re|\s+are)\s+(?:well|ok|okay|good|doing\s+well)|"
+    r"safe\s+travels|get\s+well(?:\s+soon)?|welcome\s+back|"
+    r"thanks?(?:\s+you)?(?:\s+so\s+much|\s+a\s+lot)?|thx|ty|cheers|"
+    r"ok(?:ay)?|k|yep|yup|nice|great|awesome|cool|lol|ha(?:ha)+|yay|"
+    r"[\U0001F300-\U0001FAFF☀-➿]+)"
+    r"[\W]*$", re.I)
 
 
-def _is_delivery(text: str) -> bool:
+def _is_answer(text: str) -> bool:
+    """Exclude empty contact and bare pleasantries from fresh-request evidence."""
     t = _s(text).strip()
-    if not t or _PROMISE_HINT.search(t):
-        return False
-    return bool(_DELIVERY_HINT.search(t)) or len(t) >= SUBSTANCE_CHARS
+    return bool(t) and not _CONTACT_ONLY_HINT.match(t)
 
 
 def _inbound_cutoff(created_at) -> str:
-    """The instant a delivery has to beat. New items carry a full local timestamp, which IS the
-    cutoff. A LEGACY date-only `created_at` could have been recorded at any hour of that day, so
-    nothing from that day counts — otherwise the 09:00 chat that preceded the 16:00 promise closes
-    the debt on the day it was recorded, behind the user's back."""
+    """The instant a delivery has to beat — the cutoff BOTH directions use. New items carry a full
+    local timestamp, which IS the cutoff. A LEGACY date-only `created_at` could have been recorded
+    at any hour of that day, so nothing from that day counts — otherwise the 09:00 chat that
+    preceded the 16:00 promise closes the debt on the day it was recorded, behind the user's back."""
     c = _s(created_at).strip()
     if not c:
         return ""
@@ -658,96 +565,198 @@ def _message_is_after(value, after: str) -> bool:
     return _to_user_zone(observed) > _to_user_zone(cutoff)
 
 
-def _check_inbound_delivery(identifiers: list, after: str, local: dict, thread_id: str = ""):
-    """Did THEY send something substantive since the loop was created? Mirrors
-    _check_outgoing_message exactly, with `is_from_me` inverted and the substance gate applied."""
-    after = _inbound_cutoff(after)
-    for m in (local.get("imessage") or []):
-        if m.get("is_from_me"):
-            continue
-        if (m.get("timestamp") or "") <= (after or ""):
-            continue
-        handle = m.get("handle") or ""
-        if any(_handle_matches(handle, i) for i in identifiers) and _is_delivery(m.get("text")):
-            return ("delivered", f"Inbound iMessage from {handle}")
-    for m in (local.get("whatsapp") or []):
-        if m.get("is_from_me"):
-            continue
-        if (m.get("timestamp") or "") <= (after or ""):
-            continue
-        jid = m.get("contact_jid") or ""
-        if (any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers)
-                and _is_delivery(m.get("text"))):
-            return ("delivered", f"Inbound WhatsApp from {jid}")
-    for m in (local.get("emails") or []):
-        if _is_sent_email(m):
-            continue
-        if not _message_is_after(m.get("date") or m.get("timestamp"), after):
-            continue
-        sender = parseaddr(_s(m.get("from") or m.get("sender")))[1].lower()
-        sender_match = any(_handle_matches(sender, i) for i in identifiers)
-        same_thread = bool(thread_id and _s(m.get("threadId") or m.get("thread_id")) == thread_id)
-        text = m.get("body") or m.get("text") or m.get("snippet") or ""
-        if sender_match and (same_thread or not thread_id) and _is_delivery(text):
-            detail = f"Inbound email from {sender}"
-            if same_thread:
-                detail += f" on thread {thread_id}"
-            return ("delivered", detail)
-    return None
+def _request_evidence(action: dict) -> set:
+    refs = action.get("source_refs") or []
+    if isinstance(refs, dict):
+        refs = [refs]
+    result = {(normalize_channel(_s(ref.get("sourceType") or ref.get("source_type") or ref.get("source"))),
+               _s(ref.get("sourceId") or ref.get("source_id") or ref.get("id")))
+              for ref in refs if isinstance(ref, dict)}
+    if action.get("source_message_id"):
+        result.add(("email", _s(action["source_message_id"])))
+    return {(source, ident) for source, ident in result if source and ident}
 
 
-def _check_inbound_contact(identifiers: list, after: str, local: dict, thread_id: str = ""):
-    """Did THEY reach the user at all since `after` — a message on any channel, substantive or not,
-    or a call (answered or missed)? The mirror of _check_inbound_delivery without the substance
-    gate. Returns (instant, text) of the LATEST such contact, or None. This is the third state
-    between open and delivered: "they answered, they just haven't delivered" — any inbound from
-    the counterpart restarts the chase clock; only substance closes the loop."""
-    after = _inbound_cutoff(after)
-    best = None
+def _observed_action_source(action: dict, local: dict,
+                            observed_before: str) -> tuple[tuple[tuple[str, str], ...], str] | None:
+    """Bind an explicitly separate obligation to messages that were actually in the snapshot.
 
-    def _consider(ts: str, text: str):
-        nonlocal best
-        if ts and ts > (after or "") and (best is None or ts > best[0]):
-            best = (ts, text)
-
-    for m in (local.get("imessage") or []):
-        if m.get("is_from_me"):
-            continue
-        if any(_handle_matches(m.get("handle") or "", i) for i in identifiers):
-            _consider(_s(m.get("timestamp")), _s(m.get("text")))
-    for m in (local.get("whatsapp") or []):
-        if m.get("is_from_me"):
-            continue
-        jid = m.get("contact_jid") or ""
-        if any(_jid_matches_phone(jid, i) or _handle_matches(jid, i) for i in identifiers):
-            _consider(_s(m.get("timestamp")), _s(m.get("text")))
-    for c in (local.get("calls") or []):
-        if c.get("is_outgoing"):
-            continue
-        if any(_phone_matches(c.get("phone") or "", i) for i in identifiers):
-            _consider(_s(c.get("timestamp")), "")
-    for c in (local.get("whatsapp_calls") or []):
-        if c.get("is_outgoing"):
-            continue
-        if any(_jid_matches_phone(c.get("jid") or "", i) for i in identifiers):
-            _consider(_s(c.get("timestamp")), "")
-    for m in (local.get("emails") or []):
-        if _is_sent_email(m):
-            continue
-        sender = parseaddr(_s(m.get("from") or m.get("sender")))[1].lower()
-        if not any(_handle_matches(sender, i) for i in identifiers):
-            continue
-        if thread_id and _s(m.get("threadId") or m.get("thread_id")) != thread_id:
-            continue
-        observed = _parse_dt(m.get("date") or m.get("timestamp"))
-        if observed is None:
-            try:
-                observed = parsedate_to_datetime(_s(m.get("date") or m.get("timestamp")))
-            except (TypeError, ValueError, OverflowError):
+    Identity, verbatim quotation when supplied, and an observed timestamp are mandatory. The
+    timestamp becomes the obligation's chronology; extraction time and rewritten prose cannot mint
+    a second row or make an old request look new.
+    """
+    refs = action.get("source_refs") or []
+    if isinstance(refs, dict):
+        refs = [refs]
+    if not isinstance(refs, list) or not refs:
+        return None
+    primary = _s(action.get("contact_identifier"))
+    identifiers = _collect_all_identifiers(primary, "", local)
+    bound, observed_times = [], []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            return None
+        source = normalize_channel(_s(ref.get("sourceType") or ref.get("source_type") or ref.get("source")))
+        source_id = _s(ref.get("sourceId") or ref.get("source_id") or ref.get("id"))
+        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp"}.get(source)
+        quote = " ".join(_s(ref.get("snippet")).split())
+        if not field or not source_id:
+            return None
+        found = None
+        for message in local.get(field) or []:
+            ids = {_s(message.get(k)) for k in
+                   ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
+            if source != "email" and _render_local:
+                ids.add(_render_local.message_evidence_id(message, source))
+            if source_id not in ids:
                 continue
-        _consider(_to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S"),
-                  _s(m.get("body") or m.get("text") or m.get("snippet")))
-    return best
+            timestamp = message.get("date") or message.get("timestamp")
+            observed = _parse_dt(timestamp)
+            if observed is None:
+                try:
+                    observed = parsedate_to_datetime(_s(timestamp))
+                except (TypeError, ValueError, OverflowError):
+                    observed = None
+            text = _s(message.get("body") or message.get("text") or message.get("snippet"))
+            if (observed is None or not _is_answer(text)
+                    or _message_is_after(timestamp, observed_before)):
+                continue
+            if quote and quote not in " ".join(text.split()):
+                continue
+            if source == "email":
+                outgoing = _is_sent_email(message)
+                handles = (_email_recipients(message) if outgoing else
+                           [parseaddr(_s(message.get("from") or message.get("sender")))[1]])
+                group = ""
+            else:
+                handles = [_s(message.get("handle") or message.get("contact_jid"))]
+                group = _s(message.get("chat_guid")) or (handles[0] if handles[0].endswith("@g.us") else "")
+            if action.get("group_id"):
+                matches = bool(_render_local and group and
+                    _render_local.group_id_key(group) == _render_local.group_id_key(action["group_id"]))
+            else:
+                matches = not (group or message.get("is_group_chat")) and any(
+                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
+                    for handle in handles for ident in identifiers)
+            if matches:
+                found = _to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S")
+                break
+        if not found:
+            return None
+        bound.append((source, source_id))
+        observed_times.append(found)
+    return tuple(sorted(set(bound))), min(observed_times)
+
+
+def _completion_evidence(row: dict, update: dict, local: dict):
+    """Validate identity, direction, time and a verbatim quotation; the existing brief judges meaning.
+
+    Raw text is data, never a request to change the ledger. An unsupported/missing proposal leaves
+    the obligation open. One proposal names one row; meeting attendees and thread IDs alone prove
+    nothing. Local contact expansion requires the primary identifier to be present on that card.
+    """
+    primary = _s(row.get("contact_identifier"))
+    identifiers = _collect_all_identifiers(primary, "", local)
+    wanted_inbound = is_waiting_on(row.get("action_type"))
+    refs = update.get("evidence")
+    if not isinstance(refs, list) or not refs:
+        return None
+    for evidence in refs:
+        if not isinstance(evidence, dict):
+            return None
+        source = normalize_channel(_s(evidence.get("sourceType")))
+        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp"}.get(source)
+        quote = " ".join(_s(evidence.get("snippet")).split())
+        source_id = _s(evidence.get("sourceId"))
+        if not field or not source_id or not quote:
+            return None
+        found = None
+        for message in local.get(field) or []:
+            ids = {_s(message.get(k)) for k in ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
+            if source != "email" and _render_local:
+                ids.add(_render_local.message_evidence_id(message, source))
+            if source_id not in ids:
+                continue
+            outgoing = _is_sent_email(message) if source == "email" else bool(message.get("is_from_me"))
+            if outgoing == wanted_inbound:
+                continue
+            timestamp = message.get("date") or message.get("timestamp")
+            if not _message_is_after(timestamp, _inbound_cutoff(row.get("created_at"))):
+                continue
+            text = _s(message.get("body") or message.get("text") or message.get("snippet"))
+            if quote not in " ".join(text.split()):
+                continue
+            if source == "email":
+                handles = _email_recipients(message) if outgoing else [parseaddr(_s(message.get("from") or message.get("sender")))[1]]
+                group = ""
+            else:
+                handles = [_s(message.get("handle") or message.get("contact_jid"))]
+                group = _s(message.get("chat_guid")) or (handles[0] if handles[0].endswith("@g.us") else "")
+            if row.get("group_id"):
+                matches = bool(_render_local and group and _render_local.group_id_key(group) == _render_local.group_id_key(row["group_id"]))
+            else:
+                matches = not (group or message.get("is_group_chat")) and any(
+                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
+                    for handle in handles for ident in identifiers)
+            if matches:
+                found = {"timestamp": _s(timestamp), "text": text,
+                         "description": f"{'Inbound' if wanted_inbound else 'Outgoing'} {source}: {quote}"}
+                break
+        if not found:
+            return None
+    return found
+
+
+def _new_request_since_closure(action: dict, closed: dict, local: dict) -> str:
+    """A person is not a dismissed request. Reopen only for a newly sourced incoming message
+    after the user's closure, never a new extraction timestamp or a paraphrase of old evidence.
+    Existing evidence fields bind local messages; a new email thread can bind without message ID.
+    Legacy date-only closures conservatively cover that entire day.
+    """
+    cutoff = _s(closed.get("closed_at")) or _inbound_cutoff(closed.get("resolved_at"))
+    if not cutoff or not _parse_dt(cutoff):
+        return ""
+    identifiers = _collect_all_identifiers(action.get("contact_identifier") or "",
+                                           action.get("contact_name") or "", local)
+    fresh_refs = _request_evidence(action) - _request_evidence(closed)
+    thread = _s(action.get("source_thread_id"))
+    new_thread = bool(thread and thread != _s(closed.get("source_thread_id"))
+                      and not _is_synthetic_thread(thread))
+    for source, field in (("email", "emails"), ("imessage", "imessage"), ("whatsapp", "whatsapp")):
+        for message in local.get(field) or []:
+            outgoing = _is_sent_email(message) if source == "email" else message.get("is_from_me")
+            if outgoing:
+                continue
+            timestamp = message.get("date") or message.get("timestamp")
+            if not _message_is_after(timestamp, cutoff):
+                continue
+            ids = {_s(message.get(key)) for key in ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
+            if source != "email" and _render_local:
+                ids.add(_render_local.message_evidence_id(message, source))
+            bound = any(src == source and ident in ids for src, ident in fresh_refs)
+            if source == "email":
+                bound = bound or (new_thread and thread == _s(message.get("threadId") or message.get("thread_id")))
+                handle = parseaddr(_s(message.get("from") or message.get("sender")))[1].lower()
+            else:
+                handle = _s(message.get("handle") or message.get("contact_jid"))
+            group = _s(action.get("group_id"))
+            message_group = _s(message.get("chat_guid"))
+            if group:
+                counterpart_matches = bool(_render_local and message_group
+                    and _render_local.group_id_key(message_group) == _render_local.group_id_key(group))
+            else:
+                # Group messages name an individual sender, not a one-to-one conversation.
+                counterpart_matches = not (message_group or message.get("is_group_chat")) and any(
+                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident) for ident in identifiers)
+            if not bound or not counterpart_matches:
+                continue
+            if not _is_answer(message.get("body") or message.get("text") or message.get("snippet")):
+                continue
+            observed = _parse_dt(timestamp)
+            if observed is None:
+                observed = parsedate_to_datetime(_s(timestamp))
+            return _to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S")
+    return ""
 
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -799,89 +808,6 @@ def promised_date(text: str, ref: datetime):
         ahead = (target - day.weekday()) % 7 or 7
         return (day + timedelta(days=ahead)).strftime("%Y-%m-%d")
     return None
-
-
-def _heard_from_them(it: dict, local: dict, today: str, ref: datetime) -> bool:
-    """A `waiting_on` the counterpart REPLIED to without delivering: push the chase clock to the
-    date they named, else `chase_after_days` out, without counting a chase — Maya saying "legal has
-    it until the 16th" must not be followed by a chase the morning after. Returns True when the
-    row changed. The instant is remembered so one reply restarts the clock exactly once."""
-    ident = it.get("contact_identifier") or ""
-    if not ident:
-        return False
-    ids = _collect_all_identifiers(ident, it.get("contact_name") or "", local)
-    after = max(_s(it.get("created_at")), _s(it.get("last_heard_at")), _s(it.get("last_chased_at")))
-    heard = _check_inbound_contact(ids, after, local, _s(it.get("source_thread_id")))
-    if not heard:
-        return False
-    ts, text = heard
-    named = promised_date(text, ref)
-    default = (ref + timedelta(days=chase_after_days())).strftime("%Y-%m-%d")
-    it["last_heard_at"] = ts
-    it["chase_after"] = named if named and named > today else default
-    it.pop("chase_pending", None)
-    return True
-
-
-def _check_calendar_event(identifiers: list, contact_name: str, local: dict, now: datetime):
-    events = local.get("calendar_events") or local.get("events") or []
-    name_lower = (contact_name or "").lower()
-    now_local = _to_user_zone(now)
-    lo, hi = now_local - timedelta(hours=1), now_local + timedelta(days=14)
-    id_lowers = {i.lower() for i in identifiers}
-    for e in events:
-        st = _parse_dt(e.get("start"))
-        if st is not None and not (lo <= _to_user_zone(st) <= hi):
-            continue
-        for a in (e.get("attendees") or []):
-            email = _s(a.get("email")).lower()
-            display = _s(a.get("displayName") or a.get("display_name")).lower()
-            if email and email in id_lowers:
-                return ("scheduled_meeting", f'Calendar event "{_s(e.get("summary")) or "a meeting"}" with {contact_name}')
-            if name_lower and display and display == name_lower:
-                return ("scheduled_meeting", f'Calendar event "{_s(e.get("summary")) or "a meeting"}" with {contact_name}')
-    return None
-
-
-def _check_action_resolution(it: dict, local: dict, now: datetime):
-    """Port of check_action_resolution: did the user answer this person on any channel since the
-    action was created? Returns (resolution_type, evidence) or None."""
-    if not local:
-        return None
-    # A concrete meeting commitment is not the same thing as "reply to this person". Generic traffic
-    # cannot prove the deck was sent or the market map was built; explicit/user-confirmed closure is
-    # safer than silently clearing a deliverable because one unrelated message crossed channels.
-    if _s(it.get("resolution_mode")).strip() == "explicit":
-        return None
-    ident = it.get("contact_identifier") or ""
-    if not ident:
-        return None
-    created = it.get("created_at") or ""
-    ids = _collect_all_identifiers(ident, it.get("contact_name") or "", local)
-    at = _normalize_action_type(it.get("action_type"))   # reply_message/reply_email → reply, etc.
-    if at in ledger_io.WAITING_ON_TYPES:
-        # The mirrored branch: you're owed something, so the evidence is INBOUND. Deliberately NOT
-        # the calendar check the outgoing branches use — a meeting appearing on the books proves
-        # the user scheduled something, not that the other side delivered what they promised.
-        return _check_inbound_delivery(ids, created, local, _s(it.get("source_thread_id")))
-    if at == "call_back":
-        for c in (local.get("calls") or []):
-            if c.get("is_outgoing") and (c.get("timestamp") or "") > created:
-                if any(_phone_matches(c.get("phone") or "", i) for i in ids):
-                    return ("called", f"Outgoing call to {c.get('phone')}")
-        for c in (local.get("whatsapp_calls") or []):
-            if c.get("is_outgoing") and (c.get("timestamp") or "") > created:
-                if any(_jid_matches_phone(c.get("jid") or "", i) for i in ids):
-                    return ("called", f"Outgoing WhatsApp call to {c.get('jid')}")
-        return (_check_outgoing_message(ids, created, local)
-                or _check_calendar_event(ids, it.get("contact_name") or "", local, now))
-    # DIRECTION, NOT VOCABULARY, decides how a debt closes: anything that is not a `waiting_on` is
-    # something the user owes, so it closes when the user answers — on the same rule as `reply` and
-    # `follow_up`. This used to be an explicit list, and the words outside it (`action`, `task`,
-    # `review`, a bare `call`) got no resolution check at all: they could only ever leave by aging
-    # out, which is precisely the pile the owner's ledger had become.
-    return (_check_outgoing_message(ids, created, local)
-            or _check_calendar_event(ids, it.get("contact_name") or "", local, now))
 
 
 def _s(v) -> str:
@@ -950,7 +876,44 @@ def _days_old(created_at, ref: datetime):
         return None
 
 
-def chase_due(it: dict, today: str, ref: datetime) -> bool:
+def _relationship_history() -> dict:
+    try:
+        with open(os.path.join(_data_root(), "knowledge", "relationship_state.json"),
+                  encoding="utf-8") as f:
+            history = json.load(f).get("history", {})
+        return history if isinstance(history, dict) else {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _learned_chase_after(it: dict, default_at: datetime, evaluation_now: datetime,
+                         obligation_at: datetime | None = None, history: dict | None = None) -> datetime:
+    """Apply finite counterpart latency only as a delay, never beyond an obligation deadline."""
+    default_at = _to_user_zone(default_at)
+    evaluation_now = _to_user_zone(evaluation_now)
+    obligation_at = _to_user_zone(obligation_at) if obligation_at is not None else None
+    try:
+        from relationship_importance import engagement_for_contact, learned_chase_after
+        contact = {"name": it.get("contact_name"), "canonical_id": it.get("canonical_id")}
+        engagement = engagement_for_contact(contact, history if history is not None
+                                            else _relationship_history())
+        learned = learned_chase_after(default_at, engagement, evaluation_now, obligation_at)
+        learned = _to_user_zone(learned) if isinstance(learned, datetime) else default_at
+    except (OSError, ValueError, TypeError, AttributeError):
+        learned = default_at
+    deadline = _s(it.get("deadline"))[:10]
+    if deadline:
+        try:
+            deadline_at = datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=learned.tzinfo)
+            if deadline_at <= evaluation_now:
+                return default_at
+            learned = min(learned, deadline_at)
+        except ValueError:
+            pass
+    return max(default_at, learned)
+
+
+def chase_due(it: dict, today: str, ref: datetime, history: dict | None = None) -> bool:
     """Is this waiting_on due for a chase? Deadline-less ones ripen after `chase_after_days`;
     a post-deadline one escalates immediately (it's already late); `chase_after` (stamped by the
     last chase) governs afterwards; and after CHASE_MAX chases we stop and leave it to sotto-loops."""
@@ -964,8 +927,14 @@ def chase_due(it: dict, today: str, ref: datetime) -> bool:
     deadline = _s(it.get("deadline"))[:10]
     if deadline:
         return deadline < today          # post-deadline → escalate now, no ripening wait
-    age = _days_old(it.get("created_at") or today, ref)
-    return age is not None and age >= chase_after_days()
+    try:
+        created = datetime.strptime(_s(it.get("created_at") or today)[:10], "%Y-%m-%d").replace(
+            tzinfo=_user_tzinfo())
+    except ValueError:
+        return False
+    due = _learned_chase_after(it, created + timedelta(days=chase_after_days()), ref, created,
+                               history)
+    return due.date().isoformat() <= today
 
 
 def _clear_stale_pending(active: list, today: str):
@@ -997,8 +966,9 @@ def _stamp_chase(active: list, today: str, ref: datetime):
     ranked = sorted(active, key=lambda it: (int(it.get("chase_stalls") or 0),
                                             not overdue(it),
                                             -(_days_old(it.get("created_at"), ref) or 0)))
+    history = _relationship_history()
     for it in ranked:
-        if chase_due(it, today, ref):
+        if chase_due(it, today, ref, history):
             it["chase_pending"] = today
             _persist(it)
             return
@@ -1035,10 +1005,6 @@ def _finalize_chase_unlocked(anchor_key: str, now: datetime | None = None) -> di
     TERMINAL row — a chase lands on the live debt (via `merged_into`) or nowhere."""
     now = now or _now_local(configured_tz() or "+00:00")
     today = _to_user_zone(now).strftime("%Y-%m-%d")
-    try:
-        ref = datetime.strptime(today, "%Y-%m-%d")
-    except ValueError:  # pragma: no cover — strftime output always parses
-        ref = _to_user_zone(now).replace(tzinfo=None)
     key = (anchor_key or "").strip()
     if not key:
         return {"ok": False, "detail": "missing anchor_key"}
@@ -1058,7 +1024,9 @@ def _finalize_chase_unlocked(anchor_key: str, now: datetime | None = None) -> di
                 "detail": "no chase pending for today"}
     it["chased_count"] = _int(it.get("chased_count")) + 1
     it["last_chased_at"] = today
-    it["chase_after"] = (ref + timedelta(days=chase_after_days())).strftime("%Y-%m-%d")
+    it["chase_after"] = _learned_chase_after(
+        it, _to_user_zone(now) + timedelta(days=chase_after_days()), now,
+        _to_user_zone(now), _relationship_history()).strftime("%Y-%m-%d")
     it.pop("chase_pending", None)
     # A delivered chase ends the stall penalty: the stall was a property of the days the lane was
     # down, not of this loop, and a row must not stay demoted after a chase actually landed.
@@ -1149,7 +1117,7 @@ def _load_items(with_shadowed: bool = False):
     TWO FILES, ONE ANCHOR_KEY — the duplicate nobody could see. A migration re-anchors a row in
     place (the file keeps its path, the key it answers to changes), so two files can end up carrying
     the same anchor_key. This dict then kept whichever sorted last and silently DROPPED the other:
-    it was never resolved, never expired, never pruned — but `ledger_io.load_active` reads files, not
+    it was never reconciled or updated — but `ledger_io.load_active` reads files, not
     this dict, so the brief, the count line and /app#loops all went on showing it forever. Returned
     as `shadowed` with with_shadowed=True so the one pass that writes can fold them (resolve()); the
     read-only callers keep today's signature."""
@@ -1201,7 +1169,8 @@ def _row_identity(it: dict) -> dict:
     return {"action_type": it.get("action_type"), "channel": it.get("channel"),
             "canonical_id": it.get("canonical_id"), "contact_identifier": it.get("contact_identifier"),
             "contact_name": it.get("contact_name"), "group_id": it.get("group_id"),
-            "source_thread_id": it.get("source_thread_id")}
+            "source_thread_id": it.get("source_thread_id"),
+            "summary": it.get("summary"), "ask": it.get("ask")}
 
 
 # The chase fields that fold by DATE (the count folds by max instead). Derived from ledger_io's
@@ -1217,7 +1186,7 @@ def _latest(a, b) -> str:
 
 
 def _fold_duplicate(keeper: dict, loser: dict, today: str):
-    """Two rows, one debt: the OLDER created_at is the debt's real age, the NEWER words are the live
+    """Two rows proven to be the same obligation: the OLDER created_at is its real age, the NEWER words are the live
     ask, and the loser closes as bookkeeping — `merged_duplicate` is terminal and renders as nothing
     anywhere, because a dedupe is not an outcome that moved.
 
@@ -1245,8 +1214,19 @@ def _fold_duplicate(keeper: dict, loser: dict, today: str):
             keeper[k] = latest
         else:
             keeper.pop(k, None)
-    keeper["times_surfaced"] = max(_int(keeper.get("times_surfaced"), 1),
-                                   _int(loser.get("times_surfaced"), 1))
+    # Only accepted-delivery provenance is trustworthy. Legacy `times_surfaced` counted model
+    # proposals and remains inert for compatibility; exact receipt hashes make the merge replay-safe.
+    surfaces = [value for value in (keeper.get("delivery_surface"), loser.get("delivery_surface"))
+                if isinstance(value, dict) and value.get("schema") == 1]
+    if surfaces:
+        keys = sorted({key for value in surfaces for key in value.get("delivery_keys", [])
+                       if isinstance(key, str)})
+        firsts = [_s(value.get("first_at")) for value in surfaces if _s(value.get("first_at"))]
+        lasts = [_s(value.get("last_at")) for value in surfaces if _s(value.get("last_at"))]
+        keeper["delivery_surface"] = {"schema": 1,
+                                      "delivery_keys": keys,
+                                      "first_at": min(firsts) if firsts else "",
+                                      "last_at": max(lasts) if lasts else ""}
     _terminate(loser, "dismissed", "merged_duplicate", today)
     loser["merged_into"] = _s(keeper.get("anchor_key"))
     _persist(keeper)
@@ -1274,7 +1254,7 @@ def _retire_anchorless(rows: list, today: str) -> list:
     return retired
 
 
-def _terminal_twin(items: dict, canon: dict, old_key: str) -> bool:
+def _terminal_twin(items: dict, canon: dict, old_key: str) -> dict | None:
     """Did this same debt already close under an EARLIER anchor shape? A terminal row is never
     re-anchored (a loop the user closed stays closed and keeps its key), so when the key shape
     changes the closed twin keeps the old spelling — and a live row migrating onto the new spelling
@@ -1284,18 +1264,26 @@ def _terminal_twin(items: dict, canon: dict, old_key: str) -> bool:
             continue
         row = items.get(k)
         if row is not None and _s(row.get("status", "open")) in TERMINAL:
-            return True
-    return False
+            return row
+    return None
+
+
+def _retire_into_terminal(items: dict, old_key: str, row: dict, terminal: dict, today: str) -> None:
+    """A live legacy spelling of an already-closed debt is bookkeeping, not a resurrection."""
+    _terminate(row, "dismissed", "merged_duplicate", today)
+    row["merged_into"] = _s(terminal.get("anchor_key"))
+    _persist(row)
+    items.pop(old_key, None)
 
 
 def _migrate_identity(items: dict, group_index: dict, today: str,
                       person_index: dict | None = None) -> list:
-    """ONE idempotent migration, run before resolution: a live row is re-anchored onto its
-    counterpart's real identity — the group's own platform id, or the person the knowledge graph
-    resolves — and two rows that turn out to be the same debt become one (older age, the chases both
-    rows have spent, newer words, loser terminal as `merged_duplicate`). A row minted under an invented label ("Intro
-    Group") or under a thread id ("Farid" at 2d beside the same Farid at 7d) heals on the next
-    resolve instead of living out its week as a second open debt.
+    """Idempotently migrate legacy identity shapes before matching today's actions.
+
+    A live row adopts the group's platform id or the person's graph identity. Rows fold only when
+    Legacy resolver-minted aliases fold onto the stable counterpart-and-direction base regardless
+    of prose. Explicit distinct obligations already carry custom, task or origin keys and remain
+    separate because those keys are outside `_prior_anchor_keys`.
 
     Two rows are never touched: a TERMINAL one (a loop the user closed stays closed), and one whose
     stored anchor this file did not mint (`_prior_anchor_keys`) — a content-hashed commitment anchor
@@ -1309,15 +1297,20 @@ def _migrate_identity(items: dict, group_index: dict, today: str,
         if (_s(it.get("anchor_key")) or old_key) not in _prior_anchor_keys(identity):
             continue                      # not an anchor this file composed — not ours to move
         canon = canonicalize_counterpart(identity, group_index, person_index)
-        new_key = compute_anchor_key(canon)
+        new_key = _obligation_key(canon, {k: v for k, v in items.items() if k != old_key})
         adopted = {k: canon[k] for k in ("group_id", "canonical_id", "contact_name")
                    if _s(canon.get(k)).strip() and _s(canon.get(k)) != _s(it.get(k))}
         if new_key == old_key and not adopted:
             continue                      # already anchored on the truth — the idempotent case
         twin = items.get(new_key) if new_key != old_key else None
         if twin is not None and twin.get("status", "open") in TERMINAL:
+            _retire_into_terminal(items, old_key, it, twin, today)
+            folded.append(it)
             continue                      # the same debt already closed — never resurrect it
-        if twin is None and _terminal_twin(items, canon, old_key):
+        terminal_twin = _terminal_twin(items, canon, old_key) if twin is None else None
+        if terminal_twin is not None:
+            _retire_into_terminal(items, old_key, it, terminal_twin, today)
+            folded.append(it)
             continue                      # …closed under an EARLIER anchor shape; still closed
         it.update(adopted)
         if new_key == old_key:
@@ -1345,12 +1338,9 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     # check compares against, and "2026-06-23" sorts before every message sent that day — including
     # the ones that arrived hours BEFORE the promise was made.
     created_stamp = f"{_s(today)[:10]} {_to_user_zone(now).strftime('%H:%M:%S')}"
-    signals = payload.get("signals", {}) or {}
-    replied = set(signals.get("replied_thread_ids", []))
-    handled = signals.get("handled", []) or []   # [{identifier, channel}] from the Already-Handled section
-    # The read_local snapshot (+ calendar events) drives cross-channel reply detection. The SKILL
-    # tells the agent to pass the read_local JSON AS-IS, which may still be the raw MCP tool-result
-    # wrapper — unwrap it the same way compose_brief does, or every cross-channel check sees {}.
+    # The read_local snapshot supplies source messages for proposal validation and fresh-request
+    # reopening. The SKILL passes it AS-IS and it may still be the raw MCP tool-result wrapper, so
+    # unwrap it as compose_brief does or every evidence check sees {}.
     local_data = unwrap_tool_result(payload.get("local") or {})
     if payload.get("events") and "events" not in local_data:
         local_data = {**local_data, "events": payload["events"]}
@@ -1360,12 +1350,13 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     if isinstance(email_data, list) and "emails" not in local_data:
         local_data = {**local_data, "emails": email_data}
     items, shadowed = _load_items(with_shadowed=True)
+    from delivery_effects import loop_version
     # Group identity, straight from the snapshot the model was shown (see canonicalize_counterpart).
     group_index = group_identity(local_data)
     # Person identity, straight from the knowledge graph — built once, read by every anchor below.
     person_index = person_identity()
 
-    resolved, expired, active = [], [], []
+    resolved, expired, active, parked = [], [], [], []
     # Cutoffs derive from the brief's `today` (the deterministic reference the payload carries),
     # NOT the wall clock — so an offline replay / fixture with a fixed `today` resolves identically
     # regardless of when it runs.
@@ -1374,7 +1365,6 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     except ValueError:
         ref = _to_user_zone(now).replace(tzinfo=None)
     retention_cutoff = (ref - timedelta(days=TERMINAL_RETENTION_DAYS)).strftime("%Y-%m-%d")
-    age_cutoff = (ref - timedelta(days=AGE_EXPIRY_DAYS)).strftime("%Y-%m-%d")          # continuity.rs:973
     deadline_cutoff = (ref - timedelta(days=DEADLINE_GRACE_DAYS)).strftime("%Y-%m-%d")  # continuity.rs:975
 
     # 0) identity first: fold the files no dict could hold, then re-anchor every live row onto its
@@ -1386,11 +1376,19 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         expired.extend(_retire_anchorless(list(items.values()) + shadowed, today))
         _fold_shadowed(items, shadowed, today)
         _migrate_identity(items, group_index, today, person_index)
+    versions = {key: loop_version(row) for key, row in items.items()}
+    proposed_updates = payload.get("loop_updates") or payload.get("loopUpdates") or []
+    if not isinstance(proposed_updates, list):
+        proposed_updates = []
+    update_ids = {_s(u.get("loopId")) for u in proposed_updates if isinstance(u, dict)}
 
-    # 1) merge new actions by anchor_key (bump times_surfaced, reconciler.ts). Accept the brief's
+    # 1) merge new actions by anchor_key. Capture is not delivery: only an accepted outbox effect
+    #    may record that the transport accepted a brief naming the loop. Accept the brief's
     #    camelCase actionItems OR snake_case via _normalize_action.
     merged = []
     rejected = []
+    skipped_user_terminal = []
+    origin_ordinals = {}
     for raw in (payload.get("new_actions", []) if merge else []):
         a = canonicalize_counterpart(_normalize_action(raw), group_index, person_index)
         # The ledger holds COMMUNICATION DEBTS — replies owed, follow-ups, commitments,
@@ -1411,17 +1409,61 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if why:
             rejected.append(f"{_s(a.get('contact_name')) or '(unnamed)'}: {why}")
             continue
-        ak = compute_anchor_key(a)
+        named = _s(a.get("loop_id"))
+        named_row = items.get(named) if named else None
+        if named and (not named_row or not _same_counterpart(a, named_row)):
+            # A hallucinated ID may neither discard a real extraction nor edit another person's
+            # row. Record the bad reference, then apply the stable counterpart default.
+            rejected.append(f"{_s(a.get('contact_name'))}: unknown or mismatched loopId; used counterpart base")
+            a["loop_id"] = None
+            named = ""
+        if named and named in update_ids:
+            # One response cannot redefine an obligation and claim to have fulfilled that revision.
+            continue
+
+        origin_key = ""
+        if a.get("new_obligation"):
+            observed = _observed_action_source(a, local_data, created_stamp)
+            if observed is None:
+                # Unsupported separation neither forks nor rewrites the existing task. The log is
+                # the receipt; the next extraction can retry with evidence from the real snapshot.
+                rejected.append(f"{_s(a.get('contact_name'))}: newObligation evidence not observed")
+                continue
+            else:
+                refs, observed_at = observed
+                base = compute_anchor_key(a)
+                ordinal_group = (base, refs)
+                ordinal = origin_ordinals.get(ordinal_group, 0) + 1
+                origin_ordinals[ordinal_group] = ordinal
+                origin_key = json.dumps([base, refs, ordinal], separators=(",", ":"))
+                a["origin_key"] = origin_key
+                a["created_at"] = observed_at
+        ak = _obligation_key(a, items, origin_key)
+        if ak in update_ids:
+            continue
         if ak not in items:
-            # …and if today's shape finds nothing, look under every shape this file has ever
-            # minted. A row the migration cannot move (a TERMINAL one keeps its key forever, and a
-            # live row whose stored channel differs from today's capture) would otherwise be
-            # invisible to the merge, and the capture would open a second row beside it.
-            ak = next((k for k in _prior_anchor_keys(a) if k in items), ak)
+            closed = [it for it in items.values() if it.get("status") in TERMINAL
+                      and _same_counterpart(a, it)]
+            if closed:
+                observed = max((_new_request_since_closure(a, it, local_data) for it in closed), default="")
+                if not observed:
+                    skipped_user_terminal.append(_s(a.get("contact_name")) or "(unnamed)")
+                    continue
+                a["created_at"] = observed
         if ak in items:
             it = items[ak]
+            if it.get("status") in TERMINAL:
+                observed = _new_request_since_closure(a, it, local_data)
+                if not observed:
+                    skipped_user_terminal.append(
+                        f"{_s(it.get('contact_name')) or '(unnamed)'} ({_s(it.get('resolution'))})")
+                    continue
+                a["created_at"] = observed
             merged.append(it)
-            it["times_surfaced"] = int(it.get("times_surfaced", 1)) + 1
+            if it.get("status") in PARKED:
+                # Re-captured: the ask is live again. No new-request evidence is needed — parking
+                # was Sotto's silence, not the user's closure.
+                unpark(it, today)
             if it.get("status") not in TERMINAL:
                 # A live anchor re-captured: the ASK is today's, not the day it was first seen.
                 # `action_type` stays put — direction now has its own anchor family, so a genuine
@@ -1437,13 +1479,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 # A NEW action on a TERMINAL anchor = the person came back after the loop closed
                 # (e.g. they replied again the day after resolution). Without a re-open the action
                 # is absorbed here and step 2 `continue`s on the terminal status — the person
-                # vanishes for the whole retention window. Re-open with the fresh ask; the old
-                # resolution moves to prior_* so history isn't lost.
-                if it.get("resolution"):
-                    it["prior_resolution"] = it["resolution"]
-                    it["prior_resolved_at"] = _s(it.get("resolved_at"))[:10] or None
+                # vanishes for the whole retention window. Re-open with the fresh ask.
+                #
+                # User closures reach here only with fresh request evidence (checked above).
                 it.pop("resolution", None)
                 it.pop("resolved_at", None)
+                it.pop("closed_at", None)
+                for field in ("source_thread_id", "source_message_id", "source_refs"):
+                    it[field] = a.get(field)
                 it["status"] = "open"
                 it["reopened_at"] = today
                 it["created_at"] = a.get("created_at") or created_stamp   # fresh ask — restart the clock
@@ -1457,12 +1500,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 "anchor_key": ak, "action_type": a.get("action_type"), "channel": a.get("channel"),
                 "contact_name": a.get("contact_name"), "contact_identifier": a.get("contact_identifier"),
                 "canonical_id": a.get("canonical_id"), "status": "open",
-                "created_at": a.get("created_at") or created_stamp, "times_surfaced": 1,
+                "created_at": a.get("created_at") or created_stamp,
                 "summary": a.get("summary", ""), "ask": a.get("ask"),
                 "meeting_time": a.get("meeting_time"), "deadline": a.get("deadline"),
                 "source_thread_id": a.get("source_thread_id"),
+                "source_message_id": a.get("source_message_id"),
                 "group_id": a.get("group_id"),
                 "source": a.get("source"), "source_refs": a.get("source_refs"),
+                "origin_key": a.get("origin_key"),
                 "resolution_mode": a.get("resolution_mode"),
             }
             if not a.get("source"):
@@ -1473,10 +1518,88 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             merged.append(items[ak])
 
     if rejected:
-        # Explainable in the log the same way a malformed file is: every row the gate refused, and
-        # the one sentence it refused it by.
-        print("[continuity_resolve] not a debt, no ledger row: " + "; ".join(rejected),
+        # This includes hard rejections and safe identity fallbacks, so the heading cannot claim
+        # every proposal was dropped. Each detail says which outcome occurred without message text.
+        print("[continuity_resolve] action proposal adjustments: " + "; ".join(rejected),
               file=sys.stderr)
+    if skipped_user_terminal:
+        # Same shape of receipt, for the other refusal: the loops a fresh capture would have
+        # re-opened and the user's own closure kept shut.
+        print("[continuity_resolve] left closed, the user closed it: "
+              + "; ".join(skipped_user_terminal), file=sys.stderr)
+
+    rejected_updates = {}
+    accepted_updates = 0
+    reply_history = None          # relationship_state.json, read at most once per pass
+
+    def reject_update(reason):
+        rejected_updates[reason] = rejected_updates.get(reason, 0) + 1
+
+    for update in proposed_updates:
+        if not isinstance(update, dict):
+            reject_update("malformed_update")
+            continue
+        key = _s(update.get("loopId"))
+        row = items.get(key)
+        if not row:
+            reject_update("unknown_loop")
+            continue
+        if row.get("status") in TERMINAL or row.get("resolution_mode") == "explicit":
+            reject_update("protected_loop")
+            continue
+        if not update.get("loopVersion") or update["loopVersion"] != versions.get(key):
+            reject_update("stale_revision")
+            continue
+        proof = _completion_evidence(row, update, local_data)
+        if not proof:
+            reject_update("unsupported_evidence")
+            continue
+        if update.get("status") == "resolved":
+            _terminate(row, "resolved", "delivered" if is_waiting_on(row.get("action_type")) else "replied", today)
+            row["resolution_evidence"] = proof["description"]
+            row["resolution_source_refs"] = update["evidence"]
+            resolved.append(row)
+        elif update.get("status") == "waiting" and is_waiting_on(row.get("action_type")):
+            # A specific promise postpones only this obligation. Replayed evidence never buys time.
+            if not _message_is_after(proof["timestamp"], _s(row.get("last_heard_at"))):
+                reject_update("replayed_promise")
+                continue
+            promise_ref = _parse_dt(proof["timestamp"])
+            if promise_ref is None:
+                try:
+                    promise_ref = parsedate_to_datetime(_s(proof["timestamp"]))
+                except (TypeError, ValueError, OverflowError):
+                    promise_ref = ref
+            promise_ref = _to_user_zone(promise_ref)
+            named = promised_date(proof["text"], promise_ref)
+            row["last_heard_at"] = proof["timestamp"]
+            if not named and reply_history is None:
+                reply_history = _relationship_history()
+            chase_after = (named or _learned_chase_after(
+                row, promise_ref + timedelta(days=chase_after_days()), now,
+                promise_ref, reply_history).strftime("%Y-%m-%d"))
+            hard_deadline = _s(row.get("deadline"))[:10]
+            # Bound an explicit promised date by a future obligation deadline. The unnamed path's
+            # helper already preserves the ordinary floor; a second clamp here would undo it.
+            row["chase_after"] = (min(chase_after, hard_deadline)
+                                  if named and hard_deadline and hard_deadline > today else chase_after)
+            row.pop("chase_pending", None)
+        else:
+            reject_update("unsupported_status")
+            continue
+        _persist(row)
+        accepted_updates += 1
+
+    if rejected_updates:
+        # Counts and reason codes explain a held loop without logging messages or model quotes.
+        print("[continuity_resolve] rejected loop updates: " + json.dumps(rejected_updates, sort_keys=True),
+              file=sys.stderr)
+    update_outcomes = {"accepted": accepted_updates,
+                       "rejected": sum(rejected_updates.values()),
+                       "rejected_by_reason": rejected_updates,
+                       "total": len(proposed_updates)}
+    print("[continuity_resolve] loop update outcomes: "
+          + json.dumps(update_outcomes, sort_keys=True), file=sys.stderr)
 
     if not resolve_existing:
         # --merge-only: persist exactly what this pass touched (nothing else is rewritten, so a
@@ -1485,10 +1608,12 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             _persist(it)
         open_now = [it for it in items.values()
                     if it.get("status", "open") not in TERMINAL
+                    and it.get("status") not in PARKED
                     and not (_s(it.get("snoozed_until"))[:10] > today)]
-        return {"resolved": [], "expired": [], "active": _strip(open_now)}
+        return {"resolved": _strip(resolved), "expired": [], "active": _strip(open_now)}
 
-    # 2) deterministic resolution (continuity.rs:978-1031 + resolve_from_handled:1035-1068).
+    # 2) Maintain legacy meeting shadows and snoozes. Ordinary task completion was already handled
+    # above through revision-bound, source-bound loopUpdates; no generic contact signal closes it.
     for ak, it in items.items():
         status = it.get("status", "open")
         # _s() everywhere we slice: yaml.safe_load yields datetime.date for unquoted dates and
@@ -1498,49 +1623,9 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 _remove(it)
             continue
         created = (_s(it.get("created_at")) or today)[:10]
-        tid = _s(it.get("source_thread_id")).strip()
-        is_waiting = is_waiting_on(it.get("action_type"))
         explicit = _s(it.get("resolution_mode")).strip() == "explicit"
-
-        # a) replied on the tracked thread (email — most precise)
-        if tid and tid in replied and not is_waiting and not explicit:
-            _terminate(it, "resolved", "replied", today); resolved.append(it); _persist(it); continue
-        # b) CROSS-CHANNEL: did the user answer this person on any channel (iMessage/WhatsApp/call/
-        #    calendar) since the action was created? The moat — a reply via a different channel
-        #    than the original still closes the loop.
-        cross = _check_action_resolution(it, local_data, now)
-        if cross:
-            _terminate(it, "resolved", cross[0], today); it["resolution_evidence"] = cross[1]
-            resolved.append(it); _persist(it); continue
-        # b2) they ANSWERED without delivering: the chase clock restarts (to the date they named,
-        #     else the usual days) and no chase is counted. Only substance closes the loop (b).
-        if is_waiting and not explicit and _heard_from_them(it, local_data, today, ref):
-            print(f"[continuity_resolve] heard from {_s(it.get('contact_name')) or 'them'} — "
-                  f"next chase {it.get('chase_after')}", file=sys.stderr)
-        # c) contact appeared in the brief's Already-Handled section (cross-channel id match)
-        if not is_waiting and not explicit and _handled_match(it, handled):
-            _terminate(it, "resolved", "brief_handled", today); resolved.append(it); _persist(it); continue
-        # d) aged out (open 7d+ with no resolution signal — loops must not pile up forever).
-        #    DIRECTION-AWARE: what you OWE expires quietly; what you're OWED is never expired —
-        #    silently dropping someone's debt to you is the opposite of a chief of staff. A
-        #    `waiting_on` becomes chase-eligible instead (step h) and leaves only by delivery,
-        #    by its deadline, or by the user's hand in sotto-loops.
-        dl = _s(it.get("deadline"))[:10]
-        # A dated commitment lives until its own deadline policy resolves it. The generic age cap is
-        # only for undated communication debts; it must never erase a future promise before it is due.
-        if created < age_cutoff and not is_waiting and not dl and not explicit:
-            _terminate(it, "expired", "expired", today); expired.append(it); _persist(it); continue
-        # e) deadline passed (2d grace) — for what the USER owes. A deadline never kills a
-        #    `waiting_on`: a due date makes a debt owed to the user MORE protected, not less, so a
-        #    passed one only makes it chase-eligible immediately and then hands off to sotto-loops.
-        if dl and dl < deadline_cutoff and not is_waiting and not explicit:
-            _terminate(it, "expired", "deadline_passed", today); expired.append(it); _persist(it); continue
-        # e2) …with one exit: a waiting_on Sotto has chased its full quota on and has NO channel to
-        #     chase through (no contact_identifier — it can neither self-resolve nor be nudged) is
-        #     closed honestly rather than sat on forever.
-        if (is_waiting and not explicit and not _s(it.get("contact_identifier")).strip()
-                and _int(it.get("chased_count")) >= CHASE_MAX):
-            _terminate(it, "expired", "unreachable", today); expired.append(it); _persist(it); continue
+        # Ordinary obligations close only through evidence-bound proposals above. A generic
+        # replied/handled signal, unrelated meeting, age or overdue date cannot pay off a task.
         # f) meeting passed (meeting types only) → resolved, not expired
         is_meeting = _normalize_action_type(it.get("action_type")) in MEETING_TYPES
         if not explicit and is_meeting and (meeting_passed(_s(it.get("meeting_time")), created, today)
@@ -1549,6 +1634,18 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         # g) user-snoozed (via sotto-loops): keep the file, but don't surface until the date passes.
         if _s(it.get("snoozed_until"))[:10] > today:
             _persist(it); continue
+        # i) parked: kept, out of every view, until a touch above revives it. Something you OWE
+        #    that nothing touched for PARK_AFTER_DAYS parks now — unless its deadline is still
+        #    ahead (a date is a reason to keep showing it) or the user confirmed it themselves
+        #    (`explicit`: only they change its state). What you're owed is chased instead.
+        if status in PARKED:
+            parked.append(it); _persist(it); continue
+        # Composition is not delivery. Old rows and missed evenings remain active until the
+        # outbox has accepted their warning on a previous local day, for this exact task/touch.
+        if (ledger_io.park_candidate(it, today) and ledger_io.parking_notice_current(it)
+                and _s(it.get("parking_notice_at")) < today):
+            it["status"], it["parked_at"] = "parked", today
+            parked.append(it); _persist(it); continue
         active.append(it); _persist(it)
 
     # h) the chase clock: yesterday's undelivered proposal expires, then stamp (at most) one
@@ -1557,7 +1654,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     _clear_stale_pending(active, today)
     _stamp_chase(active, today, ref)
 
-    return {"resolved": _strip(resolved), "expired": _strip(expired), "active": _strip(active)}
+    return {"resolved": _strip(resolved), "expired": _strip(expired), "active": _strip(active),
+            "parked": _strip(parked)}
 
 
 def resolve(payload: dict, now: datetime | None = None, *,
@@ -1572,19 +1670,89 @@ def _strip(lst: list) -> list:
     return [{k: v for k, v in it.items() if k != "_path"} for it in lst]
 
 
+def unpark(it: dict, today: str):
+    """A parked row comes back to life: open again, and `reopened_at` restarts the park clock (the
+    same stamp a terminal row gets when a fresh ask re-opens it — one field for "went live again").
+    The one writer for the transition, used by the resolver's re-capture and sotto-loops' `keep`."""
+    if it.get("status") in PARKED:
+        it["status"] = "open"
+        it.pop("parked_at", None)
+        it["reopened_at"] = today
+
+
+def acknowledge_parking_notice(effect: dict, accepted_at) -> bool:
+    """The existing outbox commits a warning only after provider acceptance, under our writer lock.
+
+    Retries are idempotent. A capture, correction or keep since composition makes an old warning
+    inapplicable; acknowledgement then succeeds without changing the newer obligation.
+    """
+    from delivery_effects import instant, loop_version
+    accepted = instant(accepted_at)
+    if accepted is None:
+        return False
+    day = _to_user_zone(datetime.fromtimestamp(accepted, timezone.utc)).date()
+    with _ledger_lock():
+        it = _load_items().get(_s(effect.get("anchor_key")))
+        if (not it or loop_version(it) != effect.get("loop_version")
+                or ledger_io.last_touch_day(it) != effect.get("touch")
+                or not ledger_io.park_candidate(it, (day + timedelta(days=1)).isoformat())):
+            return True
+        if ledger_io.parking_notice_current(it):
+            return True
+        it.update(parking_notice_at=day.isoformat(), parking_notice_touch=effect["touch"],
+                  parking_notice_version=effect["loop_version"])
+        _persist(it)
+    return True
+
+
+def acknowledge_loop_surfaced(effect: dict, receipt: dict) -> bool:
+    """Count a named loop only after provider acceptance, once per provider receipt.
+
+    Legacy `times_surfaced` was incremented by model capture and is intentionally ignored. The
+    versioned object below is the explicit provenance that distinguishes delivered visibility from
+    old proposal activity; the outbox run identity is hashed so replay detection stores no provider
+    addressing data in the ledger. Exact keys preserve idempotence across arbitrary retry volume;
+    canonical loops are finite and each accepted brief adds only one short hash.
+    """
+    from delivery_effects import instant, loop_identity, loop_version
+    accepted = instant(receipt.get("accepted_at"))
+    delivery_id = _s(effect.get("delivery_id")).strip()
+    if accepted is None or not delivery_id:
+        return False
+    delivery_key = hashlib.sha256(delivery_id.encode()).hexdigest()[:24]
+    accepted_at = datetime.fromtimestamp(accepted, timezone.utc).isoformat()
+    with _ledger_lock():
+        it = _load_items().get(_s(effect.get("anchor_key")))
+        # The same test staging applied: the obligation's identity, not its wording. A row that was
+        # restated between staging and acceptance is the same debt the user read about; a row that
+        # closed, or became a different debt, is not counted. Effects staged before identity
+        # existed still bind their exact version.
+        same = (loop_identity(it) == effect.get("loop_identity") if it and effect.get("loop_identity")
+                else bool(it) and loop_version(it) == effect.get("loop_version"))
+        if not it or it.get("status", "open") not in ACTIVE or not same:
+            return True  # changed after validation: delivered text cannot mutate the newer row
+        provenance = it.get("delivery_surface")
+        if not isinstance(provenance, dict) or provenance.get("schema") != 1:
+            provenance = {"schema": 1, "delivery_keys": []}
+        keys = [key for key in provenance.get("delivery_keys", []) if isinstance(key, str)]
+        if delivery_key in keys:
+            return True
+        keys.append(delivery_key)
+        prior_first = _s(provenance.get("first_at"))
+        first = min(prior_first, accepted_at) if prior_first else accepted_at
+        last = max(_s(provenance.get("last_at")), accepted_at)
+        it["delivery_surface"] = {"schema": 1,
+                                  "first_at": first, "last_at": last,
+                                  "delivery_keys": keys}
+        _persist(it)
+    return True
+
+
 def _terminate(it: dict, status: str, resolution: str, today: str):
     it["status"], it["resolution"], it["resolved_at"] = status, resolution, today
-
-
-def _handled_match(it: dict, handled: list) -> bool:
-    ident = it.get("contact_identifier") or ""
-    if not ident:
-        return False
-    it_ch = normalize_channel(it.get("channel", ""))
-    for h in handled:
-        if normalize_channel(h.get("channel", "")) == it_ch and _identifiers_match(ident, h.get("identifier", "")):
-            return True
-    return False
+    if resolution.startswith("user_"):
+        instant = _to_user_zone(datetime.now(timezone.utc))
+        it["closed_at"] = instant.isoformat() if str(instant.date()) == today else _inbound_cutoff(today)
 
 
 def _persist(it: dict):
@@ -1636,7 +1804,8 @@ def main():
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "lib"))
         from sotto_log import diag
         diag(f"[continuity_resolve] {len(result.get('active', []))} open loops, "
-             f"{len(result.get('resolved', []))} resolved, {len(result.get('expired', []))} expired")
+             f"{len(result.get('resolved', []))} resolved, {len(result.get('expired', []))} expired, "
+             f"{len(result.get('parked', []))} parked")
     except Exception:
         pass
     # default=_s: items loaded from frontmatter can carry datetime.date values (unquoted YAML

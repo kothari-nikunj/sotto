@@ -1,5 +1,12 @@
 # Where your data goes
 
+Bounded model work adds opaque attempt/usage records in `events/model-work.sqlite3` (90-day pruning
+on use) and private validated output in `events/notification-artifacts/` and
+`events/research-artifacts/` and `events/triage-artifacts/` (seven days; also erased by `forget.py --caches`). No prompts enter the
+usage ledger. The model proxy stores only attribution IDs, component sizes and usage counts.
+See [the accounting and retention contract](BOUNDED-MODEL-WORK.md).
+
+
 Sotto reads your messages, mail, calendar, contacts, notes and reminders. Software that asks for
 that owes you a precise answer about where it all ends up, so this page names **every** destination,
 **every** file it writes, and **how long each one stays**. If something here reads worse than you
@@ -75,7 +82,7 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | File | Contains | Retention |
 |---|---|---|
 | `knowledge/last_local_snapshot.json` | The latest consent-filtered Bridge payload, with per-source observation times; a partial read may retain still-usable older rows | **Reconciled each brief, never auto-deleted.** The 24h TTL stops old source content being reused, not stored. Contacts retain the existing identity carry-forward exception for thin live reads. Disabled fields are excluded on read and the next save. Delete with `forget.py --snapshot`. |
-| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted |
+| `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted, and an archived fact that is observed again is re-learned in place; only a fact you archived yourself stays archived |
 | `knowledge/x_link_suggestions.json` | The X resolver's own notes about people the graph has no file for: metadata-only identity candidates too weak (or too conflicted) to link, and the negative results that stop tomorrow's brief re-asking X the same question | **Never auto-deleted** — bounded to 100 suggestions, and negatives self-prune at 90 days on each write. A negative never creates a person file; confirmation UI is a later phase |
 | `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
@@ -86,15 +93,15 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `events/delivery.jsonl` | Run and transport outcomes, including accepted, failed, expired and superseded results; acceptance is not proof of reading | **90 days** |
 | `events/sends.jsonl` | One metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` — the hash of the exact bytes that left, never the bytes | **180 days** — the authorization trail, kept twice as long on purpose |
 | `events/drafts.jsonl` | Every draft Sotto offered you, **including its text** | **30 days** |
-| `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. Closed metadata lasts 7 days; unfinished acceptance or invalidation effects remain retryable until finalized. |
+| `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. The effects' per-source addressing leaves the moment they settle — applied **or** quarantined — so no row holds a handle, address or thread id it can no longer use. Closed metadata lasts 7 days after terminal delivery and effects resolution; unfinished acceptance or invalidation effects remain retryable until finalized. |
 | `events/delivery-effects-<run>.json` | Merged source/Calendar eligibility, original cutoff and delivery-dependent effects for one work run | Removed after the completed result reaches the outbox; retryable failures retain it. Abandoned staged files expire after **7 days**. |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
-| `style.json` | Verbatim samples of things **you** wrote | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, and the drafts-you-shipped bucket at its newest 20 per register); the sweep exempts it on that strength |
+| `style.json` | Verbatim samples of things **you** wrote, plus hash-only markers for the drafts already confirmed | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, the drafts-you-shipped bucket at its newest 20 per register, and the confirmed-action markers pruned on every extract to the drafts still in `events/drafts.jsonl`, so they inherit that ledger's 30-day bound); the sweep exempts it on that strength |
 | `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
 | `hermes/sessions/` | Hermes' own chat transcripts — one archived per day by the nightly session archive (which keeps transcripts; `/resume` reopens them), plus one per deploy | **Known gap:** Hermes' state is exempt from the sweep, and whether Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day |
 | `cache/brief-granola.json` | Gathered meeting notes plus their observation time | **1 day**; older than 30 minutes is disclosed when reused, and data older than 24 hours is not reused |
-| `events/work.sqlite3` (+ WAL/SHM) | Accepted jobs, leases and recoverable completed results | Raw payload/results removed on terminal transition; metadata and input ownership aliases expire after **7 days** |
+| `events/work.sqlite3` (+ SQLite journal or WAL/SHM) | Accepted jobs, leases and recoverable completed results | Raw payload/results removed on terminal transition; metadata and input ownership aliases expire after **7 days** |
 | `events/work-inputs/brief-*/` | Resumable brief inputs, artifacts and completion manifests | Raw current/prepared inputs removed after ancillary success; remaining staged files expire after **7 days** |
 | `config/source-state.json` | Bridge source status and observation time, without message bodies | Bounded current state; never swept |
 | `.sotto-volume.json` · `.sotto-runtime.lock` · `.sotto-recovery-hold.json` · `config/model-lease.json` | Adapter-owned volume identity, writer lock, restore hold and model lease metadata | Adapter lifecycle state; never swept |
@@ -201,16 +208,19 @@ They use the existing native model route. Selected sourced facts join `knowledge
 raw history is not copied into a new archive or the live event queue. The first useful look uses
 the ordinary brief archive, with type `welcome` and the same 60-day retention.
 
-`knowledge/history-state.json` contains frozen-window bounds, cursors/counts and sanitized failure
-classes; `knowledge/dreamer.json` contains person IDs, hashes and review time. Neither contains raw
+`knowledge/history-state.json` contains frozen-window bounds, cursors, lifetime counts, the page
+baseline for the current window, restart progress and sanitized failure classes;
+`knowledge/dreamer.json` contains person IDs, hashes and review time. Neither contains raw
 message bodies. `knowledge/conflicts.json` retains reference pairs for at most 100 people. These
 small state files have no age sweep; delete them with the rest of the volume. Deleting progress
 causes connected history to be reviewed again, not erased. `config/onboarding.json` remembers that
 the first-use message was delivered; removing it can restart onboarding on a new installation.
 
-Explicit usefulness ratings join `outcomes.jsonl`, retained for 90 days by the existing sweep. They
-include an output reference, up to 900 characters of the rated excerpt and up to 900 characters of
-the user's explanation. Prompt readers use only the latest eight examples from the past 42 days.
+Explicit usefulness ratings join `outcomes.jsonl`, retained for 90 days by the existing sweep. A row
+carries the output reference, a hashed item locator and the rating — nothing else. Neither the rated
+excerpt nor the user's explanation is stored: an explanation is only length-checked (over 900
+characters is refused as too long) and then discarded. Prompt readers resolve up to 320 characters
+from the archive for only the latest eight examples from the past 42 days.
 History-derived facts remain memory like other person facts: disabling a source stops new reads
 but does not erase previously captured person facts or writing samples.
 
@@ -224,14 +234,27 @@ cached local inputs and memory selection in both supported deployment modes.
 
 `events/work.sqlite3` stores accepted work until a completed artifact enters the existing outbox.
 Pending work may contain the context needed to resume; terminal rows discard their payload/result,
-and metadata plus input-ownership aliases expire after seven days. The SQLite WAL is part of this
-store and must be backed up using SQLite's backup API, not copied in isolation while running.
+and metadata plus input-ownership aliases expire after seven days. Journal mode is preserved on
+open: new stores use rollback journaling and existing WAL stores retain WAL. The fix for the
+concurrent-open race was to stop converting, not to convert the other way, so **the files on disk
+beside the database depend on the volume's age** — a store created after that change has a rollback
+journal, while a volume that was already WAL keeps its `-wal` and `-shm` siblings for the rest of
+its life. Use SQLite's backup API while running, rather than copying the database apart from
+whichever of those it has.
 `events/work-inputs/brief-*/` holds resumable composition inputs and artifact manifests. Ancillary
 learning removes raw current/prepared inputs after success; the retention sweep removes old
 intermediates after seven days, matching the ancillary job deadline. The artifact carries its original source cutoff and used-source IDs. A retry does not move that cutoff forward, so later messages remain eligible for the next digest. Canonical knowledge and open loops retain their existing policy.
 
 The outbox deletes sent text after acceptance but keeps the minimum delivery effects until they
-finish. A provider message ID, target and acceptance time bind an active offer to its question.
+finish. Those effects carry per-source addressing — a handle, chat or group id, phone, address or
+thread id — which is why they are kept only while a replay could still use them. A row that gives
+up on them after five attempts is **quarantined**, and quarantine closes it on the same terms as
+success: it keeps the label, the run id, the acceptance receipt and the failure reason, and drops
+the addressing. Nothing in `events/outbox.json` therefore holds a contact identifier for the
+seven-day retention window, which matters because `forget.py` has no verb that reaches this file.
+An empty `events/outbox.json.effects.lock` serializes effect callbacks across processes; it
+contains no message data and is retained with the outbox. Closed receipts expire seven days after
+the last terminal delivery or effect settlement, rather than seven days after enqueue. A provider message ID, target and acceptance time bind an active offer to its question.
 These receipts do not mean the user read or approved an action. Deferred sends are revalidated
 against current consent and relevant loop/Calendar state. No Cloud-only copy of the skills or
 personalization pipeline is introduced.

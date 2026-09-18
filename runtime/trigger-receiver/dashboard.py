@@ -90,6 +90,7 @@ HOOKS = {
     # Locates a skills-tree script (receiver wires _find_sotto_script). None → the skills tree is
     # not on this box and every write that needs it answers 503.
     "find_script": lambda *rel: None,
+    "delivery_effects": lambda: None,
     # THE atomic JSON write for the image — connectors.write_json, wired by the receiver
     # (tmp at `mode`, then os.replace). Unlike the degrade-quietly hooks above this one has no
     # sane default: silently dropping a session or a preference write is worse than a loud error.
@@ -187,7 +188,8 @@ LEDGER_MAX_PER_SOURCE = {"triage": 120, "outcome": 40, "dashboard": 40, "deliver
 QUEUE_TAIL_LINES = 50            # how much of queue.jsonl the waiting room reads (newest N lines)
 QUEUE_SHOWN = 15                 # …and how many of those it renders
 PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting_hold"})
-BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting"})
+BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change",
+                                   "meeting_prep"})   # mirrors triage_event.BUDGET_EXEMPT_CLASSES
 VALVE_MAX_AGE_MIN_DEFAULT = 240  # mirrors triage_event.VALVE_MAX_AGE_MIN — a real ask from 3h ago
 #                                  still deserves a nudge, a 2-day-old one doesn't; "meeting_hold"
 #                                  entries ignore it (a long meeting must not expire an ask).
@@ -237,6 +239,9 @@ MEMORY_TYPE_RE = re.compile(r"\A[a-z_]{1,32}\Z")
 ANCHOR_RE = re.compile(r"\A[^\x00-\x1f\x7f]{1,256}\Z")
 
 ACTIVE_LOOP_STATUSES = frozenset({"open", "waiting", "failed", "blocked"})
+# Parked: kept, hidden from the brief, revived by a touch or `keep` (ledger_io.PARKED). Served as
+# its own group so nothing kept is invisible, and never counted as open.
+PARKED_LOOP_STATUS = "parked"
 # Meeting-prep/meeting-info entries are calendar shadows, not asks — the docket is their surface.
 # They never leave /api/loops (and so never count in the overview), even when old volume files
 # still carry them.
@@ -982,12 +987,21 @@ def api_overview() -> dict:
 
 
 def api_loops() -> dict:
+    # Reuse the receiver's cached helper. Missing/broken skills cannot make the dashboard
+    # unavailable or revive legacy capture counts as evidence of delivery.
+    surface_count = lambda _row: 0
+    try:
+        helper = HOOKS["delivery_effects"]()
+        if helper is not None:
+            surface_count = helper.delivered_surface_count
+    except (AttributeError, ImportError, OSError, RuntimeError, SyntaxError, KeyError):
+        pass
     d = os.path.join(_root(), "knowledge", "continuity")
     try:
         names = sorted(os.listdir(d))
     except OSError:
         names = []
-    loops = []
+    loops, parked = [], []
     for n in names:
         if not n.endswith(".md"):
             continue
@@ -997,27 +1011,26 @@ def api_loops() -> dict:
         except OSError:
             continue
         status = _s(meta.get("status")).lower()
-        if status not in ACTIVE_LOOP_STATUSES:
+        if status not in ACTIVE_LOOP_STATUSES and status != PARKED_LOOP_STATUS:
             continue
         action_type = _s(meta.get("action_type"))
         if re.sub(r"[\s-]+", "_", action_type.lower()) in EXCLUDED_LOOP_ACTION_TYPES:
             continue
-        surfaced = meta.get("times_surfaced")
+        surfaced = surface_count(meta)
         chased = meta.get("chased_count")
         chased = chased if isinstance(chased, int) else 0
-        loops.append({
+        (parked if status == PARKED_LOOP_STATUS else loops).append({
             "anchor_key": _s(meta.get("anchor_key")),
             "action_type": action_type,
             "channel": _s(meta.get("channel")),
             "contact_name": _s(meta.get("contact_name")),
             "status": status,
             "created_at": _s(meta.get("created_at")),
-            "times_surfaced": surfaced if isinstance(surfaced, int) else 0,
+            "times_surfaced": surfaced,
             "summary": _s(meta.get("summary")),
             "meeting_time": _s(meta.get("meeting_time")) or None,
-            # The one editable field: for something YOU owe, continuity_resolve expires it 2 days
-            # past its deadline, so the deadline IS its "later" — there is no separate snooze state.
-            # (Something you're OWED is chased instead, never expired by its deadline.)
+            # The one editable field. A deadline never expires a loop (nothing does): it orders the
+            # brief and marks the row overdue. "Later" is a snooze or a park, not a date.
             "deadline": _s(meta.get("deadline"))[:10] or None,
             "source": _s(meta.get("source")) or None,
             # Chase state — written ONLY by continuity_resolve. The dashboard is positioned as a
@@ -1030,7 +1043,8 @@ def api_loops() -> dict:
             "chased_out": chased >= CHASE_MAX_DEFAULT,
         })
     loops.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"loops": loops}
+    parked.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"loops": loops, "parked": parked}
 
 
 def _api_briefs(h):
@@ -1312,7 +1326,12 @@ def _int_env(name: str, default: int) -> int:
 def _budget_today(day: str) -> dict:
     """{spent, cap, left} — triage_event._budget_spent's rule: a stamp from another local date
     reads as 0 spent, which IS the midnight rollover (no cleanup job, no cron)."""
-    cap = max(0, _int_env("SOTTO_NUDGE_BUDGET", 4))
+    configured = max(0, _int_env("SOTTO_NUDGE_BUDGET", 4))
+    raw = _s(_explicit_prefs().get("nudge_budget"))
+    try:
+        cap = min(configured, max(0, int(raw))) if raw else configured
+    except (TypeError, ValueError):
+        cap = configured
     st = _read_json_file("events", "budget.json", default=None)
     spent = 0
     if isinstance(st, dict) and _s(st.get("date")) == day:
@@ -1324,15 +1343,18 @@ def _budget_today(day: str) -> dict:
 
 
 def _taps_today(day: str) -> dict:
-    """{fired, cap} — calcache's date-keyed meeting_taps.json. Post-meeting taps have their OWN
+    """{fired, cap} — calcache's date-keyed meeting_taps.json. `fired` is the occupied allowance:
+    completed taps plus pending reservations awaiting receipt reconciliation. Taps have their OWN
     daily cap precisely so they and the interrupt budget can't starve each other."""
     cap = max(0, _int_env("SOTTO_TAP_MAX_PER_DAY", 3))
     st = _read_json_file("cache", "meeting_taps.json", default=None)
-    fired = 0
+    occupied = set()
     if isinstance(st, dict) and _s(st.get("date")) == day:
-        v = st.get("fired")
-        fired = len([k for k in v if isinstance(k, str)]) if isinstance(v, list) else 0
-    return {"fired": fired, "cap": cap}
+        for field in ("fired", "pending"):
+            v = st.get(field)
+            if isinstance(v, list):
+                occupied.update(k for k in v if isinstance(k, str))
+    return {"fired": len(occupied), "cap": cap}
 
 
 def _valve_hour() -> dict:
@@ -2239,15 +2261,16 @@ def _post_person_relations(h, slug: str, body: dict):
 
 
 def _post_loops(h, body: dict):
-    """POST /api/loops — the ledger's four verbs, all through knowledge_edit.py:
+    """POST /api/loops — the ledger's five verbs, through the skills tree's own writers:
       {anchor_key, op: resolve|dismiss}           terminal transition (the resolver's own fields)
       {op: "add", text, contact?, identifier?, deadline?}   a loop you own by hand
-      {anchor_key, op: "deadline", deadline}      set/clear the deadline — which is also "later",
-                                                  since the resolver expires 2 days past it.
+      {anchor_key, op: "deadline", deadline}      set/clear the deadline (it orders, never expires)
+      {anchor_key, op: "keep"}                    "I still care": un-parks a parked loop and
+                                                  restarts its clock — sotto-loops' own `keep`
     Returns {"ok": true, ...} plus the refreshed loops list so the view re-renders from the
     server (never optimistic)."""
     op = _s(body.get("op"))
-    if op not in ("resolve", "dismiss", "add", "deadline"):
+    if op not in ("resolve", "dismiss", "add", "deadline", "keep"):
         return _json(h, 400, {"error": "bad op"})
     if op == "add":
         text = _clean_text(body.get("text"))
@@ -2288,6 +2311,15 @@ def _post_loops(h, body: dict):
             return _edit_failure(h, result)
         _audit("write", endpoint="/api/loops", target=anchor[:200], op="deadline")
         return _json(h, 200, {"ok": True, "deadline": deadline or None, **api_loops()})
+    if op == "keep":
+        result = _run_skill_cli(("_shared", "scripts", "retune_apply.py"), ["keep", anchor], "retune_apply")
+        if result is None:
+            return _json(h, 503, {"error": "skills tree unavailable"})
+        if not result.get("ok"):
+            return _edit_failure(h, {"error": "loop not found" if "no open loop" in _s(result.get("detail"))
+                                     else _s(result.get("detail")) or "edit failed"})
+        _audit("write", endpoint="/api/loops", target=anchor[:200], op="keep")
+        return _json(h, 200, {"ok": True, **api_loops()})
     to = "resolved" if op == "resolve" else "dismissed"
     result = _run_knowledge_edit(["--op=loop", f"--anchor={anchor}", f"--to={to}"])
     if result is None:
@@ -2306,16 +2338,28 @@ def _post_cadence(h, body: dict):
                                 expressed as an ISO date / "+2h" / "3pm" / "2026-08-11T07:00").
                                 THE RULE, shown on the control: a snooze lifts when quiet hours do.
       {op: "unsnooze"}        — back to normal.
+      {op: "budget", direction: "fewer|no|more"} — explicit standing unsolicited volume.
       {op: "promote", key}    — "nudge me now" on one held item: the receiver runs the funnel's own
-                                `triage_event.py --promote`, which spends the day's interrupt
-                                budget, respects the in-meeting hold, drops the entry from the
+                                `triage_event.py --promote`, which bypasses the unsolicited budget,
+                                respects the in-meeting hold, drops the entry from the
                                 queue and records the promotion — then stages + spawns exactly as
                                 the release valve does.
     Every clock decision (what "+2h" means, whether the snooze is still active, whether a promotion
     is allowed) belongs to those two programs; this handler only validates shapes."""
     op = _s(body.get("op"))
-    if op not in ("snooze", "unsnooze", "promote"):
+    if op not in ("snooze", "unsnooze", "promote", "budget"):
         return _json(h, 400, {"error": "bad op"})
+    if op == "budget":
+        direction = _s(body.get("direction")).lower()
+        if direction not in ("fewer", "no", "more"):
+            return _json(h, 400, {"error": "bad direction"})
+        result = _run_prefs(["nudge-budget", direction])
+        if result is None:
+            return _json(h, 503, {"error": "skills tree unavailable"})
+        if not result.get("ok"):
+            return _json(h, 400, {"error": _s(result.get("error")) or "budget failed"})
+        _audit("write", endpoint="/api/cadence", target=direction, op=op)
+        return _json(h, 200, {"ok": True, **api_cadence()})
     if op == "promote":
         key = _s(body.get("key"))
         if not QUEUE_KEY_RE.match(key):

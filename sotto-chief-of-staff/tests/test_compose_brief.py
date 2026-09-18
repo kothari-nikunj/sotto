@@ -90,6 +90,13 @@ def test_strip_maintainer_comments_handles_quoted_close_tokens():
     assert "<!--id:a@b.com|ch:email-->" in out
 
 
+def test_loaded_prompt_keeps_exact_loop_marker_instruction_but_strips_maintainer_prose():
+    loaded = cb._load_prompt()
+    assert "<!--loop:EXACT_LOOP_ID-->" in loaded
+    assert "only for the specific ask described" in loaded
+    assert "<!-- MAINTAINER:" not in loaded
+
+
 def test_gemini_once_sends_system_instruction_and_schema(tmp_path, monkeypatch):
     import urllib.request
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
@@ -526,6 +533,9 @@ def test_critic_decision_matrix():
     assert cb._critic_decision("auto", 0, 0, first_run=True) == (True, "first brief — always reviewed")
     assert cb._critic_decision("off", 0, 0, first_run=True)[0] is False
     assert cb._critic_decision("auto", 0, cb.CRITIC_AUTO_MIN_ACTIONS + 1)[0] is True         # many actions
+    # a measured violation is the one thing the revise pass exists for — it outranks the quiet skip
+    assert cb._critic_decision("auto", 0, 0, n_violations=1) == (True, "1 validator violation(s) to fix")
+    assert cb._critic_decision("off", 0, 0, n_violations=3)[0] is False                      # off wins
     # unknown mode string falls back to auto
     import os as _os
     _os.environ["SOTTO_CRITIC"] = "banana"
@@ -575,6 +585,35 @@ def test_critic_auto_runs_when_many_actions(monkeypatch):
 
     cb.compose({"type": "morning", "google": {}, "local": {}}, llm=fake_llm, critic=True)
     assert seen["critic"] is True                              # small payload, but 6 actions → run
+
+
+def test_a_validator_violation_runs_the_critic_on_an_otherwise_quiet_brief(monkeypatch, tmp_path):
+    """The auto skip saves two calls on a brief with nothing to catch. A violation IS something to
+    catch, and the revise pass is the only thing that fixes it — so on the quiet brief where a
+    dropped open loop or a never-tell-twice breach is most visible, the skip was logging the defect
+    with `_diag` and shipping it. `SOTTO_CRITIC=off` still wins, violation or not."""
+    monkeypatch.delenv("SOTTO_CRITIC", raising=False)          # default = auto
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))            # …and not the always-reviewed first brief
+    (tmp_path / "briefs").mkdir()
+    (tmp_path / "briefs" / "2026-06-01.morning.delivered").write_text("")
+    monkeypatch.setattr(cb.brief_validate, "validate", lambda *a, **k: ["dropped-open-loop: Jane"])
+    seen = {"violation_reached_the_critic": False}
+
+    def fake_llm(prompt, inputs):
+        if inputs.get("_critic"):
+            seen["violation_reached_the_critic"] = "dropped-open-loop: Jane" in prompt
+            return json.dumps({"patches": [], "score": 90, "summary": "ok"})
+        return json.dumps({"brief_markdown": "# B", "actions": []})
+
+    quiet = {"type": "morning", "google": {}, "local": {}}
+    out = cb.compose(quiet, llm=fake_llm, critic=True)
+    assert seen["violation_reached_the_critic"] is True
+    # …and it is merged as a patch, so the revise pass is actually asked to fix it
+    assert "skipped" not in out["_critic"] and out["_critic"]["actionable"] == 1
+    monkeypatch.setenv("SOTTO_CRITIC", "off")
+    fake, calls = _one_call_llm()
+    out = cb.compose(quiet, llm=fake, critic=True)
+    assert calls["n"] == 1 and out["_critic"] == {"skipped": True, "reason": "SOTTO_CRITIC=off"}
 
 
 def test_critic_off_env_never_runs(monkeypatch):
@@ -695,6 +734,17 @@ def test_tap_link_drops_nonroutable_imessage_identifiers():
     assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "+1 (206) 999-4970"}) == "sms:+12069994970"
 
 
+def test_tap_link_drops_letters_stripped_into_a_fake_phone():
+    # The bug: naive \D-stripping turned "contact_14155551234" into "+14155551234" — a real-looking
+    # phone number built out of a contact id's digits. message_targets rejects the identifier
+    # outright (it contains letters), so no link is ever minted for it.
+    assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "contact_14155551234"}) == ""
+    assert cb._action_tap_link({"channel": "sms", "contactIdentifier": "contact_14155551234"}) == ""
+    assert cb._action_tap_link({"channel": "whatsapp", "contactIdentifier": "contact_14155551234"}) == ""
+    assert cb._action_tap_link({"channel": "phone", "type": "call_back",
+                                "contactIdentifier": "contact_14155551234"}) == ""
+
+
 def test_tap_link_whatsapp_and_email_unaffected():
     assert cb._action_tap_link({"channel": "whatsapp", "contactIdentifier": "15551234567"}) == "https://wa.me/15551234567"
     assert cb._action_tap_link({"channel": "email", "emailReplyTo": "a@b.com"}).startswith("mailto:a@b.com")
@@ -713,6 +763,29 @@ def test_imessage_names_resolve_from_contacts():
         [{"handle": "+12069994970", "text": "coffee?", "is_from_me": False, "timestamp": "2026-06-25"}],
         "imessage")
     assert bare[0]["name"] != "Jake Rosen"
+
+
+def test_brief_excludes_proven_assistant_rows_but_keeps_human_invitation():
+    inputs = {"type": "morning", "first_run": False, "google": {"events": [], "emails": []},
+              "local": {"contacts": [
+                  {"name": "Poke", "phones": ["+12025550123"]},
+                  {"name": "Ramp", "emails": ["ramp_cf8gd1ek_agent@rbm.goog"]},
+                  {"name": "Chase", "emails": ["chasebank_fraud_agent@rbm.goog"]}],
+                  "imessage": [
+                      {"handle": "ramp_cf8gd1ek_agent@rbm.goog", "text": "ASSISTANT_MARKER submit receipt",
+                       "sender_type": "assistant",
+                       "is_from_me": False, "timestamp": "2026-09-14T18:00:00Z"},
+                      {"handle": "+12025550123", "text": "HUMAN_MARKER want to join dinner Friday?",
+                       "is_from_me": False, "timestamp": "2026-09-14T18:01:00Z"},
+                      # Same RCS business-messaging transport as Ramp, but nothing marks the sender
+                      # as an assistant — the brief's own relevance judgment gets to see it.
+                      {"handle": "chasebank_fraud_agent@rbm.goog",
+                       "text": "BANK_MARKER fraud alert: did you authorize $4,200? Reply NO to block",
+                       "is_from_me": False, "timestamp": "2026-09-14T18:02:00Z"}]}}
+    prompt = cb.build_prompt(cb._load_prompt(), inputs)
+    assert "ASSISTANT_MARKER" not in prompt
+    assert "HUMAN_MARKER" in prompt
+    assert "BANK_MARKER" in prompt
 
 
 def test_whatsapp_jid_never_becomes_mailto():
@@ -1278,7 +1351,7 @@ def test_evening_brief_merges_followup_context(tmp_path, monkeypatch):
     # the one quiet count line, not by a row of its own (open-items contract — see
     # test_still_open_backstop_appends_dropped_ledger_items).
     assert out["brief_markdown"].startswith("# Good ") and "\n\n# Evening" in out["brief_markdown"]
-    assert "## Still open\n- 1 other open loop — see /app#loops" in out["brief_markdown"]
+    assert "## Still open\n- 1 other open loop. Ask me what's still open." in out["brief_markdown"]
     assert "send the deck" not in out["brief_markdown"]
     p = seen["prompt"]
     # rendered followup context reached the evening prompt (via the reconciliation/evening path,
@@ -1548,7 +1621,7 @@ def test_still_open_backstop_appends_dropped_urgent_items(monkeypatch):
 
     out = cb.compose(_open_ledger_inputs(), llm=fake_llm, critic=True)
     body = out["brief_markdown"]
-    assert "## Still open\n- **Priya Raman** — Send the diligence memo (1d)" in body
+    assert "## Still open\n- **Priya Raman**: Send the diligence memo (1d)" in body
     assert body.index("Still open") < body.index("## Filtered")   # before the last section, not after
     assert out["brief_text"].count("Priya Raman") == 1            # and it survives into the chat text
 
@@ -1572,7 +1645,7 @@ def test_a_quiet_pile_is_one_line_with_a_count_not_a_wall(monkeypatch):
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
     assert len(lines) == 3                                   # 2 urgent + 1 count line, nothing else
-    assert lines[-1] == "- 12 other open loops — see /app#loops"
+    assert lines[-1] == "- 12 other open loops. Ask me what's still open."
     assert "**Priya Raman**" in lines[0] and "**Amy Wu**" in lines[1]
     for i in range(12):
         assert f"loop number {i}" not in body               # the wall is gone
@@ -1593,7 +1666,7 @@ def test_one_line_per_person_however_many_debts(monkeypatch):
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": debts}},
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
-    assert lines == ["- **Spencer Schneier** — send the deck; the Onshore intro; "
+    assert lines == ["- **Spencer Schneier**: send the deck; the Onshore intro; "
                      "coffee next week (3d)"]
     assert body.count("Spencer Schneier") == 1
 
@@ -1940,9 +2013,9 @@ def test_the_ledger_block_names_the_chases_that_already_happened():
         {"status": "open", "action_type": "waiting_on", "contact_name": "Vendor", "channel": "imessage",
          "summary": "a quote", "created_at": "2026-06-20"}]}
     block = cb._format_action_ledger(local)
-    assert "[chased ×2, last Tue]" in block
+    assert "[reminded you ×2, last Tue]" in block
     assert "Vendor via imessage: a quote" in block and "chased" not in block.split("Vendor")[1]
-    assert "never propose a first follow-up" in block
+    assert "Sotto reminded YOU" in block
 
 
 def test_ledger_ages_follow_an_injected_clock():
@@ -2318,7 +2391,7 @@ def test_a_fourth_ask_from_one_person_is_named_not_sliced_off(monkeypatch):
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": debts}},
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
-    assert lines == ["- **Maya Chen** — the signed contract; the vendor list; the Q3 numbers; "
+    assert lines == ["- **Maya Chen**: the signed contract; the vendor list; the Q3 numbers; "
                      "+1 more (1d)"]
 
 
@@ -2343,7 +2416,7 @@ def test_the_brief_records_which_loops_it_named(monkeypatch, tmp_path):
 
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [named, quiet]}},
                       llm=fake_llm, critic=True)["brief_markdown"]
-    assert "**Maya Chen**" in body and "- 1 other open loop — see /app#loops" in body
+    assert "**Maya Chen**" in body and "- 1 other open loop. Ask me what's still open." in body
     with open(cb._named_loops_path(today, "morning"), encoding="utf-8") as f:
         assert json.load(f) == {"anchor_keys": ["loop:maya"]}
 
@@ -2548,6 +2621,66 @@ def test_calendar_preview_keeps_last_meeting_and_quiet_line_is_time_neutral():
     out = cb._finish_brief_presentation({'brief_markdown': body})
     assert 'this morning' not in out['brief_markdown']
     assert '5:00 PM' in out['brief_markdown']
-    assert out['brief_markdown'].count(cb.brief_validate.CALENDAR_PREVIEW_NOTE) == 1
+    assert 'Calendar preview' not in out['brief_markdown']
     assert not cb.brief_validate._check_coming_up_length(out['brief_markdown'])
     assert cb._finish_brief_presentation(out) == out
+
+
+def test_brief_facts_require_a_reference_present_in_source_snapshot():
+    person = {'person_name': 'Maya', 'facts': [
+        {'fact': 'Runs legal'},
+        {'fact': 'Runs legal', 'source_ref': ''},
+        {'fact': 'Runs legal', 'source_ref': 'invented'},
+        {'fact': 'Runs legal', 'source_ref': 'email-123'},
+    ]}
+    out = {'extracted_knowledge': {'person_updates': [person]}}
+    cb._bind_brief_fact_evidence(out, {'google': {'emails': [
+        {'id': 'email-123', 'date': '2026-09-10T08:00:00Z'}]}})
+    assert person['facts'] == [
+        {'fact': 'Runs legal', 'source_ref': 'email-123', 'observed_date': '2026-09-10'}]
+    assert out['learning_evidence'] == {'accepted': 1, 'rejected': 3}
+
+
+@pytest.mark.parametrize(("source_date", "expected"), [
+    ("Thu, 10 Sep 2026 08:00:00 +0000", "2026-09-10"),
+    ("2026-09-10T08:00:00Z", "2026-09-10"),
+    ("unavailable", None),
+])
+def test_fact_observed_date_comes_from_source_not_model(source_date, expected):
+    fact = {"fact": "Runs legal", "source_ref": "email-123", "observed_date": "2099-01-01"}
+    out = {"extracted_knowledge": {"person_updates": [{"person_name": "Maya", "facts": [fact]}]}}
+    cb._bind_brief_fact_evidence(out, {"google": {"emails": [{"id": "email-123", "date": source_date}]}})
+    assert fact.get("observed_date") == expected
+
+
+@pytest.mark.parametrize('note', [
+    'Calendar preview - open Calendar for the full schedule.',
+    'Calendar preview (open Calendar for the full schedule):',
+    'Calendar preview — open Calendar for the full schedule.',
+    'Calendar preview: open Calendar for the full schedule.',
+])
+def test_legacy_calendar_notes_are_removed_without_costing_a_meeting(note):
+    body = ('## Coming Up\n' + note + '\nCalendar preview: open Calendar for the full schedule.'
+            + '\n' + '\n'.join(f'- **{n}:00 PM**: Meeting {n}' for n in range(1, 6)))
+    out = cb._finish_brief_presentation({'brief_markdown': body})
+    assert 'Calendar preview' not in out['brief_markdown']
+    assert '5:00 PM' in out['brief_markdown']
+    assert not cb.brief_validate._check_coming_up_length(out['brief_markdown'])
+    assert cb._finish_brief_presentation(out) == out
+
+
+def test_model_work_hold_delivers_the_draft_and_never_reports_a_passing_critic(monkeypatch):
+    """A quality stage whose attempts are spent may not cost the user the brief (one per day,
+    always). The draft ships, and the record says the gate was held — never that it passed."""
+    import model_work
+    def held(*args, **kwargs):
+        raise model_work.ModelWorkHeldError('stage exhausted')
+    critic = cb.run_critic('draft', [], {}, llm=held)
+    assert critic['held'] is True and critic['score'] == -1 and critic['patches'] == []
+    out = cb.critique_and_revise({'brief_markdown': 'draft'}, {}, llm=held)
+    assert out['brief_markdown'] == 'draft' and out['_critic']['held'] is True
+    monkeypatch.setattr(cb, 'run_critic', lambda *a, **k: {
+        'patches': [{'severity': 'critical', 'type': 'fix', 'detail': 'unsupported claim'}],
+        'score': 0, 'summary': 'repair required'})
+    out = cb.critique_and_revise({'brief_markdown': 'draft'}, {}, llm=held, source_prompt='evidence')
+    assert out['brief_markdown'] == 'draft' and out['_critic']['held'] is True

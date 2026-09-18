@@ -62,6 +62,7 @@ te = _load("dd_triage", PACK, "event-triage", "scripts", "triage_event.py")
 dc = _load("dd_digest", PACK, "event-triage", "scripts", "digest_check.py")
 cr = _load("dd_continuity", PACK, "morning-brief", "scripts", "continuity_resolve.py")
 ps = _load("dd_proactive", PACK, "proactive", "scripts", "proactive_scan.py")
+prefs = _load("dd_preferences", PACK, "_shared", "scripts", "preferences.py")
 sx = _load("dd_style_extract", PACK, "_shared", "scripts", "style_extract.py")
 rec = _load("dd_receiver", HERMES, "runtime", "trigger-receiver", "receiver.py")
 cal = _load("dd_calcache", HERMES, "runtime", "trigger-receiver", "calcache.py")
@@ -75,6 +76,7 @@ on = _load("dd_onboarding", HERMES, "runtime", "trigger-receiver", "onboarding.p
 br = _load("dd_brief_runner", HERMES, "runtime", "trigger-receiver", "brief_runner.py")
 mc = _load("dd_memory_cycle", PACK, "_shared", "scripts", "memory_cycle.py")
 pc = _load("dd_personal_context", PACK, "_shared", "lib", "personal_context.py")
+de = _load("dd_delivery_effects", PACK, "_shared", "lib", "delivery_effects.py")
 
 ISLAND_RE = re.compile(
     r'<script\s+type="application/json"\s+id="sotto-rules">(.*?)</script>', re.S)
@@ -174,7 +176,7 @@ def test_island_is_flat_json_of_numbers_and_sets():
 
 def test_daily_interrupt_budget():
     _same("budget.nudge_per_day", R["budget"]["nudge_per_day"],
-          _env_default(te, "SOTTO_NUDGE_BUDGET"))
+          _env_default(prefs, "SOTTO_NUDGE_BUDGET"))
     # the dashboard's Cadence page reads the same knob — two readers, one default
     _same("budget.nudge_per_day (dashboard)", R["budget"]["nudge_per_day"],
           _env_default(dsh, "SOTTO_NUDGE_BUDGET"))
@@ -196,13 +198,16 @@ def test_cooldown_escalation_and_freshness():
           te.EVENT_MAX_AGE_MIN)
     _same("freshness.missed_call_max_age_min", R["freshness"]["missed_call_max_age_min"],
           te.MISSED_CALL_MAX_AGE_MIN)
+    _same("freshness.delivery_fresh_nudge_min", R["freshness"]["delivery_fresh_nudge_min"] * 60,
+          de.FRESH_NUDGE_VALID_SECONDS)
+    _anchor(f"{de.FRESH_NUDGE_VALID_SECONDS // 60} minutes after the source event")
     # One clock, stated in the docs: the missed-call ceiling IS the valve's age cap — a held nudge
     # and a stale call age out together. If either constant moves alone, the doctrine broke.
     assert te.MISSED_CALL_MAX_AGE_MIN == te.VALVE_MAX_AGE_MIN, RULE
     _anchor(f"a missed call buzzes up to {te.MISSED_CALL_MAX_AGE_MIN // 60} hours after the ring")
 
 
-def test_quiet_hours_and_vip_floor():
+def test_quiet_hours_window():
     _same("quiet.start_hour", R["quiet"]["start_hour"], _env_default(te, "SOTTO_QUIET_START"))
     _same("quiet.end_hour", R["quiet"]["end_hour"], _env_default(te, "SOTTO_QUIET_END"))
     # the dashboard renders the same window on the Cadence page
@@ -210,7 +215,13 @@ def test_quiet_hours_and_vip_floor():
           _env_default(dsh, "SOTTO_QUIET_START"))
     _same("quiet.end_hour (dashboard)", R["quiet"]["end_hour"],
           _env_default(dsh, "SOTTO_QUIET_END"))
-    _same("vip.min_priority", R["vip"]["min_priority"], te.VIP_PRIORITY_MIN)
+    # There is no VIP number to guard any more: the quiet-hours carve-out is the stated vip_people
+    # list or a typed family_of relation, both set-membership, neither a threshold. The island's
+    # `vip.min_priority` went with the attention-queue clause it described (Sep 2026 — volume is
+    # not importance), so a field here would be guarding a rule that no longer exists.
+    assert "vip" not in R, (
+        "docs drift — the island carries a `vip` group again; VIP is set-membership, not a "
+        f"number.\n{RULE}")
 
 
 def test_tier1_prompt_cap():
@@ -228,6 +239,9 @@ def test_release_valve():
     _same("valve.max_age_min (dashboard)", R["valve"]["max_age_min"], dsh.VALVE_MAX_AGE_MIN_DEFAULT)
     _same("intervals.valve_interval_secs", R["intervals"]["valve_interval_secs"],
           rec.VALVE_INTERVAL_SECS_DEFAULT)
+    _anchor(f"{te.VALVE_MAX_AGE_MIN} minutes after the source event")
+    _anchor(f"after release it gets {te.VALVE_MAX_AGE_MIN} minutes")
+    _anchor("the affected meeting's start")
 
 
 def test_delivery_outbox():
@@ -257,6 +271,8 @@ def test_delivery_outbox():
     _same("work.background_max_wait_seconds", R["work"]["background_max_wait_seconds"],
           rec.WORK_QUEUE.BACKGROUND_MAX_WAIT_SECONDS)
     _same("work.lease_seconds", R["work"]["lease_seconds"], rec.WORK_QUEUE.LEASE_SECONDS)
+    _same("work.shutdown_grace_seconds", R["work"]["shutdown_grace_seconds"],
+          rec.WORK_SHUTDOWN_GRACE_SECS)
     _same("work.prepare_minutes", R["work"]["prepare_minutes"], rec.BRIEF_PREPARE_SECONDS // 60)
     _same("work.compose_lead_seconds", R["work"]["compose_lead_seconds"],
           rec.BRIEF_COMPOSE_LEAD_SECONDS)
@@ -275,6 +291,8 @@ def test_onboarding_brief_and_learning_caps():
     _same('onboarding.attempts_per_day', R['onboarding']['attempts_per_day'], on.ATTEMPTS_PER_DAY)
     _same('brief.preparation_max_age_minutes', R['brief']['preparation_max_age_minutes'],
           br.PREPARATION_MAX_AGE_SECONDS // 60)
+    _same('brief.artifact_max_age_hours', R['brief']['artifact_max_age_hours'],
+          br.ARTIFACT_MAX_AGE_SECONDS // 3600)
     _same('brief.notes_cache_hours', R['brief']['notes_cache_hours'], br.NOTES_CACHE_MAX_AGE_SECONDS // 3600)
     # the retention group states the same cache age in days — one number, two renderings
     _same('retention.notes_cache_days', R['retention']['notes_cache_days'] * 86400,
@@ -341,13 +359,13 @@ def test_the_learn_step_is_one_command_with_a_receipt():
     ls = _load("dd_learn_step", PACK, "_shared", "scripts", "learn_step.py")
     _same("learn.step_timeout_secs", R["learn"]["step_timeout_secs"], ls.STEP_TIMEOUT_SECS)
     assert [name for name, _rel, _b in ls.STEPS] == [
-        "knowledge", "continuity", "drafts", "style", "granola", "contacts"], RULE
+        "knowledge", "continuity", "style", "drafts", "granola", "contacts"], RULE
     assert ls.receipt_path("2026-09-04", "morning").endswith("briefs/2026-09-04.morning.learned.json")
     assert isinstance(rt.accounts_for("briefs/2026-09-04.morning.learned.json"), rt.Rule), RULE
     _anchor("one command")
     _anchor("learned.json")
     _anchor("doubling to a fifteen-minute cap")
-    _anchor("older than 240 minutes")
+    _anchor(f"{te.VALVE_MAX_AGE_MIN} minutes after the source event")
     # deliver-once is MACHINERY at the send seam, not an instruction in a skill (Aug 30)
     _same("outbox.superseded (the terminal the gate writes)", ob.STATUS_SUPERSEDED, "superseded")
     _anchor("the send seam itself claims the deliver-once marker")
@@ -486,6 +504,9 @@ def test_continuity_resolution_windows():
           cr.DEADLINE_GRACE_DAYS)
     _same("continuity.terminal_retention_days", R["continuity"]["terminal_retention_days"],
           cr.TERMINAL_RETENTION_DAYS)
+    _same("continuity.park_after_days", R["continuity"]["park_after_days"], cr.PARK_AFTER_DAYS)
+    _anchor("two-day deadline grace is compatibility for legacy meeting shadows")
+    _anchor(f"nothing has touched for **{cr.PARK_AFTER_DAYS} days** parks")
 
 
 def test_chase_and_birthday_cadence():
@@ -688,7 +709,7 @@ def test_cron_line_matches_crons_json():
 def test_how_sotto_decides_states_every_number():
     """The playground islands and HOW-SOTTO-DECIDES.md are two renderings of the same claims.
     Anchors are built FROM the code constants, so a knob change breaks the doc, not just the page."""
-    budget = _env_default(te, "SOTTO_NUDGE_BUDGET")
+    budget = _env_default(prefs, "SOTTO_NUDGE_BUDGET")
     _anchor(f"`SOTTO_NUDGE_BUDGET` (default {budget})")
     _anchor(f"({budget} nudges today)")
     _anchor(f"`SOTTO_TAP_MAX_PER_DAY` (default {cal.TAP_MAX_PER_DAY_DEFAULT})")
@@ -703,7 +724,6 @@ def test_how_sotto_decides_states_every_number():
     _anchor(f"older than {te.EVENT_MAX_AGE_MIN} min")
     _anchor(f"`SOTTO_CHASE_AFTER_DAYS` (default {cr.CHASE_AFTER_DAYS})")
     _anchor(f"at most {cr.CHASE_MAX} per item")
-    _anchor(f"after {cr.AGE_EXPIRY_DAYS} silent days")
     _anchor(f"`SOTTO_CALENDAR_REFRESH_SECS` (default {cal.REFRESH_SECS_DEFAULT // 60} min)")
     _anchor(f"`SOTTO_EMAIL_POLL_SECS` (default {_env_default(rec, 'SOTTO_EMAIL_POLL_SECS')}s)")
     _anchor(f"`SOTTO_EVENTS_TICK_SECS`, default {R['intervals']['events_tick_secs']}s")
@@ -1136,3 +1156,63 @@ def test_birthday_importance_rules_match_shared_policy():
         'vvip_direction_days': importance.VVIP_EACH_DIRECTION_DAYS,
     }.items():
         _same('birthday.' + key, R['birthday'][key], value)
+
+
+def test_bounded_model_work_policies_and_recovery_numbers_do_not_drift():
+    import model_work
+    import compose_notification
+    expected = {'retention_days': model_work.RETENTION_DAYS,
+                'attempt_lease_seconds': model_work.ATTEMPT_LEASE_SECONDS,
+                'interruption_recoveries': model_work.MAX_INTERRUPTION_RECOVERIES,
+                'artifact_lock_shards': model_work.ARTIFACT_LOCK_SHARDS,
+                'notification_context_chars': compose_notification.MAX_CONTEXT_CHARS,
+                'notification_copy_chars': compose_notification.MAX_COPY_CHARS,
+                'attempts': {k: v.attempts for k, v in model_work.POLICIES.items()},
+                'output': {k: v.output for k, v in model_work.POLICIES.items()},
+                'low_thinking_tasks': [k for k, v in model_work.POLICIES.items() if v.thinking == 'low']}
+    for island in (ARCH, LOOPS):
+        _same('model_work', island['model_work'], expected)
+    from pathlib import Path
+    contract = (Path(DOCS) / 'BOUNDED-MODEL-WORK.md').read_text()
+    for task, policy in model_work.POLICIES.items():
+        row = f"| `{task}` | {policy.attempts} | {policy.output:,} | {policy.thinking or 'unchanged'} |"
+        assert row in contract and row in DECIDES, RULE
+    for number in (model_work.RETENTION_DAYS, model_work.ATTEMPT_LEASE_SECONDS,
+                   model_work.MAX_INTERRUPTION_RECOVERIES, model_work.ARTIFACT_LOCK_SHARDS,
+                   compose_notification.MAX_CONTEXT_CHARS, compose_notification.MAX_COPY_CHARS):
+        assert f'**{number:,}' in contract and f'**{number:,}' in DECIDES, RULE
+    research = _load('drift_research', PACK, '_shared', 'scripts', 'research_attendees.py')
+    assert research.MAX_OUTPUT_TOKENS == research.DEEP_MAX_OUTPUT_TOKENS == research.FOCUS_MAX_OUTPUT_TOKENS == model_work.POLICIES['research'].output
+
+
+def test_phase2_limits_share_existing_clocks_and_documented_rules():
+    import relationship_importance as importance
+    import review_candidates
+    import master_file
+    import compose_brief
+    import knowledge
+    expected = {
+        'history_stale_hours': compose_brief.HISTORY_STALE_HOURS,
+        'candidate_cooldown_days': review_candidates.COOLDOWN_DAYS,
+        'reply_sample_limit': importance.REPLY_SAMPLE_LIMIT,
+        'reply_min_samples': importance.REPLY_MIN_SAMPLES,
+        'learned_expiry_days': knowledge.PRUNE_STALE_AFTER_DAYS,
+        'confidence_decay_per_week': knowledge.CONFIDENCE_DECAY_PER_WEEK,
+        'vip_held_meetings': importance.VIP_HELD_MEETINGS,
+        'vip_held_weeks': importance.VIP_HELD_WEEKS,
+        'vvip_held_meetings': importance.VVIP_HELD_MEETINGS,
+        'vvip_held_weeks': importance.VVIP_HELD_WEEKS,
+        'meeting_attendee_cap': importance.MAX_RELATIONSHIP_MEETING_ATTENDEES,
+        'priority_max': master_file.PRIORITY_MAX,
+    }
+    for key, value in expected.items():
+        _same('phase2.' + key, R['phase2'][key], value)
+    _anchor(f'**{compose_brief.HISTORY_STALE_HOURS} hours**')
+    _anchor(f'**{review_candidates.COOLDOWN_DAYS}-day cooldown**')
+    _anchor(f'**{importance.REPLY_MIN_SAMPLES} completed replies**')
+    _anchor(f'**{importance.REPLY_SAMPLE_LIMIT} reply samples**')
+    _anchor(f'**{importance.VIP_HELD_MEETINGS} held meetings across {importance.VIP_HELD_WEEKS} weeks**')
+    _anchor(f'**{importance.VVIP_HELD_MEETINGS} across {importance.VVIP_HELD_WEEKS} weeks**')
+    _anchor(f'**{knowledge.CONFIDENCE_DECAY_PER_WEEK} weekly decay**')
+    _anchor(f'**{knowledge.PRUNE_STALE_AFTER_DAYS} days**')
+    _anchor('Priorities remain ranking context permanently, never an exclusion filter.')

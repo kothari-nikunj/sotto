@@ -1,5 +1,7 @@
 # Deploying Sotto to Railway — click-by-click
 
+For an existing hosted deployment, verify its explicit service target and scheduler ownership using the [bounded work runbook](docs/BOUNDED-MODEL-WORK.md#deployment-ownership-and-rollout).
+
 This is the exact Railway setup for the cloud Sotto host (Hermes + skills + trigger receiver). Two
 ways in, same result: the **[one-click Deploy link](#one-click-deploy-railway)** — it sets up the
 build, the `/data` volume and `BRIDGE_TOKEN`, and prompts for just two values (your Gemini key and
@@ -350,12 +352,12 @@ research caps — are named constants in the code that owns them, not variables 
 | `WHATSAPP_ENABLED` | `true` runs the boot-time WhatsApp pairing step and the WhatsApp gateway. **Defaults to `false`**, except when WhatsApp is the resolved delivery channel (then `true`) — so nobody waits 15 minutes for a QR scan they never intended. | optional (channel) |
 | `WHATSAPP_*` · `TELEGRAM_*` · `BLUEBUBBLES_*` · `SIGNAL_*` · `DISCORD_*` · `SLACK_*` | **your channel's own variables** — these names belong to Hermes, not Sotto (run `hermes gateway setup` once to see the ones your version wants). Every variable you set with one of these prefixes is forwarded into `~/.hermes/.env` on boot, by prefix and with no channel special-cased; the boot log names each one it forwarded. Set none and nothing happens. | optional (channel) |
 | `SOTTO_USER_EMAIL` | your own email address; used to exclude yourself from attendee research and post-meeting taps, and to list you as a guest on invites Sotto creates. **Optional override — derived automatically from your Google account when you connect it** (the `From` of your own sent mail, persisted as `google_account_email` in `/data/config/settings.json`); set this only to force a different address. | optional |
-| `SOTTO_GEMINI_MODEL` | override the Gemini model (default `gemini-3.8-flash`) — the compose default, and always the model for the gemini-only lanes (search grounding, url_context, DocSend vision). Must be 1M-context. | optional |
+| `SOTTO_GEMINI_MODEL` | Override the Gemini model (default `gemini-3.8-flash`): the compose default and the model for native grounding, url_context and DocSend vision. Must be 1M-context. A proxy-backed background cycle also checks the effective primary against the proxy's advertised native models before fetching history. | optional |
 | `SOTTO_BRIEF_MODEL` | run the compose calls on another family: `openai/<model>` or `anthropic/<model>` (bare names mean gemini). Needs that family's key below; the model must clear the brief's 400K-token context floor. Gemini stays the default — set this only to bring the family you already pay for. | optional (model family) |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | that family's key when `SOTTO_BRIEF_MODEL`/`SOTTO_TRIAGE_MODEL` name it. | optional (model family) |
 | `SOTTO_OPENAI_BASE_URL` | point the openai family at any OpenAI-compatible endpoint (LiteLLM/OpenRouter proxy, a local gateway carrying your Codex or Claude **subscription** auth). With this set, `OPENAI_API_KEY` is optional. | optional (model family) |
 | `SOTTO_CRITIC` | the brief's second-pass Gemini **critic + revise** quality gate (`auto` \| `always` \| `off`, default `auto`). `auto` skips the two extra Gemini calls on a **small/low-risk** brief (rendered source payload `<15000` chars AND `≤5` actions) and runs them otherwise; `always` = every brief; `off` = never. | optional (quality) |
-| `SOTTO_FALLBACK_MODEL` | backup model the brief falls back to on a 429/5xx/timeout. On gemini it defaults to `gemini-3-flash-preview` (cheaper, separate per-model rate-limit bucket, same key); other families have **no default** and a cross-family value is refused — the fallback must stay in the primary's family, so a quota blip never sends your data to a provider you didn't configure. The backup must clear the same 400K context floor. | optional (resilience) |
+| `SOTTO_FALLBACK_MODEL` | Backup model for a foreground brief on a 429/5xx/timeout. On Gemini it defaults to `gemini-3-flash-preview`; other families have no default. A cross-family value is refused and the backup must clear the same 400K context floor. Background history extraction and Dreamer use one primary attempt and leave retries to the next cycle; this setting does not affect them. | optional (resilience) |
 | `SOTTO_FALLBACK_API_KEY` | optional second Gemini key (different project) used for the fallback — dodges per-project quota (the 429 storm). Can be set alone (same model, backup key) or with `SOTTO_FALLBACK_MODEL`. | optional (resilience) |
 | `SOTTO_BACKGROUND_UNMETERED` | Exact `true` explicitly allows self-host history learning and Dreamer to use direct BYOK without a finite proxy budget. Unset is the safe default: background learning waits for the proxy URL/token and a finite tenant `budget_cents`. Foreground chat and ordinary briefs are unaffected. | optional owner choice |
 | `SOTTO_ALLOW_SELF_IMPROVE` | `1` to allow Hermes' skill self-writes + Curator on this instance. Default (unset) **protects** Sotto's skills: gates `skills.write_approval`, disables curator pruning. Set `1` only on a shared general-purpose Hermes. | optional |
@@ -375,7 +377,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_EMAIL_POLL_SECS` | cloud-side Gmail poll interval feeding new inbox mail into the triage funnel (default `90`; `0` disables email events). | optional (events) |
 | `SOTTO_TRIAGE_MODEL` | the cheap Tier-1 event-triage model (default `gemini-3.5-flash-lite`). | optional (events) |
 | `SOTTO_EVENT_COOLDOWN_MIN` | per-thread agent-nudge cooldown — at most one event nudge per thread per this many minutes (default `20`; suppressed events queue for the digest). | optional (events) |
-| `SOTTO_NUDGE_BUDGET` | cross-thread daily interrupt budget — at most this many event nudges per **local day** (default `4`), counting release-valve promotions. Beyond it, agent verdicts queue for the digest/next brief (class `budget`). Missed calls, escalations, post-meeting taps and calendar changes are exempt — **taps have their own cap** (`SOTTO_TAP_MAX_PER_DAY`, default `3`), so interrupts spend the daily budget, taps spend the tap cap, and neither eats the other. Per-thread cooldowns stop one sender repeating; this is what stops ten senders in an hour. | optional (events) |
+| `SOTTO_NUDGE_BUDGET` | configured ceiling for unsolicited nudges per **local day** (default `4`). “Fewer nudges” halves the effective cap, “no nudges” sets it to zero, and “more nudges” restores this ceiling; chat cannot exceed it. At zero every unsolicited path is suppressed, including held promotions, proactive work and pending outbox sends. Scheduled briefs, digests and direct requests remain available. | optional (events) |
 | `SOTTO_TAP_MAX_PER_DAY` | post-meeting taps per **local day** (default `3`), enforced once at dispatch. Independent of `SOTTO_NUDGE_BUDGET`. | optional (events) |
 | `SOTTO_MEETING_TAP` | `1` (default) fires the post-meeting tap ("your 2:00 PM with Sarah wrapped — want me to send the follow-up?"); `0` disables it. | optional (events) |
 | `SOTTO_CALENDAR_NUDGES` | `1` (default) nudges on changes to the imminent calendar the moment the 15-min refresh sees them — a decline, a last-minute invite, a move, a cancellation; `0` disables. Exempt from the daily budget (a change expires with its meeting); quiet hours/snooze/mutes still hold it. | optional (events) |
@@ -410,6 +412,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_TRIGGER_TOKEN` | separate bearer for the Bridge → cloud wake-push. Unset = the wake-push authenticates with `BRIDGE_TOKEN` (one shared bearer; wake-push is on by default in the Mac app). | optional |
 | `SOTTO_SETUP_CODE` | pin the access code gating the setup surface (`/setup`, `/pair`, `/whatsapp/qr`, `/google/*`, `/debug/google`). It is also the **Telegram pairing phrase**: boot's chat-id capture only accepts a message carrying it, so a stranger who guesses your bot's @username cannot claim the deploy. Unset = auto-generated once and persisted on `/data`; the full setup link and the pairing link both print in every boot's deploy logs. | optional |
 | *(do not set)* `PORT` | injected by Railway; the receiver binds it. | — |
+| *(do not set)* `RAILWAY_DEPLOYMENT_ID` | Railway injects the deployment revision. The model proxy records it as `proxy_deployment`; caller `application` and `deployment` come from trusted proxy tenant configuration. Authenticated tenant ID is the report owner. | — |
 | *(do not set)* `RAILWAY_PUBLIC_DOMAIN` | set by Railway once you **Generate Domain** (step 4) — the setup/Google/QR links in the deploy logs are built from it. If it's absent (no domain yet), those links fall back to `http://localhost:…`. | — |
 
 ### Removed settings
@@ -424,11 +427,10 @@ what these knobs shipped with.
 |---|---|
 | `SOTTO_ESCALATION_WINDOW_MIN` | `ESCALATION_WINDOW_MIN_DEFAULT` (45 min) |
 | `SOTTO_EVENT_MAX_AGE_MIN` | `EVENT_MAX_AGE_MIN` (30 min) |
-| `SOTTO_VIP_PRIORITY` | `VIP_PRIORITY_MIN` (10) |
+| `SOTTO_VIP_PRIORITY` | nothing — the volume-based VIP rule was removed; VIP is a name you state (`vip`) or a typed `family_of` relation |
 | `SOTTO_VALVE_MAX_AGE_MIN` · `SOTTO_VALVE_MAX_PER_HOUR` · `SOTTO_VALVE_INTERVAL_SECS` | `VALVE_MAX_AGE_MIN` (240) · `VALVE_MAX_PER_HOUR` (2) · `VALVE_INTERVAL_SECS_DEFAULT` |
 | `SOTTO_TAP_GRACE_MIN` · `SOTTO_TAP_LOOKBACK_MIN` · `SOTTO_TAP_SKIP_INTERNAL` | `TAP_GRACE_MIN_DEFAULT` · `TAP_LOOKBACK_INTERVALS` · `TAP_SKIP_INTERNAL` |
 | `SOTTO_PROACTIVE_LEAD_MIN` | `PROACTIVE_LEAD_MIN` (45 min) |
-| `SOTTO_RETUNE_OFFER_MIN` · `SOTTO_RETUNE_OFFER_COOLDOWN_DAYS` | `RETUNE_OFFER_MIN` (6) · `RETUNE_OFFER_COOLDOWN_DAYS` (7) |
 | `SOTTO_STALE_AGE_DAYS` · `SOTTO_STALE_SURFACED` | `STALE_AGE_DAYS` (4) · `STALE_SURFACED` (3) |
 | `SOTTO_RESEARCH_RECENCY_DAYS` | `DEFAULT_RECENCY_DAYS` (90) |
 | `SOTTO_PREWARM_MAX` | `MAX_PREWARM` (12) |

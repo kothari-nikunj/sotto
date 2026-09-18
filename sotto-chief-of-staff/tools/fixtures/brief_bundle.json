@@ -1,29 +1,111 @@
 {
   "today": "2026-06-23",
-  "signals": { "replied_thread_ids": ["t_old"] },
+  "signals": {
+    "replied_thread_ids": [
+      "t_old"
+    ]
+  },
   "actions": [
-    { "id": "a1", "section": "needs_attention", "channel": "email", "action_type": "reply",
-      "contact_name": "Sarah Chen", "source_thread_id": "t_sarah",
-      "summary": "Sarah asked for the signed contract by EOD" },
-    { "id": "a2", "section": "should_handle", "channel": "imessage", "action_type": "follow_up",
-      "contact_name": "Dev Patel", "source_thread_id": "t_dev",
-      "summary": "Follow up with Dev about the demo time" },
-    { "id": "a3", "section": "already_handled", "channel": "email", "action_type": "reply",
-      "contact_name": "Maria Lopez", "source_thread_id": "t_old",
-      "summary": "Replied to Maria about the invoice" }
+    {
+      "id": "a1",
+      "section": "needs_attention",
+      "channel": "email",
+      "action_type": "reply",
+      "contact_name": "Sarah Chen",
+      "source_thread_id": "t_sarah",
+      "summary": "Sarah asked for the signed contract by EOD"
+    },
+    {
+      "id": "a2",
+      "section": "should_handle",
+      "channel": "imessage",
+      "action_type": "follow_up",
+      "contact_name": "Dev Patel",
+      "source_thread_id": "t_dev",
+      "summary": "Follow up with Dev about the demo time"
+    },
+    {
+      "id": "a3",
+      "section": "already_handled",
+      "channel": "email",
+      "action_type": "reply",
+      "contact_name": "Maria Lopez",
+      "source_thread_id": "t_old",
+      "summary": "Replied to Maria about the invoice",
+      "loopId": "follow_up:id:maria@example.com",
+      "contact_identifier": "maria@example.com"
+    }
   ],
   "extracted_knowledge": {
     "person_updates": [
-      { "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
-        "profile_patch": { "title": "CTO", "company": "Acme Corp" },
+      {
+        "person_name": "Sarah Chen",
+        "identifier": "sarah@acme.com",
+        "profile_patch": {
+          "title": "CTO",
+          "company": "Acme Corp"
+        },
         "facts": [
-          { "fact": "Pushing to close the Series B by end of quarter", "memory_type": "milestone", "confidence": 0.9 },
-          { "fact": "Prefers concise email, replies fast", "memory_type": "working_style", "confidence": 0.8 }
-        ] }
+          {
+            "fact": "Pushing to close the Series B by end of quarter",
+            "memory_type": "milestone",
+            "confidence": 0.9
+          },
+          {
+            "fact": "Prefers concise email, replies fast",
+            "memory_type": "working_style",
+            "confidence": 0.8
+          }
+        ]
+      }
     ],
     "company_updates": [
-      { "company_name": "Acme Corp",
-        "news": [ { "text": "Raised Series B led by Sequoia", "url": "https://news.example/acme-b", "date": "2026-06" } ] }
+      {
+        "company_name": "Acme Corp",
+        "news": [
+          {
+            "text": "Raised Series B led by Sequoia",
+            "url": "https://news.example/acme-b",
+            "date": "2026-06"
+          }
+        ]
+      }
     ]
-  }
+  },
+  "existing_loops": [
+    {
+      "anchor_key": "follow_up:id:maria@example.com",
+      "status": "open",
+      "action_type": "reply",
+      "channel": "email",
+      "contact_name": "Maria Lopez",
+      "contact_identifier": "maria@example.com",
+      "created_at": "2026-06-22 09:00:00",
+      "summary": "Confirm the invoice with Maria",
+      "source_thread_id": "t_old"
+    }
+  ],
+  "emails": [
+    {
+      "id": "sent-invoice",
+      "to": "maria@example.com",
+      "date": "2026-06-23 08:00:00",
+      "isSent": true,
+      "body": "The invoice is approved."
+    }
+  ],
+  "loop_updates": [
+    {
+      "loopId": "follow_up:id:maria@example.com",
+      "loopVersion": "a23b48bf9c3d1f6300c81b662e32998d65567bffbd2f0e7c60fdc87b5961dea0",
+      "status": "resolved",
+      "evidence": [
+        {
+          "sourceType": "email",
+          "sourceId": "sent-invoice",
+          "snippet": "The invoice is approved."
+        }
+      ]
+    }
+  ]
 }

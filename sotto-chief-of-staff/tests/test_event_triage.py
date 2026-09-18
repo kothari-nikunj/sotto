@@ -6,6 +6,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
 
@@ -13,6 +15,7 @@ spec = importlib.util.spec_from_file_location(
     "te", os.path.join(ROOT, "event-triage", "scripts", "triage_event.py"))
 te = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(te)
+import work_queue  # noqa: E402
 
 DAY = datetime(2026, 8, 6, 11, 0)      # 11:00 local — outside the default 21..7 quiet window
 NIGHT = datetime(2026, 8, 6, 23, 0)    # 23:00 local — inside quiet hours
@@ -81,6 +84,14 @@ def _stub_llm(monkeypatch, reply):
         calls.append({"model": model, "prompt": prompt})
         if isinstance(reply, Exception):
             raise reply
+        if isinstance(reply, str):
+            try:
+                obj = json.loads(reply)
+                if isinstance(obj, dict) and "class" in obj and "sender_role" not in obj:
+                    obj["sender_role"] = "person"
+                    return json.dumps(obj)
+            except (ValueError, TypeError):
+                pass
         return reply
     monkeypatch.setattr(te._gemini, "_gemini_once", stub)
     return calls
@@ -110,6 +121,52 @@ def test_automated_email_sender_drops_silently(tmp_path, monkeypatch):
     assert _queue_entries(tmp_path) == []                     # dropped = nothing anywhere
 
 
+@pytest.mark.parametrize("name,handle,text", [
+    ("Chase", "chasebank_fraud_agent@rbm.goog",
+     "Fraud alert: did you authorize $4,200 at Best Buy? Reply NO to block"),
+    ("United", "unitedairlines_ops_agent@rbm.goog",
+     "Your flight tomorrow now departs 6:15am")])
+def test_business_messaging_transport_still_reaches_the_relevance_judgment(
+        tmp_path, monkeypatch, name, handle, text):
+    """`*_agent@rbm.goog` is the address RCS Business Messaging gives every brand, so it cannot be
+    assistant provenance: a bank's fraud alert and an airline's schedule change arrive from the
+    same shape a vendor bot does, and only the judgment can tell them apart."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path, contacts=[{"name": name, "emails": [handle]}])
+    calls = _stub_llm(monkeypatch, json.dumps({"class": "urgent", "sender_role": "person",
+                                               "why": "the user's own money/travel is at stake"}))
+    out = te.triage({"events": [_im(text, handle=handle)]}, now_local=DAY, now_utc=NOW_UTC)
+    assert len(calls) == 1                                    # it was judged, not dropped at ingress
+    assert out["verdict"] != "drop" and "software assistant" not in out["reason"]
+    assert _queue_entries(tmp_path) or _surfaced_entries(tmp_path)
+
+
+def test_vendor_assistant_on_that_transport_still_ends_as_ignore_from_the_judgment(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    handle = "ramp_cf8gd1ek_agent@rbm.goog"
+    _seed_snapshot(tmp_path, contacts=[{"name": "Ramp", "emails": [handle]}])
+    _stub_llm(monkeypatch, json.dumps({"class": "urgent", "sender_role": "assistant",
+                                       "why": "the conversation identifies a software service"}))
+    out = te.triage({"events": [_im("Urgent: confirm today", handle=handle)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop"
+    assert _queue_entries(tmp_path) == []
+
+
+def test_outbound_reply_to_business_agent_remains_a_loop_closing_signal(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    handle = "ramp_cf8gd1ek_agent@rbm.goog"
+    _seed_snapshot(tmp_path, contacts=[{"name": "Ramp", "emails": [handle]}])
+    _no_llm(monkeypatch)
+    out = te.triage({"events": [_im("submitted", handle=handle, is_from_me=True)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"
+    assert _queue_entries(tmp_path)[0]["verdict_class"] == "signal"
+
+
 def test_otp_and_shortcode_and_system_messages_drop(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path)
@@ -133,6 +190,29 @@ def test_muted_sender_and_muted_person_drop(tmp_path, monkeypatch):
     out = te.triage({"events": [email, _im(rowid=4)]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "drop"                           # both muted → nothing survives
     assert _queue_entries(tmp_path) == []
+
+
+def test_a_muted_persons_missed_call_is_dropped_like_their_messages(tmp_path, monkeypatch):
+    """"Stop surfacing X" means every channel, calls included. The mute gate used to sit AFTER the
+    calls branch, so a muted person's missed call still nudged — and did it budget-exempt, and
+    VIP-exempt from quiet hours (Sep 2026). It drops, with the same receipt a muted message leaves.
+    """
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    (tmp_path / "preferences.json").write_text(json.dumps(
+        {"explicit": {"mute_people": ["Sarah Chen"]}}))
+    _no_llm(monkeypatch)
+    out = te.triage({"events": [_call()]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop" and out["bundle"] == {}
+    assert _queue_entries(tmp_path) == []          # dropped at ingress, not held
+    row = _surfaced_entries(tmp_path)[-1]          # …and never silently: the Record answers "why?"
+    assert (row["verdict"], row["class"], row["channel"]) == ("drop", "muted", "calls")
+    assert row["reason"].endswith("stop surfacing Sarah Chen")
+    # the move did not break the branch: an un-muted known caller still buzzes
+    (tmp_path / "preferences.json").write_text(json.dumps({"explicit": {"mute_people": ["Ali"]}}))
+    out2 = te.triage({"events": [_call(rowid=8)]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out2["verdict"] == "agent"
+    assert out2["bundle"]["events"][0]["class"] == "missed_call"
 
 
 def test_missed_call_from_known_person_goes_agent(tmp_path, monkeypatch):
@@ -180,7 +260,10 @@ def test_calendar_change_nudges_deterministically_and_skips_the_budget(tmp_path,
     """A decline/last-minute invite is Tier-0 (the calendar already made the judgment), and it is
     budget-exempt — 'Ali declined your 11am' at 10:40 must land even on a spent day."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")            # the day's budget is GONE
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
+    (tmp_path / "events").mkdir(parents=True)
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
     _seed_snapshot(tmp_path)
     _no_llm(monkeypatch)                                     # no Tier-1 call, ever, for these
     out = te.triage({"events": [_cal_change()]}, now_local=DAY, now_utc=NOW_UTC)
@@ -245,9 +328,11 @@ def test_quiet_hours_queue_everything_except_vip_missed_calls(tmp_path, monkeypa
     # known but non-VIP missed call in quiet hours → queue
     out2 = te.triage({"events": [_call(rowid=10)]}, now_local=NIGHT, now_utc=NOW_UTC)
     assert out2["verdict"] == "queue"
-    # VIP (top-of-queue attention_queue priority) missed call → agent even at 23:00
+    # a STATED VIP's missed call → agent even at 23:00 (a queue priority never buys this — below)
     _seed_rel_state(tmp_path, [{"display_name": "Sarah Chen", "queue_type": "waiting_on_you",
                                 "reason": "asked about the deck", "priority": 14.0}])
+    (tmp_path / "preferences.json").write_text(json.dumps(
+        {"explicit": {"vip_people": ["Sarah Chen"]}}))
     out3 = te.triage({"events": [_call(rowid=11)]}, now_local=NIGHT, now_utc=NOW_UTC)
     assert out3["verdict"] == "agent"
     assert out3["bundle"]["events"][0]["sender"] == "Sarah Chen"
@@ -264,20 +349,33 @@ def test_a_quiet_hours_missed_call_keeps_its_class(tmp_path, monkeypatch):
     held = _queue_entries(tmp_path)[-1]
     assert (held["verdict_class"], held["held_class"]) == ("quiet", "missed_call")
     # …so the promotion is budget-exempt and carries the missed-call class into the bundle
-    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["bundle"]["events"][0]["class"] == "missed_call"
-    assert _budget_file(tmp_path) is None
+    assert _budget_file(tmp_path)["count"] == 1
 
 
-def test_low_priority_attention_queue_is_not_vip(tmp_path, monkeypatch):
+def test_attention_queue_priority_never_makes_a_vip(tmp_path, monkeypatch):
+    """VIP is a CHOICE — the stated list or a typed family_of relation — never volume. The weekly
+    pulse's priority is interactions × days-waiting × type-weight, so the old clause let four
+    messages and three days of silence clear quiet hours at 3 a.m., off a file up to a week stale
+    (Sep 2026). Any priority, high or low, holds."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path)
-    _seed_rel_state(tmp_path, [{"display_name": "Sarah Chen", "queue_type": "losing_touch",
-                                "reason": "quiet lately", "priority": 2.0}])
     _no_llm(monkeypatch)
-    out = te.triage({"events": [_call(rowid=12)]}, now_local=NIGHT, now_utc=NOW_UTC)
-    assert out["verdict"] == "queue"                          # priority below the VIP bar
+    for rowid, priority in ((12, 2.0), (13, 9_000.0)):
+        _seed_rel_state(tmp_path, [{"display_name": "Sarah Chen", "queue_type": "waiting_on_you",
+                                    "reason": "quiet lately", "priority": priority}])
+        out = te.triage({"events": [_call(rowid=rowid)]}, now_local=NIGHT, now_utc=NOW_UTC)
+        assert out["verdict"] == "queue"                      # the pulse is context, not a gate
+        assert _queue_entries(tmp_path)[-1]["verdict_class"] == "quiet"
+    assert te._is_vip("Sarah Chen", "+14155551234",
+                      {"attention_queue": [{"display_name": "Sarah Chen",
+                                            "priority": 9_000.0}]}, {}) is False
+    # …and the two checks that ARE choices still qualify (family_of has its own test below)
+    assert te._is_vip("Sarah Chen", "+14155551234", {}, {"vip_people": ["Sarah Chen"]}) is True
 
 
 # ── Tier 1 (stubbed) ──────────────────────────────────────────────────────────────────────────────
@@ -312,6 +410,32 @@ def test_tier1_ambient_queues_and_ignore_drops(tmp_path, monkeypatch):
     _stub_llm(monkeypatch, '{"class":"ignore","why":"noise"}')
     out2 = te.triage({"events": [_im("ok", rowid=41)]}, now_local=DAY, now_utc=NOW_UTC)
     assert out2["verdict"] == "drop"
+
+
+@pytest.mark.parametrize("name,phone", [("Instinct", "+12025550170"), ("Poke", "+12025550171")])
+def test_phone_thread_assistant_role_drops_from_shared_semantic_judgment(
+        tmp_path, monkeypatch, name, phone):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path, contacts=[{"name": name, "phones": [phone]}])
+    _stub_llm(monkeypatch, json.dumps({"class": "ignore", "sender_role": "assistant",
+                                      "why": "the conversation identifies a software service"}))
+    out = te.triage({"events": [_im("I can organize your trip", handle=phone)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop"
+    assert _queue_entries(tmp_path) == []
+
+
+def test_a_human_named_poke_with_an_invitation_is_not_name_filtered(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path, contacts=[{"name": "Poke", "phones": ["+12025550172"]}])
+    _stub_llm(monkeypatch, json.dumps({"class": "scheduling_ask", "sender_role": "person",
+                                      "why": "a human invitation still needs an answer"}))
+    out = te.triage({"events": [_im("Dinner Friday?", handle="+12025550172")]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"
+    assert _queue_entries(tmp_path)[0]["verdict_class"] == "scheduling_ask"
 
 
 def test_tier1_prompt_carries_event_text_without_sender_identity(tmp_path, monkeypatch):
@@ -470,7 +594,7 @@ def test_unparseable_timestamp_never_gates(tmp_path, monkeypatch):
 
 def test_surfaced_ledger_records_every_verdict(tmp_path, monkeypatch):
     """agent/queue/drop all land in surfaced.jsonl with the Record-renderable shape:
-    {ts, sender, channel, verdict, reason, class, decision_id} (ts ISO-Z)."""
+    {ts, sender, channel, verdict, reason, class, decision_id, item_key} (ts ISO-Z)."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path)
     _no_llm(monkeypatch)
@@ -480,9 +604,11 @@ def test_surfaced_ledger_records_every_verdict(tmp_path, monkeypatch):
     rows = _surfaced_entries(tmp_path)
     assert len(rows) == 3
     for r in rows:
-        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class", "decision_id"}
+        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class",
+                          "decision_id", "item_key"}
         assert r["ts"].endswith("Z")
         assert r["decision_id"]
+        assert r["item_key"].startswith("event:")
     by_verdict = {r["verdict"]: r for r in rows}
     assert by_verdict["drop"]["class"] == "automated"
     assert by_verdict["queue"]["class"] == "unknown"
@@ -691,6 +817,87 @@ def test_the_valve_never_promotes_sottos_own_proactive_nudge(tmp_path, monkeypat
     assert te._thread_key({"source": "proactive", "kind": "chase"}) == "proactive:chase"
 
 
+def test_valve_never_promotes_a_legacy_queued_assistant_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    entry = _q("actionable", sender="Ramp", handle="ramp_cf8gd1ek_agent@rbm.goog")
+    entry["event"]["sender_type"] = "assistant"        # structured provenance from the source
+    assert te._valve_candidate(entry, VALVE_NOW_UTC, VALVE_NOW_TS, 240) is None
+    # …but the shared RCS business-messaging address is a transport, not provenance: a bank's
+    # fraud alert arrives on it too, so the valve judges that row like any other.
+    bank = _q("actionable", sender="Chase", rowid=2, handle="chasebank_fraud_agent@rbm.goog")
+    assert te._valve_candidate(bank, VALVE_NOW_UTC, VALVE_NOW_TS, 240) is not None
+
+
+def test_valve_and_manual_promotion_honor_current_person_and_sender_mutes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    phone_entry = _q("meeting_hold", sender="Poke", handle="+12025550171", held="actionable")
+    ramp_entry = _q("meeting_hold", sender="Ramp", rowid=2,
+                    handle="ramp_cf8gd1ek_agent@rbm.goog", held="actionable")
+    _seed_queue(tmp_path, [phone_entry, ramp_entry])
+    (tmp_path / "preferences.json").write_text(json.dumps({"explicit": {
+        "mute_people": ["Poke"], "mute_senders": ["ramp_cf8gd1ek_agent@rbm.goog"]}}))
+    prefs = te._load_prefs()
+    assert te._valve_candidate(phone_entry, VALVE_NOW_UTC, VALVE_NOW_TS, 240,
+                               prefs=prefs) is None
+    # The valve's skip is not silent: the held copy of a muted person's message leaves the same
+    # kind of receipt the ingress drop does, so The Record can still answer "why the silence?"
+    receipt = _surfaced_entries(tmp_path)[-1]
+    assert receipt["verdict"] == "drop" and receipt["class"] == "muted"
+    assert receipt["reason"].endswith("stop surfacing Poke")
+    assert te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC,
+                            now_ts=VALVE_NOW_TS)["verdict"] == "drop"
+    key = te.queue_key(json.dumps(phone_entry))
+    promoted = te.promote_one(key, now_local=DAY, now_utc=VALVE_NOW_UTC,
+                              now_ts=VALVE_NOW_TS)
+    # "nudge me now" on a muted person names the mute — the one refusal the user can lift.
+    assert promoted["ok"] is False and promoted["error"] == "muted"
+    assert "stop surfacing Poke" in promoted["reason"]
+
+
+def test_a_muted_number_is_dropped_however_the_number_is_written(tmp_path, monkeypatch):
+    """"Stop surfacing +12025550171" is about a PERSON, not about a spelling. The ingress gate and
+    the queued-item paths ask the same predicate through the same normalizer, so the mute can't
+    drop yesterday's queued item and still let today's text ring through as a live nudge."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    (tmp_path / "preferences.json").write_text(json.dumps(
+        {"explicit": {"mute_senders": ["+12025550171"]}}))
+    _no_llm(monkeypatch)                       # a Tier-0 mute never pays for a model call
+    out = te.triage({"events": [_im(handle="+1 (202) 555-0171")]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop"
+    assert _queue_entries(tmp_path) == []      # dropped at ingress, not merely held
+    row = _surfaced_entries(tmp_path)[-1]
+    assert row["verdict"] == "drop" and row["class"] == "muted"
+    assert "stop surfacing" in row["reason"]
+    # …and the mute stops at that number: the neighbouring one is a different person.
+    out2 = te.triage({"events": [_im(handle="+12025550170", rowid=2)]},
+                     now_local=DAY, now_utc=NOW_UTC)
+    assert out2["verdict"] == "queue"
+    assert _queue_entries(tmp_path)[-1]["verdict_class"] == "unknown"   # queued, not muted
+    assert _surfaced_entries(tmp_path)[-1]["class"] == "unknown"
+
+
+def test_a_whatsapp_jid_matches_a_mute_on_that_phone_number(tmp_path, monkeypatch):
+    """A WhatsApp identifier is a phone number with a transport glued to it. Muting the number the
+    user knows has to cover the JID, or "stop surfacing them" only holds on one channel."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_snapshot(tmp_path)
+    (tmp_path / "preferences.json").write_text(json.dumps(
+        {"explicit": {"mute_senders": ["+1 202 555 0171"]}}))
+    _no_llm(monkeypatch)
+    ev = {"source": "whatsapp", "rowid": "w1", "contact_jid": "12025550171@s.whatsapp.net",
+          "sender_jid": "12025550171@s.whatsapp.net", "partner_name": "Poke",
+          "text": "I can remind you about that", "timestamp": "2026-08-06T10:00:00Z"}
+    out = te.triage({"events": [ev]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop" and _queue_entries(tmp_path) == []
+    assert _surfaced_entries(tmp_path)[-1]["class"] == "muted"
+    # A '@lid' privacy handle whose digit tail happens to match is NOT that phone number: it is a
+    # rotating id that can collide with a stranger's, so it never answers a mute on a number.
+    lid = dict(ev, rowid="w2", contact_jid="9912025550171@lid", sender_jid="9912025550171@lid")
+    assert te.triage({"events": [lid]}, now_local=DAY, now_utc=NOW_UTC)["verdict"] != "drop"
+    assert _surfaced_entries(tmp_path)[-1]["class"] != "muted"
+
+
 def test_valve_promotes_known_sender_catchup_demoted_event(tmp_path, monkeypatch):
     """End-to-end through the real demotion: a catchup-demoted urgent event promotes once the hold
     lifts — same bundle shape as a fresh agent verdict, queue entry removed, surfaced 'promoted',
@@ -752,6 +959,43 @@ def test_valve_skips_events_older_than_promotion_window(tmp_path, monkeypatch):
     monkeypatch.setattr(te, "VALVE_MAX_AGE_MIN", 480)
     out2 = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out2["verdict"] == "agent"
+
+
+def test_an_expired_entry_leaves_exactly_one_stale_row(tmp_path, monkeypatch):
+    """Nothing is thrown away quietly. The age rejection is the one valve refusal that ENDS an item
+    — cooldown, "you spoke since" and the budget all come round again, but nothing makes an entry
+    younger — so it writes one `drop`/`stale` row and marks the entry, and the next tick (and every
+    tick after it, for as long as the entry rides the digest) writes nothing."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _seed_queue(tmp_path, [
+        _q("actionable", rowid=1, ev_ts="2026-08-06T05:00:00Z",     # 7h old at 12:00 — past 4h
+           q_ts="2026-08-06T05:00:05Z"),
+    ])
+    out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
+    assert out["verdict"] == "drop" and "nothing promotable" in out["reason"]
+    rows = [r for r in _surfaced_entries(tmp_path) if r["class"] == "stale"]
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "drop" and rows[0]["sender"] == "Sarah Chen"
+    assert "past the 240m promotion window" in rows[0]["reason"]
+    # the entry itself stays — it still rides the digest/brief — carrying the once-only marker
+    entries = _queue_entries(tmp_path)
+    assert len(entries) == 1 and entries[0]["valve_expired"] is True
+    # a second tick, 15 minutes later: same refusal, no second row
+    te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS + 900)
+    assert len([r for r in _surfaced_entries(tmp_path) if r["class"] == "stale"]) == 1
+    assert len(_queue_entries(tmp_path)) == 1
+
+
+def test_a_held_entry_the_valve_only_defers_leaves_no_stale_row(tmp_path, monkeypatch):
+    """Cooldown and "the user spoke since" are HOLDS, not endings — the item is still promotable on
+    a later tick, so neither writes an expiry row. Only the age cap ends an item."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    te._stamp_cooldown("imessage:+14155551234", VALVE_NOW_TS)       # cooldown still running
+    _seed_queue(tmp_path, [_q("actionable", rowid=1)])              # 120m old — inside the window
+    out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
+    assert out["verdict"] == "drop"
+    assert [r for r in _surfaced_entries(tmp_path) if r["class"] == "stale"] == []
+    assert "valve_expired" not in _queue_entries(tmp_path)[0]
 
 
 def test_meeting_held_entries_are_exempt_from_the_promotion_window(tmp_path, monkeypatch):
@@ -988,9 +1232,8 @@ def test_check_and_spend_is_one_atomic_step(tmp_path, monkeypatch):
     assert _budget_file(tmp_path) == {"date": "2026-08-06", "count": 1}
 
 
-def test_budget_zero_holds_everything_but_the_exempt_classes(tmp_path, monkeypatch):
-    """Missed calls are exempt BY CLASS (the same list item-5's 'escalation' will join): they
-    nudge with the budget at zero, and they never spend it."""
+def test_budget_zero_holds_every_unsolicited_class(tmp_path, monkeypatch):
+    """An explicit zero is stronger than ordinary class exemptions."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")
@@ -1000,9 +1243,10 @@ def test_budget_zero_holds_everything_but_the_exempt_classes(tmp_path, monkeypat
     assert msg["verdict"] == "queue" and _queue_entries(tmp_path)[-1]["verdict_class"] == "budget"
     call = te.triage({"events": [_call(rowid=421, phone="+14155559999")]},
                      now_local=DAY, now_utc=NOW_UTC)
-    assert call["verdict"] == "agent"                          # Tier-0 missed call, budget or not
-    assert call["bundle"]["events"][0]["class"] == "missed_call"
-    assert _budget_file(tmp_path) is None                      # …and it spent nothing
+    assert call["verdict"] == "queue"
+    held = _queue_entries(tmp_path)[-1]
+    assert held["verdict_class"] == "budget" and held["held_class"] == "missed_call"
+    assert _budget_file(tmp_path) is None
     assert "missed_call" in te.BUDGET_EXEMPT_CLASSES and "escalation" in te.BUDGET_EXEMPT_CLASSES
 
 
@@ -1059,9 +1303,12 @@ def test_valve_promotion_spends_one_unit_for_the_whole_bundle(tmp_path, monkeypa
 
 def test_valve_promotes_exempt_held_classes_without_spending_budget(tmp_path, monkeypatch):
     """A cooldown-demoted MISSED CALL keeps its exemption through the valve — promoted with the
-    budget at zero, and it doesn't consume it."""
+    an already-spent nonzero budget, and it doesn't consume another unit."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
+    (tmp_path / "events").mkdir(parents=True)
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
     _seed_queue(tmp_path, [
         _q("cooldown", sender="Dhruv Patel", rowid=1, handle="+14155559999", held="urgent"),
         _q("cooldown", sender="Sarah Chen", rowid=2, handle="+14155551234", held="missed_call"),
@@ -1069,7 +1316,7 @@ def test_valve_promotes_exempt_held_classes_without_spending_budget(tmp_path, mo
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["verdict"] == "agent"
     assert [e["class"] for e in out["bundle"]["events"]] == ["missed_call"]
-    assert _budget_file(tmp_path) is None
+    assert _budget_file(tmp_path)["count"] == 1
     assert len(_queue_entries(tmp_path)) == 1                  # the non-exempt one stayed put
 
 
@@ -1107,7 +1354,8 @@ def test_snooze_holds_every_agent_verdict_including_missed_calls(tmp_path, monke
     rows = _surfaced_entries(tmp_path)
     assert [r["verdict"] for r in rows] == ["queue", "queue"]
     for r in rows:
-        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class", "decision_id"}
+        assert set(r) == {"ts", "sender", "channel", "verdict", "reason", "class", "decision_id",
+                          "item_key"}
         assert r["class"] == "snoozed" and "snoozed until 2026-08-06T15:00" in r["reason"]
     assert _budget_file(tmp_path) is None                      # a held event spends no budget
 
@@ -1198,13 +1446,13 @@ def test_in_meeting_holds_a_would_be_nudge_without_spending_budget_or_cooldown(t
 def test_meeting_hold_reason_reads_well_in_the_record(tmp_path, monkeypatch):
     """The Record's sentence composer builds "Held — <reason>" and drops the name when the reason
     already carries it (the same shape the budget/snooze reasons use). Target sentence:
-    "Held — in a meeting until 10:35 AM — Sarah Chen"."""
+    "Held — in a meeting until 10:35 AM: Sarah Chen"."""
     _seed_calendar(tmp_path, [_cal_event()])
     out = _urgent_batch(tmp_path, monkeypatch)
-    assert out["reason"] == "in a meeting until 10:35 AM — Sarah Chen"
+    assert out["reason"] == "in a meeting until 10:35 AM: Sarah Chen"
     row = _surfaced_entries(tmp_path)[-1]
     assert row["verdict"] == "queue" and row["class"] == "meeting_hold"
-    assert row["reason"] == "in a meeting until 10:35 AM — Sarah Chen"
+    assert row["reason"] == "in a meeting until 10:35 AM: Sarah Chen"
     assert row["sender"] == "Sarah Chen" and row["channel"] == "imessage"
     assert row["ts"].endswith("Z")
     assert row["sender"].lower() in row["reason"].lower()   # composer renders the reason alone
@@ -1226,7 +1474,7 @@ def test_solo_block_and_all_day_event_never_hold(tmp_path, monkeypatch):
 
 def test_missed_call_is_exempt_from_the_meeting_hold(tmp_path, monkeypatch):
     """A missed call reaches you mid-meeting; a post-meeting tap stays hold-able.
-    Imminent prep is independently hold-exempt but remains within the interrupt budget."""
+    Imminent prep is hold-exempt AND budget-exempt — it expires with its meeting (test below)."""
     assert te.MEETING_HOLD_EXEMPT_CLASSES == {"missed_call", "escalation", "calendar_change", "meeting_prep"}
     assert "post_meeting" in te.BUDGET_EXEMPT_CLASSES
     assert "post_meeting" not in te.MEETING_HOLD_EXEMPT_CLASSES
@@ -1306,11 +1554,52 @@ def test_meeting_held_ask_rides_the_valve_out_when_the_meeting_ends(tmp_path, mo
     assert out["verdict"] == "agent"
     ev = out["bundle"]["events"][0]
     assert ev["sender"] == "Sarah Chen" and ev["class"] == "urgent"   # held_class restored
+    assert ev["deferred_class"] == "meeting_hold"
+    job = work_queue.get(tmp_path, out["job_id"])
+    assert job["valid_until"] == VALVE_NOW_TS + te.VALVE_MAX_AGE_MIN * 60
     assert _queue_entries(tmp_path) == []
     assert _surfaced_entries(tmp_path)[-1]["verdict"] == "promoted"
     # the promotion spends both budgets — it IS a nudge
     assert json.loads((tmp_path / "events" / "budget.json").read_text())["count"] == 1
     assert len(json.loads((tmp_path / "events" / "valve_state.json").read_text())["promotions"]) == 1
+
+
+def test_real_tier1_asks_survive_a_meeting_longer_than_the_valve_window(tmp_path, monkeypatch):
+    """Actionable/scheduling verdicts enter as queue, not agent. The real Tier-1 route must wrap
+    them in meeting_hold so a long room does not age valid asks out before their first release."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path, contacts=[
+        {"name": "Sarah Chen", "phones": ["+14155551234"]},
+        {"name": "Dhruv Patel", "phones": ["+14155559999"]},
+    ])
+    _seed_calendar(tmp_path, [_cal_event(start="2026-08-06T09:00:00+00:00",
+                                         end="2026-08-06T15:00:00+00:00")])
+    replies = iter((
+        {"class": "actionable", "why": "send the signed waiver"},
+        {"class": "scheduling_ask", "why": "answer the dinner invitation"},
+    ))
+    monkeypatch.setattr(te.relevance, "judge", lambda *_a, **_k: next(replies))
+    out = te.triage({"events": [
+        _im("Please send the signed waiver", rowid=925),
+        _im("Can you make dinner Friday?", rowid=926, handle="+14155559999"),
+    ]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "queue"
+    held = _queue_entries(tmp_path)
+    assert [(row["verdict_class"], row["held_class"]) for row in held] == [
+        ("meeting_hold", "actionable"), ("meeting_hold", "scheduling_ask")]
+
+    released_at = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)
+    released_ts = released_at.timestamp()
+    released = te.release_valve(now_local=DAY, now_utc=released_at, now_ts=released_ts)
+    assert released["verdict"] == "agent"
+    assert [row["class"] for row in released["bundle"]["events"]] == [
+        "actionable", "scheduling_ask"]
+    assert all(row["deferred_class"] == "meeting_hold"
+               for row in released["bundle"]["events"])
+    import work_queue
+    job = work_queue.get(tmp_path, released["job_id"])
+    assert job["valid_until"] == released_ts + te.VALVE_MAX_AGE_MIN * 60
 
 
 def test_valve_hold_covers_every_queued_ask_not_just_the_meeting_held_one(tmp_path, monkeypatch):
@@ -1564,6 +1853,16 @@ def test_a_nudge_sotto_planned_is_classified_by_its_kind_with_a_plain_reason(tmp
         == "I've nudged Maya twice — nudge again, or let it go?"
 
 
+def test_watchers_legacy_chase_of_a_proven_assistant_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    _no_llm(monkeypatch)
+    nudge = _nudge("chase", person="Ramp", ident="ramp_cf8gd1ek_agent@rbm.goog")
+    nudge["sender_type"] = "assistant"                 # structured provenance, not the handle
+    out = te.triage({"events": [nudge]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "drop"
+    assert out["bundle"] == {}
+
+
 def test_the_watchers_whole_tick_spends_one_interrupt(tmp_path, monkeypatch):
     """One bundle is one message however many nudges it carries, so `_charge_once` spends exactly
     one unit for the push — the proactive lane's own rule, now the funnel's."""
@@ -1619,6 +1918,31 @@ def test_a_nudge_is_held_by_the_snooze_then_quiet_hours_then_the_mutes(tmp_path,
     row = _surfaced_entries(tmp_path)[-1]
     assert row["verdict"] == "drop" and row["class"] == "muted"
     assert row["reason"].endswith("you asked Sotto to stop surfacing Sarah Chen")
+
+
+def test_imminent_meeting_prep_survives_a_spent_budget(tmp_path, monkeypatch):
+    """A prep held for budget has no path back: the valve refuses every `source: proactive` entry,
+    and the watcher re-submits the same key every 15 minutes into the same spent budget — so "your
+    pitch starts in 20 minutes" would never arrive. It is exempt for the reason calendar_change is:
+    it expires with its meeting and the watcher dedupes it once per day per key."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
+    (tmp_path / "events").mkdir(parents=True)
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
+    _no_llm(monkeypatch)
+    prep = _nudge("meeting_prep", key="mtg:pitch", text="Pitch", detail="starts in ~20 min · VC",
+                  person="", ident="", channel="")
+    out = te.triage({"events": [prep]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "agent"
+    assert out["bundle"]["events"][0]["class"] == "meeting_prep"
+    assert "meeting_prep" in te.BUDGET_EXEMPT_CLASSES
+    assert _budget_file(tmp_path)["count"] == 1                 # exempt: no additional spend
+    # …and an ordinary nudge in the same spent day still demotes, held_class intact
+    out2 = te.triage({"events": [_nudge()]}, now_local=DAY, now_utc=NOW_UTC)
+    assert out2["verdict"] == "queue"
+    entry = _queue_entries(tmp_path)[-1]
+    assert entry["verdict_class"] == "budget" and entry["held_class"] == "commitment"
 
 
 def test_a_nudge_is_never_too_stale_and_never_escalates(tmp_path, monkeypatch):
@@ -1685,17 +2009,19 @@ def test_escalation_bypasses_cooldown_budget_and_the_meeting_hold(tmp_path, monk
     """The three gates that would each silence it, all switched on at once."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
-    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")          # the day's budget is spent
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
     _seed_snapshot(tmp_path)
     _seed_surfaced(tmp_path, [_prior_call()])
     _seed_calendar(tmp_path, [_cal_event()])               # …and the user is in a meeting
     (tmp_path / "events").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
     (tmp_path / "events" / "cooldowns.json").write_text(
         json.dumps({"email:t1": time.time()}))             # …and the thread just nudged
     _stub_llm(monkeypatch, '{"class":"urgent","why":"needs it before 3"}')
     out = te.triage({"events": [_email()]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "agent" and out["bundle"]["events"][0]["class"] == "escalation"
-    assert not (tmp_path / "events" / "budget.json").exists()   # exempt: it spends nothing
+    assert _budget_file(tmp_path)["count"] == 1
     assert _queue_entries(tmp_path) == []
 
 
@@ -1926,17 +2252,19 @@ def test_quiet_hours_and_snooze_outrank_the_join(tmp_path, monkeypatch):
 def test_held_escalation_is_promoted_by_the_valve_without_cooldown_or_budget(tmp_path, monkeypatch):
     """COOLDOWN_EXEMPT_CLASSES applies in the valve too — a held escalation is not cooled away."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")
+    monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
     _seed_snapshot(tmp_path)
     now_ts = time.time()
     _seed_queue(tmp_path, [{"ts": "2026-08-06T10:00:00Z", "verdict_class": "stale",
                             "held_class": "escalation", "sender": "Sarah Chen",
                             "event": _email()}])
+    (tmp_path / "events" / "budget.json").write_text(
+        json.dumps({"date": "2026-08-06", "count": 1}))
     (tmp_path / "events" / "cooldowns.json").write_text(json.dumps({"email:t1": now_ts}))
     out = te.release_valve(now_local=DAY, now_utc=NOW_UTC, now_ts=now_ts)
     assert out["verdict"] == "agent"
     assert out["bundle"]["events"][0]["class"] == "escalation"
-    assert not (tmp_path / "events" / "budget.json").exists()
+    assert _budget_file(tmp_path)["count"] == 1
 
 
 # ── Advisory lock around the read-modify-write state (budget.json, queue.jsonl) ───────────────────
@@ -1993,7 +2321,7 @@ def test_queue_key_names_the_exact_line(tmp_path, monkeypatch):
     assert len(te.queue_key(a)) == 16
 
 
-def test_promote_one_spends_the_budget_drains_the_queue_and_records_the_reason(tmp_path, monkeypatch):
+def test_promote_one_is_direct_and_drains_the_queue_and_records_the_reason(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_queue(tmp_path, [_q("cooldown", held="actionable", rowid=1), _q("quiet", rowid=2,
                                                                           handle="+14155559999")])
@@ -2002,13 +2330,14 @@ def test_promote_one_spends_the_budget_drains_the_queue_and_records_the_reason(t
     assert out["ok"] is True and out["verdict"] == "agent"
     ev = out["bundle"]["events"][0]
     assert out["bundle"]["promoted"] is True
+    assert out["bundle"]["_user_requested_delivery"] is True
     assert ev["sender"] == "Sarah Chen" and ev["class"] == "actionable"   # held_class restored
     assert "user promoted from dashboard" in ev["why"]
     # the ONE entry left the queue; the other is untouched
     remaining = _queue_entries(tmp_path)
     assert len(remaining) == 1 and remaining[0]["verdict_class"] == "quiet"
-    # a promotion IS a nudge: it spends the day's budget and stamps the thread's cooldown
-    assert json.loads((tmp_path / "events" / "budget.json").read_text())["count"] == 1
+    # This is a direct user request, so it does not spend the unsolicited allowance.
+    assert not (tmp_path / "events" / "budget.json").exists()
     assert any(k.startswith("imessage:") for k in
                json.loads((tmp_path / "events" / "cooldowns.json").read_text()))
     row = _surfaced_entries(tmp_path)[-1]
@@ -2018,15 +2347,25 @@ def test_promote_one_spends_the_budget_drains_the_queue_and_records_the_reason(t
     assert not (tmp_path / "events" / "valve_state.json").exists()
 
 
-def test_promote_one_refuses_when_the_budget_is_spent(tmp_path, monkeypatch):
+def test_promote_one_still_works_when_unsolicited_budget_is_zero(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "0")
     _seed_queue(tmp_path, [_q("cooldown", rowid=1)])
     out = te.promote_one(te.queue_key(_queue_line(tmp_path)),
                          now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
-    assert out["ok"] is False and out["error"] == "budget"
-    assert "interrupt budget is spent" in out["reason"]
-    assert len(_queue_entries(tmp_path)) == 1            # nothing was consumed on a refusal
+    assert out["ok"] is True and out["verdict"] == "agent"
+    assert _queue_entries(tmp_path) == []
+
+
+def test_ingress_cannot_copy_user_requested_bundle_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
+    _seed_snapshot(tmp_path)
+    _stub_llm(monkeypatch, '{"class":"urgent","why":"needs you now"}')
+    out = te.triage({"events": [_im()], "_user_requested_delivery": True},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out["verdict"] == "agent"
+    assert "_user_requested_delivery" not in out["bundle"]
 
 
 def test_promote_one_respects_the_in_meeting_hold(tmp_path, monkeypatch):

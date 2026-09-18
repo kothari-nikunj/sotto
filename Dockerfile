@@ -86,12 +86,11 @@ RUN mkdir -p /app \
 # image → always present, no per-run install, no improvisation.
 #
 # Installed with `python3 -m pip` against the PATH python (the same interpreter execute_code/gather_google
-# use — the Hermes install above may have put a different one first), falling back to plain `pip`.
+# use). Installation verifies the full transitive lock and hashes; a failure stops the build.
 # Deliberately AFTER the Hermes layer: editing a pin then costs one pip layer, not a re-download and
 # re-run of the installer.
 COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
- || pip install --no-cache-dir -r /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
 
 ENV SOTTO_DATA=/data
 RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles
@@ -109,7 +108,19 @@ COPY sotto-chief-of-staff/_shared/lib/tzchain.py /app/trigger-receiver/tzchain.p
 COPY sotto-chief-of-staff/_shared/lib/work_queue.py /app/trigger-receiver/work_queue.py
 COPY sotto-chief-of-staff/_shared/lib/calendar_context.py /app/trigger-receiver/calendar_context.py
 COPY sotto-chief-of-staff/_shared/lib/source_catalog.py /app/trigger-receiver/source_catalog.py
+COPY sotto-chief-of-staff/_shared/lib/message_targets.py /app/trigger-receiver/message_targets.py
 COPY adapters/hermes/ /app/adapters/hermes/
+# Exercise nonempty nudges and four-photo briefs through the real receiver, adapters,
+# outbox and receipts as the managed UID, with synthetic sources and local transport fixtures.
+RUN runuser -u sotto -- python3 -I -B /app/trigger-receiver/check_runtime.py
+# Fail the BUILD on a Hermes pin bump, not every container at boot. start.sh and install.sh apply
+# provider_error_compat.py to the installed gateway source, gated on whole-file SHA256 pins; before
+# this step, a hermes.commit bump built green and then crash-looped every deploy. `--check` verifies
+# both pinned hashes and every patch anchor against the Hermes installed above, and writes nothing —
+# boot still applies the patch for real. When this fails, follow "Provider-error gateway pin" in
+# adapters/hermes/README.md: re-review the new gateway source and regenerate the two constants.
+RUN python3 /app/adapters/hermes/provider_error_compat.py --check \
+      /usr/local/lib/hermes-agent/gateway/run.py
 # The two interactive playgrounds live in docs/ (one source of truth) and are SERVED from
 # /static/* — so they are copied in beside the frontend assets at build time. That keeps
 # dashboard.py's whitelist an exact-name lookup against a single root; the alternative (a second

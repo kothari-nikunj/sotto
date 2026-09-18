@@ -14,7 +14,7 @@ metadata:
 Answer questions over the user's accumulated context. PORT SOURCE: api/src/routes/ask.ts + agents/registry.ts (ask_sotto tool set).
 
 ## Where to look (in priority order)
-1. **Knowledge graph** — `execute_code` → `knowledge_query.py` for people/companies ("what do I know about Sarah", relationship facts, talking points).
+1. **Knowledge graph** — `execute_code` → `knowledge_query.py` for people/companies ("what do I know about Sarah", relationship facts, talking points). For a specific subject, use `knowledge_query.py --person "<name>" --topic "<subject from the user>"` so older relevant facts survive the context limit. These are sourced memories, not a complete transcript; read the original thread or meeting notes when the user asks what was actually said.
 2. **Continuity ledger** — `loops_query.py` (read-only `{you_owe, waiting_on_them, counts}`) for "who do I owe", "what's open". Never run `continuity_resolve.py` to answer a question — it WRITES the ledger (resolves/ages/expires loops).
 3. **Live local** — Bridge `get_messages(identifier)` / `read_local` for "did X text me", recent threads.
 4. **Live Google** — native Gmail/Calendar tools for "what's my day", "any email from …".

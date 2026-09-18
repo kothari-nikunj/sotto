@@ -19,6 +19,8 @@ Exports:
                               malformed entries so writers never persist over them)
   load_entries(...)         — every ledger file's frontmatter, sorted by path (deterministic)
   load_active()             — the entries the read views surface: ACTIVE status, not snoozed
+                              (a PARKED row is neither: hidden until something touches it)
+  last_touch_day(fm) / days_untouched(fm, today) — the park rule's one clock
   CHASE_STATE_FIELDS        — everything the chase lane has spent on a loop, cleared as one
   age_days(created_at, today) — whole days old vs an aware "today" (naive created_at → UTC)
 """
@@ -27,7 +29,7 @@ from __future__ import annotations
 import glob
 import os
 import sys
-from datetime import timezone
+from datetime import date, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
@@ -41,6 +43,14 @@ except Exception:  # pragma: no cover
 
 ACTIVE = {"open", "waiting", "failed", "blocked"}      # continuity.rs:227
 TERMINAL = {"resolved", "dismissed", "expired"}        # continuity.rs:230
+# ── Parked: kept, hidden, revived by a touch ─────────────────────────────────────────────────────
+# One sentence: something you owe that nothing has touched for PARK_AFTER_DAYS — no new message,
+# no brief re-capture, no `keep` — parks after an accepted warning: its history stays on disk, out of the brief
+# and the open list, and comes back the moment anything touches it again. Neither ACTIVE (the read
+# views skip it) nor TERMINAL (the resolver never prunes it and a re-capture reopens it without new
+# request evidence). What you're OWED never parks: it is chased, then handed back to you by name.
+PARKED = {"parked"}
+PARK_AFTER_DAYS = 14
 
 # ── Direction, defined ONCE ──────────────────────────────────────────────────────────────────────
 # One sentence: `waiting_on` is the only type where the OTHER side owes the user, so it is the only
@@ -160,19 +170,64 @@ def load_entries(with_path: bool = False, include_bare: bool = False) -> list:
     return out
 
 
-def load_active() -> list:
+def load_active(now=None) -> list:
     """The entries the read views surface: ACTIVE status AND not snoozed past today. Missing status
-    counts as open (matching continuity_resolve's default).
+    counts as open (matching continuity_resolve's default). A parked row (PARKED) is not ACTIVE, so
+    every view that reads through here — the brief's ledger, the count line, `sotto-loops`, the
+    cleanup scan, the chase clock — skips it until the resolver revives it.
 
     The SNOOZE lives here, not in each caller. The brief, `sotto-loops` and the cleanup scan are
     three views of one ledger, and the brief's used to be the one that ignored `snoozed_until` — so
     a loop the user had explicitly parked was named as urgent in the brief and counted in the line
     that says how many are open, while the dashboard the line points at showed neither. One concept,
     one implementation: hidden is hidden, in every view."""
-    today = _now_local(configured_tz() or "+00:00").strftime("%Y-%m-%d")
+    today = (now or _now_local(configured_tz() or "+00:00")).strftime("%Y-%m-%d")
     return [fm for fm in load_entries()
             if fm.get("status", "open") in ACTIVE
             and not (_s(fm.get("snoozed_until"))[:10] > today)]
+
+
+def last_touch_day(fm: dict) -> str:
+    """The day something last touched this row, as YYYY-MM-DD: it was created, re-captured by a
+    brief (`source_brief_at`), or came back to life (`reopened_at` — a terminal or parked row
+    re-captured, or a `keep`). A snooze restarts this clock on its scheduled return day, so a long
+    snooze cannot immediately park when it ends. These touches never rewrite the original request
+    date, which remains the completion-evidence cutoff."""
+    return max(_s(fm.get(k))[:10] for k in
+               ("created_at", "source_brief_at", "reopened_at", "snoozed_until"))
+
+
+def days_untouched(fm: dict, today: str):
+    """Whole days between the last touch and `today` (YYYY-MM-DD). None when no touch parses."""
+    touch = last_touch_day(fm)
+    if len(touch) < 10 or len(_s(today)) < 10:
+        return None
+    try:
+        return (date.fromisoformat(_s(today)[:10]) - date.fromisoformat(touch)).days
+    except ValueError:
+        return None
+
+
+def park_candidate(fm: dict, today: str) -> bool:
+    """One eligibility rule for both the resolver and the preceding evening's warning."""
+    return (fm.get("status", "open") in ACTIVE
+            and not is_waiting_on(fm.get("action_type"))
+            and normalize_action_type(fm.get("action_type")) not in MEETING_TYPES
+            and _s(fm.get("resolution_mode")).strip() != "explicit"
+            and not (_s(fm.get("snoozed_until"))[:10] > today)
+            and not (_s(fm.get("deadline"))[:10] >= today)
+            and (days_untouched(fm, today) or 0) >= PARK_AFTER_DAYS)
+
+
+def parking_notice_current(fm: dict) -> bool:
+    """An accepted notice belongs to this unchanged obligation and its current parking clock."""
+    from delivery_effects import loop_version
+    try:
+        date.fromisoformat(_s(fm.get("parking_notice_at")))
+    except ValueError:
+        return False
+    return (fm.get("parking_notice_touch") == last_touch_day(fm)
+            and fm.get("parking_notice_version") == loop_version(fm))
 
 
 def age_days(created_at, today):

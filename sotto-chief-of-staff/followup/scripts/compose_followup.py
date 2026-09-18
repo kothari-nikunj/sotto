@@ -198,6 +198,10 @@ def _ground_output(out: dict, ended: list, inputs: dict) -> dict:
     return grounded
 
 
+import model_work  # noqa: E402
+
+
+@model_work.procedure("followup")
 def compose(inputs: dict, since_hours: int = 36, llm=None) -> dict:
     llm = llm or call_gemini
     prompt, ended = build_prompt(_load_prompt(), inputs, since_hours)

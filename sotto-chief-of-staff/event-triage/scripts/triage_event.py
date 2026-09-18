@@ -13,7 +13,9 @@ Tier 0 (deterministic, free) — the verdict matrix:
   missed call from a KNOWN person      → agent (the interrupt bar) — VIPs only during quiet hours
   missed call from an unknown number   → queue
   OTP / shortcode / system message     → drop  (silent — _is_likely_automated + render_local's filter)
-  muted sender / muted person (prefs)  → drop
+  muted sender / muted person (prefs)  → drop  (preferences.proactively_muted, the ONE mute
+                                                predicate — every channel, and the same answer the
+                                                valve, --promote and the digest get)
   a meeting that just ENDED            → agent (class "post_meeting" — the tap; see below)
   a nudge the WATCHER planned          → agent, class = its kind (see _classify_proactive)
   quiet hours (everything else)        → queue (class "quiet")
@@ -45,10 +47,11 @@ deferred-actionable). The check and the spend are ONE atomic step under the budg
 (_budget_try_spend) — five producers run at once, and a read-then-write gap is exactly where the cap
 gets exceeded. BUDGET_EXEMPT_CLASSES are
 never counted and never demoted: Tier-0 missed calls, the "escalation" class the multi-channel join
-below emits, and the "post_meeting" tap — which has its own named daily cap (SOTTO_TAP_MAX_PER_DAY,
-default 3) instead. In one sentence: interrupts spend the daily budget (4/day), post-meeting taps
-have their own cap (3/day), and neither eats the other. The valve honors the same budget, so
-promotion can never push past the day's cap.
+below emits, the "post_meeting" tap — which has its own named daily cap (SOTTO_TAP_MAX_PER_DAY,
+default 3) instead — and the two classes that expire with the meeting they are about and are
+deduped per key at their source, "calendar_change" and "meeting_prep". In one sentence: interrupts
+spend the daily budget (4/day), post-meeting taps have their own cap (3/day), neither eats the
+other. The valve honors the same budget, so promotion can never push past the day's cap.
 
 Real-time escalation join (Editor Step 2 item 4): at event time, for a KNOWN sender, the funnel
 looks back over the retained event ledgers ($SOTTO_DATA/events/queue.jsonl — every queued verdict,
@@ -82,8 +85,11 @@ deferred-agent classes, subject to its own window).
 Queue: $SOTTO_DATA/events/queue.jsonl — one {ts, verdict_class, sender, event} per line (bounded via
 sotto_log.bounded_append). Entries demoted from an agent verdict (cooldown/quiet/catchup-stale) also
 carry `held_class` — the Tier-0/1 class the event earned BEFORE demotion, so the release valve and
-digest can tell "was interrupt-worthy, deterministically held" from born-ambient. digest_check.py
-consumes it; the release valve (below) promotes from it; brief composers may later.
+digest can tell "was interrupt-worthy, deterministically held" from born-ambient. An entry the valve
+has expired (older than VALVE_MAX_AGE_MIN) also carries `valve_expired: true` — written once, with
+its `drop`/`stale` row, so the ledger records the expiry exactly once; the entry itself stays for
+the digest/brief. digest_check.py consumes it; the release valve (below) promotes from it; brief
+composers may later.
 
 Surfaced ledger: $SOTTO_DATA/events/surfaced.jsonl — ONE line per triaged event at verdict time:
 {ts, sender, channel, verdict: agent|queue|drop|promoted, reason, class}. Bounded like the queue.
@@ -148,19 +154,22 @@ contacts → build_contact_lookup → resolve_*_name, plus relationship_state.js
 
 VIP (deliberately simple, documented): a sender is VIP when (a) the user SAID SO — their display
 name is on preferences.explicit.vip_people, written by the same preferences.py CLI chat and the
-dashboard's VIP toggle both use — or (b) their attention-queue entry in relationship_state.json has
-priority >= VIP_PRIORITY_MIN (10 — the pulse's priority is interactions × days-waiting ×
-type-weight, so 10+ means a top-of-queue relationship), or (c) their knowledge-graph person file
-carries a typed family_of relation (family clears the quiet-hours bar for missed calls). The stated list is checked
-FIRST because a user's own word outranks any heuristic.
+dashboard's VIP toggle both use — or (b) their knowledge-graph person file carries a typed family_of
+relation (family clears the quiet-hours bar for missed calls). The stated list is checked FIRST
+because a user's own word outranks any heuristic. Both are a CHOICE; message VOLUME is not one, so
+the weekly pulse's attention-queue priority no longer qualifies anyone (it let four messages and
+three days of silence clear quiet hours at 3 a.m., off a file up to a week stale). The pulse still
+reaches Tier 1 as a relationship signal in the sender one-liner — context, never a gate.
 
 User promotion (`triage_event.py --promote <queue-key>`, the dashboard's "nudge me now"): the same
-per-entry eligibility the valve applies (_valve_candidate), the same budget spend, the same
-surfaced.jsonl "promoted" row, the same bundle shape — one queue entry instead of a tick's worth.
+per-entry eligibility the valve applies (_valve_candidate), the same surfaced.jsonl "promoted"
+row, and one queue entry instead of a tick's worth. Its bundle carries an internal user-requested
+marker so the delivery-time zero-budget recheck does not turn the explicit request back into an
+unsolicited nudge.
 The gates it does NOT apply are the clock ones: quiet hours and the nudge snooze exist to stop
 UNPROMPTED interruptions, and this one was prompted by the user, who is demonstrably awake. The
-in-meeting hold DOES apply (that is about where the message lands, not about the hour), and so does
-the daily interrupt budget.
+in-meeting hold DOES apply (that is about where the message lands, not about the hour). The daily
+unsolicited budget does not: the user requested this specific delivery.
 
 The proactive watcher (proactive_scan.py, the ~15-min cron) is not a second lane: it derives its six
 kinds, hands them to `triage()` IN-PROCESS as one bundle of `source: "proactive"` events, and
@@ -179,7 +188,7 @@ Env: SOTTO_DATA, SOTTO_TIMEZONE, SOTTO_QUIET_START/END (default 21/7), SOTTO_TRI
      SOTTO_USER_NAME (group name-mention detection; unset → groups always queue), GOOGLE_AI_API_KEY,
      SOTTO_VALVE (0 disables the release valve), SOTTO_CALENDAR_REFRESH_SECS (the receiver's
      calendar-cache cadence, default 900; the in-meeting hold's staleness bound is 2× it).
-Named constants, not knobs (defaults matter — see CLAUDE.md): VIP_PRIORITY_MIN,
+Named constants, not knobs (defaults matter — see CLAUDE.md):
      VALVE_MAX_PER_HOUR, VALVE_MAX_AGE_MIN (promotion window — a real ask from 3h ago still deserves
      a nudge; a 2-day-old one doesn't. "meeting_hold" entries ignore it: an ask Sotto itself held is
      never too old to deliver), EVENT_MAX_AGE_MIN, ESCALATION_WINDOW_MIN_DEFAULT (the cross-channel
@@ -252,9 +261,6 @@ EVENT_MAX_AGE_MIN = 30
 # this it queues for the digest/next brief — told, never rung. Same clock as the valve's age cap,
 # on purpose: a held nudge and a stale call age out together.
 MISSED_CALL_MAX_AGE_MIN = VALVE_MAX_AGE_MIN
-# The attention-queue priority at which a contact counts as a VIP — VIPs are the only senders whose
-# missed call clears quiet hours. A stated vip_people entry or a family_of relation also qualifies.
-VIP_PRIORITY_MIN = 10
 # "budget" belongs here (a held real ask, same as the others) — the valve's own budget check keeps a
 # promotion from exceeding the day's cap, so in practice these wait for the day to roll over.
 # "snoozed" deliberately does NOT: an explicit "be quiet" must not end in a burst when it lifts.
@@ -270,8 +276,12 @@ PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting
 # "calendar_change" (a decline, a last-minute invite, a move, a cancellation of an imminent
 # meeting) is exempt because it EXPIRES with the meeting: it is rare, per-change deduped at the
 # source (calcache's baseline + the receiver's seen-ring), and a spent budget must not silence
-# "Ali declined your 11am" at 10:40.
-BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change"})
+# "Ali declined your 11am" at 10:40. "meeting_prep" is exempt for the identical reason, verbatim:
+# it expires with its meeting and proactive_scan dedupes it once per day per key, so a spent budget
+# used to demote "your pitch starts in 20 minutes" to class "budget" — which the valve refuses to
+# promote (no proactive source ever promotes), leaving a held prep with no path back at all.
+BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change",
+                                   "meeting_prep"})
 # The in-meeting hold exempts LESS than the budget does: a missed call or a multi-channel escalation
 # is precisely what should reach you mid-meeting, but a tap that fires while you're in your NEXT
 # meeting must still hold (that's the back-to-back case the valve promotes out of). So this is
@@ -659,9 +669,12 @@ def _graph_display_name(ident: str) -> str:
 
 
 def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -> bool:
-    """VIP (simple, documented — see module docstring): the user's STATED vip_people list first,
-    then a top-of-queue attention_queue priority (>= VIP_PRIORITY_MIN), then a
-    typed family_of relation in their graph file."""
+    """VIP (simple, documented — see module docstring): the user's STATED vip_people list, or a
+    typed family_of relation in their graph file. Two checks, both of them a CHOICE — the user's
+    or the graph's. Nothing volume-derived: the weekly pulse's attention-queue priority
+    (interactions × days-waiting × type-weight) used to qualify too, which let four messages and
+    three days of silence buy a 3 a.m. interrupt, from a file up to a week stale (Sep 2026). The
+    pulse still rides into Tier 1 as a relationship SIGNAL (_sender_one_liner); it is not a gate."""
     n = _s(name).strip().lower()
     if not n:
         return False
@@ -670,14 +683,6 @@ def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -
             return True
     except Exception:  # noqa: BLE001 — a broken prefs file must never break triage
         pass
-    vip_min = float(VIP_PRIORITY_MIN)
-    for q in (rel_state.get("attention_queue") or []):
-        if _s(q.get("display_name")).strip().lower() == n:
-            try:
-                if float(q.get("priority") or 0) >= vip_min:
-                    return True
-            except (TypeError, ValueError):
-                pass
     try:
         import knowledge  # noqa: PLC0415
         path = knowledge.find_person_file(name=name, identifier=ident or "")
@@ -761,7 +766,7 @@ def _local_day(now_local) -> str:
 
 
 def _budget_cap() -> int:
-    return max(0, _int_env("SOTTO_NUDGE_BUDGET", 4))
+    return _prefs.effective_nudge_budget()
 
 
 def _budget_spent(day: str) -> int:
@@ -847,7 +852,8 @@ def _queue_path() -> str:
 
 
 def _append_queue(verdict_class: str, sender: str, event: dict, held_class: str = "",
-                  relevance_deadline: str = "") -> None:
+                  relevance_deadline: str = "", priority_id: str = "",
+                  priority_revision: str = "") -> None:
     """One JSONL line per queued event. Bounded (rotate-keeping-tail) so the file can't grow forever
     on the /data volume. `held_class` (only on entries demoted FROM an agent verdict) preserves the
     class the event earned before cooldown/quiet/catchup demotion — the release valve and the
@@ -865,9 +871,13 @@ def _append_queue(verdict_class: str, sender: str, event: dict, held_class: str 
             entry["held_class"] = held_class
         if relevance_deadline:
             entry['relevance_deadline'] = relevance_deadline
+        if priority_id and priority_revision:
+            entry['priority_id'] = priority_id
+            entry['priority_revision'] = priority_revision
         # Same lock the valve's rewrite takes: an append that landed mid-rewrite would be dropped.
         with _locked(_queue_path()):
-            bounded_append(_queue_path(), json.dumps(entry), QUEUE_MAX_BYTES, QUEUE_KEEP_LINES)
+            bounded_append(_queue_path(), json.dumps(entry), QUEUE_MAX_BYTES, QUEUE_KEEP_LINES,
+                           already_locked=True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -895,6 +905,10 @@ def _record_surfaced(verdict: str, cls: str, reason: str, sender: str, event: di
             "reason": _s(reason)[:300],
             "class": cls,
         }
+        # Queue/drop verdicts have no work item, so this existing receipt is their durable restart
+        # identity. Agent receipts are not acceptance evidence; callers still require work_items.
+        import work_queue  # noqa: PLC0415
+        row["item_key"] = work_queue.event_item_key(ev)
         if decision_id:
             row["decision_id"] = decision_id
         if _s(ev.get("source")) == PROACTIVE_SOURCE and _s(ev.get("person")):
@@ -1158,13 +1172,17 @@ def _classify_tier1(e: dict, one_liner: str) -> tuple[str, str, str]:
         safe = [{**m, 'thread': '[same observed conversation]',
                  'text': _tier1_text(m['text'], e)} for m in recent]
         context += "\nObserved conversation (chronological; later replies matter):\n" + json.dumps(safe)
-    obj = relevance.judge(context)
+    obj = relevance.judge(context, operation_id=_ingress_key(e))
     cls = _s(obj.get("class")).strip().lower()
     why = _s(obj.get("why")).strip()[:200]
+    if _s(obj.get("sender_role")).strip().lower() == "assistant":
+        return "drop", "automated", why or "conversation evidence identifies a software assistant"
     deadline = _s(obj.get('deadline')).strip()
     # Internal handoff to classify_event. triage() deletes this key from every ingress event before
     # classification, so only this relevance judgment can populate trusted deadline metadata.
     e['_sotto_relevance_deadline'] = deadline
+    e['_sotto_priority_id'] = _s(obj.get('priority_id')).strip()
+    e['_sotto_priority_revision'] = _s(obj.get('priority_revision')).strip()
     if cls == "urgent":
         return "agent", cls, why or "tier1 urgent"
     if cls in ("actionable", "scheduling_ask"):
@@ -1353,8 +1371,12 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     if src == MEETING_END_SOURCE:
         return _classify_meeting_end(e, ctx)
     # 0b) A nudge Sotto planned — the proactive watcher's tick, handed to the funnel in-process.
-    #     Same reason it comes first: it is not a message from anyone.
+    #     It carries the underlying loop identifier in `from`; enforce proven assistant provenance
+    #     before accepting the watcher's older ledger decision.
     if src == PROACTIVE_SOURCE:
+        assistant_evidence = relevance.automated_assistant_evidence(e)
+        if assistant_evidence:
+            return "drop", "automated", f"software assistant — {assistant_evidence}", _s(e.get("person"))
         return _classify_proactive(e, ctx)
     # 0c) A change to the imminent calendar (calcache's diff tick) — same reason again.
     if src == CALENDAR_CHANGE_SOURCE:
@@ -1365,7 +1387,27 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     if e.get("is_from_me"):
         return "queue", "signal", "own outbound message (ledger signal)", name
 
-    # 2) Calls carry no text — decide entirely on direction + who.
+    # Provider/structured provenance, never a display-name blacklist. Assistant conversations stay
+    # in source history for explicit chat retrieval; an inbound row cannot open a proactive loop.
+    assistant_evidence = relevance.automated_assistant_evidence(e)
+    if assistant_evidence:
+        return "drop", "automated", f"software assistant — {assistant_evidence}", name
+
+    # 2) Explicit mutes (the sotto-feedback channel) — "stop surfacing X" must stick here too, on
+    #    EVERY channel, and BEFORE the per-channel branches below: while this gate sat after the
+    #    calls branch, a muted person's missed call still nudged — budget-exempt, and VIP-exempt
+    #    from quiet hours (Sep 2026). One predicate (preferences.proactively_muted) answers this
+    #    for ingress, the valve, a tapped promotion and the digest: when this gate only muted email
+    #    senders, "stop surfacing X" dropped yesterday's queued item and still let today's text
+    #    from the same number through to a live nudge.
+    try:
+        if _prefs.proactively_muted(name, e, ctx["prefs"]):
+            return ("drop", "muted",
+                    f"you asked Sotto to stop surfacing {name or ident}", name)
+    except Exception:  # noqa: BLE001 — malformed prefs must never swallow an event
+        pass
+
+    # 3) Calls carry no text — decide entirely on direction + who.
     if src == "calls":
         if not _is_missed_call(e):
             return "drop", "call", "answered/outgoing call — nothing to do", name
@@ -1382,7 +1424,7 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
 
     text = _event_text(e)
 
-    # 3) Automated noise — the same filters the brief applies before the LLM ever sees a thread.
+    # 4) Automated noise — the same filters the brief applies before the LLM ever sees a thread.
     if src == "email":
         if _is_likely_automated(ident):
             return "drop", "automated", f"automated sender {ident}", name
@@ -1391,17 +1433,6 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
             return "drop", "system", "system/status message", name
         if _looks_like_otp(text) or _is_shortcode(ident.split("@")[0]):
             return "drop", "automated", "OTP/shortcode blast", name
-
-    # 4) Explicit mutes (the sotto-feedback channel) — "stop surfacing X" must stick here too.
-    if src == "email" and ident:
-        try:
-            if _prefs.sender_is_muted(ident, ctx["prefs"]["mute_senders"]):
-                return "drop", "muted", f"muted sender {ident}", name
-        except Exception:  # noqa: BLE001
-            pass
-    if name and any(_s(name).strip().lower() == _s(m).strip().lower()
-                    for m in ctx["prefs"]["mute_people"]):
-        return "drop", "muted", f"muted person {name}", name
 
     # 4b) A formal calendar invite or RSVP notification arriving as email → queue, always. The
     #     calendar lane owns meeting interrupts (calcache: a NEW invite nudges only within
@@ -1471,11 +1502,8 @@ def _event_age_min(e: dict, now_utc: datetime):
 
 def _ingress_key(event):
     """Exact provider row, never a sender or a mutable batch timestamp."""
-    import hashlib
-    stable = {k: event[k] for k in ('source', 'rowid', 'source_id', 'id', 'timestamp') if k in event}
-    if len(stable) < 2:
-        stable = event
-    return 'event:' + hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+    import work_queue
+    return work_queue.event_item_key(event)
 
 
 def triage(payload: dict, now_local=None, now_utc=None) -> dict:
@@ -1484,6 +1512,8 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
     events = [e for e in (payload.get("events") or []) if isinstance(e, dict)]
     for event in events:
         event.pop('_sotto_relevance_deadline', None)
+        event.pop('_sotto_priority_id', None)
+        event.pop('_sotto_priority_revision', None)
     import work_queue
     proactive = bool(events) and all(e.get('source') == PROACTIVE_SOURCE for e in events)
     replay_jobs = {}
@@ -1552,6 +1582,8 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         ctx["held_class"] = ""        # per-event scratch: a Tier-0 cadence demotion writes it
         ctx['relevance_deadline'] = ''  # populated only by the shared relevance judgment
         verdict, cls, reason, name = classify_event(e, ctx)
+        ctx['priority_id'] = e.pop('_sotto_priority_id', '')
+        ctx['priority_revision'] = e.pop('_sotto_priority_revision', '')
         held_class = _s(ctx.get("held_class"))
         age = _event_age_min(e, now_utc)
         # Real-time escalation join: the same known person on a SECOND channel inside the window
@@ -1582,6 +1614,18 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             elif age is not None and age > cls_max:
                 held_class = cls
                 verdict, cls, reason = "queue", "stale", f"{int(age)}m old → queued ({name})"
+        # Tier 1 deliberately sends non-urgent real asks straight to the valve as `queue`, so they
+        # never enter the agent-only cadence block below. While a meeting is active, distinguish
+        # those asks from an ordinary valve wait: meeting_hold preserves their semantic class and
+        # gives them a fresh bounded delivery window when the room releases. Snooze/quiet already
+        # returned their own classes before Tier 1, and catch-up or already-stale ingress must keep
+        # its original age semantics rather than gaining a meeting-held extension.
+        if (verdict == "queue" and cls in ("actionable", "scheduling_ask")
+                and ctx["meeting_until"] and not catchup
+                and (age is None or age <= max_age)):
+            held_class = cls
+            verdict, cls, reason = ("queue", "meeting_hold",
+                                    f"in a meeting until {ctx['meeting_until']}: {name}")
         if verdict == "agent":
             key = _thread_key(e)
             # In a meeting → hold. FIRST in the chain on purpose: a held ask must burn neither its
@@ -1591,7 +1635,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             if ctx["meeting_until"] and cls not in MEETING_HOLD_EXEMPT_CLASSES:
                 held_class = cls
                 verdict, cls, reason = ("queue", "meeting_hold",
-                                        f"in a meeting until {ctx['meeting_until']} — {name}")
+                                        f"in a meeting until {ctx['meeting_until']}: {name}")
             # The escalation join is exempt (COOLDOWN_EXEMPT_CLASSES): the second channel arriving
             # inside the window is the whole signal, and the FIRST message's stamp is exactly what
             # would swallow it.
@@ -1603,7 +1647,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             # budget) and BEFORE the cooldown stamp (a budget-held event doesn't burn its thread's
             # cooldown either — it may still promote via the valve tomorrow). The check IS the
             # spend, once per bundle: _charge_once.
-            elif cls not in BUDGET_EXEMPT_CLASSES and not _charge_once():
+            elif _budget_cap() == 0 or (cls not in BUDGET_EXEMPT_CLASSES and not _charge_once()):
                 held_class = cls
                 verdict, cls, reason = ("queue", "budget",
                                         f"daily interrupt budget spent ({_budget_cap()} nudges "
@@ -1611,12 +1655,17 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         if verdict == "queue":
             queued = True
             _append_queue(cls, name, e, held_class=held_class,
-                          relevance_deadline=_s(ctx.get('relevance_deadline')))
+                          relevance_deadline=_s(ctx.get('relevance_deadline')),
+                          priority_id=_s(ctx.get('priority_id')),
+                          priority_revision=_s(ctx.get('priority_revision')))
         elif verdict == "agent":
             agent_events.append({"event": e, "sender": name, "class": cls, "why": reason,
                                  "decision_id": decision_id,
                                  **({'relevance_deadline': ctx['relevance_deadline']}
-                                    if ctx.get('relevance_deadline') else {})})
+                                    if ctx.get('relevance_deadline') else {}),
+                                 **({'priority_id': ctx['priority_id'],
+                                     'priority_revision': ctx['priority_revision']}
+                                    if ctx.get('priority_id') and ctx.get('priority_revision') else {})})
         _record_surfaced(verdict, cls, reason, name, e, decision_id)  # decision, not delivery
         reasons.append(reason)
     overall = "agent" if agent_events else ("queue" if queued else "drop")
@@ -1704,8 +1753,22 @@ def _user_spoke_since(entry: dict, ev: dict, answered: dict) -> bool:
     return ts is not None and spoke > ts
 
 
+def _entry_muted(entry: dict, prefs: dict | None) -> bool:
+    """Is this QUEUE ENTRY from someone the user muted? The same predicate the ingress gate and the
+    digest ask (preferences.proactively_muted), reading the entry's resolved sender and its event.
+    Malformed prefs read as muted: a mute that cannot be parsed must not become a nudge."""
+    if not isinstance(entry, dict):
+        return False
+    ev = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+    try:
+        return bool(_prefs.proactively_muted(_s(entry.get("sender")), ev,
+                                             prefs if isinstance(prefs, dict) else {}))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int,
-                     answered: dict | None = None):
+                     answered: dict | None = None, prefs: dict | None = None):
     """The promotable core of ONE queue entry, or None. THE single definition of "promotable", used
     by the valve's scan and by --promote so the two can never disagree: a demoted-agent class
     (PROMOTABLE_CLASSES), a KNOWN sender, a real event, an age inside the window ("meeting_hold"
@@ -1713,7 +1776,16 @@ def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int
     (COOLDOWN_EXEMPT_CLASSES skips that, as in triage()), and — `answered`, from _answered_threads —
     no later word from the user on the same thread: never promote a held ask the user has spoken
     on since it was held. Budget accounting stays with the caller: the valve spends a running
-    allowance across a tick, --promote spends exactly one."""
+    allowance across a tick, --promote spends exactly one.
+
+    Two rejections leave a receipt. The age one ENDS the item — nothing makes an entry younger —
+    so it writes one `drop`/`stale` row and marks the entry `valve_expired` so the next tick
+    writes nothing (release_valve persists that marker).
+
+    The mute is checked LAST, once everything else says "promote now", and it leaves a surfaced
+    `drop`/`muted` receipt: the ingress drop writes one, so the held copy of the same person's
+    message must not vanish silently — and checking it here means one receipt when the item was
+    actually ready to go, not one an hour for as long as it sits in the queue."""
     if not isinstance(entry, dict):
         return None
     cls = _s(entry.get("verdict_class"))
@@ -1725,6 +1797,10 @@ def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int
         return None
     ev = entry.get("event") if isinstance(entry.get("event"), dict) else None
     if not ev:
+        return None
+    # Legacy queued provider-proven agents must not escape through the valve after the ingestion
+    # rule changes. Ordinary phone rows still need their shared semantic verdict or an explicit mute.
+    if relevance.is_automated_assistant(ev):
         return None
     if _s(ev.get("source")) == PROACTIVE_SOURCE:
         # A held proactive nudge is Sotto's own, and the event skill has no branch for one — a
@@ -1752,15 +1828,34 @@ def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int
             qts = qts.replace(tzinfo=timezone.utc)
         age = max(0.0, (now_utc - qts).total_seconds() / 60.0)
     if age > max_age and cls != "meeting_hold" and not timed_ask:
+        # The one valve rejection that ENDS an item rather than holding it: cooldown, "you spoke
+        # since" and the budget all come round again, but nothing ever makes an entry younger. So
+        # it leaves the same receipt the mute does — once, on the tick that expired it. The caller
+        # persists the marker (release_valve rewrites the line), which is what keeps this to ONE
+        # row per entry instead of one every 15 minutes for as long as it sits in the queue.
+        if not entry.get("valve_expired"):
+            entry["valve_expired"] = True
+            _record_surfaced("drop", "stale",
+                             f"held {int(age)}m — past the {int(max_age)}m promotion window; it "
+                             f"rides the digest/brief now, never a nudge", sender, ev)
         return None
     if _user_spoke_since(entry, ev, answered or {}):
         return None
     key = _thread_key(ev)
     if held not in COOLDOWN_EXEMPT_CLASSES and not _cooldown_ok(key, now_ts):
         return None
+    if _entry_muted(entry, prefs):
+        # Everything else said "nudge now"; the mute is the whole reason nothing happened, so it
+        # gets the same receipt the ingress drop writes — one row, one readable answer to "why
+        # didn't I hear about this?".
+        _record_surfaced("drop", "muted", f"you asked Sotto to stop surfacing {sender}",
+                         sender, ev)
+        return None
     return {"event": ev, "sender": sender, "cls": cls, "held": held, "age": age,
             "thread_key": key, "exempt": held in BUDGET_EXEMPT_CLASSES,
-            "relevance_deadline": deadline_text if timed_ask else ''}
+            "relevance_deadline": deadline_text if timed_ask else '',
+            "priority_id": _s(entry.get('priority_id')),
+            "priority_revision": _s(entry.get('priority_revision'))}
 
 
 def _valve_state_path() -> str:
@@ -1852,6 +1947,9 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
         return {"verdict": "drop", "bundle": {},
                 "reason": f"nudges snoozed until {_s(prefs.get('nudge_snooze_until'))} — "
                           "nothing promoted"}
+    if _prefs.effective_nudge_budget(prefs) == 0:
+        return {"verdict": "drop", "bundle": {},
+                "reason": "you asked for no unsolicited nudges — nothing promoted"}
     now_ts = time.time() if now_ts is None else now_ts
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     meeting_until = _meeting_hold_until(now_local, now_utc)
@@ -1889,6 +1987,7 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
         budget_snapshot = _budget_left(day)
         answered = _answered_threads(lines)
         promoted, promoted_idx, charged, budget_blocked = [], set(), False, False
+        expired = False                   # an entry aged out on this tick → its marker needs saving
         cooldowns = []
         for i, line in enumerate(lines):     # oldest first — FIFO fairness for the longest-held ask
             if len(promoted) >= cap:
@@ -1903,8 +2002,15 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
             # itself held is never too old to deliver) / the user hasn't answered it since /
             # per-thread cooldown — all of it in _valve_candidate, which --promote applies to the
             # one entry the user picked.
-            cand = _valve_candidate(entry, now_utc, now_ts, max_age, answered)
+            was_expired = bool(entry.get("valve_expired"))
+            cand = _valve_candidate(entry, now_utc, now_ts, max_age, answered, prefs)
             if cand is None:
+                if entry.get("valve_expired") and not was_expired:
+                    # It just aged out and wrote its one `drop`/`stale` row; persist the marker in
+                    # place (the entry still rides the digest/brief) so no later tick writes a
+                    # second row for the same expiry.
+                    lines[i] = json.dumps(entry) + "\n"
+                    expired = True
                 # The one check the shared helper can't make: budget is a running allowance here.
                 if (_s(entry.get("verdict_class")) in PROMOTABLE_CLASSES and not charged
                         and budget_snapshot <= 0
@@ -1929,10 +2035,21 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
                              "why": f"promoted from the deferred queue ({reason})",
                              "decision_id": decision_id,
                              **({'relevance_deadline': cand['relevance_deadline']}
-                                if cand['relevance_deadline'] else {})})
+                                if cand['relevance_deadline'] else {}),
+                             **({'priority_id': cand['priority_id'],
+                                 'priority_revision': cand['priority_revision']}
+                                if cand['priority_id'] and cand['priority_revision'] else {})})
             promoted_idx.add(i)
             _record_surfaced("promoted", cand["held"], reason, cand["sender"], cand["event"],
                              decision_id)
+        if expired:
+            try:                          # same lock, same atomic replace as every queue rewrite
+                tmp = _queue_path() + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                os.replace(tmp, _queue_path())
+            except OSError:
+                pass
         if not promoted:
             return {"verdict": "drop", "bundle": {},
                     "reason": (f"daily interrupt budget spent ({_budget_cap()} nudges today) — "
@@ -1964,17 +2081,18 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
     """Promote the ONE queued entry whose queue_key matches — the dashboard's "nudge me now".
 
     Same mechanics as the valve, one entry instead of a tick: _valve_candidate decides
-    promotability, the day's interrupt budget is spent, the per-thread cooldown is stamped, the
+    promotability, the per-thread cooldown is stamped, the
     entry leaves the queue in the same atomic rewrite under the same lock, surfaced.jsonl gets the
     same "promoted" row, and the returned bundle is the shape the receiver already stages + spawns.
     Two gates differ, both on purpose: the CLOCK holds (quiet hours, the nudge snooze) do not apply
     — they stop unprompted interruptions, and the user prompted this one — and neither does the
     valve's ≤2/hour pacing, which governs how fast Sotto lets itself talk, not how fast you may ask.
-    The in-meeting hold DOES apply (it is about the room you are in, not the hour) and so does the
-    budget: the day's cap is the day's cap, however it is spent.
+    The in-meeting hold DOES apply (it is about the room you are in, not the hour). The unsolicited
+    budget does not apply to a delivery the user explicitly requested.
 
     Returns {"ok": True, "verdict": "agent", "reason", "bundle"} or {"ok": False, "error": <code>,
-    "reason": <one human sentence>} with error ∈ not_found | not_promotable | meeting_hold | budget.
+    "reason": <one human sentence>} with error ∈ not_found | muted | not_promotable | meeting_hold
+    | budget. `muted` is its own code because it is the one refusal the user can lift themselves.
     """
     if now_local is None:
         now_local = _now_local(configured_tz() or "+00:00")
@@ -1989,6 +2107,7 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
                 "reason": f"in a meeting until {meeting_until}"}
     day = _local_day(now_local)
     max_age = VALVE_MAX_AGE_MIN
+    prefs = _load_prefs()
     with _locked(_queue_path()):
         try:
             with open(_queue_path(), encoding="utf-8") as f:
@@ -2012,16 +2131,23 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
                     'job_id': accepted[key], 'bundle': {}}
         # No `answered` here on purpose: the valve's automatic pick skips an ask the user has
         # spoken on since, but a user who TAPS promote has said what they want.
-        cand = _valve_candidate(entry or {}, now_utc, now_ts, max_age)
+        cand = _valve_candidate(entry or {}, now_utc, now_ts, max_age, prefs=prefs)
         if cand is None:
+            # The mute gets its own answer: "can't be promoted" is not something a user can act on
+            # when the reason is a rule they wrote themselves and can lift in one sentence.
+            if _entry_muted(entry or {}, prefs):
+                return {"ok": False, "error": "muted",
+                        "reason": f"you asked Sotto to stop surfacing "
+                                  f"{_s((entry or {}).get('sender')) or 'them'} — say "
+                                  f"\"unmute\" them first"}
             return {"ok": False, "error": "not_promotable",
                     "reason": "that item can't be promoted (held for a reason the valve never "
                               "releases, an unknown sender, or a cooldown still running)"}
         # Check and spend in one atomic step — a promotion IS a nudge, and the dashboard button can
         # race the valve heartbeat and a Bridge push for the day's last unit.
-        if not cand["exempt"] and _budget_left(day) < 1:
-            return {"ok": False, "error": "budget",
-                    "reason": f"the day's interrupt budget is spent ({_budget_cap()} nudges today)"}
+        # This is a direct user request, not an unsolicited nudge. It keeps the room/mute/current
+        # truth checks above, but the user's "no nudges" preference and daily allowance do not
+        # prevent an item they explicitly asked to see now.
         reason = "user promoted from dashboard"
         decision_id = queue_key("promoted:" + queue_key(line))
         promoted_event = ({**cand['event'], 'valid_until': cand['relevance_deadline']}
@@ -2032,10 +2158,14 @@ def promote_one(key: str, now_local=None, now_utc=None, now_ts=None) -> dict:
                      "why": f"{reason} (held: {cand['cls']}, {int(cand['age'])}m old)",
                      "decision_id": decision_id,
                      **({'relevance_deadline': cand['relevance_deadline']}
-                        if cand['relevance_deadline'] else {})}]
+                        if cand['relevance_deadline'] else {}),
+                     **({'priority_id': cand['priority_id'],
+                         'priority_revision': cand['priority_revision']}
+                        if cand['priority_id'] and cand['priority_revision'] else {})}]
         bundle = {"generated_at": now_utc.astimezone(timezone.utc).isoformat(),
-                  "catchup": False, "promoted": True, "events": promoted}
-        job_id = _accept_bundle(bundle, [key], day, not cand['exempt'], now_ts)
+                  "catchup": False, "promoted": True,
+                  "_user_requested_delivery": True, "events": promoted}
+        job_id = _accept_bundle(bundle, [key], day, False, now_ts)
         if not job_id:
             return {'ok': False, 'error': 'budget', 'reason': 'daily interrupt budget spent'}
         _stamp_cooldown(cand['thread_key'], now_ts)

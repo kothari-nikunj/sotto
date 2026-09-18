@@ -27,6 +27,11 @@ gone stale**. Both are read-first. This skill never sends a message, email, or c
    `{you_owe:[…], waiting_on_them:[…], counts}`. Each item: `{anchor_key, name, what, channel, identifier,
    age_days, deadline, overdue, chased_count, last_chased_at, chased_out}`, oldest and most-overdue
    first. Don't hand-read the ledger.
+   When the user explicitly asks to see parked loops or restore one, use the same command with
+   `--parked`. The opt-in response adds `parked:[…]` and `counts.parked`; parked items are historical
+   obligations and must not be presented or counted as open. If more than one parked item could
+   match a request such as "keep Maya", show the matches and resolve the ambiguity before applying
+   `keep` with an exact `anchor_key`.
 2. **Deliver, tight and skimmable.**
    - Lead with the count ("4 you owe, 2 you're waiting on").
    - **You owe** — name + the one-line `what`, flag `overdue` or age ("3 days"). For the top items
@@ -74,9 +79,12 @@ when you can't tell which loop they mean, ask.
      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/retune_apply.py" keep    <anchor_key>
      ```
      `dismiss` = done with it, won't resurface. `snooze N` = hidden N days, then back. `keep` = "I
-     still care": on something they **owe**, it resets the clock so the 7-day drop-off won't take
-     it; on something they're **owed**, it resets the nudge count so Sotto chases again from
-     scratch. Either way, tell them which one they got.
+     still care": on something they **owe**, it records a new `reopened_at` touch and un-parks a
+     parked loop while preserving the original `created_at` evidence cutoff. `snooze N` also
+     preserves `created_at`; its park clock restarts when it returns. An untouched loop can park
+     only after 14 days and an accepted prior-day warning: it remains kept with its history, out of
+     the brief and open list, never deleted. On something they're **owed**, `keep` resets the nudge count so
+     Sotto chases again from scratch. Either way, tell them which one they got.
    - **"too noisy right now" / "quieter today"** — a *cadence* change, not a mute: route to
      `sotto-feedback` §C (`preferences.py snooze-nudges tomorrow | "+2h" | 15:00`, and
      `unsnooze-nudges` for "back to normal"). Snoozes expire on their own; mutes don't.

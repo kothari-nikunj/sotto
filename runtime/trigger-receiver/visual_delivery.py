@@ -1,4 +1,5 @@
 """Optional presentation at the existing delivery seam; the source body remains authoritative."""
+import logging
 import os
 from pathlib import Path
 
@@ -22,5 +23,7 @@ def prepare(body, label, target, load_visual, gallery_available):
         root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'cache/visual-briefs'
         manifest = visual.render(deck, root)
         return {'summary': manifest['summary'], 'images': manifest['images']}
-    except Exception:  # optional presentation must never take down canonical text delivery
+    except Exception as error:  # optional presentation must never take down canonical text delivery
+        # Log metadata only; exception messages may contain source content or private paths.
+        logging.getLogger(__name__).warning('visual_brief_fallback kind=%s error=%s', kind, type(error).__name__)
         return None  # image presentation can never prevent an ordinary brief

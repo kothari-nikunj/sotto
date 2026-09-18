@@ -40,6 +40,7 @@ import re
 import contextlib
 import fcntl
 import secrets
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -151,13 +152,13 @@ def write_text(path: str, text: str, mode: int = 0o600) -> None:
     world-readable file. write_json below is this plus a serializer; retention.py reaches it as
     HOOKS["write_text"] to rewrite a JSONL ledger, which is lines and not a document."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # PROCESS-UNIQUE temp. `path + ".tmp"` was itself a shared mutable resource: two writers opened
-    # the same scratch file, and whoever renamed first pulled it out from under the other — one of
-    # the three ways concurrent preference writes corrupted or lost data (Aug 2026).
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    # Every operation needs its own scratch inode: receiver HTTP handlers are threads in one process,
+    # so a PID-only name still lets two independent writes truncate or rename each other's temp file.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp.",
+                               dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), mode)
             f.write(text)
         os.replace(tmp, path)
     except BaseException:

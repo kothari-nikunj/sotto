@@ -6,14 +6,63 @@ and, critically, IDEMPOTENCE: routing already-converted text through again must 
 """
 import importlib.util
 import os
+import sys
+
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
+sys.path.insert(0, os.path.join(ROOT, '_shared', 'lib'))
 
 spec = importlib.util.spec_from_file_location(
     "chatfmt", os.path.join(ROOT, "_shared", "lib", "chatfmt.py"))
 cf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cf)
+
+
+@pytest.mark.parametrize('formatter', [cf.to_chat, cf.to_imessage])
+def test_invalid_tap_link_leaves_draft_and_valid_options(formatter):
+    raw = ('Reply to Ramp: "Coffee with a colleague"\n\nTap to send:\n'
+           'imessage://81?body=Coffee%20with%20a%20colleague\n\n'
+           'Tap to send:\nsms:12345&body=Memo\n'
+           'Other thread: imessage://alex2026@example.com?body=Hi')
+    out = formatter(raw)
+    assert 'imessage://81' not in out
+    assert out.count('Tap to send:') == 1
+    assert 'Reply to Ramp: "Coffee with a colleague"' in out
+    assert 'sms:12345&body=Memo' in out
+    assert 'imessage://alex2026@example.com?body=Hi' in out
+    assert formatter(out) == out
+
+
+@pytest.mark.parametrize('formatter', [cf.to_chat, cf.to_imessage])
+def test_bare_scheme_word_in_prose_is_untouched(formatter):
+    # A "Tel:"/"sms:" label with no target after it is prose, not a tap link — the scheme word
+    # itself must never be swallowed by the invalid-link strip.
+    assert formatter('Tel: 555-1234 is the office line') == 'Tel: 555-1234 is the office line'
+    assert formatter('Reply by sms: yes or no') == 'Reply by sms: yes or no'
+
+
+@pytest.mark.parametrize('formatter', [cf.to_chat, cf.to_imessage])
+def test_wa_me_click_to_chat_path_is_left_alone(formatter):
+    # wa.me also serves non-phone click-to-chat paths (e.g. /message/<id>) — only a phone-shaped
+    # wa.me target is ours to validate; anything else is a URL, not a recipient to judge.
+    raw = 'Book via https://wa.me/message/ABCDEF'
+    assert formatter(raw) == raw
+    assert formatter(formatter(raw)) == formatter(raw)
+
+
+@pytest.mark.parametrize('formatter', [cf.to_chat, cf.to_imessage])
+def test_masked_and_internal_targets_are_removed_but_web_links_survive(formatter):
+    raw = ('[Reply to Ramp](imessage://ramp_cf8gd1ek_agent?body=Hi)\n'
+           'imessage://+1415***1234?body=Hi\n'
+           'https://example.com/81?body=Hi\n'
+           'imessage://alex%231@example.com?body=Hi')
+    out = formatter(raw)
+    assert 'Reply to Ramp' in out
+    assert 'ramp_cf8gd1ek_agent' not in out and '***1234' not in out
+    assert 'https://example.com/81?body=Hi' in out
+    assert 'imessage://alex%231@example.com?body=Hi' in out
 
 
 def test_imessage_draft_and_research_are_readable_and_idempotent():

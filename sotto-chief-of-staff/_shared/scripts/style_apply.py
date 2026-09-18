@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
 from personal_context import render_feedback  # noqa: E402
+import preferences  # noqa: E402
 
 
 def _root():
@@ -113,6 +114,14 @@ def apply(req: dict) -> dict:
         parts.append("\n### Voice guardrails")
         parts += g
 
+    # A stated tone instruction is authority, not a style inference. Brief composition already
+    # honors this same explicit list; reply drafting must receive it too or "keep it terse" applies
+    # to the digest while the proposed reply ignores it.
+    tone_notes = preferences.load_explicit().get("tone_notes") or []
+    if tone_notes:
+        parts.append("\n### Explicit tone instructions")
+        parts += [f"- {note}" for note in tone_notes]
+
     # (style.json's `preferences` list — "learned preferences from past edits" — is carried forward
     # by the extractor but has NO writer; the edit-diff arc is still open. Nothing is rendered from
     # it here: a prompt section with no producer is dead real estate on the drafter's hottest path.)
@@ -124,7 +133,7 @@ def apply(req: dict) -> dict:
     parts.append('\nWrite as if you ARE this person. The samples above are the ground truth — if in doubt, re-read them.')
 
     return {"guidance": "\n".join(parts), "bucket": bucket, "source": source,
-            "master": master, "has_person": has_person}
+            "master": master, "has_person": has_person, "tone_notes": tone_notes}
 
 
 if __name__ == "__main__":

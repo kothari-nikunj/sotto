@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -735,12 +736,89 @@ def test_api_loops_active_only_newest_first(tmp_path):
         top = loops[0]
         assert top == {"anchor_key": "email:reply:sarah", "action_type": "reply",
                        "channel": "email", "contact_name": "Sarah Chen", "status": "waiting",
-                       "created_at": "2026-08-04", "times_surfaced": 5,
+                       "created_at": "2026-08-04", "times_surfaced": 0,
                        "summary": "Reply about the deck", "meeting_time": None,
                        "deadline": None, "source": None,
                        "chased_count": 0, "last_chased_at": None, "chase_after": None,
                        "chased_out": False}
         assert loops[1]["meeting_time"] == "Tomorrow 3pm"
+    finally:
+        srv.shutdown()
+
+
+def test_api_loops_uses_accepted_delivery_count_not_legacy_capture_count(tmp_path):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    trusted = ('---\nanchor_key: "trusted"\naction_type: reply\nchannel: email\n'
+               'contact_name: Jordan\nstatus: open\ncreated_at: 2026-08-05\n'
+               'times_surfaced: 99\nsummary: "Send the proposal"\n'
+               'delivery_surface:\n  schema: 1\n  delivery_keys:\n    - receipt-a\n'
+               '    - receipt-b\n    - receipt-a\n---\n')
+    _write(os.path.join(str(tmp_path), "knowledge", "continuity", "trusted.md"), trusted)
+    try:
+        cookie = _login(base)
+        loops = json.loads(_get(base, "/api/loops", headers=cookie)[1])["loops"]
+        row = next(loop for loop in loops if loop["anchor_key"] == "trusted")
+        assert row["times_surfaced"] == 2
+    finally:
+        srv.shutdown()
+
+
+def test_api_loops_reuses_receiver_helper_without_path_growth(tmp_path):
+    m = _load_receiver()
+    m.DATA = str(tmp_path)
+    _fixtures(str(tmp_path))
+    m.DASHBOARD.api_loops()
+    helper = m._shared_effects()
+    paths = list(sys.path)
+    for _ in range(5):
+        m.DASHBOARD.api_loops()
+    assert m._shared_effects() is helper
+    assert sys.path == paths
+
+
+def test_api_loops_degrades_if_shared_helper_cannot_load(tmp_path):
+    m = _load_receiver()
+    m.DATA = str(tmp_path)
+    _fixtures(str(tmp_path))
+    def fail():
+        raise SyntaxError("bad helper")
+    m.DASHBOARD.HOOKS["delivery_effects"] = fail
+    result = m.DASHBOARD.api_loops()
+    assert result["loops"] and all(row["times_surfaced"] == 0 for row in result["loops"])
+    del m.DASHBOARD.HOOKS["delivery_effects"]
+    assert m.DASHBOARD.api_loops() == result
+
+
+def test_api_loops_serves_the_parked_group_apart_from_the_open_count(tmp_path):
+    """A parked loop (untouched two weeks — kept, hidden from the brief) is its own group: never in
+    `loops`, never in the overview's open count, and still reachable so `keep` can bring it back."""
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    _write(os.path.join(str(tmp_path), "knowledge", "continuity", "parked.md"),
+           _loop_md("email:reply:parked", "parked", "2026-07-20"))
+    try:
+        cookie = _login(base)
+        out = json.loads(_get(base, "/api/loops", headers=cookie)[1])
+        assert [l["anchor_key"] for l in out["loops"]] == ["email:reply:sarah", "thread:abc"]
+        assert [l["anchor_key"] for l in out["parked"]] == ["email:reply:parked"]
+        assert out["parked"][0]["status"] == "parked"
+        assert json.loads(_get(base, "/api/overview", headers=cookie)[1])["loops_active"] == 2
+    finally:
+        srv.shutdown()
+
+
+def test_post_loops_keep_runs_sotto_loops_own_verb(tmp_path):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    rec = _stub_cli(m, tmp_path)
+    try:
+        _, authed = _login_with_csrf(base)
+        code, body, _ = _post_json(base, "/api/loops", {"anchor_key": "thread:abc", "op": "keep"},
+                                   headers=authed)
+        assert code == 200 and json.loads(body)["ok"] is True and "parked" in json.loads(body)
+        assert _cli_calls(rec) == [{"keep": "", "thread:abc": ""}]       # retune_apply.py keep <anchor>
+        assert _audit_writes(tmp_path)[0]["op"] == "keep"
     finally:
         srv.shutdown()
 
@@ -917,7 +995,7 @@ def test_api_empty_data_root_gives_empty_results_not_500(tmp_path):
     m, srv, base = _server(tmp_path)   # NO fixtures — bare volume
     try:
         cookie = _login(base)
-        assert json.loads(_get(base, "/api/loops", headers=cookie)[1]) == {"loops": []}
+        assert json.loads(_get(base, "/api/loops", headers=cookie)[1]) == {"loops": [], "parked": []}
         assert json.loads(_get(base, "/api/briefs", headers=cookie)[1]) == {"briefs": []}
         assert json.loads(_get(base, "/api/people", headers=cookie)[1]) == {"people": []}
         learned = json.loads(_get(base, "/api/learned", headers=cookie)[1])
@@ -1785,7 +1863,7 @@ def _cadence_fixtures(root, queue_lines=None):
     day = _dash._local_today()
     _write(os.path.join(root, "events", "budget.json"), json.dumps({"date": day, "count": 3}))
     _write(os.path.join(root, "cache", "meeting_taps.json"),
-           json.dumps({"date": day, "fired": ["k1", "k2"]}))
+           json.dumps({"date": day, "fired": ["k1", "k2"], "pending": ["k3"]}))
     _write(os.path.join(root, "events", "valve_state.json"),
            json.dumps({"promotions": [time.time() - 120, time.time() - 7200]}))
     _write(os.path.join(root, "preferences.json"), json.dumps(
@@ -1810,7 +1888,7 @@ def test_api_cadence_reads_the_funnel_s_own_state_files(tmp_path):
         data = json.loads(_get(base, "/api/cadence", headers=cookie)[1])
         assert data["date"] == day
         assert data["budget"] == {"spent": 3, "cap": 4, "left": 1}
-        assert data["taps"] == {"fired": 2, "cap": 3}
+        assert data["taps"] == {"fired": 3, "cap": 3}
         assert data["valve"]["promoted"] == 1 and data["valve"]["cap"] == 2   # the hour's window
         assert data["snooze"] == {"until": "2099-01-01T07:00", "active": True}
         assert data["quiet"] == {"start": 21, "end": 7}

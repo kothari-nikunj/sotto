@@ -199,13 +199,13 @@ def test_the_secrets_guard_catches_an_opaque_token_assignment():
 # below is assembled from string parts for the same reason the module-level pattern is — this file
 # ships, and the guard greps the whole shipped tree including its own tests.
 
-def _publish_with_planted_note(body: str):
+def _publish_with_planted_note(body: str, suffix: str = ".md"):
     """Run the real generator with `body` sitting in a shipped (non-ignored) file, so what is being
     exercised is the SECRETS guard and not the IGNORED one. Returns the completed process."""
     # A unique name per call: the fixture must sit in a shipped, NON-ignored directory, and a fixed
     # one would collide with the older opaque-assignment test (and with a second checkout running the
     # suite at the same time).
-    fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=".md",
+    fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=suffix,
                                    dir=os.path.join(HERMES, "adapters", "hermes"))
     os.close(fd)
     target = tempfile.mkdtemp(prefix="sotto-dist-")
@@ -318,6 +318,8 @@ def test_the_shipped_ci_workflow_names_no_credential():
             assert forbidden not in ci, f"the shipped ci.yml mentions {forbidden!r}"
         # The generated workflow and private/local callers share one shipped verification command.
         assert "python3 sotto-chief-of-staff/tools/verify.py" in ci
+        assert "tools/verify-public-image.sh ." in ci, \
+            "public CI does not build the same container context users deploy"
         import importlib.util
         verifier = os.path.join(target, "sotto-chief-of-staff", "tools", "verify.py")
         spec = importlib.util.spec_from_file_location("published_verification", verifier)
@@ -336,6 +338,12 @@ def test_the_shipped_ci_workflow_names_no_credential():
         assert "requirements-dev.txt" in ci
         assert os.path.isfile(os.path.join(target, "requirements-dev.txt")), \
             "ci.yml installs from a file the generator never copies"
+        assert os.path.isfile(os.path.join(target, "requirements-dev.in")), \
+            "the public dependency lock has no shipped source manifest"
+        for tool in ("verify-public-image.sh", "lock-requirements.sh"):
+            path = os.path.join(target, "tools", tool)
+            assert os.path.isfile(path), f"the generated workflow/docs depend on missing {tool}"
+            assert os.access(path, os.X_OK), f"the published {tool} is not executable"
     finally:
         shutil.rmtree(target, ignore_errors=True)
 
@@ -376,6 +384,46 @@ def test_the_shipped_gitignore_ignores_a_deployers_env_file():
         # …and it must not swallow the template beside it, which is a real shipped file.
         kept = subprocess.run(["git", "check-ignore", "-q", "adapters/hermes/.env.template"], cwd=target)
         assert kept.returncode != 0, "the shipped .gitignore ignores .env.template"
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+# ── MOAT GUARD, beyond the docs — the broker must not be named by shipped CODE either ────────────
+# The MOAT pattern is `--include='*.md'`-scoped, so it never looked at the shell scripts the
+# generator ships. tools/lock-requirements.sh therefore shipped for months telling a self-hoster
+# about `cloud/accounts/requirements.in` — a path in the one directory this repo deliberately does
+# not have. The guard now applies its broker half to every shipped `*.sh`; Bridge paths stay
+# .md-only, because the adapters' installers legitimately describe the monorepo-only build.
+
+def test_a_broker_mention_in_a_shipped_shell_script_fails_the_publish():
+    """The half of the fix that catches the NEXT one: a shipped script naming the broker is a leak,
+    exactly as a shipped doc is."""
+    proc = _publish_with_planted_note(
+        "# regenerate the broker locks\nuv pip compile cloud/accounts/requirements.in\n",
+        suffix=".sh")
+    assert proc.returncode != 0, "a shipped script named the broker:\n" + proc.stdout
+    assert "MOAT GUARD: FAIL" in proc.stdout
+    assert "cloud/accounts" in proc.stdout
+
+
+def test_the_shipped_lock_script_does_not_name_the_broker():
+    """…and the leak itself: the published `tools/lock-requirements.sh` locks the two manifests this
+    repo ships and mentions nothing it does not."""
+    target = tempfile.mkdtemp(prefix="sotto-dist-")
+    os.rmdir(target)                                    # the generator refuses a non-empty target
+    try:
+        proc = _run_generator(target)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "MOAT GUARD: PASS" in proc.stdout
+        shipped = os.path.join(target, "tools", "lock-requirements.sh")
+        with open(shipped, encoding="utf-8") as f:
+            script = f.read()
+        assert "cloud/accounts" not in script, script
+        # Stripping the broker block must leave a script that still runs and still does its job.
+        assert subprocess.run(["bash", "-n", shipped]).returncode == 0, "the shipped lock script is not valid bash"
+        for manifest in ("requirements.in -o requirements.txt",
+                         "requirements-dev.in -o requirements-dev.txt"):
+            assert manifest in script, f"the shipped lock script no longer locks {manifest}"
     finally:
         shutil.rmtree(target, ignore_errors=True)
 

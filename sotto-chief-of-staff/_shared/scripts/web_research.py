@@ -386,7 +386,13 @@ def deep_research(prompt: str, schema: dict, timeout: float, gemini) -> tuple:
     attempts = {"parallel": lambda: _parallel_task(prompt, schema, _remaining(deadline)),
                 "exa": lambda: _exa_deep(prompt, schema, _remaining(deadline)),
                 "gemini": lambda: gemini(prompt, schema, _remaining(deadline))}
-    return _first_answer("deep_research", lambda p: attempts[p]())
+    def dispatch(provider):
+        import model_work
+        if provider == 'gemini' or not model_work.current():
+            return attempts[provider]()  # Gemini claims each actual schema attempt itself.
+        with model_work.attempt(provider, 'deep_research', prompt, schema=schema):
+            return attempts[provider]()
+    return _first_answer("deep_research", dispatch)
 
 
 def main():

@@ -24,7 +24,9 @@ skill.** Confirm in ONE short line, as Sotto.
 ## Item usefulness — “that was useful”, “the donation item was noise”
 
 Run `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/usefulness_feedback.py" list` to find the
-actual archived brief or offered draft. Match the owner's words to that output; never guess a
+actual delivered brief whose archive is still retained and whose recorded sources are still
+permitted — for the Mac sources that comes down to the source still being shared, and in managed
+mode to it still being consented and connected. Match the owner's words to that output; never guess a
 reference when multiple items fit. Record the rating against that exact reference:
 
 ```bash
@@ -32,11 +34,15 @@ python3 "$HOME/.hermes/skills/sotto/_shared/scripts/usefulness_feedback.py" usef
   --reference "<reference from list>"
 ```
 
-Use `not_useful` for the opposite. **Only the reference and the rating are stored** — one outcomes
-row; the archived brief or draft stays the source of truth, and no excerpt, reason or other prose
-is copied anywhere. `--excerpt "<verbatim excerpt>"` is optional and is only checked against the
-referenced output (a quote that isn't in it is refused, which is how a wrong match is caught);
-`--reason` is accepted and then discarded — don't collect one. Only record a rating the owner
+Use `not_useful` for the opposite. For feedback about one item, pass
+`--excerpt "<verbatim excerpt>"` with at most 320 characters that uniquely identify that item.
+Without an excerpt, the rating applies to the whole brief. **Only the reference, hashed item
+locator, and rating are stored** in one outcomes row. The archive stays the source of truth;
+excerpt text and reasons are never copied into outcomes. Future prompts resolve only the bounded
+excerpt, and recheck retention and source access before using it. Two items in the same brief keep
+separate ratings; a later rating of the same item replaces its earlier decision. Draft archives
+without source provenance are excluded. `--reason` is accepted and discarded; don't collect one.
+Only record a rating the owner
 actually gave. A bare thumbs-up without a clear feedback referent is ambiguous; neither a reaction
 nor an item rating authorizes sending, completing a loop, muting its sender, or changing a standing
 rule. The script refuses unattended writes and invented excerpts. If the item isn't in the list,
@@ -44,7 +50,7 @@ ask the owner to name a specific preference or correction; don't fabricate a mat
 recorded.
 
 These bounded examples reach briefs, digest/nudge relevance, and drafting. Say one short line,
-such as “Got it — that school deadline was useful.” Never ask for a rating after every message.
+such as “Got it, that school deadline was useful.” Never ask for a rating after every message.
 
 ## A · Preferences (mute / tone) — "stop surfacing X", "keep it terse"
 
@@ -56,7 +62,7 @@ P="$HOME/.hermes/skills/sotto/_shared/scripts/preferences.py"
 python3 "$P" mute-sender  news@example.com      # a newsletter / noisy sender (email OR @domain)
 python3 "$P" mute-sender  @marketing.acme.com   # mute a whole sending domain
 python3 "$P" mute-person  "Bob Smith"           # stop flagging this person in briefs
-python3 "$P" mute-section birthdays             # drop a whole brief section (e.g. birthdays, screen_time)
+python3 "$P" mute-section birthdays             # drop a brief section (also weekly_review, screen_time)
 python3 "$P" tone         "keep briefs terse — bullet points, no preamble"
 python3 "$P" vip          "Sarah Chen"           # their missed calls reach you even in quiet hours
 python3 "$P" show                               # read back the current preferences
@@ -79,12 +85,16 @@ supersedes the wrong fact rather than piling on). State the truth the user gave 
 told you what's wrong, the negation. **Do not invent the replacement fact.**
 
 ```bash
-echo '{"person_updates":[{"person_name":"Peyton Lewis","updated_by":"user_edit","facts":[
-  {"fact":"Peyton is NOT the founder of Alive; correct her role per the user.",
-   "change_type":"correction","confidence":0.95,"memory_type":"context",
-   "source":"user_edit","source_ref":"user-correction"}]}]}' \
-| python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_update.py"
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_query.py" \
+  --person "Peyton Lewis" --editable-person --topic "founder Alive"
+python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_edit.py" \
+  --slug <canonical_id> --op correct --fact-id <the exact fact the user corrected> \
+  --text "Peyton is NOT the founder of Alive; correct her role per the user."
 ```
+- Match the correction to exactly one active fact from the read-only first command. If none or more
+  than one could be the target, ask one short clarifying question. Never guess a fact id.
+- Set `--topic` to the specific subject the user corrected, using their words. The active-fact view
+  is bounded, and topic ranking keeps an older relevant fact from hiding behind newer unrelated facts.
 - Use the person's real display name (as it appears in the brief / graph) so it maps to the right file.
 - If the user gave the corrected fact ("she's actually the COO"), write THAT as the fact text.
 - Company-name fixes work the same way via the fact text (e.g. "Company is Alive, not Alive Ventures").
@@ -148,6 +158,21 @@ Confirm in ONE line with the lift time the script printed, as Sotto — e.g. "Qu
 tomorrow — I'll hold everything and catch you up then." Plain chat text, no markdown headings/bold
 (the chatfmt rule — chat clients render them literally).
 
+For a standing change to unsolicited volume, use the same writer. `fewer` halves the current cap
+(and preserves zero), `no` sets it to zero, and `more` restores the configured default; the stored
+choice can never raise the installation's configured maximum:
+
+```bash
+python3 "$P" nudge-budget fewer   # "fewer nudges"
+python3 "$P" nudge-budget no      # "no nudges"
+python3 "$P" nudge-budget more    # "more nudges" / "back to normal"
+```
+
+Zero stops every unsolicited nudge, including missed calls, calendar changes, meeting prep, the
+proactive lane, and a pending retry rechecked before send. Scheduled briefs and digests still
+arrive, and a direct reply or an item the user explicitly promotes keeps its own meaning. Run the
+command only from the existing interactive chat or authenticated dashboard write path.
+
 ## D · Standing rules & who-I-am — "remember: never book Fridays", "my focus this quarter is the fund raise"
 
 A durable fact or rule the user STATES about themselves goes to the **master file**
@@ -161,6 +186,14 @@ preferences and not to a person file:
   circle. One line per rule, their words.
 - **Explicit words only, confirmed first** — "Adding to your standing file: <the line> — right?"
   Never write an inferred pattern; offer it instead. (Same contract as the persona's capture rule.)
+- Priorities are optional and limited to three explicit lines. Treat a newly stated set as a
+  replacement and use `set --section Priorities`, not append, after confirming the complete set;
+  there is no mandatory setup step.
+- Friday's review may offer one candidate. The user's exact command “prioritize staying in touch
+  with <name>” confirms that single addition. Use `master_file.py prioritize --text "Staying in touch
+  with <name>"`, which atomically preserves existing priorities and refuses a full set. Do not
+  replace or trim existing priorities to make room. “Make <name> VIP” uses the existing `vip` verb.
+  A bare yes without a uniquely bound explicit offer, or silence, grants no new authority.
 - If the write fails because the file is at its cap, say which section is largest and ask what to
   trim — never trim on your own.
 - Routing test: *behavioral preference about Sotto's output* → §A (`preferences.py`); *fact about a

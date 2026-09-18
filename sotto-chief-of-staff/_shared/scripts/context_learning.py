@@ -105,6 +105,10 @@ def observations(source, messages, now=None):
     return result
 
 
+import model_work  # noqa: E402
+
+
+@model_work.procedure('memory_extract')
 def learn(records, llm=gemini.call_gemini, now=None):
     now = now or datetime.now(timezone.utc)
     records = [r for r in records if allowed(r['source'])]

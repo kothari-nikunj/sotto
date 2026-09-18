@@ -12,6 +12,7 @@ def install(home):
     plugin.mkdir(parents=True, exist_ok=True)
     shutil.copytree(Path(__file__).with_name('sotto_photon'), plugin, dirs_exist_ok=True)
     shutil.copyfile(home / 'skills/sotto/_shared/lib/chatfmt.py', plugin / 'chatfmt.py')
+    shutil.copyfile(home / 'skills/sotto/_shared/lib/message_targets.py', plugin / 'message_targets.py')
     shutil.copyfile(Path(__file__).with_name('gallery.py'), plugin / 'gallery.py')
     path = home / 'config.yaml'
     config = yaml.safe_load(path.read_text()) if path.exists() else {}

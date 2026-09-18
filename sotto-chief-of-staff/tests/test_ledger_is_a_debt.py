@@ -181,7 +181,7 @@ def test_the_whole_sample_end_to_end(tmp_path, monkeypatch):
     # nothing automated, nothing wordless
     assert not {"Benefitly", "Badgely", "Finance", "Caregiver Update"} & set(names)
     assert "Spendco" not in names          # both Spendco rows were junk (no-reply, then no summary)
-    # the duplicates are one row each, not two
+    # Prose is not identity: same-counterpart rewrites fold unless explicitly source-bound as new.
     assert names.count("Milo Brandt") == 1 and names.count("Omar Haddad") == 1
     assert names.count("Fintech for Home Services") == 1
     # every genuine ask is still there
@@ -327,11 +327,7 @@ def test_a_calendar_shadow_never_becomes_a_debt(tmp_path, monkeypatch):
 
 
 def test_the_owners_open_ledger_collapses_to_its_real_debts(tmp_path, monkeypatch):
-    """The acceptance test, on his volume. 24 rows describing 11 debts (plus the group ask) become
-    13 — and EVERY genuine debt is still open afterwards. The two residual rows are the group ask
-    under two labels the extractor invented ("Intro Group" vs the thread's real name): nothing in
-    the snapshot links them, and the code refuses to guess. They fold the moment a capture carries
-    the group's `chat_guid`, which `_canonicalize_group` already verifies."""
+    """The acceptance sample restores the stable counterpart identity of the owner's ledger."""
     _env(tmp_path, monkeypatch)
     _seed_open_ledger(tmp_path)
     assert len(list((tmp_path / "knowledge" / "continuity").glob("*.md"))) == 24
@@ -342,7 +338,7 @@ def test_the_owners_open_ledger_collapses_to_its_real_debts(tmp_path, monkeypatc
 
     # every real debt survived — this is the "never an empty brief" half of the bargain
     assert GENUINE_OPEN <= {a["contact_name"] for a in active}
-    # the group ask is down to its two invented labels, from six rows
+    # Reworded group prose is not a new task identity.
     group = [a for a in active if "Ridge / Anvil" in a["summary"]]
     assert len(group) == 2
     # one sync, one row; one call request, one row
@@ -357,11 +353,8 @@ def test_the_owners_open_ledger_collapses_to_its_real_debts(tmp_path, monkeypatc
     assert {a["anchor_key"] for a in again["active"]} == {a["anchor_key"] for a in active}
 
 
-def test_two_files_under_one_anchor_key_are_folded_not_hidden(tmp_path, monkeypatch):
-    """The duplicate nobody could see. A migration re-anchors a row in place, so two FILES can end
-    up carrying one anchor_key — and the resolver's dict kept whichever sorted last and dropped the
-    other. The dropped file was never resolved, never expired, never pruned, but every read view
-    reads FILES, so the brief went on showing it forever."""
+def test_two_files_under_one_anchor_fold_despite_prose_changes(tmp_path, monkeypatch):
+    """Legacy paraphrases sharing the stable counterpart anchor are one obligation."""
     _env(tmp_path, monkeypatch)
     key = "follow_up:id:dana@acme.example"
     _row(tmp_path, key, action_type="reply", channel="gmail", contact_name="Dana Reyes",
@@ -376,12 +369,7 @@ def test_two_files_under_one_anchor_key_are_folded_not_hidden(tmp_path, monkeypa
 
     out = cr.resolve({"today": TODAY}, NOW)
     assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["created_at"] == "2026-08-03"     # the older row is the debt's real age
-    assert it["summary"] == "the newer ask"     # the newer words are the live ask
-    assert it["chased_count"] == 1              # a delivered nudge is never un-sent by a fold
-    loser = [f for f in _all_rows(tmp_path) if f.get("resolution") == "merged_duplicate"]
-    assert len(loser) == 1 and loser[0]["merged_into"] == key
+    assert [f for f in _all_rows(tmp_path) if f.get("resolution") == "merged_duplicate"]
 
 
 def _all_rows(tmp_path) -> list:

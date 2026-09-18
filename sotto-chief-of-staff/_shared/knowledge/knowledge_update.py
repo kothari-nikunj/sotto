@@ -591,7 +591,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
     if float(fu.get("confidence", 0.8)) < 0.5:
         return
     observed = str(fu.get('observed_date') or '')
-    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', observed) and observed <= today:
+    has_observed_date = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', observed) and observed <= today)
+    if has_observed_date:
         today = observed
     force = fu.get("change_type") == "correction"
     action, existing_id = kg.find_similar_fact(
@@ -599,19 +600,33 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
     )
     source = fu.get('source') or 'brief_extraction'
     ref = str(fu.get('source_ref') or '')[:500]
-    new_refs = {v for v in fu.get('evidence_refs', []) if isinstance(v, str) and 0 < len(v) <= 500}
-    new_refs = set(sorted(new_refs | ({ref} if ref else set()))[:64])
+    # Keep the writer-provided order: at the cap, lexicographic slicing could discard every new
+    # reference forever merely because it sorted after the first 64.  The rolling window below
+    # retains the newest distinct evidence while bounding the on-disk fact.
+    supplied_refs = fu.get('evidence_refs', [])
+    supplied_refs = supplied_refs if isinstance(supplied_refs, list) else []
+    new_refs = list(dict.fromkeys(
+        v for v in [*supplied_refs, *([ref] if ref else [])]
+        if isinstance(v, str) and 0 < len(v) <= 500
+    ))[-64:]
     if existing_id and p.facts[existing_id].source == 'user_edit' and source != 'user_edit':
         return  # Neither historical ingestion nor a model revisiting its own memory can undo a correction.
     if source == 'observed_message' and not force:
         # Overlapping words do not prove two historical statements agree. Keep both assertions
         # for evidence-based curation instead of strengthening or overwriting one heuristically.
-        exact = next((fid for fid, fact in p.facts.items()
+        # Active first (same reason as kg.find_similar_fact): an archived twin must not shadow the
+        # live copy of the same words and turn a re-observation into a SKIP.
+        exact = next((fid for fid, fact in sorted(p.facts.items(), key=lambda kv: kv[1].status == 'archived')
                       if ' '.join(fact.text.split()).casefold() == ' '.join(fu['fact'].split()).casefold()), None)
-        action, existing_id = ((kg.BUMP if p.facts[exact].status == 'active' else kg.SKIP, exact)
+        action, existing_id = ((kg.BUMP if (p.facts[exact].status == 'active'
+                                               or kg.can_revive_fact(p.facts[exact], fu['fact'])) else kg.SKIP, exact)
                                if exact else (kg.NEW, None))
     if action == kg.BUMP:
         ex = p.facts[existing_id]
+        if ex.status == 'archived':
+            # Re-observed, so re-learned (kg.find_similar_fact): drop the tombstone and keep the
+            # id, then let the bookkeeping below decide whether this sighting is independent.
+            ex.status, ex.archived_text, ex.archived_reason = 'active', None, None
         if source == 'user_edit':
             # An explicit confirmation upgrades authority once; automatic replay never does.
             if ex.source != 'user_edit':
@@ -621,15 +636,23 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
             ex.conf = float(fu.get('confidence', 1.0))
             ex.last = max(ex.last or today, today)
             return
-        refs = set(ex.evidence_refs or []) | ({ex.source_ref} if ex.source_ref else set())
-        if not new_refs - refs or len(refs) >= 64:
+        refs = list(dict.fromkeys([*(ex.evidence_refs or []),
+                                   *([ex.source_ref] if ex.source_ref else [])]))
+        retained = set(refs)
+        novel = [value for value in new_refs if value not in retained]
+        if not novel:
             # Re-reading the same evidence is not independent confirmation: no seen/conf bump.
-            # It IS a fresh observation, though — an extraction that carries no source_ref (the
-            # prompt allows that) would otherwise never refresh `last`, and a fact restated every
-            # morning decayed and was pruned as if nobody had mentioned it since the first day.
-            ex.last = max(ex.last or today, today)
+            # Nor is it a fresh observation: repeated or ref-less extraction can be the model
+            # proposing the same words from the same input. Only distinct source evidence (or the
+            # explicit user-confirmation branch above) may refresh evidence recency.
             return
-        ex.evidence_refs = sorted(refs | new_refs)[:64]
+        saturated = len(refs) >= 64
+        ex.evidence_refs = list(dict.fromkeys([*refs, *novel]))[-64:]
+        if saturated and not (has_observed_date and observed > (ex.last or '')):
+            # A bounded exact set cannot remember every evicted reference. Keep rolling provenance,
+            # but after saturation require source-bound chronology before granting corroboration:
+            # processing on a later day alone must not make replayed old evidence look new.
+            return
         ex.seen += 1
         ex.conf = min(ex.conf + 0.1, 1.0)
         ex.first = min(ex.first or today, today)
@@ -642,6 +665,7 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
                 return
             ex.status = "archived"
             ex.archived_text = ex.text
+            ex.archived_reason = "user_corrected" if source == "user_edit" else "superseded"
             counts["superseded"] += 1
         fid = kg.generate_fact_id(cid, fu["fact"], today)
         p.facts[fid] = kg.FactMeta(
@@ -649,7 +673,7 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
             seen=1, conf=float(fu.get("confidence", 0.8)),
             # provenance: research writers (persist_prep) pass source="web_research";
             # extraction writes omit it and keep the default label.
-            source=source, evidence_refs=sorted(new_refs),
+            source=source, evidence_refs=new_refs[-64:],
             source_ref=ref, first=today, last=today,
         )
         counts["new"] += 1
@@ -1128,6 +1152,7 @@ def consolidate(slug, expected_hash, summary_refs, conflicts, now=None):
             key = (fact.type, ' '.join(fact.text.split()).casefold())
             if key in seen and fact.source != 'user_edit' and fid not in summary_refs:
                 fact.status, fact.archived_text = 'archived', fact.text
+                fact.archived_reason = 'duplicate'
                 duplicates += 1
             else:
                 seen[key] = fid

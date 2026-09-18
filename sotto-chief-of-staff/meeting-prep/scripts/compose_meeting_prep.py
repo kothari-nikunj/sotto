@@ -332,10 +332,8 @@ def _loop_line(email: str, identity, name: str, loops: list) -> str:
         return ""
     status = _s(it.get("status")) or "open"
     line = f"    loop: {status} — {what}"
-    try:
-        n = int(it.get("times_surfaced") or 0)
-    except (TypeError, ValueError):
-        n = 0
+    from delivery_effects import delivered_surface_count
+    n = delivered_surface_count(it)
     if n > 1:
         line += f" (surfaced {n}x)"
     return line

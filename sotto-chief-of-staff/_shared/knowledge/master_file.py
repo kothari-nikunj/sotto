@@ -19,6 +19,7 @@ worth 100 status updates", so this is the load-bearing one).
 CLI (all output JSON):
     master_file.py get                                # the whole file ("" if absent)
     master_file.py sections                           # {section: char_count}
+    master_file.py prioritize --text T                # add one explicitly confirmed priority
     master_file.py set     --section N [--text T]     # replace a section (creates it; stdin if no --text)
     master_file.py append  --section N [--text T]     # add lines to a section (creates it)
     master_file.py remove  --section N                # delete a section
@@ -32,6 +33,7 @@ Deleting the file is the user's right: absent file = empty context, everything s
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -46,6 +48,7 @@ import jsonstore  # noqa: E402  (the ONE lock implementation)
 import knowledge as kg  # noqa: E402  (the ONE atomic-write implementation for knowledge/)
 
 MASTER_CHAR_CAP = 8000   # the file rides in EVERY brief/prep prompt — small enough to never matter
+PRIORITY_MAX = 3
 
 
 def path() -> str:
@@ -71,6 +74,22 @@ def render_for_prompt() -> str:
             "Every line below was stated by the user themselves — treat it as ground truth and "
             "resolve names/roles against it first. The Procedures section is standing "
             "instructions: apply them.\n\n" + text)
+
+
+def priorities() -> dict:
+    """Return at most three explicit priority lines with stable content ids and a set revision."""
+    _, sections = _split(read())
+    body = next((body for name, body in sections if name.strip().lower() == "priorities"), "")
+    lines = []
+    for raw in body.splitlines():
+        line = re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", raw).strip()
+        if line:
+            lines.append(line)
+    lines = lines[:PRIORITY_MAX]
+    rows = [{"id": hashlib.sha256(line.casefold().encode()).hexdigest()[:16], "text": line}
+            for line in lines]
+    revision = hashlib.sha256("\n".join(r["id"] for r in rows).encode()).hexdigest()[:16]
+    return {"revision": revision, "priorities": rows}
 
 
 # ── section machinery ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +136,10 @@ def _mutate(fn) -> dict:
 
 
 def set_section(name: str, text: str) -> dict:
+    if name.strip().lower() == "priorities":
+        nonempty = [line for line in text.splitlines() if line.strip()]
+        if len(nonempty) > PRIORITY_MAX:
+            raise ValueError(f"Priorities accepts at most {PRIORITY_MAX} explicit lines")
     def fn(pre, secs):
         out, done = [], False
         for n, b in secs:
@@ -132,6 +155,8 @@ def set_section(name: str, text: str) -> dict:
 
 
 def append_section(name: str, text: str) -> dict:
+    if name.strip().lower() == "priorities":
+        raise ValueError("Priorities is a replacement set; use set, not append")
     def fn(pre, secs):
         out, done = [], False
         for n, b in secs:
@@ -146,6 +171,30 @@ def append_section(name: str, text: str) -> dict:
     return _mutate(fn)
 
 
+def add_priority(text: str) -> dict:
+    """Add the user's explicitly confirmed line atomically, preserving every existing priority."""
+    text = text.strip()
+    if not text or "\n" in text:
+        raise ValueError("A priority must be one non-empty line")
+
+    def fn(pre, secs):
+        body = next((body for name, body in secs if name.casefold() == "priorities"), "")
+        lines = [re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", raw).strip()
+                 for raw in body.splitlines() if raw.strip()]
+        if text.casefold() in {line.casefold() for line in lines}:
+            return pre, secs
+        if len(lines) >= PRIORITY_MAX:
+            raise ValueError("Priorities is full; confirm a replacement set before changing it")
+        lines.append(text)
+        replacement = "\n".join("- " + line for line in lines)
+        found = any(name.casefold() == "priorities" for name, _ in secs)
+        updated = [(name, replacement if name.casefold() == "priorities" else value)
+                   for name, value in secs]
+        return pre, updated if found else [*updated, ("Priorities", replacement)]
+
+    return _mutate(fn)
+
+
 def remove_section(name: str) -> dict:
     def fn(pre, secs):
         return pre, [(n, b) for n, b in secs if n.lower() != name.lower()]
@@ -156,7 +205,7 @@ def remove_section(name: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("verb", choices=("get", "sections", "set", "append", "remove"))
+    ap.add_argument("verb", choices=("get", "sections", "set", "append", "remove", "prioritize"))
     ap.add_argument("--section")
     ap.add_argument("--text")
     a = ap.parse_args()
@@ -168,11 +217,14 @@ def main() -> int:
         _, secs = _split(read())
         print(json.dumps({name: len(body.strip("\n")) for name, body in secs}))
         return 0
-    if not a.section:
+    if not a.section and a.verb != "prioritize":
         print(json.dumps({"ok": False, "error": f"{a.verb} needs --section"}))
         return 2
     try:
-        if a.verb == "remove":
+        if a.verb == "prioritize":
+            print(json.dumps(add_priority(a.text or "")))
+            return 0
+        elif a.verb == "remove":
             print(json.dumps(remove_section(a.section)))
             return 0
         text = a.text if a.text is not None else sys.stdin.read()
@@ -186,6 +238,9 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"would exceed the {MASTER_CHAR_CAP}-char cap — "
                           "trim a section first (sizes below) — this file rides in every prompt",
                           "sections": e.sizes}))
+        return 2
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
         return 2
 
 

@@ -140,7 +140,9 @@ status: open                      # open|waiting|failed|blocked | resolved|dismi
 created_at: 2026-06-20
 resolved_at: 2026-06-23           # when terminal
 resolution: replied              # replied|meeting_passed|…
-times_surfaced: 2
+delivery_surface:                 # accepted brief deliveries that actually named this loop
+  schema: 1
+  delivery_keys: ["sha256:…"]     # idempotency hashes; capture/model proposals never count
 summary: "…"
 meeting_time: "Tomorrow 3pm"     # optional
 ---
@@ -276,7 +278,7 @@ the sole writer. These examples never mutate `preferences.json` or approval tier
 
 | File | Single writer | Readers |
 |---|---|---|
-| `events/work.sqlite3` (+ SQLite WAL/SHM) | `_shared/lib/work_queue.py` | Receiver admission/worker recovery; triage input ownership; health metadata |
+| `events/work.sqlite3` (+ a rollback journal on a fresh store, or `-wal`/`-shm` on one that was already WAL) | `_shared/lib/work_queue.py` | Receiver admission/worker recovery; triage input ownership; health metadata |
 | `events/work-inputs/brief-*/` | `brief_runner.py` | The same procedure and its ancillary learning follow-up; retention sweep |
 | `cache/brief-granola.json` | `brief_runner.py` | Brief preparation and composition; one-day retention sweep |
 | `.sotto-volume.json` | adapter `managed_volume.py` | Managed boot identity verification and recovery |
@@ -290,7 +292,16 @@ the sole writer. These examples never mutate `preferences.json` or approval tier
 job result has the same stable ID at both stages. Provider acceptance requires structured success
 and a provider message ID. It leaves replayable `effects_pending` metadata; finalization retries do
 not send again. Invalidation uses a separate effect phase to retry replacement admission without
-activating offers or other acceptance effects. Raw text leaves terminal rows immediately.
+activating offers or other acceptance effects. Raw text leaves terminal rows immediately, and the
+effects' per-source addressing leaves when they settle, whether they applied or were quarantined —
+a quarantined row keeps only its label, run id, acceptance receipt and failure reason.
+
+An open of `work.sqlite3` preserves whatever journal mode it already has: a store created fresh
+uses SQLite's rollback journal, a volume that predates that change keeps WAL. **Its on-disk shape
+therefore depends on the volume's age, not on the code version**, and anything that copies or
+inspects the store must look for whichever sibling files are actually present rather than assume
+one. Both modes run with `synchronous=FULL`, and schema migration shares one immediate transaction
+with every mutation.
 
 `config/source-state.json` stores `sources[id] = {status, observed_at, observed_epoch}` from
 authenticated Bridge observations. `disabled` revokes cached-source use; availability failures do

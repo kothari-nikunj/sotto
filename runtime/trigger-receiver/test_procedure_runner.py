@@ -4,12 +4,63 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 import procedure_runner
 
 PACK = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff'
+
+
+@pytest.mark.parametrize('case', ['eligible', 'disabled', 'expired', 'missing', 'guard_only',
+                                  'eligibility_only', 'partial', 'duplicate_guard', 'unknown', 'malformed'])
+def test_proactive_consumes_real_scanner_guards_before_composing(case, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_NUDGE_BUDGET', '0' if case == 'disabled' else '10')
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    monkeypatch.syspath_prepend(str(PACK / '_shared/scripts'))
+    import delivery_effects
+    import source_context
+    import compose_notification
+    monkeypatch.setattr(source_context, 'read_local', lambda: {})
+    deadline = time.time() + (-60 if case == 'expired' else 600)
+    # Use the scanner's actual producer, including its global nudge preference guard.
+    effects = delivery_effects.for_bundle({'events': [{'event': {'valid_until': deadline}}]})['effects']
+    if case == 'missing':
+        effects = []
+    elif case == 'guard_only':
+        effects = [{'kind': 'unsolicited_nudge'}]
+    elif case == 'eligibility_only':
+        effects = [e for e in effects if e['kind'] == 'eligibility']
+    elif case == 'duplicate_guard':
+        effects.append({'kind': 'unsolicited_nudge'})
+    elif case == 'unknown':
+        effects.append({'kind': 'unrecognized'})
+    elif case == 'malformed':
+        effects.append(None)
+    nudges = [{'kind': 'chase', 'detail': 'Synthetic follow-up'}]
+    if case == 'partial':
+        nudges.append({'kind': 'meeting_prep', 'detail': 'Synthetic meeting'})
+    result = {'nudges': nudges, 'quiet': False, '_eligibility': effects}
+
+    def invoke(argv, **kwargs):
+        output = 'Calendar gathered\n' if Path(argv[1]).name == 'gather_google.py' else json.dumps(result)
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', invoke)
+    composed = []
+    def compose(kind, items):
+        composed.append((kind, items))
+        return 'Synthetic follow-up'
+    monkeypatch.setattr(compose_notification, 'compose', compose)
+    request = {'pack': str(PACK), 'kind': 'proactive'}
+    if case not in ('eligible', 'disabled', 'expired'):
+        with pytest.raises(RuntimeError, match='eligibility'):
+            procedure_runner.run(request)
+    else:
+        assert procedure_runner.run(request) == ('Synthetic follow-up' if case == 'eligible' else 'NO_NUDGES')
+    assert composed == ([('proactive', nudges)] if case == 'eligible' else [])
 
 
 @pytest.mark.parametrize('mode', ['managed', 'self-host'])
@@ -53,6 +104,7 @@ def test_pulse_accepts_successful_gather_diagnostics_then_stages_source_permissi
     ({'deliver': False}, 'NO_NUDGES'),
     ({'deliver': False, 'retryable': True}, None),
     ({'deliver': True, 'items': [{'sender': 'A', 'why': 'Unanswered invitation'}],
+      'item_ids': ['digest-item-a'],
       'coverage_until': '2026-09-08T12:30:00Z',
       'effects': [{'kind': 'eligibility', 'source': 'imessage'}], 'valid_until': 2000000000},
      'Midday catch-up\n\nA: Unanswered invitation'),
@@ -74,6 +126,6 @@ def test_digest_silence_failure_and_acceptance_cutoff(result, expected, tmp_path
     assert path.exists() == bool(result.get('deliver'))
     if path.exists():
         effects = json.loads(path.read_text())['effects']
-        assert effects[0]['coverage_until'] == result['coverage_until']
+        assert effects[0] == {'kind': 'digest_accept', 'item_ids': result['item_ids']}
         assert result['effects'][0] in effects
         assert {'kind': 'eligibility', 'valid_until': result['valid_until']} in effects

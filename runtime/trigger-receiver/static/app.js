@@ -585,6 +585,7 @@
         if (seq !== state.renderSeq) return;
         var data = results[0] || {};
         var loops = results[1] && Array.isArray(results[1].loops) ? results[1].loops : [];
+        var parked = results[1] && Array.isArray(results[1].parked) ? results[1].parked : [];
         var cal = results[2];
         var research = results[3];
         var frag = document.createDocumentFragment();
@@ -610,6 +611,8 @@
 
         // Waiting on you — the loops, actionable in place
         buildLoopsSection(frag, loops, "now");
+        // Parked — kept, out of the brief; one tap brings any of them back
+        buildParkedSection(frag, parked, "now");
 
         // Today's briefs, when any have landed
         var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];
@@ -1408,9 +1411,32 @@
     return Math.floor(h / 24) + "d";
   }
 
+  /* ---------------- Parked loops (rendered by Now, only when any) ----------------
+     A loop you owe that nothing touched for two weeks parks: kept with its history,
+     out of the brief and the open count. It never expires. "keep" brings it back;
+     resolve and dismiss close it like any other row. */
+
+  function buildParkedSection(frag, parked, viewName) {
+    if (!parked.length) return;
+    var counter = { count: parked.length, cap: capCount(parked.length + " parked"), list: null };
+    frag.appendChild(ledgerCap("Parked", counter.cap,
+      "Nothing touched these in two weeks, so they left the brief. They are kept, not " +
+      "closed: keep brings one back, resolve or dismiss ends it."));
+    var list = el("div", "ledger");
+    counter.list = list;
+    for (var i = 0; i < parked.length; i++) {
+      list.appendChild(loopRow(parked[i] || {}, counter, true));
+    }
+    frag.appendChild(enterOnce(viewName, list));
+  }
+
   /* ---------------- Open loops (rendered by Now) ---------------- */
 
   function updateLoopCount(counter) {
+    if (counter.parked) {
+      counter.cap.textContent = counter.count + " parked";
+      return;
+    }
     counter.cap.textContent = counter.count === 1 ? "1 open" : counter.count + " open";
     if (counter.count === 0 && counter.list && !counter.list.querySelector(".empty-state")) {
       counter.list.appendChild(emptyState("All closed",
@@ -1418,7 +1444,8 @@
     }
   }
 
-  function loopRow(loop, counter) {
+  function loopRow(loop, counter, parked) {
+    if (parked) counter.parked = true;
     var row = el("div", "ledger-row has-dot");
     row.appendChild(statusDot(loop.status));
 
@@ -1463,9 +1490,8 @@
     }
     row.appendChild(folio);
 
-    // The deadline is the ledger's only "later": the resolver expires a loop two
-    // days past it, so moving it forward IS snoozing. Shown when set, editable
-    // either way.
+    // The deadline orders the brief and marks the row overdue; nothing expires a
+    // loop. Shown when set, editable either way.
     var deadline = typeof loop.deadline === "string" ? loop.deadline : "";
     if (deadline) {
       folio.appendChild(el("span", null, "due " + shortDate(deadline)));
@@ -1477,14 +1503,18 @@
       var errEl = el("p", "inline-error");
       errEl.hidden = true;
       var actions = el("div", "row-actions");
-      var resolveBtn, dismissBtn, dueBtn;
+      var resolveBtn, dismissBtn, dueBtn, keepBtn;
       var post = function (op) {
         errEl.hidden = true;
         resolveBtn.disabled = dismissBtn.disabled = true;
+        if (keepBtn) keepBtn.disabled = true;
         apiPost("/api/loops", { anchor_key: anchor, op: op }).then(function () {
+          // "keep" moves the row from Parked back to Waiting on you: re-render from the server.
+          if (op === "keep") return viewNow();
           removeLoopRow(row, counter);
         }).catch(function (err) {
           resolveBtn.disabled = dismissBtn.disabled = false;
+          if (keepBtn) keepBtn.disabled = false;
           if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
         });
       };
@@ -1492,7 +1522,12 @@
       dismissBtn = button("text-action", "dismiss", function () { post("dismiss"); });
       dueBtn = button("text-action", deadline ? "change the deadline" : "give it a deadline",
         function () { openDeadlineEditor(actions, errEl, anchor, deadline); });
-      append(actions, resolveBtn, dismissBtn, dueBtn);
+      if (parked) {
+        keepBtn = button("text-action", "keep", function () { post("keep"); });
+        append(actions, keepBtn, resolveBtn, dismissBtn);
+      } else {
+        append(actions, resolveBtn, dismissBtn, dueBtn);
+      }
       row.appendChild(actions);
       mainCol.appendChild(errEl);
     }
@@ -3426,6 +3461,7 @@
       if (ep === "/api/loops") {
         if (op === "resolve") return "You marked a loop resolved";
         if (op === "dismiss") return "You dismissed a loop";
+        if (op === "keep") return "You kept a parked loop";
         return "You updated a loop";
       }
       if (ep === "/api/prefs") {

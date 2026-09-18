@@ -22,7 +22,10 @@ in chat and toggling VIP in the dashboard are the same write.
 
 CLI:
   preferences.py show
-  preferences.py mute-sender <email-or-@domain>      # newsletters / noisy senders
+  preferences.py mute-sender <email | @domain | phone>  # newsletters / noisy senders / a number
+      # A phone may be written any way ("+12025550171", "+1 202 555 0171", "(202) 555-0171"): it is
+      # stored as given and normalized when it is MATCHED, so mutes already in the file keep
+      # working without a migration, and the number also matches inside a WhatsApp identifier.
   preferences.py mute-person "<display name>"        # stop flagging them in the brief
   preferences.py mute-section <section>               # e.g. birthdays, screen_time
   preferences.py tone "<short note>"                 # e.g. "keep it terse"
@@ -40,16 +43,20 @@ import json
 import os
 import re
 import sys
+from email.utils import parseaddr
 from datetime import datetime, timedelta, timezone
 
 # _shared/lib holds the shared primitives; this module is invoked as a bare script from chat, the
 # dashboard, so the path is set up here rather than assumed.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402 — THE read-modify-write lock for the volume
+# THE tree's identifier normaliser (→ textutil._normalize_identifier, last 10 digits), the same one
+# conversation_key threads by. A mute must not have a second opinion about what a number is.
+from personal_context import normalized_identifier as _normalized_identifier  # noqa: E402
 
 LISTS = ("mute_senders", "mute_people", "mute_sections", "tone_notes", "vip_people")
 # Scalar (single-value) explicit preferences. Same block, same writer, same persistence path.
-SCALARS = ("nudge_snooze_until", "brief_audio")
+SCALARS = ("nudge_snooze_until", "brief_audio", "nudge_budget")
 BRIEF_AUDIO_VALUES = ("off", "morning", "evening", "both")   # standing voice-note preference for the cron briefs
 SNOOZE_FMT = "%Y-%m-%dT%H:%M"    # minute precision, local wall clock (no offset — see snooze_active)
 # A snooze lifts when quiet hours do. "Quieter today" used to resolve to a hardcoded 6am while
@@ -164,6 +171,47 @@ def set_scalar(kind: str, value: str) -> dict:
     return _mutate(lambda ex: ex.__setitem__(kind, (value or "").strip()))
 
 
+def configured_nudge_budget() -> int:
+    """The installation's ceiling. An explicit preference may reduce it, never raise it."""
+    try:
+        return max(0, int((os.environ.get("SOTTO_NUDGE_BUDGET") or "").strip() or 4))
+    except (TypeError, ValueError):
+        return 4
+
+
+def effective_nudge_budget(explicit: dict | None = None, configured: int | None = None) -> int:
+    """Current unsolicited-nudge allowance, clamped to the configured installation maximum."""
+    ceiling = configured_nudge_budget() if configured is None else max(0, int(configured))
+    ex = explicit if isinstance(explicit, dict) else load_explicit()
+    raw = str(ex.get("nudge_budget") or "").strip()
+    if not raw:
+        return ceiling
+    try:
+        return min(ceiling, max(0, int(raw)))
+    except (TypeError, ValueError):
+        return ceiling
+
+
+def change_nudge_budget(direction: str) -> dict:
+    """Apply the user's plain volume controls: fewer halves, no sets zero, more restores default."""
+    direction = (direction or "").strip().lower()
+    if direction not in ("fewer", "no", "more"):
+        raise ValueError("nudge-budget takes fewer|no|more")
+    ceiling = configured_nudge_budget()
+
+    def _apply(ex):
+        current = effective_nudge_budget(ex, ceiling)
+        if direction == "fewer":
+            value = current if current == 0 else current // 2
+        elif direction == "no":
+            value = 0
+        else:
+            value = ceiling
+        ex["nudge_budget"] = str(value)
+
+    return _mutate(_apply)
+
+
 # ── Cadence: the nudge snooze ("quieter today" / "quiet until 3" / "back to normal") ───────────────
 
 def _now_local_best_effort() -> datetime:
@@ -263,17 +311,53 @@ def snooze_active(now_local: datetime | None = None, explicit: dict | None = Non
     return _naive(now_local or _now_local_best_effort()) < until
 
 
-def sender_is_muted(email: str, muted: list) -> bool:
-    """True if an email address matches a muted sender — exact address, or an '@domain' / 'domain'
-    suffix rule (so '@news.acme.com' or 'news.acme.com' mutes the whole sending domain)."""
-    e = (email or "").strip().lower()
+# A phone-shaped local part, by the same rule textutil._normalize_identifier applies.
+_PHONE_LOCAL = re.compile(r"[\d\s\-\+\(\)]+")
+# Chat transports that carry a real phone number in front of the '@'. Everything else with an '@'
+# is an email (matched as an email), a '@lid' privacy handle, or a '@g.us' room — never a person's
+# number, and never something a phone mute may catch.
+_PHONE_JID_DOMAINS = ("s.whatsapp.net", "whatsapp.net", "c.us")
+PHONE_KEY_MIN_DIGITS = 7                 # shorter than this is a shortcode, not a phone number
+
+
+def _phone_key(value: str) -> str:
+    """The comparison key for a phone number written any way — "+1 202 555 0171", "(202) 555-0171",
+    "12025550171", or the phone in front of a WhatsApp JID — and "" for anything that is not one.
+
+    One normaliser for the whole tree: personal_context.normalized_identifier (→
+    textutil._normalize_identifier, last 10 digits), so a mute and a conversation agree on what a
+    number is. Keys are compared whole, so a mute on +12025550171 never catches ...0170."""
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    local, sep, domain = v.partition("@")
+    if sep and domain not in _PHONE_JID_DOMAINS:
+        return ""
+    if not _PHONE_LOCAL.fullmatch(local):
+        return ""
+    key = _normalized_identifier(local)
+    return key if len(key) >= PHONE_KEY_MIN_DIGITS else ""
+
+
+def sender_is_muted(identifier: str, muted: list) -> bool:
+    """True if a sender identifier matches a muted sender.
+
+    An email matches exactly, or by an '@domain' / 'domain' suffix rule (so '@news.acme.com' or
+    'news.acme.com' mutes the whole sending domain). A phone number matches however either side is
+    written — the mute and the identifier are compared through the tree's one identifier normaliser
+    (_phone_key), which also reads the number out of a WhatsApp JID. Email matching is unchanged:
+    a phone key only ever compares against another phone key."""
+    e = (identifier or "").strip().lower()
     if not e:
         return False
+    key = _phone_key(e)
     dom = e.split("@", 1)[1] if "@" in e else e
     for m in muted:
         m = (m or "").strip().lower()
         if not m:
             continue
+        if key and _phone_key(m) == key:      # a number, in whatever format either side stored it
+            return True
         if m.startswith("@"):                 # "@domain" → whole-domain rule
             rule = m[1:]
             if rule and (dom == rule or dom.endswith("." + rule)):
@@ -285,6 +369,34 @@ def sender_is_muted(email: str, muted: list) -> bool:
             if dom == m or dom.endswith("." + m):
                 return True
     return False
+
+
+def proactively_muted(sender: str, event: dict, explicit: dict) -> bool:
+    """THE current-mute predicate for every communication surface: the event funnel's ingress gate,
+    the release valve, a tapped promotion and the midday digest all ask this one question, so
+    "stop surfacing X" cannot drop yesterday's queued message and still let today's ring through.
+
+    `sender` is triage's resolved display name; event fields retain transport identifiers. Names
+    are exact and case-insensitive. Sender rules reuse sender_is_muted, including domain rules and
+    phone numbers in any format (and the phone inside a WhatsApp JID).
+    """
+    explicit = explicit if isinstance(explicit, dict) else {}
+    name = (sender or "").strip().lower()
+    if name and any(name == str(person or "").strip().lower()
+                    for person in (explicit.get("mute_people") or [])):
+        return True
+    if not isinstance(event, dict):
+        return False
+    identifiers = []
+    for key in ("handle", "contact_jid", "sender_jid", "phone", "email", "address"):
+        value = str(event.get(key) or "").strip()
+        if value:
+            identifiers.append(value)
+    from_value = str(event.get("from") or "").strip()
+    if from_value:
+        identifiers.extend(v for v in (from_value, parseaddr(from_value)[1]) if v)
+    return any(sender_is_muted(value, explicit.get("mute_senders") or [])
+               for value in identifiers)
 
 
 _CLI = {
@@ -315,6 +427,13 @@ def main():
         print(json.dumps(_mutate(lambda ex: ex.__setitem__("tone_notes", [])))); return
     if cmd == "unsnooze-nudges":
         print(json.dumps(set_scalar("nudge_snooze_until", ""))); return
+    if cmd == "nudge-budget":
+        value = (sys.argv[2] if len(sys.argv) > 2 else "").strip().lower()
+        try:
+            print(json.dumps(change_nudge_budget(value)))
+        except ValueError as e:
+            print(json.dumps({"error": str(e)})); sys.exit(2)
+        return
     if cmd == "brief-audio":
         # One sentence: your briefs arrive as voice notes too, whenever you say so — off | morning
         # | evening | both. The text brief is always delivered regardless; voice is in addition.

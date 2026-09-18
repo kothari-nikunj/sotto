@@ -4,9 +4,11 @@ reply-on-another-channel matching (phone last-10 / email / WhatsApp JID), anchor
 UTC-offset cases (the strptime(...[:19]) off-by-one this suite pins the fix for)."""
 import importlib.util
 import os
+import re
 import sys
 from datetime import datetime
 
+import pytest
 import yaml
 
 HERE = os.path.dirname(__file__)
@@ -48,66 +50,10 @@ def _loop(tmp_path, key, **fm):
 
 # ── cross-channel reply matching (phone last-10 / email / JID) ─────────────────
 
-def test_reply_resolves_via_phone_last10_format_mismatch(tmp_path, monkeypatch):
-    # Loop tracks "+1 (415) 555-2222"; the outgoing iMessage handle is bare "4155552222".
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", contact_identifier="+1 (415) 555-2222", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "imessage": [{"is_from_me": True, "handle": "4155552222",
-                      "timestamp": "2026-06-23 20:00:00", "text": "done"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
-    assert "iMessage" in out["resolved"][0]["resolution_evidence"]
 
 
-def test_email_loop_resolves_via_whatsapp_jid_through_contacts(tmp_path, monkeypatch):
-    # Loop is an EMAIL reply owed to dhruv@acme.com; the user answered him on WhatsApp. The JID's
-    # phone prefix must match the contact's phone (email→name→phone expansion, then last-10 vs JID).
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", channel="gmail", contact_name="Dhruv",
-          contact_identifier="dhruv@acme.com", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "contacts": [{"name": "Dhruv", "emails": ["dhruv@acme.com"], "phones": ["+1 415 555 2222"]}],
-        "whatsapp": [{"is_from_me": True, "contact_jid": "14155552222@s.whatsapp.net",
-                      "timestamp": "2026-06-23 21:00:00", "text": "sent it"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
-    assert "WhatsApp" in out["resolved"][0]["resolution_evidence"]
 
 
-def test_a_reply_you_sent_by_email_closes_the_debt(tmp_path, monkeypatch):
-    """Email is a channel. The gather's in:sent lane lands in the payload flagged isSent; before
-    this the only email path was a thread-id list the agent hand-assembled, so the 11pm reply from
-    the phone was still "open" at 6:30 and got a draft of the mail already sent."""
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", channel="gmail", contact_name="Victor", contact_identifier="victor@acme.com",
-          created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "emails": [
-        {"from": "Me <me@mine.com>", "to": "Victor Yeung <victor@acme.com>", "cc": "",
-         "date": "2026-06-23T23:10:00-07:00", "body": "allocation is fine at 200k", "isSent": True}]}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
-    assert out["resolved"][0]["resolution_evidence"] == "Outgoing email to victor@acme.com"
-    # a sent mail to someone ELSE, an inbound mail from them, or one from BEFORE the loop: still open
-    for email in ({"from": "Me <me@mine.com>", "to": "other@acme.com", "date": "2026-06-23T23:10:00-07:00",
-                   "body": "x", "isSent": True},
-                  {"from": "Victor <victor@acme.com>", "to": "me@mine.com",
-                   "date": "2026-06-23T23:10:00-07:00", "body": "any word?"},
-                  {"from": "Me <me@mine.com>", "to": ["victor@acme.com"], "labels": ["SENT"],
-                   "date": "2026-06-23T01:00:00+00:00", "body": "earlier"}):
-        _env(tmp_path, monkeypatch)
-        for f in (tmp_path / "knowledge" / "continuity").glob("*.md"):
-            f.unlink()
-        _loop(tmp_path, "k", channel="gmail", contact_name="Victor",
-              contact_identifier="victor@acme.com", created_at="2026-06-23 08:00:00")
-        assert cr.resolve({"today": "2026-06-24", "emails": [email]}, NOW)["resolved"] == [], email
-    # …and a Cc, a list-shaped To, or the SENT label all count
-    _env(tmp_path, monkeypatch)
-    for f in (tmp_path / "knowledge" / "continuity").glob("*.md"):
-        f.unlink()
-    _loop(tmp_path, "k", channel="gmail", contact_name="Victor", contact_identifier="victor@acme.com",
-          created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "emails": [
-        {"from": "Me <me@mine.com>", "to": ["lp@fund.com"], "cc": ["Victor <victor@acme.com>"],
-         "labels": ["SENT"], "date": "2026-06-23T23:10:00-07:00", "body": "looping Victor"}]}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
 
 
 def test_a_briefs_own_action_is_stamped_with_the_brief_that_minted_it(tmp_path, monkeypatch):
@@ -127,43 +73,6 @@ def test_a_briefs_own_action_is_stamped_with_the_brief_that_minted_it(tmp_path, 
     assert len(out["active"]) == 2
 
 
-def test_they_replied_without_delivering_restarts_the_chase_clock(tmp_path, monkeypatch):
-    """Day 10: Maya CALLS to say legal has it until the 16th. Day 11 must not chase her. Any
-    inbound from the counterpart restarts the clock — to the date they named, else the usual days
-    — and no chase is counted; only substance closes the loop."""
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "w", action_type="waiting_on", contact_name="Maya Chen",
-          contact_identifier="+14155552222", created_at="2026-06-15 08:00:00",
-          chased_count=1, last_chased_at="2026-06-20", chase_after="2026-06-23")
-    # a call from her — no text at all — pushes the clock the default 3 days from today
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "calls": [{"is_outgoing": False, "phone": "4155552222", "timestamp": "2026-06-23 16:00:00"}]}}, NOW)
-    row, = out["active"]
-    assert out["resolved"] == [] and row["chased_count"] == 1
-    assert row["chase_after"] == "2026-06-27" and row["last_heard_at"] == "2026-06-23 16:00:00"
-    assert not any("chase_pending" in r for r in _all_fm(tmp_path))
-    # the same call again tomorrow changes nothing (remembered); a later text naming a date does
-    out = cr.resolve({"today": "2026-06-25", "local": {
-        "calls": [{"is_outgoing": False, "phone": "4155552222", "timestamp": "2026-06-23 16:00:00"}]}},
-        datetime(2026, 6, 25, 9, 0, 0))
-    assert out["active"][0]["chase_after"] == "2026-06-27"
-    out = cr.resolve({"today": "2026-06-25", "local": {
-        "imessage": [{"is_from_me": False, "handle": "4155552222", "timestamp": "2026-06-25 08:30:00",
-                      "text": "legal still has it, will send by the 16th of July"}]}},
-        datetime(2026, 6, 25, 9, 0, 0))
-    row = out["active"][0]
-    assert row["chase_after"] == "2026-07-16" and row["last_heard_at"] == "2026-06-25 08:30:00"
-    assert out["resolved"] == []                                   # a promise is not a delivery
-    # …and the model's ledger line says so
-    import render_local as rl
-    note = rl._chase_note(row)
-    assert "they replied" in note and "next check 2026-07-16" in note
-    # a substantive delivery still closes it
-    out = cr.resolve({"today": "2026-06-26", "local": {
-        "imessage": [{"is_from_me": False, "handle": "4155552222", "timestamp": "2026-06-26 08:30:00",
-                      "text": "here it is, fully executed: https://drive.example.com/contract.pdf"}]}},
-        datetime(2026, 6, 26, 9, 0, 0))
-    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
 
 
 def test_promised_dates_are_read_from_plain_words():
@@ -189,14 +98,6 @@ def test_an_rsvp_ask_never_opens_a_ledger_row(tmp_path, monkeypatch):
     assert out["active"] == [] and _all_fm(tmp_path) == []
 
 
-def test_callback_resolves_via_whatsapp_call_jid(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", action_type="call_back", channel="phone",
-          contact_identifier="+14155559999", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "whatsapp_calls": [{"is_outgoing": True, "jid": "14155559999@s.whatsapp.net",
-                            "timestamp": "2026-06-23 19:00:00"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["called"]
 
 
 def test_incoming_or_earlier_messages_do_not_resolve(tmp_path, monkeypatch):
@@ -242,11 +143,43 @@ def test_short_or_mismatched_numbers_never_false_positive(tmp_path, monkeypatch)
     assert out["resolved"] == []
 
 
+# ── the answer gate, outgoing: a bare pleasantry is contact, not payment ─────────
+# Same cutoff as the inbound mirror (`_inbound_cutoff`); a LOWER content bar than the delivery one,
+# because direction decides how a debt the user owes closes: any real message is an answer, and only
+# a pleasantry on its own ("Happy birthday!", "thanks!", "👍") is not. ANY outgoing message used to
+# close the loop.
+
+def test_short_real_replies_still_close_the_debt_and_bare_pleasantries_do_not():
+    # The predicate on its own, because the fixtures above and below only cover the two ends.
+    for answer in ("sent the LOI", "Thursday works!", "yes", "I'll send it Friday",
+                   "Happy birthday! deck coming Friday", "Confirmed, see you Tuesday."):
+        assert cr._is_answer(answer), answer
+    for contact in ("Happy birthday!", "happy new year", "thanks so much", "Thanks!", "ok", "👍",
+                    "🎉🎉", "congrats!!", "lol", "hope you're well", ""):
+        assert not cr._is_answer(contact), contact
+
+def test_a_birthday_text_does_not_close_a_document_you_owe(tmp_path, monkeypatch):
+    # The replay probe's `birthday_is_not_fulfillment`: "Happy birthday!" paid off the pricing doc.
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "k", contact_identifier="+14155552222", created_at="2026-06-23 08:00:00",
+          summary="Send the pricing document")
+    out = cr.resolve({"today": "2026-06-24", "local": {
+        "imessage": [{"is_from_me": True, "handle": "4155552222",
+                      "timestamp": "2026-06-23 20:00:00", "text": "Happy birthday!"}]}}, NOW)
+    assert out["resolved"] == [] and [a["anchor_key"] for a in out["active"]] == ["k"]
+
+
+
+
+
+
+
+
 # ── anchor_key dedup ───────────────────────────────────────────────────────────
 
-def test_anchor_dedup_across_phone_formats_bumps_times_surfaced(tmp_path, monkeypatch):
+def test_anchor_dedup_across_phone_formats_does_not_claim_delivery(tmp_path, monkeypatch):
     # The same owed reply re-extracted next brief with a differently-formatted phone → ONE loop,
-    # times_surfaced bumped (not a duplicate file).
+    # dedupes without claiming either model proposal was delivered to the user.
     _env(tmp_path, monkeypatch)
     cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "reply", "channel": "imessage", "contactName": "Jo",
@@ -256,7 +189,8 @@ def test_anchor_dedup_across_phone_formats_bumps_times_surfaced(tmp_path, monkey
         {"type": "reply", "channel": "imessage", "contactName": "Jo",
          "contactIdentifier": "4155551234", "contextSummary": "Jo asked about Thursday"}]}, NOW)
     assert len(out["active"]) == 1
-    assert out["active"][0]["times_surfaced"] == 2
+    assert "times_surfaced" not in out["active"][0]
+    assert "delivery_surface" not in out["active"][0]
     files = list((tmp_path / "knowledge" / "continuity").glob("*.md"))
     assert len(files) == 1
 
@@ -277,16 +211,6 @@ def test_anchor_thread_id_beats_contact_and_family_groups_types(tmp_path, monkey
 
 # ── 7-day age expiry ───────────────────────────────────────────────────────────
 
-def test_age_expiry_boundaries(tmp_path, monkeypatch):
-    # today 2026-06-24 → cutoff 2026-06-17: created BEFORE it expires; ON it survives.
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "old8", contact_name="Old", created_at="2026-06-16")     # 8 days → expired
-    _loop(tmp_path, "edge7", contact_name="Edge", created_at="2026-06-17")   # exactly 7 → survives
-    _loop(tmp_path, "new6", contact_name="New", created_at="2026-06-18")     # 6 days → active
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert [e["contact_name"] for e in out["expired"]] == ["Old"]
-    assert {a["contact_name"] for a in out["active"]} == {"Edge", "New"}
-    assert out["expired"][0]["resolution"] == "expired"
 
 
 def test_cutoffs_derive_from_payload_today_not_wall_clock(tmp_path, monkeypatch):
@@ -311,28 +235,10 @@ def test_snoozed_loop_hidden_then_resurfaces(tmp_path, monkeypatch):
     assert [a["contact_name"] for a in back["active"]] == ["Zoe"]
 
 
-def test_snooze_does_not_shield_from_resolution(tmp_path, monkeypatch):
-    # A snoozed loop the user then actually answers still resolves (resolution runs before snooze).
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", contact_identifier="+14155552222", created_at="2026-06-23 08:00:00",
-          snoozed_until="2026-07-15")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "imessage": [{"is_from_me": True, "handle": "4155552222",
-                      "timestamp": "2026-06-23 20:00:00"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
 
 
 # ── deadline grace ─────────────────────────────────────────────────────────────
 
-def test_deadline_two_day_grace_boundaries(tmp_path, monkeypatch):
-    # today 2026-06-24 → deadline cutoff 2026-06-22: a deadline 3 days ago expires; the 2-day-old
-    # one is still within grace.
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "past", contact_name="Past", created_at="2026-06-23", deadline="2026-06-21")
-    _loop(tmp_path, "grace", contact_name="Grace", created_at="2026-06-23", deadline="2026-06-22")
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert [(e["contact_name"], e["resolution"]) for e in out["expired"]] == [("Past", "deadline_passed")]
-    assert {a["contact_name"] for a in out["active"]} == {"Grace"}
 
 
 def test_old_loop_with_a_future_deadline_does_not_age_expire(tmp_path, monkeypatch):
@@ -452,17 +358,6 @@ def test_s_stringifies_dates_as_iso():
 
 # ── calendar-event scheduling resolution (offset starts, naive now) ────────────
 
-def test_scheduled_meeting_resolves_with_offset_start_and_naive_now(tmp_path, monkeypatch):
-    # The gathered event carries a Z offset while resolve() got a NAIVE now — the old
-    # strptime/naive-compare path could both misparse and crash-compare. Must resolve cleanly.
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", contact_name="Dana", contact_identifier="dana@x.com",
-          created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "calendar_events": [{"summary": "Coffee", "start": "2026-06-25T06:30:00Z",
-                             "attendees": [{"email": "dana@x.com"}]}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["scheduled_meeting"]
-    assert "Coffee" in out["resolved"][0]["resolution_evidence"]
 
 
 def test_calendar_event_outside_14d_window_does_not_resolve(tmp_path, monkeypatch):
@@ -502,25 +397,6 @@ def test_empty_frontmatter_file_is_not_adopted(tmp_path, monkeypatch):
 
 # ── terminal anchors re-open when the person comes back ────────────────────────
 
-def test_new_action_reopens_terminal_anchor(tmp_path, monkeypatch):
-    # The person replied again the day AFTER their loop resolved: the new action used to be
-    # absorbed (times_surfaced bump) while step 2 `continue`d on the terminal status — the
-    # person vanished for the whole retention window.
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "imessage:follow_up:id:4155550000", status="resolved", resolution="replied",
-          resolved_at="2026-06-23", created_at="2026-06-16", summary="old ask", times_surfaced=3)
-    out = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"action_type": "reply", "channel": "imessage", "contact_name": "Someone",
-         "contact_identifier": "+14155550000", "summary": "they followed up again"}]}, NOW)
-    assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["status"] == "open"
-    assert it["summary"] == "they followed up again"          # refreshed from the new action
-    assert it["created_at"].startswith("2026-06-24 ")         # age clock restarted, to a real instant
-    assert it["reopened_at"] == "2026-06-24"
-    assert it["prior_resolution"] == "replied"                # history kept
-    assert "resolution" not in it and "resolved_at" not in it
-    assert it["times_surfaced"] == 4
 
 
 def test_terminal_anchor_without_new_action_stays_terminal(tmp_path, monkeypatch):
@@ -531,36 +407,19 @@ def test_terminal_anchor_without_new_action_stays_terminal(tmp_path, monkeypatch
     assert out["active"] == [] and out["resolved"] == []       # untouched, not re-opened
 
 
+
+
+
+
 # ── reply_* type variants (the FLEX schema leaves `type` a free string) ────────
 
-def test_reply_message_variant_resolves_cross_channel(tmp_path, monkeypatch):
-    # Gemini emits reply_message/reply_email alongside the documented "reply" — the loop must
-    # still self-resolve when the user answers on any channel (it used to fall through the
-    # ("reply","follow_up","follow_up_stale") gate and live to its 7-day expiry).
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", action_type="reply_message",
-          contact_identifier="+1 (415) 555-2222", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "imessage": [{"is_from_me": True, "handle": "4155552222",
-                      "timestamp": "2026-06-23 20:00:00", "text": "done"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
-    assert "iMessage" in out["resolved"][0]["resolution_evidence"]
 
 
-def test_reply_email_variant_resolves_cross_channel(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", action_type="reply_email", channel="gmail", contact_name="Dhruv",
-          contact_identifier="dhruv@acme.com", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "contacts": [{"name": "Dhruv", "emails": ["dhruv@acme.com"], "phones": ["+1 415 555 2222"]}],
-        "whatsapp": [{"is_from_me": True, "contact_jid": "14155552222@s.whatsapp.net",
-                      "timestamp": "2026-06-23 20:00:00", "text": "sent it"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
 
 
 def test_reply_variants_collapse_to_one_anchor_family(tmp_path, monkeypatch):
     # reply vs reply_message vs reply_email must produce the SAME anchor key, so the same owed
-    # reply re-extracted under a variant spelling bumps times_surfaced instead of duplicating.
+    # reply re-extracted under a variant spelling dedupes without counting model proposals.
     base = {"channel": "imessage", "contact_identifier": "+14155551234", "contact_name": "Jo"}
     keys = {cr.compute_anchor_key({**base, "action_type": t})
             for t in ("reply", "reply_message", "reply_email", "call-back", "followup")}
@@ -578,21 +437,12 @@ def test_reply_variants_collapse_to_one_anchor_family(tmp_path, monkeypatch):
         {"type": "reply_message", "channel": "imessage", "contactName": "Jo",
          "contactIdentifier": "+14155551234", "contextSummary": "Jo asked about Thursday"}]}, NOW)
     assert len(out["active"]) == 1
-    assert out["active"][0]["times_surfaced"] == 2
+    assert "times_surfaced" not in out["active"][0]
+    assert "delivery_surface" not in out["active"][0]
 
 
 # ── MCP tool-result wrapper around `local` (shared unwrap) ─────────────────────
 
-def test_wrapped_local_still_drives_cross_channel_resolution(tmp_path, monkeypatch):
-    # The SKILL says to pass the read_local JSON AS-IS — which may be the raw MCP tool-result
-    # wrapper. Resolution must see through it (it used to see {} and never resolve anything).
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "k", contact_identifier="+1 (415) 555-2222", created_at="2026-06-23 08:00:00")
-    wrapped = {"content": [{"type": "text", "text":
-               '{"imessage": [{"is_from_me": true, "handle": "4155552222", '
-               '"timestamp": "2026-06-23 20:00:00", "text": "done"}]}'}]}
-    out = cr.resolve({"today": "2026-06-24", "local": wrapped}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["replied"]
 
 
 def test_meeting_actions_never_create_ledger_entries(tmp_path, monkeypatch):
@@ -630,44 +480,10 @@ def _waiting(tmp_path, key="w", **fm):
     _loop(tmp_path, key, **fm)
 
 
-def test_inbound_delivery_with_a_link_resolves_a_waiting_on(tmp_path, monkeypatch):
-    # They actually sent it — the mirrored branch of the outgoing check, same identifier machinery.
-    # created_at is DATE-ONLY on purpose: that is what legacy ledger files carry.
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, contact_identifier="+1 (415) 555-2222", created_at="2026-06-22")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "imessage": [{"is_from_me": False, "handle": "4155552222",
-                      "timestamp": "2026-06-23 20:00:00",
-                      "text": "here you go https://drive.example.com/contract"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
-    assert "Inbound iMessage" in out["resolved"][0]["resolution_evidence"]
 
 
-def test_inbound_delivery_via_whatsapp_jid_through_contacts(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, channel="gmail", contact_name="Dhruv",
-             contact_identifier="dhruv@acme.com", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "contacts": [{"name": "Dhruv", "emails": ["dhruv@acme.com"], "phones": ["+1 415 555 2222"]}],
-        "whatsapp": [{"is_from_me": False, "contact_jid": "14155552222@s.whatsapp.net",
-                      "timestamp": "2026-06-23 21:00:00",
-                      "text": "attached the revised deck — final_deck.pdf"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
-    assert "Inbound WhatsApp" in out["resolved"][0]["resolution_evidence"]
 
 
-def test_inbound_email_on_the_tracked_thread_resolves_a_waiting_on(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, channel="email", contact_name="Dana", contact_identifier="dana@acme.com",
-             source_thread_id="thread-1", created_at="2026-06-23 08:00:00")
-    out = cr.resolve({"today": "2026-06-24", "emails": {"emails": [{
-        "from": "Dana Roe <dana@acme.com>", "threadId": "thread-1",
-        "date": "Tue, 23 Jun 2026 20:00:00 -0700",
-        "body": "Here is the signed agreement: https://drive.example.com/agreement.pdf",
-        "isSent": False,
-    }]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
-    assert "Inbound email" in out["resolved"][0]["resolution_evidence"]
 
 
 def test_email_delivery_requires_counterpart_thread_substance_and_inbound_direction(tmp_path, monkeypatch):
@@ -749,37 +565,10 @@ def test_inbound_from_the_wrong_person_or_before_creation_never_closes(tmp_path,
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_substance_gate_shape():
-    assert cr._is_delivery("here's the deck https://x.co/d") is True
-    assert cr._is_delivery("revenue was 4.2M, margin 61%, and the board deck is attached") is True
-    assert cr._is_delivery("ok") is False
-    assert cr._is_delivery("") is False
-    assert cr._is_delivery("I'll get you the numbers by EOD, promise, they are nearly done") is False
 
 
-def test_waiting_on_never_age_expires_while_reply_and_follow_up_still_do(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "r", action_type="reply", contact_name="Owed", created_at="2026-06-10")
-    _loop(tmp_path, "f", action_type="follow_up", contact_name="Chase", created_at="2026-06-10")
-    _waiting(tmp_path, "w", contact_name="Acme", created_at="2026-06-10")
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert {e["contact_name"] for e in out["expired"]} == {"Owed", "Chase"}
-    assert [a["contact_name"] for a in out["active"]] == ["Acme"]
 
 
-def test_a_deadline_never_kills_a_waiting_on(tmp_path, monkeypatch):
-    # A due date makes a debt owed to the USER more protected, not less: the passed deadline makes
-    # it chase-eligible immediately, and sotto-loops §B is still the only exit.
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "w", created_at="2026-06-23", deadline="2026-06-20")
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert out["expired"] == []
-    assert out["active"][0]["chase_pending"] == "2026-06-24"
-    # …while what the USER owes keeps the 2-day deadline grace exactly as before.
-    _loop(tmp_path, "owed", action_type="reply", contact_name="Owed",
-          created_at="2026-06-23", deadline="2026-06-20")
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert [(e["contact_name"], e["resolution"]) for e in out["expired"]] == [("Owed", "deadline_passed")]
 
 
 def test_chase_stamp_ripens_at_the_knob_and_stops_after_two(tmp_path, monkeypatch):
@@ -852,30 +641,8 @@ def test_post_deadline_waiting_on_escalates_immediately(tmp_path, monkeypatch):
     assert out["active"][0]["chase_pending"] == "2026-06-24"
 
 
-def test_identifier_less_waiting_on_expires_as_unreachable_after_its_chases(tmp_path, monkeypatch):
-    # A commitment with no to_email can neither self-resolve (no inbound to match) nor be nudged
-    # (no channel). After its chase quota it leaves the ledger with a resolution that says why.
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "w", contact_identifier=None, created_at="2026-06-14", chased_count=1)
-    assert cr.resolve({"today": "2026-06-24"}, NOW)["expired"] == []      # one chase left
-    _waiting(tmp_path, "w", contact_identifier=None, created_at="2026-06-14", chased_count=2)
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert [e["resolution"] for e in out["expired"]] == ["unreachable"]
-    # …an identifier-ful one is never expired this way
-    _waiting(tmp_path, "k", contact_identifier="+14155552222", created_at="2026-06-14", chased_count=2)
-    assert [e["anchor_key"] for e in cr.resolve({"today": "2026-06-25"},
-                                                datetime(2026, 6, 25, 9, 0, 0))["expired"]] == []
 
 
-def test_delivery_resolves_a_chased_waiting_on_and_stops_the_chase(tmp_path, monkeypatch):
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "w", contact_identifier="+14155552222", created_at="2026-06-16",
-             chased_count=1, last_chased_at="2026-06-20", chase_after="2026-06-23")
-    out = cr.resolve({"today": "2026-06-24", "local": {
-        "imessage": [{"is_from_me": False, "handle": "4155552222", "timestamp": "2026-06-23 20:00:00",
-                      "text": "sorry for the wait — signed and sent: https://x.co/signed"}]}}, NOW)
-    assert [r["resolution"] for r in out["resolved"]] == ["delivered"]
-    assert out["active"] == []
 
 
 def test_chase_knob_is_read_from_the_environment(tmp_path, monkeypatch):
@@ -887,19 +654,6 @@ def test_chase_knob_is_read_from_the_environment(tmp_path, monkeypatch):
     assert cr.chase_after_days() == 3
 
 
-def test_reopened_waiting_on_gets_a_fresh_chase_clock(tmp_path, monkeypatch):
-    # They came back with a NEW promise after the old one closed — chasing it "for the third time"
-    # would be counting last month's silence against this week's ask.
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "imessage:follow_up:id:4155550000", status="resolved", resolution="delivered",
-             resolved_at="2026-06-20", created_at="2026-06-10", chased_count=2,
-             last_chased_at="2026-06-18", chase_after="2026-06-21")
-    out = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"action_type": "waiting_on", "channel": "imessage", "contact_name": "Acme",
-         "contact_identifier": "+14155550000", "summary": "the new quote"}]}, NOW)
-    it = out["active"][0]
-    assert it["status"] == "open" and it["created_at"].startswith("2026-06-24 ")
-    assert all(k not in it for k in ("chased_count", "chase_after", "last_chased_at", "chase_pending"))
 
 
 # ── direction is load-bearing, so direction gets its own anchor ────────────────
@@ -924,38 +678,10 @@ def test_a_delegation_and_a_reply_owed_to_the_same_person_are_two_debts(tmp_path
                                   "action_type": "waiting_on"}) == "thread:T:waiting_on"
 
 
-def test_a_live_anchor_refreshes_its_ask_but_never_its_direction(tmp_path, monkeypatch):
-    """Re-capturing a live loop updates what it's ABOUT (the brief was describing Monday's ask on
-    Friday) — but not its type: a genuine change of direction forks its own anchor instead."""
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "imessage:waiting_on:id:4155551234", contact_identifier="+14155551234",
-             summary="old ask", created_at="2026-06-20")
-    out = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"type": "waiting_on", "channel": "imessage", "contactName": "Acme",
-         "contactIdentifier": "+14155551234", "contextSummary": "the signed contract",
-         "contextAsk": "chase it", "deadlineDate": "2026-06-30"}]}, NOW)
-    it = out["active"][0]
-    assert it["summary"] == "the signed contract" and it["ask"] == "chase it"
-    assert it["deadline"] == "2026-06-30" and it["action_type"] == "waiting_on"
-    assert it["times_surfaced"] == 2 and it["created_at"] == "2026-06-20"   # age clock unchanged
 
 
 # ── the two passes: resolve before the brief, merge after it ───────────────────
 
-def test_resolve_only_and_merge_only_split_the_pass(tmp_path, monkeypatch):
-    """The brief must reason about a ledger resolved as of THIS run, and only the merge needs the
-    brief's output — so --resolve-only runs before compose and --merge-only after."""
-    _env(tmp_path, monkeypatch)
-    _loop(tmp_path, "old", action_type="reply", contact_name="Ancient", created_at="2026-06-01")
-    pre = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"type": "reply", "channel": "imessage", "contactName": "New",
-         "contactIdentifier": "+14155559999", "contextSummary": "New asked for the memo"}]}, NOW, merge=False)
-    assert [e["contact_name"] for e in pre["expired"]] == ["Ancient"]   # resolution ran…
-    assert pre["active"] == [] and "New" not in str(pre)                # …the new action did not
-    post = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"type": "reply", "channel": "imessage", "contactName": "New",
-         "contactIdentifier": "+14155559999", "contextSummary": "New asked for the memo"}]}, NOW, resolve_existing=True, merge=True)
-    assert [a["contact_name"] for a in post["active"]] == ["New"]
 
 
 def test_merge_only_writes_the_new_action_and_resolves_nothing(tmp_path, monkeypatch):
@@ -994,20 +720,6 @@ def _group_ask(name, summary, identifier=None, **extra):
     return a
 
 
-def test_a_group_ask_anchors_on_the_group_id_whatever_the_model_called_it(tmp_path, monkeypatch):
-    """Two captures of ONE group ask — one carrying the group's id under a made-up label, one
-    carrying the right label and no id — are one debt, keyed `gid:<chat_guid>`. The row also takes
-    the group's OWN name, so the brief prints what the thread is actually called."""
-    _env(tmp_path, monkeypatch)
-    out = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL, "new_actions": [
-        _group_ask("Intro Group", "asked about Insight Partners", identifier=GROUP_GUID),
-        _group_ask("FPV / Piston", "asked for contact info")]}, NOW)
-    assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["anchor_key"] == f"waiting_on:gid:{GROUP_GUID.lower()}"
-    assert it["contact_name"] == "FPV / Piston"          # the group's name, not the invented label
-    assert it["group_id"] == GROUP_GUID.lower()
-    assert it["times_surfaced"] == 2
 
 
 def test_a_group_id_counts_only_when_the_snapshot_actually_contains_it(tmp_path, monkeypatch):
@@ -1020,15 +732,6 @@ def test_a_group_id_counts_only_when_the_snapshot_actually_contains_it(tmp_path,
     assert not out["active"][0].get("group_id")
 
 
-def test_a_thread_id_never_outranks_a_verified_group_id(tmp_path, monkeypatch):
-    """The same group ask reached us with a thread id one day and without it the next — which is
-    how one debt became two rows. A verified group is the counterpart, so it anchors on the group."""
-    _env(tmp_path, monkeypatch)
-    out = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL, "new_actions": [
-        _group_ask("FPV / Piston", "asked for intros", emailThreadId=GROUP_GUID),
-        _group_ask("FPV / Piston", "asked for contact info")]}, NOW)
-    assert len(out["active"]) == 1
-    assert out["active"][0]["anchor_key"] == f"waiting_on:gid:{GROUP_GUID.lower()}"
 
 
 def test_a_person_ask_is_untouched_by_group_identity(tmp_path, monkeypatch):
@@ -1045,35 +748,6 @@ def test_a_person_ask_is_untouched_by_group_identity(tmp_path, monkeypatch):
 
 # ── the migration: one idempotent heal, and a dedupe is never a receipt ────────
 
-def test_migration_reanchors_a_label_keyed_group_row_and_folds_the_duplicate(tmp_path, monkeypatch):
-    """The volume already carries rows minted under a label. On the next resolve the joinable ones
-    re-anchor onto the group's id; two that turn out to be one debt become one — the OLDER row's
-    age and chase clock survive, the NEWER words win, and the loser closes as bookkeeping."""
-    _env(tmp_path, monkeypatch)
-    _waiting(tmp_path, "imessage:waiting_on:name:fpv /", channel="imessage",
-             contact_name="FPV / Piston", contact_identifier=None, summary="asked about Insight",
-             created_at="2026-06-21", chased_count=1, last_chased_at="2026-06-22",
-             times_surfaced=3)
-    _waiting(tmp_path, f"imessage:waiting_on:gid:{GROUP_GUID.lower()}", channel="imessage",
-             contact_name="FPV / Piston", contact_identifier=None, group_id=GROUP_GUID.lower(),
-             summary="asked for contact info", created_at="2026-06-23", times_surfaced=1)
-    out = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL}, NOW)
-    assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["anchor_key"] == f"waiting_on:gid:{GROUP_GUID.lower()}"
-    assert it["created_at"] == "2026-06-21"              # the older row's age is the debt's age
-    assert it["summary"] == "asked for contact info"     # the newer words are the live ask
-    assert it["chased_count"] == 1 and it["last_chased_at"] == "2026-06-22"   # older chase clock
-    assert it["times_surfaced"] == 3
-    # the loser is terminal, says why, and points at the survivor
-    fms = _all_fm(tmp_path)
-    loser = [f for f in fms if f.get("resolution") == "merged_duplicate"]
-    assert len(loser) == 1
-    assert loser[0]["status"] in cr.TERMINAL and loser[0]["resolved_at"] == "2026-06-24"
-    assert loser[0]["merged_into"] == f"waiting_on:gid:{GROUP_GUID.lower()}"
-    # a dedupe is bookkeeping, not an outcome that moved: it is never a "resolved" receipt
-    assert loser[0]["status"] != "resolved"
-    assert [r["resolution"] for r in out["resolved"]] == []
 
 
 def test_the_migration_is_idempotent(tmp_path, monkeypatch):
@@ -1090,7 +764,7 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
 
 def test_the_migration_never_resurrects_a_closed_loop(tmp_path, monkeypatch):
     """The user already closed this group's debt. A label-keyed row must not be folded into it (that
-    would rewrite a terminal loop) — it is left exactly where it is."""
+    would rewrite a terminal loop) — the duplicate retires and the original closure stays intact."""
     _env(tmp_path, monkeypatch)
     _waiting(tmp_path, f"imessage:waiting_on:gid:{GROUP_GUID.lower()}", channel="imessage",
              contact_name="FPV / Piston", group_id=GROUP_GUID.lower(), status="resolved",
@@ -1098,8 +772,13 @@ def test_the_migration_never_resurrects_a_closed_loop(tmp_path, monkeypatch):
     _waiting(tmp_path, "imessage:waiting_on:name:fpv /", channel="imessage",
              contact_name="FPV / Piston", contact_identifier=None, created_at="2026-06-22")
     out = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL}, NOW)
-    assert [a["anchor_key"] for a in out["active"]] == ["imessage:waiting_on:name:fpv /"]
-    assert not any(f.get("resolution") == "merged_duplicate" for f in _all_fm(tmp_path))
+    assert out["active"] == []
+    entries = _all_fm(tmp_path)
+    original = next(f for f in entries if f.get("anchor_key") == f"imessage:waiting_on:gid:{GROUP_GUID.lower()}")
+    duplicate = next(f for f in entries if f.get("anchor_key") == "imessage:waiting_on:name:fpv /")
+    assert original["status"] == "resolved" and original["resolution"] == "delivered"
+    assert duplicate["status"] == "dismissed" and duplicate["resolution"] == "merged_duplicate"
+    assert duplicate["merged_into"] == original["anchor_key"]
 
 
 def test_no_snapshot_means_no_migration(tmp_path, monkeypatch):
@@ -1129,27 +808,6 @@ def _person_file(tmp_path, cid, name, identifiers=()):
 SPENCER = "c_5pencer01"
 
 
-def test_three_threads_from_one_person_are_one_debt(tmp_path, monkeypatch):
-    """Tonight's Spencer rows: 'deck + coffee + Onshore intro', 'deck after call + intro request',
-    'intro to Onshore' — three email threads, one person, one debt. The newest words win, the
-    oldest age stands, and times_surfaced counts every capture."""
-    _env(tmp_path, monkeypatch)
-    _person_file(tmp_path, SPENCER, "Spencer Schneier", ["spencer@onshore.vc"])
-    out = cr.resolve({"today": "2026-06-24", "new_actions": [
-        {"type": "reply", "channel": "gmail", "contactName": "Spencer Schneier",
-         "contactIdentifier": "spencer@onshore.vc", "emailThreadId": "thr_a",
-         "contextSummary": "deck + coffee"},
-        {"type": "follow_up", "channel": "gmail", "contactName": "Spencer Schneier",
-         "contactIdentifier": "spencer@onshore.vc", "emailThreadId": "thr_b",
-         "contextSummary": "deck after the call"},
-        {"type": "reply", "channel": "gmail", "contactName": "Spencer Schneier",
-         "emailThreadId": "thr_c", "contextSummary": "intro to Onshore"}]}, NOW)
-    assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["anchor_key"] == f"follow_up:cid:{SPENCER}"
-    assert it["summary"] == "intro to Onshore"           # the newest capture is the live ask
-    assert it["times_surfaced"] == 3
-    assert len(_all_fm(tmp_path)) == 1                   # one file, not three
 
 
 def test_a_name_only_capture_and_an_email_capture_are_the_same_person(tmp_path, monkeypatch):
@@ -1178,34 +836,6 @@ def test_an_unresolvable_counterpart_keeps_todays_behavior(tmp_path, monkeypatch
     assert cr.resolve_canonical_id("Board sync", "", idx) == ""      # a label is not a person
 
 
-def test_the_migration_folds_the_same_debt_and_keeps_the_older_age(tmp_path, monkeypatch):
-    """Tonight's Farid pair — the SAME debt shown as both 2d and 7d. They fold: the oldest
-    created_at is the debt's true age, the newest words are the live ask, the loser renders as
-    nothing, and running it twice changes nothing more."""
-    _env(tmp_path, monkeypatch)
-    _person_file(tmp_path, "c_farid001", "Farid Mirmohseni", ["farid@x.com"])
-    _loop(tmp_path, "email:follow_up:name:farid mirmohseni", channel="gmail",
-          contact_name="Farid Mirmohseni", contact_identifier=None, summary="the older ask",
-          created_at="2026-06-17", chased_count=1, times_surfaced=4)          # 7d
-    _loop(tmp_path, "thread:thr_farid", channel="gmail", contact_name="Farid",
-          contact_identifier="farid@x.com", source_thread_id="thr_farid",
-          summary="the newer ask", created_at="2026-06-22")                   # 2d
-    out = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert len(out["active"]) == 1
-    it = out["active"][0]
-    assert it["anchor_key"] == "follow_up:cid:c_farid001"
-    assert it["created_at"] == "2026-06-17"          # 7d — the debt's true age, not the 2d row's
-    assert it["summary"] == "the newer ask"          # the live words
-    assert it["chased_count"] == 1                   # a spent nudge is never forgotten
-    assert it["times_surfaced"] == 4
-    loser = [f for f in _all_fm(tmp_path) if f.get("resolution") == "merged_duplicate"]
-    assert len(loser) == 1 and loser[0]["status"] in cr.TERMINAL
-    assert [r["resolution"] for r in out["resolved"]] == []     # a dedupe is not an outcome
-    # …and idempotent: a second resolve folds nothing further and moves no dates
-    again = cr.resolve({"today": "2026-06-24"}, NOW)
-    assert [a["anchor_key"] for a in again["active"]] == [it["anchor_key"]]
-    assert again["active"][0]["created_at"] == "2026-06-17"
-    assert len(_all_fm(tmp_path)) == 2                          # survivor + the terminal loser
 
 
 def test_a_synthetic_commitment_anchor_never_collapses_onto_its_contact(tmp_path, monkeypatch):
@@ -1285,22 +915,6 @@ def _kept(tmp_path) -> dict:
     return next(f for f in _all_fm(tmp_path) if f.get("resolution") != "merged_duplicate")
 
 
-def test_the_fold_never_un_sends_a_chase(tmp_path, monkeypatch):
-    """The keeper carries two spent nudges; the older twin — the same debt captured off a second
-    thread — carries none. The fold used to copy the older row's blank chase state over the keeper's,
-    read max() as 0, and stamp a fresh chase in the same pass: a third and fourth nudge to somebody
-    already asked twice."""
-    _env(tmp_path, monkeypatch)
-    _fold_pair(tmp_path, {"chased_count": 2, "last_chased_at": "2026-06-19",
-                          "chase_after": "2026-06-22"}, {})
-    out = cr.resolve({"today": "2026-06-24", "local": {}}, NOW, merge=False)
-    kept = _kept(tmp_path)
-    assert len(out["active"]) == 1
-    assert kept["chased_count"] == 2                  # the two spent chases survive the fold
-    assert kept["last_chased_at"] == "2026-06-19"
-    assert kept["chase_after"] == "2026-06-22"
-    assert "chase_pending" not in kept                # …so the clock is NOT re-armed
-    assert kept["created_at"] == "2026-06-01 09:00:00"   # the older row is still the debt's age
 
 
 def test_the_fold_never_rewinds_the_chase_clock(tmp_path, monkeypatch):
@@ -1319,36 +933,10 @@ def test_the_fold_never_rewinds_the_chase_clock(tmp_path, monkeypatch):
     assert "chase_pending" not in kept
 
 
-def test_the_fold_keeps_a_pending_chase_and_the_hand_off_stamp(tmp_path, monkeypatch):
-    """Preserved if EITHER row has it: a chase proposed this morning is still proposed after an
-    evening fold, and a hand-off question already asked is not asked again."""
-    _env(tmp_path, monkeypatch)
-    _fold_pair(tmp_path, {}, {"chase_pending": "2026-06-24", "chased_count": 2,
-                              "handoff_asked_at": "2026-06-23"})
-    cr.resolve({"today": "2026-06-24", "local": {}}, NOW, merge=False)
-    kept = _kept(tmp_path)
-    assert kept["chase_pending"] == "2026-06-24"
-    assert kept["handoff_asked_at"] == "2026-06-23"
-    assert kept["chased_count"] == 2
 
 
 # ── phase two never writes to a dead row ──────────────────────────────────────────────────────────
 
-def test_finalize_chase_follows_the_fold_to_the_live_debt(tmp_path, monkeypatch):
-    """The chase was stamped on the row that later LOST the fold, and proactive_scan still holds its
-    anchor_key. Counting it there left the live debt at its old count — chaseable twice more — while
-    a dismissed row carried the tally. `merged_into` is the forwarding address."""
-    _env(tmp_path, monkeypatch)
-    LOSER = "thread:T-OLD:waiting_on"
-    _fold_pair(tmp_path, {}, {"chase_pending": "2026-06-24", "chased_count": 1})
-    cr.resolve({"today": "2026-06-24", "local": {}}, NOW, merge=False)
-    res = cr.finalize_chase(LOSER, NOW)
-    rows = {f["anchor_key"]: f for f in _all_fm(tmp_path)}
-    assert res["ok"] is True and res["anchor_key"] == "waiting_on:id:maya@x.com"
-    assert rows[LOSER]["resolution"] == "merged_duplicate"
-    assert rows[LOSER]["chased_count"] == 1                    # the dead row took nothing
-    assert rows["waiting_on:id:maya@x.com"]["chased_count"] == 2             # the live debt counted
-    assert rows["waiting_on:id:maya@x.com"]["last_chased_at"] == "2026-06-24"
 
 
 def test_finalize_never_writes_to_a_terminal_row(tmp_path, monkeypatch):
@@ -1422,3 +1010,156 @@ def test_a_stalled_chase_rotates_to_the_back_of_the_lane(tmp_path, monkeypatch):
     assert "chase_stalls" not in after[stamped["anchor_key"]]
     import ledger_io
     assert "chase_stalls" in ledger_io.CHASE_STATE_FIELDS       # "keep waiting" clears it too
+
+
+def test_user_closure_does_not_mute_new_requests_but_replays_stay_closed(tmp_path, monkeypatch):
+    import knowledge_edit as ke
+    _env(tmp_path, monkeypatch)
+    old = {"action_type": "reply", "channel": "gmail", "contactName": "Dana",
+           "contactIdentifier": "dana@acme.com", "contextSummary": "Send the pricing document",
+           "emailThreadId": "pricing-thread", "emailMessageId": "old-mail", "created_at": "2026-06-22 09:00:00"}
+    first = cr.resolve({"today": "2026-06-22", "new_actions": [old]}, NOW, resolve_existing=False)
+    anchor = first["active"][0]["anchor_key"]
+    ke.op_loop(anchor, "resolved", "2026-06-23")
+    # A paraphrase and a fresh extraction timestamp do not constitute a new incoming request.
+    replay = {**old, "contextSummary": "Dana is still waiting for the pricing doc", "created_at": "2026-06-24 09:00:00"}
+    assert cr.resolve({"today": "2026-06-24", "new_actions": [replay]}, NOW, resolve_existing=False)["active"] == []
+    new = {**old, "contextSummary": "Confirm the address for tomorrow lunch", "emailThreadId": "lunch-thread", "emailMessageId": "new-mail"}
+    message = {"id": "new-mail", "threadId": "lunch-thread", "from": "dana@acme.com",
+               "body": "Can you confirm the address for our lunch tomorrow?", "date": "2026-06-24T08:00:00Z"}
+    # Old evidence, a sent mail, or another person's message cannot overturn the user's closure.
+    for bad in ({**message, "date": "2026-06-22T08:00:00Z"}, {**message, "isSent": True},
+                {**message, "from": "other@acme.com"}):
+        assert cr.resolve({"today": "2026-06-24", "new_actions": [new], "emails": [bad]}, NOW, resolve_existing=False)["active"] == []
+    row, = cr.resolve({"today": "2026-06-24", "new_actions": [new], "emails": [message]}, NOW, resolve_existing=False)["active"]
+    assert row["summary"] == new["contextSummary"] and row["source_thread_id"] == "lunch-thread"
+    assert row["source_message_id"] == "new-mail" and row["created_at"] == "2026-06-24 08:00:00"
+    assert "closed_at" not in row and "resolution" not in row
+
+
+def test_new_imessage_evidence_can_reopen_after_same_day_user_closure(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "follow_up:id:4155550000", status="dismissed", resolution="user_dismissed",
+          resolved_at="2026-06-24", closed_at="2026-06-24T07:30:00Z", summary="Send the pricing doc",
+          source_refs=[{"sourceType": "imessage", "sourceId": "11"}])
+    action = {"action_type": "reply", "channel": "imessage", "contact_identifier": "+14155550000",
+              "summary": "Confirm lunch address", "evidence": [{"sourceType": "imessage", "sourceId": "12"}]}
+    message = {"rowid": 12, "handle": "+14155550000", "timestamp": "2026-06-24T08:00:00Z", "text": "What's the address for lunch?"}
+    row, = cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [message]}}, NOW, resolve_existing=False)["active"]
+    assert row["summary"] == "Confirm lunch address"
+
+
+@pytest.mark.parametrize("channel", ["imessage", "whatsapp"])
+@pytest.mark.parametrize("group", [False, True])
+def test_real_bridge_message_reaches_prompt_and_reopens_only_a_new_request(tmp_path, monkeypatch, channel, group):
+    """Bridge's LocalData has no rowid/guid. Exercise the actual prompt and ledger boundaries,
+    copying the rendered evidence as the extractor must, without inventing a database ID."""
+    import compose_brief as cb
+    import knowledge_edit as ke
+    _env(tmp_path, monkeypatch)
+    phone = "+14155550000"
+    group_id = "iMessage;+;chat12345678" if channel == "imessage" else "12345678@g.us"
+    counterpart = phone if channel == "imessage" else "14155550000@s.whatsapp.net"
+    message = {"text": "Can you confirm the lunch address?", "timestamp": "2026-06-24T08:00:00Z",
+               "is_from_me": False, "is_group_chat": group, "chat_guid": group_id if group else None,
+               "group_name": "Lunch friends" if group else None, "group_participants": []}
+    if channel == "imessage":
+        message["handle"] = counterpart
+    else:
+        message.update(contact_jid=group_id if group else counterpart, partner_name="Dana",
+                       sender_jid=counterpart if group else None)
+    local = {channel: [message], "contacts": [{"name": "Dana", "phones": [phone]}]}
+    prompt = cb.build_prompt(cb._load_prompt(), {"type": "morning", "google": {"events": []}, "local": local})
+    ref, = re.findall(r"source_id: (msg:v1:[a-f0-9]+) \| timestamp: 2026-06-24T08:00:00Z", prompt)
+    action = {"action_type": "reply", "channel": channel, "contactName": "Lunch friends" if group else "Dana",
+              "contactIdentifier": group_id if group else counterpart,
+              "contextSummary": "Confirm the lunch address", "evidence": [{"sourceType": channel, "sourceId": ref}]}
+    # Seed a closed request with the handle-style evidence older extractions really wrote.
+    old = {**action, "contextSummary": "Send pricing doc", "evidence": [{"sourceType": channel, "sourceId": counterpart}]}
+    first, = cr.resolve({"today": "2026-06-24", "local": local, "new_actions": [old]}, NOW,
+                        resolve_existing=False)["active"]
+    ke.op_loop(first["anchor_key"], "dismissed", "2026-06-24T07:30:00Z")
+    payload = {"today": "2026-06-24", "local": local, "new_actions": [action]}
+    # A rendered old message, another sender/group, outgoing traffic or the wrong source is no proof.
+    changes = [{"timestamp": "2026-06-24T07:00:00Z"}, {"is_from_me": True}]
+    changes.append({"chat_guid": "other-group"} if group else
+                   {"handle" if channel == "imessage" else "contact_jid": "+14155559999"})
+    for change in changes:
+        bad_local = {**local, channel: [{**message, **change}]}
+        if group:
+            # Keep the real group in the snapshot's identity index while replacing its evidence.
+            bad_local[channel].append({**message, "timestamp": "2026-06-24T07:00:00Z"})
+        assert cr.resolve({**payload, "local": bad_local}, NOW, resolve_existing=False)["active"] == []
+    old_message = {**message, "timestamp": "2026-06-24T07:00:00Z"}
+    old_ref = cr._render_local.message_evidence_id(old_message, channel)
+    replay = {**action, "evidence": [{"sourceType": channel, "sourceId": old_ref}]}
+    assert cr.resolve({**payload, "local": {**local, channel: [old_message]}, "new_actions": [replay]},
+                      NOW, resolve_existing=False)["active"] == []
+    for evidence in ([], [{"sourceType": "email", "sourceId": ref}]):
+        assert cr.resolve({**payload, "new_actions": [{**action, "evidence": evidence}]}, NOW,
+                          resolve_existing=False)["active"] == []
+    opened, = cr.resolve(payload, NOW, resolve_existing=False)["active"]
+    assert opened["summary"] == "Confirm the lunch address"
+    assert opened["created_at"] == "2026-06-24 08:00:00"
+    # Closing again must not turn the same extracted ask into another request.
+    ke.op_loop(opened["anchor_key"], "dismissed", "2026-06-24T08:30:00Z")
+    assert cr.resolve(payload, NOW, resolve_existing=False)["active"] == []
+
+
+def test_local_message_evidence_is_stable_and_conversation_specific():
+    from render_local import message_evidence_id
+    message = {"handle": "+14155550000", "contact_jid": "14155550000@s.whatsapp.net",
+               "timestamp": "2026-06-24T08:00:00Z", "text": "Confirm lunch?", "is_from_me": False}
+    ref = message_evidence_id(message, "imessage")
+    assert ref.startswith("msg:v1:")
+    assert message_evidence_id({**message, "resolved_name": "Different name", "sender_name": "Dana"}, "imessage") == ref
+    for changes in ({"text": "Confirm dinner?"}, {"timestamp": "2026-06-24T08:00:01Z"},
+                    {"handle": "+14155559999"}, {"is_from_me": True}, {"chat_guid": "another-group"}):
+        assert message_evidence_id({**message, **changes}, "imessage") != ref
+    assert message_evidence_id(message, "whatsapp") != ref
+    assert message_evidence_id({**message, "rowid": 12}, "imessage") == "12"
+    assert message_evidence_id({**message, "source_id": "native-12"}, "imessage") == "native-12"
+    wa_group = {**message, "chat_guid": "123@g.us", "sender_jid": "111@s.whatsapp.net"}
+    assert message_evidence_id(wa_group, "whatsapp") != message_evidence_id(
+        {**wa_group, "sender_jid": "222@s.whatsapp.net"}, "whatsapp")
+    for missing in ("handle", "timestamp", "text", "is_from_me"):
+        assert message_evidence_id({k: v for k, v in message.items() if k != missing}, "imessage") == ""
+
+
+def test_replayed_evidence_does_not_reopen_even_if_its_timestamp_changes(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    refs = [{"sourceType": "imessage", "sourceId": "11"}]
+    _loop(tmp_path, "follow_up:id:4155550000", status="dismissed", resolution="user_dismissed",
+          resolved_at="2026-06-23", summary="Old ask", source_refs=refs)
+    action = {"action_type": "reply", "channel": "imessage", "contact_identifier": "+14155550000",
+              "summary": "A paraphrase of the old ask", "evidence": refs}
+    assert cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [
+        {"rowid": 11, "handle": "+14155550000", "timestamp": "2026-06-24 08:00:00", "text": "Can you send the doc?"}]}}, NOW, resolve_existing=False)["active"] == []
+
+
+def test_group_reopen_binds_the_group_not_the_individual_sender(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    group = GROUP_GUID.lower()
+    _loop(tmp_path, f"follow_up:gid:{group}", status="dismissed", resolution="user_dismissed",
+          resolved_at="2026-06-23", group_id=group, contact_name="FPV / Piston", contact_identifier=None,
+          summary="The old group request")
+    action = {"action_type": "reply", "channel": "imessage", "group_id": group,
+              "contact_name": "FPV / Piston", "summary": "Confirm next week's dinner address",
+              "evidence": [{"sourceType": "imessage", "sourceId": "12"}]}
+    message = {"rowid": 12, "handle": "+14155551111", "timestamp": "2026-06-24 08:00:00",
+               "text": "Can you confirm the dinner address?", "chat_guid": GROUP_GUID, "is_group_chat": True}
+    wrong = {**message, "chat_guid": "iMessage;+;another-group"}
+    assert cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [wrong]}}, NOW, resolve_existing=False)["active"] == []
+    row, = cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [message]}}, NOW, resolve_existing=False)["active"]
+    assert row["summary"] == action["summary"] and row["group_id"] == group
+
+
+def test_group_evidence_cannot_reopen_a_persons_one_to_one_request(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "follow_up:id:4155550000", status="dismissed", resolution="user_dismissed",
+          resolved_at="2026-06-23", summary="Old direct ask")
+    action = {"action_type": "reply", "channel": "imessage", "contact_identifier": "+14155550000",
+              "summary": "An unrelated group request", "evidence": [{"sourceType": "imessage", "sourceId": "12"}]}
+    message = {"rowid": 12, "handle": "+14155550000", "timestamp": "2026-06-24 08:00:00",
+               "text": "Can someone send that doc?", "chat_guid": GROUP_GUID, "is_group_chat": True}
+    assert cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [message]}}, NOW, resolve_existing=False)["active"] == []

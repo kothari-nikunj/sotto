@@ -197,3 +197,49 @@ def test_terminal_item_ownership_can_be_replaced_only_by_explicit_ingress_retry(
         work_queue.enqueue(tmp_path, 'event', payload, item_keys=['a'])
     assert work_queue.enqueue(tmp_path, 'event', payload, item_keys=['a'], retry_terminal=True) == job
     assert work_queue.get(tmp_path, job)['status'] == 'pending'
+
+
+def test_pending_unsolicited_nudge_rechecks_zero_and_freshness_but_held_survives(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_NUDGE_BUDGET', '4')
+    now = datetime.now(timezone.utc)
+    fresh = {'event': {'source': 'imessage', 'timestamp': now.isoformat()}}
+    descriptor = effects.for_bundle({'events': [fresh]})
+    assert effects.valid(descriptor['effects'], now.timestamp() + 29 * 60)
+    assert not effects.valid(descriptor['effects'], now.timestamp() + 31 * 60)
+    urgent = effects.for_bundle({'events': [{**fresh,
+        'relevance_deadline': (now + timedelta(minutes=5)).isoformat()}]})
+    assert effects.valid(urgent['effects'], now.timestamp() + 4 * 60)
+    assert not effects.valid(urgent['effects'], now.timestamp() + 6 * 60)
+    held = effects.for_bundle({'events': [{**fresh, 'deferred_class': 'meeting_hold'}]})
+    assert effects.valid(held['effects'], now.timestamp() + 5 * 3600)
+    (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'nudge_budget': '0'}}))
+    assert not effects.valid(held['effects'], now.timestamp() + 5 * 3600)
+
+
+def test_class_deadlines_are_not_shortened_to_the_generic_message_window():
+    now = datetime.now(timezone.utc)
+    event = {'source': 'phonecalls', 'timestamp': now.isoformat()}
+    missed = effects.for_bundle({'events': [{'event': event, 'class': 'missed_call'}]})
+    assert missed['valid_until'] is None
+    assert effects.valid(missed['effects'], now.timestamp() + 45 * 60)
+
+    meeting = now + timedelta(hours=2)
+    changed = effects.for_bundle({'events': [{
+        'event': {'source': 'calendar_change', 'timestamp': now.isoformat(),
+                  'start': meeting.isoformat()},
+        'class': 'calendar_change',
+    }]})
+    assert changed['valid_until'] == meeting.timestamp()
+    assert effects.valid(changed['effects'], now.timestamp() + 45 * 60)
+    assert not effects.valid(changed['effects'], meeting.timestamp())
+
+
+def test_user_requested_promotion_survives_zero_but_ordinary_bundle_does_not(tmp_path):
+    now = datetime.now(timezone.utc)
+    row = {'event': {'source': 'imessage', 'timestamp': now.isoformat()}}
+    requested = effects.for_bundle({'_user_requested_delivery': True, 'events': [row]})
+    ordinary = effects.for_bundle({'events': [row]})
+    (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'nudge_budget': '0'}}))
+    assert effects.valid(requested['effects'], now.timestamp() + 60)
+    assert not effects.valid(ordinary['effects'], now.timestamp() + 60)
