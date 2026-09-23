@@ -686,6 +686,15 @@ consented email, calendar, direct-message and active-loop subjects select older 
 exact canonical identifiers and contact aliases. Display names and nearby timestamps never join
 conversations. Topic hints are data used for lexical ranking, never instructions.
 
+Chat's person lookup adds `--person-coverage`. A missing graph match returns guidance
+from existing consent and source-health records: check permitted historical sources,
+verify an unknown connection, or explain an unavailable source. An empty recent
+snapshot does not mean older history is empty. Ask and People check the indicated
+sources before answering a past-conversation question, then name the sources and
+material coverage limits if nothing is found. A missing graph match is never proof that
+a previous conversation did not happen. The lookup itself makes no network or
+model call and does not change memory; existing query consumers retain their output.
+
 Each person block shares a **5-fact compact / 15-fact expanded** allowance across primary and
 related facts, with a **3,200-character compact / 8,000-character expanded** ceiling. Explicit
 corrections rank first, followed by topical overlap, primary-person context and curated summary

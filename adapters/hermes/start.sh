@@ -68,15 +68,18 @@ done
 #    ~/.hermes at the volume. Managed mode already verified its mount and identity above.
 #    Must run BEFORE any `hermes …` call below (they read $HOME/.hermes).
 HSTATE="${SOTTO_DATA:-/data}/hermes"
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  python3 /app/adapters/hermes/managed_identity.py verify-home "$HSTATE"
+fi
 if [ ! -d "$HSTATE" ]; then
   mkdir -p "$HSTATE"
   cp -a /root/.hermes/. "$HSTATE/" 2>/dev/null || true          # first boot: seed everything from image
-  cp -a /app/hermes-image-version.txt "$HSTATE/.image-version" 2>/dev/null || true
+  cp -a --remove-destination /app/hermes-image-version.txt "$HSTATE/.image-version" 2>/dev/null || true
 fi
 mkdir -p "$HSTATE/skills" "$HSTATE/skill-bundles"
 rm -rf "$HSTATE/skills/sotto" 2>/dev/null || true                # always refresh skills from the image
 cp -a /root/.hermes/skills/sotto "$HSTATE/skills/" 2>/dev/null || true
-cp -a /root/.hermes/skill-bundles/sotto.yaml "$HSTATE/skill-bundles/" 2>/dev/null || true
+cp -a --remove-destination /root/.hermes/skill-bundles/sotto.yaml "$HSTATE/skill-bundles/" 2>/dev/null || true
 # Hermes runtime upgrade (opt-in): the volume's ~/.hermes copy is seeded ONCE, so if the installer
 # keeps any runtime under ~/.hermes, a rebuilt image with newer Hermes can be shadowed by the stale
 # volume copy. SOTTO_REFRESH_HERMES=1 re-seeds every INSTALLER-owned top-level entry (from the
@@ -97,7 +100,7 @@ if [ "${SOTTO_REFRESH_HERMES:-0}" = "1" ] && [ -s /app/hermes-image-manifest.txt
       cp -a "/root/.hermes/$entry" "$HSTATE/" 2>/dev/null || true
     fi
   done < /app/hermes-image-manifest.txt
-  cp -a /app/hermes-image-version.txt "$HSTATE/.image-version" 2>/dev/null || true
+  cp -a --remove-destination /app/hermes-image-version.txt "$HSTATE/.image-version" 2>/dev/null || true
   echo "[sotto]   refresh done — you can unset SOTTO_REFRESH_HERMES now."
 fi
 # Refresh the Sotto persona block in the persisted SOUL.md too — otherwise persona/guardrail changes
@@ -120,17 +123,33 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
 fi
 rm -rf /root/.hermes && ln -s "$HSTATE" /root/.hermes            # ~/.hermes → volume (sessions persist)
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-  chown -R sotto:sotto "${SOTTO_DATA:-/data}"
   rm -rf /home/sotto/.hermes
   ln -s "$HSTATE" /home/sotto/.hermes
-  chown -h sotto:sotto /home/sotto/.hermes
   export HOME=/home/sotto USER=sotto LOGNAME=sotto
+  export HERMES_HOME="$HSTATE"
   export SOTTO_SKILLS_ROOT=/app/sotto-skills
   python3 /app/adapters/hermes/managed_config.py "$HSTATE"
-  # managed_config runs as the root supervisor and creates mode-0600 runtime files. Hand the
-  # completed state back to the shared workload UID before either child starts.
-  chown -R sotto:sotto "${SOTTO_DATA:-/data}"
+  # Hand tenant state to the workload UID, then protect the product SOUL and
+  # each directory entry through which that SOUL can be replaced.
+  chown -hR sotto:sotto "${SOTTO_DATA:-/data}"
+  python3 /app/adapters/hermes/managed_identity.py protect "${SOTTO_DATA:-/data}" "$HSTATE" /home/sotto/.hermes
+  # Hermes' own home setup chmods the active home to 0700. Run boot-time CLI
+  # calls as the workload UID so they cannot undo the supervisor's boundary.
+  hermes() { run_as_sotto env HOME=/home/sotto HERMES_HOME="$HSTATE" /usr/local/bin/hermes "$@"; }
 fi
+run_as_sotto() {
+  env -u SOTTO_CONTROL_TOKEN -u BRIDGE_TOKEN -u PHOTON_PROJECT_SECRET \
+    -u GOOGLE_OAUTH_CLIENT_JSON -u GOOGLE_AUTH_CODE -u SOTTO_SETUP_CODE \
+    -u SOTTO_TRIGGER_TOKEN -u GRANOLA_API_TOKEN \
+    runuser -u sotto -- "$@"
+}
+runtime_python() {
+  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+    run_as_sotto python3 "$@"
+  else
+    python3 "$@"
+  fi
+}
 
 # Version visibility: every boot log states the Hermes actually RUNNING vs the one this image was
 # built with. If they differ, the volume seed is shadowing a newer image — SOTTO_REFRESH_HERMES=1
@@ -167,10 +186,19 @@ fi
 # check "is my Hermes current?" from a terminal, and $SOTTO_DATA/cache/hermes-version.json is the
 # right place to check it from the browser. Rewritten every boot, read by nothing else, never state.
 # (Quotes/backslashes stripped so the hand-built JSON can't be broken by a version string.)
-mkdir -p "${SOTTO_DATA:-/data}/cache" 2>/dev/null || true
-printf '{"running":"%s","image":"%s"}\n' \
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  run_as_sotto mkdir -p "${SOTTO_DATA:-/data}/cache" 2>/dev/null || true
+else
+  mkdir -p "${SOTTO_DATA:-/data}/cache" 2>/dev/null || true
+fi
+VERSION_JSON="$(printf '{"running":"%s","image":"%s"}' \
   "$(printf '%s' "$RUN_HVER" | tr -d '"\\')" "$(printf '%s' "$IMG_HVER" | tr -d '"\\')" \
-  > "${SOTTO_DATA:-/data}/cache/hermes-version.json" 2>/dev/null || true
+)"
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  printf '%s\n' "$VERSION_JSON" | run_as_sotto tee "${SOTTO_DATA:-/data}/cache/hermes-version.json" >/dev/null 2>&1 || true
+else
+  printf '%s\n' "$VERSION_JSON" > "${SOTTO_DATA:-/data}/cache/hermes-version.json" 2>/dev/null || true
+fi
 
 # Brief resilience: default an AUTOMATIC fallback model for the brief's direct Gemini call.
 # compose_brief.py's call_gemini activates the fallback when SOTTO_FALLBACK_MODEL alone is set — it
@@ -224,7 +252,7 @@ if [ "$SOTTO_CRON_DELIVER" = "photon" ]; then
       /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar/index.mjs || \
       echo "[sotto] gallery unavailable; keeping ordinary text delivery"
   fi
-  python3 /app/adapters/hermes/photon_setup.py "$HSTATE"
+  runtime_python /app/adapters/hermes/photon_setup.py "$HSTATE"
   python3 /app/adapters/hermes/photon_probe_compat.py \
     /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar/stream-staleness.mjs
 fi
@@ -315,7 +343,7 @@ hermes_set_if_supported() {
 if [ -n "${BRIDGE_TOKEN:-}" ]; then
   # --derive-mcp: Hermes is handed HMAC(root, "sotto-mcp"), never the root — the agent talks to
   # prompt-injectable content, and with only the derived bearer it cannot act as the Bridge.
-  python3 /app/adapters/hermes/configure_mcp.py --url "http://127.0.0.1:${PORT:-8787}/mcp" \
+  runtime_python /app/adapters/hermes/configure_mcp.py --url "http://127.0.0.1:${PORT:-8787}/mcp" \
     --token "$BRIDGE_TOKEN" --derive-mcp --config "$HOME/.hermes/config.yaml"
   echo "[sotto] sotto-local → reverse relay (tunnel-free); the Mac dials out to /bridge/poll."
 fi
@@ -404,7 +432,7 @@ hermes config set delegation.max_concurrent_children "$RESEARCH_CONCURRENCY" >/d
 # Gemini) with an empty model. Write it straight into config.yaml (authoritative; survives version key
 # drift) and also try the CLI form. Tasks per the Hermes docs: vision, web_extract, tts_audio_tags,
 # session_search, plus compression, title_generation, approval, skills_hub, mcp, triage_specifier.
-python3 - "$HOME/.hermes/config.yaml" <<'PY' || true
+runtime_python - "$HOME/.hermes/config.yaml" <<'PY' || true
 import sys, yaml
 p = sys.argv[1]
 try:
@@ -471,13 +499,14 @@ done
 # Tapbacks (owner ask, Aug 2026): with the progress stream off, the reaction IS the acknowledgment
 # — Hermes reacts on YOUR message: 👀 when it starts working, ✅ when the reply lands, ❌ on an
 # error (Telegram Bot API replaces the bot's reaction atomically, so you only ever see one).
-# Photon uses the same lifecycle with native 👍/👎 outcomes; 👀 is a custom emoji tapback.
+# Photon uses contextual working icons, then directly replaces with ✅ / ⚠️ / ⏸️.
+# Short thanks keep ❤️. Its shared adapter never removes before replacing a status tapback.
 # This acknowledges reply delivery, not completion of a business action. WhatsApp is unsupported.
 # Hermes ships reactions off; Sotto turns them on — SOTTO_REACTIONS=0 restores off.
 if [ "${SOTTO_REACTIONS:-1}" = "1" ]; then
   export PHOTON_REACTIONS=true
   hermes config set telegram.reactions true >/dev/null 2>&1 || true
-  echo "[sotto] tapbacks: on — 👀 working · ✅ replied · ❌ error (Telegram; Photon uses 👍/👎 outcomes; SOTTO_REACTIONS=0 to disable)"
+  echo "[sotto] tapbacks: on — 👀 working · ✅ replied · ❌ error (Telegram; Photon uses contextual icons, then ✅ / ⚠️ / ⏸️; SOTTO_REACTIONS=0 to disable)"
 else
   export PHOTON_REACTIONS=false
   hermes config set telegram.reactions false >/dev/null 2>&1 || true
@@ -507,7 +536,8 @@ if hermes sessions list >/dev/null 2>&1; then
   # ONE implementation, shared with the receiver's nightly archive: the hex/uuid grep this loop
   # used to run matched none of Hermes' real ids (20260903_033026_65967d, cron_…), so it archived
   # 0 sessions at every boot for a week and no session ever reset (Sep 3, 2026).
-  python3 /app/trigger-receiver/sessions.py || echo "[sotto] fresh-per-deploy: session archive failed — persona updates reach chat only after /new"
+  runtime_python /app/trigger-receiver/sessions.py || \
+    echo "[sotto] fresh-per-deploy: session archive failed — persona updates reach chat only after /new"
 else
   echo "[sotto] fresh-per-deploy: sessions CLI unavailable — persona updates reach chat only after /new"
 fi
@@ -542,7 +572,7 @@ fi
 CRONS_JSON="${SOTTO_CRONS_JSON:-/app/adapters/hermes/crons.json}"
 # One reconciler owns boot convergence and live timezone changes. It removes only crons.json system
 # jobs (plus retired Sotto markers), fences every user-* routine, and recreates the enabled spec.
-python3 /app/adapters/hermes/reconcile_crons.py \
+runtime_python /app/adapters/hermes/reconcile_crons.py \
   --spec "$CRONS_JSON" --deliver "$SOTTO_CRON_DELIVER" \
   || echo "[sotto] WARNING: cron reconciliation did not complete; next boot will retry"
 
@@ -559,13 +589,47 @@ hermes cron list 2>&1 | head -40 | sed 's/^/[sotto]   /' || echo "[sotto]   (her
 #      the chat id); WhatsApp needs WHATSAPP_ALLOWED_USERS + WHATSAPP_HOME_CHANNEL, your number, e.g.
 #      15551234567. Every gateway variable travels the one prefix loop below — none is special-cased.
 ENVF="$HOME/.hermes/.env"
-touch "$ENVF"
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  run_as_sotto touch "$ENVF"
+else
+  touch "$ENVF"
+fi
+managed_env_update() {
+  runtime_python - "$ENVF" "$1" "$2" "${3:-}" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path, operation, key, value = Path(sys.argv[1]), *sys.argv[2:]
+lines = path.read_text().splitlines() if path.exists() else []
+lines = [line for line in lines if not line.startswith(key + '=')]
+if operation == 'set':
+    lines.append(key + '=' + value)
+fd, filename = tempfile.mkstemp(prefix='.env-', dir=path.parent)
+try:
+    with os.fdopen(fd, 'w') as stream:
+        stream.write('\n'.join(lines) + '\n')
+        os.fchmod(stream.fileno(), 0o600)
+    os.replace(filename, path)
+finally:
+    Path(filename).unlink(missing_ok=True)
+PY
+}
 upsert_env() {  # replace any existing KEY= line, then append the new value
+  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+    managed_env_update set "$1" "$2"
+    return
+  fi
   grep -v "^$1=" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
   mv "$ENVF.tmp" "$ENVF"
   printf '%s=%s\n' "$1" "$2" >> "$ENVF"
 }
 drop_env() {    # remove any existing KEY= line, leaving nothing behind
+  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+    managed_env_update drop "$1"
+    return
+  fi
   grep -v "^$1=" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
   mv "$ENVF.tmp" "$ENVF"
 }
@@ -615,7 +679,7 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   # The receiver (uid sotto, started in step 2) may already spawn a brief child while boot continues;
   # the files this rewrite just replaced are root:root 0600 until the step-5 hand-off, so give them
   # back at once rather than leaving a window where a `hermes -z` child cannot read its own config.
-  chown sotto:sotto "$HSTATE/config.yaml" "$HSTATE/SOUL.md" "$HSTATE/.env"
+  chown -h sotto:sotto "$HSTATE/config.yaml" "$HSTATE/.env"
 fi
 
 # 3.7) Google Workspace auth — DETERMINISTIC + headless. Doing this through the agent breaks: every
@@ -633,6 +697,9 @@ if [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
     GSETUP_PY=/app/adapters/hermes/google_setup.py
   fi
   PYBIN=$(command -v python || command -v python3)
+  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+    PYBIN=runtime_python
+  fi
   if [ -z "$GSETUP_PY" ]; then
     echo "[sotto] Google: setup.py not found (google-workspace skill missing?) — skipping."
   elif "$PYBIN" "$GSETUP_PY" --check >/dev/null 2>&1; then
@@ -640,7 +707,11 @@ if [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
     rm -f "$GAUTH_URL_FILE" 2>/dev/null || true
   else
     CS="$HOME/.hermes/google_client_secret.json"
-    printf '%s' "$GOOGLE_OAUTH_CLIENT_JSON" > "$CS"
+    if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+      printf '%s' "$GOOGLE_OAUTH_CLIENT_JSON" | run_as_sotto tee "$CS" >/dev/null
+    else
+      printf '%s' "$GOOGLE_OAUTH_CLIENT_JSON" > "$CS"
+    fi
     "$PYBIN" "$GSETUP_PY" --client-secret "$CS" >/dev/null 2>&1 || true
     if [ -n "${GOOGLE_AUTH_CODE:-}" ]; then
       echo "[sotto] Google: exchanging auth code…"
@@ -656,7 +727,13 @@ if [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
         echo "[sotto] Google: generating auth URL (one time)…"
         "$PYBIN" "$GSETUP_PY" --auth-url --services email,calendar --format json || true
       fi
-      [ -f "$HOME/.hermes/google_oauth_last_url.txt" ] && cp "$HOME/.hermes/google_oauth_last_url.txt" "$GAUTH_URL_FILE" 2>/dev/null || true
+      if [ -f "$HOME/.hermes/google_oauth_last_url.txt" ]; then
+        if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+          run_as_sotto cp "$HOME/.hermes/google_oauth_last_url.txt" "$GAUTH_URL_FILE" 2>/dev/null || true
+        else
+          cp "$HOME/.hermes/google_oauth_last_url.txt" "$GAUTH_URL_FILE" 2>/dev/null || true
+        fi
+      fi
       if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
         GQS="$(setup_qs)"
         echo "[sotto] ➜ Authorize Google: https://${RAILWAY_PUBLIC_DOMAIN}/google/auth${GQS}"
@@ -676,7 +753,7 @@ elif [ -n "${GRANOLA_MCP_CMD:-}" ]; then
   read -ra GTOK <<< "$GRANOLA_MCP_CMD"
   GARGS=()
   for a in "${GTOK[@]:1}"; do GARGS+=("--arg=$a"); done   # =form handles args starting with '-'
-  if python3 /app/adapters/hermes/configure_mcp.py --name granola --command "${GTOK[0]}" "${GARGS[@]}" \
+  if runtime_python /app/adapters/hermes/configure_mcp.py --name granola --command "${GTOK[0]}" "${GARGS[@]}" \
        --env "GRANOLA_API_TOKEN=${GRANOLA_API_TOKEN:-}" \
        --env "ACAI_GRANOLA_API_TOKEN=${GRANOLA_API_TOKEN:-}" \
        --env "GRANOLA_DOCUMENT_SOURCE=remote" \
@@ -764,12 +841,13 @@ fi
 #    a coordinated TERM stops both process groups cleanly. Persistent jobs/outbox survive restart.
 #    (No reconnect watchdog needed in reverse mode: the relay's /mcp is always up locally, so Hermes
 #    never loses the sotto-local binding — a sleeping Mac just means tool calls return "offline".)
-python3 /app/adapters/hermes/notification_config.py "$HSTATE" "$SOTTO_CRON_DELIVER"
-python3 /app/adapters/hermes/web_config.py "$HSTATE"
+runtime_python /app/adapters/hermes/notification_config.py "$HSTATE" "$SOTTO_CRON_DELIVER"
+runtime_python /app/adapters/hermes/web_config.py "$HSTATE"
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-  # Boot-time Hermes commands above run under the root supervisor and use atomic replacements.
-  # Transfer only artifacts still owned by root; do not recursively rewrite active receiver files.
-  find "$HSTATE" -xdev -user root -exec chown sotto:sotto {} +
+  # Hand off any remaining supervisor-created tenant artifacts. Boot-time Hermes
+  # commands already run as sotto; keep the sticky home and SOUL root-owned.
+  find "$HSTATE" -xdev ! -path "$HSTATE" ! -path "$HSTATE/SOUL.md" \
+    -user root -exec chown -h sotto:sotto {} +
 fi
 # Re-print the setup link LAST: the receiver printed it in step 0.5, but ~400 lines of boot log +
 # the ASCII QR bury it, and ONBOARDING tells users to find this exact line in the deploy logs.

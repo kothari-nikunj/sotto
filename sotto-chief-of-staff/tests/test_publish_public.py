@@ -34,6 +34,7 @@ def _fixture(tmp_path: Path, docker_exit: int = 0):
     docker.write_text(
         "#!/usr/bin/env bash\n"
         "if [ \"${1:-}\" = info ]; then exit 0; fi\n"
+        "if [ \"$*\" = \"buildx version\" ]; then exit 0; fi\n"
         f"printf '%s\\n' \"$*\" >> \"${{DOCKER_CALLS}}\"\nexit {docker_exit}\n",
         encoding="utf-8",
     )

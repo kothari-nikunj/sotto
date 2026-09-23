@@ -22,7 +22,7 @@ def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     owner = '+15555550100'
     env = {'SOTTO_MODEL_PROXY_URL': 'https://proxy.example', 'SOTTO_MODEL_PROXY_TOKEN': 'tenant-token',
            'PHOTON_HOME_CHANNEL': owner, 'PHOTON_ALLOWED_USERS': owner}
-    (tmp_path / '.env').write_text('GOOGLE_AI_API_KEY=root\nWHATSAPP_ENABLED=false\nPHOTON_STREAM_SILENCE_PROBE_MS=600000\nBRIDGE_TOKEN=bridge\n')
+    (tmp_path / '.env').write_text('GOOGLE_AI_API_KEY=root\nWHATSAPP_ENABLED=false\nPHOTON_STREAM_SILENCE_PROBE_MS=600000\nBRIDGE_TOKEN=bridge\nHERMES_HOME=/tmp/stale-home\n')
     (tmp_path / 'config.yaml').write_text(yaml.safe_dump({
         'auxiliary': {'vision': {'api_key': 'root', 'base_url': 'https://old.example'}},
         'fallback_providers': [{'provider': 'openrouter'}],

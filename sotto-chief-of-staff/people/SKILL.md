@@ -16,7 +16,7 @@ The People tab, as a conversation. PORT SOURCE: people analytics + attention que
 > Script paths are absolute under `$HOME/.hermes/skills/sotto/`.
 
 ## Capabilities
-- **"What do I know about X?"** → `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_query.py" --person "<name|id>"` → identity + top facts + talking points + recent activity.
+- **"What do I know about X?"** → follow the `sotto-ask` person lookup, including `knowledge_query.py --person "<name|id>" --person-coverage` and its consent-aware historical checks when `person_knowledge` is empty. A graph miss does not establish that there was no previous conversation.
 - **"Who do I owe / who's slipping?"** → two real sources, both deterministic:
   - open loops: `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/loops_query.py"` (the continuity ledger, split `you_owe` / `waiting_on_them`);
   - relationship drift: read `$SOTTO_DATA/knowledge/relationship_state.json` (the weekly pulse's `attention_queue`: `waiting_on_you` / `losing_touch` / `lapsed`). If it's missing or stale, offer to run `sotto-relationship-pulse` — don't recompute cadence by hand.
@@ -31,7 +31,7 @@ The People tab, as a conversation. PORT SOURCE: people analytics + attention que
 
 ## Rules
 - **Grounded only:** state only facts found in the knowledge graph, the continuity ledger, or live Bridge/Google results. If it isn't there, say "I don't have that on X" — never guess a role, company, or reason.
-- **No data:** empty graph + empty ledger → one honest line ("I don't have anything on the people front yet — briefs build this up over time"), not a padded answer.
+- **No data:** for an attention summary with an empty graph and ledger, give one honest line about the current graph and ledger. For a specific person or past conversation, check the connected historical sources from `sotto-ask` first and disclose coverage limits.
 - Surface *why* someone needs attention, then offer to draft (hand to `sotto-draft-reply`, under the approval tiers).
 
 ## Google address book

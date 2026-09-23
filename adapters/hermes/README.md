@@ -15,6 +15,7 @@ Wires the portable Sotto backend into a [Hermes](https://hermes-agent.nousresear
 | `runtime_api.py` · `send.py` | Hermes argv, structured send acceptance, session/cron/setup boundaries; the receiver keeps generic work and delivery ownership |
 | `runtime_lock.py` · `supervise.sh` · `process_group.py` | One tenant writer, retained essential process IDs, exit status and process-group shutdown |
 | `managed_exec.py` · `control_vault.py` | Managed unprivileged process launch, nondumpable receiver and process-private control credential |
+| `managed_identity.py` · `check_identity.py` | Protect managed product identity from replacement while keeping tenant state writable; offline Linux image regression with the real runtime UID |
 | `managed_volume.py` · `recovery.py` | Managed mount identity and verified offline tenant recovery; see [RECOVERY.md](RECOVERY.md) |
 | `model_lease.py` | Existing receiver heartbeat renews the proxy model lease; sanitized expiry receipt only |
 | `provider_error_compat.py` | Hash-checked pinned Hermes gateway adaptation: one plain-language provider failure at the shared chat boundaries, never the raw provider payload (see [Provider-error gateway pin](#provider-error-gateway-pin)) |
@@ -30,6 +31,19 @@ Managed boot fixes `SOTTO_CRON_DELIVER=photon`; self-host resolves its configure
 Hermes still owns interactive chat and tool discretion; its generic one-shot boundary accepts
 `SOTTO_RUN_SKILL="hermes -z"`. Standalone adapter installs retain their host scheduler and are not a
 claim of receiver-level durable delivery parity.
+
+Managed Cloud owns the product identity in `SOUL.md`. Its file, Hermes directory,
+data mount and default-home alias are protected against workload replacement.
+Boot reconciles that identity from the image; the runtime still writes sessions,
+learned memory and owner preferences. Owner standing instructions belong in
+`knowledge/master.md`, not the product persona. Self-host persona customization
+is unchanged. The image build runs `check_identity.py` offline to verify permission
+denials and successful normal Hermes initialization across an existing-volume upgrade.
+
+Photon processing Tapbacks are owned by `sotto_photon/__init__.py` for both hosting modes.
+They select a small contextual working icon locally, then replace it on the same message
+without first retracting it. `test_photon_feedback.py` covers replacement, interruption,
+duplicate callbacks and failed reactions alongside the typing lifecycle.
 
 ## Provider-error gateway pin
 

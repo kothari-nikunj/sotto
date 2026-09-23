@@ -244,6 +244,19 @@ returns provider acceptance metadata rather than making business delivery claims
 control credential stays out of Hermes and worker environments. That inheritance boundary does
 not sandbox an agent that has unrestricted access to tenant files or processes.
 
+Managed boot uses `managed_identity.py` to protect the product's `SOUL.md` and
+its replacement paths before launching workloads. The data and Hermes directories
+are root-owned and sticky with group write access: the Sotto UID can create and
+update its own state, but cannot replace the root-owned identity or Hermes directory.
+The default-home alias is protected and `HERMES_HOME` points to the canonical path.
+Boot's Hermes CLI commands run as the workload UID so upstream home initialization
+cannot remove these permissions. `managed_config.py` replaces the persona atomically
+from image sources using an exclusive temporary file. Sessions, `preferences.json`
+and `knowledge/master.md` remain writable. `check_identity.py` exercises that boundary
+with the actual UID and pinned Hermes in every Linux image build. This protects
+the product file; independent tool authorization and source-consent checks still
+enforce actions and access. Self-host persona customization is unchanged.
+
 
 ## Receiver modules
 
@@ -712,7 +725,7 @@ This revokes Bridge access, not Google consent, historical data or existing brow
 Historical source-specific purge, dashboard exchange and the iCloud mirror remain deferred.
 
 
-The shared `SOTTO_REACTIONS` setting also controls Photon processing Tapbacks through Hermes: 👀 while processing, 👍 after successful reply delivery, 👎 after processing/delivery failure, and no reaction after cancellation. These are best-effort conversational status indicators, never evidence that a draft was saved or an email sent.
+The shared `SOTTO_REACTIONS` setting also controls Photon processing Tapbacks through `sotto_photon`: a bounded local text match selects 🔎 for research/prep, 📝 for writing, 📅 for calendar requests, 🧠 for memory, or 💭 for general questions. A short standalone thanks keeps ❤️. On completion the adapter sets ✅ for a successful turn, ⚠️ for failure, or ⏸️ for interruption directly on the original message, without an `/unreact` call first. Identical updates are skipped and reactions stay scoped to their triggering message. No model call is added. These are best-effort conversational status indicators, never evidence that a draft was saved or an email sent. The transport sends one replacement operation; notification presentation still belongs to Apple Messages.
 
 `provider_error_compat.py` applies a hash-checked adaptation to the pinned Hermes shared gateway
 boundary used by Telegram, WhatsApp, Photon and the other chat adapters. It patches two files in

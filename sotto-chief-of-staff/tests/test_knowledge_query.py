@@ -54,6 +54,69 @@ def _age_people(days=21):
         os.utime(os.path.join(kg.people_dir(), name), (old, old))
 
 
+def test_empty_person_graph_keeps_historical_coverage_and_consent_distinct(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    state = tmp_path / 'config' / 'source-state.json'
+    state.parent.mkdir()
+    state.write_text(json.dumps({'sources': {
+        'imessage': {'status': 'ok', 'read': {'status': 'ok',
+            'observed_epoch': time.time(), 'has_data': False}},
+        'whatsapp': {'status': 'disabled'},
+        'contacts': {'status': 'ok', 'read': {'status': 'ok',
+            'observed_epoch': time.time(), 'has_data': True}},
+    }}))
+
+    assert _run(tmp_path, '--person', 'Alex') == {}  # existing consumers keep their shape
+    out = _run(tmp_path, '--person', '+15551234567', '--person-coverage')
+    assert out['person_knowledge'] == {}
+    assert out['coverage']['graph'] == 'no_match'
+    sources = {row['source']: row for row in out['coverage']['historical_sources']}
+    assert (sources['imessage']['status'], sources['imessage']['next_action']) == ('empty', 'check_history')
+    assert sources['imessage']['reader'] == sources['whatsapp']['reader'] == 'read_history'
+    assert 'limit <= 100' in sources['imessage']['scope']
+    assert 'at most 3 pages' in sources['imessage']['scope']
+    assert (sources['whatsapp']['status'], sources['whatsapp']['next_action']) == ('disabled', 'explain_limit')
+    assert (sources['gmail']['status'], sources['gmail']['next_action']) == ('unknown', 'check_connection')
+    assert sources['granola']['reader'] == 'gather_granola'
+    assert '14 days of notes and 36 hours of transcripts' in sources['granola']['scope']
+
+    by_name = _run(tmp_path, '--person', 'Alex', '--person-coverage')['coverage']
+    assert by_name['identity_resolution']['next_action'] == 'get_contacts'
+    assert next(row for row in by_name['historical_sources']
+                if row['source'] == 'imessage')['next_action'] == 'resolve_identifier'
+
+    receipt = json.loads(state.read_text())
+    receipt['sources']['contacts'] = {'status': 'disabled'}
+    state.write_text(json.dumps(receipt))
+    no_contacts = _run(tmp_path, '--person', 'Alex', '--person-coverage')['coverage']
+    assert no_contacts['identity_resolution']['next_action'] == 'ask_owner_for_identifier'
+
+    # A failed Bridge read is a coverage limit, not proof that its older archive is empty.
+    receipt = json.loads(state.read_text())
+    receipt['sources']['imessage'] = {'status': 'unavailable'}
+    state.write_text(json.dumps(receipt))
+    offline = _run(tmp_path, '--person', '+15551234567', '--person-coverage')
+    imessage = next(row for row in offline['coverage']['historical_sources']
+                    if row['source'] == 'imessage')
+    assert (imessage['status'], imessage['next_action']) == ('unavailable', 'explain_limit')
+
+
+def test_managed_person_coverage_respects_connected_source_grants(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture-tenant')
+    path = tmp_path / 'config' / 'managed-capabilities.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'tenant_id': 'fixture-tenant', 'sources': {
+        'gmail': {'consented': True, 'connected': True},
+        'granola': {'consented': False, 'connected': True},
+    }}))
+    out = _run(tmp_path, '--person', 'Alex', '--person-coverage')
+    sources = {row['source']: row for row in out['coverage']['historical_sources']}
+    assert (sources['gmail']['status'], sources['gmail']['next_action']) == ('connected', 'check_history')
+    assert (sources['granola']['status'], sources['granola']['next_action']) == ('disabled', 'explain_limit')
+
+
 # ── 1. company knowledge finally reaches the brief ───────────────────────────
 
 def test_company_packs_for_a_calendar_attendees_domain(tmp_path, monkeypatch):

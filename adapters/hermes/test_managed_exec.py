@@ -22,9 +22,10 @@ def test_managed_image_uses_public_runtime_and_hands_root_artifacts_to_workload_
     assert 'runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin hermes' in docker
     assert 'ENV PATH="/usr/local/bin:/usr/local/share/uv/bin:${PATH}"' in docker
     assert '/root/.local/bin:/root/.hermes/bin' not in docker
-    final_handoff = 'find "$HSTATE" -xdev -user root -exec chown sotto:sotto {} +'
-    assert start.index('python3 /app/adapters/hermes/web_config.py') < start.index(final_handoff)
+    final_handoff = 'find "$HSTATE" -xdev ! -path "$HSTATE" ! -path "$HSTATE/SOUL.md"'
+    assert start.index('runtime_python /app/adapters/hermes/web_config.py') < start.index(final_handoff)
     assert start.index(final_handoff) < start.index('managed_exec.py gateway')
+    assert start.index('managed_identity.py protect') < start.index('managed_exec.py receiver')
 
 
 def test_receiver_orders_vault_drop_privilege_and_nondumpable_before_runtime(monkeypatch):

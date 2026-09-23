@@ -376,9 +376,64 @@ def pack_companies(domains, companies) -> dict:
     return out
 
 
+def person_lookup_coverage(found: bool, person: str) -> dict:
+    """Read-only guidance for an Ask Sotto person lookup, never proof of complete history.
+
+    Source health describes recent reads, not the reach of a historical search. In particular,
+    an empty recent snapshot can still have older conversations to inspect.
+    """
+    from source_context import source_health, allowed
+
+    exact_identifier = bool(EMAIL_RE.fullmatch(person.strip()) or
+                            re.fullmatch(r'\+?[0-9][0-9 ()-]{5,}', person.strip()))
+    coverage = {'graph': 'found' if found else 'no_match', 'historical_sources': []}
+    if found:
+        return coverage
+    health = source_health()
+    local = {row['source']: row['status'] for row in health.get('sources', [])
+             if isinstance(row, dict) and row.get('source') in ('imessage', 'whatsapp', 'contacts')}
+    contacts_status = local.get('contacts', 'unknown')
+    coverage['identity_resolution'] = {
+        'status': 'exact_identifier' if exact_identifier else 'name_only',
+        'contacts_status': contacts_status,
+        'next_action': ('use_identifier' if exact_identifier else
+                        'get_contacts' if contacts_status in ('ok', 'empty', 'stale', 'partial', 'degraded')
+                        else 'check_connection' if contacts_status == 'unverified'
+                        else 'ask_owner_for_identifier'),
+    }
+    for source in ('imessage', 'whatsapp'):
+        status = local.get(source, 'unknown')
+        action = ('check_history' if status in ('ok', 'empty', 'stale', 'partial', 'degraded')
+                  else 'check_connection' if status == 'unverified' else 'explain_limit')
+        if action == 'check_history' and not exact_identifier:
+            action = 'resolve_identifier'
+        coverage['historical_sources'].append({'source': source, 'status': status,
+            'next_action': action, 'reader': 'read_history',
+            'scope': 'Use an explicit bounded since/until window, limit <= 100, and at most 3 '
+                     'pages; paginate with next_cursor as before, preserving the window. '
+                     'Disclose unsearched pages.'})
+    # Self-host Google/Granola grants are verified by their own connected tools. The generic
+    # source permission defaults to true there, so it cannot certify a connection.
+    for source in ('gmail', 'granola'):
+        if os.environ.get('SOTTO_DEPLOYMENT_MODE') == 'managed':
+            permitted = allowed(source)
+            status, action = ('connected', 'check_history') if permitted else ('disabled', 'explain_limit')
+        else:
+            status, action = 'unknown', 'check_connection'
+        coverage['historical_sources'].append({'source': source, 'status': status,
+            'next_action': action, 'reader': 'gmail_search' if source == 'gmail' else 'gather_granola',
+            'scope': ('Search a bounded date range; disclose the range and incomplete results.'
+                      if source == 'gmail' else
+                      'Default gathering covers 14 days of notes and 36 hours of transcripts; '
+                      'request a bounded wider window if needed and disclose the window.')})
+    return coverage
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--person")
+    ap.add_argument("--person-coverage", action="store_true",
+                    help="with --person, wrap the result with consent-aware historical source guidance")
     ap.add_argument("--editable-person", action="store_true",
                     help="with --person, return active fact ids/text for an explicit correction")
     ap.add_argument("--topic", default="", help="prefer facts relevant to this subject")
@@ -411,7 +466,8 @@ def main():
             key = p.canonical_id or kg.slugify(p.name)
             out[key] = editable_person(p, now, args.topic) if args.editable_person else pack_person(
                 p, True, now, args.topic)
-        print(json.dumps(out))
+        print(json.dumps({'person_knowledge': out, 'coverage': person_lookup_coverage(bool(out), args.person)}
+                         if args.person_coverage else out))
         return
 
     cutoff = now - timedelta(days=args.relevant_days)

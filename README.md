@@ -233,8 +233,13 @@ also closes each lock against its manifest; its output states whether that exact
 These locks cover Sotto's Python dependencies; Hermes manages its own runtime dependencies.
 
 Release CI and the publisher also run `bash tools/verify-public-image.sh <distribution-tree>`.
-This requires a running Docker daemon and builds the files that users actually deploy, including
-Hermes compatibility checks. It does not publish an image or start a configured Sotto instance.
+This requires a running Docker daemon and the Buildx plugin. It uses BuildKit with plain progress
+output and loads the verified image locally. Docker Desktop includes Buildx; with Homebrew, run
+`brew install docker-buildx` and follow the plugin setup instructions from `brew info docker-buildx`.
+The first build warms a new cache; subsequent builds reuse it. The image keeps the Node/Photon
+installation and dependency permission changes ahead of app code so routine releases do not
+reinstall dependencies or copy their entire tree into another permission-only layer.
+The build checks the exact files that users deploy, including Hermes compatibility and message delivery. It does not publish an image or start a configured Sotto instance.
 
 (Working in the monorepo? `docs/ADDING-A-SOURCE.md` there covers adding a new Bridge data source —
 it edits Bridge source, so it deliberately doesn't ship in this repo.)

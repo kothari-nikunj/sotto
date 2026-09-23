@@ -144,7 +144,7 @@ def test_reconciler_honors_gates_and_schedule_source(monkeypatch):
 
 
 def test_start_sh_calls_the_shared_reconciler():
-    assert "python3 /app/adapters/hermes/reconcile_crons.py" in START
+    assert "runtime_python /app/adapters/hermes/reconcile_crons.py" in START
     assert "--spec \"$CRONS_JSON\" --deliver \"$SOTTO_CRON_DELIVER\"" in START
 
 

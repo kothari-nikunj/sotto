@@ -20,6 +20,14 @@ def photon(request, monkeypatch):
 
         async def _sidecar_try(self, route, payload, label):
             self.calls.append((route, payload.copy()))
+            return True
+
+        def _reactions_enabled(self):
+            return True
+
+        async def _add_reaction(self, chat_id, message_id, emoji):
+            return await self._sidecar_try('/react', {'spaceId': chat_id, 'messageId': message_id,
+                                                    'emoji': emoji}, 'add_reaction')
 
         async def stop_typing(self, chat_id):
             await self._sidecar_try('/typing', {'spaceId': chat_id, 'state': 'stop'}, 'stop_typing')
@@ -166,3 +174,93 @@ def test_gateway_recovery_never_resends_a_possible_gallery_as_text(photon, accep
     result = asyncio.run(photon.send('chat', 'Recovered reply plus original full prep'))
     assert result.success == (acceptance == 'accepted')
     assert photon.calls == []
+
+
+@pytest.mark.parametrize(('text', 'emoji'), [
+    ('Can you research Maya before lunch?', '🔎'),
+    ('Draft a reply to the meeting invite', '📝'),
+    ('What is on my calendar tomorrow?', '📅'),
+    ('Remember that I prefer afternoon calls', '🧠'),
+    ('Thanks!', '❤️'),
+    ('thank you so much 🙏', '❤️'),
+    ('Thanks, but can you research Maya?', '🔎'),
+    ('What changed?', '💭'),
+    ('The bookshelf is useful', '💭'),  # no substring matches for "who's"
+])
+def test_contextual_tapbacks_replace_without_removal(photon, text, emoji):
+    event = types.SimpleNamespace(text=text, source=types.SimpleNamespace(chat_id='chat'), message_id='incoming')
+    async def turn():
+        await photon.on_processing_start(event)
+        await photon.on_processing_complete(event, types.SimpleNamespace(value='success'))
+        await photon.on_processing_complete(event, types.SimpleNamespace(value='success'))
+    asyncio.run(turn())
+    expected = [emoji] if emoji == '❤️' else [emoji, '✅']
+    assert photon.calls == [('/react', {'spaceId': 'chat', 'messageId': 'incoming', 'emoji': e}) for e in expected]
+
+
+@pytest.mark.parametrize(('outcome', 'emoji'), [('failure', '⚠️'), ('cancelled', '⏸️')])
+def test_failed_and_interrupted_turns_replace_instead_of_dislike_or_remove(photon, outcome, emoji):
+    event = types.SimpleNamespace(text='Find out about Maya', source=types.SimpleNamespace(chat_id='chat'), message_id='incoming')
+    async def turn():
+        await photon.on_processing_start(event)
+        await photon.on_processing_complete(event, types.SimpleNamespace(value=outcome))
+    asyncio.run(turn())
+    assert [p['emoji'] for _, p in photon.calls] == ['🔎', emoji]
+    assert all(route == '/react' for route, _ in photon.calls)
+
+
+def test_tapback_failure_does_not_block_reply_or_trigger_removal(photon):
+    event = types.SimpleNamespace(text='A question', source=types.SimpleNamespace(chat_id='chat'), message_id='incoming')
+    async def fail(*args):
+        return False
+    photon._add_reaction = fail
+    async def turn():
+        await photon.on_processing_start(event)
+        assert (await photon.send('chat', 'Here is your answer')).success
+        await photon.on_processing_complete(event, types.SimpleNamespace(value='success'))
+    asyncio.run(turn())
+    assert not hasattr(event, '_sotto_tapback')
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Here is your answer'})]
+
+
+def test_cancelled_uncertain_start_replaces_without_removal(photon):
+    event = types.SimpleNamespace(text='A question', source=types.SimpleNamespace(chat_id='chat'), message_id='incoming')
+    original = photon._add_reaction
+    async def interrupted(*args):
+        await original(*args)  # Provider may have accepted before the caller was cancelled.
+        raise asyncio.CancelledError
+    async def turn():
+        photon._add_reaction = interrupted
+        with pytest.raises(asyncio.CancelledError):
+            await photon.on_processing_start(event)
+        photon._add_reaction = original
+        await photon.on_processing_complete(event, types.SimpleNamespace(value='cancelled'))
+    asyncio.run(turn())
+    assert [p['emoji'] for _, p in photon.calls] == ['💭', '⏸️']
+    assert all(route == '/react' for route, _ in photon.calls)
+
+
+@pytest.mark.parametrize('disabled', [True, False])
+def test_no_lifecycle_reactions_when_disabled_or_target_missing(photon, disabled):
+    photon._reactions_enabled = lambda: not disabled
+    event = types.SimpleNamespace(text='A question', source=types.SimpleNamespace(chat_id='chat'),
+                                  message_id='incoming' if disabled else None)
+    async def turn():
+        await photon.on_processing_start(event)
+        for outcome in ('success', 'failure', 'cancelled'):
+            await photon.on_processing_complete(event, types.SimpleNamespace(value=outcome))
+    asyncio.run(turn())
+    assert photon.calls == []
+
+
+def test_reactions_stay_on_their_own_message(photon):
+    events = [types.SimpleNamespace(text=text, source=types.SimpleNamespace(chat_id='chat'), message_id=identifier)
+              for text, identifier in [('Research Maya', 'first'), ('Draft an email', 'second')]]
+    async def turn():
+        await photon.on_processing_start(events[0])
+        await photon.on_processing_start(events[1])
+        await photon.on_processing_complete(events[1], types.SimpleNamespace(value='success'))
+        await photon.on_processing_complete(events[0], types.SimpleNamespace(value='cancelled'))
+    asyncio.run(turn())
+    assert [(p['messageId'], p['emoji']) for _, p in photon.calls] == [
+        ('first', '🔎'), ('second', '📝'), ('second', '✅'), ('first', '⏸️')]

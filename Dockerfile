@@ -92,6 +92,21 @@ RUN mkdir -p /app \
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
 
+# Photon must run under the managed Sotto UID, which cannot traverse /root. Keep the
+# installer's Node/npm tree in an immutable shared location and install the locked sidecar deps
+# in the image, before runtime code becomes read-only. Check the actual managed-user imports.
+RUN cp -a /root/.hermes/node /usr/local/lib/sotto-node \
+ && ln -s /usr/local/lib/sotto-node/bin/node /usr/local/bin/node \
+ && ln -s /usr/local/lib/sotto-node/bin/npm /usr/local/bin/npm \
+ && ln -s /usr/local/lib/sotto-node/bin/npx /usr/local/bin/npx \
+ && chmod -R a+rX,go-w /usr/local/lib/sotto-node \
+ && npm ci --prefix /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
+ && chmod -R go-w /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin node --version \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin npm --version \
+ && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin \
+      sh -c 'cd /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar && node --input-type=module -e "import {group,text,attachment} from \"spectrum-ts\"; if (![group,text,attachment].every(f => typeof f === \"function\")) process.exit(1)"'
+
 ENV SOTTO_DATA=/data
 RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles
 
@@ -110,6 +125,9 @@ COPY sotto-chief-of-staff/_shared/lib/calendar_context.py /app/trigger-receiver/
 COPY sotto-chief-of-staff/_shared/lib/source_catalog.py /app/trigger-receiver/source_catalog.py
 COPY sotto-chief-of-staff/_shared/lib/message_targets.py /app/trigger-receiver/message_targets.py
 COPY adapters/hermes/ /app/adapters/hermes/
+# Exercise identity replacement attacks as the actual managed UID, and verify
+# the pinned Hermes still loads its persona and writes sessions after migration.
+RUN python3 /app/adapters/hermes/check_identity.py
 # Exercise nonempty nudges and four-photo briefs through the real receiver, adapters,
 # outbox and receipts as the managed UID, with synthetic sources and local transport fixtures.
 RUN runuser -u sotto -- python3 -I -B /app/trigger-receiver/check_runtime.py
@@ -138,25 +156,13 @@ COPY VERSION /app/VERSION
 # Seed the Sotto persona into SOUL.md at build time; start.sh refreshes it on the volume every boot.
 RUN cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> /root/.hermes/SOUL.md 2>/dev/null || true
 
-# Photon must run under the managed Sotto UID, which cannot traverse /root. Keep the
-# installer's Node/npm tree in an immutable shared location and install the locked sidecar deps
-# in the image, before runtime code becomes read-only. Check the actual managed-user imports.
-RUN cp -a /root/.hermes/node /usr/local/lib/sotto-node \
- && ln -s /usr/local/lib/sotto-node/bin/node /usr/local/bin/node \
- && ln -s /usr/local/lib/sotto-node/bin/npm /usr/local/bin/npm \
- && ln -s /usr/local/lib/sotto-node/bin/npx /usr/local/bin/npx \
- && chmod -R a+rX,go-w /usr/local/lib/sotto-node \
- && npm ci --prefix /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin node --version \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin npm --version \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin \
-      sh -c 'cd /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar && node --input-type=module -e "import {group,text,attachment} from \"spectrum-ts\"; if (![group,text,attachment].every(f => typeof f === \"function\")) process.exit(1)"'
-
 # Two processes: the trigger receiver (HTTP) + Hermes (agent loop + gateway + scheduler).
 # Railway exposes $PORT → the receiver. Hermes runs alongside. tini is PID 1 so the background
 # receiver/pairing/whatsapp-bridge children are reaped and SIGTERM is forwarded on redeploy.
+# Dependency permissions are sealed in their stable install layers above. Rewalking the entire
+# Hermes/uv tree here copies gigabytes into a fresh layer on every application-only change.
 RUN chmod +x /app/adapters/hermes/start.sh /app/adapters/hermes/managed_exec.py \
  && chown -R root:root /app \
- && chmod -R go-w /app /usr/local/lib/hermes-agent /usr/local/share/uv
+ && chmod -R go-w /app
 ENTRYPOINT ["tini", "--"]
 CMD ["python3", "/app/adapters/hermes/runtime_lock.py", "/app/adapters/hermes/start.sh"]

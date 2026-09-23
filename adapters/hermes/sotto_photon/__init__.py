@@ -2,12 +2,30 @@
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 
 
 BUDGET_NOTICE = ("This account has reached its usage allowance. "
                  "The account owner needs to review the limit before I can continue.")
 TYPING_START_DELAY_SECONDS = 2.0
+
+
+def processing_tapback(text):
+    """A bounded, local hint about the request, never a claim that an action ran."""
+    text = ' '.join(str(text or '').casefold().split())[:512]
+    if re.fullmatch(r'(?:thanks|thank you|thank you so much|thanks so much|appreciate it)[.!\s🙏❤️]*', text):
+        return '❤️'
+    # Specific requests win over incidental words ("draft a meeting invite").
+    for pattern, emoji in (
+        (r'\b(?:draft|write|rewrite|compose|wording|reply)\b', '📝'),
+        (r'\b(?:remember|forget|memory|memories)\b', '🧠'),
+        (r'\b(?:research|look up|lookup|find out|background|prep|prepare|who is|who.s|what do (?:i|you) know)\b', '🔎'),
+        (r'\b(?:calendar|schedule|reschedule|availability|available|meeting|meetings|appointment)\b', '📅'),
+    ):
+        if re.search(pattern, text):
+            return emoji
+    return '💭'
 
 
 def managed():
@@ -41,6 +59,32 @@ def register(ctx):
     upstream._markdown_enabled = lambda: False
 
     class SottoPhoton(upstream.PhotonAdapter):
+        async def _processing_tapback(self, event, emoji):
+            if not self._reactions_enabled():
+                return
+            chat_id = getattr(getattr(event, 'source', None), 'chat_id', None)
+            message_id = getattr(event, 'message_id', None)
+            if not chat_id or not message_id or getattr(event, '_sotto_tapback', None) == emoji:
+                return
+            # Photon sets the sender's reaction on the existing target. Calling
+            # /unreact first creates an avoidable removal event/notification.
+            event._sotto_tapback_attempted = True
+            if await self._add_reaction(chat_id, message_id, emoji):
+                event._sotto_tapback = emoji
+
+        async def on_processing_start(self, event):
+            await self._processing_tapback(event, processing_tapback(getattr(event, 'text', '')))
+
+        async def on_processing_complete(self, event, outcome):
+            outcome = getattr(outcome, 'value', outcome)
+            emoji = {'success': '✅', 'failure': '⚠️', 'cancelled': '⏸️'}.get(outcome)
+            if outcome == 'success' and getattr(event, '_sotto_tapback', None) == '❤️':
+                return  # Acknowledgments keep their heart without a second notification.
+            if outcome == 'cancelled' and not getattr(event, '_sotto_tapback_attempted', False):
+                return  # Nothing was shown; do not add a new reaction for cancellation.
+            if emoji:
+                await self._processing_tapback(event, emoji)
+
         async def _keep_typing(self, chat_id, interval=2.0, metadata=None, stop_event=None):
             # Only Hermes' turn-owned refresh loop may start typing. Its isolated
             # startup/progress calls otherwise flash once and expire during tool work.

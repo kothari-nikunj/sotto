@@ -1,10 +1,37 @@
 """Reconcile the managed runtime's credentials and platform/model configuration."""
 import os
 from pathlib import Path
+import stat
 import sys
+import tempfile
 from urllib.parse import urlsplit
 
 import yaml
+
+
+def _read_optional(path):
+    """Read tenant state without following a workload-supplied final symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd) as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise RuntimeError(f'Managed config path must be a regular file: {path}')
+        return stream.read()
+
+
+def _atomic_write(path, content, mode=0o600):
+    """Replace one state entry without following a pre-planted temporary or target."""
+    fd, filename = tempfile.mkstemp(prefix=f'.{path.name}-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+        os.replace(filename, path)
+    finally:
+        Path(filename).unlink(missing_ok=True)
 
 
 def reconcile(home, env):
@@ -18,7 +45,8 @@ def reconcile(home, env):
     token = env['SOTTO_MODEL_PROXY_TOKEN']
     home = Path(home)
     config_path = home / 'config.yaml'
-    cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    current_config = _read_optional(config_path)
+    cfg = yaml.safe_load(current_config) if current_config is not None else {}
     cfg = cfg or {}
     model = {'default': 'gemini-3.8-flash', 'provider': 'custom',
              'base_url': base + '/openai/v1', 'api_key': token}
@@ -46,10 +74,7 @@ def reconcile(home, env):
     for platform, settings in cfg.get('platforms', {}).items():
         if isinstance(settings, dict):
             settings['enabled'] = platform == 'photon'
-    temporary = config_path.with_suffix('.tmp')
-    temporary.write_text(yaml.safe_dump(cfg, sort_keys=False))
-    temporary.chmod(0o600)
-    temporary.replace(config_path)
+    _atomic_write(config_path, yaml.safe_dump(cfg, sort_keys=False))
     # A dedicated managed Sotto uses the same Sotto persona block as Telegram,
     # without the fresh Hermes installation's competing default identity.
     persona = Path(__file__).with_name('sotto-persona.md').read_text()
@@ -58,23 +83,23 @@ def reconcile(home, env):
         source = Path('/app/sotto-skills/_shared/references/writing-style.md')
     persona += '\n\n' + source.read_text()
     soul = home / 'SOUL.md'
-    temporary = soul.with_suffix('.tmp')
-    temporary.write_text(persona)
-    temporary.chmod(0o600)
-    temporary.replace(soul)
+    # Keep the resulting inode owned by the root supervisor. The exclusive
+    # random temporary and atomic replace do not follow workload symlinks.
+    _atomic_write(soul, persona, 0o444)
     # A previously seeded self-host .env must not restore root keys or channels
     # after the launcher has removed them from its own process environment.
     envfile = home / '.env'
-    lines = envfile.read_text().splitlines() if envfile.exists() else []
+    current_env = _read_optional(envfile)
+    lines = current_env.splitlines() if current_env is not None else []
     root_keys = {'GOOGLE_AI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
                  'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
                  'SOTTO_FALLBACK_API_KEY', 'GATEWAY_ALLOW_ALL_USERS', 'PHOTON_ALLOW_ALL_USERS',
-                 'PHOTON_STREAM_SILENCE_PROBE_MS', 'SOTTO_CONTROL_TOKEN'}
+                 'PHOTON_STREAM_SILENCE_PROBE_MS', 'SOTTO_CONTROL_TOKEN',
+                 'HERMES_HOME'}
     channels = ('WHATSAPP_', 'TELEGRAM_', 'DISCORD_', 'SLACK_', 'SIGNAL_', 'BLUEBUBBLES_')
     lines = [line for line in lines if line.split('=', 1)[0] not in root_keys
              and not line.startswith(channels)]
-    envfile.write_text('\n'.join(lines) + '\n')
-    envfile.chmod(0o600)
+    _atomic_write(envfile, '\n'.join(lines) + '\n')
 
 
 if __name__ == '__main__':
