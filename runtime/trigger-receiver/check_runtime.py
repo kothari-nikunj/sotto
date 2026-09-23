@@ -143,9 +143,11 @@ def proactive(receiver, root, pack):
     assert receiver._deliver_text(text, 'cron:sotto-proactive', run_id=ident, effects=staged['effects'])
     accepted(receiver, ident)
     # The scanner may have crossed UTC midnight after this harness created the meeting.
-    date = next(e['date'] for e in staged['effects'] if e['kind'] == 'proactive_seen')
+    seen_effect = next(e for e in staged['effects'] if e['kind'] == 'proactive_seen')
+    date, occurrence_key = seen_effect['date'], seen_effect['key']
     state = json.loads((root / f'proactive/{date}.json').read_text())
-    assert 'mtg:synthetic-meeting' in state['nudged'] and 'mtg:synthetic-meeting' not in state['pending']
+    assert occurrence_key.startswith('mtg:synthetic-meeting@')
+    assert occurrence_key in state['nudged'] and occurrence_key not in state['pending']
     os.environ.pop('SOTTO_DELIVERY_RUN_ID')
 
 

@@ -135,3 +135,12 @@ def test_invalid_receipt_timestamp_is_not_claimed_outside_window(tmp_path, monke
     assert receipts["invalid_timestamp"] == 2
     assert receipts["retained_outside_window"] == 1
     assert receipts["retained_in_window"] == 0
+
+
+def test_malformed_continuity_metadata_is_unknown_coverage(tmp_path):
+    for filename, steps in (("bad-steps", ["bad"]), ("bad-continuity", {"continuity": "bad"})):
+        _write_json(tmp_path / f"briefs/{filename}.learned.json", {
+            "ts": "2026-09-16T13:30:00Z", "steps": steps})
+    report = proof.build_report(str(tmp_path), now=NOW)
+    assert report["learn_receipts"]["invalid_step_metadata"] == 2
+    assert report["learn_receipts"]["proposal_outcomes"]["status"] == "unavailable"

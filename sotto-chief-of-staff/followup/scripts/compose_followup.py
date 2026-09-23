@@ -188,8 +188,8 @@ def _commitment_module():
 def _ground_output(out: dict, ended: list, inputs: dict) -> dict:
     """Remove model claims that cannot pass the ledger's source and ownership gate."""
     google = _obj(inputs, "google")
-    user_email = (_s(inputs.get("user_email")) or _s(google.get("userEmail"))
-                  or configured_user_email())
+    user_email = (configured_user_email() or _s(inputs.get("user_email"))
+                  or _s(google.get("userEmail")))
     grounded, stats = _commitment_module().ground_commitments(
         out, ended, user_email, os.environ.get("SOTTO_USER_NAME", ""))
     # Kept private-looking but visible in JSON for diagnosis: silence is safe only when operators
@@ -212,11 +212,14 @@ def compose(inputs: dict, since_hours: int = 36, llm=None) -> dict:
 
 
 def compose_for_brief(inputs: dict, since_hours: int = 12, llm=None) -> dict:
-    """The evening-brief merge entry point (roadmap Sprint 0 #4): the SAME extraction as compose(),
+    """Compatibility embedding shape for callers that need no empty-state sentence.
+
+    Scheduled post-meeting, evening and Learn paths use capture_commitments.extract_apply_meeting
+    so extraction, canonical persistence and cache identity stay one operation. This helper retains
+    the historical pure-compose API for direct consumers and tests: the SAME extraction as compose(),
     but shaped for embedding — returns {} when no recently-ended meeting has a transcript/notes (so
     the brief renders no followup block at all, instead of the human-facing 'Nothing to follow up'
-    line), and NEVER delivers anything itself. compose_brief calls this guarded; any exception there
-    degrades to an empty context."""
+    line), and NEVER delivers or persists anything itself."""
     _, ended = build_context(inputs, since_hours)
     if not ended:
         return {}
@@ -226,7 +229,7 @@ def compose_for_brief(inputs: dict, since_hours: int = 12, llm=None) -> dict:
 def _apply_ledger(out: dict, user_email: str, source_meetings: list) -> dict:
     """Persist this extraction before its on-demand result is shown.
 
-    The evening brief already does this through compose_brief._apply_followup_commitments. The CLI
+    Scheduled paths already do this through capture_commitments.extract_apply_meeting. The CLI
     used to leave it to a later agent step, behind an unnecessary "confirm the summary" gate; users
     naturally did not reply merely to confirm an accurate read-only summary, so correct Granola
     commitments vanished. Loading by path keeps compose_followup importable in tests and as a module.
@@ -288,8 +291,8 @@ def main():
     if not a.no_apply_commitments:
         # No output is emitted until this succeeds: a successful command is therefore a truthful
         # guarantee that every extracted commitment was written/deduped or already terminal.
-        user_email = (a.user_email or _s(inputs["google"].get("userEmail"))
-                      or configured_user_email())
+        user_email = (configured_user_email() or a.user_email
+                      or _s(inputs["google"].get("userEmail")))
         _, ended = build_context(inputs, a.since_hours)
         out["ledger"] = _apply_ledger(out, user_email, ended)
         if a.reconcile_open_loops:

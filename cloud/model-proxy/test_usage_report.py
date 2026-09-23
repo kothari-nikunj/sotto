@@ -11,13 +11,36 @@ def test_metadata_is_content_free_and_unknown_is_explicit(monkeypatch):
     monkeypatch.setenv('RAILWAY_DEPLOYMENT_ID', 'deploy-a')
     payload = {'messages': [{'role': 'system', 'content': 'secret instructions'},
                             {'role': 'user', 'content': 'secret question'},
-                            {'role': 'tool', 'content': 'secret result'}], 'tools': []}
+                            {'role': 'assistant', 'tool_calls': [
+                                {'id': 'call-1', 'function': {'name': 'knowledge_search'}}]},
+                            {'role': 'tool', 'tool_call_id': 'call-1', 'content': 'secret result'},
+                            {'role': 'tool', 'tool_call_id': 'missing', 'content': 'legacy result'}],
+               'tools': [{'type': 'function', 'function': {'name': 'knowledge_search'}}]}
     metadata = server.request_metadata({'X-Sotto-Workload': 'interactive\nforged'}, payload, 'chat')
     assert metadata['workload'] == 'unknown'
     assert metadata['proxy_deployment'] == 'deploy-a'
     assert metadata['deployment'] == 'unknown'
     assert 'secret' not in json.dumps(metadata)
     assert metadata['context_chars']['tool_results'] > 0
+    assert metadata['tool_result_sizes']['knowledge_search']['count'] == 1
+    assert metadata['tool_result_sizes']['unknown']['count'] == 1
+
+
+@pytest.mark.parametrize('payload', [
+    {'messages': 7, 'tools': 8},
+    {'messages': [None, {'role': 'assistant', 'tool_calls': 9},
+                  {'role': 'tool', 'tool_call_id': ['bad'], 'content': 'secret'}],
+     'tools': [{'function': {'name': {'bad': 'shape'}}}]},
+    {'messages': [{'role': 'assistant', 'tool_calls': [
+        {'id': 'x', 'function': {'name': ['bad']}}]},
+        {'role': 'tool', 'tool_call_id': 'x', 'content': 'secret'}],
+     'tools': [{'function': {'name': 'safe_tool'}}]},
+])
+def test_malformed_tool_diagnostics_never_fail_chat_metadata(payload):
+    metadata = server.request_metadata({}, payload, 'chat')
+    assert isinstance(metadata['context_chars'], dict)
+    assert isinstance(metadata['tool_result_sizes'], dict)
+    assert 'secret' not in json.dumps(metadata)
 
 
 def test_report_keeps_unknown_usage_and_does_not_mutate_ledger(tmp_path, monkeypatch):
@@ -27,7 +50,9 @@ def test_report_keeps_unknown_usage_and_does_not_mutate_ledger(tmp_path, monkeyp
     complete = {'promptTokenCount': 1000, 'cachedContentTokenCount': 800,
                 'candidatesTokenCount': 100, 'thoughtsTokenCount': 200}
     first = ledger.reserve('tenant', None, 'native', 'gemini-3.8-flash', metadata={
-        'application': 'sotto', 'deployment': 'deploy-a', 'workload': 'notification', 'operation_id': 'a' * 64})
+        'application': 'sotto', 'deployment': 'deploy-a', 'workload': 'notification',
+        'operation_id': 'a' * 64,
+        'tool_result_sizes': {'knowledge_search': {'count': 2, 'chars': 120, 'max_chars': 80}}})
     ledger.finish(first, 200, complete)
     second = ledger.reserve('tenant', None, 'native', 'gemini-3.8-flash')
     ledger.finish(second, 500, None)
@@ -45,7 +70,20 @@ def test_report_keeps_unknown_usage_and_does_not_mutate_ledger(tmp_path, monkeyp
     known = next(g for g in result['groups'] if g['workload'] == 'notification')
     assert known['cache_ratio'] == .8 and known['billed_output_tokens'] == 300
     assert known['attempts_per_operation'] == 1
+    assert known['tool_result_sizes']['knowledge_search'] == {
+        'count': 2, 'chars': 120, 'max_chars': 80}
     assert path.read_bytes() == before
+
+
+def test_report_skips_malformed_tool_size_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.time, "time", lambda: 1789680000)
+    path = tmp_path / 'calls.sqlite3'
+    ledger = server.Ledger(path)
+    call = ledger.reserve('tenant', None, 'chat', 'gemini-3.8-flash', metadata={
+        'tool_result_sizes': ['malformed']})
+    ledger.finish(call, 200, {'promptTokenCount': 1, 'candidatesTokenCount': 1})
+    result = report.report(path, 2, 'UTC', datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc))
+    assert result['groups'][0]['tool_result_sizes'] == {}
 
 
 def test_usage_migration_preserves_old_calls(tmp_path, monkeypatch):

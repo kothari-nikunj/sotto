@@ -35,6 +35,48 @@ REQUESTS_PER_WINDOW = 60
 PRICING_START = 1788307200  # 2026-09-02 UTC
 PRICING_END = 1798761600    # 2027-01-01 UTC
 SETTLEMENT_MIGRATION = 'settled_chat_allowance_v1'
+MAX_TOOL_RESULT_CATEGORIES = 32
+
+
+def tool_result_sizes(payload):
+    """Content-free tool-result sizes, attributed only through declared OpenAI tool identities."""
+    tools = payload.get('tools')
+    tools = tools if isinstance(tools, list) else []
+    messages = payload.get('messages')
+    messages = messages if isinstance(messages, list) else []
+    declared = []
+    for tool in tools:
+        function = tool.get('function') if isinstance(tool, dict) else None
+        name = function.get('name') if isinstance(function, dict) else None
+        if isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name):
+            declared.append(name)
+    allowed = set(declared[:MAX_TOOL_RESULT_CATEGORIES])
+    by_call = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get('role') != 'assistant':
+            continue
+        calls = message.get('tool_calls')
+        calls = calls if isinstance(calls, list) else []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get('id')
+            function = call.get('function')
+            name = function.get('name') if isinstance(function, dict) else None
+            if isinstance(call_id, str) and isinstance(name, str) and name in allowed:
+                by_call[call_id] = name
+    result = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get('role') != 'tool':
+            continue
+        call_id = message.get('tool_call_id')
+        name = by_call.get(call_id, 'unknown') if isinstance(call_id, str) else 'unknown'
+        size = len(json.dumps(message.get('content')))
+        bucket = result.setdefault(name, {'count': 0, 'chars': 0, 'max_chars': 0})
+        bucket['count'] += 1
+        bucket['chars'] += size
+        bucket['max_chars'] = max(bucket['max_chars'], size)
+    return dict(sorted(result.items()))
 
 
 def settled_chat_allowance(route, model, created, status, input_tokens):
@@ -66,12 +108,15 @@ def request_metadata(headers, payload, lane, tenant=None):
     result['deployment'] = tenant.get('deployment', 'unknown')
     result['proxy_deployment'] = os.environ.get('RAILWAY_DEPLOYMENT_ID', 'unknown')
     if lane == 'chat':
-        messages = payload.get('messages') or []
+        raw_messages = payload.get('messages')
+        messages = [message for message in (raw_messages if isinstance(raw_messages, list) else [])
+                    if isinstance(message, dict)]
         result['context_chars'] = {
             'instructions': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') in ('system', 'developer')),
             'tool_results': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') == 'tool'),
             'conversation': sum(len(json.dumps(m.get('content'))) for m in messages if m.get('role') not in ('system', 'developer', 'tool')),
             'tools': len(json.dumps(payload.get('tools') or []))}
+        result['tool_result_sizes'] = tool_result_sizes(payload)
     else:
         result['context_chars'] = {'instructions': len(json.dumps(payload.get('systemInstruction') or {})),
                                    'evidence': len(json.dumps(payload.get('contents') or [])),

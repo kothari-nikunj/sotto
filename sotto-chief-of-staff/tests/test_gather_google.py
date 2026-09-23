@@ -26,6 +26,13 @@ def test_event_normalization_flattens_start_and_maps_link():
     assert gg.normalize_event({"start": "2026-06-26"})["start"] == "2026-06-26"
 
 
+def test_event_normalization_preserves_exact_provider_linkage():
+    ev = gg.normalize_event({'id': 'e', 'threadId': 'gmail-thread-7', 'iCalUID': 'ical-7',
+                             'hangoutLink': 'https://meet.google.com/abc'})
+    assert ev['threadId'] == 'gmail-thread-7' and ev['iCalUID'] == 'ical-7'
+    assert ev['hangoutLink'] == 'https://meet.google.com/abc'
+
+
 def test_as_list_unwraps_common_envelopes():
     assert gg._as_list([1, 2]) == [1, 2]
     assert gg._as_list({"messages": [1]}) == [1]
@@ -189,13 +196,13 @@ def test_ensure_deps_cli_mode_only_heals(monkeypatch, capsys):
 
 def test_attendee_comms_normalizes_and_derives_direction(tmp_path, monkeypatch):
     # Per-attendee search → {"<email>": [{date,subject,snippet,from_me}]}. from_me: SENT label
-    # wins; else derived from whether the From header carries the ATTENDEE's address.
+    # proves the owner; an exact attendee sender proves inbound, anything else stays unknown.
     att = tmp_path / "att.json"
     json.dump([{"name": "Dana Roe", "email": "Dana@acme.com"}], open(att, "w"))
 
     def fake_run(api, args, timeout=60):
         assert args[:2] == ["gmail", "search"]
-        assert args[2] == "from:dana@acme.com OR to:dana@acme.com newer_than:30d"
+        assert args[2] == "{from:dana@acme.com to:dana@acme.com} newer_than:30d"
         return [
             {"from": "Dana Roe <dana@acme.com>", "subject": "Pricing", "date": "Tue, 04 Aug",
              "snippet": "circling back on the pilot", "labels": ["INBOX"]},
@@ -214,9 +221,21 @@ def test_attendee_comms_normalizes_and_derives_direction(tmp_path, monkeypatch):
     comms = json.load(open(out))
     rows = comms["dana@acme.com"]                      # keyed by LOWERCASED attendee email
     assert rows[0] == {"date": "Tue, 04 Aug", "subject": "Pricing",
-                       "snippet": "circling back on the pilot", "from_me": False}
+                       "snippet": "circling back on the pilot", "from_me": False,
+                       "sender_name": "Dana Roe", "sender_identifier": "dana@acme.com"}
     assert rows[1]["from_me"] is True                  # SENT label
-    assert rows[2]["from_me"] is True                  # no labels → From lacks attendee's address
+    assert rows[2]["from_me"] is None                  # missing labels cannot establish authorship
+
+
+def test_attendee_comms_does_not_attribute_an_introducer_or_similar_address_to_owner(monkeypatch):
+    monkeypatch.setattr(gg, '_run', lambda *a, **k: [
+        {'from': 'Priya <priya@other.com>', 'to': 'dana@acme.com, me@myco.com',
+         'subject': 'An introduction', 'snippet': 'You two should compare notes.'},
+        {'from': 'not-dana@acme.com', 'to': 'dana@acme.com', 'snippet': 'A different sender.'},
+    ])
+    _, rows = gg._fetch_attendee_comms('/fake/api.py', 'dana@acme.com')
+    assert all(row['from_me'] is None for row in rows)
+    assert rows[0]['sender_name'] == 'Priya' and rows[0]['sender_identifier'] == 'priya@other.com'
 
 
 def test_attendee_comms_fail_empty_when_api_missing(tmp_path, monkeypatch, capsys):

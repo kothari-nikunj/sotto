@@ -88,6 +88,70 @@ def record_google_consent(data, scopes):
             sources[source] = {'consented': granted, 'connected': granted}
 
 
+MANAGED_CONNECTOR_SOURCES = frozenset({'granola'})
+
+
+def record_connector_consent(data, service, connected):
+    """Persist the managed source gate beside the connector credential lifecycle.
+
+    Only named, reviewed context sources can be granted here.  Disconnect is an explicit
+    revocation rather than deletion, so a later boot cannot mistake a stale credential for
+    consent.  Self-host installs keep their existing credential-only behavior.
+    """
+    from connectors import json_transaction
+    if not enabled():
+        return
+    if service not in MANAGED_CONNECTOR_SOURCES or not isinstance(connected, bool):
+        raise ValueError('Invalid managed connector source')
+    path = str(Path(data) / 'config/managed-capabilities.json')
+    with json_transaction(path, default={}) as state:
+        tenant = os.environ['SOTTO_TENANT_ID']
+        if state.get('tenant_id') != tenant:
+            state.clear()
+        state['tenant_id'] = tenant
+        state.setdefault('sources', {})[service] = {
+            'consented': connected, 'connected': connected}
+
+
+def reconcile_connector_capabilities(data, statuses):
+    """Repair pre-gate connector links at managed process startup.
+
+    Reconciliation is intentionally narrower than an OAuth callback: it accepts only a known
+    linked service on an already tenant-bound capability file, and only fills a missing row.
+    Existing false values are revocations and remain authoritative.
+    """
+    from connectors import json_transaction
+    if not enabled() or not isinstance(statuses, list):
+        return
+    linked = {row.get('service') for row in statuses if isinstance(row, dict)
+              and row.get('connected') is True and row.get('service') in MANAGED_CONNECTOR_SOURCES}
+    if not linked:
+        return
+    path = Path(data) / 'config/managed-capabilities.json'
+    tenant = os.environ['SOTTO_TENANT_ID']
+    # Inspect before entering a write transaction: absent, malformed and foreign state must stay
+    # untouched and closed rather than being normalized into a grant.
+    try:
+        existing = json.loads(path.read_text())
+        sources = existing.get('sources')
+        if (not isinstance(existing, dict) or existing.get('tenant_id') != tenant
+                or not isinstance(sources, dict)):
+            return
+        missing = linked - set(sources)
+        if not missing:
+            return
+        with json_transaction(str(path), default={}) as state:
+            current_sources = state.get('sources')
+            if state.get('tenant_id') != tenant or not isinstance(current_sources, dict):
+                return
+            for service in missing:
+                if service not in current_sources:
+                    current_sources[service] = {'consented': True, 'connected': True}
+    except (OSError, ValueError, TypeError, AttributeError):
+        print('[sotto] managed connector reconciliation skipped: capability state unreadable',
+              flush=True)
+
+
 def brief_hold(data):
     if not enabled():
         return None

@@ -7,8 +7,9 @@ Phase 1 only. This script does three bounded things:
   3. Return recent Posts + the owner's matching bookmarks for the current prep run only.
 
 It never runs X people-search, mirrors a timeline/follow graph, reads Chat content, or writes to X.
-Post and bookmark text is written only to the caller's temporary output file; the graph stores the
-user id, handle history, resolution cache, and sourced public-profile fact.
+Post and bookmark text is written only to the caller's run input; background brief staging retains
+that ephemeral input for at most seven days after a crashed/unfinished run. The graph stores only
+the user id, handle history, resolution cache, and sourced public-profile fact.
 
 Credentials are the owner's own X app credentials:
   X_BEARER_TOKEN       app bearer token; sufficient for public lookup and Posts
@@ -49,6 +50,15 @@ MAX_BOOKMARKS_SCANNED = 25
 # in one prep and remembers nothing; NO is a suggestion at most.
 LINK, SHOW, NO = "link", "show", "no"
 TIMEOUT_SECS = 20
+
+
+class XApiError(RuntimeError):
+    """Content-free provider failure safe for receipts, warnings, and retry decisions."""
+
+    def __init__(self, code: str, *, global_failure: bool = True):
+        self.code = code
+        self.global_failure = global_failure
+        super().__init__(f"X API unavailable ({code})")
 
 # These are deliberately the obvious ambiguous local parts, not a pretend global name database.
 # The positive rule below (composite name or >=10 chars) does most of the work.
@@ -201,18 +211,59 @@ def _research_hints(research) -> dict:
 
 class XApi:
     def __init__(self):
-        self.public_token = (os.environ.get("X_BEARER_TOKEN", "").strip()
+        self.app_token = os.environ.get("X_BEARER_TOKEN", "").strip()
+        self.public_token = (self.app_token
                              or os.environ.get("X_USER_ACCESS_TOKEN", "").strip())
         self.user_token = os.environ.get("X_USER_ACCESS_TOKEN", "").strip()
         self.stub = _load(os.environ.get("SOTTO_X_STUB"), None)
         self.usage = {"user_lookup_requests": 0, "user_resources": 0,
                       "post_resources": 0, "bookmark_resources": 0}
+        self.request_succeeded = False
+        self.error_codes: list[str] = []
 
     @property
     def connected(self) -> bool:
         return isinstance(self.stub, dict) or bool(self.public_token)
 
-    def _get(self, path: str, params: dict, token: str = "") -> dict | None:
+    def _error(self, code: str, *, global_failure: bool = True):
+        # A protected person's timeline says nothing about the X connection. Keep that
+        # denial on their output row instead of recording a daily source failure.
+        if not (code == "permission_denied" and not global_failure) and code not in self.error_codes:
+            self.error_codes.append(code)
+        raise XApiError(code, global_failure=global_failure)
+
+    @staticmethod
+    def _not_found(errors) -> bool:
+        if not isinstance(errors, list) or not errors:
+            return False
+        def one(row):
+            if not isinstance(row, dict):
+                return False
+            kind = _s(row.get("type")).lower().rstrip("/")
+            return kind.endswith("resource-not-found")
+        return all(one(row) for row in errors)
+
+    def _provider_error(self, errors, *, account_scoped=True) -> None:
+        rows = errors if isinstance(errors, list) else []
+        text = " ".join((_s(row.get("title")) + " " + _s(row.get("type"))).lower()
+                        for row in rows if isinstance(row, dict))
+        codes = {row.get("code") for row in rows
+                 if isinstance(row, dict) and type(row.get("code")) in (int, str)}
+        if "credit" in text or "usage-capped" in text:
+            self._error("credits_exhausted")
+        if codes & {88, 429} or "rate" in text:
+            self._error("rate_limited", global_failure=False)
+        # X can return HTTP 200 with this problem for one protected timeline. Its title is
+        # "Authorization Error", so the generic auth check must not turn it into a bad token.
+        if ("not-authorized-for-resource" in text or codes & {220, 403}
+                or "forbidden" in text or "permission" in text):
+            self._error("permission_denied", global_failure=account_scoped)
+        if codes & {32, 89, 99, 215} or "auth" in text or "unauthorized" in text:
+            self._error("authentication_failed")
+        self._error("service_unavailable")
+
+    def _get(self, path: str, params: dict, token: str = "", *, allow_not_found=False,
+             account_scoped=True) -> dict | None:
         bearer = token or self.public_token
         if not bearer:
             return None
@@ -223,13 +274,41 @@ class XApi:
                                               "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_SECS) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                value = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(value, dict):
+                self._error("invalid_response")
+            if value.get("errors"):
+                if allow_not_found and self._not_found(value["errors"]):
+                    self.request_succeeded = True
+                    return None
+                if not account_scoped and self._not_found(value["errors"]):
+                    self._error("service_unavailable", global_failure=False)
+                self._provider_error(value["errors"], account_scoped=account_scoped)
+            return value
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None
-            raise RuntimeError(f"X API {exc.code} for {path}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"X API unavailable for {path}: {type(exc).__name__}") from exc
+            if exc.code == 404 and allow_not_found:
+                try:
+                    problem = json.loads(exc.read().decode("utf-8"))
+                except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                    problem = None
+                if isinstance(problem, dict) and self._not_found(problem.get("errors")):
+                    self.request_succeeded = True
+                    return None
+                self._error("service_unavailable")
+            if exc.code == 401:
+                self._error("authentication_failed")
+            if exc.code == 402:
+                self._error("credits_exhausted")
+            if exc.code == 403:
+                self._error("permission_denied", global_failure=account_scoped)
+            if exc.code == 429:
+                self._error("rate_limited", global_failure=False)
+            if exc.code == 404 and not account_scoped:
+                self._error("service_unavailable", global_failure=False)
+            self._error("service_unavailable")
+        except (urllib.error.URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._error("invalid_response" if isinstance(exc, (UnicodeDecodeError, json.JSONDecodeError))
+                        else "transport_unavailable")
 
     def user_by_username(self, handle: str) -> dict | None:
         handle = kg.normalize_x_handle(handle)
@@ -237,6 +316,7 @@ class XApi:
             return None
         self.usage["user_lookup_requests"] += 1
         if isinstance(self.stub, dict):
+            self.request_succeeded = True
             row = (self.stub.get("users_by_username") or {}).get(handle)
             if isinstance(row, dict):
                 self.usage["user_resources"] += 1
@@ -245,7 +325,15 @@ class XApi:
         response = self._get(
             "/users/by/username/" + urllib.parse.quote(handle),
             {"user.fields": "id,name,username,description,url,location,entities,verified,profile_image_url"},
+            allow_not_found=True,
         )
+        if response is not None:
+            row = response.get("data")
+            if (not isinstance(row, dict) or not _s(row.get("id")).strip()
+                    or not kg.normalize_x_handle(row.get("username"))):
+                self._error("invalid_response")
+        if response is not None:
+            self.request_succeeded = True
         row = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), dict) else None
         if row:
             self.usage["user_resources"] += 1
@@ -253,6 +341,7 @@ class XApi:
 
     def recent_posts(self, user_id: str, now: datetime) -> list:
         if isinstance(self.stub, dict):
+            self.request_succeeded = True
             rows = (self.stub.get("posts_by_user_id") or {}).get(str(user_id), [])
             out = [dict(r) for r in rows[:API_POST_PAGE] if isinstance(r, dict)]
             self.usage["post_resources"] += len(out)
@@ -262,15 +351,23 @@ class XApi:
             f"/users/{urllib.parse.quote(str(user_id))}/tweets",
             {"max_results": API_POST_PAGE, "start_time": start, "exclude": "retweets,replies",
              "tweet.fields": "id,text,created_at,author_id,entities"},
+            account_scoped=False,
         )
-        rows = response.get("data") if isinstance(response, dict) else []
-        out = [dict(r) for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        rows = response.get("data") if isinstance(response, dict) else None
+        valid_empty = (isinstance(response, dict) and "data" not in response
+                       and isinstance(response.get("meta"), dict)
+                       and response["meta"].get("result_count") == 0)
+        if not ((isinstance(rows, list) and all(isinstance(r, dict) for r in rows)) or valid_empty):
+            self._error("invalid_response")
+        self.request_succeeded = True
+        out = [dict(r) for r in rows] if isinstance(rows, list) else []
         self.usage["post_resources"] += len(out)
         return out
 
     def bookmarks(self) -> list:
         owner_id = os.environ.get("X_OWNER_USER_ID", "").strip()
         if isinstance(self.stub, dict):
+            self.request_succeeded = True
             rows = self.stub.get("bookmarks") or []
             out = [dict(r) for r in rows[:MAX_BOOKMARKS_SCANNED] if isinstance(r, dict)]
             self.usage["bookmark_resources"] += len(out)
@@ -282,8 +379,14 @@ class XApi:
             {"max_results": MAX_BOOKMARKS_SCANNED,
              "tweet.fields": "id,text,created_at,author_id,entities"}, self.user_token,
         )
-        rows = response.get("data") if isinstance(response, dict) else []
-        out = [dict(r) for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        rows = response.get("data") if isinstance(response, dict) else None
+        valid_empty = (isinstance(response, dict) and "data" not in response
+                       and isinstance(response.get("meta"), dict)
+                       and response["meta"].get("result_count") == 0)
+        if not ((isinstance(rows, list) and all(isinstance(r, dict) for r in rows)) or valid_empty):
+            self._error("invalid_response")
+        self.request_succeeded = True
+        out = [dict(r) for r in rows] if isinstance(rows, list) else []
         self.usage["bookmark_resources"] += len(out)
         return out
 
@@ -522,16 +625,35 @@ def _public_profile(p: kg.PersonFile, handle: str = "") -> dict:
             "profile_url": f"https://x.com/{current}" if current else ""}
 
 
+def _finish(result: dict, api: XApi) -> dict:
+    configured = api.connected
+    status = ("unconfigured" if not configured else "ok" if api.request_succeeded and not api.error_codes
+              else "degraded" if api.error_codes else "unverified")
+    result["request_status"] = {
+        "configured": configured, "succeeded": api.request_succeeded,
+        "status": status, "error_codes": list(api.error_codes),
+    }
+    try:
+        lib = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lib"))
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from source_context import record_x_status  # noqa: PLC0415
+        record_x_status(result)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # Diagnostics cannot make optional attendee context fail.
+    return result
+
+
 def gather(calendar, research=None, now: datetime | None = None, api: XApi | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     api = api or XApi()
     attendees = upcoming_attendees(calendar)
     if not attendees:
-        return {"attendees": []}
+        return _finish({"attendees": []}, api)
     if not api.connected:
         # Not configured is not a failure: `warnings` means a source that BROKE, and the brief's
         # Data Source Availability section reports those. An absent X key reports nothing.
-        return {"attendees": [], "connected": False}
+        return _finish({"attendees": [], "connected": False}, api)
 
     hints = _research_hints(research or {})
     warnings, resolved, unconfirmed_rows = [], [], []
@@ -542,7 +664,11 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
         index = kg.build_people_index()
         snapshots = [(attendee, *_graph_person(attendee, index)) for attendee in attendees]
 
+    global_failure = False
+    lookup_rate_limited = False
     for attendee, person_path, person in snapshots:
+        if global_failure:
+            break
         # The invite had no display name but the graph knows them: use the name we actually have,
         # so agreement is judged against a person rather than an email stem. Unless the graph's name
         # IS the stem — an older run wrote those, and adopting one puts the candidate handle back in
@@ -553,6 +679,10 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
             attendee = dict(attendee, name=graph_name)
         if person and person.x_user_id:
             resolved.append((attendee, person))
+            continue
+        # A limit on exact user lookup says nothing about identities already on file. Continue
+        # collecting those people for their timeline and bookmark reads.
+        if lookup_rate_limited:
             continue
 
         email = _s(attendee.get("email")).lower()
@@ -568,6 +698,7 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
             continue
 
         matched_user, unconfirmed, weak = None, None, None
+        lookup_incomplete = False
         method = ""
         try:
             for candidate, candidate_method in candidates:
@@ -596,6 +727,13 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
                 # Keep the primary (web-first) weak candidate so the suggestion cache sees the
                 # same evidence key tomorrow and does not repeat both paid lookups.
                 weak = weak or (user, reason)
+        except XApiError as exc:
+            warnings.append(str(exc))
+            if exc.code == "rate_limited":
+                lookup_rate_limited = lookup_incomplete = True
+            else:
+                global_failure = exc.global_failure
+                continue
         except RuntimeError as exc:
             warnings.append(str(exc))
             continue
@@ -645,12 +783,13 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
             })
         elif weak:
             user, reason = weak
-            resolution = {"status": "suggested", "checked_at": today,
-                          "candidate": kg.normalize_x_handle(user.get("username")),
-                          "reason": reason}
-            _cache_resolution(attendee, person, resolution, now)
+            if not lookup_incomplete:
+                resolution = {"status": "suggested", "checked_at": today,
+                              "candidate": kg.normalize_x_handle(user.get("username")),
+                              "reason": reason}
+                _cache_resolution(attendee, person, resolution, now)
             _record_suggestion(attendee, user, reason, now)
-        else:
+        elif not lookup_incomplete:
             resolution = {"status": "miss", "checked_at": today}
             if candidates:
                 # Freshness compares the primary evidence candidate (web first), so two-candidate
@@ -668,9 +807,16 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
     # One bookmarks call scans 25 posts and X bills every one of them, so it runs only once there is
     # somebody to match them against — nobody resolved meant buying 25 reads to attribute to no one.
     bookmarks = []
-    if rows:
+    if rows and not global_failure:
         try:
             bookmarks = api.bookmarks()
+        except XApiError as exc:
+            warnings.append(str(exc))
+            # Bookmark authorization is a separate user-token lane. When an app bearer exists,
+            # its public timelines remain usable even if bookmark.read is denied or expired. The
+            # same is true in user-token-only mode: permission/quota is endpoint-scoped, while an
+            # explicit authentication failure proves that shared credential cannot read either.
+            global_failure = exc.code == "authentication_failed" and not bool(api.app_token)
         except RuntimeError as exc:
             warnings.append(str(exc))
     bookmarks_by_author: dict[str, list] = {}
@@ -680,14 +826,29 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
             bookmarks_by_author.setdefault(author, []).append(post)
 
     output, remaining_items = [], MAX_X_ITEMS_TOTAL
+    timeline_rate_limited = False
     for attendee, profile, x_user_id, flags in rows:
         if remaining_items <= 0:
             break
-        try:
-            posts = api.recent_posts(x_user_id, now)
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            posts = []
+        posts = []
+        posts_status = "available"
+        if not global_failure and not timeline_rate_limited:
+            try:
+                posts = api.recent_posts(x_user_id, now)
+            except XApiError as exc:
+                posts_status = "unavailable"
+                # Protected attendee, not a connection or other-attendee failure.
+                if exc.code != "permission_denied" or exc.global_failure:
+                    warnings.append(str(exc))
+                if exc.code == "rate_limited":
+                    timeline_rate_limited = True
+                else:
+                    global_failure = exc.global_failure
+            except RuntimeError as exc:
+                warnings.append(str(exc))
+                posts_status = "unavailable"
+        elif global_failure or timeline_rate_limited:
+            posts_status = "unavailable"
         recent = posts[:min(MAX_RECENT_POSTS, remaining_items)]
         remaining_items -= len(recent)
         saved = bookmarks_by_author.get(x_user_id, [])[
@@ -698,12 +859,13 @@ def gather(calendar, research=None, now: datetime | None = None, api: XApi | Non
             **profile,
             **flags,
             "recent_posts": recent,
+            **({"recent_posts_status": posts_status} if posts_status == "unavailable" else {}),
             "bookmarks": saved,
         })
     result = {"attendees": output, "connected": True, "usage": dict(api.usage)}
     if warnings:
         result["warnings"] = list(dict.fromkeys(warnings))
-    return result
+    return _finish(result, api)
 
 
 def main() -> None:
@@ -716,7 +878,8 @@ def main() -> None:
     _write(args.out, result)
     print(json.dumps({"attendees": len(result.get("attendees") or []),
                       "usage": result.get("usage") or {},
-                      "warnings": result.get("warnings") or []}))
+                      "warnings": result.get("warnings") or [],
+                      "request_status": result.get("request_status") or {}}))
 
 
 if __name__ == "__main__":

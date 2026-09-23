@@ -9,3 +9,17 @@ SOURCE_FIELDS = {
     'safari': ('safari_history', 'safari_search_queries'), 'recent_files': ('recent_files',),
     'screen_time': ('screen_time',),
 }
+
+LOCAL_SNAPSHOT_TTL_HOURS = 24
+
+SOURCE_LABELS = {
+    'imessage': 'iMessage', 'whatsapp': 'WhatsApp', 'calls': 'Phone Calls',
+    'whatsapp_calls': 'WhatsApp Calls', 'contacts': 'Apple Contacts',
+    'reminders': 'Apple Reminders', 'apple_notes': 'Apple Notes',
+    'chrome': 'Chrome History', 'safari': 'Safari History',
+    'recent_files': 'Recent Files', 'screen_time': 'Screen Time',
+    'gmail': 'Gmail', 'calendar': 'Google Calendar',
+    'granola': 'Meeting Notes (Granola)',
+    'attendee_research': 'Attendee Research (web search)',
+    'x': 'X (attendee context)',
+}

@@ -87,6 +87,32 @@ def test_intention_and_seen_wait_for_ack_and_finalize_is_idempotent():
         assert state['nudged'] == [key] and not state['pending']
 
 
+@pytest.mark.parametrize('mode', ['offer', 'full'])
+def test_meeting_prep_suppression_requires_accepted_exact_occurrence(tmp_path, mode):
+    start = '2026-09-21T17:30:00Z'
+    effect = {'kind': 'meeting_prep_delivered', 'mode': mode,
+              'calendar_event_id': 'event-1', 'calendar_start': start}
+    assert not effects.finalize([effect], {})
+    date = '2026-09-21'
+    with effects.proactive_state(date) as state:
+        assert state.get('prep_deliveries', []) == []
+    assert effects.finalize([effect], {'accepted_at': 1234})
+    with effects.proactive_state(date) as state:
+        assert state['prep_deliveries'] == [effects.meeting_occurrence('event-1', start)]
+
+
+def test_meeting_prep_effect_uses_user_local_day_across_utc_midnight(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'America/Los_Angeles')
+    start = '2026-09-22T00:30:00Z'  # Sep 21 afternoon in Los Angeles
+    effect = {'kind': 'meeting_prep_delivered', 'mode': 'full',
+              'calendar_event_id': 'event-west', 'calendar_start': start}
+    assert effects.finalize([effect], {'accepted_at': 1234})
+    with effects.proactive_state('2026-09-21') as state:
+        assert state['prep_deliveries'] == [effects.meeting_occurrence('event-west', start)]
+    with effects.proactive_state('2026-09-22') as state:
+        assert state.get('prep_deliveries', []) == []
+
+
 def test_calendar_absence_only_means_cancelled_with_fresh_complete_same_day(tmp_path):
     now = datetime.now(timezone.utc)
     start = now + timedelta(minutes=30)

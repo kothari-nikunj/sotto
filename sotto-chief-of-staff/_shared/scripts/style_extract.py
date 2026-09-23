@@ -36,6 +36,7 @@ import action_links  # noqa: E402  (owns the offered-drafts ledger path)
 from keys import draft_key, sample_hash, sample_key  # noqa: E402,F401  (shared with the Voice card)
 import jsonstore  # noqa: E402
 from textutil import unwrap_tool_result  # noqa: E402  (shared MCP tool-result unwrap)
+from source_context import SOURCE_FIELDS, allowed, project_local  # noqa: E402
 
 # ── Constants (style-profile.ts:156-182) ─────────────────────────────────────
 MAX_PERSON_SAMPLES = 8
@@ -47,6 +48,10 @@ DAY = 24 * 3600 * 1000
 CANONICAL_TTL_MS = {"work_email": 90 * DAY, "work_message": 60 * DAY, "personal_message": 30 * DAY}
 RECENT_TTL_MS = 7 * DAY
 ALL_BUCKETS = ["work_email", "work_message", "personal_message"]
+NORMALIZED_CHANNEL_SOURCES = {
+    "imessage": "imessage", "whatsapp": "whatsapp",
+    "email": "gmail", "gmail": "gmail", "apple_mail": "gmail",
+}
 PERSONAL_DOMAINS = {"gmail.com", "yahoo.com", "icloud.com", "me.com", "mac.com",
                     "hotmail.com", "outlook.com", "aol.com", "protonmail.com", "proton.me"}
 BACK_CHANNEL = {"ok", "okay", "k", "kk", "yes", "yep", "yup", "no", "nope", "sure", "lol",
@@ -537,7 +542,9 @@ def _ingest(payload: dict, now: datetime) -> list:
     work_set = build_work_canonical_id_set(payload)
     out = []
     for m in payload.get("sent_messages", []):
-        ch = m.get("channel") or "imessage"
+        ch, _source = _normalized_channel(m)
+        if not ch:
+            continue
         raw = m.get("text") or ""
         if ch in ("email", "gmail", "apple_mail"):
             text = sanitize_sample_text(clean_email_body(raw))
@@ -555,6 +562,19 @@ def _ingest(payload: dict, now: datetime) -> list:
         s["quality"] = score_sample(s)
         out.append(s)
     return out
+
+
+def _normalized_channel(message) -> tuple[str, str] | tuple[None, None]:
+    """Resolve the normalized-message transport once for both consent and ingestion.
+
+    Legacy rows with no channel are iMessage. Unknown transports are rejected because there is no
+    source-consent decision that can authorize them.
+    """
+    if not isinstance(message, dict):
+        return None, None
+    channel = str(message.get("channel") or "").strip().lower() or "imessage"
+    source = NORMALIZED_CHANNEL_SOURCES.get(channel)
+    return (channel, source) if source else (None, None)
 
 
 def _dedupe(samples: list) -> list:
@@ -608,6 +628,29 @@ def _rebuild_per_person(all_samples: list) -> dict:
 
 
 def _extract_unlocked(payload: dict, now, gmail, path: str) -> dict:
+    payload = unwrap_tool_result(payload or {}, _READ_LOCAL_KEYS + ("sent_messages",))
+    style_sources = {"imessage", "whatsapp", "contacts"}
+    read_local_sources = {
+        source for source, fields in SOURCE_FIELDS.items()
+        if source in style_sources and any(payload.get(field) for field in fields)
+    } if isinstance(payload, dict) and "sent_messages" not in payload else set()
+    normalized_sources = set()
+    if isinstance(payload, dict) and isinstance(payload.get("sent_messages"), list):
+        kept = []
+        for message in payload["sent_messages"]:
+            channel, source = _normalized_channel(message)
+            if not source or not allowed(source):
+                continue
+            normalized_sources.add(source)
+            kept.append({**message, "channel": channel})
+        payload = {**payload, "sent_messages": kept}
+    if read_local_sources:
+        payload = project_local(payload)
+        read_local_sources = {source for source in read_local_sources if allowed(source)}
+    gmail_used = bool(_adapt_gmail(gmail))
+    if gmail_used and not allowed("gmail"):
+        gmail = None
+        gmail_used = False
     payload = _adapt_read_local(payload)
     sent_gmail = _adapt_gmail(gmail)
     if sent_gmail:   # merge WITHOUT mutating the caller's payload (passthrough contract above)
@@ -673,6 +716,9 @@ def _extract_unlocked(payload: dict, now, gmail, path: str) -> dict:
                                        if key in retained_actions}
                                       if retained_actions is not None else
                                       {key: True for key in confirmed_actions})
+    if (any(not allowed(source) for source in read_local_sources | normalized_sources)
+            or (gmail_used and not allowed("gmail"))):
+        raise RuntimeError("source consent changed during style extraction")
     jsonstore.write_atomic(path, style, indent=2)
     return {"messages_analyzed": style["messages_analyzed"],
             "canonical_counts": {b: len(canonical[b]) for b in ALL_BUCKETS},

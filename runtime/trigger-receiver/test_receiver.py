@@ -893,6 +893,13 @@ def test_setup_surface_gating_over_http(tmp_path, monkeypatch):
     r2.MCP_TOKEN = r2.RELAY_TOKEN = "bearer-tok"
     r2.TOKEN = "bearer-tok"
     r2.RAILWAY_DOMAIN = "myapp.up.railway.app"
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    os.makedirs(tmp_path / 'config', exist_ok=True)
+    with open(tmp_path / 'config/managed-capabilities.json', 'w') as f:
+        json.dump({'tenant_id': 'test', 'sources': {
+            'granola': {'consented': True, 'connected': True}}}, f)
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), r2.Handler)
     base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -955,7 +962,35 @@ def test_setup_surface_gating_over_http(tmp_path, monkeypatch):
                           headers={"Cookie": "sotto_setup=sekrit-code-123"})
         assert code == 200 and json.loads(body)["ok"] is True
         assert not os.path.exists(tok) and not os.path.exists(errf)
+        assert json.load(open(tmp_path / 'config/managed-capabilities.json'))['sources']['granola'] == {
+            'consented': False, 'connected': False}
         assert sorted(json.loads(body)["removed"]) == ["granola.error", "granola.json"]
+        # A failed revocation is reported and the credential remains: no false "disconnected"
+        # response can leave already cached Granola material authorized.
+        with open(tok, "w", encoding="utf-8") as f:
+            json.dump({"service": "granola", "access_token": "t"}, f)
+        import managed as managed_module
+        real_record = managed_module.record_connector_consent
+        monkeypatch.setattr(managed_module, 'record_connector_consent',
+                            lambda *_args: (_ for _ in ()).throw(OSError('fixture')))
+        code, body = post("/setup/disconnect", b'{"service":"granola"}',
+                          headers={"Cookie": "sotto_setup=sekrit-code-123"})
+        assert code == 500 and json.loads(body)["ok"] is False and os.path.exists(tok)
+        monkeypatch.setattr(managed_module, 'record_connector_consent', real_record)
+        os.unlink(tok)
+        with open(tok, "w", encoding="utf-8") as f:
+            json.dump({"service": "granola", "access_token": "t"}, f)
+        real_disconnect = r2.CONNECTORS.disconnect
+        monkeypatch.setattr(r2.CONNECTORS, 'disconnect',
+                            lambda *_args: (_ for _ in ()).throw(OSError('fixture')))
+        code, body = post("/setup/disconnect", b'{"service":"granola"}',
+                          headers={"Cookie": "sotto_setup=sekrit-code-123"})
+        assert code == 500 and json.loads(body)["detail"] == "credential removal failed"
+        assert os.path.exists(tok)
+        assert json.load(open(tmp_path / 'config/managed-capabilities.json'))['sources']['granola'] == {
+            'consented': False, 'connected': False}
+        monkeypatch.setattr(r2.CONNECTORS, 'disconnect', real_disconnect)
+        os.unlink(tok)
         code, body = post("/setup/disconnect", b'{"service":"granola"}',
                           headers={"Cookie": "sotto_setup=sekrit-code-123"})
         assert code == 200 and json.loads(body)["removed"] == []    # already gone → still success
@@ -3031,8 +3066,20 @@ def test_a_skills_output_is_actually_sent_to_the_home_channel(tmp_path, monkeypa
     assert len(sends) == 1, "the skill's output was never handed to `hermes send`"
     assert sends[0]["argv"][:4] == ["hermes", "send", "--to", "whatsapp"]
     assert sends[0]["input"] == "You're meeting Ashton in ~14 min"
-    assert [r["status"] for r in _delivery_rows(tmp_path)] == ["spawned", "delivered"]
+    rows = _delivery_rows(tmp_path)
+    assert [r["status"] for r in rows] == ["spawned", "delivered"]
+    assert {r["run_id"] for r in rows} == {t}
     assert rec.WORK_QUEUE.get(tmp_path, t)["status"] == "done"
+
+
+def test_delivery_receipt_only_accepts_durable_run_identity(tmp_path):
+    rec.DATA = str(tmp_path)
+    run_id = "a" * 32
+    rec._record_delivery("event", "spawned", run_id=run_id)
+    rec._record_delivery("event", "spawned", run_id="free-form-run-name")
+    rows = _delivery_rows(tmp_path)
+    assert rows[0]["run_id"] == run_id
+    assert "run_id" not in rows[1]
 
 
 def test_the_delivery_target_is_the_same_channel_the_crons_use(tmp_path, monkeypatch):
@@ -4148,6 +4195,33 @@ def test_delivery_effect_helper_keeps_its_sibling_dirs_on_the_path_exactly_once(
     assert rec._shared_effects() is first and sys.path == grown, "cached: no second load, no growth"
     for name in ('pending_offer', 'schedule_wakeup', 'ledger_io'):
         assert importlib.import_module(name).__file__.startswith(scripts)
+
+
+def test_source_context_loader_works_in_fresh_flattened_receiver_process(tmp_path):
+    """The image starts with receiver siblings on sys.path, not the skills shared-lib directory."""
+    import subprocess
+    import sys
+    config = tmp_path / 'config'
+    config.mkdir()
+    (config / 'managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'test', 'sources': {
+            'granola': {'consented': True, 'connected': True}}}))
+    receiver_dir = str(Path(HERE))
+    skills_root = str(Path(HERE).parents[1] / 'sotto-chief-of-staff')
+    code = (
+        "import importlib,sys; "
+        "sys.path.insert(0, sys.argv[1]); "
+        "receiver=importlib.import_module('receiver'); "
+        "assert receiver.DASHBOARD.HOOKS['source_allowed']('granola'); "
+        "first=receiver._source_context(); second=receiver._source_context(); "
+        "assert first is second; print(first.__file__)"
+    )
+    env = dict(os.environ, SOTTO_DEPLOYMENT_MODE='managed', SOTTO_TENANT_ID='test',
+               SOTTO_DATA=str(tmp_path), SOTTO_SKILLS_ROOT=skills_root)
+    result = subprocess.run([sys.executable, '-I', '-c', code, receiver_dir], env=env,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert '/_shared/lib/source_context.py' in result.stdout
 
 
 def test_fire_cron_job_surfaces_terminal_work_and_still_swallows_spawn_failures(tmp_path, monkeypatch):

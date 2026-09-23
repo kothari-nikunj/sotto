@@ -49,7 +49,7 @@ def test_valid_empty_read_clears_previous_rows_and_stays_empty_offline():
     assert not cb._local_fallback({}).get('imessage')
 
 
-def test_partial_pull_preserves_old_source_age_without_renewing_its_ttl():
+def test_partial_pull_drops_missing_old_rows_and_records_the_new_observation():
     old = stamp(cb.LOCAL_SNAPSHOT_TTL_HOURS + 1)
     cb._save_local_snapshot({'generated_at': old, 'source_status': {'imessage': 'ok', 'whatsapp': 'ok'},
                             'imessage': [{'text': 'expired'}], 'whatsapp': [{'text': 'old'}]})
@@ -58,7 +58,7 @@ def test_partial_pull_preserves_old_source_age_without_renewing_its_ttl():
                                       'imessage': [], 'whatsapp': [{'text': 'fresh'}]})
     assert not current.get('imessage')
     assert current['whatsapp'][0]['text'] == 'fresh'
-    assert current['_source_observed_at']['imessage'] == old
+    assert current['_source_observed_at']['imessage'] != old
     assert not cb._local_fallback({}).get('imessage')
 
 

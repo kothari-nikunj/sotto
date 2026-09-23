@@ -183,7 +183,7 @@ def normalize_email(it: dict, full: dict) -> dict:
     Tolerant of field-name variants so the SAME brief works whichever host provided the data."""
     labels = _pick(full, "labels", "labelIds") or _pick(it, "labels", "labelIds", "label_ids") or []
     labels = [str(x).upper() for x in labels] if isinstance(labels, list) else []
-    return {
+    normalized = {
         "id": _pick(it, "id", "message_id", "messageId"),
         "threadId": _pick(it, "threadId", "thread_id") or _pick(full, "threadId", "thread_id"),
         "from": _addr_str(_pick(full, "from", "sender", "from_address") or _pick(it, "from", "sender")),
@@ -195,6 +195,7 @@ def normalize_email(it: dict, full: dict) -> dict:
         "labelIds": labels,
         "isSent": "SENT" in labels,
     }
+    return normalized
 
 
 def normalize_event(e: dict) -> dict:
@@ -203,7 +204,7 @@ def normalize_event(e: dict) -> dict:
     def _t(*keys):
         v = _pick(e, *keys)
         return (v.get("dateTime") or v.get("date") or "") if isinstance(v, dict) else (v or "")
-    return {
+    normalized = {
         "id": _pick(e, "id", "event_id", "eventId"),
         "summary": _pick(e, "summary", "title", "name") or "",
         "start": _t("start", "start_time", "startTime"),
@@ -217,6 +218,12 @@ def normalize_event(e: dict) -> dict:
         # haven't answered is an ask. Nothing read this field before (Sep 2026).
         "my_response": my_response(e),
     }
+    # Preserve exact provider linkage when present. These are opaque identifiers only; callers may
+    # use an exact Gmail thread binding but must not infer one from a shared attendee or title.
+    for key in ("threadId", "thread_id", "iCalUID", "conferenceData", "hangoutLink", "htmlLink"):
+        if e.get(key) not in (None, "", [], {}):
+            normalized[key] = e[key]
+    return normalized
 
 
 def my_response(e: dict) -> str:
@@ -704,13 +711,12 @@ def _attendee_emails_from_file(path: str) -> list:
 
 def _fetch_attendee_comms(api, email: str) -> tuple:
     """One per-attendee Gmail search (30d window, both directions). A failure just means that
-    attendee gets no thread context — never fails the whole gather. from_me: the user's own address
-    isn't knowable here (no auth introspection), so direction is derived from the message itself —
-    the SENT label when the CLI returns labels, else whether the From header carries the ATTENDEE's
-    address (if it doesn't, the user wrote it: the search guarantees the attendee is on the thread)."""
+    attendee gets no thread context. Only SENT proves the owner authored a message; another
+    participant in an introduction thread is not the owner. Unattributed direction stays null,
+    with the actual sender retained for attribution and mute checks."""
     try:
         items = _as_list(_run(api, ["gmail", "search",
-                                    f"from:{email} OR to:{email} newer_than:30d",
+                                    f"{{from:{email} to:{email}}} newer_than:30d",
                                     "--max", str(ATTENDEE_COMMS_MAX_PER)],
                               timeout=ATTENDEE_COMMS_TIMEOUT))
     except Exception:
@@ -721,13 +727,24 @@ def _fetch_attendee_comms(api, email: str) -> tuple:
             continue
         labels = _pick(it, "labels", "labelIds", "label_ids") or []
         labels = [str(x).upper() for x in labels] if isinstance(labels, list) else []
-        frm = _addr_str(_pick(it, "from", "sender", "from_address") or "").lower()
-        rows.append({
+        senders = getaddresses([_addr_str(_pick(it, "from", "sender", "from_address") or "")])
+        name, sender = senders[0] if len(senders) == 1 else ('', '')
+        sender = sender.lower().strip()
+        row = {
             "date": str(_pick(it, "date", "internalDate", "received_at") or ""),
             "subject": str(_pick(it, "subject", "title") or ""),
             "snippet": str(_pick(it, "snippet", "preview", "body_preview") or ""),
-            "from_me": ("SENT" in labels) or bool(frm and email not in frm),
-        })
+            "from_me": True if "SENT" in labels else (False if sender == email else None),
+            "sender_name": name,
+            "sender_identifier": sender,
+        }
+        message_id = str(_pick(it, "id", "messageId", "message_id") or "")
+        thread_id = str(_pick(it, "threadId", "thread_id") or "")
+        if message_id:
+            row['message_id'] = message_id
+        if thread_id:
+            row['thread_id'] = thread_id
+        rows.append(row)
     return email, rows[:ATTENDEE_COMMS_MAX_PER]
 
 

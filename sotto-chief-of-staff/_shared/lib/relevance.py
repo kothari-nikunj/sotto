@@ -135,6 +135,9 @@ def _validate(raw, batch):
         if not isinstance(row.get("why"), str) or not row["why"].strip():
             raise ValueError("relevance judgment needs an evidence-based reason")
         deadline = row.get('deadline')
+        if isinstance(deadline, str) and not deadline.strip():
+            row.pop('deadline', None)
+            deadline = None
         if deadline is not None:
             if not isinstance(deadline, str) or not deadline.strip():
                 raise ValueError('relevance deadline must be an ISO-8601 timestamp')

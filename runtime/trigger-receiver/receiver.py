@@ -164,19 +164,59 @@ _relay_mod = importlib.util.module_from_spec(_relay_spec)
 _relay_spec.loader.exec_module(_relay_mod)
 RELAY = _relay_mod.Relay()
 
-def _record_source_response(request, result):
-    if request.get('method') != 'tools/call' or (request.get('params') or {}).get('name') not in ('health', 'read_local'):
-        return
+def _source_context():
+    """Load the shared permission owner in source checkouts and flattened runtime images."""
+    module = getattr(_source_context, '_module', None)
+    if module is not None:
+        return module
     script = _find_sotto_script('_shared', 'lib', 'source_context.py')
     if not script:
         raise RuntimeError('source context helper missing')
     directory = os.path.dirname(script)
     if directory not in sys.path:
         sys.path.insert(0, directory)
-    import source_context
+    module = importlib.import_module('source_context')
+    _source_context._module = module
+    return module
+
+
+def _record_source_response(request, result):
+    if request.get('method') != 'tools/call' or (request.get('params') or {}).get('name') not in ('health', 'read_local'):
+        return
     from textutil import unwrap_tool_result
-    if not result.get('isError'):
-        source_context.record_bridge_status(unwrap_tool_result(result), data_root=DATA)
+    if result.get('isError'):
+        return
+    unwrapped = unwrap_tool_result(result)
+    if not isinstance(unwrapped, dict) or not any(
+            isinstance(unwrapped.get(key), dict) for key in ('source_status', 'sources')):
+        return
+    # `unwrap_tool_result` may legitimately return `result` itself for a raw payload. Detach the
+    # payload before adding MCP wrapper fields below, or structuredContent would point back to its
+    # own parent and make the response impossible to JSON-encode.
+    payload = dict(unwrapped)
+    marker_key = _relay_mod.BRIDGE_REQUEST_STARTED_AT
+    marker = request.get(marker_key)
+    if isinstance(marker, str) and marker:
+        payload[marker_key] = marker
+    else:
+        # A marker supplied by the Bridge has no ordering authority.
+        payload.pop(marker_key, None)
+
+    # Keep MCP's two payload representations identical. Downstream adapters may unwrap either
+    # lane, and a later recorder must retain the original server-authored request start.
+    result['structuredContent'] = payload
+    encoded = json.dumps(payload)
+    content = result.get('content')
+    if not isinstance(content, list):
+        content = []
+        result['content'] = content
+    text_entry = next((entry for entry in content
+                       if isinstance(entry, dict) and entry.get('type') == 'text'), None)
+    if text_entry is None:
+        content.append({'type': 'text', 'text': encoded})
+    else:
+        text_entry['text'] = encoded
+    _source_context().record_bridge_status(payload, data_root=DATA)
 
 
 RELAY.on_response = _record_source_response
@@ -211,6 +251,8 @@ DASHBOARD.HOOKS.update({
     "connector_status": lambda: CONNECTORS.service_status(),
     "connector_error": lambda s: _connector_error(s),
     "connector_has_refresh": lambda s: _connector_has_refresh(s),
+    "source_allowed": lambda s: _source_context().allowed(s),
+    "source_health": lambda: _source_context().source_health(DATA),
     # M2 writes: dashboard.py shells out to the skills tree's knowledge_edit.py, located with the
     # same discovery run_triage uses (late-bound so test monkeypatches on _find_sotto_script land).
     "find_script": lambda *rel: _find_sotto_script(*rel),
@@ -275,8 +317,8 @@ OUTBOX.HOOKS.update({
     "send": lambda body, target: _send_via_channel(body, target),
     "send_gallery": lambda presentation, target: _hermes_adapter('runtime_api').send_gallery(
         presentation, target, SEND_TIMEOUT_SECS),
-    "record": lambda label, status, detail="", usage=None, decision_ids=None: _record_delivery(
-        label, status, detail, usage=usage, decision_ids=decision_ids),
+    "record": lambda label, status, detail="", usage=None, decision_ids=None, run_id="": _record_delivery(
+        label, status, detail, usage=usage, decision_ids=decision_ids, run_id=run_id),
     # A chase is only counted once the message that chased actually landed — wherever it landed,
     # first try or fifth. The ack is what finalizes effects, so this rides the ack.
     "on_delivered": lambda payload: _on_delivered(payload),
@@ -593,7 +635,7 @@ def _deliver_target() -> str:
 
 
 def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None,
-                     decision_ids: list | None = None) -> None:
+                     decision_ids: list | None = None, run_id: str = "") -> None:
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
     spawned / delivered / empty / failed / skipped (nothing spawned — e.g. a wake trigger after the
@@ -617,6 +659,10 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
             row["detail"] = detail[:300]
         if usage:
             row["usage"] = usage
+        # Durable-work IDs are the same 32-hex identity exported to model_work as run_id. Keep only
+        # that fixed shape: arbitrary labels/details must never become an accidental join key.
+        if re.fullmatch(r"[0-9a-f]{32}", str(run_id or "")):
+            row["run_id"] = run_id
         ids = [str(v) for v in (decision_ids or []) if str(v).strip()]
         if ids:
             row["decision_ids"] = ids[:20]
@@ -709,7 +755,8 @@ def _invalid_delivery(payload):
         return True  # another accepted or active run owns this day's brief
     if claim == 'uncertain':
         _record_delivery(label, 'failed', 'Brief changed after a send with unknown acceptance; '
-                         'its delivery reservation was preserved to avoid a second brief.')
+                         'its delivery reservation was preserved to avoid a second brief.',
+                         run_id=payload.get('run_id') or '')
         return True
     if payload.get('valid_until') and time.time() >= payload['valid_until']:
         return True
@@ -776,11 +823,11 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
     body = _strip_mailto(_MARKER_RE.sub("", text or ""))
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     if not body:
-        _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids)
+        _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids, run_id=run_id)
         return False
     if _is_silence(body):
         _record_delivery(label, "empty", f"{SILENCE_SENTINEL} sentinel — nothing to deliver",
-                         usage=usage, decision_ids=decision_ids)
+                         usage=usage, decision_ids=decision_ids, run_id=run_id)
         return False
     # An offer is actionable only if its exact question is present in the text being handed off.
     effects = [effect for effect in (effects or []) if effect.get('kind') != 'pending_offer'
@@ -788,6 +835,7 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
                    and str(effect['offer']['question']).strip() in body)]
     target = _deliver_target()
     presentation = None
+    presentation_status = {}
     if not any(e.get('kind') == 'pending_offer' for e in effects):
         # Consent offers/effects stay in their existing exact-text delivery contract.
         prepare = _load_shared_lib('visual_delivery').prepare
@@ -796,9 +844,9 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
             import visual_brief
             return visual_brief
         presentation = prepare(body, label, target, load_visual,
-                               _hermes_adapter('runtime_api').gallery_available)
+                               _hermes_adapter('runtime_api').gallery_available, diagnostics=presentation_status)
     return OUTBOX.deliver({"label": label, "body": body, "target": target,
-                           "presentation": presentation,
+                           "presentation": presentation, "presentation_status": presentation_status,
                            "usage": usage, "decision_ids": decision_ids,
                            "effects": effects or [], "run_id": run_id, "valid_until": valid_until,
                            "not_before": not_before, "coverage_until": coverage_until})
@@ -889,13 +937,7 @@ WORK_SHUTDOWN_GRACE_SECS = 10
 
 
 def _brief_revision(kind=None):
-    script = _find_sotto_script('_shared', 'lib', 'source_context.py')
-    if not script:
-        raise RuntimeError('source permissions helper missing')
-    directory = os.path.dirname(script)
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
-    import source_context
+    source_context = _source_context()
     permission = {source: source_context.allowed(source) for source in
                   (*source_context.SOURCE_FIELDS, 'gmail', 'calendar', 'granola')}
     try:
@@ -975,7 +1017,7 @@ def _execute_work(job):
         # Adapter API owns Hermes flags; a foreign runner receives only its declared arguments.
         argv = _hermes_adapter('runtime_api').run_argv(runner, prompt, usage_path,
                                                   os.environ.get('SOTTO_SPAWN_TOOLSETS', '').strip())
-        _record_delivery(label, 'spawned', decision_ids=request.get('decision_ids'))
+        _record_delivery(label, 'spawned', decision_ids=request.get('decision_ids'), run_id=job['id'])
         # Child creation and registration share the signal handler's lock. Thus shutdown either
         # wins before Popen (and no child is created) or snapshots the new child after registration.
         with _WORK_LOCK:
@@ -1092,19 +1134,20 @@ def _work_one(job):
         # fault attempts; release's timestamp sets the next due time, not the hard job deadline.
         WORK_QUEUE.release(DATA, job['id'], owner, now=time.time() + 60)
         _record_delivery(job['payload'].get('label', job['kind']), 'skipped',
-                         f'work {job["id"]}: generation busy; retry queued')
+                         f'work {job["id"]}: generation busy; retry queued', run_id=job['id'])
     except _WorkInterruptedError:
         # A redeploy's SIGTERM, not the job's fault: the lease goes back uncharged so the next
         # instance simply resumes it. Charging it made a day's brief terminal in three pushes.
         WORK_QUEUE.release(DATA, job['id'], owner)
         _record_delivery(job['payload'].get('label', job['kind']), 'skipped',
-                         f'work {job["id"]}: interrupted by shutdown; resumes on the next instance')
+                         f'work {job["id"]}: interrupted by shutdown; resumes on the next instance',
+                         run_id=job['id'])
     except Exception as error:
         diagnostic = error.diagnostic if isinstance(error, _WorkerError) else type(error).__name__
         WORK_QUEUE.fail(DATA, job['id'], owner, diagnostic)
         _record_delivery(job['payload'].get('label', job['kind']), 'failed',
                          f'work {job["id"]}: {diagnostic}; persisted for bounded retry',
-                         usage=getattr(error, 'usage', None))
+                         usage=getattr(error, 'usage', None), run_id=job['id'])
     finally:
         settled.set()
         _WORK_WAKE.set()
@@ -3773,6 +3816,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._html(code, _connect_error_page(e.step, str(e)))
         except Exception as e:  # noqa: BLE001
             return self._html(500, _connect_error_page("exchange", f"unexpected error: {e}"))
+        try:
+            __import__('managed').record_connector_consent(DATA, record["service"], True)
+        except Exception:  # noqa: BLE001 — keep the credential for a safe retry/reconciliation
+            print('[sotto] connector linked but managed capability write failed', flush=True)
+            return self._html(500, _connect_error_page(
+                "capability", "the connection was saved but access could not be enabled; retry or contact support"))
         label = CONNECTORS.SERVICES.get(record["service"], {}).get("label", record["service"])
         import html as _html2
         return self._html(200, _connect_page(
@@ -3969,7 +4018,19 @@ class Handler(BaseHTTPRequestHandler):
             if service not in CONNECTORS.SERVICES:
                 return self._send(400, {"ok": False, "detail": f"unknown service '{service}' — "
                                         "known: " + ", ".join(sorted(CONNECTORS.SERVICES))})
-            res = CONNECTORS.disconnect(service)
+            try:
+                # Revoke first. If the capability store cannot record the user's decision, retain
+                # the token and report failure instead of leaving cached data authorized after a
+                # superficially successful disconnect.
+                __import__('managed').record_connector_consent(DATA, service, False)
+            except Exception:  # noqa: BLE001
+                print('[sotto] connector disconnect blocked: capability revocation failed', flush=True)
+                return self._send(500, {"ok": False, "detail": "could not record revocation"})
+            try:
+                res = CONNECTORS.disconnect(service)
+            except OSError:
+                print('[sotto] connector disconnect failed: credential removal failed', flush=True)
+                return self._send(500, {"ok": False, "detail": "credential removal failed"})
             return self._send(200, {"ok": True, **res})
         # /setup/google-client — urlencoded form (no-JS friendly) or JSON
         if ctype == "application/json":
@@ -4109,6 +4170,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Upgrade managed installations linked before connector consent joined the capability file.
+    # The reconciler is tenant-bound, allowlisted, and never overrides an explicit revocation.
+    statuses = [row for row in CONNECTORS.service_status()
+                if CONNECTORS.credential_matches(row.get('service', ''))]
+    __import__('managed').reconcile_connector_capabilities(DATA, statuses)
     # Railway/Render set $PORT and require binding 0.0.0.0 (their proxy terminates TLS); locally,
     # default to loopback. Security in both cases: the bearer token + TLS at the proxy.
     port = int(os.environ.get("PORT", os.environ.get("SOTTO_TRIGGER_PORT", "8787")))

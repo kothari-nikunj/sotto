@@ -30,7 +30,139 @@ def test_empty_and_templates_make_no_model_call(isolated, monkeypatch):
     assert '30 minutes' in text and text.endswith('Want the full prep on Sam?')
     doc = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
     assert doc['effects'][0]['kind'] == 'pending_offer'
+    prep = next(e for e in doc['effects'] if e['kind'] == 'meeting_prep_delivered')
+    assert prep == {'kind': 'meeting_prep_delivered', 'mode': 'offer',
+                    'calendar_event_id': '', 'calendar_start': '2026-09-17T12:30:00Z', 'date': ''}
     assert not (isolated / 'pending_offer.json').exists()
+
+
+def _prep_item(**values):
+    return {'kind': 'meeting_prep', 'key': 'meeting-1', 'decision_id': 'prep-1',
+            'person': 'Sam', 'who': 'Partner at Example', 'identifier': 'sam@example.com',
+            'calendar_start': '2026-09-17T12:30:00Z', **values}
+
+
+def test_prep_reminder_joins_intro_and_reason_without_losing_offer(isolated, monkeypatch):
+    calls = []
+    context = 'Alex connected you through Priya. Sam suggested this coffee to discuss the robotics fund.'
+    monkeypatch.setattr(notification, '_prep_threads', lambda item: [
+        {'date': '2026-09-16', 'subject': 'Coffee', 'snippet': 'Sam suggested coffee to discuss the robotics fund.', 'from_me': False}])
+
+    def write(*args, **kwargs):
+        calls.append(json.loads(args[2]))
+        return json.dumps({'items': [{'id': 'prep-1', 'text': context, 'draft': '', 'decline': ''}]})
+    monkeypatch.setattr(gemini, '_gemini_once', write)
+    item = _prep_item(person_facts={'sam': 'Alex introduced you to Priya, who connected you with Sam.'},
+                      event={'summary': 'Coffee', 'description': 'Discuss robotics fund'}, open_loop='the deck you promised')
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    text = notification.compose('proactive', [item], now=now)
+    assert notification.compose('proactive', [item], now=now) == text
+    assert len(calls) == 1  # the existing composition cache owns retries
+    assert context in text and '30 minutes' in text and 'Partner at Example' in text
+    assert 'the deck you promised' in text and text.endswith('Want the full prep on Sam?')
+    assert 'sam@example.com' not in text and text.count('?') == 1
+    supplied = calls[0][0]
+    assert supplied['event']['description'] == 'Discuss robotics fund'
+    assert supplied['attendee_comms'][0]['date'] == '2026-09-16'
+    assert 'Alex introduced' in supplied['person_facts']['sam']
+    effects = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())['effects']
+    offer = next(e['offer'] for e in effects if e['kind'] == 'pending_offer')
+    assert offer['person'] == 'Sam' and offer['question'] == 'Want the full prep on Sam?'
+    assert any(e['kind'] == 'source_permissions' and e['sources'] == ['gmail'] for e in effects)
+    assert not (isolated / 'pending_offer.json').exists()  # acceptance still finalizes the offer
+
+
+@pytest.mark.parametrize('failure', ['lookup', 'held', 'provider', 'invalid', 'empty'])
+def test_optional_prep_context_cannot_swallow_the_reminder(isolated, monkeypatch, failure):
+    def lookup(item):
+        if failure == 'lookup':
+            raise OSError('source unavailable')
+        return []
+    monkeypatch.setattr(notification, '_prep_threads', lookup)
+
+    def write(*args, **kwargs):
+        if failure == 'held':
+            raise notification.model_work.ModelWorkHeldError('budget held')
+        if failure == 'provider':
+            raise OSError('provider unavailable')
+        if failure == 'invalid':
+            return json.dumps({'items': [{'id': 'prep-1', 'text': 'Want a draft?', 'draft': '', 'decline': ''}]})
+        return '{"items":[]}'
+    monkeypatch.setattr(gemini, '_gemini_once', write)
+    text = notification.compose('proactive', [_prep_item(person_facts={'sam': 'Partner at Example'})],
+                                now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
+    assert text == "You're meeting Sam (Partner at Example) in about 30 minutes. Want the full prep on Sam?"
+    doc = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    assert doc['notification_decision_ids'] == ['prep-1']
+    assert any(e['kind'] == 'pending_offer' for e in doc['effects'])
+
+
+def test_prep_uses_exact_attendee_and_skips_revoked_gmail(isolated, monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    gather = SimpleNamespace(_find_google_api=lambda: 'google_api.py',
+        _fetch_attendee_comms=lambda api, email: calls.append(email) or (email, [{'snippet': 'Useful context'}]))
+    monkeypatch.setattr(notification, '_load', lambda *a: gather)
+    monkeypatch.setattr(notification, 'allowed', lambda _: False)
+    assert notification._prep_threads(_prep_item()) == [] and calls == []
+    monkeypatch.setattr(notification, 'allowed', lambda _: True)
+    assert notification._prep_threads(_prep_item(identifier='Sam')) == [] and calls == []
+    assert notification._prep_threads(_prep_item()) == [
+        {'snippet': 'Useful context', 'relation_to_event': 'recent_background'}]
+    assert calls == ['sam@example.com']
+    consent = iter([True, False])
+    monkeypatch.setattr(notification, 'allowed', lambda _: next(consent))
+    assert notification._prep_threads(_prep_item()) == []
+
+
+def test_prep_permission_change_during_write_keeps_plain_reminder(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda item: [{'snippet': 'Introduced by Alex'}])
+    monkeypatch.setattr(notification, 'allowed', lambda _: False)
+    monkeypatch.setattr(gemini, '_gemini_once', lambda *a, **kw: json.dumps({'items': [
+        {'id': 'prep-1', 'text': 'Alex introduced you.', 'draft': '', 'decline': ''}]}))
+    text = notification.compose('proactive', [_prep_item()], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
+    assert 'Alex' not in text and text.endswith('Want the full prep on Sam?')
+    doc = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    assert not any(e['kind'] == 'source_permissions' for e in doc['effects'])
+
+
+def test_prep_thread_context_honors_muted_introducers_and_drops_oversized_excerpts(isolated, monkeypatch):
+    from types import SimpleNamespace
+    rows = [{'sender_name': 'Muted', 'sender_identifier': 'muted@example.com', 'snippet': 'Private'},
+            {'sender_name': 'Priya', 'sender_identifier': 'priya@example.com', 'snippet': 'You two should meet.'},
+            {'snippet': 'Long excerpt ' * 250}]
+    gather = SimpleNamespace(_find_google_api=lambda: 'google_api.py',
+                              _fetch_attendee_comms=lambda *a: ('sam@example.com', rows))
+    monkeypatch.setattr(notification, '_load', lambda *a: gather)
+    monkeypatch.setattr(notification, 'allowed', lambda _: True)
+    monkeypatch.setattr(notification.preferences, 'load_explicit', lambda: {'mute_senders': ['muted@example.com']})
+    assert notification._prep_threads(_prep_item()) == [rows[1]]
+    assert rows[1]['relation_to_event'] == 'recent_background'
+    projected = notification._writer_item({'id': 'prep-1', **_prep_item(), 'attendee_comms': [rows[1]]})
+    assert 'Priya' in json.dumps(projected) and 'priya@example.com' not in json.dumps(projected)
+
+
+def test_unselected_or_started_prep_never_fetches_or_writes_context(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda item: pytest.fail('unselected read'))
+    monkeypatch.setattr(notification, '_write', lambda *a: pytest.fail('unselected model call'))
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    first = {'kind': 'intention', 'key': 'x', 'title': 'Call Alex', 'deadline': now.isoformat()}
+    assert notification.compose('proactive', [first, _prep_item()], now=now) == 'Call Alex'
+    assert notification.compose('proactive', [_prep_item(calendar_start=now.isoformat())], now=now) == 'NO_NUDGES'
+
+
+@pytest.mark.parametrize('row', [
+    {'text': 'Some background.', 'draft': 'Let us meet.', 'decline': ''},
+    {'text': 'Some background.', 'draft': '', 'decline': 'No thanks.'},
+    {'text': 'Where should we meet?', 'draft': '', 'decline': ''},
+    {'text': 'A' * 501, 'draft': '', 'decline': ''},
+    {'text': 'word ' * 61, 'draft': '', 'decline': ''},
+    {'text': 'Alex introduced you.\nWant more?', 'draft': '', 'decline': ''},
+])
+def test_prep_context_has_no_extra_action_or_wall_of_text(isolated, row):
+    with pytest.raises(ValueError):
+        notification._validate(json.dumps({'items': [{'id': 'prep-1', **row}]}),
+                               [{'id': 'prep-1', **_prep_item()}])
 
 
 def test_one_direct_call_reuses_composed_artifact(isolated, monkeypatch):
@@ -134,30 +266,23 @@ def test_unrendered_candidates_do_not_earn_delivery_effects(isolated, monkeypatc
     assert doc['effects'] == [{'kind': 'source_permissions', 'sources': ['calendar']}]
 
 
-def test_post_meeting_matches_once_reuses_output_and_restricts_recipient(isolated, monkeypatch):
+def test_post_meeting_uses_shared_persisted_capture_and_restricts_recipient(isolated, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr(notification, 'allowed', lambda _: True)
     event = {'summary': 'Planning', 'start': '2026-09-17T10:00:00Z',
              'attendees': [{'email': 'sam@example.com', 'name': 'Sam'}]}
     def gather(argv, **kwargs):
         Path(argv[-1]).write_text(json.dumps({'meetings': [
-            {'title': 'Planning', 'start': event['start'], 'transcript': 'I will send the deck.'},
-            {'title': 'Other meeting', 'start': event['start'], 'transcript': 'Private unrelated material.'}]}))
+            {'title': 'Planning', 'start': event['start'], 'transcript': 'I will send the deck.'}]}))
         return SimpleNamespace(returncode=0)
-    calls = []
-    def compose(inputs, **kwargs):
-        calls.append(inputs)
-        return {'drafts': [{'to_email': 'sam@example.com', 'body': 'Here is the deck.'},
-                           {'to_email': 'invented@example.com', 'body': 'An invented recipient.'}]}
     monkeypatch.setattr(notification.subprocess, 'run', gather)
-    monkeypatch.setattr(notification, '_load', lambda *args: SimpleNamespace(compose=compose))
-    item = {'event': event, 'title': 'Planning'}
-    first = notification._post_meeting(item)
-    assert notification._post_meeting(item) == first
-    assert len(calls) == 1 and len(calls[0]['granola']) == 1
-    assert 'Here is the deck.' in first and 'invented' not in first
-    assert 'Want this in your Gmail drafts?' in first
-    assert not (isolated / 'pending_offer.json').exists()
+    monkeypatch.setattr(notification, '_load', lambda *args: SimpleNamespace(
+        extract_apply_meeting=lambda *a, **k: {'ledger': {'written': 1}, 'followup': {'drafts': [
+            {'to_email': 'sam@example.com', 'body': 'Here is the deck.'},
+            {'to_email': 'invented@example.com', 'body': 'Invented.'}]}}))
+    rendered = notification._post_meeting({'event': event, 'title': 'Planning'})
+    assert 'Here is the deck.' in rendered and 'Invented' not in rendered
+    assert 'Want this in your Gmail drafts?' in rendered
 
 
 def test_calendar_permission_revocation_prevents_availability(isolated, monkeypatch):

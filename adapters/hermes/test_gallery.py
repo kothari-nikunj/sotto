@@ -6,6 +6,7 @@ import types
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 def load(name):
@@ -57,6 +58,41 @@ def test_unconfirmed_receipts_never_become_accepted(media, monkeypatch):
     for result in ({'ok': True}, [], {'ok': False, 'messageId': 'id'}):
         monkeypatch.setattr(g, '_call', lambda *a: (True, 'accepted', result))
         assert g.send([str(media.with_name(f'{i:02d}.png')) for i in range(1, 5)], 'Preview', 'photon')[2]['acceptance'] == 'unknown'
+
+
+def test_focused_background_reaches_four_image_transport(tmp_path, monkeypatch):
+    """Real skill headings and renderer must reach one gallery dispatch, not just a mocked deck."""
+    g = load('gallery')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_VISUAL_BRIEFS', '1')
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes'))
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    skill = tmp_path / 'hermes/skills/sotto'
+    skill.parent.mkdir(parents=True)
+    skill.symlink_to(Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff')
+    calls = []
+
+    def transport(endpoint, payload, timeout=60):
+        calls.append((endpoint, payload))
+        if endpoint == 'gallery-capability':
+            return True, 'accepted', {'galleryVersion': 1}
+        return True, 'accepted', {'ok': True, 'messageId': 'parent', 'messageIds': ['a', 'b', 'c', 'd']}
+    monkeypatch.setattr(g, '_call', transport)
+    body = ('Sam (Example)\nYour thread\nPriya introduced you after Alex suggested a conversation.\n'
+            'What Example builds\nSoftware for clinics.\nThe founder\nPreviously led engineering.\n'
+            'Traction & signals\nThree pilots are signed.\nThe space & why now\nClinics want faster reviews.\n'
+            'Angles\nAsk how pilots convert to paid contracts.')
+    deck = g.prepare_prep(body)
+    assert deck and len(deck['images']) == 4
+    for path in deck['images']:
+        with Image.open(path) as photo:
+            assert photo.size == (1080, 1920)
+    first = g.send_once(deck['images'], deck['summary'], 'photon', 'request-1')
+    assert first[0] and first[2]['acceptance'] == 'accepted'
+    assert g.send_once(deck['images'], deck['summary'], 'photon', 'request-1')[0]
+    assert [endpoint for endpoint, _ in calls] == ['gallery-capability', 'send-gallery']
+    assert len(calls[-1][1]['paths']) == 4
 
 
 def test_patch_is_exact_idempotent_and_fails_on_pin_drift(tmp_path):

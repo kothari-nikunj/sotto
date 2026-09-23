@@ -21,14 +21,30 @@ def _at(hour):
 def test_meeting_prep_fires_for_external_meeting_in_window():
     now = _at(10)
     soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
-    cal = [{"id": "ev1", "summary": "Pitch", "start": soon,
+    cal = [{"id": "ev1", "summary": "Pitch", "start": soon, "description": "Priya suggested discussing the robotics fund.",
             "attendees": [{"email": "me@x.com", "self": True}, {"email": "vc@fund.com", "displayName": "VC"}]}]
     out = ps.scan(cal, [], {}, "me@x.com", now)
     kinds = {n["kind"] for n in out["nudges"]}
     assert "meeting_prep" in kinds
+    nudge = next(n for n in out['nudges'] if n['kind'] == 'meeting_prep')
+    assert nudge['identifier'] == 'vc@fund.com'
+    assert nudge['event'] == {'summary': 'Pitch', 'start': soon,
+                              'description': 'Priya suggested discussing the robotics fund.'}
     # an internal-only meeting in-window does NOT nudge
     cal2 = [{"id": "ev2", "summary": "Standup", "start": soon, "attendees": [{"email": "me@x.com", "self": True}]}]
     assert not ps.scan(cal2, [], {}, "me@x.com", now)["nudges"]
+
+
+def test_meeting_prep_preserves_exact_thread_linkage_for_composer():
+    now = _at(10)
+    soon = (now + timedelta(minutes=20)).isoformat()
+    event = {'id': 'ev-thread', 'summary': 'Intro', 'start': soon,
+             'threadId': 'gmail-thread-7', 'iCalUID': 'ical-7',
+             'attendees': [{'email': 'me@x.com', 'self': True},
+                           {'email': 'vc@fund.com', 'displayName': 'VC'}]}
+    nudge = ps.scan([event], [], {}, 'me@x.com', now)['nudges'][0]
+    assert nudge['event']['threadId'] == 'gmail-thread-7'
+    assert nudge['event']['iCalUID'] == 'ical-7'
 
 
 def test_the_prep_nudge_carries_who_they_are_and_what_you_owe_them(tmp_path, monkeypatch):
@@ -219,28 +235,29 @@ def test_proactive_verdicts_are_recorded_even_on_a_quiet_budget(tmp_path, monkey
     assert row["verdict"] == "agent" and "Send the LOI" in row["reason"]
 
 
-def test_meeting_prep_skipped_when_todays_research_covers_the_attendees(tmp_path, monkeypatch):
-    """The docstring's 'that you haven't prepped', made real: today's research cache means a prep
-    or brief run already covered this meeting's people."""
+def test_meeting_prep_suppression_is_occurrence_specific_delivery_evidence(tmp_path, monkeypatch):
     now = _at(10)
     soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
     cal = [{"id": "ev1", "summary": "Pitch", "start": soon,
             "attendees": [{"email": "me@x.com", "self": True}, {"email": "VC@fund.com"}]}]
     assert ps.scan(cal, [], {}, "me@x.com", now)["nudges"]                       # not prepped → fires
-    prepped = {"vc@fund.com"}                                                    # case-insensitive
-    assert not ps.scan(cal, [], {}, "me@x.com", now, prepped_emails=prepped)["nudges"]
-    # someone ELSE's research doesn't count as having prepped this meeting
-    assert ps.scan(cal, [], {}, "me@x.com", now, prepped_emails={"other@else.com"})["nudges"]
+    occurrence = ps.delivery_effects.meeting_occurrence('ev1', soon)
+    assert not ps.scan(cal, [], {}, "me@x.com", now,
+                       prepped_occurrences={occurrence})["nudges"]
+    # Same attendee in another meeting and the same event after a reschedule remain eligible.
+    other = [{**cal[0], 'id': 'ev2'}]
+    assert ps.scan(other, [], {}, "me@x.com", now, prepped_occurrences={occurrence})["nudges"]
+    moved = [{**cal[0], 'start': (now + timedelta(minutes=25)).isoformat()}]
+    assert ps.scan(moved, [], {}, "me@x.com", now, prepped_occurrences={occurrence})["nudges"]
 
 
-def test_research_cache_reader(tmp_path, monkeypatch):
+def test_research_cache_never_counts_as_prep_delivery(tmp_path, monkeypatch):
     import json
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    assert ps._research_cache_emails("2026-08-08") == set()                      # no cache yet
     (tmp_path / "cache").mkdir()
     (tmp_path / "cache" / "research_2026-08-08.json").write_text(json.dumps(
         {"attendees": [{"email": "VC@Fund.com"}, {"title": "no email"}]}))
-    assert ps._research_cache_emails("2026-08-08") == {"vc@fund.com"}
+    assert ps._delivered_prep_occurrences("2026-08-08") == set()
 
 
 def test_the_day_of_birthday_is_dedupd_by_a_delivered_brief_not_delayed(tmp_path, monkeypatch,

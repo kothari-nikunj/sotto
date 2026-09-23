@@ -150,6 +150,27 @@ def test_fallback_never_crosses_families(monkeypatch):
     assert seen == ["gpt-big"]
 
 
+def test_followup_allowance_reaches_primary_retry_and_fallback(tmp_path, monkeypatch):
+    import model_work
+    import time
+    from urllib.error import HTTPError
+    _clean_env(monkeypatch)
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'test')
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
+    calls = []
+    def invoke(model, key, prompt, label='', **kwargs):
+        calls.append((model, label))
+        if len(calls) < 3:
+            raise HTTPError('https://example.invalid', 503, 'retry', {}, None)
+        return '{}'
+    monkeypatch.setattr(gem, '_gemini_once', invoke)
+    with model_work.scope('followup', 'one grounded meeting', occurrence='run-1'):
+        assert gem.call_gemini('prompt', {}) == '{}'
+    assert calls == [('gemini-3.8-flash', ''), ('gemini-3.8-flash', ' [retry]'),
+                     ('gemini-3-flash-preview', ' [fallback]')]
+
+
 def test_context_floor_refuses_known_small_models(monkeypatch):
     _clean_env(monkeypatch)
     monkeypatch.setenv("SOTTO_BRIEF_MODEL", "openai/tiny")

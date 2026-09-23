@@ -4,7 +4,8 @@ learn_step.py — the brief's Learn step as ONE command that leaves a receipt.
 
 In one sentence: a brief that delivered without writing its memory is a failed brief, and says so.
 
-The six Learn writers (knowledge, continuity, draft outcomes, style, meeting attendance, contacts) used
+The seven Learn writers (knowledge, continuity, draft outcomes, style, meeting commitments,
+meeting attendance, contacts) used
 to be six separate instructions in the skill — "run ALL SIX" — with nothing verifying that any of
 them ran. The knowledge, draft outcomes and style loops all rest on that step, and a run that skipped
 it (the way runs skipped the deliver-once claim, four times in one week) left the graph a day
@@ -24,6 +25,7 @@ Steps, in order (a step whose input file is absent is recorded `skipped`, never 
   continuity   continuity_resolve.py --merge-only <cont>  the brief's actions[] → the ledger
   style        style_extract.py <local> --gmail <gmail>   what you actually sent
   drafts       draft_outcomes.py                          drafts matched to sends → outcomes + voice confirms
+  commitments  capture_commitments.py --granola <granola> new/changed notes → canonical obligations
   granola      granola_graph.py --granola <granola>       who you actually sat with
   contacts     prewarm_graph.py --sync-contacts           identifiers, notes, birthdays
 
@@ -47,6 +49,7 @@ from timeutil import configured_tz, _user_local_date  # noqa: E402
 ESSENTIAL_STEPS = frozenset({"knowledge", "continuity"})
 
 STEP_TIMEOUT_SECS = 300      # one writer, generously: knowledge_update on a big day is seconds
+COMMITMENTS_TIMEOUT_SECS = 540  # fit inside brief_runner's 600s ancillary-process ceiling
 
 # name → (script path relative to the pack, argv builder taking the parsed args)
 STEPS = (
@@ -61,6 +64,8 @@ STEPS = (
     # Grade only after extraction: a newly observed verbatim send can be confirmed in this pass.
     ("drafts", ("_shared", "scripts", "draft_outcomes.py"),
      lambda a: []),
+    ("commitments", ("followup", "scripts", "capture_commitments.py"),
+     lambda a: ["--granola", a.granola] if a.granola else None),
     ("granola", ("_shared", "scripts", "granola_graph.py"),
      lambda a: ["--granola", a.granola] if a.granola else None),
     ("contacts", ("_shared", "scripts", "prewarm_graph.py"),
@@ -78,10 +83,12 @@ def receipt_path(day: str, kind: str) -> str:
 
 def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
     try:
+        timeout = (COMMITMENTS_TIMEOUT_SECS if os.path.basename(script) == 'capture_commitments.py'
+                   else STEP_TIMEOUT_SECS)
         r = run([sys.executable or "python3", script, *argv], capture_output=True, text=True,
-                timeout=STEP_TIMEOUT_SECS, env=os.environ)
+                timeout=timeout, env=os.environ)
     except subprocess.TimeoutExpired:
-        return {"status": "failed", "detail": f"timed out after {STEP_TIMEOUT_SECS}s"}
+        return {"status": "failed", "detail": f"timed out after {timeout}s"}
     except Exception as e:  # noqa: BLE001 — a missing interpreter is a failed step, not a crash
         return {"status": "failed", "detail": f"{type(e).__name__}: {e}"}
     tail = (r.stderr or r.stdout or "").strip().splitlines()
@@ -105,6 +112,29 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
                     proof = {"loop_updates": parsed, "coverage": "exact_resolver_outcomes"}
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+    if os.path.basename(script) == "capture_commitments.py":
+        try:
+            parsed = json.loads(r.stdout.strip().splitlines()[-1])
+            revisions = parsed.get('meeting_revisions')
+            stable_revisions = parsed.get('stable_meeting_revisions', [])
+            failed_revisions = parsed.get('failed_meeting_revisions', [])
+            if (isinstance(revisions, list) and all(isinstance(value, str) for value in revisions)
+                    and isinstance(failed_revisions, list)
+                    and isinstance(stable_revisions, list)
+                    and all(isinstance(value, str) for value in stable_revisions)
+                    and all(isinstance(value, str) for value in failed_revisions)
+                    and all(isinstance(parsed.get(key), int) and parsed[key] >= 0
+                            for key in ('examined', 'written', 'deduped', 'skipped_terminal'))):
+                proof = {'coverage': ('successful_meeting_revisions' if r.returncode == 0
+                                      else 'partial_successful_meeting_revisions'),
+                         'meeting_revisions': revisions,
+                         'stable_meeting_revisions': stable_revisions,
+                         'failed_meeting_revisions': failed_revisions,
+                         'examined': parsed['examined'], 'written': parsed['written'],
+                         'deduped': parsed['deduped'],
+                         'skipped_terminal': parsed['skipped_terminal']}
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     result = {"status": "ok" if r.returncode == 0 else "failed", "exit": r.returncode,
               "detail": detail}
     if proof is not None:

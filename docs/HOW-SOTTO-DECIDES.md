@@ -6,6 +6,11 @@ Transient writing failures wait for queue backoff; malformed copy gets one repai
 reminders survive writer failures. Scheduling remains a question until all-calendar availability
 can be verified; today's primary-calendar gather is insufficient. No new daily spend limit is added.
 
+In managed deployments, connecting Granola opens its source gate only after OAuth succeeds;
+disconnect records explicit revocation before removing the credential. At startup, an older linked
+Granola credential can repair only a missing gate row in an already matching tenant capability
+file. Missing, malformed, foreign-tenant and explicitly disabled state remain closed.
+
 | Operation | Attempts | Native Gemini output ceiling | Thinking override |
 |---|---:|---:|---|
 | `notification` | 2 | 4,096 | low |
@@ -17,8 +22,12 @@ can be verified; today's primary-calendar gather is insufficient. No new daily s
 | `brief_extract` | 6 | 65,536 | unchanged |
 | `brief_critic` | 3 | 65,536 | unchanged |
 | `brief_revise` | 3 | 65,536 | unchanged |
-| `followup` | 2 | 8,192 | low |
+| `followup` | 3 | 8,192 | low |
+| `meeting_prep` | 3 | 65,536 | unchanged |
 | `research` | 4 | 8,192 | low |
+| `web_search` | 2 | 65,536 | unchanged |
+| `web_fetch` | 2 | 8,192 | unchanged |
+| `deck_read` | 2 | 32,768 | unchanged |
 
 Model-work receipts retain **90 days**. An unknown worker claim has a **900-second** lease, with at most **2** interruption replacements per operation. Artifact families use **256** lock shards. Notification context is capped at **48,000 characters**, including instructions and schema.
 Selected notification copy (text plus draft and decline) is limited to **1,200 characters**.
@@ -139,6 +148,19 @@ is a table lookup, not a code search.
 | **Calendar diff** (a decline · a last-minute invite · a move · a cancellation of an imminent meeting) | `calcache.change_tick` — the same refresh tick as the tap | `triage_event.triage` as a `calendar_change` event — snooze, quiet hours and mutes still hold it; exempt from the budget, the in-meeting hold and the cooldown, because a change expires with the meeting it's about (per-change deduped at the source) |
 | **Proactive watcher** (intention · meeting prep · commitment · chase · birthday · handoff) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
 | **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses; the explicit request bypasses the unsolicited budget |
+
+An admitted pre-meeting reminder carries the known role, countdown and open item, plus at most
+two short sentences about the introduction or meeting purpose when supported by existing memory,
+the invitation or recent correspondence. Only the selected attendee gets the focused prep's bounded
+Gmail lookup. The existing notification writer and artifact cache own composition; no extra research
+agent or scheduler runs. Missing evidence, source failures and held/failed model work retain the
+basic reminder and its named prep offer. Gmail consent is checked before and after the read, after
+composition and at delivery. Accepting that offer runs the focused meeting prep, presented as four
+photos on iMessage when it fits; the initial reminder is text.
+
+The watcher suppresses an imminent prep only after provider acceptance records the exact calendar
+event ID and start. Research is reusable context, not evidence the user received an offer or prep;
+moving the meeting creates a new occurrence and makes it eligible again.
 
 ## The gate order
 
@@ -285,6 +307,25 @@ to connect!" never earns an interrupt.
 - **Meetings are not debts** — a meeting prep/info action is a calendar shadow: the docket is its
   surface and the calendar closes it by passing. It never opens a loop, whichever of `meeting`,
   `meeting_prep`, `meeting_info` or `calendar` the extractor called it.
+- **Meeting promises are captured once after learning, not announced on intent** — ancillary Learn
+  checks at most three changed meetings from a fourteen-day overlap, records only
+  grounded obligations, and checkpoints a meeting revision only after the canonical writer returns.
+  A successful transcript extraction also checkpoints the same meeting's no-transcript alias, so
+  the short-lived transcript aging out reuses the saved result while transcript additions or edits
+  remain new evidence. The bounded
+  pass gets nine minutes inside the background worker's ten-minute process ceiling and caches each
+  completed meeting before moving on, so a later worker retry does not repay successful work. Delayed notes therefore
+  retry without re-reading unchanged notes. Obligation identity preserves action, counterpart and deliverable qualifiers, including weekday
+  and relative-time words; a Monday report cannot fold into a Tuesday report. A promise without one unambiguous counterpart is left
+  out rather than becoming an identifier-less debt. New captured promises close only when a later source message both names the promised
+  deliverable, including its qualifiers, and affirms the matching action; thanks, questions,
+  future plans, negation and counterfactuals leave it open. Ambiguous shorthand also stays open
+  for correction rather than guessing completion. An explicit user lock always remains manual. Meeting prep
+  carries at most three relevant open obligations per attendee, including undated work in either
+  direction.
+- **Invitation email linkage is exact or unknown** — when a calendar provider supplies an actual
+  Gmail thread identifier, that thread may explain the invitation. Otherwise bounded mail with the
+  attendee is labeled recent background and cannot prove who introduced the meeting or why it exists.
 - **The brief decides, it doesn't inventory** — an open loop earns its own line in a brief only when
   it is **overdue, due within 24 hours, or already chased without an answer**. Every other open loop
   is one quiet line — how many there are and where to see them — and is worked by the nudges (the
@@ -565,7 +606,12 @@ Every verdict — nudged, queued, dropped, or promoted — is written to a ledge
 the dashboard's **Record** view (`/app#record`) renders it. If you're asking "why didn't I get
 nudged about that?", the answer is a row there: *muted sender*, *quiet hours*, *daily interrupt
 budget spent (4 nudges today)*, *in a meeting until 2:30 PM — Sarah Chen*, and so on. Nothing is
-silently discarded without a reason you can read.
+silently discarded without a reason you can read. Provider acceptance is labelled Sent, not proof
+that a device displayed it. Photo briefs record whether four photos were sent or why they used text;
+that explanation comes from the existing outbox receipt and survives its retries. Expandable Activity details connect a send to its recorded prior decisions by identity; missing or later evidence is never guessed. The Mac menu's
+View activity opens this same record. Full Disk Access on the Mac stays Checking after a permission
+restart until the Bridge confirms access; source read failures stay visible independently of the
+app's permission check.
 
 A mute is not an exception to that: when the valve would have promoted a held item and only the
 mute stops it, the ledger gets a *dropped — muted* row like the ingress drop does, and tapping
@@ -581,6 +627,32 @@ System jobs use the receiver in Cloud and receiver-based self-host. The weekly r
 For the managed personal pilot, successful Google consent opens only the Gmail/Calendar source capabilities actually granted; missing or declined permissions leave the scheduled-brief gate closed when no other source is connected.
 
 A Bridge with a local Cloud policy reads only its consented sources and excludes the Sotto iMessage handle before transferring history, unread messages or events. Contacts follow their source consent; source access does not authorize outbound actions.
+
+Local sources follow these rules:
+
+- Both setup/prewarm and recurring Contacts/style writers recheck contributing source consent before writing learned data.
+- Unknown style channels are rejected; legacy channel-less messages require iMessage consent and email aliases require Gmail consent.
+- A disable reported by a Bridge probe takes effect on arrival whatever either clock says, only a strictly later probe restores access, and a completed read never does.
+- An unreadable consent receipt withholds every local source and is left for repair rather than rewritten, while the brief still ships and says why.
+- A healthy access probe cannot erase failed extraction or make an old read fresh.
+- Relayed reads and probes retain server request order through snapshot replay, independent of Mac clock corrections; older unsolicited wake uploads still rely on Mac timestamps.
+- The Bridge serializes status-file updates, and a failed deferred-unread reader makes its messaging source partial without discarding valid messages.
+- Schema/query failures report degradation; only access failures ask for Full Disk Access.
+- Missing Chrome or WhatsApp stays quiet until that optional source has been available, while lost access to a previously available source is reported.
+- Authenticated diagnostics retain status, counts and timestamps, never message bodies, browsing queries or file names.
+- Partial observations retain only valid fields returned by the current read, including explicit empty results, and disclose coverage gaps from the first brief onward.
+- Failed file metadata means unknown open status, never unread; isolated retries preserve valid peers within the existing six-second metadata budget.
+- Browser and file observations feed the existing brief pipeline without another history-learning queue.
+
+X attendee context follows these rules:
+
+- Explicit owner credentials enable optional X context in either hosting mode; no token is unconfigured, and an untested token is unverified.
+- Actual request results and last success appear in authenticated diagnostics, and a run with no requests cannot clear an earlier failure.
+- A protected attendee's permission error appears only beside that attendee, without a connection alarm or a claim that they have no recent posts; it cannot stop other attendees or clear a prior connection failure.
+- A lookup rate limit preserves already-linked attendees, and a timeline rate limit stops only further timeline calls while retaining other usable context.
+- Failed or malformed API responses never become cached missing identities.
+- Removing public or bookmark credentials excludes that staged input at consumption and invalidates queued messages that used it, without immediately deleting files.
+- Previously learned public-profile facts remain editable graph memory; staged Posts and bookmarks are deleted by learning cleanup or the existing seven-day abandoned-input sweep.
 
 The shared brief runner executes gather and compose directly; the agent does not choose whether
 they happen. If essential memory writes fail, the staged brief can still be delivered and durable
@@ -606,6 +678,40 @@ Gmail polling keeps independent inbox and sent-mail bounds, page cursors and pen
 version-2 `events/gmail_seen.json`. It resumes bounded oldest-first pages after downtime and advances
 only after receiver acceptance. Fresh or legacy state starts with a defined 24-hour recovery window;
 recovered messages keep their original timestamps and enter as catch-up.
+
+### Memory retrieval
+
+One reader, `knowledge_query.py`, supplies chat, briefs, meeting prep and notifications. Current
+consented email, calendar, direct-message and active-loop subjects select older relevant facts by
+exact canonical identifiers and contact aliases. Display names and nearby timestamps never join
+conversations. Topic hints are data used for lexical ranking, never instructions.
+
+Each person block shares a **5-fact compact / 15-fact expanded** allowance across primary and
+related facts, with a **3,200-character compact / 8,000-character expanded** ceiling. Explicit
+corrections rank first, followed by topical overlap, primary-person context and curated summary
+references. Confidence and recency settle ties within each person's facts. Summary references emit no duplicate
+copy; a busy week cannot append facts beyond the allowance. Assertions fit whole or are omitted,
+never shortened by cutting off a qualifier. The expanded read says when anything was left out;
+the compact read is a summary by design and says so only when the character ceiling refused a
+whole assertion. The graph itself is unchanged by a read budget. Legacy notes keep their leading
+complete sentences inside the excerpt, including its omission marker in the limit. A line wrap
+alone never ends a sentence; a single sentence too long to fit is left out whole. Situational
+fields remain bounded inside the character ceiling.
+
+Topical queries inspect at most **5 relation edges**, load exact canonical files and select at most
+**2 related people**, with at most **2 related facts per person**, inside that same allowance.
+Only facts sharing topic words qualify. Each excerpt names its subject and relation, and cannot
+expand the current participant list, create a task or authorize an action. There is no recursive
+expansion or fallback through a relation's display name. A primary conflict is shown with both
+active assertions or omitted as a whole; conflicting indirect facts are left for a direct query.
+
+Topic hints use at most **6 records per identifier**, **800 characters per record** and
+**2,400 characters per identifier**. Conversations precede calendar and standing-work topic hints;
+exact aliases share a single person-topic budget so a busy phone cannot hide that person's email.
+The participant cohort retains its existing cap. Disconnecting
+a source excludes its current hints and observations; it does not erase learned graph facts.
+Explicit corrections and archives use the existing graph writer and apply to direct and indirect
+retrieval alike. No new store, scheduler, model call or inferred standing authority is added.
 
 ## Learning before and between briefs
 
@@ -728,7 +834,14 @@ supporting material when it uniquely matches a real meeting's subject and exact 
 available for preparation, but does not manufacture a conflict or a second meeting nudge. A shared
 time alone is not sufficient; ambiguous or unrelated meetings remain separate. Sotto never deletes
 or declines an event on this basis. Coming Up shows up to five schedule lines, without a repeated
-instruction to open Calendar for the full agenda. A quiet evening uses “Nothing
+instruction to open Calendar for the full agenda. After extraction and revision, code rebuilds
+that preview from the consented source snapshot in the user's timezone. It selects the nearest
+remaining or ongoing events through the next three local days, excluding declined and cancelled
+entries. Birthdays use the same local date and contact permissions; when present, the nearest
+birthday reserves one of the five lines and further birthdays use any spare lines. Explicit section
+mutes still apply. Missing calendar access cannot resurrect cached meetings. Extraction, RSVP capture
+and the critic share the same eligible source list. Quiet-loop expansion runs after the schedule,
+so optional detail cannot take its space. A quiet evening uses “Nothing
 needs your attention right now,” rather than morning wording or an unsupported claim about the
 whole inbox.
 
@@ -793,7 +906,7 @@ release gate.
 
 ### Visual presentation
 
-Morning/evening briefs and focused meeting backgrounds default to four-photo galleries on iMessage; other channels, short updates and consent questions stay text. The shared renderer changes presentation only. It makes no additional relevance or model call. A brief with an action that cannot fit stays text; uncertain multipart acceptance is held rather than blindly retried. See [visual briefs](VISUAL-BRIEFS.md).
+Morning/evening briefs and focused meeting backgrounds default to four-photo galleries on iMessage; other channels, short updates and consent questions stay text. The shared renderer changes presentation only. After mandatory brief sections, the composer can use spare space in a readable four-card gallery to name quiet active obligations, ordered by deadline then age. It uses the same layout to check fit; the remaining items stay a count. The named details enter the canonical text before delivery attribution, so all channels and chase suppression agree. This does not make an item urgent. It makes no additional relevance or model call. Crowded briefs first redistribute complete paragraphs using measured height, preserving font size and source labels. Needs-you and today can share one card, leaving room for follow-ups on two. A brief with an action that still cannot fit stays text; uncertain multipart acceptance is held rather than blindly retried. See [visual briefs](VISUAL-BRIEFS.md).
 
 ## Shared writing rule
 

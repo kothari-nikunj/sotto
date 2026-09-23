@@ -4,6 +4,11 @@ from datetime import datetime
 import re
 
 
+SCHEDULE_DAY = (r'(?:Today|Tomorrow|(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|'
+        r'Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)(?:,?\s+[A-Za-z]{3,9}\s+\d{1,2})?'
+        r'|[A-Za-z]{3,9}\s+\d{1,2})')
+
+
 def human_attendees(event, self_email='', *, include_self=False):
     """Normalize people, excluding room resources and (normally) the account owner."""
     owner = self_email.strip().lower()

@@ -11,6 +11,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,113 @@ def _read_json(path):
         return None
 
 
+def _observed_correlations(root, rows, since, until):
+    """Join retained observations, never infer unseen transitions or a user's reason."""
+    events = {}
+    malformed = 0
+
+    def retain(rec):
+        nonlocal malformed
+        if not isinstance(rec, dict):
+            malformed += 1
+            return
+        if rec.get("outcome") not in ("loop_transition", "loop_proposal"):
+            return
+        stamp = _dt(rec.get("ts"))
+        ident = rec.get("event_id")
+        if (rec.get("schema") != 1 or stamp is None or
+                not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{64}", ident)):
+            malformed += 1
+            return
+        if any(value is not None and (not isinstance(value, str)
+               or not re.fullmatch(r"[a-f0-9]{64}", value))
+               for value in (rec.get("loop_identity"), rec.get("loop_key"))):
+            malformed += 1
+            return
+        if rec["outcome"] == "loop_transition" and (
+                not isinstance(rec.get("from_status"), str)
+                or not isinstance(rec.get("to_status"), str)
+                or rec.get("from_status") not in ledger_io.ACTIVE | ledger_io.TERMINAL | ledger_io.PARKED | {"absent"}
+                or rec.get("to_status") not in ledger_io.ACTIVE | ledger_io.TERMINAL | ledger_io.PARKED
+                or rec.get("actor") not in ("user", "system")):
+            malformed += 1
+            return
+        if stamp <= until:
+            events[ident] = rec
+
+    exhaust = os.path.join(root, "outcomes.jsonl")
+    try:
+        with open(exhaust, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    retain(json.loads(line))
+                except ValueError:
+                    malformed += 1
+    except FileNotFoundError:
+        pass
+    except OSError:
+        malformed += 1
+    # A saved correction is real even if the diagnostics append failed. Deduping the canonical
+    # last transition and exhaust by event_id also makes ordinary retries invisible to counts.
+    for row in rows:
+        if isinstance(row.get("proof_transition"), dict):
+            retain(row["proof_transition"])
+    ordered = sorted(events.values(), key=lambda rec: (_dt(rec["ts"]), rec["event_id"]))
+    transitions = [r for r in ordered if r["outcome"] == "loop_transition"]
+    in_window = [r for r in ordered if since <= _dt(r["ts"]) <= until]
+    if not in_window:
+        return None, {"status": "unavailable", "retained_events_in_window": 0,
+                      "malformed_or_unreadable": malformed,
+                      "reason": "no identity-bearing observations retained in window"}
+
+    proposals = [r for r in in_window if r["outcome"] == "loop_proposal"
+                 and r.get("result") == "rejected" and r.get("proposed_status") == "resolved"
+                 and r.get("reason") in ("unsupported_evidence", "stale_revision")
+                 and r.get("loop_identity")]
+    local_proposals = [r for r in in_window if r["outcome"] == "loop_proposal"
+                       and r.get("observation_identity") != "durable_run"]
+    manual = [r for r in transitions if r.get("actor") == "user"
+              and r.get("to_status") == "resolved" and since <= _dt(r["ts"]) <= until]
+    matched = {r["loop_identity"] for r in manual if any(
+        p["loop_identity"] == r.get("loop_identity") and _dt(p["ts"]) <= _dt(r["ts"])
+        for p in proposals)}
+    dismissals = [r for r in transitions if r.get("actor") == "user"
+                  and r.get("to_status") == "dismissed" and since <= _dt(r["ts"]) <= until]
+    quick = {r["loop_identity"] for r in dismissals if r.get("loop_identity") and any(
+        c.get("loop_identity") == r["loop_identity"] and c.get("from_status") == "absent"
+        and c.get("capture_origin") == "automatic"
+        and timedelta(0) <= _dt(r["ts"]) - _dt(c["ts"]) <= timedelta(hours=24)
+        for c in transitions)}
+    reopened = [r for r in transitions if r.get("from_status") in ledger_io.TERMINAL | ledger_io.PARKED
+                and r.get("to_status") in ledger_io.ACTIVE]
+    resurfaced = {r["loop_identity"] for r in dismissals if r.get("loop_identity") and any(
+        c.get("loop_identity") == r["loop_identity"] and _dt(c["ts"]) <= _dt(r["ts"])
+        for c in reopened)}
+    local_note = ("; local or legacy proposal observations may repeat across invocations"
+                  if local_proposals else "")
+    note = ("observed review candidates only; user intent and missing historical events are unknown"
+            + local_note)
+    proposal_status = "candidate_observations" if local_proposals else "observed"
+    return {
+        "proposal_to_later_manual_resolution": {
+            "status": proposal_status, "rejected_completion_proposals": len(proposals),
+            "loops_later_manually_resolved": len(matched), "error_rate": None, "interpretation": note},
+        "quick_dismissal_to_false_capture": {
+            "status": "observed", "loops_dismissed_within_24h_of_observed_capture": len(quick),
+            "error_rate": None, "interpretation": note},
+        "resurfacing_after_terminal_or_parked_state": {
+            "status": "observed", "reopened_loops_later_dismissed": len(resurfaced),
+            "error_rate": None, "interpretation": note},
+    }, {
+        "status": "observed_only", "retained_events_in_window": len(in_window),
+        "malformed_or_unreadable": malformed,
+        "local_or_legacy_proposal_observations": len(local_proposals),
+        "proposal_dedupe": ("partial_local_candidates" if local_proposals else "durable_run_identity"),
+        "first_observed_at": in_window[0]["ts"], "last_observed_at": in_window[-1]["ts"],
+        "coverage_note": "retained observations do not establish complete event coverage or a quality denominator",
+    }
+
+
 def build_report(data_root=None, days=30, now=None):
     root = os.path.abspath(data_root or os.environ.get("SOTTO_DATA", "/data"))
     until = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -67,8 +175,13 @@ def build_report(data_root=None, days=30, now=None):
     rejection_reasons = Counter()
     exact_receipts = 0
     successful_continuity = 0
+    invalid_step_metadata = 0
     for receipt in retained:
-        continuity = (receipt.get("steps") or {}).get("continuity") or {}
+        steps = receipt.get("steps") or {}
+        continuity = steps.get("continuity") or {} if isinstance(steps, dict) else None
+        if not isinstance(continuity, dict):
+            invalid_step_metadata += 1
+            continue
         if continuity.get("status") == "ok":
             successful_continuity += 1
         proof_envelope = continuity.get("proof") or {}
@@ -119,13 +232,16 @@ def build_report(data_root=None, days=30, now=None):
         if created and closed and 0 <= (closed.date() - created.date()).days <= 1:
             quick.append(row)
 
-    denominator_known = successful_continuity > 0 and exact_receipts == successful_continuity
+    denominator_known = (successful_continuity > 0 and exact_receipts == successful_continuity
+                         and invalid_step_metadata == 0)
     if denominator_known:
         proposal_outcomes = {"status": "available", "proposed": proposed,
                              "accepted": accepted, "rejected": rejected,
                              "rejected_by_reason": dict(sorted(rejection_reasons.items()))}
     elif successful_continuity == 0:
-        proposal_outcomes = {"status": "unavailable", "reason": "no successful continuity receipts retained in window"}
+        proposal_outcomes = {"status": "unavailable", "reason": (
+            "invalid continuity metadata prevents determining receipt coverage" if invalid_step_metadata else
+            "no successful continuity receipts retained in window")}
     elif exact_receipts == 0:
         proposal_outcomes = {"status": "unavailable",
                              "reason": "retained continuity receipts predate exact proposal counters",
@@ -136,7 +252,7 @@ def build_report(data_root=None, days=30, now=None):
         proposal_outcomes = {"status": "partial", "proposed": proposed,
                              "accepted": accepted, "rejected": rejected,
                              "rejected_by_reason": dict(sorted(rejection_reasons.items())),
-                             "missing_receipts": successful_continuity - exact_receipts}
+                             "missing_receipts": successful_continuity - exact_receipts + invalid_step_metadata}
     correlations = {
         "proposal_to_later_manual_resolution": {
             "status": "unavailable",
@@ -151,6 +267,9 @@ def build_report(data_root=None, days=30, now=None):
             "reason": "current ledger rows overwrite earlier status transitions",
         },
     }
+    observed, observation_coverage = _observed_correlations(root, rows, since, until)
+    if observed is not None:
+        correlations = observed
     return {
         "schema": 1,
         "mode": "read_only_existing_volume",
@@ -159,6 +278,7 @@ def build_report(data_root=None, days=30, now=None):
         "learn_receipts": {
             "retained_in_window": len(retained), "unreadable": unreadable,
             "invalid_timestamp": invalid_timestamp,
+            "invalid_step_metadata": invalid_step_metadata,
             "retained_outside_window": outside,
             "first_retained_at": min((str(r.get("ts")) for r in retained), default=None),
             "last_retained_at": max((str(r.get("ts")) for r in retained), default=None),
@@ -178,6 +298,7 @@ def build_report(data_root=None, days=30, now=None):
             "interpretation": "observable proxies only; neither count establishes model error or user intent",
         },
         "correlations": correlations,
+        "correlation_observations": observation_coverage,
     }
 
 

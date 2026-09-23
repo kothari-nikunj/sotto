@@ -29,8 +29,10 @@ POLICIES = {
     'memory_extract': Policy(2, 16384), 'memory_curate': Policy(2, 8192),
     'brief': Policy(12, 65536, None),
     'brief_extract': Policy(6, 65536, None), 'brief_critic': Policy(3, 65536, None),
-    'brief_revise': Policy(3, 65536, None), 'followup': Policy(2, 8192),
-    'research': Policy(4, 8192),
+    'brief_revise': Policy(3, 65536, None), 'followup': Policy(3, 8192),
+    'meeting_prep': Policy(3, 65536, None), 'research': Policy(4, 8192),
+    'web_search': Policy(2, 65536, None), 'web_fetch': Policy(2, 8192, None),
+    'deck_read': Policy(2, 32768, None),
 }
 RETENTION_DAYS = 90
 ATTEMPT_LEASE_SECONDS = 900

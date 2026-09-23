@@ -25,11 +25,11 @@ NOW = datetime(2026, 7, 2, 10, 0, 0)
 USER = "me@x.com"
 
 
-def _ganchor(meeting_id, what, owner_is_user=True, waiting=False, source_snippet=""):
-    """Exact source occurrence: meeting identity + direction + normalized commitment text."""
+def _ganchor(meeting_id, what, owner_is_user=True, waiting=False, source_snippet="", counterpart=""):
+    """Exact obligation: meeting identity + direction + normalized deliverable."""
     role = "user" if owner_is_user else "other"
     digest = hashlib.sha256(
-        f"{role}|{ac._normalized_what(source_snippet or what)}".encode()).hexdigest()[:12]
+        f"{role}|{counterpart}|{ac._deliverable_key(what)}".encode()).hexdigest()[:12]
     suffix = ":waiting_on" if waiting else ""
     return f"thread:granola:{meeting_id}:{digest}{suffix}"
 
@@ -53,7 +53,7 @@ def test_commitment_with_email_becomes_follow_up_ledger_item(tmp_path, monkeypat
     assert res["written"] == 1 and res["deduped"] == 0
     items = _ledger_items(tmp_path)
     it = items[_ganchor("m-acme", "send the deck",
-                        source_snippet="Nikunj: I'll send the deck")]
+                        source_snippet="Nikunj: I'll send the deck", counterpart="dana@acme.com")]
     assert it["action_type"] == "follow_up"                   # the user owes it
     assert it["status"] == "open" and "times_surfaced" not in it
     assert it["deadline"] == "2026-07-04"
@@ -70,7 +70,8 @@ def test_rerun_dedupes_by_anchor_key(tmp_path, monkeypatch):
     assert res["written"] == 0 and res["deduped"] == 1
     items = _ledger_items(tmp_path)
     assert len(items) == 1
-    assert "times_surfaced" not in items[_ganchor("m-sync", "send deck")]
+    assert "times_surfaced" not in items[_ganchor("m-sync", "send deck",
+                                                    counterpart="dana@acme.com")]
 
 
 def test_distinct_commitments_to_same_email_both_written(tmp_path, monkeypatch):
@@ -98,8 +99,9 @@ def test_extractor_can_reconcile_commitment_with_an_existing_same_direction_loop
     # same direction. This is the intentionally narrow semantic-dedupe boundary.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-07-02", "new_actions": [
-        {"type": "follow_up", "channel": "gmail", "contactName": "Dana",
-         "contactIdentifier": "dana@acme.com", "contextSummary": "follow up with Dana"}]}, NOW)
+            {"type": "follow_up", "channel": "gmail", "contactName": "Dana",
+             "contactIdentifier": "dana@acme.com", "contextSummary": "send deck",
+             "ask": "send deck"}]}, NOW)
     res = ac.apply({"commitments": [{"meeting": "Sync", "meeting_id": "m-sync",
                                      "owner": "you", "owner_is_user": True, "what": "send deck",
                                      "existing_anchor_key": "follow_up:id:dana@acme.com",
@@ -109,7 +111,7 @@ def test_extractor_can_reconcile_commitment_with_an_existing_same_direction_loop
     items = _ledger_items(tmp_path)
     assert len(items) == 1
     assert items["follow_up:id:dana@acme.com"]["source_refs"][0]["source_id"] == "m-sync"
-    assert items["follow_up:id:dana@acme.com"]["resolution_mode"] == "explicit"
+    assert items["follow_up:id:dana@acme.com"]["resolution_mode"] == "source_grounded"
     after_reply = cr.resolve({"today": "2026-07-03", "local": {"imessage": [
         {"is_from_me": True, "handle": "dana@acme.com", "timestamp": "2026-07-03 09:00:00",
          "text": "checking in"}]}}, datetime(2026, 7, 3, 10, 0, 0))
@@ -122,7 +124,8 @@ def test_other_owner_becomes_waiting_on(tmp_path, monkeypatch):
     ac.apply({"commitments": [{"meeting": "Sync", "meeting_id": "m-sync", "owner": "Dana",
                                "owner_is_user": False, "what": "send the contract",
                                "due": None, "to_email": "dana@acme.com"}]}, USER, NOW)
-    it = _ledger_items(tmp_path)[_ganchor("m-sync", "send the contract", False, True)]
+    it = _ledger_items(tmp_path)[_ganchor("m-sync", "send the contract", False, True,
+                                          counterpart="dana@acme.com")]
     assert it["action_type"] == "waiting_on"
     assert it["contact_name"] == "Dana"
     assert "Dana owes" in it["summary"]
@@ -146,7 +149,7 @@ def test_terminal_item_is_never_resurrected(tmp_path, monkeypatch):
     ac.apply({"commitments": [{"meeting": "Sync", "meeting_id": "m-sync", "owner": "you",
                                "owner_is_user": True, "what": "send deck",
                                "due": None, "to_email": "dana@acme.com"}]}, USER, NOW)
-    key = _ganchor("m-sync", "send deck")
+    key = _ganchor("m-sync", "send deck", counterpart="dana@acme.com")
     items = cr._load_items()
     it = items[key]
     cr._terminate(it, "resolved", "replied", "2026-07-02")    # user handled it
@@ -164,7 +167,7 @@ def test_fuzzy_due_stays_out_of_deadline(tmp_path, monkeypatch):
     ac.apply({"commitments": [{"meeting": "Sync", "meeting_id": "m-sync", "owner": "you",
                                "owner_is_user": True, "what": "intro to Alex",
                                "due": "Friday", "to_email": "alex@x.com"}]}, USER, NOW)
-    it = _ledger_items(tmp_path)[_ganchor("m-sync", "intro to Alex")]
+    it = _ledger_items(tmp_path)[_ganchor("m-sync", "intro to Alex", counterpart="alex@x.com")]
     assert it["deadline"] is None
     assert "due Friday" in it["summary"]
 
@@ -203,7 +206,8 @@ def test_ledger_items_surface_in_loops_query_shape(tmp_path, monkeypatch):
                                "owner_is_user": True, "what": "send deck",
                                "due": None, "to_email": "dana@acme.com"}]}, USER, NOW)
     out = cr.resolve({"today": "2026-07-02"}, NOW)
-    assert any(a["anchor_key"] == _ganchor("m-sync", "send deck") for a in out["active"])
+    assert any(a["anchor_key"] == _ganchor("m-sync", "send deck", counterpart="dana@acme.com")
+               for a in out["active"])
 
 
 def test_default_now_uses_user_timezone(tmp_path, monkeypatch):
@@ -224,7 +228,7 @@ def test_default_now_uses_user_timezone(tmp_path, monkeypatch):
         {"meeting": "Sync", "meeting_id": "m-sync", "owner": "you", "owner_is_user": True,
          "what": "send notes", "to_email": "dana@acme.com"}]}, USER)
     assert res["written"] == 1 and seen["tz"] == "-07:00"
-    it = _ledger_items(tmp_path)[_ganchor("m-sync", "send notes")]
+    it = _ledger_items(tmp_path)[_ganchor("m-sync", "send notes", counterpart="dana@acme.com")]
     assert it["created_at"] == "2026-07-01 17:30:00"  # local time, not UTC's next date
 
 
@@ -247,6 +251,109 @@ def test_same_source_snippet_dedupes_even_when_llm_paraphrases(tmp_path, monkeyp
                       USER, NOW)
     assert first["anchor_keys"] == second["anchor_keys"]
     assert second["written"] == 0 and second["deduped"] == 1
+
+
+def test_reworded_source_snippet_folds_same_deliverable_but_keeps_different_one(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    base = {'meeting_id': 'week-edit', 'owner': 'you', 'owner_is_user': True,
+            'to_email': 'dana@example.com'}
+    first = ac.apply({'commitments': [{**base, 'what': 'send the deck',
+        'source_snippet': "I'll send the deck."}]}, USER, NOW)
+    same = ac.apply({'commitments': [{**base, 'what': 'share the deck with them',
+        'source_snippet': 'I will share the deck with them.'}]}, USER, NOW)
+    different = ac.apply({'commitments': [{**base, 'what': 'send the contract',
+        'source_snippet': "I'll send the contract."}]}, USER, NOW)
+    assert first['anchor_keys'] == same['anchor_keys'] and same['deduped'] == 1
+    assert different['written'] == 1 and different['anchor_keys'] != first['anchor_keys']
+
+    review = ac.apply({'commitments': [{**base, 'what': 'review the contract',
+        'source_snippet': "I'll review the contract."}]}, USER, NOW)
+    send = ac.apply({'commitments': [{**base, 'what': 'send the contract',
+        'source_snippet': "I'll send the contract."}]}, USER, NOW)
+    q2 = ac.apply({'commitments': [{**base, 'what': 'send the Q2 report',
+        'source_snippet': "I'll send the Q2 report."}]}, USER, NOW)
+    q3 = ac.apply({'commitments': [{**base, 'what': 'send the Q3 report',
+        'source_snippet': "I'll send the Q3 report."}]}, USER, NOW)
+    assert len({review['anchor_keys'][0], send['anchor_keys'][0],
+                q2['anchor_keys'][0], q3['anchor_keys'][0]}) == 4
+
+
+def test_unknown_account_name_rejects_local_part_shared_by_attendee(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_USER_NAME', raising=False)
+    meeting = {'meeting_id': 'm-nik', 'transcript': "Nik: I'll send the deck.",
+               'attendees': [{'email': 'nik@own.com', 'name': ''},
+                             {'email': 'nik.patel@other.com', 'name': 'Nik Patel'}],
+               'attendee_emails': ['nik@own.com', 'nik.patel@other.com']}
+    result = ac.apply({'commitments': [{'meeting_id': 'm-nik', 'owner': 'Nik',
+        'owner_is_user': True, 'what': 'send the deck',
+        'source_snippet': "Nik: I'll send the deck."}]}, 'nik@own.com', NOW,
+        source_meetings=[meeting])
+    assert result['written'] == 0 and result['grounding']['reasons']['owner'] == 1
+
+
+def test_full_owner_claim_does_not_make_ambiguous_first_name_quote_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    meeting = {'meeting_id': 'm-two-nikunj', 'transcript': "Nikunj: I'll send the deck.",
+               'attendees': [{'email': USER, 'name': 'Nikunj Kothari'},
+                             {'email': 'other@example.com', 'name': 'Nikunj Patel'},
+                             {'email': 'dana@example.com', 'name': 'Dana'}],
+               'attendee_emails': [USER, 'other@example.com', 'dana@example.com']}
+    result = ac.apply({'commitments': [{'meeting_id': 'm-two-nikunj',
+        'owner': 'Nikunj Kothari', 'owner_is_user': True, 'what': 'send the deck',
+        'to_email': 'dana@example.com', 'source_snippet': "Nikunj: I'll send the deck."}]},
+        USER, NOW, source_meetings=[meeting])
+    assert result['written'] == 0 and result['grounding']['reasons']['owner'] == 1
+
+
+def test_grounded_promise_without_unambiguous_counterpart_is_not_persisted(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    meeting = {'meeting_id': 'm-group', 'transcript': "you: I'll send the deck.",
+               'attendee_emails': [USER, 'dana@example.com', 'sam@example.com']}
+    result = ac.apply({'commitments': [{'meeting_id': 'm-group', 'owner': 'you',
+        'owner_is_user': True, 'what': 'send the deck',
+        'source_snippet': "you: I'll send the deck."}]}, USER, NOW,
+        source_meetings=[meeting])
+    assert result['written'] == 0 and result['grounding']['reasons']['counterpart'] == 1
+
+
+def test_other_owner_is_bound_to_verified_attendee_not_model_email(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    meeting = {'meeting_id': 'm-owners', 'transcript': "Dana: I'll send the deck.",
+               'attendees': [{'email': USER, 'name': 'Me'},
+                             {'email': 'dana@example.com', 'name': 'Dana'},
+                             {'email': 'alex@example.com', 'name': 'Alex'}],
+               'attendee_emails': [USER, 'dana@example.com', 'alex@example.com']}
+    result = ac.apply({'commitments': [{'meeting_id': 'm-owners', 'owner': 'Dana',
+        'owner_is_user': False, 'what': 'send the deck', 'to_email': 'alex@example.com',
+        'source_snippet': "Dana: I'll send the deck."}]}, USER, NOW, source_meetings=[meeting])
+    row = _ledger_items(tmp_path)[result['anchor_keys'][0]]
+    assert row['contact_identifier'] == 'dana@example.com'
+
+
+def test_suggested_anchor_requires_same_counterpart_and_deliverable(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    first = ac.apply({'commitments': [{'meeting_id': 'm-one', 'owner': 'you',
+        'owner_is_user': True, 'what': 'send the deck', 'to_email': 'dana@example.com'}]}, USER, NOW)
+    anchor = first['anchor_keys'][0]
+    wrong_person = ac.apply({'commitments': [{'meeting_id': 'm-two', 'owner': 'you',
+        'owner_is_user': True, 'what': 'send the deck', 'to_email': 'alex@example.com',
+        'existing_anchor_key': anchor}]}, USER, NOW)
+    wrong_task = ac.apply({'commitments': [{'meeting_id': 'm-three', 'owner': 'you',
+        'owner_is_user': True, 'what': 'review the contract', 'to_email': 'dana@example.com',
+        'existing_anchor_key': anchor}]}, USER, NOW)
+    assert wrong_person['written'] == 1 and wrong_person['anchor_keys'][0] != anchor
+    assert wrong_task['written'] == 1 and wrong_task['anchor_keys'][0] != anchor
+
+
+def test_same_deliverable_for_two_other_attendees_has_distinct_anchors(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    dana = ac.apply({'commitments': [{'meeting_id': 'm-shared', 'owner': 'Dana',
+        'owner_is_user': False, 'what': 'send the deck', 'to_email': 'dana@example.com'}]}, USER, NOW)
+    alex = ac.apply({'commitments': [{'meeting_id': 'm-shared', 'owner': 'Alex',
+        'owner_is_user': False, 'what': 'send the deck', 'to_email': 'alex@example.com'}]}, USER, NOW)
+    assert dana['anchor_keys'][0] != alex['anchor_keys'][0]
 
 
 def test_wrong_direction_or_invented_reconciliation_anchor_is_ignored(tmp_path, monkeypatch):
@@ -275,3 +382,75 @@ def test_explicit_owner_boolean_overrides_an_ambiguous_name(tmp_path, monkeypatc
     items = _ledger_items(tmp_path)
     assert items[res["anchor_keys"][0]]["action_type"] == "follow_up"
     assert items[res["anchor_keys"][1]]["action_type"] == "waiting_on"
+
+
+def test_grounding_accepts_unambiguous_first_name_alias_and_rejects_ambiguous_speaker(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    commitment = {"meeting_id": "m-alias", "owner": "Alex", "owner_is_user": True,
+                  "what": "send the deck", "source_snippet": "Alex: I'll send the deck."}
+    clear = [{"meeting_id": "m-alias", "transcript": "Alex: I'll send the deck.",
+              "attendee_emails": ["dana@example.com"]}]
+    accepted = ac.apply({"commitments": [commitment]}, "unrelated@example.com", NOW,
+                        user_name="Alex Smith", source_meetings=clear)
+    assert accepted["written"] == 1 and accepted["grounding"]["accepted"] == 1
+
+    ambiguous = [{"meeting_id": "m-other", "transcript": (
+        "Alex: I'll send the deck.\nAlex Chen: I'll send the contract."),
+        "attendee_emails": ["alex.chen@example.com"]}]
+    rejected = ac.apply({"commitments": [{**commitment, "meeting_id": "m-other"}]},
+                        "unrelated@example.com", NOW, user_name="Alex Smith",
+                        source_meetings=ambiguous)
+    assert rejected["written"] == 0 and rejected["grounding"]["reasons"]["owner"] == 1
+
+
+def test_email_local_first_name_does_not_bypass_attendee_ambiguity(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    meeting = {'meeting_id': 'm-alex', 'transcript': "Alex: I'll send the deck.",
+               'attendees': [{'email': 'alex@owner.com', 'name': 'Alex Smith'},
+                             {'email': 'alex.jones@other.com', 'name': 'Alex Jones'}]}
+    commitment = {'meeting_id': 'm-alex', 'owner': 'Alex', 'owner_is_user': True,
+                  'what': 'send the deck', 'source_snippet': "Alex: I'll send the deck."}
+    result = ac.apply({'commitments': [commitment]}, 'alex@owner.com', NOW,
+                      user_name='Alex Smith', source_meetings=[meeting])
+    assert result['written'] == 0 and result['grounding']['reasons']['owner'] == 1
+
+
+def test_exact_account_attendee_display_supplies_full_name_when_env_is_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_USER_NAME', raising=False)
+    meeting = {'meeting_id': 'm-owner', 'transcript': "Nikunj: I'll send the deck.",
+               'attendees': [{'email': USER, 'name': 'Nikunj Kothari'},
+                             {'email': 'dana@example.com', 'name': 'Dana'}]}
+    commitment = {'meeting_id': 'm-owner', 'owner': 'Nikunj', 'owner_is_user': True,
+                  'what': 'send the deck', 'source_snippet': "Nikunj: I'll send the deck."}
+    result = ac.apply({'commitments': [commitment]}, USER, NOW, source_meetings=[meeting])
+    assert result['written'] == 1 and result['grounding']['accepted'] == 1
+
+
+def test_semantic_merge_preserves_explicit_user_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    cr.resolve({"today": "2026-07-02", "new_actions": [{
+        "type": "follow_up", "channel": "gmail", "contactName": "Dana",
+        "contactIdentifier": "dana@acme.com", "contextSummary": "send Dana the deck",
+        "resolutionMode": "explicit"}]}, NOW)
+    items = cr._load_items()
+    row = items["follow_up:id:dana@acme.com"]
+    row["resolution_mode"] = "explicit"       # same state the user lock/correction path persists
+    cr._persist(row)
+    ac.apply({"commitments": [{"meeting_id": "m-lock", "owner": "you",
+        "owner_is_user": True, "what": "send the deck", "to_email": "dana@acme.com",
+        "existing_anchor_key": row["anchor_key"], "source_snippet": "I'll send the deck"}]},
+        USER, NOW)
+    assert cr._load_items()[row["anchor_key"]]["resolution_mode"] == "explicit"
+
+
+def test_obligation_identity_preserves_temporal_deliverable_qualifiers(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    base = {'meeting_id': 'qualified-reports', 'owner': 'you', 'owner_is_user': True,
+            'to_email': 'dana@example.com'}
+    result = ac.apply({'commitments': [{**base, 'what': f'send the {qualifier} report',
+        'source_snippet': f"I'll send the {qualifier} report."}
+        for qualifier in ('Monday', 'Tuesday', 'next', 'this')]}, USER, NOW)
+    assert result['written'] == 4 and result['deduped'] == 0
+    assert len(set(result['anchor_keys'])) == 4

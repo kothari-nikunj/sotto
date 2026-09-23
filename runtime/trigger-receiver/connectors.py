@@ -525,13 +525,28 @@ def service_status() -> list[dict]:
     return out
 
 
+def credential_matches(service: str) -> bool:
+    """True only for a pinned token written for this registered service."""
+    rec = _read_json(token_path(service))
+    return bool(service in SERVICES and rec and rec.get("service") == service
+                and rec.get("access_token"))
+
+
 def disconnect(service: str) -> dict:
     """Forget a connected service: delete its TOKEN file (the credential) and the gather-written
     `.error` marker. The DCR client registration and discovery cache stay — they hold no user
     credential and make a later reconnect one click. Nothing to delete is a success (the forget.py
     posture): disconnecting twice is not an error."""
     removed = []
-    for p in (token_path(service), os.path.join(_connectors_dir(), f"{service}.error")):
+    credential = token_path(service)
+    try:
+        os.unlink(credential)
+        removed.append(os.path.basename(credential))
+    except FileNotFoundError:
+        pass
+    # Any other failure must reach the setup handler: claiming success while the bearer remains
+    # on disk makes the tile immediately flip back to Connected after an explicit disconnect.
+    for p in (os.path.join(_connectors_dir(), f"{service}.error"),):
         try:
             os.unlink(p)
             removed.append(os.path.basename(p))

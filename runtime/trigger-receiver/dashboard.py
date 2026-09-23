@@ -58,6 +58,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -87,6 +88,8 @@ HOOKS = {
     "connector_status": lambda: [],
     "connector_error": lambda service: None,
     "connector_has_refresh": lambda service: True,
+    "source_allowed": lambda service: False,
+    "source_health": lambda: {"status": "unavailable", "sources": []},
     # Locates a skills-tree script (receiver wires _find_sotto_script). None → the skills tree is
     # not on this box and every write that needs it answers 503.
     "find_script": lambda *rel: None,
@@ -785,7 +788,7 @@ def _handle_static(h, path: str):
                     _headers(doc=ctype.startswith("text/html"), cache=cache))
 
 
-# ── Read-only JSON API (all session-gated; tolerant readers — missing data is empty, never 500) ──
+# ── Read-only JSON API (all session-gated; missing data is empty, corrupt data is visible) ──
 
 def _handle_api(h, path: str):
     rec = _session_record(h)
@@ -844,9 +847,9 @@ def _handle_api(h, path: str):
             obj = api_labels_day(m.group(1))
             return _json(h, 200, obj) if obj is not None else _json(h, 404, {"error": "no such day"})
         return _json(h, 404, {"error": "not found"})
-    except Exception as e:  # noqa: BLE001 — a data-shape surprise must not 500 the dashboard
+    except Exception as e:  # noqa: BLE001 — report corrupt state without replacing valid UI
         print(f"[sotto] dashboard api error on {path}: {e}", flush=True)
-        return _json(h, 200, {"error": "unreadable"})
+        return _json(h, 503, {"error": "unreadable"})
 
 
 def _read_json_file(*parts, default=None):
@@ -927,6 +930,8 @@ def _granola_state() -> str:
                 continue
             if not s.get("connected"):
                 return "absent"
+            if not HOOKS["source_allowed"]("granola"):
+                return "reconnect"
             if HOOKS["connector_error"]("granola") is not None:
                 return "reconnect"
             exp = s.get("expires_at")
@@ -967,12 +972,18 @@ def api_overview() -> dict:
         last_event = HOOKS["last_event_at"]()
     except Exception:  # noqa: BLE001
         last_event = None
+    try:
+        source_health = HOOKS["source_health"]()
+    except Exception:  # noqa: BLE001  # Diagnostics cannot withhold the dashboard.
+        source_health = {"status": "unavailable", "sources": []}
     return {
         "date": today,
-        "briefs_today": [{"kind": k, "file": f} for (d, k, f) in _brief_files() if d == today],
+        "briefs_today": _brief_delivery_states(today),
         "loops_active": len(api_loops()["loops"]),
         "last_event_at": last_event,
         "bridge_connected": _hook_bool("bridge_connected"),
+        # Authenticated overview only. Public /health never exposes per-source activity counts.
+        "source_health": source_health,
         # One row per thing that can be disconnected. The delivery channel is named, not assumed:
         # "WhatsApp isn't linked" was a lie on a Telegram deploy.
         "services": {
@@ -984,6 +995,64 @@ def api_overview() -> dict:
         # Housekeeping, not an alert: one subdued line on Today when a newer Sotto is published.
         "update": _update_notice(),
     }
+
+
+def _brief_kind(label):
+    match = re.search(r'sotto-(morning|evening)-brief$', _s(label))
+    return match.group(1) if match else ''
+
+
+def _brief_delivery_states(today: str) -> list:
+    """Canonical provider receipt/outbox projection for today's two brief occurrences."""
+    states = {}
+    def retain(kind, status, order, at=None):
+        prior = states.get(kind)
+        # Provider acceptance is terminal truth for this kind/day. A later duplicate that queues or
+        # fails cannot unsend it. Before acceptance, the latest-created attempt is current.
+        if prior is None or status == 'sent' or (prior[1]['status'] != 'sent' and order >= prior[0]):
+            states[kind] = (order, {'kind': kind, 'status': status, **({'at': at} if at else {})})
+    receipt_path = os.path.join(_root(), 'events', 'delivery.jsonl')
+    try:
+        with open(receipt_path, encoding='utf-8') as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                kind = _brief_kind(row.get('label')) if isinstance(row, dict) else ''
+                stamp = _from_iso(row.get('ts')) if isinstance(row, dict) else None
+                if not kind or stamp is None:
+                    continue
+                local_day = datetime.fromtimestamp(stamp, _tzchain().local_now(_root()).tzinfo).date().isoformat()
+                if local_day == today and row.get('status') == 'delivered':
+                    retain(kind, 'sent', stamp, row.get('ts'))
+    except FileNotFoundError:
+        pass
+
+    outbox_path = os.path.join(_root(), 'events', 'outbox.json')
+    try:
+        with open(outbox_path, encoding='utf-8') as stream:
+            doc = json.load(stream)
+        rows = doc.get('rows', []) if isinstance(doc, dict) else []
+        if not isinstance(rows, list):
+            raise ValueError('outbox rows must be a list')
+        for sequence, row in enumerate(rows):
+            if not isinstance(row, dict) or row.get('day') != today:
+                continue
+            kind = _brief_kind((row.get('payload') or {}).get('label'))
+            status = row.get('status')
+            if not kind:
+                continue
+            # Only the delivered transition is provider-acceptance truth. Pre-send invalidation
+            # also carries effects_pending, so that flag cannot prove a send. Quarantine retains a
+            # delivered row status and therefore remains Sent without special inference.
+            projected = 'sent' if status == 'delivered' else status
+            if projected not in ('sent', 'pending', 'failed'):
+                continue
+            order = float(row.get('created_at') or 0) + sequence / 1_000_000
+            retain(kind, projected, order)
+    except FileNotFoundError:
+        pass
+    return [states[kind][1] for kind in ('morning', 'evening') if kind in states]
 
 
 def api_loops() -> dict:
@@ -1826,6 +1895,67 @@ def api_research() -> dict:
     return {"attendees": [], "date": None, "stale": False}
 
 
+_MODEL_WORKLOADS = frozenset({"notification", "triage", "digest", "memory_extract",
+                              "memory_curate", "brief", "brief_extract", "brief_critic",
+                              "brief_revise", "followup", "meeting_prep", "research",
+                              "web_search", "web_fetch", "deck_read"})
+
+
+def _model_work_diagnostics(run_ids: set[str]) -> dict:
+    """Exact receipt-to-attempt join. Counts only; proxy telemetry remains the spend source."""
+    if not run_ids:
+        return {}
+    path = os.path.join(_root(), "events", "model-work.sqlite3")
+    grouped = {run_id: {"status": "no_records", "operations": set(), "attempts": 0,
+                        "attempt_statuses": collections.Counter(),
+                        "workloads": collections.Counter()} for run_id in run_ids}
+    try:
+        db = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(path)) + "?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" for _ in run_ids)
+            rows = db.execute(
+                "SELECT operation,status,metadata FROM attempts "
+                "WHERE json_valid(metadata) AND json_extract(metadata,'$.run_id') IN (" + placeholders + ")",
+                tuple(sorted(run_ids))).fetchall()
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error):
+        return {run_id: {"status": "unavailable"} for run_id in run_ids}
+    for operation, raw_status, raw_metadata in rows:
+        try:
+            metadata = json.loads(raw_metadata or "{}")
+        except (TypeError, ValueError):
+            continue
+        run_id = metadata.get("run_id") if isinstance(metadata, dict) else None
+        if not isinstance(run_id, str) or run_id not in grouped:
+            continue
+        task = metadata.get("task")
+        workload = task if isinstance(task, str) and task in _MODEL_WORKLOADS else "unknown"
+        if raw_status == "succeeded":
+            status = "succeeded"
+        elif raw_status == "started":
+            status = "in_progress"
+        elif raw_status == "interrupted_unknown":
+            status = "interrupted_unknown"
+        elif raw_status in ("http_400", "http_422"):
+            status = "request_rejected"
+        elif isinstance(raw_status, str) and raw_status.startswith("http_"):
+            status = "upstream_error"
+        else:
+            status = "failed"
+        bucket = grouped[run_id]
+        bucket["status"] = "observed"
+        bucket["operations"].add(operation)
+        bucket["attempts"] += 1
+        bucket["attempt_statuses"][status] += 1
+        bucket["workloads"][workload] += 1
+    return {run_id: ({"status": item["status"]} if item["status"] != "observed" else {
+        "status": "observed", "operations": len(item["operations"]), "attempts": item["attempts"],
+        "attempt_statuses": dict(sorted(item["attempt_statuses"].items())),
+        "workloads": dict(sorted(item["workloads"].items())),
+    }) for run_id, item in grouped.items()}
+
+
 def api_ledger(days_param="") -> dict:
     """GET /api/ledger?days=N (default 7, cap 30) → outcomes.jsonl (log_outcome.py: {ts, action_id,
     outcome, channel, contact, action_type, tier, …}) merged with dashboard_audit.jsonl ({ts,
@@ -1867,10 +1997,48 @@ def api_ledger(days_param="") -> dict:
             ts = _from_iso(rec.get("ts"))
             if ts is None or ts < cutoff:
                 continue
+            if source == "outcome" and rec.get("outcome") in ("loop_proposal", "loop_transition"):
+                if rec["outcome"] == "loop_proposal":
+                    rec["display_label"] = ("Loop proposal accepted" if rec.get("result") == "accepted"
+                                            else "Loop proposal rejected")
+                else:
+                    rec["display_label"] = ("Loop status changed by you" if rec.get("actor") == "user"
+                                            else "Loop status changed")
             rows.append({**rec, "source": source})
         # Each ledger is append-ordered, so the tail IS the newest rows of that source. A source
         # with no declared share falls back to the total cap — i.e. to the old behavior.
         entries.extend(rows[-LEDGER_MAX_PER_SOURCE.get(source, LEDGER_MAX_ROWS):])
+    # Join only explicit decision identities from this already bounded view. A later
+    # decision cannot explain an earlier send; missing/aged-out evidence stays absent.
+    decisions = {}
+    for entry in entries:
+        key = entry.get("decision_id")
+        if entry.get("source") == "triage" and isinstance(key, str) and key:
+            decisions.setdefault(key, []).append(entry)
+    for entry in entries:
+        if entry.get("source") != "delivery":
+            continue
+        ids = entry.get("decision_ids")
+        ids = {key for key in ids if isinstance(key, str)} if isinstance(ids, list) else set()
+        related = []
+        for key in sorted(ids):
+            candidates = [row for row in decisions.get(key, [])
+                          if _from_iso(row["ts"]) <= _from_iso(entry["ts"])]
+            if candidates:
+                latest = max(candidates, key=lambda row: _from_iso(row["ts"]))
+                related.append({field: latest.get(field, "") for field in
+                                ("ts", "decision_id", "sender", "channel", "verdict", "reason", "class")})
+        entry["related_decisions"] = related
+    run_ids = {entry["run_id"] for entry in entries if entry.get("source") == "delivery"
+               and isinstance(entry.get("run_id"), str)
+               and re.fullmatch(r"[a-f0-9]{32}", entry["run_id"])}
+    diagnostics = _model_work_diagnostics(run_ids)
+    for entry in entries:
+        if entry.get("source") != "delivery":
+            continue
+        run_id = entry.get("run_id")
+        entry["model_work"] = (diagnostics.get(run_id, {"status": "unknown"})
+                               if isinstance(run_id, str) else {"status": "unknown"})
     entries.sort(key=lambda r: _s(r.get("ts")), reverse=True)   # both writers emit ISO-Z — sortable
     return {"days": days, "entries": entries[:LEDGER_MAX_ROWS]}
 

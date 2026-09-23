@@ -59,6 +59,26 @@ def test_malformed_model_judgment_raises(monkeypatch, response):
         relevance.judge("untrusted source")
 
 
+@pytest.mark.parametrize('deadline', [None, '', '   '])
+def test_optional_blank_deadline_is_normalized_absent(monkeypatch, deadline):
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'test')
+    row = {'class': 'actionable', 'sender_role': 'person', 'why': 'A grounded ask'}
+    if deadline is not None:
+        row['deadline'] = deadline
+    monkeypatch.setattr(relevance.gemini, 'model_once', lambda *a, **kw: json.dumps(row))
+    assert 'deadline' not in relevance.judge('untrusted source')
+
+
+@pytest.mark.parametrize('deadline', ['tomorrow', '2026-09-12T10:00:00'])
+def test_nonempty_invalid_deadline_stays_invalid(monkeypatch, deadline):
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'test')
+    row = {'class': 'actionable', 'sender_role': 'person', 'why': 'A grounded ask',
+           'deadline': deadline}
+    monkeypatch.setattr(relevance.gemini, 'model_once', lambda *a, **kw: json.dumps(row))
+    with pytest.raises(ValueError):
+        relevance.judge('untrusted source')
+
+
 @pytest.mark.parametrize('managed', [False, True])
 def test_live_probe_builds_real_source_input_and_does_not_touch_tenant_state(tmp_path, monkeypatch, managed):
     spec = importlib.util.spec_from_file_location("relevance_eval", ROOT / "evals/run_relevance.py")

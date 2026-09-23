@@ -30,6 +30,7 @@ followup/                            # post-meeting: commitments + ready-to-send
   references/followup-prompt.md      # the followup extraction prompt (grounded-only, verbatim emails)
   scripts/compose_followup.py        # meetings that JUST ended (Granola transcripts) -> commitments + drafts
   scripts/apply_commitments.py       # write extracted commitments straight into the continuity ledger
+  scripts/capture_commitments.py     # shared cached extract+apply; Learn retries late/edited notes
 proactive/                           # ~15-min watcher: meeting-prep/commitment/chase/birthday/handoff nudges
   SKILL.md
   scripts/proactive_scan.py          # what is due (lead window, dedup) → the funnel decides who hears it

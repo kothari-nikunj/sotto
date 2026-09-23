@@ -65,11 +65,13 @@ def test_mcp_happy_path_maps_to_existing_granola_shape():
     # Identity + exact start survive the gather boundary so capture is idempotent and future
     # meetings later today cannot be mistaken for completed meetings.
     assert set(m1) == {"meeting_id", "title", "start", "end", "date", "time", "attendee_emails",
-                       "your_notes", "ai_summary", "transcript"}
+                       "attendees", "your_notes", "ai_summary", "transcript"}
     assert m1["meeting_id"] == "m1"
     assert m1["start"] == "2026-08-06T10:00:00+00:00"
     assert m1["date"] == "2026-08-06" and m1["time"] == "10:00"
     assert m1["attendee_emails"] == ["sarah@acme.com", "dev@acme.com"]  # {email} dicts AND bare strings
+    assert m1["attendees"] == [{"email": "sarah@acme.com", "name": "Sarah"},
+                                {"email": "dev@acme.com", "name": ""}]
     assert m1["your_notes"] == "my typed notes"                         # notes_markdown variant mapped
     assert m1["ai_summary"] == "Discussed the pilot rollout."           # summary variant mapped
     assert m1["transcript"] == "you: I'll send the deck"                # recent → transcript fetched
@@ -375,7 +377,8 @@ def test_rest_mode_same_shape_with_transcript(monkeypatch):
                                     "notes": "detail notes"}).encode()
         return 200, json.dumps({"notes": [
             {"id": "n1", "title": "Board Prep", "created_at": _iso_hours_ago(3),
-             "attendees": ["a@b.com"], "summary": "prep points"},
+             "attendees": [{"email": "a@b.com", "name": "Avery Board"}],
+             "summary": "prep points"},
             {"id": "n2", "title": "Last Week", "created_at": _iso_hours_ago(24 * 5),
              "summary": "old summary"}]}).encode()
 
@@ -386,9 +389,11 @@ def test_rest_mode_same_shape_with_transcript(monkeypatch):
     assert "created_after=" in requests[0][0] and requests[0][0].startswith(gg.REST_BASE + "/notes?")
     b1, b2 = meetings
     assert set(b1) == {"meeting_id", "title", "start", "end", "date", "time", "attendee_emails",
-                       "your_notes", "ai_summary", "transcript"}
+                       "attendees", "your_notes", "ai_summary", "transcript"}
     assert b1["meeting_id"] == "n1"
     assert b1["start"] == "2026-08-06T09:00:00+00:00"
+    assert b1["attendee_emails"] == ["a@b.com"]
+    assert b1["attendees"] == [{"email": "a@b.com", "name": "Avery Board"}]
     assert b1["transcript"] == "full transcript"
     assert b1["your_notes"] == "detail notes"       # detail backfills notes missing from the list item
     assert b1["ai_summary"] == "prep points"

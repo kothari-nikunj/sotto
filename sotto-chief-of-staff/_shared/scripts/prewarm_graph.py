@@ -112,6 +112,10 @@ def sync_contacts(local: dict) -> dict:
     minting 2,000 person files would bury the graph. A card syncs when Sotto ALREADY knows the
     person, or when the user wrote a note or a birthday on it — the only two things a brief three
     months from now could use. Idempotent: identical note text BUMPs, it never duplicates."""
+    from source_context import allowed, project_local
+    local = project_local(local)
+    if not allowed("contacts"):
+        return {"contacts": 0, "synced": 0, "facts": 0}
     cards = _arr(local, "contacts")
     try:
         index = kg.build_people_index()
@@ -129,6 +133,8 @@ def sync_contacts(local: dict) -> dict:
             continue
         upd["updated_by"] = CONTACTS_SOURCE
         updates.append(upd)
+    if updates and not allowed("contacts"):
+        raise RuntimeError("source consent changed during contacts sync")
     if updates:
         ku.apply({"person_updates": updates})
     return {"contacts": len(cards), "synced": len(updates),
@@ -222,6 +228,15 @@ def _research_facts(updates: list) -> int:
 
 
 def prewarm(local: dict, research: bool = True) -> dict:
+    from source_context import SOURCE_FIELDS, allowed, project_local
+    # Setup can hand us the raw MCP wrapper's payload. Apply current consent before resolving
+    # names or copying Contacts identifiers/facts, then remember exactly which projected sources
+    # contributed so a revocation during research cannot race the graph write.
+    local = project_local(local)
+    source_permissions = {
+        source for source, fields in SOURCE_FIELDS.items()
+        if any(local.get(field) for field in fields)
+    }
     cards = _contact_cards(local)
     top = _top_contacts(local)
     updates = []
@@ -240,6 +255,8 @@ def prewarm(local: dict, research: bool = True) -> dict:
     if research and os.environ.get("SOTTO_PREWARM_RESEARCH", "1") != "0" and updates:   # default ON; =0 skips
         researched = _research_facts(updates)
 
+    if updates and any(not allowed(source) for source in source_permissions):
+        raise RuntimeError("source consent changed during graph prewarm")
     if updates:
         ku.apply({"person_updates": updates})
     return {"stubs": len(updates), "researched": researched,
@@ -253,7 +270,8 @@ def _snapshot_local() -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             local = (json.load(f) or {}).get("local") or {}
-        return local if isinstance(local, dict) else {}
+        from source_context import project_local
+        return project_local(local) if isinstance(local, dict) else {}
     except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
         return {}
 

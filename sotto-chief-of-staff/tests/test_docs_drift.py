@@ -77,6 +77,8 @@ br = _load("dd_brief_runner", HERMES, "runtime", "trigger-receiver", "brief_runn
 mc = _load("dd_memory_cycle", PACK, "_shared", "scripts", "memory_cycle.py")
 pc = _load("dd_personal_context", PACK, "_shared", "lib", "personal_context.py")
 de = _load("dd_delivery_effects", PACK, "_shared", "lib", "delivery_effects.py")
+cc = _load("dd_capture_commitments", PACK, "followup", "scripts", "capture_commitments.py")
+mp = _load("dd_meeting_prep", PACK, "meeting-prep", "scripts", "compose_meeting_prep.py")
 
 ISLAND_RE = re.compile(
     r'<script\s+type="application/json"\s+id="sotto-rules">(.*?)</script>', re.S)
@@ -189,6 +191,18 @@ def test_post_meeting_tap_cap_and_grace():
     _same("tap.max_per_day (dashboard)", R["tap"]["max_per_day"],
           _env_default(dsh, "SOTTO_TAP_MAX_PER_DAY"))
     _same("tap.grace_min", R["tap"]["grace_min"], cal.TAP_GRACE_MIN_DEFAULT)
+
+
+def test_meeting_followthrough_bounds():
+    _same('meeting_followthrough.capture_window_hours',
+          R['brief']['meeting_followthrough']['capture_window_hours'], cc.CAPTURE_WINDOW_HOURS)
+    _same('meeting_followthrough.capture_max',
+          R['brief']['meeting_followthrough']['capture_max'], cc.MAX_MEETINGS_PER_RUN)
+    _same('meeting_followthrough.prep_loop_max',
+          R['brief']['meeting_followthrough']['prep_loop_max'], mp.MAX_RELEVANT_LOOPS_PER_ATTENDEE)
+    _anchor('fourteen-day overlap')
+    _anchor('at most three changed meetings')
+    _anchor('at most three relevant open obligations')
 
 
 def test_cooldown_escalation_and_freshness():
@@ -354,12 +368,14 @@ def test_account_broker_capacity_guards():
 
 def test_the_learn_step_is_one_command_with_a_receipt():
     """Three loops (knowledge, preferences, style) rest on the Learn step, so the step is machinery:
-    learn_step.py runs the six writers and leaves briefs/<day>.<kind>.learned.json, the receiver
+    learn_step.py runs the seven writers and leaves briefs/<day>.<kind>.learned.json, the receiver
     reads it on the ack, and retention ages it with the brief."""
     ls = _load("dd_learn_step", PACK, "_shared", "scripts", "learn_step.py")
     _same("learn.step_timeout_secs", R["learn"]["step_timeout_secs"], ls.STEP_TIMEOUT_SECS)
+    _same("learn.commitments_timeout_secs", R["learn"]["commitments_timeout_secs"],
+          ls.COMMITMENTS_TIMEOUT_SECS)
     assert [name for name, _rel, _b in ls.STEPS] == [
-        "knowledge", "continuity", "style", "drafts", "granola", "contacts"], RULE
+        "knowledge", "continuity", "style", "drafts", "commitments", "granola", "contacts"], RULE
     assert ls.receipt_path("2026-09-04", "morning").endswith("briefs/2026-09-04.morning.learned.json")
     assert isinstance(rt.accounts_for("briefs/2026-09-04.morning.learned.json"), rt.Rule), RULE
     _anchor("one command")
@@ -1216,3 +1232,26 @@ def test_phase2_limits_share_existing_clocks_and_documented_rules():
     _anchor(f'**{knowledge.CONFIDENCE_DECAY_PER_WEEK} weekly decay**')
     _anchor(f'**{knowledge.PRUNE_STALE_AFTER_DAYS} days**')
     _anchor('Priorities remain ranking context permanently, never an exclusion filter.')
+
+
+def test_memory_retrieval_budgets_match_docs_and_both_playgrounds():
+    import knowledge as kg
+    import knowledge_query as query
+    import personal_context as context
+    expected = {
+        'compact_facts': kg.MAX_FACTS_COMPACT, 'expanded_facts': kg.MAX_FACTS_FOR_LLM,
+        'compact_chars': query.MAX_COMPACT_CHARS, 'expanded_chars': query.MAX_EXPANDED_CHARS,
+        'relation_edges': kg.MAX_RELATIONS_FOR_LLM, 'related_people': query.MAX_RELATED_PEOPLE,
+        'related_facts': query.MAX_RELATED_FACTS, 'topic_records': context.TOPIC_RECORDS,
+        'topic_record_chars': context.TOPIC_RECORD_CHARS, 'topic_chars': context.TOPIC_CHARS,
+    }
+    for key, value in expected.items():
+        _same('memory_retrieval.' + key, R['memory_retrieval'][key], value)
+    _anchor(f'**{kg.MAX_FACTS_COMPACT}-fact compact / {kg.MAX_FACTS_FOR_LLM}-fact expanded**')
+    _anchor(f'**{query.MAX_COMPACT_CHARS:,}-character compact / {query.MAX_EXPANDED_CHARS:,}-character expanded**')
+    _anchor(f'**{kg.MAX_RELATIONS_FOR_LLM} relation edges**')
+    _anchor(f'**{query.MAX_RELATED_PEOPLE} related people**')
+    _anchor(f'**{query.MAX_RELATED_FACTS} related facts per person**')
+    _anchor(f'**{context.TOPIC_RECORDS} records per identifier**')
+    _anchor(f'**{context.TOPIC_RECORD_CHARS} characters per record**')
+    _anchor(f'**{context.TOPIC_CHARS:,} characters per identifier**')

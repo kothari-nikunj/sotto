@@ -275,3 +275,366 @@ def test_topic_finds_old_wrong_fact_then_exact_correction_replaces_retrieved_mem
     active = next(iter(_run(tmp_path, '--person', 'peyton@example.com', '--editable-person',
                             '--topic', 'Alive leadership').values()))
     assert all(fact['id'] != 'f_wrong' for fact in active['facts'])
+
+
+def _person(tmp_path, *, cid='c_123456789abc', name='Alex', facts=None, **fields):
+    now = datetime(2026, 9, 20)
+    person = kg.PersonFile(canonical_id=cid, name=name,
+        identifiers=fields.pop('identifiers', ['alex@example.com', '+14155550199']),
+        facts=facts or {}, **fields)
+    kg.write_person_file(os.path.join(kg.people_dir(), cid + '.md'), person, now)
+    return person
+
+
+def _fact(text, **kw):
+    return kg.FactMeta(text=text, first='2026-09-20', last='2026-09-20', conf=.95, **kw)
+
+
+def test_recent_burst_and_summary_share_one_fact_budget(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    facts = {f'f_{i}': _fact(f'Fresh portfolio observation {i}.') for i in range(100)}
+    facts['f_copy'] = _fact('Fresh portfolio observation 0.')
+    facts['f_owner'] = _fact('Owner corrected the role to adviser.', source='user_edit')
+    p = _person(tmp_path, facts=facts, summary_refs=['f_0', 'f_1', 'f_copy'])
+    packed = query.pack_person(p, False, datetime(2026, 9, 20))
+    assert packed.count('= ') == 5
+    assert packed.count('Fresh portfolio observation 0.') == 1
+    assert packed.index('Owner corrected') < packed.index('Fresh portfolio')
+    # A compact read is a summary by design: the fact allowance is not an omission to announce
+    # to the brief's model, which cannot narrow anything. The expanded read says so.
+    assert query.OMITTED_CONTEXT not in packed
+    assert query.OMITTED_CONTEXT in query.pack_person(p, True, datetime(2026, 9, 20))
+    assert len(packed) <= query.MAX_COMPACT_CHARS
+    assert len(p.facts) == 102  # A read budget never deletes the underlying memory.
+
+
+def test_an_ordinary_compact_block_carries_no_omission_notice(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, facts={f'f_{i}': _fact(f'Fact {i} about a project the person runs.') for i in range(7)})
+    packed = query.pack_person(p, False, datetime(2026, 9, 20))
+    assert packed.count('= ') == 5 and query.OMITTED_CONTEXT not in packed
+
+
+def test_char_budget_keeps_whole_assertions_and_bounds_legacy_context(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    oversized = 'A very long legacy assertion ' + 'details ' * 2000 + 'but not approved.'
+    p = _person(tmp_path, facts={'f_long': _fact(oversized), 'f_small': _fact('Runs acoustic research.')},
+                talking_points=['legacy ' * 2000] * 20, recent_activity=['activity ' * 2000] * 20)
+    for expanded, cap in ((False, query.MAX_COMPACT_CHARS), (True, query.MAX_EXPANDED_CHARS)):
+        packed = query.pack_person(p, expanded, datetime(2026, 9, 20))
+        assert len(packed) <= cap
+        assert 'A very long legacy assertion' not in packed  # Never amputate the qualifier.
+        assert 'Runs acoustic research.' in packed
+        assert query.OMITTED_CONTEXT in packed
+
+
+def _crowded_memory(tmp_path):
+    facts = {f'f_new_{i}': _fact(f'Unrelated portfolio observation {i}.') for i in range(20)}
+    facts['f_clinic'] = kg.FactMeta(text='Pediatric clinic procurement requires a six-month review.',
+                                  conf=.65, first='2025-01-01', last='2025-01-01')
+    return _person(tmp_path, facts=facts)
+
+
+def test_email_and_phone_topics_recall_old_facts_without_calendar(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _crowded_memory(tmp_path)
+    assert 'six-month review' not in _run(tmp_path, '--person', 'alex@example.com')[p.canonical_id]
+    email = tmp_path / 'mail.json'
+    email.write_text(json.dumps([{'from': 'Alex <ALEX@example.com>',
+                                 'subject': 'Pediatric clinic procurement'}]))
+    local = tmp_path / 'local.json'
+    local.write_text(json.dumps({'imessage': [{'handle': '+1 (415) 555-0199',
+                                              'text': 'Pediatric clinic procurement'}]}))
+    for args in (('--gmail', str(email)), ('--local', str(local))):
+        packed = _run(tmp_path, *args)['person_knowledge'][p.canonical_id]
+        assert 'six-month review' in packed
+        assert packed.count('= ') == 5
+
+
+def test_topic_projection_uses_exact_aliases_and_respects_revocation(tmp_path, monkeypatch):
+    import personal_context as pc
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    _crowded_memory(tmp_path)
+    inputs = dict(local={'imessage': [
+        {'handle': '+1 (415) 555-0199', 'text': 'Pediatric clinic procurement', 'name': 'Alex'},
+        {'handle': '+14155550198', 'text': 'Industrial turbines', 'name': 'Alex'},
+        {'handle': '+14155550199', 'text': 'Group-only phrase', 'is_group_chat': True}]})
+    topics = pc.participant_topics(**inputs)
+    assert topics['4155550199'] == 'Pediatric clinic procurement'
+    assert topics['4155550198'] == 'Industrial turbines'
+    from source_context import record_bridge_status
+    record_bridge_status({'source_status': {'imessage': 'disabled'}})
+    assert pc.participant_topics(**inputs) == {}
+    assert pc.participant_identifiers(**inputs) == set()
+    # Disconnect stops new context, not explicit memory queries or owner-managed durable facts.
+    explicit = _run(tmp_path, '--person', '+14155550199', '--topic', 'Pediatric clinic procurement')
+    assert 'six-month review' in next(iter(explicit.values()))
+
+
+def test_topic_projection_is_bounded_and_gmail_revocation_is_respected(tmp_path, monkeypatch):
+    import personal_context as pc
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    gmail = [{'from': 'alex@example.com', 'subject': 'Pediatric clinic procurement ' + str(i) * 2000}
+             for i in range(100)]
+    assert len(pc.participant_topics(gmail=gmail)['alex@example.com']) <= pc.TOPIC_CHARS
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config/managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'test', 'sources': {'gmail': {'consented': False, 'connected': True}}}))
+    assert pc.participant_topics(gmail=gmail) == {}
+    assert pc.participant_identifiers(gmail=gmail) == set()
+
+
+def test_one_hop_retrieval_is_attributed_bounded_and_does_not_expand_active_cohort(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    relation = kg.Relation(type='introduced_by', slug='c_222222222222', name='Jo')
+    p = _crowded_memory(tmp_path)
+    p.relations = [relation, kg.Relation(type='works_with', slug='../../elsewhere', name='Impostor')]
+    kg.write_person_file(os.path.join(kg.people_dir(), p.canonical_id + '.md'), p)
+    _person(tmp_path, cid=relation.slug, name='Jo', identifiers=['jo@example.com'],
+        facts={'f_intro': _fact('Discussed pediatric clinic procurement safeguards.'),
+               'f_private': _fact('Unrelated holiday planning.')},
+        relations=[kg.Relation(type='works_with', slug='c_333333333333', name='Pat')])
+    _person(tmp_path, cid='c_333333333333', name='Pat', identifiers=['pat@example.com'],
+        facts={'f_two': _fact('Pediatric clinic procurement second-hop detail.')})
+    cal = _topic_cal(tmp_path, 'alex@example.com', 'Pediatric clinic procurement', '')
+    out = _run(tmp_path, '--calendar', cal)
+    packed = out['person_knowledge'][p.canonical_id]
+    assert 'Related context about Jo (c_222222222222), introduced_by:' in packed
+    assert 'procurement safeguards' in packed
+    assert 'holiday planning' not in packed and 'second-hop detail' not in packed
+    assert len(out['person_knowledge']) == 1
+    assert 'jo@example.com' not in out['memory_participants']
+    assert packed.count('= ') + packed.count('Related context about') == 5
+    ordinary = _run(tmp_path, '--person', 'alex@example.com')[p.canonical_id]
+    assert 'procurement safeguards' not in ordinary
+
+
+def test_related_name_does_not_substitute_for_a_missing_canonical_file(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, relations=[kg.Relation(type='introduced_by', slug='c_444444444444', name='Jo')])
+    _person(tmp_path, cid='c_222222222222', name='Jo', identifiers=['jo@example.com'],
+            facts={'f_one': _fact('Pediatric clinic procurement safeguards.')})
+    packed = _run(tmp_path, '--person', 'alex@example.com', '--topic', 'clinic procurement')[p.canonical_id]
+    assert 'procurement safeguards' not in packed
+
+
+def test_live_conflict_is_atomic_deduplicated_and_disappears_after_correction(tmp_path, monkeypatch):
+    import knowledge_edit as edit
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, facts={'f_founder': _fact('Alex founded Acme.'),
+                               'f_adviser': _fact('Alex advises Acme.')}, summary_refs=['f_founder'])
+    (tmp_path / 'knowledge/conflicts.json').write_text(json.dumps({'people': {
+        p.canonical_id: {'pairs': [['f_founder', 'f_adviser']]}}}))
+    packed = _run(tmp_path, '--person', 'alex@example.com')[p.canonical_id]
+    assert 'Unresolved memory conflict' in packed
+    assert packed.count('Alex founded Acme.') == 1
+    assert packed.count('Alex advises Acme.') == 1
+    edit.op_correct(p.canonical_id, 'f_founder', 'Alex advises Acme.')
+    packed = _run(tmp_path, '--person', 'alex@example.com')[p.canonical_id]
+    assert 'Unresolved memory conflict' not in packed and 'founded Acme' not in packed
+    assert packed.count('Alex advises Acme.') == 1
+
+
+def test_archived_indirect_fact_cannot_return_through_summary_or_related_context(tmp_path, monkeypatch):
+    import knowledge_edit as edit
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _person(tmp_path, relations=[kg.Relation(type='introduced_by', slug='c_222222222222', name='Jo')])
+    _person(tmp_path, cid='c_222222222222', name='Jo', identifiers=['jo@example.com'],
+            facts={'f_old': _fact('Pediatric clinic procurement safeguards.')}, summary_refs=['f_old'])
+    args = ('--person', 'alex@example.com', '--topic', 'Pediatric clinic procurement')
+    assert 'procurement safeguards' in next(iter(_run(tmp_path, *args).values()))
+    edit.op_archive('c_222222222222', 'f_old')
+    assert 'procurement safeguards' not in next(iter(_run(tmp_path, *args).values()))
+    assert 'procurement safeguards' not in next(iter(_run(tmp_path, '--person', 'jo@example.com').values()))
+
+
+def test_corrected_memory_reaches_chat_brief_prep_and_notification_context(tmp_path, monkeypatch):
+    import compose_brief as brief
+    import compose_meeting_prep as prep
+    import compose_notification as notification
+    import knowledge_edit as edit
+    import render_local
+    from datetime import timezone
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    p = _crowded_memory(tmp_path)
+    edit.op_correct(p.canonical_id, 'f_clinic', 'Pediatric clinic procurement requires board approval, not a fixed timeline.')
+    want = 'requires board approval, not a fixed timeline'
+    old = 'requires a six-month review'
+    topic = 'Pediatric clinic procurement'
+    chat = _run(tmp_path, '--person', '+1 (415) 555-0199', '--topic', topic)
+    event = {'summary': topic, 'attendees': [{'email': 'alex@example.com', 'displayName': 'Alex'}]}
+    cal = tmp_path / 'cal.json'
+    cal.write_text(json.dumps([event]))
+    context = _run(tmp_path, '--calendar', str(cal))
+    inputs = {'type': 'morning', 'local': {}, 'google': {'userEmail': 'owner@elsewhere.com',
+              'events': [event]}, 'prior_knowledge': context}
+    brief_prompt = brief.build_prompt(brief._load_prompt(), inputs)
+    prep_prompt, meetings = prep.build_prompt(prep._load_prompt(), inputs)
+    assert meetings
+    item = {'kind': 'actionable', 'person': 'Alex', 'identifier': 'alex@example.com',
+            'event': {'subject': topic}, 'channel': 'gmail'}
+    notification_context = notification.enrich([item], datetime.now(timezone.utc))[0]['person_facts']
+    for value in (json.dumps(chat), brief_prompt, prep_prompt, json.dumps(notification_context)):
+        assert want in value and old not in value
+    # The changed packed format must not trigger paid re-research just because the first fact is short.
+    assert render_local._is_high_quality_profile('Alex\n= Runs clinics.\n= Advises procurement boards on pediatric rollouts and governance.')
+    assert not render_local._is_high_quality_profile('Alex\n= Runs clinics.\nRelated context about Jo: ' + 'expert ' * 30)
+
+
+def test_resolved_work_does_not_become_a_current_topic(tmp_path, monkeypatch):
+    import personal_context as pc
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    loops = [{'status': 'resolved', 'canonical_id': 'c_123456789abc',
+              'contact_identifier': 'alex@example.com', 'summary': 'Send the pediatric clinic deck'}]
+    assert pc.participant_identifiers(loops=loops) == set()
+    assert pc.participant_topics(loops=loops) == {}
+    loops[0]['status'] = 'waiting'
+    assert pc.participant_topics(loops=loops)['alex@example.com'] == 'Send the pediatric clinic deck'
+
+
+def test_conflicted_related_memory_is_not_silently_cherry_picked(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _person(tmp_path, relations=[kg.Relation(type='works_with', slug='c_222222222222', name='Jo')])
+    _person(tmp_path, cid='c_222222222222', name='Jo', identifiers=['jo@example.com'],
+            facts={'f_a': _fact('Clinic procurement is approved.'), 'f_b': _fact('Clinic procurement is not approved.')})
+    (tmp_path / 'knowledge/conflicts.json').write_text(json.dumps({'people': {
+        'c_222222222222': {'pairs': [['f_a', 'f_b']]}}}))
+    packed = next(iter(_run(tmp_path, '--person', 'alex@example.com', '--topic', 'clinic procurement').values()))
+    assert 'procurement is approved' not in packed and 'procurement is not approved' not in packed
+
+
+def test_malformed_optional_records_cannot_break_primary_retrieval(tmp_path, monkeypatch):
+    import knowledge_query as query
+    import personal_context as context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, facts={'f_one': _fact('Runs clinic procurement.')},
+                relations=[kg.Relation(type='works_with', slug='c_222222222222', name='Jo')])
+    (tmp_path / 'knowledge/people/c_222222222222.md').write_text('---\n- malformed YAML shape\n---\n')
+    packed = query.pack_person(p, False, datetime(2026, 9, 20), 'clinic procurement')
+    assert 'Runs clinic procurement' in packed
+    inputs = dict(loops=[None, 'broken', {'status': 'waiting', 'contact_identifier': 'alex@example.com',
+                                        'summary': 'Clinic procurement'}],
+                  gmail=[None, 'broken'], calendar=[None, 'broken'])
+    assert context.participant_identifiers(**inputs) == {'alex@example.com'}
+    assert context.participant_topics(**inputs) == {'alex@example.com': 'Clinic procurement'}
+
+
+def test_related_limits_and_loaded_identity_are_enforced(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    relations = []
+    for i in range(1, 7):
+        cid = f'c_{i:012x}'
+        relations.append(kg.Relation(type='works_with', slug=cid, name=f'Colleague {i}'))
+        _person(tmp_path, cid=cid, name=f'Colleague {i}', identifiers=[f'c{i}@example.com'],
+                facts={f'f_{n}': _fact(f'Clinic procurement colleague {i} observation {n}.') for n in range(4)})
+    p = _person(tmp_path, relations=relations)
+    packed = query.pack_person(p, True, datetime(2026, 9, 20), 'clinic procurement')
+    assert packed.count('Related context about') == 4  # Two people, two facts each.
+    assert 'colleague 3 observation' not in packed and 'colleague 6 observation' not in packed
+    p.relations = [kg.Relation(type='', slug='c_000000000001', name='Colleague 1')]
+    assert 'colleague 1 observation' not in query.pack_person(p, True, datetime(2026, 9, 20), 'clinic procurement')
+    p.relations[0].type = 'works_with'
+    path = tmp_path / 'knowledge/people/c_000000000001.md'
+    path.write_text(path.read_text().replace('canonical_id: c_000000000001', 'canonical_id: c_111111111111'))
+    assert 'colleague 1 observation' not in query.pack_person(p, True, datetime(2026, 9, 20), 'clinic procurement')
+
+
+def test_filler_question_does_not_expand_related_profiles(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _person(tmp_path, relations=[kg.Relation(type='introduced_by', slug='c_222222222222', name='Jo')])
+    _person(tmp_path, cid='c_222222222222', name='Jo', identifiers=['jo@example.com'],
+            facts={'f_one': _fact('She is the lead for compliance and procurement.')})
+    packed = next(iter(_run(tmp_path, '--person', 'alex@example.com',
+                           '--topic', 'Can you please tell me about them and what you know?').values()))
+    assert 'lead for compliance' not in packed
+
+
+def test_legacy_notes_are_not_cut_before_a_qualifier(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, notes='The procurement plan has been approved ' + 'detail ' * 100 + 'only if the board agrees.')
+    packed = query.pack_person(p, True, datetime(2026, 9, 20))
+    assert 'procurement plan has been approved' not in packed
+    assert query.OMITTED_CONTEXT in packed
+    # …but a note made of several sentences keeps the complete ones that fit, and says the rest is out
+    p = _person(tmp_path, notes='Met at the summit in May. Prefers email over calls. '
+                + 'The procurement plan has been approved ' + 'detail ' * 100 + 'only if the board agrees.')
+    packed = query.pack_person(p, True, datetime(2026, 9, 20))
+    assert '# Met at the summit in May. Prefers email over calls. …' in packed
+    assert 'procurement plan has been approved' not in packed
+    assert query.OMITTED_CONTEXT in packed
+
+
+def test_legacy_note_line_wrap_cannot_drop_its_qualifier(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, notes='Prefers email.\nThe procurement plan is approved\nonly if '
+                + 'the conditions hold ' * 30 + 'and the board agrees.')
+    packed = query.pack_person(p, True, datetime(2026, 9, 20))
+    assert '# Prefers email. …' in packed
+    assert 'procurement plan is approved' not in packed
+    assert query.OMITTED_CONTEXT in packed
+
+
+def test_legacy_note_suffix_shares_the_excerpt_budget(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    for sentence_size in (kg.NOTES_EXCERPT_CHARS - 2, kg.NOTES_EXCERPT_CHARS - 1):
+        first_sentence = 'A' * (sentence_size - 1) + '.'
+        p = _person(tmp_path, notes=first_sentence + ' ' + 'More context. ' * 30)
+        packed = query.pack_person(p, True, datetime(2026, 9, 20))
+        note_lines = [line[2:] for line in packed.splitlines() if line.startswith('# ')]
+        assert all(len(line) <= kg.NOTES_EXCERPT_CHARS for line in note_lines)
+        assert note_lines == ([first_sentence + ' …'] if sentence_size + 2 <= kg.NOTES_EXCERPT_CHARS else [])
+        assert query.OMITTED_CONTEXT in packed
+
+
+def test_omitted_relation_notice_survives_an_active_conflict(tmp_path, monkeypatch):
+    import knowledge_query as query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, facts={'f_a': _fact('Funding is approved.'), 'f_b': _fact('Funding is not approved.')},
+                relations=[kg.Relation(type='works_with', slug='c_222222222222', name='Long ' * 1000)])
+    (tmp_path / 'knowledge/conflicts.json').write_text(json.dumps({'people': {
+        p.canonical_id: {'pairs': [['f_a', 'f_b']]}}}))
+    packed = query.pack_person(p, False, datetime(2026, 9, 20))
+    assert 'Unresolved memory conflict' in packed
+    assert query.OMITTED_CONTEXT in packed
+
+
+def test_current_mail_topic_survives_busy_phone_alias_and_standing_work(tmp_path, monkeypatch):
+    import personal_context as pc
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _crowded_memory(tmp_path)
+    gmail = [{'from': 'alex@example.com', 'subject': 'Pediatric clinic procurement'}]
+    loops = [{'status': 'waiting', 'contact_identifier': 'alex@example.com',
+              'summary': 'Unrelated project ' + str(i) * 1000} for i in range(10)]
+    local = {'imessage': [{'handle': '+14155550199', 'text': 'Unrelated project ' + str(i) * 1000}
+                         for i in range(10)]}
+    topics = pc.participant_topics(local=local, gmail=gmail, loops=loops)
+    joined = pc.topic_for_identifiers(topics, ['alex@example.com', '+1 (415) 555-0199'])
+    assert 'Pediatric clinic procurement' in joined
+    assert len(joined) <= pc.TOPIC_CHARS
+    for filename, value in [('mail.json', gmail), ('local.json', local), ('loops.json', loops)]:
+        (tmp_path / filename).write_text(json.dumps(value))
+    out = _run(tmp_path, '--gmail', str(tmp_path / 'mail.json'), '--local', str(tmp_path / 'local.json'),
+               '--loops', str(tmp_path / 'loops.json'))
+    assert 'six-month review' in next(iter(out['person_knowledge'].values()))
+
+
+def test_topic_budget_follows_work_cohort_even_during_chat_burst(tmp_path, monkeypatch):
+    import personal_context as pc
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    loops = [{'status': 'waiting', 'identifier': f'person{i}@example.com', 'ask': f'Clinic procurement {i}'}
+             for i in range(pc.PARTICIPANT_LIMIT)]
+    local = {'imessage': [{'handle': f'+1415555{i:04d}', 'text': 'Unrelated'} for i in range(100)]}
+    topics = pc.participant_topics(local=local, loops=loops)
+    assert len(topics) == pc.PARTICIPANT_LIMIT
+    assert all(key.startswith('person') for key in topics)

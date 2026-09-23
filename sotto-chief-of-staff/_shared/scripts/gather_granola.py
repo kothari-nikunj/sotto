@@ -146,15 +146,20 @@ def map_meeting(m: dict) -> dict:
         tstr = str(m.get("time") or "")
 
     emails = []
+    people = []
     attendees = m.get("attendees") or m.get("participants")
     if isinstance(attendees, list):
         for a in attendees:
             if isinstance(a, str) and a:
                 emails.append(a)
+                people.append({'email': a, 'name': ''})
             elif isinstance(a, dict) and a.get("email"):
                 emails.append(a["email"])
+                people.append({'email': a['email'],
+                               'name': a.get('name') or a.get('display_name') or a.get('displayName') or ''})
     elif isinstance(m.get("attendee_emails"), list):
         emails.extend(e for e in m["attendee_emails"] if e)
+        people.extend({'email': e, 'name': ''} for e in m['attendee_emails'] if e)
 
     return {
         "meeting_id": _meeting_id(m),
@@ -164,6 +169,7 @@ def map_meeting(m: dict) -> dict:
         "date": date,
         "time": tstr,
         "attendee_emails": emails,
+        "attendees": people,
         "your_notes": m.get("notes") or m.get("your_notes") or m.get("notes_markdown") or None,
         "ai_summary": m.get("summary") or m.get("ai_summary") or m.get("summary_markdown") or None,
     }

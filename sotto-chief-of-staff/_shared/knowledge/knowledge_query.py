@@ -34,7 +34,6 @@ from the packed people's `company` field, resolved through knowledge_update's on
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import glob
 import json
 import os
@@ -45,9 +44,16 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import knowledge as kg  # noqa: E402
-from personal_context import participant_identifiers  # noqa: E402
+from personal_context import (  # noqa: E402
+    PARTICIPANT_LIMIT, TOPIC_CHARS, participant_identifiers, participant_topics, topic_for_identifiers,
+)
 
-MAX_PEOPLE_PACKED = 80
+MAX_PEOPLE_PACKED = PARTICIPANT_LIMIT
+MAX_COMPACT_CHARS = 3200
+MAX_EXPANDED_CHARS = 8000
+MAX_RELATED_PEOPLE = 2
+MAX_RELATED_FACTS = 2
+OMITTED_CONTEXT = 'Additional stored context omitted; narrow the topic for details.'
 
 
 LOW_CONFIDENCE = 0.6   # below this a fact must be visibly labeled in the packed context
@@ -62,8 +68,9 @@ EMAIL_RE = re.compile(r"[\w.+\-']+@[\w\-]+\.[\w.\-]+")
 TOPIC_WORD_RE = re.compile(r"[a-z0-9]{3,}")
 TOPIC_STOP = frozenset({
     'about', 'after', 'before', 'from', 'have', 'meeting', 'sync', 'that', 'their', 'them',
-    'this', 'with', 'your',
-})
+    'this', 'with', 'your', 'you', 'our', 'can', 'please', 'thanks', 'thank', 'tell',
+    'know', 'what', 'who', 'how', 'when', 'where', 'there',
+}) | kg.STOP_WORDS
 
 
 def _fact_text(f: kg.FactMeta, now: datetime) -> str:
@@ -84,8 +91,6 @@ def _topic_words(value: str) -> set[str]:
 def _rank_facts(facts: list, topic: str) -> list:
     """Keep authority first, then prefer facts sharing concrete words with the current work."""
     words = _topic_words(topic)
-    if not words:
-        return facts
     indexed = list(enumerate(facts))
     indexed.sort(key=lambda item: (
         item[1][1].source != 'user_edit',
@@ -95,8 +100,49 @@ def _rank_facts(facts: list, topic: str) -> list:
     return [fact for _, fact in indexed]
 
 
+def _conflicts(p, state):
+    """Only live fact IDs participate; an edit/archive immediately removes stale conflict prose."""
+    people = state.get('people')
+    record = people.get(p.canonical_id) if isinstance(people, dict) else None
+    pairs = record.get('pairs') if isinstance(record, dict) else None
+    if not isinstance(pairs, list):
+        return []
+    return [pair for pair in pairs[:3] if isinstance(pair, list) and len(pair) == 2
+            and all(isinstance(fid, str) and fid in p.facts and p.facts[fid].status == 'active' for fid in pair)]
+
+
+def _related_facts(p, topic, now, state):
+    """One exact graph edge, never a name match, recursion, or a second person's full profile."""
+    words = _topic_words(topic)
+    if not words:
+        return []
+    found, seen = [], {p.canonical_id}
+    for relation in p.relations[:kg.MAX_RELATIONS_FOR_LLM]:
+        cid = relation.slug
+        if relation.type not in kg.RELATION_INVERSE or cid in seen or not kg.valid_canonical_id(cid):
+            continue
+        seen.add(cid)
+        try:
+            other = _load(kg.safe_path(kg.people_dir(), cid))
+        except Exception:  # noqa: BLE001 - optional related context cannot break the primary read
+            continue
+        if other.canonical_id != cid:
+            continue
+        # An indirect excerpt must not silently choose one side of a known disagreement.
+        disputed = {fid for pair in _conflicts(other, state) for fid in pair}
+        facts = [(fid, f) for fid, f in _rank_facts(kg.sorted_active_facts(other.facts, now), topic)
+                 if fid not in disputed and words & _topic_words(f.text)][:MAX_RELATED_FACTS]
+        if facts:
+            found.append((other, relation, facts))
+    # Choose by relevance, not edge insertion order; bounded inspection is the displayed edges.
+    found.sort(key=lambda row: -max(len(words & _topic_words(f.text)) for _, f in row[2]))
+    return found[:MAX_RELATED_PEOPLE]
+
+
 def pack_person(p: kg.PersonFile, expanded: bool, now: datetime, topic: str = '') -> str:
-    lines = []
+    topic = topic[:TOPIC_CHARS]
+    cap = MAX_EXPANDED_CHARS if expanded else MAX_COMPACT_CHARS
+    limit = kg.MAX_FACTS_FOR_LLM if expanded else kg.MAX_FACTS_COMPACT
     identity = f"{p.name} ({p.canonical_id})"
     if p.title and p.company:
         identity += f" | {p.title} @ {p.company}"
@@ -112,48 +158,102 @@ def pack_person(p: kg.PersonFile, expanded: bool, now: datetime, topic: str = ''
             if isinstance(p.x_handles[-1], dict) else ""
         if handle:
             identity += f" | X @{handle}"
-    lines.append(identity)
-    if p.summary_refs and all(fid in p.facts and p.facts[fid].status == 'active' for fid in p.summary_refs):
-        lines.append('Context: ' + ' '.join(_fact_text(p.facts[fid], now) for fid in p.summary_refs))
+    # Profile strings are not facts. Bound malformed/legacy headers without cutting an assertion.
+    lines = [identity if len(identity) <= 600 else f"{p.name[:200]} ({p.canonical_id[:200]})"]
+    remaining = cap - len(lines[0]) - len(OMITTED_CONTEXT) - 2
+    # Two kinds of leaving out. `omitted`: the fact allowance or a legacy field's limit cut
+    # something — expected in a compact read (it is a summary by design, and the brief's model
+    # cannot "narrow the topic"), worth saying in an expanded one. `cut`: the character ceiling
+    # refused a whole assertion — always said, in both reads.
+    omitted = cut = False
+
+    def append(text):
+        nonlocal remaining, cut
+        if len(text) + 1 > remaining:
+            cut = True
+            return False
+        lines.append(text)
+        remaining -= len(text) + 1
+        return True
+
     try:
         import jsonstore
         state = jsonstore.read(os.path.join(kg.data_root(), 'knowledge/conflicts.json'), default={})
-        for pair in state.get('people', {}).get(p.canonical_id, {}).get('pairs', [])[:1]:
-            if len(pair) == 2 and all(fid in p.facts and p.facts[fid].status == 'active' for fid in pair):
-                lines.append('Unresolved memory conflict (do not choose silently): '
-                             + ' / '.join(p.facts[fid].text for fid in pair))
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-
-    # Relations, as sentences, right under the identity line — so every consumer of a packed person
-    # block (the brief, meeting prep's "Your thread", Ask, the event funnel's "who is this")
-    # inherits "Introduced to you by Vishnu Sharma (May 2026)" with no further wiring.
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError, TypeError):
+        state = {}
     sentences = [s for s in (r.sentence() for r in p.relations) if s][:kg.MAX_RELATIONS_FOR_LLM]
     if sentences:
-        lines.append("& " + "; ".join(sentences))
+        append("& " + "; ".join(sentences))
 
+    # Summary refs influence selection but never emit another copy. Recent observations compete
+    # inside the same cap. Owner corrections outrank every automatic selection, even without a topic.
     active = _rank_facts(kg.sorted_active_facts(p.facts, now), topic)
-    limit = kg.MAX_FACTS_FOR_LLM if expanded else kg.MAX_FACTS_COMPACT
-    seven_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-    facts, included = [], set()
-    for fid, f in active[:limit]:
-        facts.append(_fact_text(f, now)); included.add(fid)
-    if not expanded:
-        for fid, f in active:
-            if fid not in included and f.last >= seven_ago:
-                facts.append(_fact_text(f, now))
-    if facts:
-        lines.append("= " + "; ".join(facts))
-    if p.talking_points:
-        tp = p.talking_points if expanded else p.talking_points[:kg.MAX_TALKING_POINTS_FOR_LLM]
-        lines.append("> " + "; ".join(tp))
-    if p.recent_activity:
-        ra = p.recent_activity if expanded else p.recent_activity[:kg.MAX_RECENT_ACTIVITY_FOR_LLM]
-        lines.append("~ " + "; ".join(ra))
+    pairs = _conflicts(p, state)
+    disputed = {fid for pair in pairs for fid in pair}
+    candidates = [(p, [(fid, f)], '') for fid, f in active if fid not in disputed]
+    if pairs:
+        candidates.append((p, [(fid, p.facts[fid]) for fid in dict.fromkeys(pairs[0])], 'conflict'))
+        omitted |= len(pairs) > 1
+    for other, relation, facts in _related_facts(p, topic, now, state):
+        candidates.extend((other, [(fid, f)], relation.type) for fid, f in facts)
+    words = _topic_words(topic)
+    candidates.sort(key=lambda row: (
+        not any(f.source == 'user_edit' for _, f in row[1]),
+        -max(len(words & _topic_words(f.text)) for _, f in row[1]),
+        row[0].canonical_id != p.canonical_id,
+        not any(fid in p.summary_refs for fid, _ in row[1]) if row[0] is p else True,
+    ))
+    included, count = set(), 0
+    for owner, facts, relation in candidates:
+        keys = {(owner.canonical_id, ' '.join(f.text.split()).casefold()) for _, f in facts}
+        if keys <= included:
+            continue
+        if count + len(keys) > limit:
+            omitted = True
+            continue
+        if relation == 'conflict':
+            text = 'Unresolved memory conflict (do not choose silently): ' + ' / '.join(
+                _fact_text(f, now) for _, f in facts)
+        elif relation:
+            text = f'Related context about {owner.name} ({owner.canonical_id}), {relation}: ' + _fact_text(facts[0][1], now)
+        else:
+            text = '= ' + _fact_text(facts[0][1], now)
+        if append(text):
+            included.update(keys)
+            count += len(keys)
+    # Read compatibility for old files only. New writers do not persist situational advice.
+    for prefix, values, maximum in (('> ', p.talking_points, kg.MAX_TALKING_POINTS_FOR_LLM),
+                                    ('~ ', p.recent_activity, kg.MAX_RECENT_ACTIVITY_FOR_LLM)):
+        values = [v for v in values if (p.canonical_id, ' '.join(v.split()).casefold()) not in included]
+        for value in values[:maximum]:
+            append(prefix + value)
+        omitted |= len(values) > maximum
     if expanded and p.notes:
-        excerpt = p.notes[:kg.NOTES_EXCERPT_CHARS] + ("..." if len(p.notes) > kg.NOTES_EXCERPT_CHARS else "")
-        lines.append("# " + excerpt)
+        excerpt = _notes_excerpt(p.notes)
+        if excerpt:
+            append('# ' + excerpt)
+        omitted |= excerpt != p.notes
+    if cut or (expanded and omitted):
+        lines.append(OMITTED_CONTEXT)
     return "\n".join(lines)
+
+
+def _notes_excerpt(notes: str) -> str:
+    """The note whole when it fits, else its leading COMPLETE sentences inside NOTES_EXCERPT_CHARS
+    with an ellipsis. A sentence is the unit that carries its own qualifier, so a note made of
+    several keeps what fits; one sentence too long to fit is left out whole, never cut before
+    its "only if"."""
+    if len(notes) <= kg.NOTES_EXCERPT_CHARS:
+        return notes
+    suffix = ' …'
+    head = notes[:kg.NOTES_EXCERPT_CHARS]
+    # A wrapped line can continue an assertion's qualifier. Only punctuation ends the
+    # excerpt, and the omission marker shares the cap rather than overflowing it.
+    boundary = max((match.end() for match in re.finditer(r'[.!?](?=\s)', head)
+                    if match.end() <= kg.NOTES_EXCERPT_CHARS - len(suffix)), default=0)
+    return head[:boundary] + suffix if boundary else ''
 
 
 def _load(path):
@@ -182,30 +282,6 @@ def _calendar_attendee_emails(path: str | None) -> set:
             if isinstance(em, str) and "@" in em:
                 emails.add(em.strip().lower())
     return emails
-
-
-def _calendar_topics(path: str | None) -> dict[str, str]:
-    """Meeting subject/description text by attendee email, for bounded fact retrieval only."""
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:  # noqa: BLE001
-        return {}
-    events = data.get("events") if isinstance(data, dict) else data
-    topics: dict[str, list[str]] = defaultdict(list)
-    for event in events if isinstance(events, list) else []:
-        if not isinstance(event, dict):
-            continue
-        text = ' '.join(str(event.get(key) or '') for key in ('summary', 'title', 'description'))[:1200]
-        if not text.strip():
-            continue
-        for attendee in event.get('attendees') or []:
-            email = attendee.get('email') if isinstance(attendee, dict) else attendee
-            if isinstance(email, str) and '@' in email:
-                topics[email.strip().lower()].append(text)
-    return {email: ' '.join(values)[:2400] for email, values in topics.items()}
 
 
 def editable_person(p: kg.PersonFile, now: datetime, topic: str = '') -> dict:
@@ -341,12 +417,13 @@ def main():
     cutoff = now - timedelta(days=args.relevant_days)
     from source_context import allowed
     cal_emails = _calendar_attendee_emails(args.calendar) if allowed('calendar') else set()
-    calendar_topics = _calendar_topics(args.calendar) if allowed('calendar') else {}
     local = _input(args.local, 'local') if args.local else {}
     loops = _input(args.loops, 'items') if args.loops else active_loop_participants()
-    participants = participant_identifiers(local=local if isinstance(local, dict) else {},
+    inputs = dict(local=local if isinstance(local, dict) else {},
         gmail=_input(args.gmail, 'emails') if args.gmail else [],
         calendar=_input(args.calendar, 'events') if args.calendar else [], loops=loops)
+    participants = participant_identifiers(**inputs)
+    topics = participant_topics(cohort=participants, **inputs)
     # THE GATE, in one sentence: a person packs when they appear in today's inputs or on today's
     # calendar; the mtime window is the fallback cohort, used only when no inputs were supplied.
     # mtime only says when a file was last REWRITTEN, so under it someone who emailed you this
@@ -382,7 +459,7 @@ def main():
                 continue
         if len(person_knowledge) >= MAX_PEOPLE_PACKED:
             continue
-        topic = ' '.join(calendar_topics.get(str(i).strip().lower(), '') for i in identifiers)
+        topic = topic_for_identifiers(topics, [*identifiers, p.canonical_id])
         person_knowledge[p.canonical_id or kg.slugify(p.name)] = pack_person(p, False, now, topic)
         if p.company:
             companies.append(p.company)

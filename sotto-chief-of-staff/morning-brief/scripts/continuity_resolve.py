@@ -29,6 +29,7 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
 import ledger_io  # noqa: E402
+import log_outcome  # noqa: E402
 from brief_validate import is_name_shaped  # noqa: E402  (one owner for "is this a person's name")
 from textutil import _is_likely_automated, unwrap_tool_result  # noqa: E402
 from timeutil import _env_tz, _now_local, _resolve_tz, configured_tz  # noqa: E402
@@ -648,6 +649,81 @@ def _observed_action_source(action: dict, local: dict,
     return tuple(sorted(set(bound))), min(observed_times)
 
 
+# Captured promises name concrete deliverables. The model still proposes completion, but a
+# counterpart's unrelated reply (or a cherry-picked phrase inside a negation) cannot prove it.
+_COMPLETION_FILLER = frozenset("a an the to of and for with on in at from by as into "
+    "i we you he she they me us him her them my our your his their its it this that "
+    "please complete finish make do get have has had will would can could "
+    "should commit committed promise promised need needs".split())
+_FULFILLMENT_CUE = re.compile(
+    r"\b(?:sent|shared|forwarded|provided|delivered|submitted|attached|uploaded|completed|"
+    r"finished|confirmed|updated|reviewed|signed|paid|booked|scheduled|introduced|enclosed)\b"
+    r"|\bhere(?:'s| is| are)\b", re.I)
+_UNFINISHED_CUE = re.compile(
+    r"\b(?:not|never|haven't|hasn't|hadn't|didn't|don't|doesn't|can't|cannot|couldn't|"
+    r"won't|wouldn't|isn't|aren't|wasn't|weren't|will|would|could|should|might|may|"
+    r"plan|planning|hope|hoping|intend|intending|pending|without|almost|nearly|thought|mistaken)\b|\b\w+'ll\b|\b(?:going|need|needs) to\b|\?", re.I)
+
+# The object alone is insufficient: reviewing a deck is not sending it. These conservative
+# action families accept affirmative evidence; unfamiliar wording waits for user correction.
+_CAPTURED_ACTIONS = (
+    (frozenset("send share forward provide deliver attach upload submit".split()),
+     re.compile(r"\b(?:sent|shared|forwarded|provided|delivered|attached|uploaded|submitted|enclosed)\b|\bhere(?:'s| is| are)\b", re.I)),
+    (frozenset("review read".split()), re.compile(r"\b(?:reviewed|read)\b", re.I)),
+    (frozenset("sign".split()), re.compile(r"\bsigned\b", re.I)),
+    (frozenset("pay".split()), re.compile(r"\bpaid\b", re.I)),
+    (frozenset("book schedule".split()), re.compile(r"\b(?:booked|scheduled|confirmed)\b", re.I)),
+    (frozenset("confirm".split()), re.compile(r"\bconfirmed\b", re.I)),
+    (frozenset("update".split()), re.compile(r"\bupdated\b", re.I)),
+    (frozenset("introduce".split()), re.compile(r"\bintroduced\b", re.I)),
+)
+
+
+def _captured_fulfillment(row: dict, quote: str, text: str) -> bool:
+    """Require the deliverable in an affirmative source clause; uncertain shorthand stays open.
+
+    This is a conservative necessary check, not another semantic model. Existing proposal,
+    identity, direction, chronology and verbatim-source checks still apply. User corrections do
+    not go through this guard. Legacy captured rows without `ask` retain their summary fallback.
+    """
+    def words(value):
+        return set(re.findall(r"[^\W_]+", _s(value).casefold()))
+
+    task = _s(row.get("ask")).strip()
+    if not task:
+        task = re.sub(r"^(?:you committed to:|.+? owes:)\s*", "", _s(row.get("summary")), flags=re.I)
+        task = re.split(r' \(from "| [—–] due ', task, maxsplit=1)[0]
+    people = words(row.get("contact_name")) | words(os.environ.get("SOTTO_USER_NAME", ""))
+    # Only action positions are verbs: "review" in "send the review deck" is an object qualifier.
+    action_words = set()
+    actions = []
+    for verbs, cue in _CAPTURED_ACTIONS:
+        matched = {verb for verb in verbs if re.search(
+            r"(?:^|\b(?:please|to|and|then)\s+)" + verb + r"\b", task, re.I)}
+        if matched:
+            action_words.update(matched)
+            actions.append(cue)
+    terms = words(task) - _COMPLETION_FILLER - people - action_words
+    if not terms or not terms <= words(quote):
+        return False
+    # Inspect the source sentence around the quote, not just the model's chosen substring:
+    # `sent the deck` inside `I haven't sent the deck` must remain an outstanding promise.
+    normalized = " ".join(text.replace("’", "'").split())
+    quoted = " ".join(quote.replace("’", "'").split())
+    start = normalized.find(quoted)
+    if start < 0:
+        return False
+    left = max(normalized.rfind(mark, 0, start) for mark in ('.', '!', '?')) + 1
+    end = start + len(quoted)
+    ends = [pos + 1 for mark in ('.', '!', '?')
+            if (pos := normalized.find(mark, end)) >= 0]
+    clause = normalized[left:min(ends) if ends else len(normalized)]
+    if _UNFINISHED_CUE.search(clause):
+        return False
+    return (all(cue.search(clause) for cue in actions) if actions
+            else bool(_FULFILLMENT_CUE.search(clause)))
+
+
 def _completion_evidence(row: dict, update: dict, local: dict):
     """Validate identity, direction, time and a verbatim quotation; the existing brief judges meaning.
 
@@ -685,6 +761,10 @@ def _completion_evidence(row: dict, update: dict, local: dict):
                 continue
             text = _s(message.get("body") or message.get("text") or message.get("snippet"))
             if quote not in " ".join(text.split()):
+                continue
+            if (row.get("resolution_mode") == "source_grounded"
+                    and update.get("status") == "resolved"
+                    and not _captured_fulfillment(row, quote, text)):
                 continue
             if source == "email":
                 handles = _email_recipients(message) if outgoing else [parseaddr(_s(message.get("from") or message.get("sender")))[1]]
@@ -1531,16 +1611,20 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     rejected_updates = {}
     accepted_updates = 0
     reply_history = None          # relationship_state.json, read at most once per pass
+    proposal_observed_at = datetime.now(timezone.utc).isoformat()
 
     def reject_update(reason):
         rejected_updates[reason] = rejected_updates.get(reason, 0) + 1
+        log_outcome.record_loop_proposal(update, row, "rejected", reason, proposal_observed_at)
 
     for update in proposed_updates:
+        row = None
         if not isinstance(update, dict):
             reject_update("malformed_update")
             continue
         key = _s(update.get("loopId"))
         row = items.get(key)
+        proposal_row = dict(row) if row else None
         if not row:
             reject_update("unknown_loop")
             continue
@@ -1588,6 +1672,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             reject_update("unsupported_status")
             continue
         _persist(row)
+        log_outcome.record_loop_proposal(update, proposal_row, "accepted", "evidence_verified",
+                                        proposal_observed_at)
         accepted_updates += 1
 
     if rejected_updates:
@@ -1758,6 +1844,17 @@ def _terminate(it: dict, status: str, resolution: str, today: str):
 def _persist(it: dict):
     os.makedirs(_dir(), exist_ok=True)
     path = it.get("_path") or os.path.join(_dir(), f"{_safe(it['anchor_key'])}.md")
+    previous = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            previous = ledger_io.parse_frontmatter(handle.read())
+    except FileNotFoundError:
+        pass
+    # Save the transition with the row, then project it through the existing outcome writer.
+    # A retry can re-append the same identity safely; no second store or scheduling loop.
+    event = log_outcome.loop_transition(previous, it)
+    if event:
+        it["proof_transition"] = event
     fm = {k: v for k, v in it.items() if k != "_path"}
     body = f"---\n{yaml.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n"
     fd, tmp = tempfile.mkstemp(prefix=".loop-", suffix=".tmp", dir=_dir())
@@ -1767,6 +1864,7 @@ def _persist(it: dict):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        log_outcome.record_loop_event(event)
     finally:
         try:
             os.unlink(tmp)

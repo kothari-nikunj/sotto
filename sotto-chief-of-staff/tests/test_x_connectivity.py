@@ -1,5 +1,9 @@
 """Phase-1 X connectivity: typed identity, bounded resolution, and ephemeral prep context."""
 import json
+import urllib.error
+import urllib.request
+
+import pytest
 from datetime import datetime, timezone
 
 import knowledge as kg
@@ -209,7 +213,10 @@ def test_same_name_different_email_never_inherits_the_other_persons_x(tmp_path, 
     assert old.x_user_id == "101" and new.x_user_id == "202"
 
 
-def test_x_context_renders_inside_existing_research_lane():
+def test_x_context_renders_inside_existing_research_lane(monkeypatch):
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-public-token")
+    monkeypatch.setenv("X_USER_ACCESS_TOKEN", "fixture-user-token")
+    monkeypatch.setenv("X_OWNER_USER_ID", "1")
     text = _format_x_context({"x_context": {"attendees": [{
         "email": "alice@acme.com", "handle": "alice", "recent_posts": [
             {"id": "1", "text": "Shipped a product.", "created_at": "2026-08-30T00:00:00Z"}],
@@ -354,9 +361,371 @@ def test_an_unconfigured_x_is_silent_but_a_broken_one_is_reported(tmp_path, monk
     monkeypatch.delenv("X_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("X_USER_ACCESS_TOKEN", raising=False)
     quiet = xc.gather(_calendar(), now=datetime(2026, 8, 31, tzinfo=timezone.utc))
-    assert quiet == {"attendees": [], "connected": False}
+    assert quiet["attendees"] == [] and quiet["connected"] is False
+    assert quiet["request_status"] == {"configured": False, "succeeded": False,
+                                        "status": "unconfigured", "error_codes": []}
     assert _format_source_availability({}) == ""                      # nothing to report
     assert "X (attendee context)" in _format_source_availability({"x": "unavailable"})
+
+
+class _Response:
+    def __init__(self, value):
+        self.value = value
+    def __enter__(self):
+        return self
+    def __exit__(self, *_):
+        return False
+    def read(self):
+        return json.dumps(self.value).encode()
+
+
+def test_200_auth_error_is_not_cached_as_a_miss_and_stops_serial_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "invalid-fixture-token")
+    calls = []
+    def denied(request, **_kwargs):
+        calls.append(request.full_url)
+        return _Response({"errors": [{"title": "Unauthorized", "type": "about:authentication"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", denied)
+    calendar = [{"attendees": [
+        {"name": "Alice Chen", "email": "alicechen@acme.com"},
+        {"name": "Robert Builder", "email": "robertbuilder@other.com"},
+    ]}]
+    out = xc.gather(calendar, now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert len(calls) == 1
+    assert out["request_status"] == {"configured": True, "succeeded": False,
+                                     "status": "degraded", "error_codes": ["authentication_failed"]}
+    assert not (tmp_path / "knowledge" / "x_link_suggestions.json").exists()
+    assert "alicechen" not in json.dumps(out) and "robertbuilder" not in json.dumps(out)
+
+
+def test_200_resource_not_found_is_a_valid_cacheable_miss(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response({
+        "errors": [{"title": "Not Found Error",
+                    "type": "https://api.twitter.com/2/problems/resource-not-found"}]}))
+    out = xc.gather(_calendar(), now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["request_status"] == {"configured": True, "succeeded": True,
+                                     "status": "ok", "error_codes": []}
+    cached = json.loads((tmp_path / "knowledge" / "x_link_suggestions.json").read_text())
+    assert cached["misses"]["alicechen@acme.com"]["status"] == "miss"
+
+
+def test_malformed_200_envelope_is_failure_not_healthy_empty_or_cached_miss(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response({}))
+    out = xc.gather(_calendar(), now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["request_status"]["succeeded"] is False
+    assert out["request_status"]["error_codes"] == ["invalid_response"]
+    assert not (tmp_path / "knowledge" / "x_link_suggestions.json").exists()
+
+
+def test_http_failures_have_content_free_stable_codes(monkeypatch):
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    expected = {401: "authentication_failed", 402: "credits_exhausted",
+                403: "permission_denied", 429: "rate_limited", 503: "service_unavailable"}
+    for status, code in expected.items():
+        api = xc.XApi()
+        def fail(request, _status=status, **_kwargs):
+            raise urllib.error.HTTPError(request.full_url, _status, "private provider phrase", {}, None)
+        monkeypatch.setattr(urllib.request, "urlopen", fail)
+        try:
+            api.user_by_username("privatehandle")
+            assert False, status
+        except xc.XApiError as error:
+            assert error.code == code and "privatehandle" not in str(error)
+
+
+def test_bare_http_404_is_not_assumed_to_be_a_cacheable_user_miss(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    def fail(request, **_kwargs):
+        raise urllib.error.HTTPError(request.full_url, 404, "provider route failure", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    out = xc.gather(_calendar(), now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+    assert out["request_status"]["error_codes"] == ["service_unavailable"]
+    assert not (tmp_path / "knowledge" / "x_link_suggestions.json").exists()
+
+
+def test_endpoint_success_shapes_are_strict_and_malformed_codes_are_bounded(monkeypatch):
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    api = xc.XApi()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response({"data": {}}))
+    for call in (lambda: api.user_by_username("alicechen"),
+                 lambda: api.recent_posts("101", datetime(2026, 8, 31, tzinfo=timezone.utc))):
+        try:
+            call()
+            assert False
+        except xc.XApiError as error:
+            assert error.code == "invalid_response"
+    api = xc.XApi()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response({
+        "errors": [{"code": {"malformed": True}, "title": ["also malformed"]}]}))
+    try:
+        api.user_by_username("alicechen")
+        assert False
+    except xc.XApiError as error:
+        assert error.code == "service_unavailable"
+
+
+def test_absent_list_data_requires_explicit_zero_result_count(monkeypatch):
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-token")
+    api = xc.XApi()
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *_a, **_k: _Response({"meta": {"result_count": 0}}))
+    assert api.recent_posts("101", datetime(2026, 8, 31, tzinfo=timezone.utc)) == []
+    assert api.request_succeeded is True
+
+
+def _linked_x_people(now):
+    ku.apply({"person_updates": [
+        {"person_name": "Alice Chen", "identifier": "alicechen@acme.com",
+         "profile_patch": {"x_user_id": "101", "x_handle": "alicechen"}},
+        {"person_name": "Robert Builder", "identifier": "robertbuilder@other.com",
+         "profile_patch": {"x_user_id": "202", "x_handle": "robertbuilder"}},
+    ]}, now)
+    return [{"attendees": [
+        {"name": "Alice Chen", "email": "alicechen@acme.com"},
+        {"name": "Robert Builder", "email": "robertbuilder@other.com"},
+    ]}]
+
+
+@pytest.mark.parametrize("app_token", ["fixture-app-token", ""])
+def test_bookmark_permission_failure_does_not_suppress_public_timelines(
+        tmp_path, monkeypatch, app_token):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    if app_token:
+        monkeypatch.setenv("X_BEARER_TOKEN", app_token)
+    else:
+        monkeypatch.delenv("X_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("X_USER_ACCESS_TOKEN", "fixture-user-token")
+    monkeypatch.setenv("X_OWNER_USER_ID", "999")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    calendar = _linked_x_people(now)
+    calls = []
+    def response(request, **_kwargs):
+        calls.append(request.full_url)
+        if "/bookmarks" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 403, "private", {}, None)
+        user_id = request.full_url.split("/users/", 1)[1].split("/", 1)[0]
+        return _Response({"data": [{"id": "post-" + user_id, "author_id": user_id, "text": "ok"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+    out = xc.gather(calendar, now=now)
+    assert [row["recent_posts"][0]["id"] for row in out["attendees"]] == ["post-101", "post-202"]
+    assert sum("/tweets" in url for url in calls) == 2
+    assert out["request_status"]["error_codes"] == ["permission_denied"]
+
+
+def test_protected_timeline_does_not_block_other_people(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    calendar = _linked_x_people(now)
+    def response(request, **_kwargs):
+        if "/users/101/tweets" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 403, "protected", {}, None)
+        if "/users/202/tweets" in request.full_url:
+            return _Response({"data": [{"id": "visible", "author_id": "202", "text": "ok"}]})
+        return _Response({"meta": {"result_count": 0}})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+    out = xc.gather(calendar, now=now)
+    assert out["attendees"][0]["recent_posts"] == []
+    assert out["attendees"][0]["recent_posts_status"] == "unavailable"
+    assert out["attendees"][1]["recent_posts"][0]["id"] == "visible"
+    assert out["request_status"]["status"] == "ok"
+    assert out["request_status"]["error_codes"] == []
+
+
+def test_200_protected_timeline_problem_is_local_permission_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    calendar = _linked_x_people(now)
+    calls = []
+    def response(request, **_kwargs):
+        calls.append(request.full_url)
+        if "/users/101/tweets" in request.full_url:
+            return _Response({"errors": [{
+                "title": "Authorization Error",
+                "type": "https://api.x.com/2/problems/not-authorized-for-resource",
+            }]})
+        return _Response({"data": [{"id": "visible", "author_id": "202", "text": "ok"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+
+    out = xc.gather(calendar, now=now)
+
+    assert [row["x_user_id"] for row in out["attendees"]] == ["101", "202"]
+    assert out["attendees"][0]["recent_posts"] == []
+    assert out["attendees"][0]["recent_posts_status"] == "unavailable"
+    assert out["attendees"][1]["recent_posts"][0]["id"] == "visible"
+    assert "recent_posts_status" not in out["attendees"][1]
+    assert sum("/tweets" in url for url in calls) == 2
+    assert out["request_status"] == {"configured": True, "succeeded": True,
+                                     "status": "ok", "error_codes": []}
+    assert "warnings" not in out
+    from source_context import source_health
+    x_health = next(row for row in source_health()["sources"] if row["source"] == "x")
+    assert x_health["status"] == "ok" and x_health["error_codes"] == []
+
+
+@pytest.mark.parametrize("prior_failure", [False, True])
+def test_only_protected_timeline_does_not_claim_success_or_clear_prior_failure(
+        tmp_path, monkeypatch, prior_failure):
+    from source_context import record_x_status, source_health
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    _linked_x_people(now)
+    if prior_failure:
+        record_x_status({"request_status": {"status": "degraded", "succeeded": False,
+                                           "error_codes": ["authentication_failed"]}})
+    calls = []
+    def response(request, **_kwargs):
+        calls.append(request.full_url)
+        return _Response({"errors": [{
+            "title": "Authorization Error",
+            "type": "https://api.x.com/2/problems/not-authorized-for-resource",
+        }]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+
+    out = xc.gather(_calendar(), now=now)
+
+    assert len(calls) == 1
+    assert out["attendees"][0]["recent_posts_status"] == "unavailable"
+    assert out["request_status"] == {"configured": True, "succeeded": False,
+                                     "status": "unverified", "error_codes": []}
+    assert "warnings" not in out
+    x_health = next(row for row in source_health()["sources"] if row["source"] == "x")
+    if prior_failure:
+        assert x_health["status"] == "degraded"
+        assert x_health["error_codes"] == ["authentication_failed"]
+    else:
+        assert x_health["status"] == "unverified" and x_health["error_codes"] == []
+
+
+@pytest.mark.parametrize("lookup_response", [
+    "http_429", "body_429",
+])
+def test_lookup_rate_limit_keeps_linked_people_and_skips_more_lookups(
+        tmp_path, monkeypatch, lookup_response):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    monkeypatch.setenv("X_USER_ACCESS_TOKEN", "fixture-user-token")
+    monkeypatch.setenv("X_OWNER_USER_ID", "999")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    _linked_x_people(now)
+    calendar = [{"attendees": [
+        {"name": "First Stranger", "email": "firststranger@other.com"},
+        {"name": "Alice Chen", "email": "alicechen@acme.com"},
+        {"name": "Second Stranger", "email": "secondstranger@other.com"},
+        {"name": "Robert Builder", "email": "robertbuilder@other.com"},
+    ]}]
+    calls = []
+    def response(request, **_kwargs):
+        url = request.full_url
+        calls.append(url)
+        if "/users/by/username/" in url:
+            if lookup_response == "http_429":
+                raise urllib.error.HTTPError(url, 429, "limited", {}, None)
+            return _Response({"errors": [{"code": 429, "title": "Rate Limit Exceeded"}]})
+        if "/bookmarks" in url:
+            return _Response({"data": [{"id": "saved", "author_id": "101", "text": "saved"}]})
+        user_id = url.split("/users/", 1)[1].split("/", 1)[0]
+        return _Response({"data": [{"id": "post-" + user_id,
+                                   "author_id": user_id, "text": "ok"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+
+    out = xc.gather(calendar, now=now)
+
+    assert [row["x_user_id"] for row in out["attendees"]] == ["101", "202"]
+    assert [row["recent_posts"][0]["id"] for row in out["attendees"]] == [
+        "post-101", "post-202"]
+    assert out["attendees"][0]["bookmarks"][0]["id"] == "saved"
+    assert sum("/users/by/username/" in url for url in calls) == 1
+    assert sum("/tweets" in url for url in calls) == 2
+    assert sum("/bookmarks" in url for url in calls) == 1
+    assert out["request_status"]["error_codes"] == ["rate_limited"]
+    assert not (tmp_path / "knowledge" / "x_link_suggestions.json").exists()
+
+
+def test_timeline_rate_limit_keeps_profiles_and_bookmarks_without_repeating_timeline(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    monkeypatch.setenv("X_USER_ACCESS_TOKEN", "fixture-user-token")
+    monkeypatch.setenv("X_OWNER_USER_ID", "999")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    calendar = _linked_x_people(now)
+    calls = []
+    def response(request, **_kwargs):
+        calls.append(request.full_url)
+        if "/bookmarks" in request.full_url:
+            return _Response({"data": [{"id": "saved", "author_id": "202", "text": "saved"}]})
+        raise urllib.error.HTTPError(request.full_url, 429, "limited", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+
+    out = xc.gather(calendar, now=now)
+
+    assert [row["x_user_id"] for row in out["attendees"]] == ["101", "202"]
+    assert all(row["recent_posts"] == [] for row in out["attendees"])
+    assert out["attendees"][1]["bookmarks"][0]["id"] == "saved"
+    assert sum("/tweets" in url for url in calls) == 1
+    assert out["request_status"]["error_codes"] == ["rate_limited"]
+
+
+def test_lookup_limit_preserves_new_link_completed_earlier_in_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    _linked_x_people(now)
+    calendar = [{"attendees": [
+        {"name": "Nora Green", "email": "noragreen@newco.com"},
+        {"name": "Second Stranger", "email": "secondstranger@other.com"},
+        {"name": "Alice Chen", "email": "alicechen@acme.com"},
+        {"name": "Third Stranger", "email": "thirdstranger@other.com"},
+    ]}]
+    calls = []
+    def response(request, **_kwargs):
+        url = request.full_url
+        calls.append(url)
+        if "/users/by/username/noragreen" in url:
+            return _Response({"data": {"id": "303", "username": "noragreen",
+                                       "name": "Nora Green", "description": "Founder at Newco"}})
+        if "/users/by/username/" in url:
+            raise urllib.error.HTTPError(url, 429, "limited", {}, None)
+        return _Response({"data": [{"id": "post", "author_id": "303", "text": "ok"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+
+    out = xc.gather(calendar, now=now)
+
+    assert [row["x_user_id"] for row in out["attendees"]] == ["303", "101"]
+    assert sum("/users/by/username/" in url for url in calls) == 2
+    assert sum("/tweets" in url for url in calls) == 2
+    assert _person("noragreen@newco.com")[1].x_user_id == "303"
+    assert out["request_status"]["error_codes"] == ["rate_limited"]
+
+
+def test_200_credit_failure_still_stops_paid_requests(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("X_BEARER_TOKEN", "fixture-app-token")
+    calls = []
+    def response(request, **_kwargs):
+        calls.append(request.full_url)
+        return _Response({"errors": [{"title": "Credits Exhausted",
+                                      "type": "https://api.x.com/2/problems/usage-capped"}]})
+    monkeypatch.setattr(urllib.request, "urlopen", response)
+    calendar = [{"attendees": [
+        {"name": "Alice Chen", "email": "alicechen@acme.com"},
+        {"name": "Robert Builder", "email": "robertbuilder@other.com"},
+    ]}]
+
+    out = xc.gather(calendar, now=datetime(2026, 8, 31, tzinfo=timezone.utc))
+
+    assert len(calls) == 1
+    assert out["request_status"]["error_codes"] == ["credits_exhausted"]
+    assert not (tmp_path / "knowledge" / "x_link_suggestions.json").exists()
 
 
 def test_two_alexes_at_one_firm_are_never_conflated(tmp_path, monkeypatch):

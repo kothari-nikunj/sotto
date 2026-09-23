@@ -10,13 +10,17 @@ import itertools
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
+
+import pytest
 
 # "Today" is whatever the dashboard's OWN tz chain answers — never time.strftime, which is the
 # machine's local zone. The two agree in a UTC container and disagree on a developer's Mac after
@@ -169,6 +173,9 @@ def _fixtures(root):
         {"brief_markdown": "old", "actions": []}))
     # non-archive siblings in briefs/ must never surface in listings
     _write(os.path.join(root, "briefs", f"{today}.morning.delivered"), "")
+    _write(os.path.join(root, "events", "delivery.jsonl"), json.dumps({
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "label": "brief:sotto-morning-brief", "status": "delivered"}) + "\n")
     _write(os.path.join(root, "briefs", f"{today}.morning_ready.payload.json"), "{}")
     # Realistic fingerprint shape (style_learner): the REGISTERS live under `canonical`; the
     # top-level keys are schema internals that must never surface as "buckets".
@@ -651,13 +658,15 @@ def test_api_requires_a_session_401_json(tmp_path):
 def test_api_overview_shape(tmp_path):
     m, srv, base = _server(tmp_path)
     today = _fixtures(str(tmp_path))
+    m.DASHBOARD.HOOKS["source_allowed"] = lambda source: True
     try:
         cookie = _login(base)
         code, body, _ = _get(base, "/api/overview", headers=cookie)
         assert code == 200
         ov = json.loads(body)
         assert ov["date"] == today
-        assert ov["briefs_today"] == [{"kind": "morning", "file": f"{today}_morning.json"}]
+        assert ov["briefs_today"][0]["kind"] == "morning"
+        assert ov["briefs_today"][0]["status"] == "sent"
         assert ov["loops_active"] == 2       # resolved + meeting_prep/meeting-info excluded
         assert ov["last_event_at"] is None                  # no event stamp yet
         assert ov["bridge_connected"] is False
@@ -666,6 +675,10 @@ def test_api_overview_shape(tmp_path):
         # and channel_ok says so rather than flattering a channel that cannot deliver.
         assert ov["services"] == {"google": True, "channel": "telegram", "channel_ok": False,
                                   "granola": "ok"}
+        m.DASHBOARD.HOOKS["source_allowed"] = lambda source: False
+        ov = json.loads(_get(base, "/api/overview", headers=cookie)[1])
+        assert ov["services"]["granola"] == "reconnect"
+        m.DASHBOARD.HOOKS["source_allowed"] = lambda source: True
         # a gather-written error file downgrades granola to reconnect; no token file → absent
         _write(os.path.join(str(tmp_path), "connectors", "granola.error"), "401 upstream")
         ov = json.loads(_get(base, "/api/overview", headers=cookie)[1])
@@ -681,6 +694,59 @@ def test_api_overview_shape(tmp_path):
         assert ov["update"] == {"available": False}     # dev build: nothing to say
     finally:
         srv.shutdown()
+
+
+def test_source_diagnostics_require_dashboard_auth_and_never_reach_public_health(tmp_path):
+    m, srv, base = _server(tmp_path)
+    diagnostic = {"status": "ok", "sources": [{"source": "chrome", "label": "Chrome History",
+        "status": "partial", "field_counts": {"chrome_history": 7, "search_queries": 2}}]}
+    m.DASHBOARD.HOOKS["source_health"] = lambda: diagnostic
+    try:
+        assert _get(base, "/api/overview")[0] == 401
+        code, body, _ = _get(base, "/health")
+        assert code == 200
+        assert "source_health" not in body and "field_counts" not in body
+        cookie = _login(base)
+        code, body, _ = _get(base, "/api/overview", headers=cookie)
+        assert code == 200
+        assert json.loads(body)["source_health"] == diagnostic
+
+        def unavailable():
+            raise OSError("cannot read source receipt")
+        m.DASHBOARD.HOOKS["source_health"] = unavailable
+        code, body, _ = _get(base, "/api/overview", headers=cookie)
+        assert code == 200
+        assert json.loads(body)["source_health"] == {"status": "unavailable", "sources": []}
+    finally:
+        srv.shutdown()
+
+
+def test_overview_brief_state_prefers_latest_attempt_and_outbox_acceptance(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dash, '_root', lambda: str(tmp_path))
+    today = _dash._local_today()
+    _write(os.path.join(str(tmp_path), 'events', 'outbox.json'), json.dumps({'rows': [
+        {'id': 'a' * 16, 'kind': 'brief', 'day': today, 'created_at': 10, 'finished_at': 100,
+         'status': 'failed',
+         'payload': {'label': 'brief:sotto-morning-brief'}},
+        {'id': 'b' * 16, 'kind': 'brief', 'day': today, 'created_at': 20, 'status': 'pending',
+         'payload': {'label': 'brief:sotto-morning-brief'}},
+        {'id': 'c' * 16, 'kind': 'brief', 'day': today, 'created_at': 30, 'status': 'delivered',
+         'effects_status': 'quarantined', 'payload': {'label': 'brief:sotto-evening-brief'}},
+        {'id': 'd' * 16, 'kind': 'brief', 'day': today, 'created_at': 40, 'status': 'failed',
+         'payload': {'label': 'brief:sotto-evening-brief'}},
+        {'id': 'e' * 16, 'kind': 'brief', 'day': today, 'created_at': 50, 'status': 'pending',
+         'effects_pending': True, 'effect_phase': 'invalidate',
+         'payload': {'label': 'brief:sotto-morning-brief'}},
+    ]}))
+    assert _dash._brief_delivery_states(today) == [
+        {'kind': 'morning', 'status': 'pending'}, {'kind': 'evening', 'status': 'sent'}]
+
+
+def test_overview_corrupt_canonical_outbox_is_not_empty_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dash, '_root', lambda: str(tmp_path))
+    _write(os.path.join(str(tmp_path), 'events', 'outbox.json'), '{bad json')
+    with pytest.raises(json.JSONDecodeError):
+        _dash._brief_delivery_states(_dash._local_today())
 
 
 def test_api_overview_carries_the_update_banner_only_when_there_is_one(tmp_path):
@@ -1627,6 +1693,76 @@ def test_api_ledger_merges_newest_first_and_skips_malformed(tmp_path):
         srv.shutdown()
 
 
+def test_ledger_joins_delivery_run_to_bounded_model_work_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setitem(_dash.HOOKS, "data_root", lambda: str(tmp_path))
+    events = tmp_path / "events"
+    events.mkdir()
+    run_id = "a" * 32
+    now = _dash._iso()
+    _write(str(events / "delivery.jsonl"), "\n".join([
+        json.dumps({"ts": now, "label": "brief", "status": "delivered", "run_id": run_id}),
+        json.dumps({"ts": now, "label": "legacy", "status": "delivered"}),
+        json.dumps({"ts": now, "label": "malformed", "status": "delivered", "run_id": ["bad"]}),
+    ]) + "\n")
+    db = sqlite3.connect(events / "model-work.sqlite3")
+    db.execute("CREATE TABLE attempts(operation TEXT, attempt INTEGER, metadata TEXT, status TEXT, usage TEXT, created REAL)")
+    db.executemany("INSERT INTO attempts VALUES(?,?,?,?,?,?)", [
+        ("op1", 1, json.dumps({"run_id": run_id, "task": "brief_extract"}), "succeeded", None, 1),
+        ("op1", 2, json.dumps({"run_id": run_id, "task": "brief_extract"}), "http_500", None, 2),
+        ("op2", 1, json.dumps({"run_id": run_id, "task": "novel_private_name"}), "ValueError", None, 3),
+        ("op3", 1, json.dumps({"run_id": ["bad"], "task": ["bad"]}), "succeeded", None, 4),
+        ("unrelated", 1, "{malformed legacy metadata", "succeeded", None, 5),
+    ])
+    db.commit(); db.close()
+    rows = _dash.api_ledger()["entries"]
+    observed = next(row for row in rows if row.get("run_id") == run_id)["model_work"]
+    assert observed == {"status": "observed", "operations": 2, "attempts": 3,
+                        "attempt_statuses": {"failed": 1, "succeeded": 1, "upstream_error": 1},
+                        "workloads": {"brief_extract": 2, "unknown": 1}}
+    assert next(row for row in rows if row["label"] == "legacy")["model_work"] == {"status": "unknown"}
+    assert next(row for row in rows if row["label"] == "malformed")["model_work"] == {"status": "unknown"}
+    assert "usage" not in observed and "cost" not in json.dumps(observed)
+
+
+def test_activity_joins_only_explicit_prior_decisions_and_keeps_fallback_detail(tmp_path, monkeypatch):
+    monkeypatch.setitem(_dash.HOOKS, "data_root", lambda: str(tmp_path))
+    events = tmp_path / "events"
+    events.mkdir()
+    now = time.time()
+    stamp = lambda offset: datetime.fromtimestamp(now + offset, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    decision = {"decision_id": "a" * 16, "channel": "gmail", "verdict": "agent", "class": "actionable"}
+    rows = [dict(decision, ts=stamp(-10), reason="A reply was requested.", private_extra="not-projected"),
+            dict(decision, ts=stamp(10), reason="Later evidence must not explain an earlier send."),
+            dict(decision, decision_id="b" * 16, ts=stamp(-5), reason="Unrelated event.")]
+    _write(str(events / "surfaced.jsonl"), "\n".join(map(json.dumps, rows)) + "\n")
+    detail = "Sent as text. A section did not fit in the photos. Device display is not confirmed."
+    deliveries = [{"ts": stamp(0), "label": "brief", "status": "delivered", "detail": detail,
+                   "decision_ids": [decision["decision_id"], decision["decision_id"], "aged-out", {}]},
+                  {"ts": stamp(0), "label": "legacy", "status": "delivered", "decision_ids": "a" * 16}]
+    _write(str(events / "delivery.jsonl"), "\n".join(map(json.dumps, deliveries)) + "\n")
+    entries = _dash.api_ledger()["entries"]
+    sent = next(row for row in entries if row.get("label") == "brief")
+    assert sent["detail"] == detail
+    assert len(sent["related_decisions"]) == 1
+    assert sent["related_decisions"][0]["reason"] == "A reply was requested."
+    assert "private_extra" not in sent["related_decisions"][0]
+    assert next(row for row in entries if row.get("label") == "legacy")["related_decisions"] == []
+
+
+def test_loop_proof_rows_get_fixed_readable_labels(tmp_path, monkeypatch):
+    monkeypatch.setitem(_dash.HOOKS, "data_root", lambda: str(tmp_path))
+    rows = [
+        {"ts": _dash._iso(), "outcome": "loop_proposal", "result": "rejected",
+         "loop_identity": "a" * 64},
+        {"ts": _dash._iso(), "outcome": "loop_transition", "actor": "user",
+         "loop_identity": "b" * 64},
+    ]
+    _write(str(tmp_path / "outcomes.jsonl"), "\n".join(map(json.dumps, rows)) + "\n")
+    entries = _dash.api_ledger()["entries"]
+    assert {entry["display_label"] for entry in entries} == {
+        "Loop proposal rejected", "Loop status changed by you"}
+
+
 def test_m3_endpoints_kill_switch_and_auth(tmp_path, monkeypatch):
     m, srv, base = _server(tmp_path)
     m._find_sotto_script = lambda *rel: None      # calendar degrades; no forks in this test
@@ -2379,6 +2515,16 @@ def test_the_shipped_frontend_keeps_its_two_rules(tmp_path):
     routes = re.search(r"var routes = \{(.*?)\n  \};", js, re.S).group(1)
     for name in navs:
         assert re.search(rf"\b{name}: function", routes), name
+    # A refresh failure may retain only a valid Now render. Coming back from Activity/Memory starts
+    # a fresh Now view, so it cannot leave the other tab's DOM under the Now nav highlight.
+    assert 'state.renderedView = null;' in js
+    assert 'var preservingNow = state.renderedView === "now";' in js
+    assert 'state.renderedView = "now";' in js
+    assert 'if (preservingNow) toast(' in js
+    assert 'brief sent; read it' in js and 'brief delivered — read it' not in js
+    assert '}\n    if (failedToday.length) {' in js
+    assert '}\n    if (pendingToday.length) {' in js
+    assert 'if (!sentToday.length && !failedToday.length && !pendingToday.length)' in js
 
 
 # ── Relations: the person page's links, and the ✕ that removes one ───────────────────────────────

@@ -102,6 +102,7 @@ import fcntl
 # a message, not a second hashing convention invented here.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keys import queue_key as _content_id  # noqa: E402
+from visual_delivery import delivery_detail  # noqa: E402
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -424,8 +425,11 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
 
 
 def _payload_receipt(payload: dict, status: str, detail: str = "") -> None:
+    if status == STATUS_DELIVERED and not detail:
+        detail = delivery_detail(payload.get("presentation_status"))
     HOOKS["record"](payload.get("label") or "", status, detail,
-                    usage=payload.get("usage"), decision_ids=payload.get("decision_ids"))
+                    usage=payload.get("usage"), decision_ids=payload.get("decision_ids"),
+                    run_id=payload.get("run_id") or "")
 
 
 def _attempt(key: str) -> bool:

@@ -5,6 +5,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
 
@@ -95,6 +97,15 @@ def test_empty_input_is_safe(tmp_path, monkeypatch):
     assert out == {"stubs": 0, "researched": 0, "people": []}
 
 
+def test_disabled_contacts_cannot_sync_into_graph(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    local = {"contacts": [{"name": "Private", "emails": ["private@example.com"],
+                            "note": "must not persist"}],
+             "source_status": {"contacts": "disabled"}}
+    assert pw.sync_contacts(local) == {"contacts": 0, "synced": 0, "facts": 0}
+    assert kg.find_person_file(name="Private", identifier="private@example.com") is None
+
+
 def test_research_persists_one_combined_fact_profiles_only(tmp_path, monkeypatch):
     # ONE combined fact per person (title + company + summary texture): two separate "Per web
     # search:" facts overlap >0.5 and find_similar_fact BUMP-swallows the richer summary.
@@ -157,6 +168,41 @@ def test_main_unwraps_mcp_tool_result_wrapper(tmp_path, monkeypatch, capsys):
     pw.main()
     out = json.loads(capsys.readouterr().out)
     assert set(out["people"]) == {"Dhruv", "Sarah"}
+
+
+def test_wrapped_setup_seed_applies_current_source_consent(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_PREWARM_RESEARCH", "0")
+    local = _local()
+    local["contacts"][0]["notes"] = "Private contact note must not enter the graph."
+    local["source_status"] = {"imessage": "disabled", "contacts": "disabled"}
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"content": [{"type": "text", "text": json.dumps(local)}]}))
+    monkeypatch.setattr(sys, "argv", ["prewarm_graph.py", str(seed)])
+    pw.main()
+    assert json.loads(capsys.readouterr().out)["stubs"] == 0
+    assert kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com") is None
+
+
+def test_setup_seed_rechecks_consent_immediately_before_graph_write(tmp_path, monkeypatch):
+    import source_context
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    revoked = False
+    original_allowed = source_context.allowed
+
+    def permission(source):
+        return False if revoked and source == "imessage" else original_allowed(source)
+
+    def revoke_during_optional_work(_updates):
+        nonlocal revoked
+        revoked = True
+        return 0
+
+    monkeypatch.setattr(source_context, "allowed", permission)
+    monkeypatch.setattr(pw, "_research_facts", revoke_during_optional_work)
+    with pytest.raises(RuntimeError, match="consent changed"):
+        pw.prewarm(_local())
+    assert kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com") is None
 
 
 # ── Apple Contacts sync: the graph stops depending on a live Contacts read ─────────────────────

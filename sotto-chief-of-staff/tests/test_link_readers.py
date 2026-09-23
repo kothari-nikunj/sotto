@@ -2,10 +2,12 @@
 ladder order, never-raise contracts, the DocSend gate flow on fixture HTML, and the
 unattended refusal that keeps deck views chat-only."""
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
+from urllib.error import HTTPError
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -181,6 +183,50 @@ def test_docsend_cli_refuses_unattended_runs(tmp_path):
 # the builder only parses the header and embeds the bytes verbatim (/DCTDecode is packaging).
 FAKE_JPEG = (b"\xff\xd8" + b"\xff\xc0\x00\x11\x08" + (100).to_bytes(2, "big")
              + (200).to_bytes(2, "big") + b"\x03" + b"\x00" * 9 + b"\xff\xd9")
+
+
+def test_deck_reader_rejects_truncated_model_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(df.gemini_transport, "credential", lambda: "g")
+    monkeypatch.setattr(df.gemini_transport, "request", lambda *args: object())
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self):
+            return json.dumps({"candidates": [{"finishReason": "MAX_TOKENS",
+                                               "content": {"parts": [{"text": "partial"}]}}]}).encode()
+
+    monkeypatch.setattr(df.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    assert df._gemini_read([b"page"], "Deck") == ""
+
+
+def test_deck_client_repair_releases_parked_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "b" * 32)
+    monkeypatch.setattr(df.gemini_transport, "credential", lambda: "g")
+    monkeypatch.setattr(df.gemini_transport, "request", lambda *args: object())
+    calls = []
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self):
+            return json.dumps({"candidates": [{"content": {"parts": [{"text": "complete"}]}}]}).encode()
+
+    def open_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise HTTPError("https://provider", 400, "bad request", {}, io.BytesIO())
+        return Response()
+
+    monkeypatch.setattr(df.urllib.request, "urlopen", open_once)
+    assert df._gemini_read([b"page"], "Deck") == ""
+    assert df._gemini_read([b"page"], "Deck") == ""
+    assert len(calls) == 1
+    monkeypatch.setattr(df, "_client_revision", lambda: "repaired-client")
+    assert df._gemini_read([b"page"], "Deck") == "complete"
+    assert len(calls) == 2
 
 
 def test_pdf_builder_embeds_jpegs_and_declines_anything_else():

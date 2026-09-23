@@ -229,15 +229,15 @@ def current_conversation(event, now=None, candidates=None):
     return messages
 
 
-def participant_identifiers(*, local=None, gmail=None, calendar=None, loops=None):
-    """Select current participants by addresses/canonical IDs, never by fuzzy name or time."""
+TOPIC_RECORD_CHARS = 800
+TOPIC_CHARS = 2400
+TOPIC_RECORDS = 6
+
+
+def _participant_records(*, local=None, gmail=None, calendar=None, loops=None):
+    """One permission/identity projection for both the cohort and its retrieval topics."""
     from email.utils import getaddresses
     from source_context import allowed, project_local
-    identifiers = []
-    def add(value):
-        value = normalized_identifier(value)
-        if value and value not in identifiers and len(identifiers) < PARTICIPANT_LIMIT:
-            identifiers.append(value)
     local = project_local(local or {})
     # Explicit active work is first: stale file mtimes and chat volume cannot crowd it out.
     for item in (loops or []):
@@ -245,24 +245,70 @@ def participant_identifiers(*, local=None, gmail=None, calendar=None, loops=None
             continue
         if item.get('group_id'):
             continue
-        for field in ('canonical_id', 'contact_identifier', 'identifier'):
-            add(item.get(field))
+        yield [item.get(f) for f in ('canonical_id', 'contact_identifier', 'identifier')], \
+            str(item.get('summary') or item.get('ask') or '')
     if allowed('calendar'):
         for event in calendar or []:
-            for person in event.get('attendees') or []:
-                add(person.get('email') if isinstance(person, dict) else person)
+            if isinstance(event, dict):
+                yield [p.get('email') if isinstance(p, dict) else p for p in event.get('attendees') or []], \
+                    ' '.join(str(event.get(k) or '') for k in ('summary', 'title', 'description'))
     for source, fields in (('imessage', ('handle', 'canonical_id')), ('whatsapp', ('contact_jid', 'canonical_id'))):
         for message in reversed(local.get(source) or []):
             if not isinstance(message, dict) or message.get('is_group_chat'):
                 continue
-            for field in fields:
-                add(message.get(field))
+            yield [message.get(f) for f in fields], \
+                ' '.join(str(message.get(k) or '') for k in ('subject', 'text', 'body'))
     if allowed('gmail'):
         for message in gmail or []:
-            for field in ('from', 'to', 'cc'):
-                for _, address in getaddresses([str(message.get(field) or '')]):
-                    add(address)
+            if isinstance(message, dict):
+                yield [a for f in ('from', 'to', 'cc') if message.get(f)
+                       for _, a in getaddresses([str(message[f])])], \
+                    ' '.join(str(message.get(k) or '') for k in ('subject', 'snippet', 'body'))
+
+
+def participant_identifiers(**inputs):
+    """Select current participants by addresses/canonical IDs, never by fuzzy name or time."""
+    identifiers = []
+    for values, _ in _participant_records(**inputs):
+        for value in values:
+            value = normalized_identifier(value)
+            if value and value not in identifiers and len(identifiers) < PARTICIPANT_LIMIT:
+                identifiers.append(value)
     return set(identifiers)
+
+
+def participant_topics(*, cohort=None, **inputs):
+    """Bounded lexical retrieval hints, never instructions or a new identity join."""
+    from itertools import chain
+    cohort = participant_identifiers(**inputs) if cohort is None else cohort
+    topics = {}
+    # Work decides WHO packs, but current conversations decide WHAT to recall. Several long
+    # standing obligations must not use every topic slot before today's message is considered.
+    records = chain(_participant_records(local=inputs.get('local'), gmail=inputs.get('gmail')),
+                    _participant_records(calendar=inputs.get('calendar')),
+                    _participant_records(loops=inputs.get('loops')))
+    for values, text in records:
+        text = ' '.join(text.split())[:TOPIC_RECORD_CHARS]
+        if not text:
+            continue
+        for value in values:
+            value = normalized_identifier(value)
+            if not value or value not in cohort:
+                continue
+            parts = topics.setdefault(value, [])
+            if text not in parts and len(parts) < TOPIC_RECORDS:
+                parts.append(text)
+    return {key: ' '.join(parts)[:TOPIC_CHARS] for key, parts in topics.items()}
+
+
+def topic_for_identifiers(topics, identifiers):
+    """Share the existing topic budget across exact aliases; a busy phone cannot hide an email."""
+    parts = list(dict.fromkeys(topics[key] for key in sorted({normalized_identifier(i) for i in identifiers})
+                              if topics.get(key)))
+    if not parts:
+        return ''
+    share = max(0, (TOPIC_CHARS - len(parts) + 1) // len(parts))
+    return ' '.join(part[:share] for part in parts)[:TOPIC_CHARS]
 
 
 if __name__ == '__main__':

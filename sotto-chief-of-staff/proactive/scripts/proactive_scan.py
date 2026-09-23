@@ -308,17 +308,13 @@ def _finalize(kind: str, anchor_key: str) -> None:
         pass
 
 
-def _research_cache_emails(date: str) -> set:
-    """Emails researched TODAY ($SOTTO_DATA/cache/research_<date>.json, written by every successful
-    research_attendees run — brief or prep). Read-only, best-effort, empty on any failure."""
-    path = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "cache", f"research_{date}.json")
+def _delivered_prep_occurrences(date: str) -> set:
+    """Meeting occurrences whose offer or full prep reached the provider."""
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f) or {}
+        with delivery_effects.proactive_state(date) as state:
+            return {str(value) for value in state.get('prep_deliveries', []) if str(value)}
     except Exception:  # noqa: BLE001
         return set()
-    return {_s(a.get("email")).lower().strip()
-            for a in (data.get("attendees") or []) if isinstance(a, dict) and a.get("email")}
 
 
 def _prep_lines(attendee: dict, continuity) -> tuple:
@@ -539,14 +535,14 @@ def _birthday_importance(local, now):
 
 
 def scan(calendar, continuity, local, user_email, now_local,
-         prepped_emails=None, brief_recent: bool = False,
+         prepped_occurrences=None, brief_recent: bool = False,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
          brief_named=None, intentions=None, handoff_allowed: bool = False,
          birthday_importance=None) -> dict:
     """Pure decision (no I/O, no gates): given the inputs and the local 'now', return every nudge
     that is DUE now. Whether any of them reaches the user — the snooze, quiet hours, the mutes, the
     in-meeting hold, the daily interrupt budget — is the funnel's call, made in one place, on the
-    bundle main hands it. `prepped_emails` / `brief_recent` / `brief_today` / `brief_named` /
+    bundle main hands it. `prepped_occurrences` / `brief_recent` / `brief_today` / `brief_named` /
     `chase_candidates` / `handoff_candidates` are computed by main (they need disk: today's research cache, the
     delivered markers and what the delivered brief named).
     """
@@ -587,23 +583,30 @@ def scan(calendar, continuity, local, user_email, now_local,
                and not (user_domain and a['email'].endswith("@" + user_domain))]
         if not ext:
             continue  # internal/solo meeting — no prep nudge
-        # "…that you haven't prepped" — the honest, deterministic signal for that is today's
-        # research cache: an external attendee only lands in it because a meeting-prep or brief run
-        # TODAY researched a meeting they're on. Any hit means this meeting's people are already
-        # prepped, so the nudge would be offering work the user has. (Chosen over an agent-side
-        # "did you prep?" question, which nothing can answer deterministically.)
-        if prepped_emails and {_s(a.get("email")).lower().strip() for a in ext} & set(prepped_emails):
+        # Research is reusable input, not evidence that anything reached the user. Suppress only
+        # this exact occurrence after its offer or full prep is provider-accepted.
+        occurrence = delivery_effects.meeting_occurrence(_s(e.get('id')), st.isoformat())
+        if occurrence and occurrence in set(prepped_occurrences or ()):
             continue
         # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
         # own title/company for the first external attendee) and the one open loop with them, if
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
         who, loop = _prep_lines(ext[0], continuity)
-        nudges.append({"kind": "meeting_prep", "key": f"mtg:{_s(e.get('id'))}",
+        nudges.append({"kind": "meeting_prep", "key": f"mtg:{occurrence}",
                        "calendar_event_id": _s(e.get('id')), "calendar_start": st.isoformat(),
+                       "proactive_date": today,
                        "calendar_observed_at": _s(e.get('calendar_observed_at')) or now_local.isoformat(),
                        "valid_until": st.isoformat(),
                        "title": _s(e.get("summary")) or "Meeting",
                        "person": _s(ext[0].get("displayName")) or _s(ext[0].get("email")).split("@")[0],
+                       "identifier": _s(ext[0].get("email")).lower().strip(),
+                       # Preserve provider-supplied exact linkage. The composer treats absent
+                       # linkage honestly: attendee mail remains recent background, never proof of
+                       # this invitation's introduction or purpose.
+                       "event": {k: e[k] for k in ('summary', 'description', 'start', 'end',
+                                                   'threadId', 'thread_id', 'iCalUID',
+                                                   'conferenceData', 'hangoutLink', 'htmlLink')
+                                 if k in e},
                        "who": who, "open_loop": loop,
                        "detail": f"starts in ~{int(mins_away)} min · "
                                  + ", ".join(_s(a.get('displayName') or a.get('email')) for a in ext[:4])
@@ -744,7 +747,7 @@ def main():
     brief_recent = _recent_brief_delivered(now_local)
     due = scan(calendar, continuity, local, user_email, now_local,
                birthday_importance=_birthday_importance(local, now_local),
-               prepped_emails=_research_cache_emails(date), brief_recent=brief_recent,
+               prepped_occurrences=_delivered_prep_occurrences(date), brief_recent=brief_recent,
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
                handoff_candidates=_handoff_candidates(), handoff_allowed=not brief_recent,

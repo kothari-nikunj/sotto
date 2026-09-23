@@ -67,6 +67,25 @@ def test_read_local_snapshot_seeds_nonempty_style(tmp_path):
     assert style["master"]["greetings"] or style["master"]["patterns"]
 
 
+def test_disabled_message_source_cannot_seed_style(tmp_path):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    payload = json.loads(json.dumps(SNAPSHOT))
+    payload["source_status"]["imessage"] = "disabled"
+    payload["source_status"]["whatsapp"] = "disabled"
+    res = se.extract(payload)
+    assert res["messages_analyzed"] == 0
+
+
+def test_wrapped_disabled_source_cannot_bypass_style_consent(tmp_path):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    payload = json.loads(json.dumps(SNAPSHOT))
+    payload["source_status"]["imessage"] = "disabled"
+    payload["source_status"]["whatsapp"] = "disabled"
+    wrapped = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+    res = se.extract(wrapped)
+    assert res["messages_analyzed"] == 0
+
+
 def test_read_local_work_vs_personal_classification(tmp_path):
     os.environ["SOTTO_DATA"] = str(tmp_path)
     se.extract(json.loads(json.dumps(SNAPSHOT)))
@@ -102,6 +121,57 @@ def test_sent_messages_payload_still_works(tmp_path):
     assert res["messages_analyzed"] == 2
     assert len(style["canonical"]["work_message"]) == 2
     assert "c_sarah" in style["per_person"]
+
+
+def test_normalized_sent_messages_obey_source_consent(tmp_path, monkeypatch):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setattr(se, "allowed", lambda source: source not in ("imessage", "gmail"))
+    res = se.extract({"sent_messages": [
+        {"text": "This iMessage sample must not persist after consent is revoked.",
+         "channel": "imessage", "recipient": "Sarah"},
+        {"text": "This channel-free sample defaults to iMessage and must obey its consent.",
+         "recipient": "Alex"},
+        {"text": "This Apple Mail sample must obey Gmail consent too.",
+         "channel": "apple_mail", "recipient": "Alex@example.com"},
+    ]})
+    assert res["messages_analyzed"] == 0
+    style = json.load(open(os.path.join(str(tmp_path), "style.json")))
+    assert not style["samples"]
+
+
+def test_normalized_channel_wins_over_non_source_provenance(tmp_path, monkeypatch):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setattr(se, "allowed", lambda source: source != "imessage")
+    res = se.extract({"sent_messages": [{
+        "text": "A confirmed label must not disguise an iMessage after revocation.",
+        "channel": "imessage", "source": "confirmed", "recipient": "Sarah",
+    }]})
+    assert res["messages_analyzed"] == 0
+
+
+def test_unknown_normalized_channel_is_rejected_instead_of_bypassing_consent(tmp_path):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    res = se.extract({"sent_messages": [
+        {"text": "An unsupported transport must never become an unconsented style sample.",
+         "channel": "carrier_pigeon", "recipient": "Alex"},
+        {"text": "Known email aliases remain accepted by the centralized resolver.",
+         "channel": "apple_mail", "recipient": "alex@example.com", "work": True},
+    ]})
+    assert res["messages_analyzed"] == 1
+    style = json.load(open(os.path.join(str(tmp_path), "style.json")))
+    assert [sample["channel"] for sample in style["samples"]] == ["apple_mail"]
+    assert se._normalized_channel({"text": "legacy"}) == ("imessage", "imessage")
+    assert se._normalized_channel({"channel": "unknown"}) == (None, None)
+
+
+def test_unrelated_raw_source_revocation_does_not_block_style(tmp_path, monkeypatch):
+    os.environ["SOTTO_DATA"] = str(tmp_path)
+    original = se.allowed
+    monkeypatch.setattr(se, "allowed", lambda source: False if source == "chrome" else original(source))
+    payload = json.loads(json.dumps(SNAPSHOT))
+    payload["chrome_history"] = [{"domain": "example.com", "visit_count": 2}]
+    payload["source_status"]["chrome"] = "ok"
+    assert se.extract(payload)["messages_analyzed"] == 4
 
 
 def test_adapt_passthrough_when_sent_messages_present():

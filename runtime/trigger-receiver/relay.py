@@ -31,11 +31,13 @@ import secrets
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 # Mirror the real Bridge's identity (sotto-bridge/core/src/mcp.rs: PROTOCOL_VERSION + server_info),
 # so Hermes sees ONE consistent server whether initialize is answered here or the Mac is connected.
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sotto-bridge", "version": "1.0"}
+BRIDGE_REQUEST_STARTED_AT = "_bridge_request_started_at"
 # Minimal fallback tool list used only before the Bridge has ever connected (no cache yet).
 _FALLBACK_TOOLS = [
     {"name": "read_local", "description": "Local Mac context (messages/calls/contacts/…).",
@@ -148,11 +150,17 @@ class Relay:
     def _forward(self, req: dict, timeout: float):
         external_id = req.get("id")
         internal_id = secrets.token_hex(16)
-        forwarded = {**req, "id": internal_id}
+        # This server clock is the ordering authority for relay-requested observations. Keep it on
+        # the private pending-request copy: callers cannot forge it, and the Mac never receives the
+        # reserved field (so a response can only acquire it after response validation).
+        request = {**req, BRIDGE_REQUEST_STARTED_AT: datetime.now(timezone.utc).isoformat()}
+        forwarded = {key: value for key, value in req.items()
+                     if key != BRIDGE_REQUEST_STARTED_AT}
+        forwarded["id"] = internal_id
         ev = threading.Event()
         with self._lock:
             self._waiters[internal_id] = {"event": ev, "value": None,
-                                          "external_id": external_id, "request": req, "deadline": time.monotonic() + timeout}
+                                          "external_id": external_id, "request": request, "deadline": time.monotonic() + timeout}
         self._q.put((time.monotonic() + timeout, forwarded))
         if ev.wait(timeout):
             with self._lock:

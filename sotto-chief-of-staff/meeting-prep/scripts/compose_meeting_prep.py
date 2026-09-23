@@ -60,8 +60,10 @@ from render_local import (  # noqa: E402
     resolve_contact_names,
 )
 import ledger_io  # noqa: E402  (continuity ledger read — per-attendee open loops)
+import delivery_effects  # noqa: E402
 import research_attendees as ra  # noqa: E402  (is_filler_point — shared anti-fabrication filter)
 from chatfmt import to_chat  # noqa: E402
+import model_work  # noqa: E402
 
 _HERE = os.path.dirname(__file__)
 PROMPT_PATH = os.path.join(_HERE, "..", "references", "meeting-prep-prompt.md")
@@ -203,15 +205,19 @@ def _identity_keys(entry) -> set:
     return keys
 
 
-def _thread_lines(rows: list) -> list:
+def _thread_lines(rows: list, event_thread: str = "") -> list:
     """`thread:` context lines (≤MAX_THREAD_LINES) from the attendee's Gmail exchange with the
     user — email <date> "<subject>" (you→them|them→you): <snippet≤140>."""
     lines = []
-    for row in rows[:MAX_THREAD_LINES]:
-        direction = "you→them" if row.get("from_me") else "them→you"
+    ordered = sorted(rows, key=lambda row: not (event_thread and row.get('thread_id') == event_thread))
+    for row in ordered[:MAX_THREAD_LINES]:
+        direction = ("you→them" if row.get("from_me") is True else
+                     "them→you" if row.get("from_me") is False else
+                     "from " + _s(row.get('sender_name')) if row.get('sender_name') else "sender unknown")
         date = _s(row.get("date")).strip()[:31]
         subject = _s(row.get("subject")).strip()[:80]
         snippet = _s(row.get("snippet")).strip()[:140]
+        relation = "event thread" if event_thread and row.get('thread_id') == event_thread else "recent background"
         line = "    thread: email"
         if date:
             line += f" {date}"
@@ -220,6 +226,7 @@ def _thread_lines(rows: list) -> list:
         line += f" ({direction})"
         if snippet:
             line += f": {snippet}"
+        line += f" [{relation}]"
         lines.append(line)
     return lines
 
@@ -310,8 +317,11 @@ def _active_loops() -> list:
         return []
 
 
-def _loop_line(email: str, identity, name: str, loops: list) -> str:
-    """One `loop:` context line — the continuity ledger's open item with this attendee. Matching
+MAX_RELEVANT_LOOPS_PER_ATTENDEE = 3
+
+
+def _loop_lines(email: str, identity, name: str, loops: list) -> list[str]:
+    """Bounded open obligations in both directions for this attendee, dated or undated. Matching
     mirrors _contact_identity's conservatism: contact_identifier must hit the attendee's normalized
     email/phone keys; a contact_name match counts only when it is unique across active loops."""
     keys = _identity_keys(identity) | {_normalize_identifier(_s(email))}
@@ -324,19 +334,26 @@ def _loop_line(email: str, identity, name: str, loops: list) -> str:
                  if _s(it.get("contact_name")) and _names_match(display, _s(it.get("contact_name")))]
         matches = named if len(named) == 1 else []
     if not matches:
-        return ""
-    it = matches[0]
-    what = (_s(it.get("summary") or it.get("ask"))
-            or _s(it.get("action_type")).replace("_", " ")).strip()[:140]
-    if not what:
-        return ""
-    status = _s(it.get("status")) or "open"
-    line = f"    loop: {status} — {what}"
+        return []
+    matches.sort(key=lambda it: (not bool(_s(it.get('deadline'))),
+                                 _s(it.get('deadline')) or '9999-99-99',
+                                 _s(it.get('created_at')), _s(it.get('anchor_key'))))
     from delivery_effects import delivered_surface_count
-    n = delivered_surface_count(it)
-    if n > 1:
-        line += f" (surfaced {n}x)"
-    return line
+    lines = []
+    for it in matches[:MAX_RELEVANT_LOOPS_PER_ATTENDEE]:
+        what = (_s(it.get("summary") or it.get("ask"))
+                or _s(it.get("action_type")).replace("_", " ")).strip()[:140]
+        if not what:
+            continue
+        status = _s(it.get("status")) or "open"
+        direction = 'they owe you' if ledger_io.is_waiting_on(it.get('action_type')) else 'you owe'
+        line = f"    loop: {status} — {what}"
+        n = delivered_surface_count(it)
+        if n > 1:
+            line += f" (surfaced {n}x)"
+        line += f" [{direction}]"
+        lines.append(line)
+    return lines
 
 
 def _upcoming(inputs: dict) -> list:
@@ -489,11 +506,10 @@ def build_context(inputs: dict) -> tuple[str, list]:
             # recent Granola meeting with THIS person, and 1:1 texts (matched via contact_index
             # — exact identifiers only). Each source degrades silently; the combined block is
             # hard-capped (highest-signal lines first) so prep context stays budgeted.
-            private = _thread_lines(comms_by_email.get(email) or [])
+            event_thread = _s(e.get('threadId') or e.get('thread_id')).strip()
+            private = _thread_lines(comms_by_email.get(email) or [], event_thread)
             identity = _contact_identity(email, name, contact_index)
-            loop = _loop_line(email, identity, name, loops)
-            if loop:
-                private.append(loop)
+            private.extend(_loop_lines(email, identity, name, loops))
             granola = _granola_line(email, granola_meetings)
             if granola:
                 private.append(granola)
@@ -511,9 +527,10 @@ def build_context(inputs: dict) -> tuple[str, list]:
     x_context = _format_x_context(inputs).strip()
     if x_context:
         context += "\n\n" + x_context
-    raw_x = inputs.get("x_context") if isinstance(inputs, dict) else None
-    if isinstance(raw_x, dict) and raw_x.get("warnings"):
-        context += "\n\n" + _format_source_availability({"x": "unavailable"})
+    from source_context import x_availability
+    x_status = x_availability(inputs.get("x_context") if isinstance(inputs, dict) else None)
+    if x_status:
+        context += "\n\n" + _format_source_availability({"x": x_status})
     return context, meetings_out
 
 
@@ -562,19 +579,48 @@ def _normalize(parsed: dict, meetings: list) -> dict:
     return out
 
 
+@model_work.procedure('meeting_prep')
 def compose(inputs: dict, llm=None) -> dict:
     """prep_markdown is chat-ready on the way out (one formatting pipeline — Sprint 0 §3): the
     LLM's markdown (## / **bold** / any markers) goes through chatfmt.to_chat so the skill's
     verbatim delivery never leaks raw CommonMark into WhatsApp. JSON keys are unchanged."""
     llm = llm or call_gemini
+    from source_context import allowed, project_x, used_sources
+    inputs = dict(inputs, x_context=project_x(inputs.get('x_context')))
+    x_sources = used_sources(x_context=inputs['x_context'])
     prompt, meetings = build_prompt(_load_prompt(focus=focus_mode(inputs)), inputs)
     if not meetings:
         # Nothing to prep — skip the model call entirely.
         return {"prep_markdown": "No meetings with outside people in the next 3 days — "
                 "your calendar's internal.", "meetings": []}
     raw = llm(prompt, inputs)
-    out = _normalize(json.loads(raw), meetings)
+    if any(not allowed(source) for source in x_sources):
+        raise RuntimeError('source permission changed while composing')
+    parsed = json.loads(raw)
+    # Suppression evidence must be explicit structured coverage from the writer, not _normalize's
+    # compatibility fallback that copies every input meeting into a missing/empty output list.
+    canonical = {(_s(meeting.get('event_id')), delivery_effects.instant(meeting.get('start'))): meeting
+                 for meeting in meetings}
+    covered = []
+    rendered = _s(parsed.get('prep_markdown') or parsed.get('markdown')) if isinstance(parsed, dict) else ''
+    rows = parsed.get('meetings') if isinstance(parsed, dict) else None
+    if rendered.strip() and isinstance(rows, list):
+        for row in rows:
+            points = row.get('talking_points') if isinstance(row, dict) else None
+            if not isinstance(points, list) or not any(isinstance(point, str) and point.strip()
+                    and not ra.is_filler_point(point) for point in points):
+                continue
+            key = (_s(row.get('event_id')), delivery_effects.instant(row.get('start')))
+            if key in canonical:
+                covered.append(canonical[key])
+    out = _normalize(parsed, meetings)
     out["prep_markdown"] = to_chat(out.get("prep_markdown"))
+    if x_sources:
+        delivery_effects.stage([{'kind': 'source_permissions', 'sources': x_sources}])
+    delivery_effects.stage([{'kind': 'meeting_prep_delivered', 'mode': 'full',
+                             'calendar_event_id': meeting.get('event_id', ''),
+                             'calendar_start': meeting.get('start', '')}
+                            for meeting in covered])
     return out
 
 

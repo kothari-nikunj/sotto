@@ -141,16 +141,16 @@ to lane 1 (a key tile) — document it and move on.
 
 ## X — person-centered connectivity (Phase 1)
 
-X is a fourth channel and a meeting-research source, not a feed or a new Sotto surface. Phase 1 is
-read-only and uses the owner's own X app credentials. Set `X_BEARER_TOKEN` for exact user lookup and
+X is an optional meeting-research source. Phase 1 is read-only and uses the owner's own X app
+credentials in both hosting modes. Set `X_BEARER_TOKEN` for exact user lookup and
 recent public Posts; add `X_USER_ACCESS_TOKEN` (OAuth2 user token with `bookmark.read`) and
 `X_OWNER_USER_ID` to include the owner's newest bookmarks when their authors are upcoming
 attendees.
 
 The meeting-prep and morning-brief skills run `_shared/scripts/x_connectivity.py` after the existing
 web research pass. Identity anchors on immutable `x_user_id`; handle observations remain alias
-history. Resolution is exact-lookup-only: a distinctive email local-part first, then a handle found
-by the web research already being performed. X people-search never runs ambiently. A profile
+history. Resolution is exact-lookup-only: a handle found by the existing web research first,
+then a distinctive email local-part. X people-search never runs ambiently. A profile
 auto-links only when a full name agrees with the profile AND the profile agrees about their
 company — where the name is either one a *human* wrote (the invite's display name or the graph's,
 never the email's local part), or the one the research pass published for a **corporate** address.
@@ -160,14 +160,24 @@ a third, independent voice. At a freemail address that thread snaps — the pass
 but the local part — so the profile is shown in that one prep marked **unconfirmed** and nothing is
 written down. Weaker matches land in
 `$SOTTO_DATA/knowledge/x_link_suggestions.json` for confirmation. Misses stay on the person file for
-90 days, so a prep does not repeatedly buy the same absence.
+90 days, or in the existing suggestions file if no person exists, so a prep does not repeatedly
+buy the same absence. Provider failures and malformed responses never become cached misses.
 
 Only durable public-profile facts enter the graph (`source: x` with the profile URL). Recent Posts
-and bookmarks exist solely in `/tmp/sotto_x_context.json` for that prep run. No Chat content,
+and bookmarks are run inputs: `/tmp/sotto_x_context.json` for interactive prep, or the brief's
+durable staging directory until learning cleanup or the existing seven-day abandoned-input sweep.
+No Chat content,
 timeline mirror, social-graph mirror, API sends, or X-specific interrupt lane exists in Phase 1.
 
-The API tier is not needed for Phase 1's identity/prep lane. It becomes a build-time fact for Phase
-2, where Chat/DM/mention delivery cadence depends on the endpoints the owner's tier actually opens.
+Credential presence does not prove API access. Existing source diagnostics show whether X is
+unconfigured, unverified, successful or degraded, with a last-success timestamp and safe failure
+categories. A failed bookmark request does not disable public Posts when a separate bearer still
+works. Removing public or bookmark credentials excludes the corresponding staged context when it
+is consumed and invalidates queued messages that used it; it does not immediately delete staged
+files. The existing learning cleanup or seven-day abandoned-input sweep removes those files.
+Previously learned public-profile facts remain editable. A protected attendee is a per-person
+permission failure, not a broken token. A lookup rate limit leaves already-linked attendees usable;
+a timeline rate limit stops further timeline calls while preserving other available context.
 
 Ranked by **what Sotto cannot see or do today**, not by what has a shiny MCP. Every row has to
 survive one question — *what would Sotto do differently tomorrow morning because this is

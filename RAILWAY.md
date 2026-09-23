@@ -214,6 +214,23 @@ Fallbacks, only if you want them:
 
 Granola is optional — fine to skip and ship Gmail + Calendar + the Bridge first.
 
+## 6d. X attendee context (optional)
+
+Set `X_BEARER_TOKEN` on the instance service to read public profiles and recent Posts for upcoming
+meeting attendees. Optional bookmarks additionally require `X_USER_ACCESS_TOKEN` with bookmark
+read access and `X_OWNER_USER_ID`. These are your own X app credentials, separate from Google or
+Granola sign-in. Set secrets in Railway Variables, never in chat or source control, then redeploy
+the instance so its processes inherit them. The same variables work in self-host.
+
+The authenticated dashboard's `/api/overview` source diagnostics report X as `unconfigured` when
+credentials are absent, `unverified` until a real request succeeds, and `degraded` after an API
+failure. A token's presence alone never proves the API works. The record includes a last-success
+timestamp and safe error categories; it does not include handles or private saved Posts. Ordinary
+background prep performs the check when there are eligible attendees, with no additional probe
+or paid call scheduled just for health. Removing the credentials stops use of staged X material
+and invalidates queued messages that used it. Public-profile facts already in the graph remain
+editable memory. X is optional; briefs still use web research, meeting notes and your history.
+
 ## 7. Talk to Sotto
 On **Telegram** (the default) you talk to Sotto in the chat with your bot:
 - Send **"hi"** → the agent replies, and reacts to your message as status (👀 working · ✅ replied ·

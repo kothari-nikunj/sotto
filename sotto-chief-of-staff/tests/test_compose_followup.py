@@ -86,11 +86,13 @@ def test_compose_for_brief_composes_when_meeting_ended():
     def fake_llm(prompt, inputs):
         assert "Sync" in prompt
         return json.dumps({"followup_markdown": "**Sync** — send the deck.",
-                           "commitments": [{"meeting_id": "m-sync", "owner": "you",
-                                            "owner_is_user": True, "what": "send deck",
-                                            "source_snippet": "you: I'll send the deck"}],
+                               "commitments": [{"meeting_id": "m-sync", "owner": "you",
+                                                "owner_is_user": True, "what": "send deck",
+                                                "to_email": "dana@example.com",
+                                                "source_snippet": "you: I'll send the deck"}],
                            "drafts": []})
     inputs = {"granola": [{"meeting_id": "m-sync", "title": "Sync", "date": _iso(2),
+                            "attendee_emails": ["dana@example.com"],
                             "transcript": "you: I'll send the deck"}],
               "local": {}, "google": {"events": []}}
     out = cf.compose_for_brief(inputs, since_hours=12, llm=fake_llm)
@@ -123,8 +125,10 @@ def test_compose_with_injected_llm():
 def test_apply_ledger_persists_on_demand_commitments(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     sources = [
-        {"meeting_id": "m-user", "transcript": "you: I'll send Dana the deck"},
-        {"meeting_id": "m-dana", "transcript": "Dana: I'll return the pricing model"},
+            {"meeting_id": "m-user", "transcript": "you: I'll send Dana the deck",
+             "attendee_emails": ["me@example.com", "dana@example.com"]},
+            {"meeting_id": "m-dana", "transcript": "Dana: I'll return the pricing model",
+             "attendee_emails": ["me@example.com", "dana@example.com"]},
     ]
     out = {"commitments": [
         {"meeting": "Sync", "meeting_id": "m-user", "owner": "you", "owner_is_user": True,
@@ -145,13 +149,15 @@ def test_cli_applies_commitments_before_it_prints_success(tmp_path, monkeypatch,
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     granola = tmp_path / "granola.json"
     granola.write_text(json.dumps({"meetings": [{
-        "meeting_id": "m-sync", "title": "Sync", "date": _iso(2),
-        "transcript": "you: I'll send the deck",
+            "meeting_id": "m-sync", "title": "Sync", "date": _iso(2),
+            "attendee_emails": ["me@example.com", "dana@example.com"],
+            "transcript": "you: I'll send the deck",
     }]}))
     monkeypatch.setattr(cf, "compose", lambda inputs, since_hours: {
         "followup_markdown": "*Sync* — send the deck.",
         "commitments": [{"meeting": "Sync", "meeting_id": "m-sync", "owner": "you",
-                         "owner_is_user": True, "what": "Send the deck",
+                             "owner_is_user": True, "what": "Send the deck",
+                             "to_email": "dana@example.com",
                          "source_snippet": "you: I'll send the deck"}],
         "drafts": [],
     })
@@ -168,6 +174,7 @@ def test_cli_applies_commitments_before_it_prints_success(tmp_path, monkeypatch,
 
 def test_compose_rejects_fabricated_quote_wrong_direction_and_wrong_object():
     meeting = {"meeting_id": "m-sync", "title": "Sync", "date": _iso(2),
+               "attendee_emails": ["dana@example.com"],
                "transcript": ("Dana: I'll send the deck tomorrow.\n"
                               "Dana said Nikunj will send the model.\n"
                               "Dana: I'll review the memo.\n"
@@ -195,7 +202,8 @@ def test_compose_rejects_fabricated_quote_wrong_direction_and_wrong_object():
     assert [c["what"] for c in out["commitments"]] == ["send deck"]
     assert out["commitment_grounding"] == {
         "accepted": 1, "rejected": 6,
-        "reasons": {"meeting": 0, "snippet": 1, "owner": 3, "deliverable": 2},
+        "reasons": {"meeting": 0, "snippet": 1, "owner": 3, "deliverable": 2,
+                    "counterpart": 0},
     }
 
 

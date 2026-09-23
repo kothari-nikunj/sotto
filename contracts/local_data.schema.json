@@ -30,7 +30,7 @@
 
     "source_status": {
       "type": "object",
-      "additionalProperties": { "enum": ["ok", "unavailable", "needs_fda", "degraded"] }
+      "additionalProperties": { "enum": ["ok", "partial", "unavailable", "needs_fda", "degraded", "disabled"] }
     }
   },
   "$defs": {
@@ -169,7 +169,7 @@
         "last_used": { "type": "string" },
         "date_added": { "type": "string" },
         "file_type": { "type": "string" },
-        "status": { "enum": ["opened", "unopened"] },
+        "status": { "enum": ["opened", "unopened", "unknown"] },
         "source_url": { "type": "string" }
       }
     },

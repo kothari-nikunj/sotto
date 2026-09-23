@@ -71,15 +71,26 @@ held, never as passed: a quality stage may not cost the user the day's brief.
 | `brief_extract` | 6 | 65,536 | unchanged |
 | `brief_critic` | 3 | 65,536 | unchanged |
 | `brief_revise` | 3 | 65,536 | unchanged |
-| `followup` | 2 | 8,192 | low |
+| `followup` | 3 | 8,192 | low |
+| `meeting_prep` | 3 | 65,536 | unchanged |
 | `research` | 4 | 8,192 | low |
+| `web_search` | 2 | 65,536 | unchanged |
+| `web_fetch` | 2 | 8,192 | unchanged |
+| `deck_read` | 2 | 32,768 | unchanged |
 
 The `brief` row is the parent envelope: extraction owns six requests (two semantic extraction
 attempts, each with the existing three-request provider ladder), critic owns three and revision owns
-three. These stages cannot consume each other's allowance. The optional evening follow-up has its
-separate two-request child allowance. Core brief output retains the proxy's previous 65,536-token
+three. These stages cannot consume each other's allowance. Follow-up allows three calls so its
+primary, one transient retry and same-family fallback ladder is reachable; the optional evening
+follow-up uses that separate child allowance. Core brief output retains the proxy's previous 65,536-token
 ceiling and provider-default thinking. OpenAI-compatible and Anthropic output parameters retain
 their pre-change behavior; these native Gemini ceilings do not silently alter those providers.
+Meeting prep, grounded web search/fetch, and deck reading now use the same durable operation ledger.
+Each invocation retains its existing model and thinking behavior; successful grounded research still
+persists facts through its existing path. A retry is a new attempt under the same operation identity,
+while a fresh delivery run receives a fresh identity. Repeated identical URL/search work in one run
+reuses its complete in-memory result within the same data root; failures are never cached. A fixed
+set of process locks makes concurrent identical requests share that result instead of paying twice.
 Low-thinking overrides are limited to tested request contracts; a priced model is not automatically
 considered compatible.
 

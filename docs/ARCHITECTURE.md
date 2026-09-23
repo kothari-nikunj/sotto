@@ -31,7 +31,7 @@ the midday digest have their own procedures and share the source, relevance and 
 | Stage | Owner | In one sentence |
 |---|---|---|
 | **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. Two facts it reads that nothing read before (Sep 2026): the stale-sent lane (`gather_stale_sent` — one `in:sent` search plus one `threads.get` per candidate: is the last word on the thread still yours?) and your own answer to each invite (`normalize_event.my_response`). |
-| **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass — and the debts code can see are minted by code beside them (`_stale_debt_actions`, `_rsvp_actions`): an email you sent that nobody answered, an invite you haven't answered that is nearly here. The model's own row for the same thread or event wins. |
+| **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass — and the debts code can see are minted by code beside them (`_stale_debt_actions`, `_rsvp_actions`): an email you sent that nobody answered, an invite you haven't answered that is nearly here. The model's own row for the same thread or event wins. After revision, a deterministic source-backed calendar preview precedes optional loop expansion; the model cannot delete its schedule. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Checks structure, identifiers and deterministic obligations; findings guide the critic/revision pass. These checks cannot prove every model judgment correct. |
 | **commit essential memory** | [`_shared/scripts/learn_step.py`](../sotto-chief-of-staff/_shared/scripts/learn_step.py) `--phase essential` | Applies extracted knowledge and merges actions into continuity before returning the brief for delivery. Failure retries these writes against the saved artifact. |
 | **deliver** | `receiver.py` → `outbox.py` → `adapters/hermes/runtime_api.py` | The outbox persists the artifact, checks its due time and current eligibility, then claims the brief marker at the send seam. A missing composed archive cannot claim the day. Structured provider acceptance completes delivery; retrying a known result does not recompose it. |
@@ -63,6 +63,8 @@ small deterministic guards around it, rather than a second workflow engine:
 ```text
 Granola notes / summary / transcript
   → gather_granola: meeting_id + exact start/end + source text
+  → ancillary Learn capture: up to 3 new/changed revisions from the 14-day overlap;
+       successful revisions checkpoint in the existing learned receipt, failed writes retry
   → compose_followup: owner_is_user + verbatim source_snippet + optional existing_anchor_key
   → apply_commitments:
        meeting id + copied quote + named owner + action/deliverable words must match source (or drop)
@@ -82,8 +84,10 @@ against the gathered meeting: its id exists, the supporting quote was copied, th
 claimed owner, and it contains the obligation's action/deliverable words. Ambiguity drops the
 item instead of opening a loop. Exact occurrence identity handles reruns; the model may suggest at
 most one semantic merge, and code accepts it only if that anchor is live and points in the same
-direction. There is no fuzzy-matching subsystem. Source-backed Granola commitments close explicitly,
-so an ordinary reply, an old creation date, or the user's own chase cannot silently erase them.
+direction. There is no fuzzy-matching subsystem. New source-backed Granola commitments can close
+only through the existing task-specific, source-message evidence checks; an explicit user lock
+remains manual. An ordinary reply, an old creation date, or the user's own chase cannot silently
+erase either.
 
 The same ledger owns every obligation. Separate asks remain separate rows and the brief groups them
 once per person only when rendering. Optional model `loopUpdates` name one ledger ID and revision
@@ -257,7 +261,7 @@ imports the receiver back.
 | `work_queue.py` (shared library) | SQLite ownership of accepted work until output is handed to the outbox; stable input IDs, bounded leases/retries, two worker slots with at most one background worker |
 | `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the brief schedule (`crons.json`'s `runner: receiver` jobs), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
 | `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
-| `calendar_context.py` (copied from `_shared/lib/` by Docker) | Shared human-attendee normalization and explicit user participation. Explicit context notes with the exact same interval and a unique matching meeting subject attach to that meeting as `supporting_context`; their descriptions remain available for prep, without creating a second busy block or invite. Calendar diffs only nudge for declines in the user's one-to-one meetings; prep and docket exclude resource rooms. |
+| `calendar_context.py` (copied from `_shared/lib/` by Docker) | Shared human-attendee normalization, explicit user participation and the schedule day grammar used by composition and card layout. Explicit context notes with the exact same interval and a unique matching meeting subject attach to that meeting as `supporting_context`; their descriptions remain available for prep, without creating a second busy block or invite. Calendar diffs only nudge for declines in the user's one-to-one meetings; prep and docket exclude resource rooms. |
 | `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector with a durable comparison baseline (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel). A meeting the user DECLINED is dropped before the served list (the Today view and the funnel's in-meeting hold never see it) while the raw wire events keep it for the diff |
 | `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_text`/`write_json`, the one atomic-write helper the whole image uses** |
 | `outbox.py` | The durable delivery outbox — `events/outbox.json`, the idempotency key, the retry backoff, the per-kind expiry, and the drain heartbeat. **Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn instead of dying.** |
@@ -368,14 +372,14 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `config/onboarding.json` | receiver `onboarding.py` | receiver first-use tick and scheduled hold |
 | `config/model-lease.json` | adapter `model_lease.py` | receiver renewal heartbeat and operator recovery diagnostics |
 | `config/cloud-pairing.sqlite` | receiver `cloud_pairing.py` | device grant redemption, authentication, listing and revocation |
-| `config/source-state.json` | shared `source_context.py` | consent-aware source readers and history learning |
+| `config/source-state.json` | shared `source_context.py` | consent-aware readers, history learning and authenticated dashboard diagnostics; bounded per-source access status and last extraction counts/timestamp, never source content |
 | `knowledge/history-state.json` | `memory_cycle.py` | diagnostics/setup: initial bounds, progress, extraction/Dreamer request latches, per-source history protocol latch and bounded work receipt |
 | `knowledge/dreamer.json` | `dreamer.py` | Semantic fact-evidence selection and review receipt; full-file hashes still guard concurrent writes |
 | `knowledge/conflicts.json` | `knowledge_update.consolidate` | `knowledge_query.py` renders unresolved pairs with their source facts |
 | `setup_code` | receiver (boot) | receiver, `start.sh` |
 | `config/photon-activation.json` | managed Photon adapter (first owner DM) | managed receiver gate and owner destination check |
 | `Mac: cloud-policy.json` | personal pilot operator | Bridge readers and event watcher |
-| `config/managed-capabilities.json` | managed receiver after Google OAuth and Bridge consent | managed receiver gate (missing state means zero sources) |
+| `config/managed-capabilities.json` | managed receiver after Google OAuth, Granola OAuth/disconnect and Bridge consent | managed receiver gate (missing state means zero sources). Startup repairs only a missing Granola row for an already linked connector on the same tenant; explicit revocation remains false. |
 | `config/managed-status.json` | receiver after outbox acceptance of `status:no-sources` | receiver's cron heartbeat (one-time notice) |
 | `config/settings.json` | receiver (`/setup/timezone`) | receiver, dashboard, `start.sh`, skills (`timeutil`) |
 | `briefs/<date>.<kind>.claim` · `briefs/<date>.<kind>.delivered` | receiver (the `.claim`; and the `.delivered` when the send seam's gate claims it), skills (`brief_marker.py --claim`) | receiver (trigger dedup, the cron-window fold, and the outbox's deliver-once gate — the `.delivered` file's CONTENT is the claiming run's id), skills (`proactive_scan.py`) |
@@ -384,7 +388,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
 | `briefs/<date>.<kind>.learned.json` | skills (`learn_step.py`, phases `essential`, `ancillary`, or legacy `all`) | Receiver diagnostics: per-writer `ok`, `skipped`, `queued` or `failed`; essential and ancillary durable background work may finish after a valid brief is delivered |
 | `events/model-work.sqlite3` | shared model_work.py | opaque attempt claims and usage; 90-day pruning on use |
-| `events/notification-artifacts/` | compose_notification.py | validated notification copy and bounded lock shards; seven-day output retention |
+| `events/notification-artifacts/` | `compose_notification.py`, `capture_commitments.py` | validated notification copy plus persisted per-meeting extraction/apply results and bounded lock shards; seven-day output retention |
 | `events/research-artifacts/` | research_attendees.py | coalesced batch results and bounded lock shards; seven-day output retention |
 | `events/triage-artifacts/` | relevance.py | validated event classifications and bounded lock shards; seven-day output retention |
 | `events/seen.json` | receiver | receiver (idempotency ring — Bridge events, keyed `(source,rowid)`) |
@@ -398,7 +402,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/digest_accepted.json` | skills (`digest_check.py`) after successful silent review; receiver after delivery acceptance | skills (`digest_check.py`) — durable conversation-version coverage prevents repeats without skipping bounded overflow or failed sends |
 | `events/queue.jsonl` · `events/surfaced.jsonl` | skills (`triage_event.py`) | dashboard (the Record + the waiting room), skills (`compose_brief.py` reads only verdicts whose `decision_id` has a delivered receipt); surfaced `item_key` identifies completed queue/drop decisions during tap recovery |
 | `events/drafts.jsonl` | skills (`action_links.py` — every tap link built with a draft) | skills (`draft_outcomes.py`, run directly by `learn_step.py` each brief: matched against the queue's `is_from_me` signals → outcomes.jsonl + style confirms) |
-| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage` and correlated `decision_ids` |
+| `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage`, correlated `decision_ids`, and content-free photo/text presentation detail |
 | `events/outbox.json` | `outbox.py` (the ONE writer) | receiver (the retry drain), dashboard (`/api/runs` — the pending/failed line) — one row per message Sotto composed, written BEFORE the first send attempt and flipped to `delivered` only on the channel's ack |
 | `events/outbox.json.effects.lock` | `outbox.py` | Empty persistent lock file for post-acceptance and invalidation callbacks; operating-system locks release on process exit |
 | `events/delivery-effects-<run>.json` | shared `delivery_effects.py`, merging procedure contributions transactionally | Receiver result commit and outbox handoff: source/Calendar eligibility, original coverage cutoff, chase/handoff, proactive/intention and offer effects; only delivery-dependent effects activate after provider acceptance |
@@ -432,6 +436,22 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
 | `telegram-link.json` | `telegram_link.py` (the ONE owner of the Telegram handshake — run by `start.sh` at boot, or by hand: [CHANNELS.md](../CHANNELS.md) § Telegram setup) | `start.sh` (`--boot` reuses the captured id for this token, else captures it, and forwards it to Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL`), receiver (`_telegram_status` — the "this chat is linked" probe behind the wizard tile and the nudge gate). It holds the bot token, so 0600 |
 | `preferences.json` | `preferences.py` (chat and dashboard invoke it) | skills, dashboard |
+
+Durable delivery receipts carry the same opaque run ID as native model-work attempts. The dashboard
+may join those exact identities for bounded attempt/status diagnostics; proxy usage remains the only
+spend source, so local token observations are never added to proxy estimates. Legacy receipts without
+a run ID remain explicitly unknown. Critic archives retain only fixed validator and critic repair
+categories and counts. Chat proxy metadata likewise records declared tool names and result sizes, with
+unmatched or truncated history grouped as `unknown`; it never stores result content.
+
+`outcomes.jsonl` also carries content-free `loop_proposal` and `loop_transition` records with stable
+IDs. The canonical ledger row saves its latest transition atomically, so a failed diagnostics append
+cannot undo a saved correction, and repeated persistence deduplicates. The proof report joins observed
+rejected-completion to later manual resolution, capture to dismissal within 24 hours, and reopen to
+later dismissal by stable obligation identity. These are review candidates, not measured error rates
+or complete historical coverage; missing history remains unknown. Durable delivery runs deduplicate
+proposal observations by run identity. Local and legacy observations lack that identity, so the proof
+report labels their proposal counts as candidate observations that may include repeated invocations.
 
 Every row but the last is **one-way**: exactly one writer, and readers that never write. That is the
 property that keeps the two processes from needing a lock.
@@ -468,7 +488,7 @@ one rejoins: [HOW-SOTTO-DECIDES.md § Who can produce a nudge](HOW-SOTTO-DECIDES
 |---|---|---|
 | The people/company graph | `knowledge/*.md` | `_shared/knowledge/knowledge_update.py` (`knowledge.py` is its model + serializer) |
 | Grounded research (people **and** companies) | same files | `meeting-prep/scripts/persist_prep.py` and `_shared/scripts/prewarm_graph.py` — both *through* `knowledge_update.apply()`; there is no second writer for either file type |
-| Verified X identity + public-profile provenance | person files above | `_shared/scripts/x_connectivity.py` — exact handle lookup only, then *through* `knowledge_update.apply()`; immutable `x_user_id`, handle alias history, and the 90-day negative cache are durable, while Posts/bookmarks stay in the run's temporary prep payload |
+| Verified X identity + public-profile provenance | person files above | `_shared/scripts/x_connectivity.py`: exact handle lookup only, then *through* `knowledge_update.apply()`; immutable `x_user_id`, handle alias history, and the 90-day negative cache are durable. Posts/bookmarks stay in staged run inputs, removed by learning cleanup or the existing seven-day abandoned-input sweep. |
 | Ambiguous X identity suggestions | `knowledge/x_link_suggestions.json` | `_shared/scripts/x_connectivity.py`; a weak or already-owned match is proposed here instead of being silently attached |
 | Meeting attendance + Apple Contacts identity | same files | `_shared/scripts/granola_graph.py` (who you sat with) and `_shared/scripts/prewarm_graph.py --sync-contacts` (every email/phone as an identifier, the card's notes + birthday) — both *through* `knowledge_update.apply()` |
 | User-initiated graph edits | same files | `_shared/knowledge/knowledge_edit.py` — which routes *through* `knowledge_update.apply()`, so a dashboard edit and a texted correction are byte-identical |
@@ -524,13 +544,23 @@ The read side of all of the above, and the one place the retrieval question is a
 
 | Emits | From | Gated by |
 |---|---|---|
-| `person_knowledge` — the compact packed block per person | `knowledge/people/*.md` | Current participants from consented `--local`, `--gmail`, `--calendar` and active loops, resolved through canonical aliases. The standalone `--relevant-days 7` fallback applies only when no input files were supplied. |
+| `person_knowledge` — the compact packed block per person | `knowledge/people/*.md` | Current participants from consented `--local`, `--gmail`, `--calendar` and active loops, resolved through canonical aliases. The `--relevant-days 7` fallback applies only when no current participant identifiers can be obtained. |
 | `company_knowledge` — About + the 3 newest news lines, ≤5 companies | `knowledge/companies/*.md`, via `knowledge_update.company_knowledge()` | today's attendee email domains + the packed people's `company`, deduped by file |
 | `contact_index` — the identity map | EVERY person file | ungated: it is what resolves a phone and an email to one person |
 
 `mtime` says when a file was last *rewritten*, which was never the same question as "does this
 person matter today" — under it, someone who emailed you this morning packed nothing and the model
 re-derived what the graph already knew.
+
+`personal_context._participant_records` is the shared permission and exact-identity projection
+for the cohort and its topical retrieval hints. `knowledge_query.pack_person` ranks and budgets
+whole assertions once, including selected summary references and labeled facts from one existing
+relationship edge. Those related people do not enter `memory_participants`. Notifications supply
+the current event subject/text to the same reader; chat supplies the requested topic, while brief
+and prep gathers supply current source records. Each uses the same graph and correction path in
+Cloud and self-host, independent of delivery channel. The reader does not persist a profile view.
+Source disconnect stops current-source context; durable memory still requires an explicit archive
+or correction. The [retrieval rules](HOW-SOTTO-DECIDES.md#memory-retrieval) state the read budgets.
 
 Two things deliberately do NOT persist, and both are correct:
 
@@ -723,6 +753,76 @@ The personal Cloud comparison uses the established Telegram agent settings: the 
 
 Managed persona refresh belongs to `managed_config.reconcile`; the legacy append/refresh path is self-host-only.
 
+
+#### Source observations and end-to-end checks
+
+Source permission, access and extraction are distinct. The Bridge health response covers all 11
+Mac sources; only an actual `read_local` response updates the extraction receipt in the existing
+`config/source-state.json`. A healthy access probe cannot erase a failed extraction or refresh an
+old read. Access and read receipts retain separate ordering timestamps. Relay-requested observations
+also retain the server's request-start time through snapshot replay, so a corrected Mac clock does
+not pin availability or let a delayed relayed read replace a newer one. Older unsolicited wake
+uploads lack that marker and retain Mac-clock ordering; their ordering across a clock correction
+remains ambiguous. Displayed freshness is bounded by server arrival. A disable reported by a probe takes effect on arrival whatever
+either clock says; only a strictly later probe restores access, and a completed read never does, so
+neither clock skew nor a clock correction can hold a disable back or let a delayed read undo it.
+An unreadable or invalid consent receipt fails closed for readers and is left untouched by metadata
+writers; the brief still composes with every local source withheld and says so.
+Style learning rejects unknown channel labels; channel-less legacy rows follow iMessage consent,
+and email aliases follow Gmail consent. A drift test checks the Python receipt vocabulary against
+the statuses the Rust Bridge emits.
+The Mac serializes status-file writers and keeps capability probes separate from extraction outcomes.
+`status.json` also carries `checked_at`, advanced only by a real Bridge access probe after health or
+extraction, never by a connection heartbeat. The menu calls the heartbeat Last connected. Full Disk
+Access is Ready only when the app grant and Bridge probe agree; after the existing one-time permission
+restart it stays Checking until a newer observation arrives. A blocked child gets quit/reopen and
+Full Disk Access recovery instructions; partial/degraded reader hints remain visible even with an
+app grant. The menu's View activity opens the existing authenticated `/app#record` with no credentials
+in the URL. The Record's expandable detail joins delivery to prior triage decisions by explicit
+`decision_ids` within the existing bounded ledger response. Missing evidence stays absent; later
+verdicts cannot explain earlier sends. This is a read-only projection, with no new store or writer.
+Source switches and consent behavior are unchanged; current access failures
+and disabled toggles take effect immediately. Schema/query failures report degradation, not an
+FDA request that cannot fix them. The authenticated dashboard reports disabled, unverified, empty, partial/degraded,
+unavailable and stale states. Its metadata includes only field counts and timestamps; the public
+`/health` response does not expose source activity. Freshness uses the same 24-hour bound as local
+snapshot reuse. Empty successful reads and disabled sources do not produce dashboard warnings.
+A missing optional Chrome or WhatsApp source is `not_present` until it has been available;
+subsequent loss is reported. Built-in Mac sources still report first-run access failures.
+Failed deferred-unread reads mark their parent messaging source partial without dropping valid data.
+
+The same source-state receipt holds X request status and the last successful request, without
+handles, Posts, bookmarks or provider error payloads. X uses optional owner credentials in both
+hosting modes, separate from Bridge source switches. Authenticated diagnostics distinguish
+unconfigured, unverified, successful and degraded X requests. Account-wide failures stop the
+remaining paid requests in that run; source failure does not block an otherwise useful brief.
+Protected timeline errors, including HTTP 200 resource-authorization problems, stay per-attendee
+in prep and brief context without a connection-wide dashboard alarm. Protected-only runs prove
+neither a successful connection nor recovery from a prior connection failure.
+Rate limits stop further requests to that endpoint, retaining linked identities and other context.
+Current credentials gate staged X inputs at composition and through the existing delivery-effects
+permission check. Bookmarks have their own permission ID so losing user access cannot leave
+private saved Posts in a brief just because public access still works. No new store or scheduler.
+
+Chrome preserves readable profiles while reporting partial coverage when another fails. Notes
+and Screen Time query failures are distinct from empty results. Spotlight command failures do
+not prove there are no files; failed last-used metadata means the file's open status is unknown,
+including file/meeting matches. Bounded batches isolate vanished files with per-file retries under
+one shared six-second metadata deadline, preserving successful peers.
+Partial reads keep valid current fields, including empty lists, without blending cached sibling
+fields. All source projections count when deciding whether a snapshot is live. Current consent
+is checked again before style or Contacts updates from cached observations are written, including
+welcome/setup prewarm; channel-less style samples use the same iMessage consent as ingestion.
+First-brief composition fills availability per source, so one disabled source cannot hide another
+source's partial coverage.
+
+Browser history, recent-file metadata, screen time, notes and reminders supply current brief
+context. They do not add another history backfill or guarantee a nudge for each observation.
+Existing compose/extract logic decides what is useful; the ordinary graph and ledger remain the
+durable stores. Fixture tests exercise each Mac source through the authenticated Bridge response,
+the real brief prompt and the source manifest in both hosting modes, then revoke access and
+verify that held input is removed. Rust fixtures cover reader failures; dashboard tests prove
+diagnostic metadata requires authentication. These tests run in the existing verification suites.
 
 #### One product core, two deployment modes
 
@@ -935,7 +1035,7 @@ in the Mac and transport activation remain later integration gates.
 
 ## Optional card presentation
 
-`_shared/lib/visual_brief.py` owns the common brief/prep templates and licensed local fonts. `visual_delivery.py` selects presentation at the receiver seam; the Hermes gallery adapter sends one multipart message through the existing outbox. Temporary PNGs/manifests use `cache/visual-briefs/` and the seven-day staged-artifact retention rule. [Visual briefs](VISUAL-BRIEFS.md) documents the opt-in and test gates.
+`_shared/lib/visual_brief.py` owns the common brief/prep templates and licensed local fonts. `visual_delivery.py` selects presentation at the receiver seam and supplies fixed fallback reason codes to the existing delivery receipt; the Hermes gallery adapter sends one multipart message through the existing outbox. Temporary PNGs/manifests use `cache/visual-briefs/` and the seven-day staged-artifact retention rule. [Visual briefs](VISUAL-BRIEFS.md) documents the opt-in and test gates.
 
 The shared writing policy lives at `sotto-chief-of-staff/_shared/references/writing-style.md`. Existing provider request builders attach it to system instructions, and Hermes installation/startup appends that same file to the persona. Cloud and self-host share this policy; no channel-specific prose policy or new persistent store is introduced.
 

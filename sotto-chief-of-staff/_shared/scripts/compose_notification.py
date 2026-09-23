@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,7 @@ import gemini  # noqa: E402
 import jsonstore  # noqa: E402
 import model_work  # noqa: E402
 import pending_offer  # noqa: E402
+import preferences  # noqa: E402
 import action_links  # noqa: E402
 import loops_query  # noqa: E402
 import style_apply  # noqa: E402
@@ -49,6 +51,20 @@ availability; leave draft and decline empty and retain the grounded reason for t
 For lead birthday offers suggest a gift only from supplied interests/preferences and VIP evidence.
 Do not invent a person's interests. For escalation lead with the supplied cross-channel fact.
 For calendar changes state only the evidenced change/conflict. No headers, bullet lists or signoffs.
+For meeting_prep, text is ONLY one or two short sentences of personal context: who introduced
+the people (and each link in the introduction chain when explicit), what prompted THIS meeting,
+or a relevant last exchange. Prioritize the introduction and the reason for meeting. Use only
+the supplied memory, invitation and dated thread excerpts. Only excerpts marked event_thread can
+prove the invitation or introduction chain; recent_background is background, not proof of this
+meeting's purpose. A null from_me means neither owner
+nor attendee authorship is established; use sender_name if supplied, never attribute it to 'you'.
+An organizer is not necessarily an
+introducer; a previous discussion is not automatically today's agenda. Do not infer a purpose
+from someone's job, company, or a generic calendar title. Never turn tentative plans or disputed
+memory into settled facts. Do not repeat the person's role, countdown or open items: code adds
+those plus the prep offer. Do not offer research, ask questions or write replies. Leave draft
+and decline empty. Return no items if there is no useful grounded context. At most 60 words and
+500 characters.
 Match the provided writing samples. Drafts are text for review, never actions to execute."""
 
 
@@ -198,7 +214,12 @@ def enrich(items, now):
         item['style'] = style_apply.apply({'recipient': ident or person, 'channel': item.get('channel', '')})
         if person or ident:
             try:
-                item['person_facts'] = _read_json_script('_shared/knowledge/knowledge_query.py', '--person', ident or person)
+                from personal_context import TOPIC_RECORD_CHARS
+                event = item.get('event') or {}
+                topic = ' '.join(str(event.get(k) or '') for k in ('subject', 'summary', 'description', 'text', 'body', 'snippet'))
+                topic = (topic.strip() or str(item.get('title') or ''))[:TOPIC_RECORD_CHARS]
+                item['person_facts'] = _read_json_script('_shared/knowledge/knowledge_query.py',
+                    '--person', ident or person, '--topic', topic)
             except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
                 item['person_facts'] = {}  # Optional enrichment cannot suppress unrelated work.
         if item['kind'] == 'scheduling_ask':
@@ -209,7 +230,7 @@ def enrich(items, now):
     return items
 
 
-def _template(item, now):
+def _template(item, now, prep_context=''):
     kind = item['kind']
     if kind == 'intention':
         return ' '.join(str(item.get(k) or '') for k in ('title', 'detail')).strip()
@@ -222,10 +243,75 @@ def _template(item, now):
         person = item.get('person') or item.get('title') or 'your meeting'
         who = f" ({item['who']})" if item.get('who') else ''
         text = f"You're meeting {person}{who} in about {max(1, int((start - now.timestamp()) / 60))} minutes."
+        if prep_context:
+            text += ' ' + prep_context
         if item.get('open_loop'):
             text += ' Open with them: ' + item['open_loop'] + '.'
         return text + f' Want the full prep on {person}?'
     return None
+
+
+def _prep_threads(item):
+    """Reuse the focused prep's bounded Gmail read for the selected attendee only.
+
+    No web research, dependency installation or new durable store. Missing Google tooling or a
+    failed search leaves memory and the invitation available, and never withholds the reminder.
+    """
+    identifier = item.get('identifier', '')
+    if not re.fullmatch(r'[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+', identifier) or not allowed('gmail'):
+        return []
+    gather = _load('_shared/scripts/gather_google.py', 'notification_prep_google')
+    api = gather._find_google_api()
+    if not api:
+        return []
+    _, rows = gather._fetch_attendee_comms(api, identifier)
+    if not allowed('gmail'):
+        return []
+    # Keep whole excerpts; dropping an oversized one is safer than removing its qualifier.
+    explicit = preferences.load_explicit()
+    rows = [row for row in rows if len(json.dumps(row)) <= 2000
+            and not preferences.proactively_muted(row.get('sender_name', ''),
+                {'from': row.get('sender_identifier', '')}, explicit)]
+    event = item.get('event') or {}
+    event_thread = str(event.get('threadId') or event.get('thread_id') or '').strip()
+    for row in rows:
+        if event_thread and row.get('thread_id') == event_thread:
+            row['relation_to_event'] = 'event_thread'
+        else:
+            # Calendar providers usually supply no Gmail thread binding. Shared-attendee mail is
+            # useful recent background, never proof of this invitation's introduction or purpose.
+            row['relation_to_event'] = 'recent_background'
+    rows.sort(key=lambda row: row.get('relation_to_event') != 'event_thread')
+    return rows[:5]
+
+
+def _meeting_prep(item, now, llm):
+    """Optional context uses the existing bounded writer; the time-sensitive offer always survives."""
+    basic = _template(item, now)
+    if not basic:
+        return basic
+    try:
+        threads = _prep_threads(item)
+    except Exception as error:
+        logging.getLogger(__name__).warning('Meeting reminder thread lookup unavailable: %s', type(error).__name__)
+        threads = []
+    evidence = {**item, 'attendee_comms': threads}
+    if not (item.get('person_facts') or (item.get('event') or {}).get('description') or threads):
+        return basic
+    try:
+        rows = _write([evidence], llm)
+        if not rows:
+            return basic
+        # Consent can change while the writer is running. Never deliver copy based on a newly
+        # disabled source, including cached copy. The plain reminder needs no Gmail permission.
+        if threads:
+            if not allowed('gmail'):
+                return basic
+            delivery_effects.stage([{'kind': 'source_permissions', 'sources': ['gmail']}])
+        return _template(item, now, rows[0]['text'].strip())
+    except Exception as error:
+        logging.getLogger(__name__).warning('Meeting reminder context unavailable: %s', type(error).__name__)
+        return basic
 
 
 def _validate(raw, items):
@@ -244,6 +330,10 @@ def _validate(raw, items):
             raise ValueError('model supplied an action link')
         item = accepted[row['id']]
         copy = '\n'.join(row[k] for k in ('text', 'draft', 'decline'))
+        if item['kind'] == 'meeting_prep' and (row['draft'] or row['decline']
+                or len(row['text']) > 500 or len(row['text'].split()) > 60
+                or '?' in row['text'] or '\n' in row['text']):
+            raise ValueError('meeting context must be a short statement, not another offer')
         if not row['text'].strip() or len(copy) > MAX_COPY_CHARS or re.search(r'(?i)\b(proactive|chase|retune|ledger|loop)\b|following up|waiting for your response', copy):
             raise ValueError('notification violated plain writing contract')
         # A labelled field is a line that opens with a one- or two-word label and a colon
@@ -268,7 +358,7 @@ def _private_values(value):
     result = set()
     if isinstance(value, dict):
         for key, child in value.items():
-            if key in ('identifier', 'thread_id', 'threadId', 'anchor_key', 'sender_jid', 'contact_jid', 'chat_guid', 'id', 'contact_id', 'fact_id'):
+            if key in ('identifier', 'sender_identifier', 'thread_id', 'threadId', 'anchor_key', 'sender_jid', 'contact_jid', 'chat_guid', 'id', 'contact_id', 'fact_id'):
                 # An identifier has a digit or a separator in it, or is long; a fact id that is a
                 # plain English word must not ban that word from the copy.
                 if isinstance(child, str) and (len(child) >= 12 or re.search(r'[0-9_:@/+-]', child)) and len(child) >= 4:
@@ -284,9 +374,9 @@ def _private_values(value):
 def _writer_item(item):
     """Pass human evidence, never action bindings or the continuity ledger's control fields."""
     value = {k: item[k] for k in ('id', 'kind', 'person', 'title', 'detail', 'style', 'person_facts',
-                                 'slots', 'lead_days', 'importance', 'deadline') if k in item}
+                                 'slots', 'lead_days', 'importance', 'deadline', 'attendee_comms') if k in item}
     value['event'] = {k: v for k, v in (item.get('event') or {}).items()
-                      if k in ('text', 'body', 'subject', 'summary', 'start', 'end')}
+                      if k in ('text', 'body', 'subject', 'summary', 'description', 'start', 'end')}
     value['open_items'] = [{k: v for k, v in row.items() if k in ('name', 'what', 'deadline', 'direction')}
                            for row in item.get('open_loops', [])]
     if item.get('calendar'):
@@ -298,7 +388,7 @@ def _writer_item(item):
     def clean(obj):
         if isinstance(obj, dict):
             return {k: clean(v) for k, v in obj.items() if k not in
-                    ('identifier', 'thread_id', 'anchor_key', 'chased_count', 'email', 'phone', 'jid', 'url', 'id', 'contact_id', 'fact_id')}
+                    ('identifier', 'sender_identifier', 'thread_id', 'anchor_key', 'chased_count', 'email', 'phone', 'jid', 'url', 'id', 'contact_id', 'fact_id')}
         if isinstance(obj, list):
             return [clean(v) for v in obj]
         if isinstance(obj, str):
@@ -372,7 +462,7 @@ def _render(row, item):
 
 
 def _post_meeting(item):
-    """Run the existing transcript-grounded composer without its CLI's ledger apply step."""
+    """Immediate follow-up through the shared cached extract → canonical-apply seam."""
     event = item.get('event') or {}
     attendees = {a.get('email', '').lower(): a for a in event.get('attendees') or [] if a.get('email')}
     meetings = []
@@ -390,34 +480,23 @@ def _post_meeting(item):
                     if (meeting.get('title') == event.get('summary') and start is not None
                             and expected is not None and abs(start - expected) <= 300):
                         meetings.append(meeting)
-    if len(meetings) != 1:
-        loops = item.get('open_loops') or []
-        if not loops:
-            return ''
-        return f"After {item.get('title') or 'your meeting'}, still open: " + '; '.join(r['what'] for r in loops[:3])
-    if not allowed('granola'):
+    if len(meetings) == 1 and allowed('granola'):
+        delivery_effects.stage([{'kind': 'source_permissions', 'sources': ['granola']}])
+        capture = _load('followup/scripts/capture_commitments.py', 'notification_followup_capture')
+        result = capture.extract_apply_meeting(
+            meetings[0], data_root=os.environ.get('SOTTO_DATA', '/data'))
+        for draft in (result.get('followup') or {}).get('drafts') or []:
+            email = (draft.get('to_email') or '').lower()
+            if email not in attendees or not isinstance(draft.get('body'), str) or not draft['body'].strip():
+                continue
+            target_item = {**item, 'identifier': email, 'channel': 'email',
+                           'person': attendees[email].get('name') or email}
+            return _render({'text': f"After {item.get('title') or 'your meeting'}:",
+                            'draft': draft['body'], 'decline': ''}, target_item)
+    loops = item.get('open_loops') or []
+    if not loops:
         return ''
-    delivery_effects.stage([{'kind': 'source_permissions', 'sources': ['granola']}])
-    composer = _load('followup/scripts/compose_followup.py', 'notification_followup')
-    inputs = {'granola': meetings, 'google': {'events': [event]}, 'user_email': os.environ.get('SOTTO_USER_EMAIL', '')}
-    root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'events/notification-artifacts'
-    root.mkdir(parents=True, exist_ok=True)
-    path = str(root / ('followup-' + model_work.revision([inputs, gemini.gemini_transport.effective_compose_model(),
-                                                       (PACK / 'followup/scripts/compose_followup.py').read_text()]) + '.json'))
-    with jsonstore.lock(model_work.artifact_lock_path(root, path)):
-        result = jsonstore.read(path, default=None, strict=True)
-        if result is None:
-            result = composer.compose(inputs, since_hours=3)
-            jsonstore.write_atomic(path, result)
-    for draft in result.get('drafts') or []:
-        email = (draft.get('to_email') or '').lower()
-        if email not in attendees or not isinstance(draft.get('body'), str) or not draft['body'].strip():
-            continue
-        target_item = {**item, 'identifier': email, 'channel': 'email',
-                       'person': attendees[email].get('name') or email}
-        return _render({'text': f"After {item.get('title') or 'your meeting'}:",
-                              'draft': draft['body'], 'decline': ''}, target_item)
-    return ''
+    return f"After {item.get('title') or 'your meeting'}, still open: " + '; '.join(r['what'] for r in loops[:3])
 
 
 def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
@@ -451,6 +530,8 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
         try:
             if item['kind'] == 'post_meeting':
                 rendered = _post_meeting(item)
+            elif item['kind'] == 'meeting_prep':
+                rendered = _meeting_prep(item, now, llm)
             else:
                 if item['id'] not in ready and item in writing and not written:
                     written = True
@@ -470,6 +551,11 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
                         if item['kind'] == 'meeting_prep' else rendered.rsplit('. ', 1)[-1])
             pending_offer.set_offer(item['kind'], question, item.get('person', ''),
                                     item.get('detail', ''), anchor_key=item.get('anchor_key', ''))
+        if item['kind'] == 'meeting_prep':
+            delivery_effects.stage([{'kind': 'meeting_prep_delivered', 'mode': 'offer',
+                                     'calendar_event_id': item.get('calendar_event_id', ''),
+                                     'calendar_start': item.get('calendar_start', ''),
+                                     'date': item.get('proactive_date', '')}])
         break
     if not text and error:
         raise error

@@ -43,7 +43,7 @@ def run(request):
     sys.path.insert(0, str(pack / '_shared' / 'lib'))
     import jsonstore
     import work_queue
-    from source_context import allowed, project_local, read_local, record_bridge_status, used_sources
+    from source_context import allowed, project_local, project_x, read_local, record_bridge_status, used_sources
     from textutil import unwrap_tool_result
     from timeutil import configured_tz, _user_local_date
 
@@ -234,7 +234,7 @@ def run(request):
             if usable_prep:
                 save(paths['granola'], load(scratch / 'prepared/granola.json', {}))
                 save(paths['research'], load(scratch / 'prepared/research.json', {'attendees': []}))
-                save(paths['x'], load(scratch / 'prepared/x.json', {}))
+                save(paths['x'], project_x(load(scratch / 'prepared/x.json', {})))
             else:
                 # Reuse durable research already prepared today. No uncached web research delays
                 # delivery; the scheduled preparation job and ordinary prep lane can complete it.
@@ -273,7 +273,7 @@ def run(request):
             if not isinstance(composed.get('brief_text'), str) or not composed['brief_text'].strip():
                 raise RuntimeError('composer produced no chat text')
             composed.setdefault('_source_permissions', used_sources(
-                local, emails, events, load(paths['granola'], {})))
+                local, emails, events, load(paths['granola'], {}), load(paths['x'], {})))
             composed['_source_cutoff'] = coverage_until
             composed['_calendar_eligibility'] = [
                 {'kind': 'eligibility', 'source': 'calendar',

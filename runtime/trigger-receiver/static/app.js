@@ -73,6 +73,9 @@
   }
 
   function setView() {
+    // The marker describes the DOM that is actually committed, not the route that requested it.
+    // Every replacement invalidates it; a successful view sets its own identity afterwards.
+    state.renderedView = null;
     main.replaceChildren();
     for (var i = 0; i < arguments.length; i++) {
       if (arguments[i]) main.appendChild(arguments[i]);
@@ -574,7 +577,8 @@
 
   function viewNow(anchor) {
     var seq = ++state.renderSeq;
-    setView(skeletonView(3));
+    var preservingNow = state.renderedView === "now";
+    if (!preservingNow) setView(skeletonView(3));
     Promise.all([
       api("/api/overview"),
       api("/api/loops").catch(function () { return null; }),
@@ -614,27 +618,30 @@
         // Parked — kept, out of the brief; one tap brings any of them back
         buildParkedSection(frag, parked, "now");
 
-        // Today's briefs, when any have landed
+        // Today's brief delivery state, from the outbox/provider receipts.
         var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];
         if (todays.length) {
-          frag.appendChild(ledgerCap("Delivered today", capCount(String(todays.length))));
+          var sent = todays.filter(function (brief) { return brief && brief.status === "sent"; });
+          frag.appendChild(ledgerCap("Sent today", capCount(String(sent.length))));
           var bl = el("div", "ledger");
-          for (var b = 0; b < todays.length; b++) {
-            bl.appendChild(briefRow({ date: data.date, kind: todays[b] && todays[b].kind }, "today"));
+          for (var b = 0; b < sent.length; b++) {
+            bl.appendChild(briefRow({ date: data.date, kind: sent[b] && sent[b].kind }, "today"));
           }
-          frag.appendChild(bl);
+          if (sent.length) frag.appendChild(bl);
         }
 
         state.entered.now = true;
         setView();
         main.appendChild(frag);
+        state.renderedView = "now";
         if (anchor === "docket") {
           var target = document.getElementById("docket");
           if (target) target.scrollIntoView();
         }
       }).catch(function (err) {
         if (seq !== state.renderSeq || err.handled) return;
-        setView(errorView("The Now page didn't load.", function () { viewNow(); }));
+        if (preservingNow) toast("The latest status couldn't be read; showing the last update");
+        else setView(errorView("The Now page didn't load.", function () { viewNow(); }));
       });
   }
 
@@ -688,16 +695,39 @@
     if (svc.google !== true) trouble.push("Google needs connecting");
     if (svc.channel_ok !== true) trouble.push(humanChannel(svc.channel) + " isn't linked");
     if (svc.granola === "reconnect") trouble.push("Granola needs a reconnect");
+    if (data.source_health && data.source_health.status === "unavailable") {
+      trouble.push("source status couldn't be read");
+    }
+    var sourceRows = data.source_health && Array.isArray(data.source_health.sources)
+      ? data.source_health.sources : [];
+    var sourceIssues = sourceRows.filter(function (row) {
+      return (row.source === "x" || data.bridge_connected === true)
+        && ["partial", "degraded", "unavailable", "needs_fda", "stale"].indexOf(row.status) >= 0;
+    });
+    if (sourceIssues.length) {
+      trouble.push(sourceIssues.map(function (row) { return row.label; }).join(", ")
+        + (sourceIssues.length === 1 ? " needs checking" : " need checking"));
+    }
     if (trouble.length) parts.push(clause(trouble.join(", "), "/setup", true));
 
     // 2 · Briefs today
     var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];
-    if (todays.length === 1 && todays[0] && todays[0].kind) {
-      parts.push(clause(String(todays[0].kind) + " brief delivered — read it",
-        "#briefs/" + encodeURIComponent(data.date || "") + "/" + encodeURIComponent(todays[0].kind)));
-    } else if (todays.length > 1) {
-      parts.push(clause(todays.length + " briefs delivered today", "#activity/briefs"));
-    } else {
+    var sentToday = todays.filter(function (brief) { return brief && brief.status === "sent"; });
+    var failedToday = todays.filter(function (brief) { return brief && brief.status === "failed"; });
+    var pendingToday = todays.filter(function (brief) { return brief && brief.status === "pending"; });
+    if (sentToday.length === 1 && sentToday[0].kind) {
+      parts.push(clause(String(sentToday[0].kind) + " brief sent; read it",
+        "#briefs/" + encodeURIComponent(data.date || "") + "/" + encodeURIComponent(sentToday[0].kind)));
+    } else if (sentToday.length > 1) {
+      parts.push(clause(sentToday.length + " briefs sent today", "#activity/briefs"));
+    }
+    if (failedToday.length) {
+      parts.push(clause("a brief couldn't be sent", "#activity/briefs", true));
+    }
+    if (pendingToday.length) {
+      parts.push(clause("a brief is waiting to be sent", "#activity/briefs"));
+    }
+    if (!sentToday.length && !failedToday.length && !pendingToday.length) {
       parts.push(clause("no brief has landed yet today", "#activity/briefs"));
     }
 
@@ -3282,7 +3312,32 @@
     row.appendChild(el("span", "rg-clock", d ? fmtClock(d) : "—"));
     var sentence = recordSentence(entry);
     if (!/[.!?]$/.test(sentence)) sentence += ".";
-    row.appendChild(el("span", "rg-text", sentence));
+    var text = el("div", "rg-main");
+    text.appendChild(el("span", "rg-text", sentence));
+    var related = Array.isArray(entry.related_decisions) ? entry.related_decisions : [];
+    // The sentence already carries the reason for a skipped, dropped, superseded or failed
+    // send; the expandable detail is for what the sentence leaves out (how it was sent).
+    var extraDetail = entry.source === "delivery" && str(entry.detail) &&
+      !/^(skipped|expired|superseded|failed)$/.test(str(entry.status)) ? str(entry.detail) : "";
+    if (entry.source === "delivery" && (extraDetail || related.length)) {
+      var details = el("details", "rg-details");
+      details.appendChild(el("summary", null, "Details"));
+      if (extraDetail) details.appendChild(el("p", "row-detail", extraDetail));
+      if (related.length) {
+        details.appendChild(el("p", "row-detail", "Related decisions"));
+        var reasons = el("ul");
+        related.forEach(function (decision) {
+          var channel = humanChannel(decision.channel);
+          var who = str(decision.sender);
+          var reason = str(decision.reason) || TRIAGE_CLASS_LABELS[str(decision["class"])] || "Recorded decision";
+          reasons.appendChild(el("li", "row-detail",
+            (channel ? channel + " · " : "") + (who ? who + ": " : "") + reason));
+        });
+        details.appendChild(reasons);
+      }
+      text.appendChild(details);
+    }
+    row.appendChild(text);
     var channel = "";
     if ((entry.source === "outcome" || entry.source === "triage") && str(entry.channel)) {
       channel = humanChannel(entry.channel);
@@ -3332,15 +3387,19 @@
   };
 
   function deliveryThing(label) {
-    var head = str(label).split(":")[0].toLowerCase();
-    return DELIVERY_THING[head] || "a message";
+    var parts = str(label).toLowerCase().split(":");
+    var job = parts[parts.length - 1].replace(/^sotto-/, "");
+    var scheduled = { "morning-brief": "your morning brief", "evening-brief": "your evening brief",
+      "midday-digest": "the midday digest", "relationship-pulse": "your relationship update",
+      "meeting-prep": "your meeting prep" };
+    return scheduled[job] || DELIVERY_THING[parts[0]] || "a message";
   }
 
   function deliverySentence(e) {
     var thing = deliveryThing(e.label);
     var why = str(e.detail);
     switch (str(e.status)) {
-      case "delivered": return "Delivered " + thing;
+      case "delivered": return "Sent " + thing;
       case "empty": return "Nothing worth saying — " + thing + " stayed silent";
       case "skipped": return "Skipped " + thing + (why ? " — " + why : "");
       case "expired": return "Dropped " + thing + (why ? " — " + why : "");
@@ -3402,6 +3461,7 @@
   /* log_outcome.py vocabulary: draft_created | opened | copied | dismissed |
      executed | viewed | edited_and_sent. Anything else renders tolerantly. */
   function outcomeSentence(e) {
+    if (str(e.display_label)) return str(e.display_label);
     var thing = actionThing(e.action_type);
     var contact = str(e.contact);
     var to = contact ? " to " + contact : "";

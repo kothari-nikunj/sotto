@@ -475,7 +475,7 @@ def test_feedback_archive_requires_current_source_consent(tmp_path, monkeypatch)
     brief.with_name('2026-09-07.morning.delivered').write_text('run')
     source_state = tmp_path / 'config/source-state.json'
     source_state.parent.mkdir()
-    source_state.write_text(json.dumps({'sources': {'imessage': {'status': 'enabled'}}}))
+    source_state.write_text(json.dumps({'sources': {'imessage': {'status': 'ok'}}}))
     assert usefulness_feedback.items()[0]['text'] == text
     usefulness_feedback.record(brief.stem, 'useful', text)
     source_state.write_text(json.dumps({'sources': {'imessage': {'status': 'disabled'}}}))
@@ -530,7 +530,7 @@ def test_whole_brief_feedback_requires_authorized_archive(tmp_path, lost, legacy
     marker.touch()
     source = tmp_path / 'config/source-state.json'
     source.parent.mkdir()
-    source.write_text(json.dumps({'sources': {'imessage': {'status': 'enabled'}}}))
+    source.write_text(json.dumps({'sources': {'imessage': {'status': 'ok'}}}))
     usefulness_feedback.record(brief.stem, 'useful')
     if legacy:
         outcomes = tmp_path / 'outcomes.jsonl'

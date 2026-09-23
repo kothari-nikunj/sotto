@@ -38,11 +38,13 @@ def test_every_writer_runs_in_order_and_the_receipt_says_what_ran(tmp_path, monk
                  continuity=_touch(tmp_path, "cont.json"))
     receipt = ls.learn(args, run=fake_run)
     assert calls == ["knowledge_update.py", "continuity_resolve.py", "style_extract.py",
-                     "draft_outcomes.py", "granola_graph.py", "prewarm_graph.py"]
+                     "draft_outcomes.py", "capture_commitments.py", "granola_graph.py",
+                     "prewarm_graph.py"]
     assert receipt["ok"] is False and receipt["day"] == "2026-09-04" and receipt["kind"] == "morning"
     assert receipt["steps"]["granola"] == {"status": "failed", "exit": 3, "detail": "boom"}
     assert {k: v["status"] for k, v in receipt["steps"].items() if k != "granola"} == {
-        "knowledge": "ok", "continuity": "ok", "drafts": "ok", "style": "ok", "contacts": "ok"}
+        "knowledge": "ok", "continuity": "ok", "drafts": "ok", "style": "ok",
+        "commitments": "ok", "contacts": "ok"}
     on_disk = json.load(open(ls.receipt_path("2026-09-04", "morning")))
     assert on_disk == receipt
 
@@ -58,8 +60,17 @@ def test_a_step_with_no_input_is_skipped_never_failed(tmp_path, monkeypatch):
     assert calls == ["draft_outcomes.py", "prewarm_graph.py"]
     assert receipt["ok"] is True
     assert {k: v["status"] for k, v in receipt["steps"].items()} == {
-        "knowledge": "skipped", "continuity": "skipped", "drafts": "ok",
+        "knowledge": "skipped", "continuity": "skipped", "drafts": "ok", "commitments": "skipped",
         "style": "skipped", "granola": "skipped", "contacts": "ok"}
+
+
+def test_commitment_capture_gets_three_meeting_timeout_budget():
+    seen = {}
+    def fake_run(argv, **kwargs):
+        seen['timeout'] = kwargs['timeout']
+        return types.SimpleNamespace(returncode=0, stdout='{}', stderr='')
+    ls._run_one('/tmp/capture_commitments.py', ['--granola', '/tmp/g.json'], run=fake_run)
+    assert seen['timeout'] == ls.COMMITMENTS_TIMEOUT_SECS == 540
 
 
 def test_a_missing_gmail_file_never_skips_the_voice_writer(tmp_path, monkeypatch):

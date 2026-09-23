@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,12 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 VIEW_RE = re.compile(r"https?://(?:www\.)?docsend\.com/view/([A-Za-z0-9_-]+)", re.I)
 TOKEN_RE = re.compile(r'name="authenticity_token"\s+value="([^"]+)"')
 CSRF_RE = re.compile(r'name="csrf-token"\s+content="([^"]+)"')
+
+
+def _client_revision() -> str:
+    """Release parked deck-reader request contracts when this owning client is repaired."""
+    with open(__file__, "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()
 TITLE_RE = re.compile(r"<title>([^<]*)</title>", re.I)
 
 
@@ -355,14 +362,29 @@ def _gemini_read(images: list, title: str) -> str:
     for img in images:
         parts.append({"inline_data": {"mime_type": "image/png",
                                       "data": base64.b64encode(img).decode()}})
-    req = gemini_transport.request(MODEL, {"contents": [{"parts": parts}]}, key)
+    import model_work
+    evidence = [title, MODEL, [hashlib.sha256(image).hexdigest() for image in images]]
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read())
+        with model_work.scope('deck_read', [evidence, _client_revision()], occurrence=True):
+            body = {"contents": [{"parts": parts}],
+                    "generationConfig": model_work.generation_config(MODEL)}
+            request_contract = {"inline_mime_type": "image/png",
+                                "generationConfig": body["generationConfig"]}
+            with model_work.attempt('gemini', MODEL, json.dumps(evidence), schema=request_contract):
+                req = gemini_transport.request(MODEL, body, key)
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    data = json.loads(r.read())
+                model_work.note_usage(MODEL, data.get('usageMetadata'))
+                cand = (data.get("candidates") or [{}])[0]
+                if cand.get('finishReason') == 'MAX_TOKENS':
+                    raise ValueError('Gemini deck read reached MAX_TOKENS')
+                text = "".join(p.get("text", "")
+                               for p in (cand.get("content", {}).get("parts") or [])).strip()
+                if not text:
+                    raise ValueError('Gemini deck read returned no text')
     except Exception:  # noqa: BLE001
         return ""
-    cand = (data.get("candidates") or [{}])[0]
-    return "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
+    return text
 
 
 def main() -> int:

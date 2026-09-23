@@ -1,6 +1,9 @@
 """web_research.py — THE search seam: the provider ladder (Exa / Parallel / Gemini), the honest
 no-provider path, and each client's response parsing against its verified wire shape."""
+import concurrent.futures
 import importlib.util, io, json, os
+import threading
+from urllib.error import HTTPError
 
 import pytest
 
@@ -103,7 +106,8 @@ def test_web_search_prefers_exa_over_gemini(monkeypatch):
     assert all("generativelanguage" not in c for c in calls)   # Gemini was never billed
 
 
-def test_web_search_falls_through_when_exa_errors(monkeypatch):
+def test_web_search_falls_through_when_exa_errors(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("EXA_API_KEY", "e"); monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
     _wire(monkeypatch, {"api.exa.ai": OSError("connection reset"),
                         "generativelanguage": GEMINI_SEARCH})
@@ -111,7 +115,8 @@ def test_web_search_falls_through_when_exa_errors(monkeypatch):
     assert out["provider"] == "gemini" and out["text"] == "Peyton works at Browserbase."
 
 
-def test_web_search_falls_through_when_exa_finds_nothing(monkeypatch):
+def test_web_search_falls_through_when_exa_finds_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("EXA_API_KEY", "e"); monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
     _wire(monkeypatch, {"api.exa.ai": {"results": []}, "generativelanguage": GEMINI_SEARCH})
     assert wr.research("q")["provider"] == "gemini"
@@ -151,12 +156,121 @@ def test_exa_search_parses_text_and_citations(monkeypatch):
     assert "no url — dropped" not in out["text"]     # a result without a URL is not a citation
 
 
-def test_gemini_search_parses_grounding_citations(monkeypatch):
+def test_gemini_search_parses_grounding_citations(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
     _wire(monkeypatch, {"generativelanguage": GEMINI_SEARCH})
     out = wr.research("Peyton Casper")
     assert out["text"] == "Peyton works at Browserbase."
     assert out["citations"] == [{"title": "Team", "uri": "https://browserbase.com/team"}]
+
+
+def test_gemini_search_rejects_truncated_output_inside_attempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    truncated = {"candidates": [{"finishReason": "MAX_TOKENS",
+                                 "content": {"parts": [{"text": "partial answer"}]}}]}
+    _wire(monkeypatch, {"generativelanguage": truncated})
+    out = wr.research("Peyton Casper")
+    assert out["provider"] is None and out["text"] == ""
+    import sqlite3
+    with sqlite3.connect(tmp_path / "events/model-work.sqlite3") as db:
+        assert db.execute("SELECT status FROM attempts").fetchone()[0] == "ValueError"
+
+
+def test_web_client_repair_releases_parked_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "a" * 32)
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise HTTPError("https://provider", 400, "bad request", {}, io.BytesIO())
+        return GEMINI_SEARCH
+
+    monkeypatch.setattr(wr, "_post", post)
+    with pytest.raises(HTTPError):
+        wr._gemini_search("same query", 10)
+    import model_work
+    with pytest.raises(model_work.ModelWorkHeldError):
+        wr._gemini_search("same query", 10)
+    assert len(calls) == 1
+    monkeypatch.setattr(wr, "_client_revision", lambda: "repaired-client")
+    assert wr._gemini_search("same query", 10)["text"] == "Peyton works at Browserbase."
+    assert len(calls) == 2
+
+
+def test_identical_grounded_search_in_one_run_reuses_complete_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "c" * 32)
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    calls = []
+    _wire(monkeypatch, {"generativelanguage": GEMINI_SEARCH}, calls)
+    first = wr._gemini_search("same query", 10)
+    second = wr._gemini_search("same query", 10)
+    assert first == second and len(calls) == 1
+    first["text"] = "mutated by caller"
+    assert wr._gemini_search("same query", 10)["text"] == "Peyton works at Browserbase."
+
+
+def test_identical_url_read_in_one_run_reuses_complete_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "d" * 32)
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    calls = []
+    response = {"candidates": [{"content": {"parts": [{"text": "Title\nBody"}]}}]}
+    _wire(monkeypatch, {"generativelanguage": response}, calls)
+    assert wr._gemini_fetch_url("https://example.com", 10) == wr._gemini_fetch_url(
+        "https://example.com", 10)
+    assert len(calls) == 1
+
+
+def test_concurrent_identical_searches_single_flight_one_paid_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "e" * 32)
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    with wr._RUN_CACHE_LOCK:
+        wr._RUN_CACHE.clear()
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(2)
+        return GEMINI_SEARCH
+
+    monkeypatch.setattr(wr, "_post", post)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(wr._gemini_search, "same concurrent query", 10)
+        assert entered.wait(1)
+        second = pool.submit(wr._gemini_search, "same concurrent query", 10)
+        release.set()
+        assert first.result() == second.result()
+    assert len(calls) == 1
+
+
+def test_same_run_and_query_never_reuses_across_data_roots(tmp_path, monkeypatch):
+    first_root, second_root = tmp_path / "one", tmp_path / "two"
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "f" * 32)
+    monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
+    with wr._RUN_CACHE_LOCK:
+        wr._RUN_CACHE.clear()
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(os.environ["SOTTO_DATA"])
+        text = "first root" if os.environ["SOTTO_DATA"] == str(first_root) else "second root"
+        return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+
+    monkeypatch.setattr(wr, "_post", post)
+    monkeypatch.setenv("SOTTO_DATA", str(first_root))
+    assert wr._gemini_search("same cross-root query", 10)["text"] == "first root"
+    monkeypatch.setenv("SOTTO_DATA", str(second_root))
+    assert wr._gemini_search("same cross-root query", 10)["text"] == "second root"
+    assert calls == [str(first_root), str(second_root)]
 
 
 def test_exa_deep_parses_structured_output(monkeypatch):

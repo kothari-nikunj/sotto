@@ -218,6 +218,58 @@ def test_preparation_does_optional_work_once_then_current_sources_are_gathered_a
     assert names.index('research_attendees.py') < names.index('compose_brief.py')
 
 
+def test_managed_granola_capability_allows_scheduled_preparation_gather(
+        procedure, tmp_path, monkeypatch):
+    request, state = procedure
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    (tmp_path / 'config').mkdir(exist_ok=True)
+    (tmp_path / 'config/managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'test', 'sources': {
+            'granola': {'consented': True, 'connected': True}}}))
+    assert brief_runner.run({**request, 'prepare': True}) == 'NO_NUDGES'
+    assert 'gather_granola.py' in [name for name, _, _ in state['calls']]
+
+
+@pytest.mark.parametrize('mode', ['self-host', 'managed'])
+@pytest.mark.parametrize('revoke', [False, True])
+def test_prepared_x_reaches_brief_and_permission_manifest(procedure, tmp_path, monkeypatch, mode, revoke):
+    request, state = procedure
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
+    monkeypatch.setenv('X_BEARER_TOKEN', 'fixture')
+    monkeypatch.delenv('SOTTO_X_STUB', raising=False)
+    original = brief_runner.subprocess.run
+    x = {'attendees': [{'handle': 'fixture', 'recent_posts': [{'text': 'Fresh X fixture'}]}],
+         'warnings': ['X bookmarks unavailable']}
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'x_connectivity.py':
+            assert '--calendar' in argv and '--research' in argv
+            Path(argv[argv.index('--out') + 1]).write_text(json.dumps(x))
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            context = json.loads(Path(argv[argv.index('--x-context') + 1]).read_text())
+            if revoke:
+                assert not context['attendees']
+            else:
+                assert context['attendees'][0]['recent_posts'][0]['text'] == 'Fresh X fixture'
+                assert context['warnings'] == ['X bookmarks unavailable']
+        return result
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run({**request, 'prepare': True}) == 'NO_NUDGES'
+    assert 'x_connectivity.py' in [name for name, _, _ in state['calls']]
+    if revoke:
+        monkeypatch.delenv('X_BEARER_TOKEN')
+    assert brief_runner.run(request) == 'A useful brief'
+    manifest = json.loads((tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    sources = next(effect['sources'] for effect in manifest['effects'] if effect['kind'] == 'source_permissions')
+    assert ('x' in sources) is not revoke
+    if not revoke:
+        monkeypatch.delenv('X_BEARER_TOKEN')
+        with pytest.raises(RuntimeError, match='permission changed'):
+            brief_runner.run(request)
+
+
 def test_preparation_finishing_after_due_composition_does_not_publish_stale_receipt(
         procedure, tmp_path, monkeypatch):
     request, _state = procedure

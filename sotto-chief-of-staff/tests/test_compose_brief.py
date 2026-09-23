@@ -454,6 +454,53 @@ def test_a_broken_contacts_source_still_carries_forward(tmp_path):
     del os.environ["SOTTO_DATA"]
 
 
+def test_browser_only_payload_is_a_live_local_observation():
+    assert cb._live_local_observation({"search_queries": ["quarterly planning"]})
+    assert cb._live_local_observation({"screen_time": {"top_apps": [{"app_name": "Notes"}]}})
+
+
+def test_partial_browser_read_keeps_explicit_live_fields_without_cached_sibling(tmp_path):
+    previous = {
+        "captured_at": _recent_stamp(2),
+        "local": {
+            "chrome_history": [{"domain": "old.example", "visit_count": 2}],
+            "search_queries": ["older query"],
+            "source_status": {"chrome": "ok"},
+            "_source_observed_at": {"chrome": _recent_stamp(2)},
+        },
+    }
+    live_stamp = _recent_stamp(1)
+    merged = cb._merge_local_snapshot({
+        "generated_at": live_stamp,
+        "chrome_history": [{"domain": "fresh.example", "visit_count": 3}],
+        "search_queries": [],
+        "source_status": {"chrome": "partial"},
+    }, previous)
+    assert merged["chrome_history"][0]["domain"] == "fresh.example"
+    assert merged["search_queries"] == []
+    assert merged["source_status"]["chrome"] == "partial"
+    assert merged["_source_availability"]["chrome"] == "partial"
+    assert merged["_source_observed_at"]["chrome"] == live_stamp
+    assert "_local_stale_since" not in merged
+
+    # A later partial response that omits search_queries cannot resurrect the old cached query.
+    again = cb._merge_local_snapshot({
+        "generated_at": _recent_stamp(0),
+        "chrome_history": [{"domain": "newest.example", "visit_count": 1}],
+        "source_status": {"chrome": "degraded"},
+    }, {"captured_at": live_stamp, "local": merged})
+    assert "search_queries" not in again
+
+
+def test_source_availability_uses_readable_local_source_labels():
+    text = cb._format_source_availability({
+        "safari": "unavailable", "recent_files": "unavailable",
+        "screen_time": "disabled", "apple_notes": "disabled",
+    })
+    assert "Safari History" in text and "Recent Files" in text
+    assert "Screen Time" in text and "Apple Notes" in text
+
+
 def test_build_data_manifest_shape():
     inputs = {"google": {"emails": [{"headers": {"subject": "Deal", "from": "a@x.com"}, "threadId": "t1"},
                                     {"headers": {"subject": "Deal", "from": "a@x.com"}, "threadId": "t1"}],
@@ -1335,7 +1382,7 @@ def _followup_capable_llm(seen, calls):
     return fake_llm
 
 
-def test_evening_brief_merges_followup_context(tmp_path, monkeypatch):
+def test_evening_brief_reuses_shared_persisted_capture(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     seen, calls = {}, {"followup": 0}
     inputs = {"type": "evening", "google": {"events": [], "userEmail": "me@x.com"},
@@ -1345,24 +1392,30 @@ def test_evening_brief_merges_followup_context(tmp_path, monkeypatch):
                            "attendee_emails": ["dana@acme.com"]}],
               "local": {}}
     out = cb.compose(inputs, llm=_followup_capable_llm(seen, calls))
-    assert calls["followup"] == 1                      # exactly one followup extraction ran
-    # The model's narrative is delivered as written; the commitment this very run wrote to the
-    # ledger has no deadline and has never been chased, so it is NOT urgent — it is represented by
-    # the one quiet count line, not by a row of its own (open-items contract — see
-    # test_still_open_backstop_appends_dropped_ledger_items).
+    assert calls["followup"] == 1
     assert out["brief_markdown"].startswith("# Good ") and "\n\n# Evening" in out["brief_markdown"]
-    assert "## Still open\n- 1 other open loop. Ask me what's still open." in out["brief_markdown"]
-    assert "send the deck" not in out["brief_markdown"]
     p = seen["prompt"]
-    # rendered followup context reached the evening prompt (via the reconciliation/evening path,
-    # since the template has no {{followup_context}} placeholder yet)
     assert "Today's Meeting Follow-Ups" in p
-    assert "send the deck" in p
-    assert "Ready-to-send drafts prepared: 1" in p
-    # commitments were deterministically written to the continuity ledger via the existing apply path
-    cdir = tmp_path / "knowledge" / "continuity"
-    files = list(cdir.glob("*.md")) if cdir.exists() else []
-    assert files and any("send the deck" in f.read_text() for f in files)
+    assert "Commitments confirmed in the action ledger: 1" in p
+    assert (tmp_path / "knowledge/continuity").exists()
+
+
+def test_evening_shared_capture_preserves_standing_rule_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    seen = {}
+    def llm(prompt, inputs, system=None, schema=None):
+        if inputs.get('_followup'):
+            return json.dumps({'followup_markdown': '', 'commitments': [], 'drafts': [],
+                               'procedural_candidates': ['Always send a recap after investor calls.']})
+        seen['prompt'] = prompt
+        return json.dumps({'brief_markdown': '# Evening', 'actions': []})
+    inputs = {'type': 'evening', 'google': {'events': [], 'userEmail': 'me@x.com'},
+              'granola': [{'meeting_id': 'm-rule', 'title': 'Investor call',
+                           'date': _iso_hours_ago(2),
+                           'transcript': 'Me: Always send a recap after investor calls.',
+                           'attendee_emails': ['investor@example.com']}], 'local': {}}
+    out = cb.compose(inputs, llm=llm)
+    assert 'Always send a recap after investor calls.' in out['brief_markdown']
 
 
 def test_morning_brief_never_runs_followup(monkeypatch, tmp_path):
@@ -1581,6 +1634,33 @@ def test_validator_violations_feed_critic_and_force_revise(monkeypatch):
     # … and force the revise pass even though the critic itself found nothing
     assert _body(out["brief_markdown"]) == fixed_brief
     assert out["_critic"]["actionable"] >= 2
+    assert out["_critic"]["revision_reasons"] == {
+        "critic": {"count": 0, "categories": {}},
+        "validator": {"count": 2,
+                      "categories": {"banned-phrase": 1, "missing-marker": 1}},
+    }
+
+
+def test_revision_reason_diagnostics_are_content_free_and_bounded(monkeypatch):
+    monkeypatch.setenv("SOTTO_CRITIC", "always")
+
+    def fake_llm(prompt, inputs, system=None, schema=None):
+        if inputs.get("_critic"):
+            return json.dumps({"patches": [
+                {"type": "fix_attribution", "detail": "private detail", "severity": "critical"},
+                {"type": "invented-freeform-type", "detail": "another detail", "severity": "moderate"},
+            ], "score": 50, "summary": "repair"})
+        return json.dumps({"brief_markdown": "## Needs Attention Now\nFixed.", "actions": []})
+
+    out = cb.critique_and_revise(
+        {"brief_markdown": "draft", "actions": []}, {}, llm=fake_llm,
+        violations=["bad category with spaces: secret source text",
+                    "dropped-open-loop: private obligation"], source_prompt="sources")
+    assert out["_critic"]["revision_reasons"] == {
+        "critic": {"count": 2, "categories": {"fix_attribution": 1, "other": 1}},
+        "validator": {"count": 2, "categories": {"dropped-open-loop": 1, "other": 1}},
+    }
+    assert "private detail" not in json.dumps(out["_critic"]["revision_reasons"])
 
 
 def test_validator_never_blocks_delivery(monkeypatch):
@@ -2684,3 +2764,214 @@ def test_model_work_hold_delivers_the_draft_and_never_reports_a_passing_critic(m
         'score': 0, 'summary': 'repair required'})
     out = cb.critique_and_revise({'brief_markdown': 'draft'}, {}, llm=held, source_prompt='evidence')
     assert out['brief_markdown'] == 'draft' and out['_critic']['held'] is True
+
+
+
+def test_gallery_space_names_active_loops_before_delivery_attribution(tmp_path, monkeypatch):
+    from test_visual_brief import BRIEF
+    import visual_brief
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    rows = [{"anchor_key": f"quiet-{i}", "contact_name": name, "status": "open",
+             "canonical_id": f"person-{i}", "contact_identifier": f"person{i}@example.com",
+             "type": "waiting_on", "created_at": "2026-09-19T10:00:00+00:00",
+             "summary": f"Send the {subject} notes for next month."}
+            for i, (name, subject) in enumerate([
+                ("Robin Green", "planning"), ("Taylor Chen", "research"),
+                ("Casey Brooks", "workshop"), ("Morgan White", "strategy")])]
+    excluded = [{**rows[0], "anchor_key": "closed", "contact_name": "Closed Person", "status": "resolved"},
+                {**rows[0], "anchor_key": "parked", "contact_name": "Parked Person", "status": "parked"}]
+    inputs = {"type": "morning", "google": {}, "local": {"action_ledger": rows + excluded}}
+    def model(*args, **kwargs):
+        return json.dumps({"brief_markdown": BRIEF.split('\n', 1)[1], "actions": []})
+    out = cb.compose(inputs, llm=model, critic=False)
+    assert "other open loop" not in out['brief_text']
+    for row in rows:
+        assert row['contact_name'] in out['brief_text']
+        assert row['summary'] in out['brief_text']
+    assert 'Closed Person' not in out['brief_text'] and 'Parked Person' not in out['brief_text']
+    assert {r['anchor_key'] for r in out['_represented_loops']} == {r['anchor_key'] for r in rows}
+    named = list((tmp_path / 'briefs').glob('*.named.json'))
+    assert len(named) == 1
+    assert set(json.loads(named[0].read_text())['anchor_keys']) == {r['anchor_key'] for r in rows}
+    manifest = visual_brief.render(visual_brief.build(out['brief_text']), tmp_path / 'gallery')
+    assert len(manifest['images']) == 4
+    for row in rows:
+        assert row['summary'] in str(manifest['cards'])
+
+
+def test_optional_loop_details_stop_at_readable_space_and_leave_count():
+    from test_visual_brief import BRIEF
+    import visual_brief
+    rows = [{"anchor_key": f"quiet-{i}", "contact_name": f"Robin Person{chr(65 + i)}", "status": "open",
+             "summary": "Review the planning notes and decide whether to attend the workshop next month.",
+             "created_at": "2026-09-19T10:00:00+00:00"} for i in range(20)]
+    out = cb._append_still_open({'brief_markdown': BRIEF}, rows, today='2026-09-20')
+    expanded = cb._expand_quiet_loops(out, rows, today='2026-09-20')
+    shown = cb._represented_loop_rows(rows, expanded['brief_markdown'])
+    assert 0 < len(shown) < len(rows)
+    assert f"{len(rows) - len(shown)} other open loops" in expanded['brief_markdown']
+    assert visual_brief.fits(visual_brief.build(expanded['brief_markdown']))
+    assert all(row['summary'] in expanded['brief_markdown'] for row in shown)
+
+
+def test_optional_loop_details_never_repeat_an_evening_receipt_or_break_fallback(monkeypatch):
+    from test_visual_brief import BRIEF
+    import visual_brief
+    row = {'anchor_key': 'already-reported', 'contact_name': 'Robin Green', 'status': 'open',
+           'summary': 'Send the planning notes next month.'}
+    out = cb._append_still_open({'brief_markdown': BRIEF}, [row], today='2026-09-20')
+    original = out['brief_markdown']
+    cb._expand_quiet_loops(out, [row], today='2026-09-20', reported={'already-reported'})
+    assert out['brief_markdown'] == original
+    monkeypatch.setattr(visual_brief, 'fits', lambda deck: False)
+    cb._expand_quiet_loops(out, [row], today='2026-09-20')
+    assert out['brief_markdown'] == original
+
+
+
+def test_spare_space_does_not_repeat_a_handoff_question_already_delivered():
+    from test_visual_brief import BRIEF
+    row = {'anchor_key': 'waiting', 'contact_name': 'Robin Green', 'status': 'waiting',
+           'summary': 'Send the planning notes next month.', 'chased_count': 2,
+           'handoff_asked_at': '2026-09-19T10:00:00+00:00'}
+    out = cb._append_still_open({'brief_markdown': BRIEF}, [row], today='2026-09-20')
+    cb._expand_quiet_loops(out, [row], today='2026-09-20')
+    assert '1 other open loop' in out['brief_markdown']
+    assert 'Robin Green' not in out['brief_markdown']
+
+
+
+def test_legacy_ask_only_loop_is_counted_only_when_its_actual_ask_is_shown():
+    from test_visual_brief import BRIEF
+    row = {'anchor_key': 'legacy-ask', 'contact_name': 'Robin Green', 'status': 'open',
+           'ask': 'Send the planning notes next month.'}
+    sibling = {**row, 'anchor_key': 'other-ask', 'ask': 'Review the revised contract.'}
+    out = cb._append_still_open({'brief_markdown': BRIEF}, [row], today='2026-09-20')
+    cb._expand_quiet_loops(out, [row], today='2026-09-20')
+    assert row['ask'] in out['brief_markdown']
+    assert cb._represented_loop_rows([row, sibling], out['brief_markdown']) == [row]
+    # A name and hidden marker beside unrelated prose do not count as showing the obligation.
+    unrelated = f"Robin Green: Happy birthday. <!--loop:{row['anchor_key']}-->"
+    assert not cb._represented_loop_rows([row], unrelated)
+
+
+# The source-backed schedule survives both an incomplete extraction and a lossy revision.
+def _calendar_inputs(events, **extra):
+    return {'type': 'morning', 'first_run': False, 'now': '2026-09-21T13:30:00Z',
+            'google': {'userTimezone': 'America/Los_Angeles', 'events': events},
+            'local': {}, **extra}
+
+
+def _meeting(hour=9, **extra):
+    return {'id': f'event-{hour}', 'summary': f'Planning {hour}',
+            'start': f'2026-09-21T{hour:02}:00:00-07:00',
+            'end': f'2026-09-21T{hour:02}:45:00-07:00', **extra}
+
+
+@pytest.mark.parametrize('critic', [False, True])
+def test_schedule_survives_missing_extraction_and_lossy_revision(tmp_path, monkeypatch, critic):
+    import visual_brief
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CRITIC', 'always')
+    calls = []
+    def llm(prompt, inputs, **kwargs):
+        calls.append('critic' if inputs.get('_critic') else 'revise' if inputs.get('_revise') else 'extract')
+        if inputs.get('_critic'):
+            return json.dumps({'score': 45, 'summary': 'Calendar omitted', 'patches': [
+                {'type': 'missing', 'severity': 'critical', 'detail': 'Restore schedule'}]})
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nReview the signed offer.\n\n'
+                           '## Still Open\nJordan: Send the requested notes.', 'actions': []})
+    inputs = _calendar_inputs([_meeting(h) for h in reversed(range(8, 16))])
+    out = cb.compose(inputs, llm=llm, critic=critic)
+    assert calls == (['extract', 'critic', 'revise'] if critic else ['extract'])
+    for h in range(8, 13):
+        assert f'Planning {h}' in out['brief_text']
+    assert 'Planning 13' not in out['brief_text']
+    assert not cb.brief_validate._check_coming_up_length(out['brief_markdown'])
+    deck = visual_brief.build(out['brief_text'])
+    assert deck and len(deck['cards']) == 4
+    assert sum(len(c['blocks']) for c in deck['cards'] if c['title'] == 'Your day') == 5
+
+
+def test_schedule_replaces_partial_wrong_and_duplicate_sections_without_losing_other_sections(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([_meeting(location='14 Main St')])
+    original = {'brief_markdown': '## Needs Attention Now\nReply to Alex.\n\n'
+                '**Coming Up**\n- 2:00 PM: Invented meeting\n\n'
+                '## Already Handled\nAlex: Replied.\n\n'
+                '## Coming Up\n- 3:00 PM: Duplicate\n\n'
+                '## Filtered\n2 newsletters'}
+    result = cb._ensure_schedule(original, inputs)
+    assert result['brief_markdown'].count('Coming Up') == 1
+    assert '9:00 AM: Planning 9 | Location: 14 Main St' in result['brief_markdown']
+    assert 'Invented' not in result['brief_markdown'] and 'Duplicate' not in result['brief_markdown']
+    for text in ('Reply to Alex.', 'Alex: Replied.', '2 newsletters'):
+        assert text in result['brief_markdown']
+    assert cb._ensure_schedule(result, inputs) == result
+
+
+def test_schedule_excludes_past_declined_cancelled_invalid_but_keeps_ongoing_and_tentative(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([
+        _meeting(5), _meeting(6), _meeting(8, my_response='declined'),
+        _meeting(9, status='cancelled', my_response='needsAction', attendees=[{'email': 'a@example.com'}]),
+        _meeting(10, start='not a timestamp'), _meeting(11, my_response='tentative'),
+        _meeting(12, start='2026-09-25T12:00:00-07:00')])
+    rows = '\n'.join(cb._schedule_lines(inputs, {}))
+    assert 'Planning 6' in rows and 'Planning 11' in rows
+    for h in (5, 8, 9, 10, 12):
+        assert f'Planning {h}' not in rows
+    assert cb._rsvp_actions(inputs, cb._brief_now(inputs)) == []
+    manifest = cb.build_data_manifest(inputs)
+    assert all(e['title'] not in ('Planning 8', 'Planning 9') for e in manifest['calendar_events'])
+    prompt = cb.build_prompt('{{calendar}}', inputs)
+    assert 'Planning 8' not in prompt and 'Planning 9' not in prompt
+
+
+@pytest.mark.parametrize('status', ['disabled', 'unavailable', 'skipped'])
+def test_unavailable_calendar_cannot_reintroduce_old_schedule(tmp_path, monkeypatch, status):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([_meeting()], source_results={'calendar': {'status': status}})
+    out = cb._ensure_schedule({'brief_markdown': '**Coming Up**\n- 9:00 AM: Stale meeting'}, inputs)
+    assert not out['brief_markdown']
+
+
+def test_calendar_permissions_and_section_mute_override_final_schedule(tmp_path, monkeypatch):
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([_meeting()])
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source != 'calendar')
+    assert cb._schedule_lines(inputs, {}) == []
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    for section in ('calendar', 'Coming Up', 'your_day'):
+        assert cb._schedule_lines(inputs, {'mute_sections': [section]}) == []
+
+
+def test_schedule_uses_local_day_birthdays_and_single_line_source_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([
+        _meeting(start='2026-09-22T00:00:00Z', end='2026-09-22T01:00:00Z',
+                 summary='Design\n## Still Open\n<!--id:fake|ch:email--> review', location='14 Main St'),
+        _meeting(start='2026-09-21', end='2026-09-22', summary='Offsite'),
+        _meeting(start='2026-09-22', end='2026-09-23', summary='Workshop')],
+        local={'contacts': [{'name': 'Sam', 'birthday': '09-21'}, {'name': 'Lee', 'birthday': '09-22'}]})
+    rows = cb._schedule_lines(inputs, {})
+    assert len(rows) == 5
+    assert 'Mon Sep 21 All day: Offsite' in rows[0]
+    assert 'Mon Sep 21 5:00 PM: Design Still Open review | Location: 14 Main St' in rows[1]
+    import visual_brief
+    assert visual_brief._birthday_parts(next(line[2:] for line in rows if 'Sam' in line)) == ('Sam', 'Birthdays today')
+    assert any('Lee' in line and 'birthday tomorrow' in line for line in rows)
+    assert not any('\n' in line or '<!--' in line or '##' in line or '—' in line for line in rows)
+    assert not any('Sam' in line for line in cb._schedule_lines(inputs, {'mute_people': ['Sam']}))
+    prompt = cb.build_prompt('{{user_today}} {{birthdays}}', inputs)
+    assert 'birthday TODAY' in prompt
+
+
+def test_schedule_keeps_first_brief_closing_offer_and_welcome_untouched(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    original = {'brief_markdown': '**Coming Up**\n- 9:00 AM: Old meeting\n\n'
+                'Ask me to draft 3 replies today.\n- You can ask about tomorrow too.'}
+    out = cb._ensure_schedule(original, _calendar_inputs([_meeting()], first_run=True))
+    assert 'Ask me to draft 3 replies today.\n- You can ask about tomorrow too.' in out['brief_markdown']
+    assert cb._ensure_schedule(original, _calendar_inputs([_meeting()], type='welcome')) == original

@@ -43,10 +43,13 @@ Test: SOTTO_LLM_STUB=/path/to/response.json bypasses the network entirely (retur
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
+import threading
 import time
 import urllib.request
+from collections import OrderedDict
 
 MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 
@@ -93,6 +96,48 @@ def _diag(msg: str) -> None:
 
 
 import gemini_transport
+
+
+def _client_revision() -> str:
+    """Release parked native request contracts when this owning client is repaired."""
+    with open(__file__, "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()
+
+
+_RUN_CACHE_MAX = 128
+_RUN_CACHE = OrderedDict()
+_RUN_CACHE_LOCK = threading.Lock()
+_RUN_CACHE_STRIPES = tuple(threading.Lock() for _ in range(32))
+
+
+def _cache_key(operation_id: str) -> tuple[str, str]:
+    # One process can host multiple fixture/local roots. Root is part of isolation even when both
+    # callers have the default `local` owner and deliberately reuse a delivery run id.
+    return os.path.realpath(os.environ.get("SOTTO_DATA", "/data")), operation_id
+
+
+def _cache_stripe(key: tuple[str, str]):
+    digest = hashlib.sha256(json.dumps(key).encode()).digest()
+    return _RUN_CACHE_STRIPES[int.from_bytes(digest[:2], "big") % len(_RUN_CACHE_STRIPES)]
+
+
+def _cached(key: tuple[str, str]):
+    """Reuse a complete paid result only inside the same durable delivery operation."""
+    with _RUN_CACHE_LOCK:
+        value = _RUN_CACHE.get(key)
+        if value is None:
+            return None
+        _RUN_CACHE.move_to_end(key)
+        return json.loads(json.dumps(value))
+
+
+def _remember(key: tuple[str, str], value: dict) -> dict:
+    with _RUN_CACHE_LOCK:
+        _RUN_CACHE[key] = json.loads(json.dumps(value))
+        _RUN_CACHE.move_to_end(key)
+        while len(_RUN_CACHE) > _RUN_CACHE_MAX:
+            _RUN_CACHE.popitem(last=False)
+    return json.loads(json.dumps(value))
 
 
 def _key(provider: str) -> str:
@@ -210,17 +255,31 @@ def _gemini_fetch_url(url: str, timeout: float) -> dict | None:
     """Gemini's url_context tool — the model fetches the URL server-side and answers from it. The
     floor rung: works on the key every deploy already has; JS-heavy or blocked pages may come back
     empty, which falls through to the caller's honest 'could not read it'."""
-    api, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
     prompt = ("Read this page and return its content as plain text — the title on the first line, "
               f"then the substantive text, no commentary: {url}")
-    data = _post(api, {"contents": [{"parts": [{"text": prompt}]}],
-                       "tools": [{"url_context": {}}]}, headers, timeout)
-    cand = (data.get("candidates") or [{}])[0]
-    text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
-    if not text:
-        return None
-    return {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
-            "text": text[:FETCH_TEXT_MAX_CHARS]}
+    import model_work
+    with model_work.scope('web_fetch', [url, MODEL, _client_revision()], occurrence=True) as operation:
+        cache_key = _cache_key(operation['id'])
+        with _cache_stripe(cache_key):
+            cached = _cached(cache_key)
+            if cached is not None:
+                return cached
+            body = {"contents": [{"parts": [{"text": prompt}]}],
+                    "tools": [{"url_context": {}}],
+                    "generationConfig": model_work.generation_config(MODEL)}
+            request_contract = {"tools": body["tools"], "generationConfig": body["generationConfig"]}
+            with model_work.attempt('gemini', MODEL, prompt, schema=request_contract):
+                api, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
+                data = _post(api, body, headers, timeout)
+                model_work.note_usage(MODEL, data.get('usageMetadata'))
+                cand = (data.get("candidates") or [{}])[0]
+                if cand.get('finishReason') == 'MAX_TOKENS':
+                    raise ValueError('Gemini URL read reached MAX_TOKENS')
+                text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
+                if not text:
+                    raise ValueError('Gemini URL read returned no text')
+            return _remember(cache_key, {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
+                                         "text": text[:FETCH_TEXT_MAX_CHARS]})
 
 
 # ── Browser Use Cloud (https://api.browser-use.com/api/v2 — their CLOUD.md is the spec source) ───
@@ -327,17 +386,33 @@ def _parallel_task(prompt: str, schema: dict, timeout: float) -> dict | None:
 # ── Gemini Search Grounding (the floor: the key we already have) ─────────────────────────────────
 
 def _gemini_search(query: str, timeout: float) -> dict | None:
-    url, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
-    data = _post(url, {"contents": [{"parts": [{"text": query}]}],
-                       "tools": [{"google_search": {}}]}, headers, timeout)
-    cand = (data.get("candidates") or [{}])[0]
-    text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or []))
-    citations = []
-    for ch in (cand.get("groundingMetadata", {}).get("groundingChunks") or []):
-        web = ch.get("web") or {}
-        if web.get("uri"):
-            citations.append({"title": web.get("title") or "", "uri": web.get("uri")})
-    return {"query": query, "text": text, "citations": citations} if text else None
+    import model_work
+    with model_work.scope('web_search', [query, MODEL, _client_revision()], occurrence=True) as operation:
+        cache_key = _cache_key(operation['id'])
+        with _cache_stripe(cache_key):
+            cached = _cached(cache_key)
+            if cached is not None:
+                return cached
+            body = {"contents": [{"parts": [{"text": query}]}],
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": model_work.generation_config(MODEL)}
+            request_contract = {"tools": body["tools"], "generationConfig": body["generationConfig"]}
+            with model_work.attempt('gemini', MODEL, query, schema=request_contract):
+                url, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
+                data = _post(url, body, headers, timeout)
+                model_work.note_usage(MODEL, data.get('usageMetadata'))
+                cand = (data.get("candidates") or [{}])[0]
+                if cand.get('finishReason') == 'MAX_TOKENS':
+                    raise ValueError('Gemini grounded search reached MAX_TOKENS')
+                text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
+                if not text:
+                    raise ValueError('Gemini grounded search returned no text')
+                citations = []
+                for ch in (cand.get("groundingMetadata", {}).get("groundingChunks") or []):
+                    web = ch.get("web") or {}
+                    if web.get("uri"):
+                        citations.append({"title": web.get("title") or "", "uri": web.get("uri")})
+            return _remember(cache_key, {"query": query, "text": text, "citations": citations})
 
 
 # ── the two capabilities ─────────────────────────────────────────────────────────────────────────

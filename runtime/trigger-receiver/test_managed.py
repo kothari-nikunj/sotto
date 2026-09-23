@@ -83,6 +83,70 @@ def test_google_consent_opens_only_granted_sources_and_preserves_bridge(tmp_path
     assert sources['imessage']['connected'] is True
 
 
+def test_connector_consent_lifecycle_is_tenant_bound_and_self_host_is_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json', sources={
+        'calendar': {'consented': True, 'connected': True}})
+    managed.record_connector_consent(tmp_path, 'granola', True)
+    sources = managed.read_state(tmp_path, 'managed-capabilities.json')['sources']
+    assert sources['granola'] == {'consented': True, 'connected': True}
+    assert sources['calendar']['connected'] is True
+    managed.record_connector_consent(tmp_path, 'granola', False)
+    assert managed.read_state(tmp_path, 'managed-capabilities.json')['sources']['granola'] == {
+        'consented': False, 'connected': False}
+
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
+    before = (tmp_path / 'config/managed-capabilities.json').read_text()
+    managed.record_connector_consent(tmp_path, 'granola', True)
+    assert (tmp_path / 'config/managed-capabilities.json').read_text() == before
+
+
+def test_connector_reconciliation_repairs_only_missing_same_tenant_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    linked = [{'service': 'granola', 'connected': True}]
+    state(tmp_path, 'managed-capabilities.json', sources={})
+    managed.reconcile_connector_capabilities(tmp_path, linked)
+    assert managed.read_state(tmp_path, 'managed-capabilities.json')['sources']['granola'] == {
+        'consented': True, 'connected': True}
+
+    # Explicit disconnect is authoritative even while a stale token is still visible at boot.
+    managed.record_connector_consent(tmp_path, 'granola', False)
+    managed.reconcile_connector_capabilities(tmp_path, linked)
+    assert managed.read_state(tmp_path, 'managed-capabilities.json')['sources']['granola'] == {
+        'consented': False, 'connected': False}
+
+    # A token on a capability file bound to another tenant cannot grant this tenant access.
+    state(tmp_path, 'managed-capabilities.json', sources={}, tenant_id='other')
+    managed.reconcile_connector_capabilities(tmp_path, linked)
+    assert json.loads((tmp_path / 'config/managed-capabilities.json').read_text())['tenant_id'] == 'other'
+
+
+@pytest.mark.parametrize('body', ['', '[]', '{"tenant_id":"test","sources":null}'])
+def test_connector_reconciliation_keeps_malformed_or_missing_state_closed(
+        tmp_path, monkeypatch, body):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    (tmp_path / 'config').mkdir()
+    path = tmp_path / 'config/managed-capabilities.json'
+    if body:
+        path.write_text(body)
+    managed.reconcile_connector_capabilities(
+        tmp_path, [{'service': 'granola', 'connected': True}])
+    if body:
+        assert path.read_text() == body
+    else:
+        assert not path.exists()
+
+
+def test_connector_consent_rejects_unknown_sources(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    with pytest.raises(ValueError, match='Invalid managed connector'):
+        managed.record_connector_consent(tmp_path, 'future-service', True)
+
+
 def test_photon_policy_rejects_groups_even_from_owner():
     path = Path(__file__).resolve().parents[2] / 'adapters/hermes/sotto_photon/__init__.py'
     spec = importlib.util.spec_from_file_location('managed_photon', path)

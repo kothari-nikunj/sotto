@@ -46,11 +46,15 @@ def test_never_omits_overlong_action_or_pads_a_single_link_into_four_cards():
         assert v.build('Morning\nNeeds Attention Now\n' + text) is None
 
 
-def test_partitions_actions_and_falls_back_if_more_than_four_cards():
+def test_partitions_actions_and_rejects_more_than_four_readable_cards(tmp_path):
     paragraph = 'Alex — ' + 'word ' * (v.MAX_WORDS // 2)
     deck = v.build('Morning\nNeeds Attention Now\n' + '\n'.join([paragraph] * 4))
     assert len(deck['cards']) == 4
-    assert v.build('Morning\nNeeds Attention Now\n' + '\n'.join([paragraph] * 5)) is None
+    crowded = v.build('Morning\nNeeds Attention Now\n' + '\n'.join([paragraph] * 5))
+    assert not v.fits(crowded)
+    with pytest.raises(v.LayoutError, match='four readable cards'):
+        v.render(crowded, tmp_path)
+    assert not list(tmp_path.iterdir())
 
 
 def test_prep_sections_remain_extracts_not_new_research():
@@ -115,15 +119,16 @@ def test_mixed_weight_wrapping_preserves_words_and_respects_width():
         assert offset + draw.textlength(word, font=face) <= 340
 
 
-def test_vertical_centering_keeps_content_inside_header_and_footer():
+def test_top_alignment_keeps_content_inside_header_and_footer():
     top, height = 248, 700
     actual = v._content_top(top, height)
-    assert abs((actual - top) - (v.HEIGHT - 106 - actual - height)) <= 1
+    assert actual == top
+    assert v._content_top(top, 100) == actual
     with pytest.raises(ValueError, match='readable height'):
         v._content_top(top, v.HEIGHT)
 
 
-@pytest.mark.parametrize('handled_count, fits', [(7, True), (8, False)])
+@pytest.mark.parametrize('handled_count, fits', [(5, True), (7, True), (18, False)])
 def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path, monkeypatch, handled_count, fits):
     # A normal-length brief can overflow from names, line wrapping, and paragraph gaps,
     # even with fewer than 200 words on each card. Keep fixed type and a real gap floor.
@@ -134,7 +139,7 @@ def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path
         '3 other open loops - see /app#loops')
     deck = v.build(source)
     before = json.dumps(deck, sort_keys=True)
-    assert len(deck['cards'][-1]['blocks']) == handled_count + 2
+    assert sum(len(c['blocks']) for c in deck['cards'] if c['title'] == 'Follow-ups') == handled_count + 2
     from PIL import ImageDraw
     draw_text = ImageDraw.ImageDraw.text
     body_sizes = set()
@@ -149,28 +154,51 @@ def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path
     if fits:
         manifest = v.render(deck, tmp_path)
         assert len(manifest['images']) == 4
-        assert manifest['cards'] == deck['cards']
-        assert body_sizes <= {32, 42}
-        assert 42 in body_sizes
+        assert (tmp_path / deck['id'] / 'manifest.json').is_file()
+        assert sorted(b['line'] for c in manifest['cards'] for b in c['blocks']) == sorted(
+            b['line'] for c in deck['cards'] for b in c['blocks'])
+        if handled_count == 5:
+            assert manifest['cards'] == deck['cards']
+        assert body_sizes <= {36, 48}
+        assert 48 in body_sizes
     else:
-        with pytest.raises(ValueError, match='readable height'):
+        with pytest.raises(v.LayoutError):
             v.render(deck, tmp_path)
         assert not list(tmp_path.rglob('manifest.json'))
     assert json.dumps(deck, sort_keys=True) == before
 
 
-def test_agenda_locations_and_dash_free_presentation(tmp_path):
+def test_agenda_locations_wrap_without_clipping_or_losing_unicode(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    address = ('1355 Market Street, Suite 900, San Francisco, California 94103, '
+               'Entrance on José Plaza near Café München')
     source = BRIEF.replace('12:00 PM — Lunch with Alex', '12:00 PM — Lunch with Alex | Location: 535 Mission St, Suite 800')
+    source = source.replace('535 Mission St, Suite 800', address)
     deck = v.build(source, preview=True)
     assert '—' not in deck['summary']
     assert '—' in deck['full_text']
-    assert v._agenda_parts('12:00 PM — Lunch with Alex | Location: 535 Mission St, Suite 800') == ('', '12:00 PM', 'Lunch with Alex', '535 Mission St, Suite 800')
+    assert v._agenda_parts('12:00 PM — Lunch with Alex | Location: ' + address) == ('', '12:00 PM', 'Lunch with Alex', address)
     assert v._agenda_parts('10:00 AM — Team meeting') == ('', '10:00 AM', 'Team meeting', '')
     assert v._display_text('Alex — Reply before lunch.', 'brief') == 'Alex: Reply before lunch.'
     assert '—' not in v._display_text('A long-term plan—already discussed.')
-    assert len(v.render(deck, tmp_path)['images']) == 4
-    too_long = v.build(source.replace('535 Mission St, Suite 800', 'A very long street address ' * 8))
-    with pytest.raises(ValueError, match='location exceeds'):
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        if kwargs.get('font') and kwargs['font'].size == 36:
+            drawn.append((xy, text))
+        return original(self, xy, text, *args, **kwargs)
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    manifest = v.render(deck, tmp_path)
+    assert len(manifest['images']) == 4 and address in manifest['full_text']
+    location_lines = [text for (x, _y), text in drawn if x == 300 and text in address]
+    assert len(location_lines) >= 2
+    assert ' '.join(location_lines) == address
+    assert all(Path(path).read_bytes().startswith(b'\x89PNG') for path in manifest['images'])
+
+    too_long = v.build(source.replace(address, 'California Boulevard Entrance Plaza ' * 38))
+    assert too_long is not None
+    with pytest.raises(ValueError, match='readable height'):
         v.render(too_long, tmp_path)
 
 
@@ -328,3 +356,36 @@ def test_birthday_cannot_swallow_the_following_meetings_day(tmp_path, monkeypatc
     v.render(v.build(source), tmp_path)
     assert 'Tomorrow · Birthdays in 1 day' in drawn
     assert '12:00 PM' in drawn
+
+
+@pytest.mark.parametrize('birthday, label', [
+    ('🎂 Alex Smith (birthday today)', 'Birthdays today'),
+    ('🎂️ Alex Smith (birthday tomorrow)', 'Birthdays tomorrow'),
+    ('Alex Smith - birthday in 2 days', 'Birthdays in 2 days'),
+    ('🎂 Alex Smith · birthday today', 'Birthdays today'),
+])
+def test_birthday_forms_render_readable_words_without_missing_glyphs(tmp_path, monkeypatch, birthday, label):
+    from PIL import ImageDraw
+    source = BRIEF.replace('10:00 AM — Team meeting', birthday)
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        drawn.append(text)
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    deck = v.build(source)
+    assert birthday in deck['full_text']
+    assert v.fits(deck)
+    v.render(deck, tmp_path)
+    assert label in drawn and 'Alex Smith' in drawn
+    assert not any('🎂' in text or '\ufe0f' in text for text in drawn)
+    assert '12:00 PM' in drawn
+
+
+def test_fit_check_and_delivery_agree_on_overflow(tmp_path):
+    deck = v.build(BRIEF.replace('Alex — Complete the preschool waiver by tomorrow; the form is still outstanding.', 'W' * 150))
+    assert not v.fits(deck)
+    with pytest.raises(ValueError, match='too wide'):
+        v.render(deck, tmp_path)

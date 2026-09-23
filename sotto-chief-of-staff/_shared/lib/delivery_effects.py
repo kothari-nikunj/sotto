@@ -128,6 +128,12 @@ def instant(value):
     return parsed.timestamp() if parsed else None
 
 
+def meeting_occurrence(event_id, start):
+    """Stable identity for one scheduled occurrence; a reschedule is a new occurrence."""
+    event_id, start_at = str(event_id or '').strip(), instant(start)
+    return f'{event_id}@{start_at:.3f}' if event_id and start_at is not None else ''
+
+
 def _loops():
     import ledger_io
     return {row.get('anchor_key'): row for row in ledger_io.load_entries() if row.get('anchor_key')}
@@ -352,6 +358,16 @@ def finalize(effects, receipt):
                 pending = state['pending'].get(effect['key'], {})
                 if pending.get('run_id') == effect.get('run_id'):
                     state['pending'].pop(effect['key'], None)
+        elif kind == 'meeting_prep_delivered':
+            occurrence = meeting_occurrence(effect.get('calendar_event_id'), effect.get('calendar_start'))
+            if occurrence and effect.get('mode') in ('offer', 'full'):
+                date = str(effect.get('date') or '')
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date):
+                    from timeutil import configured_tz, _resolve_tz
+                    zone = _resolve_tz(configured_tz() or '+00:00') or timezone.utc
+                    date = datetime.fromtimestamp(instant(effect['calendar_start']), zone).date().isoformat()
+                with proactive_state(date) as state:
+                    state['prep_deliveries'] = sorted(set(state.get('prep_deliveries', [])) | {occurrence})
         elif kind == 'intention':
             import schedule_wakeup
             schedule_wakeup.transition(effect['id'], 'fired')

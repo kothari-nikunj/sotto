@@ -14,8 +14,9 @@ import re
 
 from chatfmt import to_imessage
 from brief_validate import is_calendar_preview_note
+from calendar_context import SCHEDULE_DAY as _DAY
 
-VERSION = 12
+VERSION = 15
 MAX_CARDS = 4
 MAX_WORDS = 200
 MAX_PREP_WORDS = 200
@@ -124,20 +125,13 @@ def build(text, kind='brief', preview=False):
             words += count
         if blocks:
             cards.append({'title': section['title'], 'blocks': blocks})
-    if len(cards) > MAX_CARDS:
+    if kind == 'prep' and len(cards) > MAX_CARDS:
         return None  # keep the whole brief in text instead of losing an actionable ask
     # Four attachments produce the compact native gallery. Split only at real paragraph
     # boundaries; if there is too little source material, keep the short update as text.
-    while cards and len(cards) < MAX_CARDS:
-        candidates = [c for c in cards if len(c['blocks']) > 1]
-        if not candidates:
-            return None
-        largest = max(candidates, key=lambda c: sum(len(b['text']) for b in c['blocks']))
-        at = cards.index(largest)
-        cut = max(1, len(largest['blocks']) // 2)
-        cards[at:at + 1] = [dict(largest, blocks=largest['blocks'][:cut]),
-                           dict(largest, blocks=largest['blocks'][cut:])]
-    if not cards:
+    try:
+        cards = _split_to_four(cards)
+    except LayoutError:
         return None
     selected = {b['line'] for c in cards for b in c['blocks']}
     omitted = any(line.strip() and i not in selected and i > 0 and not _heading(line.strip(), kind)
@@ -173,11 +167,19 @@ def _companion_links(text):
     return links
 
 
+class LayoutError(ValueError):
+    """Only fixed reason codes and a card number may cross the diagnostics boundary."""
+    def __init__(self, reason, message, card_index=None):
+        super().__init__(message)
+        self.reason = reason
+        self.card_index = card_index
+
+
 def _lines(draw, text, font, width):
     output, line = [], ''
     for word in text.split():
         if draw.textlength(word, font=font) > width:
-            raise ValueError('card contains a word too wide to render')
+            raise LayoutError('word_too_wide', 'card contains a word too wide to render')
         candidate = (line + ' ' + word).strip()
         if line and draw.textlength(candidate, font=font) > width:
             output.append(line)
@@ -208,9 +210,7 @@ def _display_text(text, kind=''):
 
 
 # Recognize the formats already emitted by the composer, including date-prefixed rows.
-_DAY = (r'(?:Today|Tomorrow|(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|'
-        r'Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)(?:,?\s+[A-Za-z]{3,9}\s+\d{1,2})?'
-        r'|[A-Za-z]{3,9}\s+\d{1,2})')
+
 
 
 def _agenda_parts(text):
@@ -228,6 +228,16 @@ def _agenda_parts(text):
         if address:
             title, location = title[:address.start()], address[1]
     return match['day'] or '', match['time'], _display_text(title), _display_text(location.strip())
+
+
+def _birthday_parts(text):
+    plain = re.sub(r'^🎂[\ufe0f\ufe0e]?\s*', '', text)
+    match = re.fullmatch(r'(.+?)\s+(?:[·—–-]\s*|\()(birthday\s+[^()]+)\)?', plain, re.I)
+    if match:
+        return match[1], re.sub(r'^birthday', 'Birthdays', match[2], flags=re.I)
+    if plain != text:
+        return plain, 'Birthdays'
+    return None
 
 
 def _emphasis_end(text, kind):
@@ -250,7 +260,7 @@ def _rich_lines(draw, text, regular, bold, width, emphasis_end):
         face = bold if match.start() < emphasis_end else regular
         word_width = draw.textlength(word, font=face)
         if word_width > width:
-            raise ValueError('card contains a word too wide to render')
+            raise LayoutError('word_too_wide', 'card contains a word too wide to render')
         gap = draw.textlength(' ', font=regular) if current else 0
         if current and used + gap + word_width > width:
             lines.append(current)
@@ -265,33 +275,35 @@ def _rich_lines(draw, text, regular, bold, width, emphasis_end):
 def _content_top(top, height):
     available = HEIGHT - 106 - top
     if height > available:
-        raise ValueError('card exceeds readable height; use text')
-    return top + (available - height) // 2
+        raise LayoutError('card_height', 'card exceeds readable height; use text')
+    return top
 
 
-def render(deck, destination):
-    """Write bounded PNGs plus an immutable manifest; private files, no network or HTML execution."""
+def _render_pages(deck, *, measure_only=False):
+    """One layout path for fit checks and PNG delivery; never shrink text to fit."""
     from PIL import Image, ImageDraw, ImageFont
-    destination = Path(destination) / deck['id']
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if len(deck['cards']) != MAX_CARDS:
-        raise ValueError('an image brief must contain exactly four cards')
+    if not measure_only and len(deck['cards']) != MAX_CARDS:
+        raise LayoutError('card_count', 'an image brief must contain exactly four cards')
     def font(size, weight=400):
         face = ImageFont.truetype(str(FONT_DIR / 'Inter.ttf'), size)
         face.set_variation_by_axes([32 if size >= 60 else 14, weight])
         return face
-    label_font, meta_font = font(32), font(26)
+    label_font, meta_font = font(36), font(28)
     seal = Image.open(SEAL_PATH).convert('RGBA')
     seal.thumbnail((78, 78), Image.Resampling.LANCZOS)
     seal.putalpha(seal.getchannel('A').point(lambda alpha: round(alpha * 0.42)))
-    body_font, heading_font = font(42), font(76, 650)
-    bold_font, section_font = font(42, 650), font(32, 650)
-    row_font, time_font = font(42), font(32, 650)
-    location_font = font(32)
-    pages = []
+    body_font, heading_font = font(48), font(76, 650)
+    bold_font, section_font = font(48, 650), font(36, 650)
+    row_font, time_font = font(48), font(36, 650)
+    location_font = font(36)
     for index, card in enumerate(deck['cards'], 1):
-        image = Image.new('RGB', (WIDTH, HEIGHT), '#F5F5F7')
+        image = Image.new('RGB', (1, 1) if measure_only else (WIDTH, HEIGHT), '#F5F5F7')
         draw = ImageDraw.Draw(image)
+        if measure_only:
+            # Text measurement still uses Pillow; measuring must not paint or trigger
+            # instrumentation intended for actual delivered pages.
+            for method in ('text', 'line', 'ellipse', 'rounded_rectangle'):
+                setattr(draw, method, lambda *args, **kwargs: None)
         # The company/person leads; the seal stays small and secondary.
         blocks = [b['text'] for b in card['blocks']]
         agenda = card['title'] == 'Your day'
@@ -304,7 +316,7 @@ def render(deck, destination):
         title = _display_text(title)
         title_lines = _lines(draw, title, heading_font, 870)
         if len(title_lines) > 2:
-            raise ValueError('card heading exceeds readable height')
+            raise LayoutError('heading_height', 'card heading exceeds readable height')
         y = 70
         if deck['kind'] == 'brief':
             # Use the composition's own date, never today's date during a replay.
@@ -312,7 +324,7 @@ def render(deck, destination):
                              lambda match: match[1].capitalize() + ' brief · ', deck['title'], flags=re.I)
             edition = _display_text(edition)
             if draw.textlength(edition, font=meta_font) > WIDTH - 128:
-                raise ValueError('brief date exceeds readable width')
+                raise LayoutError('date_width', 'brief date exceeds readable width')
             draw.text((64, 45), edition, font=meta_font, fill='#6E6E73')
             y = 108
         for line in title_lines:
@@ -328,6 +340,7 @@ def render(deck, destination):
             y += 54 if deck['kind'] == 'brief' else 90
         else:
             y += 42
+        y += 32  # stable breathing room below the fixed header
         if agenda:
             rows, current_day = [], ''
             for block, source in zip(blocks, card['blocks']):
@@ -336,21 +349,21 @@ def render(deck, destination):
                 day_label = day if day and day != current_day else ''
                 if day:
                     current_day = day
-                birthday = re.fullmatch(r'(?:🎂\s*)?(.+?) [·—–-] (birthday (?:today|in .+))', event) if not time else None
-                birthday_label = birthday[2].replace('birthday', 'Birthdays', 1) if birthday else ''
+                birthday = _birthday_parts(event) if not time else None
+                birthday_label = birthday[1] if birthday else ''
                 if birthday:
-                    event = birthday[1]
+                    event = birthday[0]
                 lines = _lines(draw, event, row_font, 702 if time else 902)
-                if location and len(_lines(draw, location, location_font, 702)) > 1:
-                    raise ValueError('meeting location exceeds one readable line; use text')
+                location_lines = _lines(draw, location, location_font, 702) if location else []
                 padding = (44 if birthday else 36) if rows and (birthday or day_label) else 0
                 label = ' · '.join(part for part in (day_label, birthday_label) if part)
                 if draw.textlength(label, font=section_font) > 904:
-                    raise ValueError('calendar day label exceeds readable width; use text')
-                height = max(100, len(lines) * 55 + 32 + (42 if location else 0)) if time else len(lines) * 55 + 30
-                rows.append((time, lines, height + padding + (46 if label else 0), location, padding, label))
+                    raise LayoutError('calendar_label_width', 'calendar day label exceeds readable width; use text')
+                height = max(100, len(lines) * 62 + 32 + len(location_lines) * 44) if time else len(lines) * 62 + 30
+                rows.append((time, lines, height + padding + (46 if label else 0),
+                             location_lines, padding, label))
             y = _content_top(y, sum(row[2] for row in rows))
-            for time, lines, height, location, padding, label in rows:
+            for time, lines, height, location_lines, padding, label in rows:
                 y += padding
                 height -= padding
                 if label:
@@ -361,9 +374,10 @@ def render(deck, destination):
                     draw.text((88, y + 5), time, font=time_font, fill='#0066CC')
                     draw.line((300, y + height - 14, 1016, y + height - 14), fill='#DEDEE3', width=1)
                 for offset, line in enumerate(lines):
-                    draw.text((300 if time else 88, y + offset * 55), line, font=row_font, fill='#1D1D1F')
-                if location:
-                    draw.text((300, y + len(lines) * 55 + 4), location, font=location_font, fill='#6E6E73')
+                    draw.text((300 if time else 88, y + offset * 62), line, font=row_font, fill='#1D1D1F')
+                for offset, line in enumerate(location_lines):
+                    draw.text((300, y + len(lines) * 62 + 4 + offset * 44), line,
+                              font=location_font, fill='#6E6E73')
                 y += height
 
         else:
@@ -372,12 +386,12 @@ def render(deck, destination):
                         for block, source in zip(blocks, card['blocks'])]
             bullets = [deck['kind'] == 'prep' and len(blocks) > 1 and not end for end in emphasis]
             counts = [bool(re.match(r'^\d+ other open loops?\b', block)) for block in blocks]
-            line_heights = [42 if count else 55 for count in counts]
+            line_heights = [48 if count else 62 for count in counts]
             laid_out = [_rich_lines(draw, block, label_font if count else body_font,
                                     label_font if count else bold_font, 878 if bullet else 904, end)
                         for block, bullet, end, count in zip(blocks, bullets, emphasis, counts)]
             sections = [b.get('section', '') for b in card['blocks']]
-            merged = card['title'] in ('Your relationship', 'Signals & context', 'Follow-ups')
+            merged = card.get('section_labels') or card['title'] in ('Your relationship', 'Signals & context', 'Follow-ups')
             starts = [merged and name and (i == 0 or name != sections[i-1]) for i, name in enumerate(sections)]
             # Measure the actual wrapped text, then spend spare height on paragraph gaps.
             # Dense cards may tighten spacing, but never shrink type or omit a paragraph.
@@ -416,6 +430,117 @@ def render(deck, destination):
         for dot in range(MAX_CARDS):
             x = 928 + dot * 22
             draw.ellipse((x, HEIGHT - 56, x + 9, HEIGHT - 47), fill='#1D1D1F' if dot == index - 1 else '#D1D1D6')
+        yield image
+
+
+def _measure(deck, cards):
+    # Same wrapping, fonts, headers and gaps as the PNG path, on a one-pixel canvas.
+    # No artifacts and no second formula for deciding whether a page fits.
+    completed = 0
+    try:
+        for page in _render_pages(dict(deck, cards=cards), measure_only=True):
+            page.close()
+            completed += 1
+    except LayoutError as error:
+        error.card_index = completed + 1
+        raise
+
+
+def _split_to_four(cards):
+    cards = list(cards)
+    while len(cards) < MAX_CARDS:
+        candidates = [c for c in cards if len(c['blocks']) > 1]
+        if not candidates:
+            raise LayoutError('card_count', 'an image brief must contain exactly four cards')
+        largest = max(candidates, key=lambda c: sum(len(b['text']) for b in c['blocks']))
+        at, cut = cards.index(largest), max(1, len(largest['blocks']) // 2)
+        cards[at:at + 1] = [dict(largest, blocks=largest['blocks'][:cut]),
+                           dict(largest, blocks=largest['blocks'][cut:])]
+    return cards
+
+
+def _packed(deck):
+    """Keep ordinary layouts; repair crowded briefs at complete paragraph boundaries."""
+    cards = deck['cards']
+    try:
+        if len(cards) == MAX_CARDS:
+            _measure(deck, cards)
+            return deck
+    except LayoutError:
+        if deck['kind'] != 'brief':
+            raise
+    if deck['kind'] != 'brief':
+        raise LayoutError('card_count', 'an image brief must contain exactly four cards')
+
+    # Only adjacent action sections share a page. Calendar rows retain their own
+    # layout, day labels and blue times; follow-ups retain Still open/Handled labels.
+    groups = []
+    for card in cards:
+        group = 'actions' if card['title'] in ('Needs you', 'Today') else card['title']
+        blocks = [dict(b, section=b.get('section') or card['title']) for b in card['blocks']]
+        if groups and groups[-1][0] == group:
+            groups[-1][1].extend(blocks)
+        else:
+            groups.append((group, blocks))
+
+    packed = []
+    for group, blocks in groups:
+        def candidate(items):
+            sections = {b['section'] for b in items}
+            title = (next(iter(sections)) if len(sections) == 1 else 'Today') if group == 'actions' else group
+            return {'title': title, 'blocks': items,
+                    'section_labels': group == 'actions' and len(sections) > 1}
+        current = []
+        for block in blocks:
+            proposed = candidate([*current, block])
+            try:
+                if sum(len(b['text'].split()) for b in proposed['blocks']) > MAX_WORDS:
+                    raise LayoutError('card_height', 'card exceeds readable height; use text')
+                _measure(deck, [proposed])
+            except LayoutError as error:
+                if not current:
+                    error.card_index = len(packed) + 1
+                    raise
+                packed.append(candidate(current))
+                current = [block]
+                try:
+                    _measure(deck, [candidate(current)])
+                except LayoutError as error:
+                    error.card_index = len(packed) + 1
+                    raise
+            else:
+                current.append(block)
+            if len(packed) >= MAX_CARDS:
+                raise LayoutError('card_count', 'content exceeds four readable cards', MAX_CARDS + 1)
+        if current:
+            packed.append(candidate(current))
+    if len(packed) > MAX_CARDS:
+        raise LayoutError('card_count', 'content exceeds four readable cards', MAX_CARDS + 1)
+    packed = _split_to_four(packed)
+    _measure(deck, packed)
+    # The content/version identity already determines this layout. Preserve it for
+    # callers that locate the manifest using the original build result.
+    return dict(deck, cards=packed)
+
+
+def fits(deck):
+    """Measure the delivery layout, including reflow, without writing artifacts."""
+    if not deck:
+        return False
+    try:
+        _packed(deck)
+        return True
+    except (ImportError, OSError, ValueError):
+        return False
+
+
+def render(deck, destination):
+    """Write bounded PNGs plus an immutable manifest; private files, no network or HTML execution."""
+    deck = _packed(deck)
+    destination = Path(destination) / deck['id']
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pages = []
+    for index, image in enumerate(_render_pages(deck), 1):
         path = destination / f'{index:02d}.png'
         fd, name = tempfile.mkstemp(dir=destination, suffix='.tmp')
         tmp = Path(name)

@@ -58,12 +58,26 @@ def report(path, days=7, zone='UTC', now=None, billed_total=None):
             if values:
                 components[name] = {'median': statistics.median(values),
                                     'p95': values[math.ceil(.95 * len(values)) - 1]}
+        tool_result_sizes = {}
+        for _, metadata, _ in rows:
+            raw_tool_sizes = metadata.get('tool_result_sizes')
+            for name, item in (raw_tool_sizes.items() if isinstance(raw_tool_sizes, dict) else []):
+                if (not isinstance(item, dict) or not isinstance(name, str)
+                        or (name != 'unknown' and not name.replace('_', '').replace('-', '').isalnum())):
+                    continue
+                bucket = tool_result_sizes.setdefault(name, {'count': 0, 'chars': 0, 'max_chars': 0})
+                for field in ('count', 'chars'):
+                    if isinstance(item.get(field), int):
+                        bucket[field] += item[field]
+                if isinstance(item.get('max_chars'), int):
+                    bucket['max_chars'] = max(bucket['max_chars'], item['max_chars'])
         attributed = sum(bool(m.get('operation_id')) for _, m, _ in rows)
         output.append(dict(zip(('day', 'application', 'deployment', 'workload', 'model', 'route', 'owner', 'proxy_deployment'), key)) | {
             'requests': len(rows), 'operations': len(operations),
             'unattributed_requests': sum(not m.get('operation_id') for _, m, _ in rows),
             'unsuccessful_requests': sum(r['status'] != 200 for r, _, _ in rows),
             'context_chars': components,
+            'tool_result_sizes': dict(sorted(tool_result_sizes.items())),
             'attempts_per_operation': attributed / len(operations) if operations else None,
             'input_tokens': sum(inputs) if inputs else None, 'unknown_input_requests': len(rows) - len(inputs),
             'cache_ratio': counts['cached_input_tokens'] / sum(inputs) if (inputs and sum(inputs)

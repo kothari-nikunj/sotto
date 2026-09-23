@@ -285,6 +285,7 @@ def test_finish_auth_happy_path_writes_pinned_schema(tmp_path, monkeypatch):
     assert on_disk["resource"] == on_disk["mcp_url"] == "https://mcp.granola.ai/mcp"
     assert on_disk["obtained_at"] >= before
     assert (os.stat(path).st_mode & 0o777) == 0o600
+    assert con.credential_matches("granola") is True
     assert not os.path.exists(path + ".tmp")
     # the state was single-use: replaying the same callback fails at the state step
     try:
@@ -292,6 +293,25 @@ def test_finish_auth_happy_path_writes_pinned_schema(tmp_path, monkeypatch):
         assert False, "replay should have raised"
     except con.ConnectorError as e:
         assert e.step == "state"
+
+
+def test_disconnect_surfaces_credential_unlink_failure(tmp_path, monkeypatch):
+    _use(monkeypatch, con, tmp_path, MockHttp([]))
+    path = con.token_path('granola')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump({'service': 'granola', 'access_token': 'token'}, f)
+    real_unlink = con.os.unlink
+
+    def fail_credential(target):
+        if target == path:
+            raise OSError('fixture permission error')
+        return real_unlink(target)
+
+    monkeypatch.setattr(con.os, 'unlink', fail_credential)
+    with pytest.raises(OSError, match='fixture permission'):
+        con.disconnect('granola')
+    assert os.path.exists(path)
 
 
 def test_finish_auth_no_expiry_or_refresh_becomes_null(tmp_path, monkeypatch):
@@ -461,10 +481,16 @@ def _get(base, path, headers=None):
         return e.code, e.read().decode(), dict(e.headers)
 
 
-def test_connect_endpoints_over_http(tmp_path):
+def test_connect_endpoints_over_http(tmp_path, monkeypatch):
     """The full matrix: /connect/<svc>/start is setup-code-gated and 302s with the S256 shape;
     /connect/oauth/callback is public, 400s a bogus state with a step-named body, and completes the
     happy path writing the pinned token file."""
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    os.makedirs(tmp_path / 'config')
+    json.dump({'tenant_id': 'test', 'sources': {}},
+              open(tmp_path / 'config/managed-capabilities.json', 'w'))
     r2, srv, base = _serve(tmp_path)
     r2.CONNECTORS._http = _flow_http(
         (200, json.dumps({"access_token": "at-9", "refresh_token": "rt-9",
@@ -488,6 +514,7 @@ def test_connect_endpoints_over_http(tmp_path):
         # callback is NOT gated: a bogus state gets a 4xx page naming the state step (no setup code)
         code, body, _ = _get(base, "/connect/oauth/callback?code=x&state=bogus-state-aaaa")
         assert code == 400 and "state" in body and "Connection failed" in body
+        assert json.load(open(tmp_path / 'config/managed-capabilities.json'))['sources'] == {}
         # provider-denied consent → authorization step named
         code, body, _ = _get(base, f"/connect/oauth/callback?error=access_denied&state={q['state']}")
         assert code == 400 and "authorization" in body and "access_denied" in body
@@ -498,6 +525,11 @@ def test_connect_endpoints_over_http(tmp_path):
         assert code == 200 and "Connected" in body and "/setup" in body
         tok = json.load(open(os.path.join(str(tmp_path), "connectors", "granola.json")))
         assert tok["access_token"] == "at-9" and tok["service"] == "granola"
+        assert json.load(open(tmp_path / 'config/managed-capabilities.json'))['sources']['granola'] == {
+            'consented': True, 'connected': True}
+        from source_context import allowed
+        assert allowed('granola') is True
+        assert r2.DASHBOARD.HOOKS['source_allowed']('granola') is True
         # exchange failure path: fresh start, token endpoint now errors → 502 naming exchange + body
         r2.CONNECTORS._http = _flow_http((400, b'{"error":"invalid_grant"}'))
         code, _, hdrs = _get(base, "/connect/granola/start?code=sekrit-code-123")

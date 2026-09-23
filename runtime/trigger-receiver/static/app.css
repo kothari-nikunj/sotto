@@ -928,6 +928,12 @@ a.ledger-row:active, .ledger-row.pressable:active { background: var(--accent-sof
   overflow: hidden;
 }
 
+.rg-main { min-width: 0; }
+.rg-details { margin-top: var(--space-1); }
+.rg-details summary { color: var(--ink-muted); font-size: 0.75rem; cursor: pointer; }
+.rg-details summary:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 3px; }
+.rg-details ul { margin: var(--space-2) 0; padding-left: 1.2rem; }
+
 /* Row actions — revealed on hover/focus on pointer devices; always on touch.
    Space is reserved (opacity, not display) so reveal never shifts layout. */
 .row-actions {

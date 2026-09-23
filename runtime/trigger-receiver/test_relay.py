@@ -1,8 +1,10 @@
 """Reverse-MCP relay: initialize/tools-list answered locally, tool calls forwarded to the Bridge."""
 import importlib.util
+import json
 import os
 import threading
 import time
+from datetime import datetime
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("relay", os.path.join(HERE, "relay.py"))
@@ -106,6 +108,140 @@ def test_full_forward_cycle_with_a_bridge():
     t.join()
     assert resp["result"]["content"][0]["text"] == "pong"
     assert resp["id"] == 7
+
+
+def test_source_response_uses_server_request_start_and_returns_it_in_both_payload_lanes(monkeypatch):
+    receiver_spec = importlib.util.spec_from_file_location(
+        "receiver_request_marker", os.path.join(HERE, "receiver.py"))
+    receiver = importlib.util.module_from_spec(receiver_spec)
+    receiver_spec.loader.exec_module(receiver)
+    recorded = []
+
+    class SourceContext:
+        @staticmethod
+        def record_bridge_status(payload, data_root=None):
+            recorded.append((dict(payload), data_root))
+
+    monkeypatch.setattr(receiver, '_source_context', lambda: SourceContext)
+    r = relay.Relay()
+    r.on_response = receiver._record_source_response
+    validation_markers = []
+    r.validate_response = lambda request, result: (
+        validation_markers.append((request[relay.BRIDGE_REQUEST_STARTED_AT],
+                                   result['structuredContent'][relay.BRIDGE_REQUEST_STARTED_AT]))
+        or True)
+
+    caller_marker = '1900-01-01T00:00:00+00:00'
+    bridge_marker = '2999-01-01T00:00:00+00:00'
+    bridge_request = []
+
+    def bridge():
+        req = r.poll(timeout=5)
+        bridge_request.append(req)
+        payload = {'generated_at': bridge_marker, 'source_status': {'chrome': 'ok'},
+                   relay.BRIDGE_REQUEST_STARTED_AT: bridge_marker}
+        r.respond({'jsonrpc': '2.0', 'id': req['id'], 'result': {
+            'structuredContent': dict(payload),
+            'content': [{'type': 'text', 'text': json.dumps(payload)}],
+            'isError': False,
+        }})
+
+    thread = threading.Thread(target=bridge)
+    thread.start()
+    time.sleep(.05)
+    response = r.mcp_call({
+        'jsonrpc': '2.0', 'id': 17, 'method': 'tools/call',
+        'params': {'name': 'read_local', 'arguments': {}},
+        relay.BRIDGE_REQUEST_STARTED_AT: caller_marker,
+    }, timeout=5)
+    thread.join()
+
+    assert relay.BRIDGE_REQUEST_STARTED_AT not in bridge_request[0]
+    payload = response['result']['structuredContent']
+    returned_text_payload = json.loads(response['result']['content'][0]['text'])
+    marker = payload[relay.BRIDGE_REQUEST_STARTED_AT]
+    assert marker not in (caller_marker, bridge_marker)
+    assert datetime.fromisoformat(marker).tzinfo is not None
+    assert returned_text_payload == payload == recorded[0][0]
+    assert receiver._load_shared_lib('textutil').unwrap_tool_result(response['result']) == payload
+    assert validation_markers == [(marker, bridge_marker)]  # validation precedes annotation
+
+
+def test_source_response_removes_untrusted_marker_without_pending_request_marker(monkeypatch):
+    receiver_spec = importlib.util.spec_from_file_location(
+        "receiver_untrusted_marker", os.path.join(HERE, "receiver.py"))
+    receiver = importlib.util.module_from_spec(receiver_spec)
+    receiver_spec.loader.exec_module(receiver)
+    recorded = []
+
+    class SourceContext:
+        @staticmethod
+        def record_bridge_status(payload, data_root=None):
+            recorded.append(dict(payload))
+
+    monkeypatch.setattr(receiver, '_source_context', lambda: SourceContext)
+    payload = {'sources': {'chrome': 'ok'},
+               relay.BRIDGE_REQUEST_STARTED_AT: '2999-01-01T00:00:00+00:00'}
+    result = {'structuredContent': dict(payload),
+              'content': [{'type': 'text', 'text': json.dumps(payload)}],
+              'isError': False}
+    receiver._record_source_response(
+        {'method': 'tools/call', 'params': {'name': 'health'}}, result)
+
+    assert relay.BRIDGE_REQUEST_STARTED_AT not in result['structuredContent']
+    assert relay.BRIDGE_REQUEST_STARTED_AT not in json.loads(result['content'][0]['text'])
+    assert recorded == [{'sources': {'chrome': 'ok'}}]
+
+
+def test_source_response_wraps_raw_payload_without_self_reference(monkeypatch):
+    receiver_spec = importlib.util.spec_from_file_location(
+        "receiver_raw_payload", os.path.join(HERE, "receiver.py"))
+    receiver = importlib.util.module_from_spec(receiver_spec)
+    receiver_spec.loader.exec_module(receiver)
+    recorded = []
+
+    class SourceContext:
+        @staticmethod
+        def record_bridge_status(payload, data_root=None):
+            recorded.append(dict(payload))
+
+    monkeypatch.setattr(receiver, '_source_context', lambda: SourceContext)
+    request = {'method': 'tools/call', 'params': {'name': 'health'},
+               relay.BRIDGE_REQUEST_STARTED_AT: '2026-09-22T12:00:00+00:00'}
+    result = {'sources': {'chrome': 'ok'}}
+    receiver._record_source_response(request, result)
+
+    assert result['structuredContent'] is not result
+    assert json.loads(json.dumps(result))['structuredContent'] == recorded[0]
+    assert json.loads(result['content'][0]['text']) == recorded[0]
+
+
+def test_source_response_leaves_empty_and_malformed_results_untouched(monkeypatch):
+    receiver_spec = importlib.util.spec_from_file_location(
+        "receiver_malformed_payload", os.path.join(HERE, "receiver.py"))
+    receiver = importlib.util.module_from_spec(receiver_spec)
+    receiver_spec.loader.exec_module(receiver)
+
+    class SourceContext:
+        @staticmethod
+        def record_bridge_status(_payload, data_root=None):
+            raise AssertionError('malformed payload must not be recorded')
+
+    monkeypatch.setattr(receiver, '_source_context', lambda: SourceContext)
+    request = {'method': 'tools/call', 'params': {'name': 'read_local'},
+               relay.BRIDGE_REQUEST_STARTED_AT: '2026-09-22T12:00:00+00:00'}
+    results = [
+        {},
+        {'structuredContent': {}},
+        {'structuredContent': {'source_status': []}, 'isError': False},
+        {'content': [{'type': 'text', 'text': 'not json'}], 'isError': False},
+    ]
+    originals = [json.loads(json.dumps(result)) for result in results]
+
+    for result in results:
+        receiver._record_source_response(request, result)
+
+    assert results == originals
 
 
 def test_response_hook_failure_does_not_discard_authenticated_bridge_result():
