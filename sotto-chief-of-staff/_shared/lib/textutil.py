@@ -18,6 +18,14 @@ import re
 import unicodedata
 
 
+# Consumer mailboxes do not identify an employer. Shared by research and automatic prep.
+FREEMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com", "outlook.com",
+    "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
+    "protonmail.com", "pm.me", "hey.com", "fastmail.com", "gmx.com", "zoho.com", "mail.com",
+}
+
+
 # ---------------------------------------------------------------------------
 # Defensive accessors — every source may be missing before the Bridge emits it.
 # ---------------------------------------------------------------------------

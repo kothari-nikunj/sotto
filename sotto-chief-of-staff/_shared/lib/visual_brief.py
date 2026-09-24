@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import re
@@ -548,7 +549,9 @@ def render(deck, destination):
             image.save(stream, format='PNG', optimize=True)
         tmp.replace(path)
         pages.append(str(path))
-    manifest = {**deck, 'images': pages}
+    from source_context import permission_fingerprint
+    manifest = {**deck, 'images': pages, 'source_permission_fingerprint': permission_fingerprint(),
+                'owner_channel_hash': hashlib.sha256(os.environ.get('PHOTON_HOME_CHANNEL', '').encode()).hexdigest()}
     path = destination / 'manifest.json'
     fd, name = tempfile.mkstemp(dir=destination, suffix='.tmp')
     tmp = Path(name)

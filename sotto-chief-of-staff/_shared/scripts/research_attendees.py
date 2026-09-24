@@ -127,11 +127,7 @@ def _recency_days() -> int:
 
 # Freemail domains: no company behind the @ — the person→company fallback can't help here, so
 # these are the only addresses where "No public profile found." with no company is acceptable.
-FREEMAIL_DOMAINS = {
-    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com", "outlook.com",
-    "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
-    "protonmail.com", "pm.me", "hey.com", "fastmail.com", "gmx.com", "zoho.com", "mail.com",
-}
+from textutil import FREEMAIL_DOMAINS  # noqa: E402, F401 (public compatibility export)
 
 # Generic-filler talking points ("Ask for introductions…", "Understand the agenda…") are the
 # fabrication the user called out — a deterministic post-filter, not just a prompt rule. Its one

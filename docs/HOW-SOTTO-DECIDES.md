@@ -158,6 +158,24 @@ basic reminder and its named prep offer. Gmail consent is checked before and aft
 composition and at delivery. Accepting that offer runs the focused meeting prep, presented as four
 photos on iMessage when it fits; the initial reminder is text.
 
+Automatic meeting prep and background attendee research require an external work email. Personal
+mailboxes are excluded, including when the owner uses a personal mailbox; explicit prep requests
+remain available for anyone. Prep names come from exact-email contacts, calendar names or the
+existing research cache, never a prettified email handle. Missing names use the meeting title.
+
+Before notification composition, held asks and due commitments get current thread and calendar
+context. The writer omits scheduling questions already settled by a matching invitation or later
+confirmation; a meeting alone does not complete a document promise. Exact source-message evidence
+also suppresses an ask whose matching ledger obligations are all terminal, both before writing
+and again at delivery. A new message on the same thread is independent. These checks withhold
+stale notifications without marking obligations complete by fuzzy calendar or person matches.
+
+For managed owner chat, a bare text-only "download this" with no URL, attachment or reply target asks for the link before
+starting model work. A new URL is the current document target. The DocSend reader accepts branded
+DocSend hosts and preserves the host through the email gate and page reads. A verification gate
+says that the cloud reader cannot use the Mac browser session, and asks for a PDF or a link without
+verification rather than promising browser sign-in will unlock cloud access.
+
 The watcher suppresses an imminent prep only after provider acceptance records the exact calendar
 event ID and start. Research is reusable context, not evidence the user received an offer or prep;
 moving the meeting creates a new occurrence and makes it eligible again.
@@ -1003,3 +1021,28 @@ other priorities and refusing additions when the three-priority set is full.
 Two audit corrections use existing writers: heard-once facts decay and archive from the same
 first-observation clock, so repeating an unsupported claim cannot refresh confidence or retention; explicit `tone_notes` reach the draft
 writer alongside observed style samples. User-corrected facts retain their authority.
+
+
+## Read back the work
+
+A missing or non-text Granola attendee name is absent identity evidence, not an extraction failure.
+The existing ownership and counterpart checks still reject ambiguous promises. Learn receipts
+retain each failed revision's exception class, never the exception body, so a successful provider
+call cannot hide a failed grounding or ledger write.
+
+`meeting_context.py` reads notes and joins obligations by the exact Granola occurrence. It returns
+up to **20 obligations**, with **8,000 characters per note field** and explicit omission metadata.
+Directions remain separate. Evidence-backed resolution, explicit user completion and other ledger
+closures have different labels. Completion evidence is withheld when its source is disabled.
+The next prep carries these current states beside the newest prior meeting notes, and the actual
+calendar description can explain the meeting's purpose. Unlinked email remains background.
+
+`brief_detail.py` retrieves only an accepted owner gallery within **7 days**, under unchanged
+source permissions. Pages carry up to **12,000 characters** with a continuation offset; ambiguous
+searches list up to **20 choices** and report omitted matches. Old artifacts without permission
+metadata require a fresh source read. The lookup neither sends nor recomposes the brief.
+
+`release_one_proof.py --days 7 --complete-days --timezone America/Los_Angeles` excludes today's
+partial day and reports which morning/evening receipts contain exact counters for each local day.
+Two exact scheduled Learn receipts establish that day's observation coverage, not model accuracy.
+Missing historical counters remain unknown; a zero observed error candidate count is not zero errors.

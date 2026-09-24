@@ -47,6 +47,18 @@ def test_acknowledged_gallery_never_repeats(box, monkeypatch):
     assert 'presentation' not in row['payload']
 
 
+def test_gallery_identity_survives_payload_erasure_in_atomic_acceptance_receipt(box, monkeypatch):
+    import hashlib
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: (True, '', {'message_id': 'parent'}))
+    item = payload()
+    item['presentation']['images'] = [f'/data/cache/visual-briefs/{"a"*24}/{i:02}.png' for i in range(4)]
+    assert box.deliver(item)
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['receipt']['visual_artifact_id'] == 'a'*24
+    assert row['receipt']['target_hash'] == hashlib.sha256(b'photon').hexdigest()
+    assert 'body' not in row['payload'] and 'presentation' not in row['payload']
+
+
 @pytest.mark.parametrize('acceptance', ['unknown', 'not_attempted'])
 def test_uncertain_gallery_held_but_proven_unsent_can_retry(box, monkeypatch, acceptance):
     calls = []

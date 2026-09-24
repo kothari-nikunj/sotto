@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 
 import yaml
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -23,6 +24,26 @@ cr = _load("continuity_resolve_fl", "morning-brief/scripts/continuity_resolve.py
 
 NOW = datetime(2026, 7, 2, 10, 0, 0)
 USER = "me@x.com"
+
+
+@pytest.mark.parametrize('missing', [None, '', 42, {}])
+def test_email_only_attendee_does_not_crash_or_supply_owner_identity(tmp_path, monkeypatch, missing):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    source = {'meeting_id': 'null-name', 'transcript': "Dana: I'll send the deck.",
+              'attendees': [{'email': USER, 'name': missing},
+                            {'email': 'dana@example.com', 'name': 'Dana Smith'}],
+              'attendee_emails': [USER, 'dana@example.com']}
+    payload = {'commitments': [{'meeting_id': 'null-name', 'owner': 'Dana Smith',
+        'owner_is_user': False, 'what': 'send the deck',
+        'source_snippet': "Dana: I'll send the deck."}]}
+    result = ac.apply(payload, USER, NOW, source_meetings=[source])
+    assert result['written'] == 1
+    assert next(iter(_ledger_items(tmp_path).values()))['action_type'] == 'waiting_on'
+    source['attendees'][1]['name'] = None
+    source['attendees'][1]['email'] = 'unrelated@example.com'
+    source['attendee_emails'] = [USER, 'unrelated@example.com']
+    result = ac.apply(payload, USER, NOW, source_meetings=[source])
+    assert result['written'] == 0 and result['grounding']['reasons']['counterpart'] == 1
 
 
 def _ganchor(meeting_id, what, owner_is_user=True, waiting=False, source_snippet="", counterpart=""):

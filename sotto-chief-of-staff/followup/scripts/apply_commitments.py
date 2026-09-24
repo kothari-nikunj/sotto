@@ -122,7 +122,10 @@ def _meeting_user_name(meeting: dict, user_email: str, configured_name: str) -> 
 
 
 def _normalized_what(value: str) -> str:
-    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
+    # Granola attendees can have an email with a null/missing display name. Absence is not
+    # identity evidence, and must not crash the grounding of every other commitment.
+    return " ".join("".join(ch.lower() if ch.isalnum() else " "
+                           for ch in (value if isinstance(value, str) else "")).split())
 
 
 def _deliverable_key(value: str) -> str:

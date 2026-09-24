@@ -1120,3 +1120,29 @@ are written under the same JSON lock in `relationship_state.json.review_candidat
 accepted-delivery finalizer. They do not grant authority. The user-confirmed `master_file.py
 prioritize` command adds one line atomically, preserving the existing set; VIP uses `preferences.py`.
 No other preference writer, persistent store, scheduler, model call or tuning environment is added.
+
+### Notification evidence and document targets
+
+The direct notification composer reuses `personal_context.current_conversation`, the active
+ledger view (including group IDs) and its existing Google Calendar read before its bounded
+writer decides whether an old ask still needs attention. `delivery_effects` compares exact source
+message references against terminal ledger rows at composition and send time. It never joins
+obligations by person or meeting title. Calendar context informs relevance, not automatic closure.
+
+`calendar_context.work_attendees` owns the work-address policy used by automatic research and prep.
+The managed Photon adapter clarifies a bare unbound download request after owner authorization and before dispatching model work. The
+DocSend reader validates complete URLs, accepts branded subdomains, and retains that host through
+the gate and page reads. Its cloud session does not inherit Mac browser verification. No new store,
+scheduler, model call or environment variable is introduced.
+
+### Meeting and photo readback
+
+The existing Ask skill invokes two read-only projections. `_shared/scripts/meeting_context.py`
+combines fresh Granola notes with canonical continuity rows by occurrence; the prep composer uses
+the same obligation reader for resolved and outstanding context. It does not extract, write or
+resolve commitments. `_shared/scripts/brief_detail.py` reads immutable visual manifests plus the
+existing outbox acceptance receipts or interactive gallery receipts. Acceptance keeps an opaque
+artifact ID and recipient hash after payload deletion. Render records the permission fingerprint
+and current owner-channel hash, so a default-channel receipt cannot follow a change of owner.
+No additional store or daemon is introduced. Existing cache retention and forget still own deletion.
+Learn preserves content-free extraction failures; the proof reader adds completed-local-day coverage.

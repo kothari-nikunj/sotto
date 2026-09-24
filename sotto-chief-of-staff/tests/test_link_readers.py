@@ -157,7 +157,7 @@ def test_docsend_verification_wall_fails_loud_with_the_step():
     out = df.fetch_deck("https://docsend.com/view/abc", "n@x.com", http=http,
                         vision=lambda i, t: "x")
     assert out["status"] == "error" and out["step"] == "gate"
-    assert "VERIFICATION" in out["error"] or "passcode" in out["error"]
+    assert "verification" in out["error"] or "passcode" in out["error"]
 
 
 def test_docsend_rejects_non_docsend_urls():
@@ -369,3 +369,38 @@ def test_docsend_gate_is_posted_as_docsend_wrote_it(monkeypatch):
     # the older markup (no <form action>, token only) still posts to the view URL
     action, parsed = df._gate_form(GATED_PAGE)
     assert action == "" and parsed["authenticity_token"] == "form-tok"
+
+
+def test_branded_docsend_keeps_the_requested_host_through_gate_and_pages():
+    class Branded(FakeHttp):
+        def get(self, url, accept='text/html'):
+            if not url.startswith('https://img/'):
+                assert url.startswith('https://acme.docsend.com/view/deck123')
+            return super().get(url, accept)
+        def post_form(self, url, fields, referer):
+            assert url == referer == 'https://acme.docsend.com/view/deck123'
+            return super().post_form(url, fields, referer)
+    out = df.fetch_deck('https://acme.docsend.com/view/deck123', 'owner@example.com',
+                        http=Branded(), vision=lambda images, title: 'The requested deck')
+    assert out['status'] == 'ok'
+    assert out['url'] == 'https://acme.docsend.com/view/deck123'
+    assert out['pages'] == 2
+
+
+def test_docsend_rejects_embedded_or_lookalike_hosts_without_a_request():
+    class NoNetwork:
+        def get(self, *a, **kw):
+            raise AssertionError('untrusted URL must never be requested')
+    for url in ('https://docsend.com.evil.example/view/deck',
+                'https://evil.example/path/https://docsend.com/view/deck',
+                'https://docsend.com@evil.example/view/deck',
+                'https://evil.example/?url=https://docsend.com/view/deck',
+                'https://paper.example/view/deck', 'https://docsend.com:8080/view/deck'):
+        assert not df.is_docsend(url)
+        assert df.fetch_deck(url, 'owner@example.com', http=NoNetwork())['step'] == 'url'
+
+
+def test_verification_does_not_claim_the_mac_session_unlocks_the_cloud():
+    out = df.fetch_deck('https://acme.docsend.com/view/deck', 'owner@example.com', http=FakeHttp(unlock=False))
+    assert 'cloud reader cannot use your Mac browser session' in out['error']
+    assert 'ask the sender for a PDF' in out['error']

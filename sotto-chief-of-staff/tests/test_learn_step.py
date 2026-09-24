@@ -11,6 +11,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "_shared", "scripts", "learn_step.py")
 
 
+def test_writer_error_class_survives_successful_model_timing_line():
+    result = {'meeting_revisions': [], 'stable_meeting_revisions': [],
+              'failed_meeting_revisions': ['opaque'], 'examined': 0, 'written': 0,
+              'deduped': 0, 'skipped_terminal': 0,
+              'failures': [{'meeting_revision': 'opaque', 'error': 'TypeError'},
+                           {'meeting_revision': 'opaque', 'error': 'private message body'}]}
+    run = lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=json.dumps(result),
+                                               stderr='successful model timing line')
+    receipt = ls._run_one('/tmp/capture_commitments.py', [], run=run)
+    assert receipt['proof']['failures'] == [{'meeting_revision': 'opaque', 'error': 'TypeError'}]
+
+
 def _args(tmp_path, **over):
     base = {"type": "morning", "local": "", "gmail": "", "granola": "", "knowledge_out": "",
             "continuity": "", "day": "2026-09-04"}

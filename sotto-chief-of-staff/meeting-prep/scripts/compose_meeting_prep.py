@@ -127,8 +127,11 @@ def _knowledge_lookup(prior_knowledge: dict) -> tuple[dict, list]:
 def _granola_for_emails(granola_meetings: list, emails: set) -> list:
     """Past meetings whose attendees overlap this meeting's external attendees (port of the
     get_granola_notes join in MEETING_PREP_PROMPT)."""
+    from meeting_context import obligations
     hits = []
-    for m in granola_meetings:
+    ledger = ledger_io.load_entries()
+    # The newest meeting must survive the bounded past-meeting context regardless of input order.
+    for m in sorted(granola_meetings, key=lambda m: _s(m.get('start') or m.get('date')), reverse=True):
         ae = {_s(e).lower().strip() for e in (m.get("attendee_emails") or [])}
         if ae & emails:
             # Distilled first, same rule as the followup composer: the user's own notes, then
@@ -147,8 +150,14 @@ def _granola_for_emails(granola_meetings: list, emails: set) -> list:
                 segs.append(f"[summary]: {summary[:PAST_NOTES_CHAR_CAP]}")
             if transcript:
                 segs.append(f"[transcript tail]: {transcript[-PAST_TRANSCRIPT_CHAR_CAP:]}")
+            for item in obligations(_s(m.get('meeting_id') or m.get('id')), ledger)[:MAX_RELEVANT_LOOPS_PER_ATTENDEE]:
+                segs.append(f"[recorded obligation; {item['direction']}; {item['status']}; "
+                            f"{item['completion_basis']}]: {item['what']}"
+                            + (f" Evidence: {item['resolution_evidence']}" if item['resolution_evidence'] else ''))
             if segs:
                 hits.append(f"- {_s(m.get('title'))} ({_s(m.get('date'))}) " + " ".join(segs))
+                if len(hits) == 3:
+                    break
     return hits[:3]
 
 
@@ -454,6 +463,9 @@ def build_context(inputs: dict) -> tuple[str, list]:
             lines.append(f"link: {e.get('meetingLink')}")
         if e.get("location"):
             lines.append(f"location: {_s(e.get('location'))}")
+        if e.get('description'):
+            lines.append('calendar description (stated meeting purpose, if present): '
+                         + _s(e.get('description'))[:PAST_NOTES_CHAR_CAP])
         att_struct = []
         for a in attendees:
             email = a["email"]

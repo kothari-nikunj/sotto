@@ -12,6 +12,7 @@ for directory in ('_shared/lib', '_shared/scripts', 'followup/scripts',
 import capture_commitments as capture
 import compose_meeting_prep as prep
 import continuity_resolve as resolver
+import meeting_context
 from delivery_effects import loop_version
 
 
@@ -78,3 +79,10 @@ def test_notes_to_prep_to_specific_fulfillment_once(tmp_path, monkeypatch):
                                'loop_updates': [update]},
                               datetime(2026, 9, 19, 12), resolve_existing=False)
     assert replay['resolved'] == [] and resolver._load_items()[anchor]['status'] == 'resolved'
+
+    monkeypatch.setattr(meeting_context, 'allowed', lambda source: True)
+    outcome = meeting_context.query('granola-1', {'meetings': [meeting]})
+    assert outcome['obligations'][0]['status'] == 'resolved'
+    assert outcome['obligations'][0]['completion_basis'] == 'source_evidence'
+    prior = '\n'.join(prep._granola_for_emails([meeting], {'dana@acme.com'}))
+    assert 'send Dana the deck' in prior and 'resolved; source_evidence' in prior

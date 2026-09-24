@@ -1,7 +1,18 @@
 """Optional presentation at the existing delivery seam; the source body remains authoritative."""
 import logging
 import os
+import re
 from pathlib import Path
+
+
+def artifact_id(presentation):
+    """Opaque gallery identity for the existing acceptance receipt, never image paths or text."""
+    paths = presentation.get('images', []) if isinstance(presentation, dict) else []
+    if not isinstance(paths, list) or len(paths) != 4 or not all(isinstance(p, str) for p in paths):
+        return None
+    parents = {Path(p).parent for p in paths}
+    ident = next(iter(parents)).name if len(parents) == 1 else ''
+    return ident if re.fullmatch(r'[a-f0-9]{24}', ident) else None
 
 
 # Fixed copy only. Model text, exception messages and private paths never become diagnostics.

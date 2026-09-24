@@ -72,7 +72,7 @@ def test_the_prep_nudge_carries_who_they_are_and_what_you_owe_them(tmp_path, mon
     cal2 = [{"id": "ev2", "summary": "Coffee", "start": soon,
              "attendees": [{"email": "me@x.com", "self": True}, {"email": "stranger@else.com"}]}]
     m, = ps.scan(cal2, [], {}, "me@x.com", now)["nudges"]
-    assert m["who"] == "" and m["open_loop"] == "" and m["person"] == "stranger"
+    assert m["who"] == "" and m["open_loop"] == "" and m["person"] == ""
 
 
 def test_a_declined_meeting_never_gets_a_prep_nudge():
@@ -971,3 +971,50 @@ def test_duplicate_cards_for_one_identity_keep_explicit_vip_alias(tmp_path, monk
     assert importance['canonical:c_jordan']['tier'] == 'vip'
     # The same-name c_other card cannot borrow the explicit choice.
     assert importance['canonical:c_other']['tier'] == 'regular'
+
+
+def test_automatic_prep_uses_work_addresses_only_for_consumer_and_corporate_owners():
+    now = _at(10)
+    event = {'id': 'work-only', 'summary': 'Coffee', 'start': (now + timedelta(minutes=20)).isoformat(),
+             'attendees': [{'email': 'partner@yahoo.com', 'displayName': 'Partner'}]}
+    for owner in ('me@company.example', 'me@yahoo.com'):
+        assert ps.scan([event], [], {}, owner, now)['nudges'] == []
+        event['attendees'].append({'email': 'maya@outside.example', 'displayName': 'Maya Patel'})
+        assert ps.scan([event], [], {}, owner, now)['nudges'][0]['person'] == 'Maya Patel'
+        event['attendees'].pop()
+
+
+def test_prep_name_uses_exact_email_research_and_never_another_namesake(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    now = _at(10)
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    (cache / f'research_{now:%Y-%m-%d}.json').write_text(json.dumps({'attendees': [
+        {'email': 'lee@acme.example', 'full_name': 'Lee Morgan'},
+        {'email': 'lee@other.example', 'full_name': 'Lee Jones'}]}))
+    event = {'id': 'board', 'summary': 'Board meeting', 'start': (now + timedelta(minutes=20)).isoformat(),
+             'attendees': [{'email': 'lee@acme.example'}]}
+    nudge, = ps.scan([event], [], {}, 'me@fund.example', now)['nudges']
+    assert nudge['person'] == 'Lee Morgan'
+    event['attendees'][0]['email'] = 'lee@third.example'
+    assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''
+    event['attendees'][0]['email'] = 'lee@acme.example'
+    local = {'contacts': [{'name': 'Lee Updated', 'emails': ['lee@acme.example']}]}
+    assert ps.scan([event], [], local, 'me@fund.example', now)['nudges'][0]['person'] == 'Lee Updated'
+    event['attendees'][0]['displayName'] = 'Lee Calendar'
+    assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == 'Lee Calendar'
+    # Expired cached research is not fresh identity evidence.
+    (cache / f'research_{now:%Y-%m-%d}.json').rename(cache / 'research_2000-01-01.json')
+    event['attendees'][0].pop('displayName')
+    assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''
+
+
+def test_malformed_optional_name_data_does_not_drop_prep(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    sys.path.insert(0, os.path.join(ROOT, "_shared", "knowledge"))
+    import knowledge as kg
+    path = tmp_path / 'corrupt.md'
+    path.write_text('---\nname: [unterminated\n---\n')
+    monkeypatch.setattr(kg, 'find_person_file', lambda **kw: str(path))
+    assert ps._prep_name({'email': 'person@acme.example'}, {}, _at(10)) == ''

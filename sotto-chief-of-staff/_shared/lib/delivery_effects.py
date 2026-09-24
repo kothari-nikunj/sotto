@@ -96,6 +96,11 @@ def notification_selection(selected, proactive=None):
         return
     with jsonstore.transaction(_path(ident), default={}, strict=True) as doc:
         doc['notification_decision_ids'] = sorted(set(selected))
+        # A retry can select a different primary after the original ask closes. Keep the
+        # send-time closure gate bound to this attempt's selection, not a previous attempt.
+        doc['effects'] = [e for e in doc.get('effects', [])
+                         if e.get('kind') != 'eligibility' or not e.get('notification_id')
+                         or e['notification_id'] in selected]
         if proactive is not None:
             keys = {n.get('key') for n in proactive}
             anchors = {(n.get('kind'), n.get('anchor_key')) for n in proactive}
@@ -169,6 +174,44 @@ def source_for_event(event):
                   'contacts' if event.get('kind') == 'birthday' else event.get('channel', ''))
     return {'email': 'gmail', 'calendar_change': 'calendar', 'meeting_end': 'calendar',
             'phonecalls': 'calls'}.get(source, source)
+
+
+def request_reference(event):
+    """Use the extractor's source message identity, never a sender or thread as an obligation."""
+    if event.get('source') not in ('gmail', 'email', 'imessage', 'whatsapp'):
+        return None
+    source = source_for_event(event)
+    if source == 'gmail':
+        ident = event.get('source_id') or event.get('id') or event.get('messageId') or event.get('message_id')
+    elif source in ('imessage', 'whatsapp'):
+        from render_local import message_evidence_id
+        ident = message_evidence_id(event, source)
+    else:
+        ident = None
+    return {'source': source, 'id': str(ident)} if ident else None
+
+
+def request_closed(reference, loops=None):
+    """A held original message cannot revive its settled obligations.
+
+    One message can contain several asks. Keep it eligible if any matching obligation is active;
+    a new message on the same thread is independent. No fuzzy person/wording joins.
+    """
+    if not reference:
+        return False
+    import ledger_io
+    matches = []
+    for row in (loops if loops is not None else _loops()).values():
+        refs = row.get('source_refs') or []
+        if isinstance(refs, dict):
+            refs = [refs]
+        refs = [r for r in refs if isinstance(r, dict)]
+        if row.get('source_message_id'):
+            refs = [*refs, {'sourceType': row.get('channel'), 'sourceId': row['source_message_id']}]
+        if any(source_for_event({'source': r.get('sourceType') or r.get('source_type') or r.get('source')}) == reference['source']
+               and str(r.get('sourceId') or r.get('source_id') or r.get('id') or '') == reference['id'] for r in refs):
+            matches.append(row)
+    return bool(matches) and all(r.get('status') in ledger_io.TERMINAL for r in matches)
 
 
 def for_bundle(bundle):
@@ -269,6 +312,13 @@ def valid(effects, now=None):
         source = effect.get('source')
         if source and not allowed(source):
             return False
+        # Only the selected notification carries this reference. Inferring it from every
+        # bundled event would let a closed, unselected ask suppress a fresh primary item.
+        reference = effect.get('request_reference')
+        if reference:
+            loops = _loops() if loops is None else loops
+            if request_closed(reference, loops):
+                return False
         until = instant(effect.get('valid_until'))
         if until is not None and now >= until:
             return False

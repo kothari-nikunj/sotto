@@ -133,6 +133,16 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
                          'examined': parsed['examined'], 'written': parsed['written'],
                          'deduped': parsed['deduped'],
                          'skipped_terminal': parsed['skipped_terminal']}
+                # Do not let the last successful model timing line hide a later writer failure.
+                # Only the class and opaque revision survive; no exception text or source notes.
+                failures = parsed.get('failures', [])
+                proof['failures'] = [
+                    {'meeting_revision': row['meeting_revision'], 'error': row['error']}
+                    for row in failures if isinstance(row, dict)
+                    and row.get('meeting_revision') in failed_revisions
+                    and isinstance(row.get('error'), str)
+                    and row['error'].isidentifier() and len(row['error']) <= 80
+                ] if isinstance(failures, list) else []
         except (IndexError, TypeError, ValueError, json.JSONDecodeError):
             pass
     result = {"status": "ok" if r.returncode == 0 else "failed", "exit": r.returncode,

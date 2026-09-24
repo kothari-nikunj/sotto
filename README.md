@@ -252,4 +252,4 @@ that keeps your Full Disk Access grant.
 
 Cloud and self-host use the same shared runtime and skill pack.
 
-Four-photo iMessage briefs and focused meeting backgrounds: [visual briefs, privacy, and testing](docs/VISUAL-BRIEFS.md).
+Four-photo iMessage briefs, focused meeting backgrounds, and saved text on request: [visual briefs, privacy, and testing](docs/VISUAL-BRIEFS.md).

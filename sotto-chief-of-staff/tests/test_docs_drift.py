@@ -97,6 +97,18 @@ ARCH = _island("playground-architecture.html")
 LOOPS = _island("playground-feedback-loops.html")
 R = ARCH   # the two are asserted identical below; read from one of them everywhere else
 
+
+def test_readback_limits_match_both_rules_islands():
+    import brief_detail
+    import meeting_context
+    assert ARCH['readback'] == LOOPS['readback'] == {
+        'photo_retention_days': brief_detail.RETENTION_DAYS,
+        'photo_page_chars': brief_detail.PAGE_CHARS,
+        'photo_choices': brief_detail.MAX_MATCHES,
+        'meeting_items': meeting_context.MAX_MEETING_ITEMS,
+        'meeting_note_chars': meeting_context.NOTES_CHARS,
+    }, RULE
+
 with open(os.path.join(DOCS, "HOW-SOTTO-DECIDES.md"), encoding="utf-8") as _f:
     DECIDES = re.sub(r"\s+", " ", _f.read())
 
@@ -1255,3 +1267,14 @@ def test_memory_retrieval_budgets_match_docs_and_both_playgrounds():
     _anchor(f'**{context.TOPIC_RECORDS} records per identifier**')
     _anchor(f'**{context.TOPIC_RECORD_CHARS} characters per record**')
     _anchor(f'**{context.TOPIC_CHARS:,} characters per identifier**')
+
+
+def test_notification_context_policy_is_documented():
+    assert R['notification_context'] == {
+        'automatic_prep': 'external_work_email', 'closed_requests': 'exact_message_evidence',
+        'scheduling': 'current_thread_and_calendar', 'missing_download_link': 'clarify',
+        'docsend': 'branded_hosts_supported'}
+    _anchor('Automatic meeting prep and background attendee research require an external work email.')
+    _anchor('held asks and due commitments get current thread and calendar context.')
+    _anchor('Exact source-message evidence also suppresses an ask')
+    _anchor('the cloud reader cannot use the Mac browser session')

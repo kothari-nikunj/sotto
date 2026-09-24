@@ -87,6 +87,8 @@ _shared/
   scripts/compose_brief.py           # the FLEX extraction engine + critic + tap-links + escalation (PORT: gemini-flex.ts/brief-critic.ts/generate.ts)
   lib/review_candidates.py           # Friday candidate selection and accepted offer receipts in existing relationship state
   lib/relationship_importance.py     # reciprocal activity, held meetings and separate decaying reply signals
+  scripts/brief_detail.py            # accepted owner photo text, permission-checked and paginated
+  scripts/meeting_context.py         # read-only meeting notes and canonical obligation outcomes
   scripts/release_one_proof.py        # read-only retained-history coverage and proposal counters; no model call
   scripts/learn_step.py              # essential knowledge/continuity, then separately queued ancillary writers; one merged receipt
   scripts/memory_cycle.py            # bounded work-driven history progress and changed-person curation

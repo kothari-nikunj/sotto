@@ -11,6 +11,20 @@ BUDGET_NOTICE = ("This account has reached its usage allowance. "
 TYPING_START_DELAY_SECONDS = 2.0
 
 
+def missing_download_link(event):
+    """A standalone 'download this' often arrives before its link in the next message.
+
+    Clarify that narrow text-only request before a model can act on an unrelated old deck.
+    Explicit URLs, reply targets, attachments and named requests retain ordinary handling.
+    """
+    if (getattr(event, 'media_urls', None) or getattr(event, 'reply_to_message_id', None)
+            or getattr(event, 'reply_to_text', None)):
+        return False
+    text = ' '.join(str(getattr(event, 'text', '') or '').split())
+    return bool(re.fullmatch(r'(?:(?:can you|could you|would you|please)\s+)?download\s+'
+                             r'(?:this|that|it)(?:\s+(?:to|as)\s+(?:a\s+)?pdf)?[?.!]*', text, re.I))
+
+
 def processing_tapback(text):
     """A bounded, local hint about the request, never a claim that an action ran."""
     text = ' '.join(str(text or '').casefold().split())[:512]
@@ -173,23 +187,25 @@ def register(ctx):
             return await super()._sidecar_call(path, body)
 
         async def handle_message(self, event):
-            if not managed():
-                return await super().handle_message(event)
-            owner = os.environ.get("PHOTON_HOME_CHANNEL", "")
-            if not permits(event.source, owner):
-                return
-            # A content-free receipt separates infrastructure readiness from the first
-            # owner-initiated conversation required by Photon's shared-line policy.
-            root = Path(os.environ.get("SOTTO_DATA", "/data")) / "config"
-            root.mkdir(parents=True, exist_ok=True)
-            receipt = root / "photon-activation.json"
-            payload = {"tenant_id": os.environ["SOTTO_TENANT_ID"], "owner": owner,
-                       "chat_id": event.source.chat_id, "activated": True}
-            if not receipt.exists():
-                tmp = receipt.with_suffix(".tmp")
-                tmp.write_text(json.dumps(payload))
-                tmp.chmod(0o600)
-                tmp.replace(receipt)
+            if managed():
+                owner = os.environ.get("PHOTON_HOME_CHANNEL", "")
+                if not permits(event.source, owner):
+                    return
+                # A content-free receipt separates infrastructure readiness from the first
+                # owner-initiated conversation required by Photon's shared-line policy.
+                root = Path(os.environ.get("SOTTO_DATA", "/data")) / "config"
+                root.mkdir(parents=True, exist_ok=True)
+                receipt = root / "photon-activation.json"
+                payload = {"tenant_id": os.environ["SOTTO_TENANT_ID"], "owner": owner,
+                           "chat_id": event.source.chat_id, "activated": True}
+                if not receipt.exists():
+                    tmp = receipt.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(payload))
+                    tmp.chmod(0o600)
+                    tmp.replace(receipt)
+            if managed() and missing_download_link(event):
+                return await self.send(event.source.chat_id, "Send me the link you want saved as a PDF.",
+                                       reply_to=getattr(event, 'message_id', None))
             return await super().handle_message(event)
 
     async def owner_send(config, chat_id, message, **kwargs):
@@ -211,6 +227,9 @@ def register(ctx):
                 "The user is texting Sotto in Apple Messages. Use short, plain-text paragraphs "
                 "and • bullets. No Markdown headings, emphasis markers, quote prefixes or tables. "
                 "Web links must be ordinary URLs, not Markdown links. Never offer a mailto URL. "
+                "For a link request, use the URL in this message or its explicit reply target. "
+                "If the requested link is missing or ambiguous, ask for it; do not pick an older "
+                "deck from the conversation. A new URL replaces the earlier target. "
                 "Check google_action.py capabilities before offering to save a Gmail draft; "
                 "Gmail read access does not imply draft permission."
             )

@@ -91,6 +91,7 @@ sent unrecorded).
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 import threading
@@ -102,7 +103,7 @@ import fcntl
 # a message, not a second hashing convention invented here.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keys import queue_key as _content_id  # noqa: E402
-from visual_delivery import delivery_detail  # noqa: E402
+from visual_delivery import delivery_detail, artifact_id  # noqa: E402
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -406,6 +407,10 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
             row["status"], row["last_error"] = STATUS_DELIVERED, ""
             payload = _close(row)
             row['receipt'] = {**(receipt or {}), 'accepted_at': time.time()}
+            visual_id = artifact_id(payload.get('presentation'))
+            if visual_id:
+                row['receipt']['visual_artifact_id'] = visual_id
+                row['receipt']['target_hash'] = hashlib.sha256(str(payload.get('target') or '').encode()).hexdigest()
             # Drop message text immediately, retain only replayable post-acceptance effects.
             row['payload'] = {k: v for k, v in payload.items() if k in
                               ('label', 'effects', 'run_id', 'coverage_until', 'decision_ids')}

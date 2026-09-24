@@ -65,7 +65,9 @@ MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 DOCSEND_MAX_PAGES = 30        # a seed deck is 10-20 pages; 30 covers the long tail without a book
 HTTP_TIMEOUT = 30
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-VIEW_RE = re.compile(r"https?://(?:www\.)?docsend\.com/view/([A-Za-z0-9_-]+)", re.I)
+VIEW_RE = re.compile(
+    r"\Ahttps?://(?P<host>(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*docsend\.com)"
+    r"/view/(?P<id>[A-Za-z0-9_-]+)/?(?:[?#][^\s]*)?\Z", re.I)
 TOKEN_RE = re.compile(r'name="authenticity_token"\s+value="([^"]+)"')
 CSRF_RE = re.compile(r'name="csrf-token"\s+content="([^"]+)"')
 
@@ -78,7 +80,7 @@ TITLE_RE = re.compile(r"<title>([^<]*)</title>", re.I)
 
 
 def is_docsend(url: str) -> bool:
-    return bool(VIEW_RE.search(url or ""))
+    return bool(VIEW_RE.fullmatch((url or "").strip()))
 
 
 class _Http:
@@ -254,10 +256,12 @@ def _save_deck(view_id: str, result: dict, images: list) -> str:
 def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = None,
                vision=None) -> dict:
     """The whole flow. `http`/`vision` injectable for tests. Returns the output contract above."""
-    m = VIEW_RE.search(url or "")
+    m = VIEW_RE.fullmatch((url or "").strip())
     if not m:
         return _err("url", f"not a docsend.com/view link: {url!r}")
-    view_url = f"https://docsend.com/view/{m.group(1)}"
+    parsed_url = urllib.parse.urlsplit(url.strip())
+    view_url = urllib.parse.urlunsplit(('https', m.group('host').lower(),
+                                       '/view/' + m.group('id'), parsed_url.query, ''))
     http = http or _Http()
 
     try:
@@ -296,8 +300,9 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
             return _err("gate", f"email gate refused: {type(e).__name__}: {e}")
         if "link_auth_form" in page and 'name="link_auth_form[email]"' in page:
             hint = ("this deck requires a passcode — pass --passcode" if "passcode" in page.lower()
-                    else "this deck requires EMAIL VERIFICATION (a click-the-link mail) — "
-                         "open it yourself once, or ask the sender to relax the setting")
+                    else "This deck requires email verification. Sotto's cloud reader cannot use "
+                         "your Mac browser session. Open it in your browser to view it yourself, "
+                         "or ask the sender for a PDF or a link that does not require verification.")
             return _err("gate", hint)
 
     # Page images: /view/<id>/page_data/<n> answers {imageUrl: ...} per page while the session
@@ -305,7 +310,9 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
     images = []
     for n in range(1, DOCSEND_MAX_PAGES + 1):
         try:
-            meta = json.loads(http.get(f"{view_url}/page_data/{n}", accept="application/json"))
+            page_url = urllib.parse.urlsplit(view_url)
+            page_url = page_url._replace(path=page_url.path + f"/page_data/{n}").geturl()
+            meta = json.loads(http.get(page_url, accept="application/json"))
         except Exception:  # noqa: BLE001 — first missing page = the end of the deck
             break
         img_url = (meta or {}).get("imageUrl") or ""
@@ -329,10 +336,10 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
 def read_deck(url: str, email: str, passcode: str = "", fresh: bool = False) -> dict:
     """The storing front door: cache first (a re-ask must not re-receipt the founder's analytics),
     else fetch + save. `fresh` forces a new fetch (and a new, visible, view)."""
-    m = VIEW_RE.search(url or "")
+    m = VIEW_RE.fullmatch((url or "").strip())
     if not m:
         return _err("url", f"not a docsend.com/view link: {url!r}")
-    view_id = m.group(1)
+    view_id = m.group("id")
     if not fresh:
         cached = load_cached(view_id)
         if cached:
@@ -401,8 +408,8 @@ def main() -> int:
     # allowed through — reading a file already on the volume is not a view — which is what lets a
     # brief discuss a deck the user already read in chat.
     if os.environ.get("SOTTO_UNATTENDED", "").strip():
-        m = VIEW_RE.search(a.url or "")
-        cached = load_cached(m.group(1)) if m else None
+        m = VIEW_RE.fullmatch((a.url or "").strip())
+        cached = load_cached(m.group("id")) if m else None
         if cached:
             print(json.dumps({"status": "ok", "cached": True, "pages": cached.get("pages", 0),
                               "url": cached.get("url", a.url), "title": cached.get("title", ""),

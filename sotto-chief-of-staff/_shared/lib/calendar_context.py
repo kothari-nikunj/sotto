@@ -47,6 +47,24 @@ def user_participates(event, self_email=''):
         (owner and str(organizer.get('email') or '').strip().lower() == owner))
 
 
+def work_attendees(event, self_email=''):
+    """Unsolicited research/prep is for external work addresses, never personal mailboxes.
+
+    This is eligibility for automatic prep, not an identity claim or a restriction on a user's
+    explicit prep request. A consumer mailbox belonging to the owner is not a company domain.
+    """
+    # Only skill-side callers need this policy. The receiver also copies this module alone.
+    from textutil import FREEMAIL_DOMAINS
+    owner_domain = self_email.strip().lower().partition('@')[2]
+    if owner_domain in FREEMAIL_DOMAINS:
+        owner_domain = ''
+    return [a for a in human_attendees(event, self_email)
+            if re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', a['email'])
+            and a['status'] != 'declined'
+            and a['email'].partition('@')[2] not in FREEMAIL_DOMAINS
+            and a['email'].partition('@')[2] != owner_domain]
+
+
 _CONTEXT_TITLE = re.compile(r'^(?:meeting\s+)?(?:context|prep notes|briefing notes|meeting notes)\s*:\s*(.+)$', re.I)
 
 

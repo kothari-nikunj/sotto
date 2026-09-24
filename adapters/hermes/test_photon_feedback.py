@@ -1,6 +1,7 @@
 """Observe sidecar feedback across turn lifecycle; no Photon connection or model calls."""
 import asyncio
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -17,6 +18,9 @@ def photon(request, monkeypatch):
         def __init__(self):
             self.calls = []
             self._typing_paused = set()
+
+        async def handle_message(self, event):
+            self.calls.append(('/model_turn', event.text))
 
         async def _sidecar_try(self, route, payload, label):
             self.calls.append((route, payload.copy()))
@@ -264,3 +268,48 @@ def test_reactions_stay_on_their_own_message(photon):
     asyncio.run(turn())
     assert [(p['messageId'], p['emoji']) for _, p in photon.calls] == [
         ('first', '🔎'), ('second', '📝'), ('second', '✅'), ('first', '⏸️')]
+
+
+def test_download_without_a_link_clarifies_before_starting_a_model_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    event = types.SimpleNamespace(text='Can you download this to PDF?', message_id='new-request',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    if os.environ['SOTTO_DEPLOYMENT_MODE'] != 'managed':
+        # Keep the host's gateway authorization ahead of all self-hosted replies.
+        assert photon.calls == [('/model_turn', event.text)]
+        return
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Send me the link you want saved as a PDF.'})]
+    # The next message is the new target. No old document lookup has started.
+    event.text = 'https://acme.docsend.com/view/new-deck'
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls[-1] == ('/model_turn', event.text)
+
+
+@pytest.mark.parametrize('extra,text', [
+    ({'reply_to_message_id': 'deck-message'}, 'Can you download this to PDF?'),
+    ({'reply_to_text': 'https://acme.docsend.com/view/current'}, 'Download this'),
+    ({'media_urls': ['attachment.pdf']}, 'Download this as PDF'),
+    ({}, 'Download the Acme deck as PDF'),
+    ({}, 'Download this to PDF: https://acme.docsend.com/view/current'),
+    ({}, 'Save our meeting notes as a PDF'),
+])
+def test_bound_or_named_downloads_keep_normal_handling(photon, tmp_path, monkeypatch, extra, text):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    event = types.SimpleNamespace(text=text, source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'), **extra)
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/model_turn', text)]
+
+
+def test_missing_link_cannot_bypass_sender_authorization(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    event = types.SimpleNamespace(text='Download this as PDF', source=types.SimpleNamespace(
+        chat_id='stranger-chat', user_id='stranger', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    if os.environ['SOTTO_DEPLOYMENT_MODE'] == 'managed':
+        assert photon.calls == []
+    else:
+        assert photon.calls == [('/model_turn', event.text)]  # upstream authorization, no direct reply

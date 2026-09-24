@@ -269,3 +269,44 @@ def test_user_requested_promotion_survives_zero_but_ordinary_bundle_does_not(tmp
     (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'nudge_budget': '0'}}))
     assert effects.valid(requested['effects'], now.timestamp() + 60)
     assert not effects.valid(ordinary['effects'], now.timestamp() + 60)
+
+
+def test_held_request_rechecks_exact_completion_at_delivery(monkeypatch):
+    rows = {'a': {'anchor_key': 'a', 'status': 'open', 'channel': 'email',
+                  'source_refs': [{'sourceType': 'email', 'sourceId': 'original-ask'}]}}
+    monkeypatch.setattr(effects, '_loops', lambda: rows)
+    bundle = {'events': [{'class': 'scheduling_ask', 'event': {
+        'source': 'email', 'id': 'original-ask', 'threadId': 'same-thread'}}]}
+    staged = [{'kind': 'eligibility', 'source': 'gmail',
+               'request_reference': effects.request_reference(bundle['events'][0]['event'])}]
+    assert effects.valid(staged)
+    rows['a']['status'] = 'resolved'
+    assert not effects.valid(staged)
+    # Same thread/person does not make a new request the old obligation.
+    bundle['events'][0]['event']['id'] = 'new-ask'
+    assert effects.valid([{**staged[0], 'request_reference': effects.request_reference(bundle['events'][0]['event'])}])
+    # Nor does one completed task pay off a second task in the original message.
+    rows['b'] = {**rows['a'], 'anchor_key': 'b', 'status': 'open'}
+    assert effects.valid(staged)
+    rows['b']['status'] = 'dismissed'
+    assert not effects.valid(staged)
+
+
+def test_local_request_uses_the_same_evidence_identity_as_extraction(monkeypatch):
+    from render_local import message_evidence_id
+    event = {'source': 'imessage', 'handle': '+15550000000', 'chat_guid': 'group-1',
+             'is_from_me': False, 'text': 'Thursday at 3?', 'timestamp': '2026-09-21T12:00:00Z'}
+    ref = effects.request_reference(event)
+    assert ref['id'] == message_evidence_id(event, 'imessage')
+    rows = {'a': {'status': 'resolved', 'source_refs': [{'sourceType': 'imessage', 'sourceId': ref['id']}]}}
+    assert effects.request_closed(ref, rows)
+    assert not effects.request_closed({**ref, 'source': 'whatsapp'}, rows)
+    assert not effects.request_closed(effects.request_reference({**event, 'text': 'Another question'}), rows)
+
+
+def test_unselected_bundle_event_does_not_gain_a_closure_gate(monkeypatch):
+    monkeypatch.setattr(effects, '_loops', lambda: {'closed': {'status': 'dismissed',
+        'source_refs': [{'sourceType': 'email', 'sourceId': 'old-message'}]}})
+    legacy = {'kind': 'eligibility', 'source': 'gmail', 'event': {'source': 'gmail', 'id': 'old-message'}}
+    assert effects.valid([legacy])
+    assert effects.request_reference({'source': 'proactive', 'channel': 'email', 'id': 'old-message'}) is None

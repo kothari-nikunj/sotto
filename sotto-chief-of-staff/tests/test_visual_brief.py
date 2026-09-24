@@ -22,7 +22,8 @@ Donation blast and social chatter.
 """
 
 
-def test_quotes_provenance_and_renders_private_readable_cards(tmp_path):
+def test_quotes_provenance_and_renders_private_readable_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'owner')
     deck = v.build(BRIEF, preview=True)
     assert deck == v.build(BRIEF, preview=True)
     assert [c['title'] for c in deck['cards']] == ['Needs you', 'Today', 'Your day', 'Follow-ups']
@@ -37,6 +38,9 @@ def test_quotes_provenance_and_renders_private_readable_cards(tmp_path):
         assert Path(path).stat().st_mode & 0o777 == 0o600
     saved = json.loads((Path(manifest['images'][0]).parent / 'manifest.json').read_text())
     assert saved['full_text'] == BRIEF.strip()
+    assert saved['owner_channel_hash'] == v.hashlib.sha256(b'owner').hexdigest()
+    from source_context import permission_fingerprint
+    assert saved['source_permission_fingerprint'] == permission_fingerprint()
     assert 'Donation' not in str(deck['cards'])
     assert 'Historical preview' in deck['summary']
 

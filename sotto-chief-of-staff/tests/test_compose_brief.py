@@ -1994,9 +1994,8 @@ def test_seed_snapshot_tolerates_a_raw_tool_wrapper_and_refuses_an_empty_seed(tm
 
 # ── freemail user domain: same-domain attendees still get researched ────────────
 
-def test_freemail_user_domain_does_not_skip_freemail_attendees(tmp_path, monkeypatch):
-    # A gmail.com user shares a "domain" with every other gmail.com human — the colleague-domain
-    # skip must not blanket-exclude them from research (corporate domains keep the skip).
+def test_automatic_research_excludes_personal_addresses_for_every_owner(tmp_path, monkeypatch):
+    # Automatic prep is for work addresses even when the owner uses a personal account.
     import datetime as _dt
 
     class _FixedDateTime(_dt.datetime):
@@ -2009,7 +2008,9 @@ def test_freemail_user_domain_does_not_skip_freemail_attendees(tmp_path, monkeyp
         {"id": "e", "summary": "Coffee", "start": "2026-06-24T22:00:00+00:00", "attendees": [
             {"email": "me@yahoo.com", "displayName": "Me"},
             {"email": "jordan.vale@yahoo.com", "displayName": "Jordan Vale"}]}]}, "local": {}}
-    assert [p["email"] for p in cb.select_attendees_for_research(inputs)] == ["jordan.vale@yahoo.com"]
+    assert cb.select_attendees_for_research(inputs) == []
+    inputs['google']['events'][0]['attendees'].append({'email': 'jordan@acme.example', 'displayName': 'Jordan Vale'})
+    assert [p['email'] for p in cb.select_attendees_for_research(inputs)] == ['jordan@acme.example']
     # Corporate stays corporate: same-domain colleague still skipped.
     inputs["google"]["userEmail"] = "me@mycorp.com"
     inputs["google"]["events"][0]["attendees"] = [

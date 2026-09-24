@@ -10,9 +10,8 @@ surfaces a ready draft, it never sends on the user's behalf.
 
 Six nudge kinds:
   - intention     — a one-shot plain-language recipe whose due time has arrived
-  - meeting_prep  — an external meeting starting within the lead window that you haven't prepped
-                    (deterministic test: none of its external attendees are in TODAY's research
-                    cache, i.e. no prep or brief run has covered this meeting's people yet)
+  - meeting_prep  — a meeting with an external work address within the lead window; suppressed
+                    only after an offer or prep for this exact occurrence reaches provider acceptance.
   - commitment    — a continuity open-loop YOU owe whose deadline is today or overdue. Deliberately
                     one direction: a loop you are WAITING ON belongs to the chase lane and nowhere
                     else — one loop, one nudge, one register (the two branches draft opposite
@@ -90,13 +89,14 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # Reuse the brief's tz + contact helpers so "today"/external/birthday logic matches the brief exactly.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
 from textutil import _arr, _s, unwrap_tool_result  # noqa: E402
-from calendar_context import human_attendees, meeting_events  # noqa: E402
+from calendar_context import work_attendees, meeting_events  # noqa: E402
 from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email  # noqa: E402
 import delivery_effects  # noqa: E402
 # The funnel itself — this file calls triage() in-process, so there is one gate order and not a
@@ -317,6 +317,58 @@ def _delivered_prep_occurrences(date: str) -> set:
         return set()
 
 
+def _prep_name(attendee, local, now):
+    """Display evidence bound to this email; never title-case an email handle into a person.
+
+    Published research can fill a missing name, but never changes identity or overwrites a
+    contact/calendar name. The existing seven-day cache needs no new network read or research call.
+    """
+    from render_local import build_identity_resolver
+    from source_context import project_local
+    from research_attendees import CACHE_KEEP_DAYS
+    email = _s(attendee.get('email')).strip().lower()
+    def human_name(value):
+        value = _s(value).strip()
+        return value if (value and len(value) <= 120 and '\n' not in value and '@' not in value
+                         and value != email.partition('@')[0]) else ''
+    try:
+        identity = build_identity_resolver(project_local(local or {}))(email) or {}
+    except Exception:  # noqa: BLE001 - optional identity enrichment must not withhold a reminder
+        identity = {}
+    contact = human_name(identity.get('name'))
+    supplied = human_name(attendee.get('displayName'))
+    if contact and identity.get('confidence') == 'high':
+        return contact
+    if supplied:
+        return supplied
+    if contact:
+        return contact
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / '_shared/knowledge'))
+        import knowledge as kg
+        path = kg.find_person_file(name='', identifier=email) if email else None
+        if path:
+            name = human_name(kg.parse_person_file(Path(path).read_text()).name)
+            if name:
+                return name
+    except Exception:  # noqa: BLE001 - malformed optional graph data degrades to the meeting title
+        pass
+    # Older graphs often contain only the email handle even though research knows the full name.
+    for offset in range(CACHE_KEEP_DAYS + 1):
+        day = (now - timedelta(days=offset)).strftime('%Y-%m-%d')
+        path = Path(os.environ.get('SOTTO_DATA', '/data')) / 'cache' / f'research_{day}.json'
+        try:
+            data = json.loads(path.read_text())
+            names = {human_name(r.get('full_name')) for r in data.get('attendees', [])
+                     if isinstance(r, dict) and _s(r.get('email')).strip().lower() == email}
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        names.discard('')
+        if names:
+            return next(iter(names)) if len(names) == 1 else ''
+    return ''
+
+
 def _prep_lines(attendee: dict, continuity) -> tuple:
     """(who, open_loop) for the first external attendee of an imminent meeting — the prep the nudge
     carries. `who` is the graph's typed title/company ("VP Eng at Acme"), never a guess; empty when
@@ -330,7 +382,7 @@ def _prep_lines(attendee: dict, continuity) -> tuple:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
                                         "_shared", "knowledge"))
         import knowledge as kg  # noqa: PLC0415
-        path = kg.find_person_file(name=name, identifier=email) if (name or email) else None
+        path = kg.find_person_file(name="" if email else name, identifier=email) if (name or email) else None
         if path and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 p = kg.parse_person_file(f.read())
@@ -548,7 +600,6 @@ def scan(calendar, continuity, local, user_email, now_local,
     """
     lead = PROACTIVE_LEAD_MIN
     user_email = (user_email or "").lower()
-    user_domain = user_email.split("@")[1] if "@" in user_email else ""
     today = now_local.strftime("%Y-%m-%d")
     nudges = []
 
@@ -578,9 +629,7 @@ def scan(calendar, continuity, local, user_email, now_local,
         mins_away = (st.astimezone(timezone.utc) - now_local.astimezone(timezone.utc)).total_seconds() / 60.0
         if not (0 <= mins_away <= lead):
             continue
-        ext = [a for a in human_attendees(e, user_email)
-               if _s(a.get('status')).lower() != 'declined'
-               and not (user_domain and a['email'].endswith("@" + user_domain))]
+        ext = work_attendees(e, user_email)
         if not ext:
             continue  # internal/solo meeting — no prep nudge
         # Research is reusable input, not evidence that anything reached the user. Suppress only
@@ -591,14 +640,15 @@ def scan(calendar, continuity, local, user_email, now_local,
         # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
         # own title/company for the first external attendee) and the one open loop with them, if
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
-        who, loop = _prep_lines(ext[0], continuity)
+        attendee = {**ext[0], "displayName": _prep_name(ext[0], local, now_local)}
+        who, loop = _prep_lines(attendee, continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{occurrence}",
                        "calendar_event_id": _s(e.get('id')), "calendar_start": st.isoformat(),
                        "proactive_date": today,
                        "calendar_observed_at": _s(e.get('calendar_observed_at')) or now_local.isoformat(),
                        "valid_until": st.isoformat(),
                        "title": _s(e.get("summary")) or "Meeting",
-                       "person": _s(ext[0].get("displayName")) or _s(ext[0].get("email")).split("@")[0],
+                       "person": attendee["displayName"],
                        "identifier": _s(ext[0].get("email")).lower().strip(),
                        # Preserve provider-supplied exact linkage. The composer treats absent
                        # linkage honestly: attendee mail remains recent background, never proof of

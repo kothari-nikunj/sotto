@@ -15,6 +15,7 @@ import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -151,13 +152,22 @@ def _observed_correlations(root, rows, since, until):
     }
 
 
-def build_report(data_root=None, days=30, now=None):
+def build_report(data_root=None, days=30, now=None, *, complete_days=False, timezone_name='UTC'):
     root = os.path.abspath(data_root or os.environ.get("SOTTO_DATA", "/data"))
-    until = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    since = until - timedelta(days=days)
+    clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    zone = ZoneInfo(timezone_name)
+    end = clock.astimezone(zone)
+    if complete_days:
+        end = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    since = (end - timedelta(days=days)).astimezone(timezone.utc)
+    # Existing correlation readers use an inclusive bound. A complete-day window ends just
+    # before midnight, so the current partial day cannot enter its counters (also across DST).
+    until = end.astimezone(timezone.utc) - (timedelta(microseconds=1) if complete_days else timedelta())
 
     receipt_paths = sorted(glob.glob(os.path.join(root, "briefs", "*.learned.json")))
     retained, unreadable, invalid_timestamp, outside = [], 0, 0, 0
+    slots_by_day = {}
+    exact_slots_by_day = {}
     for path in receipt_paths:
         receipt = _read_json(path)
         if receipt is None:
@@ -168,6 +178,13 @@ def build_report(data_root=None, days=30, now=None):
             invalid_timestamp += 1
         elif since <= timestamp <= until:
             retained.append(receipt)
+            # Only canonical scheduled receipt filenames count as morning/evening coverage.
+            match = re.fullmatch(r'(\d{4}-\d{2}-\d{2})\.(morning|evening)\.learned\.json', os.path.basename(path))
+            if match:
+                day, slot = match.groups()
+                slots_by_day.setdefault(day, set()).add(slot)
+                receipt = dict(receipt, _report_slot=(day, slot))
+                retained[-1] = receipt
         else:
             outside += 1
 
@@ -201,6 +218,9 @@ def build_report(data_root=None, days=30, now=None):
                 or sum(reasons.values()) != values[2]):
             continue
         exact_receipts += 1
+        if receipt.get('_report_slot'):
+            day, slot = receipt['_report_slot']
+            exact_slots_by_day.setdefault(day, set()).add(slot)
         proposed += proof.get("total", 0)
         accepted += proof.get("accepted", 0)
         rejected += proof.get("rejected", 0)
@@ -273,8 +293,22 @@ def build_report(data_root=None, days=30, now=None):
     return {
         "schema": 1,
         "mode": "read_only_existing_volume",
-        "window": {"days": days, "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "until": until.strftime("%Y-%m-%dT%H:%M:%SZ")},
+        "window": {"days": days, "since": since.isoformat(), "until": until.isoformat(),
+                   "timezone": timezone_name, "complete_days_only": complete_days},
+        "scheduled_coverage": {
+            "days": [{"date": day, "observed_slots": sorted(slots_by_day.get(day, set())),
+                      "exact_slots": sorted(exact_slots_by_day.get(day, set()))}
+                     for day in [(since.astimezone(zone).date() + timedelta(days=i)).isoformat()
+                                 for i in range(days)]],
+            "complete_exact_days": sum(
+                exact_slots_by_day.get((since.astimezone(zone).date() + timedelta(days=i)).isoformat())
+                == {'morning', 'evening'}
+                and (since.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+                     + timedelta(days=i)).astimezone(timezone.utc) >= since
+                and (since.astimezone(zone).date() + timedelta(days=i)) < clock.astimezone(zone).date()
+                for i in range(days)),
+            "interpretation": "two exact scheduled Learn receipts per completed local day; not a model-accuracy denominator",
+        },
         "learn_receipts": {
             "retained_in_window": len(retained), "unreadable": unreadable,
             "invalid_timestamp": invalid_timestamp,
@@ -307,13 +341,21 @@ def main(argv=None):
     parser.add_argument("--data-root", default="", help="existing Sotto volume (default: SOTTO_DATA or /data)")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--now", default="", help="UTC ISO timestamp for deterministic probes")
+    parser.add_argument('--complete-days', action='store_true', help='exclude the current partial local day')
+    parser.add_argument('--timezone', default='UTC', help='IANA zone for completed calendar days')
     args = parser.parse_args(argv)
     if args.days < 1:
         parser.error("--days must be positive")
     now = _dt(args.now) if args.now else None
     if args.now and now is None:
         parser.error("--now must be an ISO timestamp")
-    print(json.dumps(build_report(args.data_root or None, args.days, now), indent=2, sort_keys=True))
+    try:
+        ZoneInfo(args.timezone)
+    except (KeyError, ValueError, OSError):  # ZoneInfoNotFoundError is a KeyError
+        parser.error("--timezone must be an IANA zone name such as America/Los_Angeles")
+    print(json.dumps(build_report(args.data_root or None, args.days, now,
+                                 complete_days=args.complete_days, timezone_name=args.timezone),
+                     indent=2, sort_keys=True))
     return 0
 
 

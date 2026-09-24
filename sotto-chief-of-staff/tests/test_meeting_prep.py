@@ -30,6 +30,19 @@ def test_introduction_thread_preserves_actual_author_in_full_prep():
     assert 'you→them' not in text and 'them→you' not in text
 
 
+def test_calendar_purpose_and_newest_meeting_notes_survive_input_order(monkeypatch):
+    monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
+    inputs = {'google': {'userEmail': 'me@example.com', 'events': [{
+        'id': 'e', 'summary': 'Dana review', 'start': _soon(),
+        'description': 'Priya introduced us to discuss the contract.',
+        'attendees': [{'email': 'dana@acme.com', 'displayName': 'Dana'}]}]},
+        'local': {'granola_meetings': [{'meeting_id': str(i), 'date': f'2026-09-{i:02}',
+            'attendee_emails': ['dana@acme.com'], 'your_notes': f'Decision {i}'} for i in range(10, 15)]}}
+    context, _ = mp.build_context(inputs)
+    assert 'Priya introduced us to discuss the contract.' in context
+    assert 'Decision 14' in context and 'Decision 10' not in context
+
+
 def _event(summary, start, attendees, **extra):
     return {"id": summary.lower().replace(" ", "-"), "summary": summary, "start": start,
             "attendees": attendees, **extra}

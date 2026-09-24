@@ -4,12 +4,50 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "_shared/scripts/release_one_proof.py"
 spec = importlib.util.spec_from_file_location("release_one_proof", SCRIPT)
 proof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proof)
 NOW = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+
+
+def test_completed_local_days_exclude_today_and_require_both_exact_slots(tmp_path):
+    exact = {'status': 'ok', 'proof': {'coverage': 'exact_resolver_outcomes', 'loop_updates': {
+        'total': 1, 'accepted': 1, 'rejected': 0, 'rejected_by_reason': {}}}}
+    for name, timestamp in [('2026-09-22.morning', '2026-09-22T13:30:00Z'),
+                            ('2026-09-22.evening', '2026-09-23T00:30:00Z'),
+                            ('2026-09-23.morning', '2026-09-23T13:30:00Z')]:
+        _write_json(tmp_path / f'briefs/{name}.learned.json', {
+            'ts': timestamp, 'steps': {'continuity': exact}})
+    now = datetime(2026, 9, 24, 5, tzinfo=timezone.utc)  # Sep 23 in California
+    report = proof.build_report(str(tmp_path), days=2, now=now, complete_days=True,
+                                timezone_name='America/Los_Angeles')
+    assert report['learn_receipts']['proposal_outcomes']['proposed'] == 2
+    assert report['scheduled_coverage']['complete_exact_days'] == 1
+    assert report['scheduled_coverage']['days'][0]['date'] == '2026-09-21'
+
+
+def test_completed_days_follow_dst_not_a_24_hour_subtraction(tmp_path):
+    report = proof.build_report(str(tmp_path), days=1,
+        now=datetime(2026, 3, 9, 18, tzinfo=timezone.utc), complete_days=True,
+        timezone_name='America/Los_Angeles')
+    assert report['window']['since'].startswith('2026-03-08T08:00')
+    assert report['window']['until'].startswith('2026-03-09T06:59:59')
+
+
+def test_rolling_window_does_not_call_its_first_partial_day_complete(tmp_path):
+    exact = {'status': 'ok', 'proof': {'coverage': 'exact_resolver_outcomes', 'loop_updates': {
+        'total': 0, 'accepted': 0, 'rejected': 0, 'rejected_by_reason': {}}}}
+    for slot, stamp in [('morning', '2026-09-22T13:30:00Z'), ('evening', '2026-09-23T00:30:00Z')]:
+        _write_json(tmp_path / f'briefs/2026-09-22.{slot}.learned.json', {
+            'ts': stamp, 'steps': {'continuity': exact}})
+    report = proof.build_report(str(tmp_path), days=1,
+        now=datetime(2026, 9, 23, 12, tzinfo=timezone.utc), timezone_name='America/Los_Angeles')
+    assert report['learn_receipts']['with_exact_proposal_outcomes'] == 2
+    assert report['scheduled_coverage']['complete_exact_days'] == 0
 
 
 def _write_json(path, value):
@@ -144,3 +182,10 @@ def test_malformed_continuity_metadata_is_unknown_coverage(tmp_path):
     report = proof.build_report(str(tmp_path), now=NOW)
     assert report["learn_receipts"]["invalid_step_metadata"] == 2
     assert report["learn_receipts"]["proposal_outcomes"]["status"] == "unavailable"
+
+
+def test_unknown_timezone_is_a_usage_error_not_a_traceback(tmp_path, capsys):
+    with pytest.raises(SystemExit) as stop:
+        proof.main(['--data-root', str(tmp_path), '--days', '1', '--complete-days', '--timezone', 'Mars/Olympus'])
+    assert stop.value.code == 2
+    assert 'IANA zone' in capsys.readouterr().err

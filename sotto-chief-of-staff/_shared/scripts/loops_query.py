@@ -50,6 +50,7 @@ def _entry(it: dict, today: datetime, today_str: str) -> dict:
         # offered off this loop lands IN the thread (`google_action.py gmail-draft --thread-id`)
         # instead of starting a new one; "" for every loop with no email thread behind it.
         "thread_id": _s(it.get("source_thread_id")),
+        "group_id": _s(it.get("group_id")),
         "action_type": _s(it.get("action_type")),
         "age_days": age,
         "deadline": deadline or None,

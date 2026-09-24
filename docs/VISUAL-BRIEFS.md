@@ -57,8 +57,14 @@ connect the send to recorded prior decisions by identity. Missing or later evide
 guessed, and acceptance never claims device display. An ambiguous provider result must not
 trigger a second text send.
 
-The shared Photon adapter recognizes the focused meeting-prep output before upstream text truncation and uses the same renderer and native gallery transport. It sends one group, records the returned parent/child IDs, and bypasses upstream retries on unknown acceptance. A private delivery receipt beside the card manifest is written before dispatch; matching gateway retries/restarts reuse accepted receipts or hold uncertain sends. The inbound reply anchor distinguishes a new request; without an anchor, identical cached content is deduplicated. Receipts expire with the seven-day artifact cache. The pinned gateway’s recovery markers are checked against existing manifests and target-scoped receipts before any plain-text resend; uncertain acceptance remains a failure, never a fabricated delivery receipt. Proven unsent media falls back to the original text. Ordinary chat and compact multi-meeting sweeps stay text. Natural-language retrieval of an old card's full text is not wired yet. The original full text stays in the manifest for inspection; normal
-brief history continues to use the existing archive. Do not promise a special “full text” command.
+The shared Photon adapter recognizes the focused meeting-prep output before upstream text truncation and uses the same renderer and native gallery transport. It sends one group, records the returned parent/child IDs, and bypasses upstream retries on unknown acceptance. A private delivery receipt beside the card manifest is written before dispatch; matching gateway retries/restarts reuse accepted receipts or hold uncertain sends. The inbound reply anchor distinguishes a new request; without an anchor, identical cached content is deduplicated. Receipts expire with the seven-day artifact cache. The pinned gateway’s recovery markers are checked against existing manifests and target-scoped receipts before any plain-text resend; uncertain acceptance remains a failure, never a fabricated delivery receipt. Proven unsent media falls back to the original text. Ordinary chat and compact multi-meeting sweeps stay text. Ask Sotto now routes “expand that item” to `brief_detail.py`, a read-only lookup of the original
+composed text. Scheduled acceptance receipts retain the opaque gallery ID and owner-target hash
+before erasing the payload; interactive prep uses its existing adjacent receipt. Only accepted,
+non-preview owner galleries inside seven days qualify. The manifest records the source-permission
+fingerprint at render time. Changed or absent permission metadata withholds archived content and
+asks for a fresh consented read. Multiple date/topic matches require a choice. Text pages expose
+an explicit continuation offset; the response distinguishes composed text from original source
+transcripts. No extra model call, store, scheduler or new outward send is involved.
 
 Rendered files live in `$SOTTO_DATA/cache/visual-briefs/<content-id>/` with private permissions.
 They are delivery artifacts, not a second knowledge store. The receiver's existing retention

@@ -429,3 +429,118 @@ def test_optional_knowledge_failure_does_not_drop_candidate(isolated, monkeypatc
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, '_read_json_script', notification._read_json_script)
     assert module.enrich(items, datetime.now(timezone.utc))[0]['person_facts'] == {}
+
+
+@pytest.fixture
+def real_enrichment(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'b' * 32)
+    monkeypatch.setattr(notification.style_apply, 'apply', lambda _: {})
+    monkeypatch.setattr(notification, '_read_json_script', lambda *a: {})
+    monkeypatch.setattr(notification.loops_query, 'query', lambda: {'you_owe': [], 'waiting_on_them': []})
+    monkeypatch.setattr(notification.delivery_effects, '_loops', lambda: {})
+    return tmp_path
+
+
+def test_stale_scheduling_candidate_gets_current_invitation_and_thread_before_writing(real_enrichment, monkeypatch):
+    import personal_context
+    now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
+    old = {'source': 'email', 'id': 'ask', 'threadId': 'invite-thread',
+           'from': 'assistant@example.com', 'date': '2026-09-21T20:00:00Z',
+           'body': 'Please schedule Thursday at 3:45 with Jordan.'}
+    newer = {**old, 'id': 'confirmation', 'date': '2026-09-23T20:00:00Z',
+             'body': 'Confirmed Thursday at 3:45. Invite sent.'}
+    unrelated = {**newer, 'threadId': 'different-thread', 'body': 'unrelated-private-text'}
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [(newer, '', ''), (unrelated, '', '')])
+    monkeypatch.setattr(notification, '_calendar', lambda: {'all_calendars_complete': False, 'events': [
+        {'summary': 'Zoom: Jordan <> Fund', 'start': '2026-09-24T15:45:00-07:00',
+         'end': '2026-09-24T16:30:00-07:00', 'my_response': 'accepted'}]})
+    def write(model, key, prompt, **kwargs):
+        system = kwargs["system"]
+        value = json.loads(prompt)
+        data = json.dumps(value)
+        assert 'Invite sent.' in data and 'Zoom: Jordan' in data and '2026-09-21' in data
+        assert 'unrelated-private-text' not in data
+        assert 'Omit a scheduling question once the' in system
+        return json.dumps({'items': []})
+    monkeypatch.setattr(gemini, 'provider_key', lambda _: 'test')
+    monkeypatch.setattr(gemini, '_gemini_once', write)
+    bundle = {'events': [{'class': 'scheduling_ask', 'decision_id': 'held-ask', 'event': old}]}
+    assert notification.compose('event', bundle, now=now) == 'NO_NUDGES'
+
+
+def test_group_commitment_gets_calendar_and_the_group_confirmation(real_enrichment, monkeypatch):
+    import personal_context
+    now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
+    loop = {'anchor_key': 'ask', 'identifier': '', 'name': 'Planning group', 'group_id': 'group-id'}
+    monkeypatch.setattr(notification.loops_query, 'query', lambda: {'you_owe': [loop], 'waiting_on_them': []})
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [({'source': 'imessage',
+        'chat_guid': 'group-id', 'text': 'Booked, see you Thursday.', 'timestamp': '2026-09-23T20:00:00Z'}, '', '')])
+    monkeypatch.setattr(notification, '_calendar', lambda: {'events': [{'summary': 'Jordan meeting'}]})
+    item = {'id': 'x', 'kind': 'commitment', 'channel': 'imessage', 'anchor_key': 'ask'}
+    enriched, = notification.enrich([item], now)
+    sent = notification._writer_item(enriched)
+    assert sent['calendar']['events'][0]['summary'] == 'Jordan meeting'
+    assert sent['current_conversation'][0]['text'] == 'Booked, see you Thursday.'
+    assert 'group-id' not in json.dumps(sent)
+
+
+def test_resolved_original_message_is_removed_before_writer(real_enrichment, monkeypatch):
+    monkeypatch.setattr(notification, '_calendar', lambda: None)
+    monkeypatch.setattr(notification.delivery_effects, '_loops', lambda: {'a': {'status': 'resolved',
+        'source_refs': [{'sourceType': 'email', 'sourceId': 'original'}]}})
+    monkeypatch.setattr(gemini, '_gemini_once', lambda *a, **k: pytest.fail('closed ask reached writer'))
+    bundle = {'events': [{'class': 'scheduling_ask', 'event': {'source': 'email', 'id': 'original'}}]}
+    assert notification.compose('event', bundle) == 'NO_NUDGES'
+
+
+def test_unknown_attendee_uses_meeting_title_instead_of_a_handle(isolated):
+    text = notification.compose('proactive', [_prep_item(person='', title='Board meeting')],
+                                now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
+    assert text.startswith('Board meeting starts in about 30 minutes.')
+    assert text.endswith('Want the full prep?')
+    effects = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())['effects']
+    offer = next(e['offer'] for e in effects if e['kind'] == 'pending_offer')
+    assert offer['question'] == 'Want the full prep?'
+
+
+@pytest.mark.parametrize('initial_status', ['open', 'resolved', 'retry'])
+def test_closure_recheck_is_bound_to_selected_request_not_whole_bundle(real_enrichment, monkeypatch, initial_status):
+    effects = notification.delivery_effects
+    rows = {'old': {'status': 'open' if initial_status == 'retry' else initial_status,
+                    'source_refs': [{'sourceType': 'email', 'sourceId': 'old'}]},
+            'fresh': {'status': 'open', 'source_refs': [{'sourceType': 'email', 'sourceId': 'fresh'}]}}
+    monkeypatch.setattr(effects, '_loops', lambda: rows)
+    monkeypatch.setattr(notification, '_calendar', lambda: None)
+    bundle = {'events': [{'class': 'scheduling_ask', 'decision_id': ident,
+                         'event': {'source': 'email', 'id': ident, 'threadId': ident}} for ident in rows]}
+    preflight = effects.for_bundle(bundle)['effects']
+    assert effects.valid(preflight)
+    if initial_status == 'retry':
+        monkeypatch.setattr(notification, '_write', lambda items, llm: [
+            {'id': 'old', 'text': 'Sam needs a meeting time.', 'draft': '', 'decline': ''}])
+        assert 'Sam needs' in notification.compose('event', bundle)
+        rows['old']['status'] = 'resolved'
+    monkeypatch.setattr(notification, '_write', lambda items, llm: [
+        {'id': 'fresh', 'text': 'Alex needs a meeting time.', 'draft': '', 'decline': ''}])
+    assert 'Alex needs' in notification.compose('event', bundle)
+    staged = json.loads((real_enrichment / ('events/delivery-effects-' + 'b' * 32 + '.json')).read_text())['effects']
+    rows['old']['status'] = 'resolved'
+    assert effects.valid([*preflight, *staged])  # closed or newly closed unselected ask cannot cancel this
+    rows['fresh']['status'] = 'resolved'
+    assert not effects.valid([*preflight, *staged])  # selected ask closes while awaiting acceptance
+
+
+def test_notification_thread_context_still_honors_mutes_and_source_consent(real_enrichment, monkeypatch):
+    import personal_context
+    now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
+    event = {'source': 'imessage', 'chat_guid': 'group', 'text': 'Ask', 'timestamp': '2026-09-23T21:00:00Z'}
+    private = {**event, 'handle': '+15551234567', 'text': 'muted-private-text'}
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [(private, '', '')])
+    monkeypatch.setattr(notification.preferences, 'load_explicit', lambda: {'mute_senders': ['+15551234567']})
+    monkeypatch.setattr(notification, '_calendar', lambda: None)
+    item = {'id': 'x', 'kind': 'scheduling_ask', 'event': event}
+    assert 'muted-private-text' not in json.dumps(notification.enrich([item], now))
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: False)
+    assert notification.enrich([item], now)[0]['current_conversation'] == []

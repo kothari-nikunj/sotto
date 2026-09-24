@@ -69,7 +69,7 @@ from timeutil import (  # noqa: E402
 from gemini import _diag, call_gemini  # noqa: E402
 from chatfmt import to_chat  # noqa: E402  (the ONE markdown→chat transformation)
 import metrics  # noqa: E402  (cost/latency observability — best-effort, never blocks a brief)
-from calendar_context import SCHEDULE_DAY, meeting_events  # noqa: E402
+from calendar_context import work_attendees, SCHEDULE_DAY, meeting_events  # noqa: E402
 from render_local import (  # noqa: E402
     build_contact_lookup, build_identity_resolver,
     resolve_contact_names, _action_age,
@@ -292,33 +292,15 @@ BRIEF_RESPONSE_SCHEMA = {
 
 
 
-def _freemail_domains() -> set:
-    """research_attendees.FREEMAIL_DOMAINS — imported lazily (research_attendees imports THIS module
-    at its top level, so a module-level import here would be circular) rather than mirrored as a
-    second list. Best-effort: an import failure just means the colleague-domain skip stays on."""
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import research_attendees as _ra  # noqa: PLC0415
-        return _ra.FREEMAIL_DOMAINS
-    except Exception:
-        return set()
-
-
 def select_attendees_for_research(inputs: dict) -> list:
     """Deterministically pick the external attendees of upcoming meetings who warrant research.
     Mirrors the Mac backend: within RESEARCH_HORIZON_HOURS, an attendee needs research unless they
-    are the user, share the user's email domain, or are already a known contact / in the graph.
+    have personal addresses, are internal colleagues, or already have a researched profile.
     Returns [{name, email, meeting_title, meeting_start}], deduped by email, capped at the max."""
     google = _obj(inputs, "google")
     local = resolve_contact_names(_obj(inputs, "local"))
     events = meeting_events(_arr(google, "events"))
     user_email = (_s(google.get("userEmail")) or configured_user_email()).lower()
-    user_domain = user_email.split("@")[1] if "@" in user_email else ""
-    # The same-domain skip means "colleagues don't need research" — that only holds for a CORPORATE
-    # domain. For a freemail user (gmail.com etc.) sharing a domain proves nothing, and the skip
-    # would silently exclude EVERY freemail attendee from research forever.
-    if user_domain in _freemail_domains():
-        user_domain = ""
     # Research-quality gate: a thin/stale graph profile doesn't count as "known" here, so the
     # attendee gets re-researched (port of the Mac's re-research-on-low-quality cache behavior).
     known_emails, known_names = _known_identities(local, research_quality=True)
@@ -336,15 +318,11 @@ def select_attendees_for_research(inputs: dict) -> list:
             hours_away = (st - now).total_seconds() / 3600.0
             if hours_away < -1 or hours_away > RESEARCH_HORIZON_HOURS:
                 continue  # past meeting or beyond the research horizon
-        for a in _arr(e, "attendees"):
+        for a in work_attendees(e, user_email):
             email = _s(a.get("email")).lower().strip()
             if not email or email in seen:
                 continue
             name = _s(a.get("displayName")) or (email.split("@")[0])
-            if email == user_email:
-                continue
-            if user_domain and email.endswith("@" + user_domain):
-                continue
             if email in known_emails or any(_names_match(name, kn) for kn in known_names):
                 continue
             seen.add(email)
