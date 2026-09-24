@@ -4,6 +4,8 @@ Wires the portable Sotto backend into a [Hermes](https://hermes-agent.nousresear
 
 | File | Role |
 |---|---|
+| `install-runtime.sh` | install the reviewed Hermes pin; refuse to replace an incompatible existing runtime |
+| `local_preflight.py` | check the local Python version and locked dependencies before configuration changes |
 | `install.sh` | one-command wiring (idempotent, `--dry-run`) — copy skills (tap fallback), bundle, persona, MCP, cron |
 | `config.template.yaml` | `~/.hermes/config.yaml` template (model + `mcp_servers` + `scheduler`) |
 | `configure_mcp.py` | merge the `sotto-local` Bridge into `config.yaml` (robust drop-in) |
@@ -21,6 +23,8 @@ Wires the portable Sotto backend into a [Hermes](https://hermes-agent.nousresear
 | `provider_error_compat.py` | Hash-checked pinned Hermes gateway adaptation: one plain-language provider failure at the shared chat boundaries, never the raw provider payload (see [Provider-error gateway pin](#provider-error-gateway-pin)) |
 | `managed_config.py` · `photon_setup.py` · `photon_probe_compat.py` · `sotto_photon/` | Managed model/channel reconciliation and the pinned Photon adapter compatibility seam |
 | `wa_pair.py` | drives `hermes whatsapp` non-interactively under a PTY (headless/cloud QR pairing) |
+
+For a fresh Mac, follow [LOCAL-SETUP.md](../../LOCAL-SETUP.md) first, including the Sotto Python environment and pinned runtime.
 
 Run: `bash adapters/hermes/install.sh` (local stdio Bridge) or `BRIDGE_TOKEN=<bearer> bash
 adapters/hermes/install.sh` (cloud reverse relay), then `/sotto setup`. Flags: `--dry-run`,

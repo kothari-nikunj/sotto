@@ -12,7 +12,8 @@ WhatsApp is the appendix at the end of this page.)
 
 > **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
 > fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
-> reads data and nudges timing. The Bridge never sends anything — replies are drafts you tap to send.
+> reads permitted data and nudges timing. Replies default to drafts. Sending to another person
+> requires your explicit approval and a separately enabled sending capability.
 
 ## 0 · What you'll need
 
@@ -27,13 +28,13 @@ WhatsApp is the appendix at the end of this page.)
 Everything else — linking your Mac, connecting Google, your channel, your timezone, and optional
 extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
 
-**Two defaults you can change, if you want to — decide now, it's a variable each.** Full detail (and
+**You can change either default. Each channel and model has its own setup requirements.** Full detail (and
 how tested each one is) in **[CHANNELS.md — Choosing your channel and model](CHANNELS.md)**:
 
 | Your channel | | Your model |
 |---|---|---|
 | **Telegram** — default. **One variable** (`TELEGRAM_BOT_TOKEN`): you tap the pairing link boot prints and it captures your chat id — no id hunting, no phone pairing. The path this guide follows. | | **Gemini** — default, and what the brief pipeline calls today. One key covers everything. |
-| **WhatsApp** — a real contact instead of a bot, at the price of a QR scan. Three variables (`WHATSAPP_ENABLED=true`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`) plus `SOTTO_CRON_DELIVER=whatsapp` — the **[appendix](#appendix--whatsapp-instead-of-telegram)** at the end of this page. | | **Anthropic / OpenAI / Kimi / DeepSeek** — for the **chat** layer only (Ask Sotto, nudge replies). The briefs still need a Gemini key. |
+| **WhatsApp** — a real contact instead of a bot, at the price of a QR scan. Three variables (`WHATSAPP_ENABLED=true`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`) plus `SOTTO_CRON_DELIVER=whatsapp` — the **[appendix](#appendix--whatsapp-instead-of-telegram)** at the end of this page. | | **Anthropic / OpenAI** can also compose briefs through `SOTTO_BRIEF_MODEL`; chat is configured separately. Other Hermes chat providers do not automatically support every Sotto capability. See [model limits](docs/MODELS.md). |
 | **iMessage (BlueBubbles)** — blue bubbles, but an always-on Mac + Firebase + a tunnel. Hand-wired recipe, hours not minutes. | | **Exa / Parallel** — web research only, and independent of the rest: set the key and research stops going through Gemini. |
 
 ## 1 · Deploy the backend on Railway
@@ -188,24 +189,19 @@ same words.)*
 one-time, interactive-only step — scheduled briefs run the same scripts through the terminal
 tool, which needs no approval.
 
-The guided setup verifies every connection, then seeds your memory and **writing voice** from ~6
-weeks of history — a few minutes, up to ~8 the very first time (it's researching the people in your
-calendar), walks you through it step by step — schedules the briefs, and closes with an honest checklist:
-
-> Here's where you stand:
-> - **Bridge** (Mac: messages, calls, contacts) — ✓ connected
-> - **Google** (Gmail + Calendar) — ✓ connected
-> - **Granola** (meeting notes) — – optional, skipped
-> Briefs are scheduled for 6:30am and 5:30pm.
-
-Then it offers your first brief on the spot. Say **"good morning"** and you're running.
+The guided setup verifies connections and reports the installed schedule. The receiver sends
+its first useful look once a context source and delivery channel are ready. It uses recent
+context; progressive history learning has separate spending controls described below.
+It closes with a checklist based on actual probes, including any missing connection or memory hold.
+Do not start a second welcome run while the receiver's first look is pending. You can request
+an ordinary brief later by saying **"good morning"**.
 
 From here it's all conversation:
 - *"good morning"* / *"good evening"* — the briefs
 - *"prep me for my 2pm"* / *"follow up on my meetings"*
 - *"find 30 min with Alex next week"* / *"accept my 3pm"* — proposes from your real calendar, then books/RSVPs on your OK
 - *"triage my inbox"* / *"what am I waiting on"*
-- *"draft a reply to Sarah"* — in your voice; **you** always send
+- *"draft a reply to Sarah"* — in your voice; saved as a draft unless you explicitly approve sending
 - *"who am I losing touch with"* / *"what do I know about Alex"*
 - *"what can you do?"* — the full map, any time
 
@@ -234,16 +230,25 @@ Day one is quiet on purpose — quiet ≠ broken:
 - **The dashboard fills as briefs run** — the Briefs tab starts with your first delivered brief, and
   the Learned page (voice + preferences) populates after the first brief runs.
 
-And three things Sotto will never do, worth knowing on day one:
+Three rules to know on day one:
 
 - **No bot joins your calls.** Meeting notes come from Granola reading the notes you already take.
   Nothing of Sotto's dials into a meeting, and nothing records one.
-- **Sotto can't send as you.** The Mac Bridge refuses to send at all unless you start it with
-  `--allow-send`, and every message — brief, nudge, reply, follow-up — is a draft **you** send.
+- **Replies default to drafts.** Sending to another person requires your explicit approval and
+  an enabled send capability. The Mac Bridge refuses sends unless started with `--allow-send`.
+  Scheduled briefs and nudges to you use the linked delivery channel.
 - **Every silence is auditable.** Nudged, queued, or dropped, each event gets a ledger row with its
   reason, readable in the dashboard's **Record** view (`/app#record`).
 
 The rules behind all three: [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md).
+
+## Background memory needs a separate spending choice
+
+The receiver's first useful look uses recent context. Progressive history learning and Dreamer
+need a budgeted model proxy, or a deliberate `SOTTO_BACKGROUND_UNMETERED=true` opt-in to
+background calls billed to your own key. Ordinary chat and briefs continue without that opt-in;
+background learning reports a hold. Do not assume six weeks of history were reviewed just because
+the first brief arrived. Check `knowledge/history-state.json` and [RAILWAY.md](RAILWAY.md).
 
 ## What runs on its own
 

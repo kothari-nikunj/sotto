@@ -16,7 +16,14 @@ one line per step, no walls of text. Do the work; don't make them read a manual.
 
 ## Procedure
 
-**0. If there is no Mac in this deploy** — `execute_code`: `test -n "$BRIDGE_TOKEN" && echo bridge || echo no-bridge` prints `no-bridge`, or `health()` answers `{"connected": false}` and the user says they have no Mac / didn't install the Bridge — the Bridge is **optional**: say so in one line ("No Mac linked — I'll brief from Gmail and Calendar; add the Sotto Bridge app any time for iMessage/WhatsApp"), skip the Bridge probe in step 2, and carry on. A self-host without a Mac is a supported deploy, not a dead end.
+**0. Establish the installation mode before giving setup instructions.** A configured
+`sotto-local` stdio tool is a local Bridge even when `BRIDGE_TOKEN` is unset. Call its `health()`
+when available. Only skip local sources when no Bridge is configured and the user confirms they
+have no Mac or do not want local sources. Gmail and Calendar alone are a supported deployment.
+For a standalone Mac, use LOCAL-SETUP.md: terminal Full Disk Access, an activated Sotto Python
+environment and `hermes gateway`. Do not send this user to a receiver `/setup` page they do not have.
+The connection remedies below describe receiver-based installs; use the local guide's equivalents
+for stdio. A missing relay token alone never means that local data is unavailable.
 
 **0b. If the `health()` tool isn't available** (the `sotto-local` toolset isn't connected) on a deploy that DOES have a Mac, STOP and say in one line — pick the right message:
 > - **If the Mac recently woke from sleep:** "Your Mac just woke up — I reconnect to the Bridge automatically within ~60 seconds. Give it a moment and ask me again." (The host binds the Bridge connection at startup; a watchdog bounces it to reconnect shortly after your Mac comes back online.)
@@ -46,14 +53,23 @@ Do NOT explore the filesystem / packages / Hermes internals or run `hermes tools
      - otherwise → mark it "optional, skipped" and move on (one line: "No Granola — optional; one-click connect lives on your `/setup` page under **Connected services**."). Never block setup on it.
    Don't claim full capability until **FDA + the Bridge connection are green**; report Google, the delivery channel and Granola honestly as found.
 
-**3. First useful look and progressive learning.** The receiver handles this automatically in
-Cloud and self-host once a context source and delivery channel are ready. It seeds observed voice
+**3. First useful look and progressive learning.** A running receiver handles this automatically in
+Cloud and receiver-based self-host once a context source and delivery channel are ready. It seeds observed voice
 and people from recent context, composes a short first look through the normal pipeline, and sends
 it through the existing outbox. `config/onboarding.json` records delivery/retry state; upgrades with
 prior briefs keep their current conversation. Do not run a second seed, queue another welcome, or
 make the user answer a profile questionnaire first.
 
-The same heartbeat reviews paginated iMessage, WhatsApp and Gmail history progressively. Read
+The standalone Mac installer has no receiver heartbeat. Offer its first brief on demand and
+learn from the context it reads; do not claim automatic history backfill is running there.
+
+On receiver-based installs, progressive learning needs the budgeted model proxy, or an explicit
+self-host `SOTTO_BACKGROUND_UNMETERED=true` opt-in to direct-key background spending. Never set
+that opt-in for the user. For a `background_budget_not_configured` hold, say "Your briefs work,
+but background history learning hasn't started; its spending configuration is missing." For other
+holds, explain the recorded reason instead. Report actual coverage.
+
+The receiver heartbeat reviews paginated iMessage, WhatsApp and Gmail history progressively. Read
 `knowledge/history-state.json` for actual per-source progress: frozen initial bounds, pages and
 rows fetched, messages reviewed, completion and sanitized failures. A bounded window is not a
 claim that all history has been reviewed. Mac sources need the Bridge online; Google can continue
@@ -72,8 +88,10 @@ real next action; there is no mandatory “tell me about yourself” form.
    On Railway, boot reconciles the host jobs and the receiver schedules its own jobs. Verify from
    the two sources you can read: `execute_code` → `cat "${SOTTO_CRONS_JSON:-/app/adapters/hermes/crons.json}"`
    (the container copy; a source checkout keeps it at `adapters/hermes/crons.json`) for every job, its schedule and who runs it
-   (`"runner": "receiver"` rows fire from the receiver and never appear in `hermes cron list`), then
-   `terminal` → `hermes cron list` for the host-run rows. A job with a `gate` whose env var is `0` is
+   (`"runner": "receiver"` rows are receiver-owned in container installs), then
+   `terminal` → `hermes cron list` for the host-run rows. In standalone Mac installs, install.sh
+   registers these same enabled schedules with Hermes instead; verify them in `hermes cron list`
+   and verify that the gateway is running. A job with a `gate` whose env var is `0` is
    off. Report only the schedule you actually verified, in the configured timezone; the dashboard's
    Activity page shows the same schedule to the user. If neither source is readable, say scheduling
    is unverified; don't promise delivery times.
@@ -93,10 +111,10 @@ real next action; there is no mandatory “tell me about yourself” form.
    the user is guaranteed to read it; state it, don't sell it — no marketing, no emphasis stacking):
    > - No bot ever joins your calls. Meeting notes come from Granola reading the notes you already
    >   take — nothing of mine dials in or records.
-   > - I can't send as you. Sending is switched off on the Mac side unless you turn it on, and
-   >   every message I write — brief, nudge, reply — is a draft that you send.
-   > - Every silence is auditable. Anything I didn't surface has a row saying why, in the **Record**
-   >   view of your dashboard (`/app#record`).
+   > - Replies default to drafts. Sending to someone else requires your explicit approval and an
+   >   enabled sending capability; connecting a channel alone does not grant that permission.
+   > - On receiver-based installs, the dashboard's Record view explains triage decisions.
+   Do not promise a dashboard or receiver delivery receipts on a standalone Mac installation.
    If they want the full rules, point them at the project's **HOW-SOTTO-DECIDES** doc on GitHub
    (`docs/HOW-SOTTO-DECIDES.md` in the repo they deployed from — it isn't installed locally) — one
    line, then move on.

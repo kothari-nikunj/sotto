@@ -1,151 +1,132 @@
-# Local setup — Hermes on your Mac (no cloud, no tunnel)
+# Local setup: Hermes on your Mac
 
-Run the whole thing on your Mac. The Bridge talks to Hermes over **stdio** (a child process), so there's
-**no tunnel, no Railway, no HTTP bearer** — Hermes just spawns the Bridge binary and reads local data
-directly. Pick this if you want **no cloud host in the path** — no Railway, no container, no volume
-off your machine. Trade-off: briefs only run while your Mac is awake. The cloud path is
-[ONBOARDING.md](ONBOARDING.md) (friendly) / [RAILWAY.md](RAILWAY.md) (reference).
+Run Sotto and its Bridge on your Mac, with no Railway account or tunnel. Hermes starts the
+Bridge as a local child process over stdio. Your Mac must stay awake with the gateway running
+for scheduled briefs. For an always-on self-hosted server, use [ONBOARDING.md](ONBOARDING.md).
 
-> **This is not "your messages never leave the Mac."** It removes the *host*, not the *model*. A
-> brief is one call to your LLM provider, and the prompt for that call contains the material the
-> brief is about — message text, email bodies, notes, calendar events. That leaves your Mac and is
-> processed on your provider's servers under their terms. The only way to keep everything local is a
-> local model, which Sotto does not ship today (`docs/DATA-FLOW.md` § What fully local would take).
+**Local hosting still uses your model provider.** Briefs and prep send relevant messages, notes
+and calendar context to the provider you configure. Sotto does not ship a fully offline model.
+The skills and memory code are shared with the container; the standalone Hermes scheduler does
+not provide the receiver's durable work queue, retries or delivery receipts.
 
-Same backend either way — identical skills, scripts, knowledge graph, continuity, style. Only the
-transport differs (stdio here vs the tunnel-free reverse dial-out relay in the cloud).
+## Before starting
 
-## Prereqs
-- A Mac, Python 3.
-- A **1M-context model key** — a Google **Gemini API key** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey);
-  Gemini 3.8 Flash is cheap, 1M, and a fine driver). Sotto stores no keys — this goes in Hermes' native
-  `~/.hermes/.env`. Any 1M model works; Gemini is the recommendation.
+- A Mac and Python 3.12. The downloaded Bridge needs no Rust toolchain.
+- A model API key. Gemini is the default; see [docs/MODELS.md](docs/MODELS.md) for other families
+  and feature limits. Keys stay in your Hermes configuration, never in this repository.
+- Run these commands from the directory containing `requirements.txt` and `adapters/`.
 
-## Steps
+## 1. Install the Bridge and check access
 
-All commands run from the repo root.
+Download **Sotto Bridge.app** from [Releases](https://github.com/kothari-nikunj/sotto/releases/latest)
+and drag it to `/Applications`. The signed app's first launch requires an invitation code;
+[ask for one in Issues](https://github.com/kothari-nikunj/sotto/issues). Hosting your own server
+requires no Sotto account, but it does not bypass the app's invitation requirement.
 
-**1. Get the Bridge + grant Full Disk Access** (the only manual permission).
+The installer finds the bundled engine automatically. If yours lives elsewhere, set
+`SOTTO_BRIDGE_BIN` to its absolute path before step 4.
 
-Get a `sotto-bridged` engine onto this Mac. Step 4's installer
-finds it on its own and registers it — you never type a path.
+For this stdio path, grant **Full Disk Access to your terminal app** in System Settings,
+Privacy & Security, then fully quit and reopen the terminal. Hermes and the Bridge are children
+of that terminal. Verify access:
 
-*Install the app (no toolchain needed).* Download **"Sotto Bridge.app"**
-from the Releases page and drag it to **/Applications**. First launch asks for an **access code** —
-the Bridge is invite-only for now; the code is checked on your Mac and never sent anywhere, and
-[Issues](https://github.com/kothari-nikunj/sotto/issues) is where to ask for one. The signed app bundles the engine inside
-itself at:
-```
-/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged
-```
-That is the path `install.sh` probes second, so nothing else is needed.
-
-
-*(Engine kept somewhere else? Export `SOTTO_BRIDGE_BIN=/path/to/sotto-bridged` before step 4 — an
-explicit override beats both probes. If none of the three exists, the installer refuses to say
-"Done": it names every path it looked in and exits non-zero.)*
-
-Grant **Full Disk Access to your terminal app** (Terminal/iTerm — System Settings ▸ Privacy & Security ▸
-**Full Disk Access**), then fully quit and reopen it. Why the terminal: in stdio mode macOS attributes
-the `chat.db` read to the process that *spawns* the Bridge — and both the verify command below and
-Hermes-launched runs are children of your terminal, so the terminal is the TCC principal. Adding
-`/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged` itself is belt-and-braces only. Verify:
-rebuild — the terminal grant doesn't.) Verify:
 ```bash
-# the installed app:
 "/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged" --doctor
 ```
-One line per source: `ok (N rows readable)` means that source works — the count is rows seen in a
-fixed 6-hour probe window, not a lifetime total, so `ok (0 rows readable)` for a source you haven't
-used since lunch is still `ok`; `needs Full Disk Access` means
-the grant above didn't take (the exact fix is printed at the bottom); `unavailable` just means that
-app isn't on this Mac. The command exits 0 only when every enabled source is `ok` (or `disabled`), so
-an `unavailable` source makes it exit non-zero too — read the per-source lines before assuming trouble:
-a non-zero exit can simply mean an app you don't use isn't installed, **not** that Full Disk Access is
-broken. Only a `needs Full Disk Access` line points at the grant.
 
-**2. Install Hermes** (skip if you already run it). The repo vendors the reviewed installer — the
-same bytes the container image builds with:
+Read each source's result. `ok` with zero rows can mean no recent activity. `needs Full Disk Access`
+requires the permission above; `unavailable` can mean that app is not installed. A nonzero exit
+alone does not tell you which source needs attention. Local stdio mode is read-only by default.
+
+## 2. Install Sotto's Python dependencies and pinned Hermes
+
+Sotto's Python environment is separate from Hermes' own environment. Install the locked
+runtime dependencies, including image rendering and Google clients:
+
 ```bash
-bash adapters/hermes/hermes-install.sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.txt
+source .venv/bin/activate
+bash adapters/hermes/install-runtime.sh
+export PATH="$PWD/.venv/bin:$HOME/.local/bin:$PATH"
 ```
 
-**3. Secrets + exhaust dir** — do this BEFORE the installer (step 4 reads the key from here):
+The wrapper installs exactly `adapters/hermes/hermes.commit` and checks its compatibility.
+It refuses to replace an incompatible existing Hermes installation. If that happens, use
+Sotto's container, or back up and deliberately replace your existing installation yourself.
+Do not run `hermes update` independently: use a reviewed Sotto release with its matching pin.
+
+## 3. Configure the key, data directory, timezone and channel
+
+For the default Gemini and Telegram setup:
+
 ```bash
 mkdir -p "$HOME/SottoData" ~/.hermes
-# single-quote the key so a '$' in it isn't shell-expanded; keep "$HOME" double-quoted so it expands
-printf 'GOOGLE_AI_API_KEY=%s\nSOTTO_DATA=%s\nSOTTO_TIMEZONE=%s\n' \
-  '<your-gemini-key>' "$HOME/SottoData" 'America/Los_Angeles' >> ~/.hermes/.env
+printf 'GOOGLE_AI_API_KEY=%s\nSOTTO_DATA=%s\nSOTTO_TIMEZONE=%s\nSOTTO_CRON_DELIVER=%s\n' \
+  '<your-gemini-key>' "$HOME/SottoData" 'America/Los_Angeles' 'telegram' >> ~/.hermes/.env
+export SOTTO_CRON_DELIVER=telegram
 ```
-`SOTTO_TIMEZONE` is your IANA zone (`America/New_York`, `Europe/London`, …). The cloud auto-detects it
-from the setup wizard; **local does not** — leave it unset and the 6:30/17:30 briefs compute "today" in UTC.
 
-**4. Run the Sotto installer:**
+Set your own IANA timezone, for example `Europe/London`. Local setup cannot detect it from a
+browser. If repeating these steps, edit existing values instead of appending duplicate keys.
+For WhatsApp, use `whatsapp` in both places. Without an explicit choice the local installer
+keeps its historical WhatsApp default. The container defaults to Telegram.
+
+## 4. Wire Sotto into Hermes
+
+With the Python environment from step 2 still active:
+
 ```bash
-./adapters/hermes/install.sh --dedicated
+bash adapters/hermes/install.sh --dedicated
+hermes mcp list
 ```
-`--dedicated` sets the chat model to the native `gemini-3.8-flash` — the right default for a
-Sotto-dedicated local Hermes. The installer also copies the repo's local skills to
-`~/.hermes/skills/sotto` (no hub tap needed; `SOTTO_TAP` overrides the fallback), maps your Gemini key
-to all three names Hermes/Sotto read (`GOOGLE_AI_API_KEY` + `GEMINI_API_KEY` + `GOOGLE_API_KEY`),
-registers the Bridge from step 1 as a stdio MCP (no `BRIDGE_TOKEN` set → local mode), and
-creates five crons: `sotto-morning-brief` (6:30), `sotto-evening-brief` (17:30 — its end-of-day
-report includes post-meeting follow-up drafts; no standalone follow-up cron exists anymore),
-`sotto-relationship-pulse` (Mon 9:00), `sotto-proactive` (`*/15`, mostly-silent nudges — set
-`SOTTO_PROACTIVE=0` to skip), and `sotto-midday-digest` (12:30, an adaptive catch-up that runs the
-`sotto-event` skill in digest mode and stays silent on quiet days — set `SOTTO_DIGEST=0` to skip;
-`SOTTO_DIGEST_MIN`, default 8, sets how heavy a day must be before it delivers).
 
-*Sharing Hermes with other work?* Drop `--dedicated` — the installer then leaves your global model
-untouched (the brief still runs on Gemini via `compose_brief.py`); just make sure your own chat
-model/key is already configured.
+`--dedicated` sets Hermes chat to the default Gemini model. Omit it to keep your chat model.
+Brief composition has its own provider setting. The installer checks Python dependencies and
+Hermes delivery compatibility before modifying configuration, copies the skills, registers
+`sotto-local`, and installs the enabled schedules from `adapters/hermes/crons.json`.
+If it reports **NOT done**, fix the named missing Bridge path before continuing.
 
-**5. Verify the Bridge MCP** — confirm `sotto-local` got registered:
+## 5. Connect and run
+
 ```bash
-hermes mcp list        # → sotto-local
+hermes setup             # connect Google and configure your model
+hermes gateway setup     # link the same channel selected in step 3
+hermes                  # ask: "Sotto, set up", then "Sotto, morning brief"
 ```
-If step 4 ended with **"NOT done"** instead of "Done", it found no engine at any of the three paths
-it names — do step 1 (option A is the quick one) and re-run the installer.
 
-**6. Connect Google + a channel, then run:**
+For scheduled delivery, leave the gateway running in a terminal with Sotto's Python active:
+
 ```bash
-hermes setup            # connect Google Workspace — interactive OAuth via the google-workspace CLI
-                        # (Granola locally: set GRANOLA_API_KEY, or GRANOLA_MCP_CMD for a stdio
-                        #  MCP — RAILWAY.md § Granola fallbacks; the /setup wizard tile is cloud-only)
-hermes gateway setup    # Telegram (bot token) or WhatsApp (scan a QR) — for scheduled-brief delivery
-                        # Telegram is only the default; the choice is in CHANNELS.md
-hermes                  # then: "Sotto, set up"  →  "Sotto, morning brief"
+source .venv/bin/activate
+export PATH="$PWD/.venv/bin:$HOME/.local/bin:$PATH"
+hermes gateway
 ```
 
-You get a brief from Gmail/Calendar + local messages, knowledge seeding into `~/SottoData`. Ask
-follow-ups ("Sotto, what do I know about <name>?"). An email reply is offered into your **Gmail
-drafts** (say yes and it's there, in the thread, ready for you to send); every other channel is a
-one-tap **deep link** (`imessage:` / `sms:` / `wa.me`) — tap on your phone to send. Nothing sends
-from the Mac.
+Reactivate that environment after opening a new terminal. A separately installed launch service
+does not automatically inherit it. Check `hermes cron list` for the actual schedules and channel.
+Telegram briefs are text by default. The four-photo presentation requires the configured Photon
+channel; see [CHANNELS.md](CHANNELS.md).
 
-## How briefs reach you locally
-- **Interactive** — always works, no channel: run `hermes` and ask ("Sotto, morning brief").
-- **Scheduled** — the installer's crons are created with `--deliver whatsapp` (a local Hermes pairs
-  WhatsApp interactively, so that stays the laptop default — the cloud boot resolves its own channel;
-  `SOTTO_CRON_DELIVER` overrides either way). They reach you only while `hermes gateway` is running on the Mac with
-  that channel connected (step 6). Set `SOTTO_CRON_DELIVER=local` before running the installer only if
-  you deliberately want cron briefs kept in the CLI session instead.
+Google and local context can feed the first requested brief. Granola is optional; for local
+credentials or a custom MCP server, see [RAILWAY.md](RAILWAY.md)'s Granola fallbacks.
+Email replies default to Gmail drafts. The local stdio Bridge configured here has no send
+permission; use the offered draft or link to send yourself.
 
-## What local mode doesn't have
-- **No browser `/setup` wizard** — that's the cloud receiver. Local setup is the CLI steps above.
-- **No timezone auto-detect** — the wizard captures your browser's zone in the cloud; locally you set
-  `SOTTO_TIMEZONE` yourself (step 3).
-- **No headless `/google/auth` flow** — connect Google with `hermes setup` (the google-workspace CLI's
-  interactive OAuth), which is easier locally anyway: the browser is right there.
-- **No briefs while the laptop is closed** — crons and the gateway only run while the Mac is awake.
-- **No real-time event push** — the Bridge's event watcher (`/bridge/events` → triage funnel →
-  instant nudges) and the cloud-side Gmail polling run in **cloud mode only** (`SOTTO_EVENTS`,
-  `SOTTO_EMAIL_POLL_SECS`, `SOTTO_TRIAGE_MODEL`, `SOTTO_EVENT_COOLDOWN_MIN` — see RAILWAY.md).
-  Locally you still get the `sotto-midday-digest` cron (silent unless the queue is heavy) and the
-  `*/15` proactive watcher.
+## Memory and automation limits
 
-## Local vs cloud — when to switch
-- **Stay local** if privacy-of-messages or offline matters most, or you don't want an always-on bill.
-- **Go cloud** (`ONBOARDING.md` / `RAILWAY.md`) if you want briefs to fire on schedule even when the
-  laptop is closed. The same `install.sh` + skills move over — tunnel-free: the Bridge app on your Mac
-  dials *out* to the Railway host (`sotto-bridged --connect …`), so there's nothing to expose.
+Ordinary briefs learn from the context they read. The standalone install does not run the
+receiver's automatic welcome, progressive six-week history scan or Dreamer heartbeat. It also
+lacks the receiver's live event push, Google polling, dashboard and durable delivery retries.
+An empty historical graph does not mean you have never spoken to someone.
+
+In a **receiver-based self-host**, background history learning additionally needs a budgeted
+model proxy. A deliberate `SOTTO_BACKGROUND_UNMETERED=true` permits direct-key background calls
+at your expense; it does not add a receiver to this standalone install. Without either, that
+background work stays held while ordinary chat and briefs continue. Check
+`knowledge/history-state.json` for coverage rather than assuming six weeks were learned.
+See [RAILWAY.md](RAILWAY.md) for proxy configuration and spend controls.
+
+Choose the always-on container if you need the full scheduled product. It can send briefs while
+your Mac sleeps, using cloud sources and the last permitted local snapshot. It cannot refresh
+local data from a sleeping Mac.

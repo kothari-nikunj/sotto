@@ -3,6 +3,7 @@ lands in the OWNER's terminal mid-release (it has, twice). Same regexes as
 tools/prepare-public-repo.sh; distributable paths only."""
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -458,6 +459,15 @@ def test_the_public_local_setup_offers_exactly_one_way_to_get_the_bridge():
         doctor = [ln.strip() for ln in doc.splitlines() if "--doctor" in ln]
         assert len(doctor) == 1, f"expected exactly one --doctor invocation, got {doctor}"
         assert bridged in doctor[0], f"--doctor points somewhere that does not exist here: {doctor[0]}"
+
+        # The guide is shared verbatim now. A prose rewrite must not leave a dangling
+        # source-build sentence or drop the pinned-runtime/dependency steps again.
+        assert doc == Path(HERMES, "LOCAL-SETUP.md").read_text()
+        assert "bash adapters/hermes/install-runtime.sh" in doc
+        assert "--require-hashes -r requirements.txt" in doc
+        assert "SOTTO_BACKGROUND_UNMETERED=true" in doc
+        for name in ("install-runtime.sh", "local_preflight.py"):
+            assert Path(target, "adapters/hermes", name).is_file()
     finally:
         shutil.rmtree(target, ignore_errors=True)
 

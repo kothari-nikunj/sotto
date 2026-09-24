@@ -64,7 +64,7 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
    [Gemini API key](https://aistudio.google.com/apikey) is the only key Sotto needs, plus a
    [@BotFather](https://t.me/BotFather) bot token, a `/data` volume and a public domain). *One-click
    Deploy is in there too — same result, two prompts.* *Telegram and Gemini are the **defaults**, not
-   requirements — WhatsApp and iMessage delivery, and other models, are a variable each:*
+   requirements. WhatsApp, iMessage and other models have their own setup requirements:*
    **[Choosing your channel and model](CHANNELS.md)**.
 2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
    drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
@@ -75,12 +75,15 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
    a code once, and it stops streaming to your cloud until you enter one — nothing else is lost
    (pairing, Full Disk Access and your settings all survive), and the same
    [Issues](https://github.com/kothari-nikunj/sotto/issues) link is where you ask for a code.
-   A 3-step wizard in the app then covers **disk access → connect → privacy toggles**, in that
+   A 3-step wizard in the app covers **Connect → Choose sources → Disk access**, in that
    order, and nothing is read or sent until you press **Save & Connect** at the end. Connect Google
    on the same setup page — which also reports your channel's link (and shows the WhatsApp QR if
    that's your channel).
-3. **Say "set up Sotto"** in chat. It verifies every connection honestly, seeds its memory and your
-   writing voice from ~6 weeks of history, and offers your first brief on the spot.
+3. **Say "set up Sotto"** in chat. It verifies connections and reports the first useful look from
+   recent context. Progressive history learning is separate: receiver-based self-hosts need a
+   budgeted model proxy, or an explicit `SOTTO_BACKGROUND_UNMETERED=true` opt-in to direct-key
+   background spending. Without either, chat and briefs work but history learning stays held.
+   Check `knowledge/history-state.json` for actual coverage. See [RAILWAY.md](RAILWAY.md).
 
 **Staying updated:** your server checks once a day and, when a newer Sotto is published, says so
 three quiet ways — a line on its `/setup` page, a line on the dashboard, and one line in your next
@@ -107,13 +110,13 @@ Text stays the primary interface; the dashboard is the window.
 
 ## The model
 
-Gemini is the **default**, and it is what the brief pipeline calls today. The honest split, by layer:
+Gemini is the default. The model settings are separate for each layer:
 
-- **Briefs, meeting prep, follow-ups, triage** — a `GOOGLE_AI_API_KEY`, full stop: this half is
-  deterministic Python posting to Gemini's REST API. It needs a **1M-context model**; default
-  **Gemini 3.8 Flash**, with automatic fallback to `gemini-3-flash-preview` (cheaper, separate
-  rate-limit bucket, same key) on quota errors. `SOTTO_GEMINI_MODEL` / `SOTTO_FALLBACK_MODEL` pick
-  which Gemini model — not which vendor.
+- **Briefs, meeting prep, follow-ups and triage** use the shared provider seam. Gemini uses
+  `GOOGLE_AI_API_KEY`; `SOTTO_BRIEF_MODEL=openai/<model>` or `anthropic/<model>` selects another
+  family with its credentials. `SOTTO_TRIAGE_MODEL` configures triage separately. Brief models
+  must meet the context requirement; see [docs/MODELS.md](docs/MODELS.md) for limits and
+  capabilities that still require Gemini. Changing the chat model alone does not change these calls.
 - **The chat layer** (Ask Sotto, nudge replies) — Hermes' model, so Anthropic, OpenAI, Kimi,
   DeepSeek, xAI and OpenRouter all work with that provider's key and no Sotto code change. One
   caveat on the cloud container, stated in [CHANNELS.md](CHANNELS.md#switching-the-chat-model).

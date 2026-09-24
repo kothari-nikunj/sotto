@@ -22,14 +22,14 @@ OpenAI-compatible URL, Sotto can run on it.
 (`_shared/scripts/web_research.py`) resolves a provider by key presence, `web_search`: **Exa →
 Gemini grounding**, `deep_research`: **Parallel → Exa → Gemini grounding**, `fetch_url` (read a
 link someone sent): **Exa → Gemini url_context → Browser Use Cloud**. That is the hole §5(c)
-used to describe, and it is closed; everything else below still needs the Gemini key.
+used to describe, and it is closed. The remaining Gemini-specific capabilities are listed below.
 
 **What already runs on other models today: the chat layer.** Hermes — not Sotto — owns the
 conversational model, and it ships first-class providers for Anthropic, OpenAI, Kimi/Moonshot,
 DeepSeek, xAI, OpenRouter and more. Point `model.provider` at one of those, give it that provider's
 key, and "prep me for my 2pm" / "draft a reply to Sarah" / every nudge reply runs on it with **zero
-Sotto code changes**. You still need the Gemini key for the briefs themselves — and on the cloud
-container there is one boot-time pin to know about (§5a). The short version of this whole page, for
+Sotto code changes**. Brief composition is configured separately through `SOTTO_BRIEF_MODEL`.
+On the cloud container there is also a chat boot-time pin to know about (§5a). The short version of this whole page, for
 someone choosing at setup time, is in [CHANNELS.md](../CHANNELS.md).
 
 **What stays Gemini-keyed regardless of the compose family:** search grounding and `url_context`
@@ -38,6 +38,10 @@ says so) and DocSend's vision read (falls back to your Gemini key if present, re
 reason if not). `SOTTO_GEMINI_MODEL` keeps its meaning for exactly these lanes.
 
 ---
+
+Background history learning and Dreamer require the budgeted native Gemini proxy unless a
+self-host explicitly chooses `SOTTO_BACKGROUND_UNMETERED=true`. Direct-key composition does
+not silently enable this extra spending. Managed installs cannot use that opt-out.
 
 ## 1. Where the LLM calls actually are
 
@@ -54,8 +58,8 @@ reason if not). `SOTTO_GEMINI_MODEL` keeps its meaning for exactly these lanes.
 | 9 | Hermes' own chat/agent model | Ask Sotto, nudge replies, tool use, `web_extract`, compression, titles | every conversational turn | Hermes-owned |
 | 10 | Hermes TTS (`tts.provider`) | Voice notes | opt-in (`brief_audio`) | **not an LLM** — default `edge`, free, no key |
 
-Sites 1–8 are deterministic Python that calls Gemini's REST endpoint directly. Site 9 is a separate,
-**already-switchable** layer. Site 10 is model-independent unless you set `SOTTO_TTS_PROVIDER=gemini`.
+Sites 1–8 call the shared composition or research seams described above. Site 9 is a separate
+chat model setting. Site 10 is model-independent unless you set `SOTTO_TTS_PROVIDER=gemini`.
 
 ---
 
@@ -212,8 +216,7 @@ model:
 ```
 
 That switches Ask Sotto, every nudge reply, and Hermes' auxiliary tasks. **It does not switch the
-briefs** — those are `execute_code` Python calling Gemini's REST endpoint with `GOOGLE_AI_API_KEY`,
-and they neither know nor care what the chat model is.
+briefs**: set `SOTTO_BRIEF_MODEL` and the matching provider credentials separately.
 
 **One caveat, and it is a real one on the cloud container:** `adapters/hermes/start.sh` runs
 `hermes config set model gemini-3.8-flash` **on every boot** (and routes every auxiliary task to
@@ -224,23 +227,12 @@ in your fork, not a config change. On a **local or pre-existing** Hermes it genu
 ("Leaving the global model untouched") and leaves your provider alone. Don't promise a knob that
 isn't there.
 
-### (b) The one cheapest code change that unlocks the most
+### (b) Composition providers are implemented
 
-**An OpenAI-compatible client beside `call_gemini` — one function, one file.** `_gemini_once` is ~50
-lines: build a URL, POST JSON, pull text out of the response, hand `usageMetadata` to `metrics`.
-An `_openai_once` alongside it (base URL + bearer, `messages[]`, `choices[0].message.content`,
-`usage.prompt_tokens`/`completion_tokens`) covers **GPT-5.x, Kimi, DeepSeek, xAI-via-OpenRouter,
-Grok-via-OpenRouter and every local/self-hosted server that speaks the same shape** in one go. Every
-call site already funnels through `call_gemini` / `_gemini_once`, so nothing above it changes; the
-schema argument maps to `response_format`, and `system` maps to a `system` role message.
-
-**Does Anthropic's OpenAI-compatibility endpoint make Sonnet free-riders on that same client?**
-Partly, and not well enough to rely on. It would get a request through, but the two things this
-pipeline leans on hardest are exactly where a compatibility shim is thinnest: the structured-output
-contract (Sonnet 4.6 has neither `output_config.format` nor prefill) and token accounting for
-`metrics.PRICE_TABLE`. If Claude is a real target, budget a small native `anthropic_messages` client
-and pick a model that supports structured outputs. **The OpenAI-compatible client is the change worth
-making; the Anthropic one is a separate, later decision.**
+The shared client dispatches to native Gemini, OpenAI-compatible and Anthropic transports.
+`SOTTO_BRIEF_MODEL` selects the compose family; credentials, the context floor, structured
+output and same-family fallback checks still apply. This is separate from Hermes chat and from
+research. No additional provider client is needed to enable the existing OpenAI/Anthropic seam.
 
 ### (c) Research when Gemini is absent — SOLVED
 
@@ -274,9 +266,9 @@ silent.
 
 ### (d) What we should NOT support
 
-- **Anything under ~64K context.** Not because a heavy day needs more — it doesn't, it needs ~44K —
-  but because the margin between 44K and a bad day is the whole safety story. A model that only fits
-  the median day fails on the day the user most needs the brief.
+- **Known models below the 400K-token brief context floor.** The earlier measurements below
+  that floor are historical examples, not a safe ceiling for today's full prompt. Unknown model
+  sizes warn rather than establish compatibility; verify the context limit before using one.
 - **Anything that would require a chunking subsystem.** Splitting the extraction across calls means
   splitting the *judgement*: the brief's entire value is cross-source correlation (the same person on
   three channels, the escalation, the cross-source index), and a chunk boundary is exactly where that
@@ -286,24 +278,16 @@ silent.
   If the ceiling ever becomes a real problem, cap `EMAIL_BODY_MAX` — one constant — before building
   anything.
 - **Models with JSON mode but no schema enforcement, for the brief path, without a validator.**
-  DeepSeek's price is extraordinary and its context is sufficient; its JSON story is not. If it ships,
-  it ships with client-side schema validation and a retry, not with hope.
+  Provider support alone does not establish that a particular model has enough context or returns
+  valid structured output. Validate both before choosing it for briefs.
 
 ---
 
-## 6. The recommended next change
+## 6. Remaining verification
 
-One file, one new function, no call-site churn:
-
-1. `_shared/lib/gemini.py` (or a sibling) gains `_openai_once(model, key, prompt, system, schema)` —
-   base URL from env, `Authorization: Bearer`, `messages[]`, `response_format`, and a `usage`
-   adapter into `metrics.record`.
-2. `call_gemini` dispatches on the configured provider and keeps its existing retry/fallback ladder
-   unchanged.
-3. `metrics.PRICE_TABLE` gains rows for the models actually offered (an unpriced model already yields
-   `est=n/a` rather than a guess, so this is additive).
-4. Research needs nothing from this change — the search seam already stands on its own keys, per
-   rule (c). That is what makes this the *only* remaining blocker to a non-Gemini deployment.
-
-Scope: one new function plus a dispatch line, its tests, and the three docs that name the model
-(RAILWAY.md's env table, `.env.template`, and this file).
+The provider seam is implemented. Before changing the default model, measure complete brief
+quality and structured-output failures on representative inputs, including heavy days, and
+verify every required research capability has credentials. The historical prompt and cost
+measurements above are examples, not a current production benchmark or a promise that every
+Hermes chat model can compose a Sotto brief. Keep background-learning admission and its spend
+controls separate from that choice.

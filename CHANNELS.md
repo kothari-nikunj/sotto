@@ -19,17 +19,16 @@ pipeline runs on **Gemini**. Both are choices. This page is the choice, made onc
 
 - **Gemini** — *the default, and what the brief pipeline actually calls today.* One
   `GOOGLE_AI_API_KEY` covers briefs, chat, triage and research.
-- **Anthropic / OpenAI / Kimi / DeepSeek / xAI** — *available for the chat layer* (Ask Sotto, nudge
-  replies), because Hermes owns that model and ships those providers. **Not** for the briefs: the
-  brief pipeline POSTs Gemini's REST API directly. On the cloud container there is one more catch —
-  see "Switching the chat model" below.
+- **Anthropic / OpenAI** can compose briefs with `SOTTO_BRIEF_MODEL` and the matching key;
+  context and capability limits are in [docs/MODELS.md](docs/MODELS.md).
+- **Hermes chat** separately supports Anthropic, OpenAI, Kimi, DeepSeek and xAI. Changing chat
+  does not change brief composition. See "Switching the chat model" below.
 - **Exa / Parallel** — *web research, independent of both.* Set `EXA_API_KEY` and/or
   `PARALLEL_API_KEY` and attendee/company research stops going through Gemini entirely.
 
-Reply *sending* is unaffected by all of this. An **email** draft is offered into your Gmail drafts
-("want this in your Gmail drafts?" — it lands in the right thread, and you press send yourself);
-every other channel is a one-tap deep link (`imessage:` / `sms:` / `wa.me`) you tap on your phone,
-so your contacts receive a real iMessage or SMS no matter which channel delivers the brief to you.
+Replies default to drafts or links you send yourself. An explicit approved send requires a
+configured sending capability; Bridge sends additionally require `--allow-send`. The channel
+that delivers your brief does not grant permission to message another person.
 Without Google connected, email falls back to a `mailto:` link like everything else.
 
 ## The honest status of each channel
@@ -52,6 +51,18 @@ Hermes' gateway supports 20+ surfaces (`hermes gateway setup`). What *this repo*
 **TL;DR:** **Telegram is the recommendation.** Take WhatsApp when you want Sotto to be a contact
 rather than a bot and don't mind the QR. Take iMessage only if blue-bubble delivery is itself the
 point and you'll maintain a Mac for it.
+
+## Photon iMessage and photo briefs
+
+Photon is the managed Cloud default and an optional self-host channel. A self-host needs its
+own Photon project and credentials; it does not inherit the managed Sotto number. Configure
+`PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`, `PHOTON_HOME_CHANNEL` and `PHOTON_ALLOWED_USERS`,
+with the owner as the home channel and allowed user, plus `SOTTO_CRON_DELIVER=photon`.
+The adapter installs Sotto's Photon plugin at boot. Protect the secret like any other API key.
+
+The four-photo brief requires Photon gallery support and an eligible layout. Telegram and
+WhatsApp use text briefs by default; a text fallback on another channel is expected.
+The Mac Bridge supplies local context. Updating it does not change your delivery provider.
 
 ## Telegram setup (default)
 
@@ -179,9 +190,10 @@ its own blue bubble is a further step, with its own risks: [docs/BLUEBUBBLES.md]
 
 Two layers, and only one of them is switchable without editing a file:
 
-- **The briefs (and triage, prep, follow-ups) require `GOOGLE_AI_API_KEY`.** They are deterministic
-  Python calling Gemini's REST endpoint directly — no other provider's key does anything for them
-  today. `SOTTO_GEMINI_MODEL` picks *which* Gemini model; it cannot pick a different vendor.
+- **Briefs, prep and follow-ups** have their own provider setting, `SOTTO_BRIEF_MODEL`.
+  **Triage** uses `SOTTO_TRIAGE_MODEL`. Gemini is the default; OpenAI and Anthropic are supported
+  with the limits in [docs/MODELS.md](docs/MODELS.md). Background history learning has a separate
+  proxy/spend requirement, described in [RAILWAY.md](RAILWAY.md).
 - **The chat layer is Hermes', and Hermes ships Anthropic, OpenAI, Kimi/Moonshot, DeepSeek, xAI and
   OpenRouter.** On a **local or existing** Hermes, `model.provider` + that provider's key switches
   Ask Sotto and every nudge reply with zero Sotto changes (the installer leaves your global model
@@ -198,7 +210,7 @@ The full call-site map, measured prompt sizes and a five-model comparison:
 ## Local (Mac) delivery
 
 Everything above assumes the cloud container, but the gateway is the same on a **local** Hermes
-([LOCAL-SETUP.md](LOCAL-SETUP.md)): run `hermes gateway setup` then `hermes gateway` on the Mac and
+([LOCAL-SETUP.md](LOCAL-SETUP.md)): activate the Sotto Python environment, run `hermes gateway setup`, then `hermes gateway` on the Mac and
 scheduled briefs deliver over the same channels (the local installer's crons default to
 `--deliver whatsapp` — a local Hermes pairs WhatsApp interactively, so that stays the laptop default;
 `SOTTO_CRON_DELIVER` overrides, and the cloud boot resolves the channel for you instead). Interactive

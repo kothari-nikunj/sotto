@@ -30,9 +30,15 @@ note() { echo "+ $*"; }
 
 echo "== Sotto · Hermes adapter (dry-run=$DRY_RUN) =="
 
+# Check before patching Hermes or writing config. The gateway inherits this PATH,
+# so its skill subprocesses must find this same Sotto Python environment.
+if [ "$DRY_RUN" -eq 0 ]; then
+  python3 "$HERE/local_preflight.py"
+fi
+
 command -v hermes >/dev/null 2>&1 || {
   echo "Hermes not found. Install Sotto's pinned compatible runtime, then re-run:" >&2
-  echo "  bash \"$HERE/hermes-install.sh\" --commit \"$(cat "$HERE/hermes.commit")\"" >&2
+  echo "  bash \"$HERE/install-runtime.sh\"" >&2
   [ "$DRY_RUN" -eq 1 ] || exit 1
 }
 
@@ -42,7 +48,7 @@ if command -v hermes >/dev/null 2>&1 && ! hermes send --help 2>&1 | grep -q -- '
   cat >&2 <<EOF
 Hermes is too old for Sotto delivery: 'hermes send' does not support --json provider receipts.
 No messages were sent. Install the repository's pinned compatible runtime, then re-run:
-  bash "$HERE/hermes-install.sh" --commit "$(cat "$HERE/hermes.commit")"
+  bash "$HERE/install-runtime.sh"
 EOF
   [ "$DRY_RUN" -eq 1 ] || exit 1
 fi
@@ -62,15 +68,14 @@ elif ! run python3 "$HERE/provider_error_compat.py" "$HERMES_SOURCE_ROOT/gateway
   # provider_error_compat.py has already printed one [sotto] FATAL line naming the expected and
   # found hashes. Say what to do about it from here: this installed Hermes is not the reviewed pin.
   echo "Nothing was installed. Reinstall the repository's pinned Hermes runtime, then re-run:" >&2
-  echo "  bash \"$HERE/hermes-install.sh\" --commit \"$(cat "$HERE/hermes.commit")\"" >&2
+  echo "  bash \"$HERE/install-runtime.sh\"" >&2
   echo "If you are deliberately moving to a newer Hermes, follow 'Provider-error gateway pin'" >&2
   echo "in $HERE/README.md to re-review and regenerate the hashes first." >&2
   exit 1
 fi
 
 # 1) Model + scheduler.
-#    The brief ALWAYS runs on Gemini via _shared/scripts/compose_brief.py (needs GOOGLE_AI_API_KEY in
-#    the env), so we never touch the user's global model — clean drop-in on an existing agent.
+#    The brief has its own provider setting in compose_brief.py, independent of the chat model.
 #    --dedicated optionally sets the conversational driver to Gemini too (for a Sotto-only instance).
 #    Use the NATIVE Gemini model id, same as start.sh — the OpenRouter-style "google/…" id would route
 #    via OpenRouter and need OPENROUTER_API_KEY; the native id uses the gemini provider with your
@@ -78,7 +83,7 @@ fi
 DEDICATED=0
 for a in "$@"; do [ "$a" = "--dedicated" ] && DEDICATED=1; done
 [ "$DEDICATED" -eq 1 ] && run hermes config set model gemini-3.8-flash \
-  || echo "! Leaving the global model untouched (brief uses Gemini via compose_brief.py + GOOGLE_AI_API_KEY)."
+  || echo "! Leaving the global model untouched (brief provider is configured separately)."
 # scheduler.enabled: Hermes v0.20 dropped the key and warns on it — probe with `config get` and set
 # only where supported. (hermes-missing is dry-run only — the guard above exits otherwise — so keep
 # the old dry-run output in that case.)
@@ -325,4 +330,4 @@ if [ "${SOTTO_CRON_DELIVER:-}" = "photon" ]; then
   run python3 "$HERE/photon_setup.py" "$HERMES_HOME"
 fi
 
-echo "== Done. In chat: '/sotto setup' (or 'Sotto, set up') — it verifies health(), seeds your memory + writing voice, and offers your first brief. =="
+echo "== Done. In chat: '/sotto setup' (or 'Sotto, set up') checks your connections and schedules, then helps you get your first brief. =="
