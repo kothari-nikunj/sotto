@@ -61,12 +61,15 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
 
 1. **Deploy the agent** on Railway from your own copy of this repo — four settings and three
    variables, all listed in [ONBOARDING.md § 1](ONBOARDING.md) (a
-   [Gemini API key](https://aistudio.google.com/apikey) is the only key Sotto needs, plus a
+   [Gemini API key](https://aistudio.google.com/apikey) covers model calls, plus a
    [@BotFather](https://t.me/BotFather) bot token, a `/data` volume and a public domain). *One-click
    Deploy is in there too — same result, two prompts.* *Telegram and Gemini are the **defaults**, not
    requirements. WhatsApp, iMessage and other models have their own setup requirements:*
    **[Choosing your channel and model](CHANNELS.md)**.
-2. **Link your Mac** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
+   **For iMessage, [follow the Photon self-host setup](CHANNELS.md#photon-imessage-and-photo-briefs)**
+   using your own provider connection. It ships in this public runtime; the Telegram template does
+   not allocate an iMessage number. The Mac Bridge is independent of the delivery channel.
+2. **Connect your sources; add your Mac if wanted** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
    drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
    click from the `/setup` page it opens. First run asks for an **access code** — the distributed Bridge binary's first-run access is invite-only for now (self-host deployment
    itself is not), the code is checked on your Mac and never sent anywhere, and if you don't
@@ -79,8 +82,9 @@ walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. T
    order, and nothing is read or sent until you press **Save & Connect** at the end. Connect Google
    on the same setup page — which also reports your channel's link (and shows the WhatsApp QR if
    that's your channel).
-3. **Say "set up Sotto"** in chat. It verifies connections and reports the first useful look from
-   recent context. Progressive history learning is separate: receiver-based self-hosts need a
+3. **Check the automatic first brief** once your channel and a context source are ready. Setup
+   reports preparing, waiting to send, delayed or sent; confirm it appears on your device before
+   requesting another. Progressive history learning is separate: receiver-based self-hosts need a
    budgeted model proxy, or an explicit `SOTTO_BACKGROUND_UNMETERED=true` opt-in to direct-key
    background spending. Without either, chat and briefs work but history learning stays held.
    Check `knowledge/history-state.json` for actual coverage. See [RAILWAY.md](RAILWAY.md).

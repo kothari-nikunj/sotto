@@ -7,6 +7,13 @@ question while gathering covers only the primary calendar. `model_work.py` owns 
 attempt claims and opaque receipts in `events/model-work.sqlite3`; validated artifacts survive
 delivery retries. The proxy owns provider call accounting. Stable receiver job IDs distinguish
 retries from later occurrences; dead-worker claims retain unknown spend and allow bounded recovery.
+Notification source dates survive queue release and are displayed outside model-written copy.
+Prep offers reuse exact-address mail already in the consented queue/snapshot, plus invitation and
+graph facts; no source fetch or research call is added. Cached exact-address envelopes can supply a missing
+prep name with delivery-time consent. Calendar-change copy comes directly from the detector:
+dated moves, explicit cancellations, or a removed slot without guessing why. Context/prep entries
+do not mint separate meeting-change nudges; unique nonrecurring iCalUIDs preserve identity across
+replaced IDs. Calendar normalization retains explicit cancellation and recurring-occurrence metadata.
 Brief extraction, critic and revision own separate retry allowances. See [bounded model
 work](BOUNDED-MODEL-WORK.md) for contracts, storage and reports.
 
@@ -171,6 +178,8 @@ cannot commit a replacement worker's result. The queue lives on the existing ten
 Schema migration and mutation share one immediate SQLite transaction. Opening the queue preserves
 its journal mode: fresh stores use SQLite's rollback journal and existing WAL stores retain WAL,
 both with full synchronous durability. Admission does not race a journal-mode change at startup.
+Shared JSON sidecar locks allow nesting only within the owning thread; concurrent threads and
+processes remain excluded, including when consuming a one-use approval before a send.
 
 The receiver loads shared delivery code from the immutable image's `/app/sotto-skills/_shared/lib`
 or the equivalent source-checkout path, never from the writable Hermes home. Startup validates
@@ -256,6 +265,9 @@ and `knowledge/master.md` remain writable. `check_identity.py` exercises that bo
 with the actual UID and pinned Hermes in every Linux image build. This protects
 the product file; independent tool authorization and source-consent checks still
 enforce actions and access. Self-host persona customization is unchanged.
+The local adapter gate also measures the assembled persona and shared writing rules:
+at most 19,000 characters, leaving 1,000 below pinned Hermes's 20,000-character
+context-file limit. The Linux image gate verifies the complete identity loads unchanged.
 
 
 ## Receiver modules
@@ -268,7 +280,7 @@ imports the receiver back.
 | Module | Owns |
 |---|---|
 | `managed.py` | Managed activation/source checks, granted Google scope receipts, and the one-time source notice policy. Missing or foreign tenant state holds scheduled briefs, including Bridge wake triggers; self-host behavior is unchanged. |
-| `onboarding.py` | Durable first-use reservation and delivery acknowledgement; resumes after failure, preserves established installations |
+| `onboarding.py` | Durable first-use reservation and delivery acknowledgement; read-only setup progress, recovery after failure and preservation of established installations |
 | `brief_runner.py` | One deterministic daily/first-use procedure in Cloud and receiver-based self-host: durable artifact and inputs, essential knowledge/continuity writes, exact chat text, deferred ancillary learning |
 | `procedure_runner.py` | Shared proactive, digest and relationship-pulse procedures; eligible proactive results use deterministic templates or the bounded direct writer, and reviewed digest coverage advances only after delivery acceptance |
 | `work_queue.py` (shared library) | SQLite ownership of accepted work until output is handed to the outbox; stable input IDs, bounded leases/retries, two worker slots with at most one background worker |
@@ -294,6 +306,13 @@ container boot and local installation. Shutdown, restart, startup and interrupte
 notices stay in operator logs on Telegram, Photon and configured channels; normal replies
 and actionable source/provider failures retain their existing delivery paths. The scheduled
 digest runner uses the checker's default CLI action, with a real subprocess regression check.
+The same writer sets Hermes' existing `display.busy_ack_enabled` to false. Redirected, steered,
+queued and interrupting-run acknowledgments stay out of chat; Hermes routes the correction before
+checking that setting. The writer also disables displayed reasoning, automatic memory-update
+notices, runtime footers (including per-channel overrides), and routine compression progress.
+Memory and compression still run. Approval policy, final replies and actionable errors are
+unaffected. The shared writing-style reference asks for ordinary-language outcomes and recovery
+steps, without internal paths or tool jargon unless the user asks for technical detail.
 
 ## Background threads
 
@@ -308,7 +327,7 @@ restarting a thread or process does not erase accepted work.
 | Delivery outbox drain (`outbox.start_drain_thread`) | `outbox.DRAIN_INTERVAL_SECS` = 60s | Retries every message the channel hasn't acknowledged — backoff doubling from 60s to a 900s cap, then `failed` (a brief, loudly, when its local day ends) or `expired` (a nudge past 240 min). After acceptance, effects retry five times without resending, then quarantine with their receipt, label, run id and reason retained and their per-source addressing dropped. |
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Work dispatch (`receiver.start_work_thread`, thread `sotto-work-dispatch`) | every 5s, or the moment a job is admitted or finishes (`_WORK_WAKE`) | Claims due jobs from `events/work.sqlite3` under a fresh per-claim owner and starts one `sotto-work` thread per claim, within the queue's two worker slots |
-| Work execution (`receiver._work_one`, thread `sotto-work`, one per claimed job) | for the life of the job | Runs the declared procedure (or reuses a saved result), saves the exact output, renews the lease once more, hands the text to the outbox, then `finish`es or `fail`s the job for bounded retry |
+| Work execution (`receiver._work_one`, thread `sotto-work`, one per claimed job) | for the life of the job | Runs the declared procedure (or reuses a saved result), saves the exact output, renews the lease once more, hands the text to the outbox, then `finish`es or `fail`s the job for bounded retry. Incoming-event notification writing gets four separate provider recoveries for explicit 429/500/502/503/504 responses, with exponential delay inside its original deadline. `model_work` preserves every call receipt while leaving validation attempts available. Only the declared notification runner's typed exit can request recovery; saved delivery handoffs keep their own limit. Final receipts distinguish queued retries from stopped work. |
 | Work lease (`receiver._work_one.keep_lease`, thread `sotto-work-lease`, one per running job) | every 30s while its job runs | Renews the job's 120s lease; a renewal the queue refuses (the lease was recovered by another claim) ends the keeper, and the worker's own pre-handoff renewal then fails rather than delivering twice |
 | Session archive (`receiver._session_archive_tick`, thread `sotto-session-archive`) | once a local day at the retention sweep slot (3:30 AM), spawned from the cron tick | Archives every Hermes chat session through `sessions.py` on its own thread, so one slow CLI call cannot delay the brief window the cron thread is in |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
@@ -820,8 +839,11 @@ private saved Posts in a brief just because public access still works. No new st
 Chrome preserves readable profiles while reporting partial coverage when another fails. Notes
 and Screen Time query failures are distinct from empty results. Spotlight command failures do
 not prove there are no files; failed last-used metadata means the file's open status is unknown,
-including file/meeting matches. Bounded batches isolate vanished files with per-file retries under
-one shared six-second metadata deadline, preserving successful peers.
+including file/meeting matches. One ten-second `mdfind -0 -attr` query returns paths, last-used
+dates and download origins from the same indexed records. This avoids a separate `mdls` path
+lookup that can fail even when Spotlight finds existing files. NUL record boundaries preserve
+multiline names and origin arrays. Malformed metadata marks coverage partial without poisoning
+successful peers; an explicit null last-used date alone means unopened.
 Partial reads keep valid current fields, including empty lists, without blending cached sibling
 fields. All source projections count when deciding whether a snapshot is live. Current consent
 is checked again before style or Contacts updates from cached observations are written, including

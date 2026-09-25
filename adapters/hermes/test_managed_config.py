@@ -18,6 +18,19 @@ def test_managed_start_fails_fast_on_every_runtime_identity():
         assert f'${{{name}:?managed mode requires' in start
 
 
+def test_complete_product_identity_fits_pinned_hermes_context_limit(tmp_path):
+    module.reconcile(tmp_path, {
+        'SOTTO_MODEL_PROXY_URL': 'https://proxy.example',
+        'SOTTO_MODEL_PROXY_TOKEN': 'fixture',
+        'PHOTON_HOME_CHANNEL': '+15555550100',
+        'PHOTON_ALLOWED_USERS': '+15555550100',
+    })
+    # Pinned Hermes truncates SOUL.md at 20,000 characters. Keep 1,000 spare;
+    # measure the assembled identity, including the shared writing rules.
+    soul = (tmp_path / 'SOUL.md').read_text()
+    assert len(soul) <= 19_000, f'Product identity grew to {len(soul)} characters'
+
+
 def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     owner = '+15555550100'
     env = {'SOTTO_MODEL_PROXY_URL': 'https://proxy.example', 'SOTTO_MODEL_PROXY_TOKEN': 'tenant-token',

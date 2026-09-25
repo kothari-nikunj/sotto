@@ -312,13 +312,14 @@ def test_confirm_survives_the_next_extraction_and_reaches_the_drafter(tmp_path):
 
 
 def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, monkeypatch):
+    import threading
     os.environ["SOTTO_DATA"] = str(tmp_path)
     original = se.jsonstore.write_atomic
     observed = []
 
     def checked(path, obj, **kwargs):
         lock = se.jsonstore.lock_path(path)
-        observed.append(se.jsonstore._ReentrantLock._depth.get(lock, 0))
+        observed.append(se.jsonstore._ReentrantLock._depth.get((os.getpid(), threading.get_ident(), lock), 0))
         assert observed[-1] > 0
         return original(path, obj, **kwargs)
 

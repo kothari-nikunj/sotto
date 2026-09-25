@@ -1050,6 +1050,9 @@ def _execute_work(job):
             raise _WorkDeferredError('brief generation is busy')
         if process.returncode:
             error = _WorkerError(process.returncode, _stderr)
+            error.retry_provider = (job['kind'] == 'event'
+                                    and process.returncode == WORK_QUEUE.PROVIDER_RETRY_EXIT
+                                    and runner == [sys.executable, _find_sotto_script('_shared', 'scripts', 'compose_notification.py')])
             error.usage = _read_usage(usage_path)
             raise error
         kind = MARKED_BRIEF_KINDS.get(label.rsplit(':', 1)[-1])
@@ -1144,9 +1147,15 @@ def _work_one(job):
                          run_id=job['id'])
     except Exception as error:
         diagnostic = error.diagnostic if isinstance(error, _WorkerError) else type(error).__name__
-        WORK_QUEUE.fail(DATA, job['id'], owner, diagnostic)
+        disposition = WORK_QUEUE.fail(DATA, job['id'], owner, diagnostic,
+                                      retry_provider=getattr(error, 'retry_provider', False))
+        if disposition is None:
+            return  # a newer lease owns both the retry and its receipt
+        detail = ('retry queued' if disposition in ('pending', 'ready') else
+                  'relevance deadline reached; no retry queued' if disposition == 'expired' else
+                  'attempt limit reached; no retry queued')
         _record_delivery(job['payload'].get('label', job['kind']), 'failed',
-                         f'work {job["id"]}: {diagnostic}; persisted for bounded retry',
+                         f'work {job["id"]}: {diagnostic}; {detail}',
                          usage=getattr(error, 'usage', None), run_id=job['id'])
     finally:
         settled.set()
@@ -2345,7 +2354,12 @@ def _background_context_tick() -> None:
     import onboarding
     try:
         has_sources = (managed.has_sources(DATA) if managed.enabled() else
-                       RELAY.bridge_connected() or Path(_hermes_adapter('runtime_api').home_path('google_token.json')).exists())
+                       RELAY.bridge_connected() or Path(_hermes_adapter('runtime_api').home_path('google_token.json')).exists()
+                       or any(s.get('connected') and s.get('service') in managed.MANAGED_CONNECTOR_SOURCES
+                              and not _connector_error(s['service'])
+                              and (not s.get('expires_at') or s['expires_at'] >= time.time()
+                                   or _connector_has_refresh(s['service']))
+                              for s in CONNECTORS.service_status()))
         # Check durable completion before touching the channel or doing any work.
         onboarding.tick(DATA, lambda: has_sources and (not managed.enabled() or managed.messaging_activated(DATA))
                         and _delivery_channel_ready(onboarding.LABEL),
@@ -3383,12 +3397,14 @@ def start_update_check_thread():
 
 
 def setup_status() -> dict:
+    import onboarding
     gok, gmsg = google_connected()
     client_present = os.path.exists(_hermes_adapter('runtime_api').home_path('google_client_secret.json'))
     tz = _configured_tz_name()   # tzchain: SOTTO_TIMEZONE → TZ → settings.json (→ UTC)
     return {
         "bridge_connected": RELAY.bridge_connected(),
         "google_connected": gok,
+        "first_brief": onboarding.status(DATA),
         "google_detail": gmsg,
         "google_client_present": client_present,
         "timezone": tz,
@@ -3613,21 +3629,26 @@ def _setup_page(code: str = "") -> str:
                   "headers:{'Content-Type':'application/json'},body:JSON.stringify({service:s})})"
                   ".then(function(){location.reload();});return false;}</script>")
 
-    # Steps 1–4 all done (tile 5 is optional and never gates): the wizard's job is finished, so the
-    # page's FIRST affordance becomes the handoff to the dashboard. The delivery step uses the SAME
+    # Any connected context source is enough; Mac and Google are independent.
+    # Setup can open the dashboard while showing the first brief's actual progress. The delivery step uses the SAME
     # rule the valve and the meeting tap use (_delivery_ready): the active channel must be linked —
     # a never-scanned WhatsApp or an un-texted Telegram bot must not celebrate over a dead delivery
     # channel — while a channel with no probe never blocks the wizard from finishing.
-    done = (st["bridge_connected"] and st["google_connected"] and bool(st["timezone"]) and ch_done)
+    context_connected = st["bridge_connected"] or st["google_connected"] or svc_connected
+    done = (context_connected and bool(st["timezone"]) and ch_done)
     hero = "<a class='hero-cta' href='/app'>Open your dashboard →</a>" if done else ""
-    say_where = ("Message your bot on Telegram" if channel == "telegram" else
-                 "Message yourself on WhatsApp" if channel == "whatsapp" else
-                 f"Message Sotto on {_html.escape(channel)}")
-    footer = (f"<p class='page-sub'>You're connected. {say_where}: "
-              "<b>“Sotto, give me my morning brief.”</b> Briefs also fire automatically at 6:30 am / 5:30 pm.</p>"
-              if done else
-              "<p class='tile-hint'>Finish the steps above, then "
-              f"<a href='/setup{qs}'>recheck</a>. Briefs deliver once your Mac is linked, Google is connected, and a timezone is set.</p>")
+    first_brief = st.get('first_brief', 'waiting')
+    progress = {
+        'waiting': "Sotto will prepare your first brief automatically once a context source and your message connection are ready.",
+        'composing': "Sotto is preparing your first brief. You can close this page.",
+        'queued': "Your first brief is ready and waiting to be sent. You do not need to request another.",
+        'retrying': "Your first brief is delayed. Sotto will retry automatically; you do not need to reconnect.",
+        'delivered': "Your first brief was sent. Check your connected chat.",
+        'existing': "Your setup is connected. Scheduled briefs continue in your connected chat.",
+    }.get(first_brief, "Checking your first brief.")
+    footer = (f"<p class='page-sub'>{progress}</p>" if done else
+              "<p class='tile-hint'>Connect a context source and your message channel, then "
+              f"<a href='/setup{qs}'>check again</a>. Mac sources and Google can be connected independently.</p>")
 
     # Version facts, in the same quiet mono zone as the Host line at the foot of the page. This page
     # is the deliberate one — you opened it — so it states the fact whenever the cache holds it; the

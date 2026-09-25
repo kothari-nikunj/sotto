@@ -12,7 +12,14 @@ spec.loader.exec_module(module)
 @pytest.mark.parametrize('channel', ['telegram', 'photon', 'whatsapp:fixture-chat', 'local'])
 def test_quiet_lifecycle_preserves_channel_access_and_reply_behavior(tmp_path, channel):
     path = tmp_path / 'config.yaml'
-    original = {'model': {'default': 'fixture-model'}, 'platforms': {
+    original = {'model': {'default': 'fixture-model'},
+                'approvals': {'mode': 'manual', 'timeout': 300, 'cron_mode': 'deny'},
+                'compression': {'enabled': True, 'threshold': 0.5, 'progress_notices': True},
+                'display': {'busy_ack_enabled': True, 'busy_input_mode': 'interrupt',
+                            'busy_text_mode': 'queue', 'tool_progress': 'off',
+                            'platforms': {'photon': {'show_reasoning': True, 'memory_notifications': 'verbose',
+                                                     'runtime_footer': {'enabled': True, 'fields': ['model']},
+                                                     'streaming': False}}}, 'platforms': {
         'telegram': {'enabled': False, 'token': 'fixture-token', 'typing_indicator': True,
                      'gateway_restart_notification': True},
         'photon': {'enabled': True, 'home_channel': {'chat_id': 'fixture-owner'},
@@ -27,6 +34,14 @@ def test_quiet_lifecycle_preserves_channel_access_and_reply_behavior(tmp_path, c
         expected = {**settings, 'gateway_restart_notification': False}
         assert result['platforms'][name] == expected
     assert result['model'] == original['model']
+    assert result['approvals'] == original['approvals']
+    assert result['compression'] == {**original['compression'], 'progress_notices': False}
+    assert result['display'] == {
+        **original['display'], 'busy_ack_enabled': False, 'show_reasoning': False,
+        'memory_notifications': 'off', 'runtime_footer': {'enabled': False},
+        'platforms': {'photon': {'show_reasoning': False, 'memory_notifications': 'off',
+                               'runtime_footer': {'enabled': False, 'fields': ['model']}, 'streaming': False}},
+    }
     assert 'local' not in result['platforms']
     if channel.startswith('whatsapp:'):
         assert result['platforms']['whatsapp'] == {'gateway_restart_notification': False}
@@ -37,7 +52,10 @@ def test_quiet_lifecycle_preserves_channel_access_and_reply_behavior(tmp_path, c
 
 def test_new_install_keeps_both_chat_channels_quiet_without_enabling_them(tmp_path):
     module.reconcile(tmp_path / 'fresh')
-    assert yaml.safe_load((tmp_path / 'fresh/config.yaml').read_text()) == {'platforms': {
-        'photon': {'gateway_restart_notification': False},
-        'telegram': {'gateway_restart_notification': False},
-    }}
+    assert yaml.safe_load((tmp_path / 'fresh/config.yaml').read_text()) == {
+        'display': {'busy_ack_enabled': False, 'show_reasoning': False,
+                    'memory_notifications': 'off', 'runtime_footer': {'enabled': False}},
+        'compression': {'progress_notices': False},
+        'platforms': {'photon': {'gateway_restart_notification': False},
+                      'telegram': {'gateway_restart_notification': False}},
+    }

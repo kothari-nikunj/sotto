@@ -12,6 +12,9 @@ pipeline runs on **Gemini**. Both are choices. This page is the choice, made onc
 - **WhatsApp** — *a real contact instead of a bot, at the price of a QR.* Two variables plus
   `WHATSAPP_ENABLED=true`, then scan a QR from the `/setup` page with your phone. The container still
   pairs and probes it for you; it is simply no longer what you get by default.
+- **iMessage (Photon)** — cloud delivery using your own Photon project and messaging connection.
+  Sotto installs the adapter for you; you supply the provider credentials and your exact sender
+  identity. Your Mac does not have to stay awake for delivery. [Full setup below](#photon-imessage-and-photo-briefs).
 - **iMessage (BlueBubbles)** — *blue bubbles, at a price:* an always-on Mac, a Firebase project and a
   tunnel. Nothing here automates it; it is a hand-wired recipe. Hours, not minutes.
 
@@ -35,34 +38,67 @@ Without Google connected, email falls back to a `mailto:` link like everything e
 
 Hermes' gateway supports 20+ surfaces (`hermes gateway setup`). What *this repo* does for each:
 
-| | **Telegram** | **WhatsApp** | **iMessage (BlueBubbles)** |
+| Channel | What you supply | Delivery while your Mac sleeps | Photo briefs |
 |---|---|---|---|
-| Status here | **the default path** | **first-class, opt-in** | **recipe only, not automated** |
-| Runs fully in the cloud | ✅ | ✅ | ❌ needs an always-on Mac |
-| Setup | ~2 min, one variable | ~3 min, two variables + a QR | ~30–45 min + a Firebase project |
-| Linked for you on boot | ✅ `start.sh` prints a one-tap pairing link; tapping it captures your chat id | ✅ `start.sh` runs pairing, serves the QR at `/whatsapp/qr` | ❌ hand-wired |
-| A `/setup` wizard tile | ✅ tile ③ | ✅ tile ③ (whichever channel is active gets the tile) | ❌ |
-| `SOTTO_CRON_DELIVER` target | ✅ default | ✅ | ✅ (whatever name `hermes gateway setup` registered) |
-| Nudge delivery-gate | holds a nudge until your chat id is linked | probes the WhatsApp link before spending a nudge | nothing to probe → nudges always dispatch |
-| Feels like a normal contact | ⚠️ a bot, not a contact | ✅ | ✅ blue bubbles |
-| Tapbacks as status (👀 ✅ ❌) | ✅ | ❌ Hermes has no bot reactions there | ❌ |
-| Cost | free | free | free, but a Mac powered 24/7 |
+| Telegram | Your bot token; link your chat using the boot-log pairing link | Yes | Text by default |
+| WhatsApp | Your number settings and QR pairing | Yes | Text by default |
+| iMessage / Photon | Your own working Photon project, connection, credentials and exact owner identity | Yes | Four photos when the provider and layout support it |
+| iMessage / BlueBubbles | An always-on Mac, BlueBubbles and its server connection | No | Not the Photon gallery path |
 
-**TL;DR:** **Telegram is the recommendation.** Take WhatsApp when you want Sotto to be a contact
-rather than a bot and don't mind the QR. Take iMessage only if blue-bubble delivery is itself the
-point and you'll maintain a Mac for it.
+Telegram is the default template path. For iMessage, use Photon if you have provider access;
+confirm its availability and charges separately. BlueBubbles is a different, manually configured
+alternative. The Sotto Bridge is an optional source reader, not either messaging provider.
 
 ## Photon iMessage and photo briefs
 
-Photon is the managed Cloud default and an optional self-host channel. A self-host needs its
-own Photon project and credentials; it does not inherit the managed Sotto number. Configure
-`PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`, `PHOTON_HOME_CHANNEL` and `PHOTON_ALLOWED_USERS`,
-with the owner as the home channel and allowed user, plus `SOTTO_CRON_DELIVER=photon`.
-The adapter installs Sotto's Photon plugin at boot. Protect the secret like any other API key.
+This path is included in the public self-host runtime. You need your **own Photon project and
+working iMessage connection**, including the address people message to reach it. Creating a
+Railway service or installing the Mac Bridge does not allocate that connection. Check provider
+access and pricing before starting; no Photon account or number is included with this repository.
 
-The four-photo brief requires Photon gallery support and an eligible layout. Telegram and
-WhatsApp use text briefs by default; a text fallback on another channel is expected.
-The Mac Bridge supplies local context. Updating it does not change your delivery provider.
+1. Sign in at [Photon](https://app.photon.codes/) and prepare a project, register your iMessage
+   phone number, and obtain the assigned line plus runtime project ID and secret. If you need
+   guided provisioning, [Hermes' Photon setup](https://github.com/NousResearch/hermes-agent/blob/245e48008fa814b3251f50755eb656bd9fb86cb1/plugins/platforms/photon/README.md#first-time-setup)
+   performs these steps. An operator can run it in an isolated Hermes environment; Sotto does not
+   require installing Hermes on your Mac. Use a separate project/connection for this installation.
+   Setup can rotate the project secret, so do not run it against someone else's live project.
+2. Follow [ONBOARDING step 1](ONBOARDING.md#1--deploy-the-backend-on-railway)'s **manual GitHub
+   deployment** using the public repository. The current Railway template is Telegram-oriented
+   and requests a bot token; it is not an iMessage provisioning template. Skip BotFather and
+   Telegram pairing. Keep the Gemini key, unique `BRIDGE_TOKEN`, `/data` volume and public domain.
+3. Set these additional Railway variables before deployment:
+
+   | Variable | Value |
+   |---|---|
+   | `SOTTO_CRON_DELIVER` | `photon` |
+   | `PHOTON_PROJECT_ID` | Your Photon project ID |
+   | `PHOTON_PROJECT_SECRET` | That project's secret; keep it in Railway Variables |
+   | `PHOTON_HOME_CHANNEL` | **Your registered phone number**, including `+` and country code |
+   | `PHOTON_ALLOWED_USERS` | The same exact owner identity; no wildcard |
+
+   The last two values identify **you**, the person receiving briefs and sending requests. They
+   are not Sotto's provider-assigned number. For this setup, choose the registered phone number
+   in Messages' **Start new conversations from** setting, rather than an Apple ID email. Leave
+   `SOTTO_DEPLOYMENT_MODE` unset for self-host and omit Telegram credentials.
+4. Deploy. Boot installs and enables Sotto's Photon plugin automatically. Check that the gateway
+   connects without authentication errors. No separate Hermes install on your Mac is required.
+5. From the configured owner identity, send a hello to your Photon connection's iMessage address.
+   This first inbound message also allows a shared Photon line to reply to you; it cannot initiate
+   a new conversation by itself. Confirm a reply arrives. A configured channel or a healthy HTTP endpoint alone does not prove
+   messaging works; check the project/connection and exact sender identity if it stays silent.
+6. Continue at [ONBOARDING step 2](ONBOARDING.md#2--open-your-setup-link): open the private setup
+   link, check timezone, and connect Google, selected Mac sources or Granola. If adding the Mac
+   Bridge, choose **Use my own server instead**, even though your delivery channel is iMessage.
+7. Wait for the automatic first brief and confirm it appears in Messages. Eligible briefs use
+   four photos; an ineligible layout can fall back to text. Check the dashboard Record for send
+   status and any presentation fallback. Reopening setup should not send another welcome brief.
+
+Protect the private setup link and provider secret. Do not enable open access to get around a
+sender mismatch. Drafting a reply does not authorize sending it to another person.
+
+The Mac Bridge supplies local context independently of delivery. While your Mac sleeps, Photon
+can still deliver using server-side sources; local context may become stale. Updating the Bridge
+does not provision or change your delivery provider.
 
 ## Telegram setup (default)
 
@@ -167,9 +203,9 @@ channels below, not for the cloud, which links your channel automatically.)*
 
 ## iMessage via BlueBubbles
 
-iMessage has **no cloud API**, so a Mac signed into iMessage must always be running. BlueBubbles is
-the open-source bridge that exposes that Mac's Messages over an authenticated API for Hermes to use.
-Nothing in Sotto's installers automates any of this.
+This alternative uses BlueBubbles to expose a Mac's Messages over an authenticated API for Hermes.
+That Mac must stay awake. It is separate from Photon cloud delivery above; Sotto's installers do
+not automate the BlueBubbles setup.
 
 What it requires (per BlueBubbles docs):
 1. **An always-on Mac** signed into your iMessage account, on power + internet 24/7.

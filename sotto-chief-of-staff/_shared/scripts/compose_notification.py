@@ -19,12 +19,14 @@ import delivery_effects  # noqa: E402
 import gemini  # noqa: E402
 import jsonstore  # noqa: E402
 import model_work  # noqa: E402
+import work_queue  # noqa: E402
 import pending_offer  # noqa: E402
 import preferences  # noqa: E402
 import action_links  # noqa: E402
 import loops_query  # noqa: E402
 import style_apply  # noqa: E402
 from source_context import allowed  # noqa: E402
+from timeutil import parse_observed_time, _parse_ts  # noqa: E402
 
 MAX_CONTEXT_CHARS = 48000
 MAX_COPY_CHARS = 1200
@@ -47,6 +49,11 @@ message can be days old even if its meeting is still ahead. Omit a scheduling qu
 same meeting is booked or a later exchange settled it. Match the participants, subject and time;
 an unrelated meeting or a generic reply does not complete a promise to send a document. An open
 ledger entry alone does not prove that the original scheduling question still needs an answer.
+Use source_timing as the date of the original message, never the queue arrival or reminder run.
+Anchor relative dates in old messages to that source date, not today. Keep the useful reason for
+resurfacing an older ask. A signature request or automated reminder proves only that a request
+was sent, not that the document remains unsigned: attribute it to the dated reminder and say
+completion is unconfirmed unless supplied evidence establishes it. A user's completion wins.
 For each selected ID, text is at most two plain sentences explaining who/what/why now, without
 questions. draft is a short reply only when the user's direction is established; otherwise empty.
 For scheduling_ask with verified slots provide both draft and decline as alternatives. When
@@ -55,11 +62,13 @@ invent times. When there are no verified slots, ask which time window works, wit
 availability; leave draft and decline empty and retain the grounded reason for the meeting. No invented reason for declining. For chase use a warm question, no nagging.
 For lead birthday offers suggest a gift only from supplied interests/preferences and VIP evidence.
 Do not invent a person's interests. For escalation lead with the supplied cross-channel fact.
-For calendar changes state only the evidenced change/conflict. No headers, bullet lists or signoffs.
+For calendar changes state only the evidenced change/conflict. Removal is not proof of cancellation,
+and a request to reschedule is not a new confirmed time. No headers, bullet lists or signoffs.
 For meeting_prep, text is ONLY one or two short sentences of personal context: who introduced
 the people (and each link in the introduction chain when explicit), what prompted THIS meeting,
 or a relevant last exchange. Prioritize the introduction and the reason for meeting. Use only
-the supplied memory, invitation and dated thread excerpts. Only excerpts marked event_thread can
+the supplied memory, invitation and dated thread excerpts. Excerpts are partial; never use an
+excerpt's silence as proof that something did not happen. Only excerpts marked event_thread can
 prove the invitation or introduction chain; recent_background is background, not proof of this
 meeting's purpose. A null from_me means neither owner
 nor attendee authorship is established; use sender_name if supplied, never attribute it to 'you'.
@@ -257,6 +266,11 @@ def _template(item, now, prep_context=''):
         return ' '.join(str(item.get(k) or '') for k in ('title', 'detail')).strip()
     if kind == 'handoff':
         return item.get('detail') or ''
+    if kind == 'calendar_change' and (item.get('event') or {}).get('source') == 'calendar_change':
+        # The detector owns the claim and its certainty. A writer must not turn an absent
+        # calendar entry into a cancellation, or strip a move's old/new dates.
+        text = str(item['event'].get('text') or '').strip()
+        return text[:1].upper() + text[1:] if text else ''
     if kind == 'meeting_prep':
         start = delivery_effects.instant(item.get('calendar_start'))
         if start is None or start <= now.timestamp():
@@ -274,27 +288,40 @@ def _template(item, now, prep_context=''):
     return None
 
 
-def _prep_threads(item):
-    """Reuse the focused prep's bounded Gmail read for the selected attendee only.
-
-    No web research, dependency installation or new durable store. Missing Google tooling or a
-    failed search leaves memory and the invitation available, and never withholds the reminder.
-    """
+def _prep_threads(item, now=None):
+    """Reuse consented, dated mail already on disk; an offer never fetches more prep."""
+    from email.utils import getaddresses
+    from personal_context import conversation_snapshot, conversation_message, CONVERSATION_DAYS
     identifier = item.get('identifier', '')
     if not re.fullmatch(r'[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+', identifier) or not allowed('gmail'):
         return []
-    gather = _load('_shared/scripts/gather_google.py', 'notification_prep_google')
-    api = gather._find_google_api()
-    if not api:
-        return []
-    _, rows = gather._fetch_attendee_comms(api, identifier)
+    now = now or datetime.now().astimezone()
+    rows, seen = [], set()
+    explicit = preferences.load_explicit()
+    for event, _, cls in conversation_snapshot():
+        if event.get('source') not in ('email', 'gmail'):
+            continue
+        addresses = getaddresses([str(event[k]) for k in ('from', 'to', 'cc') if event.get(k)])
+        if identifier.casefold() not in {email.casefold() for _, email in addresses}:
+            continue
+        stamp = parse_observed_time(event.get('date') or event.get('timestamp'))
+        if stamp is None or not now - timedelta(days=CONVERSATION_DAYS) <= stamp <= now:
+            continue
+        sender = getaddresses([str(event.get('from') or '')])
+        sender_name = sender[0][0] if len(sender) == 1 else ''
+        if preferences.proactively_muted(event.get('sender_name') or sender_name, event, explicit):
+            continue
+        message = conversation_message(event, prior_class=cls)
+        key = (message['ts'], message['text'])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({'date': stamp.isoformat(), 'snippet': message['text'],
+                     'sender_name': sender_name,
+                     'from_me': True if message['is_from_me'] else None,
+                     'thread_id': str(event.get('threadId') or event.get('thread_id') or '')})
     if not allowed('gmail'):
         return []
-    # Keep whole excerpts; dropping an oversized one is safer than removing its qualifier.
-    explicit = preferences.load_explicit()
-    rows = [row for row in rows if len(json.dumps(row)) <= 2000
-            and not preferences.proactively_muted(row.get('sender_name', ''),
-                {'from': row.get('sender_identifier', '')}, explicit)]
     event = item.get('event') or {}
     event_thread = str(event.get('threadId') or event.get('thread_id') or '').strip()
     for row in rows:
@@ -304,17 +331,23 @@ def _prep_threads(item):
             # Calendar providers usually supply no Gmail thread binding. Shared-attendee mail is
             # useful recent background, never proof of this invitation's introduction or purpose.
             row['relation_to_event'] = 'recent_background'
+    rows.sort(key=lambda row: row['date'], reverse=True)
     rows.sort(key=lambda row: row.get('relation_to_event') != 'event_thread')
     return rows[:5]
 
 
 def _meeting_prep(item, now, llm):
     """Optional context uses the existing bounded writer; the time-sensitive offer always survives."""
+    if item.get('name_source') == 'gmail':
+        if not allowed('gmail'):
+            item['person'] = ''
+        else:
+            delivery_effects.stage([{'kind': 'source_permissions', 'sources': ['gmail']}])
     basic = _template(item, now)
     if not basic:
         return basic
     try:
-        threads = _prep_threads(item)
+        threads = _prep_threads(item, now)
     except Exception as error:
         logging.getLogger(__name__).warning('Meeting reminder thread lookup unavailable: %s', type(error).__name__)
         threads = []
@@ -397,7 +430,8 @@ def _private_values(value):
 def _writer_item(item):
     """Pass human evidence, never action bindings or the continuity ledger's control fields."""
     value = {k: item[k] for k in ('id', 'kind', 'person', 'title', 'detail', 'style', 'person_facts',
-                                 'slots', 'lead_days', 'importance', 'deadline', 'attendee_comms') if k in item}
+                                 'slots', 'lead_days', 'importance', 'deadline', 'attendee_comms',
+                                 'source_timing') if k in item}
     value['event'] = {k: v for k, v in (item.get('event') or {}).items()
                       if k in ('text', 'body', 'subject', 'summary', 'description', 'start', 'end', 'date', 'timestamp')}
     value['current_conversation'] = [{k: r[k] for k in ('ts', 'is_from_me', 'text') if k in r}
@@ -532,6 +566,19 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
         return 'NO_NUDGES'
     items = (enrich_fn or enrich)(items, now)
     items = [i for i in items if not i.get('resolved')]
+    for item in items:
+        event = item.get('event') or {}
+        raw_stamp = event.get('timestamp') or event.get('date')
+        stamp = parse_observed_time(raw_stamp)
+        # Bridge chat readers emit naive Mac wall time. Preserve that source date instead of
+        # pretending it was UTC and moving a morning message into the previous evening.
+        if event.get('source') in ('imessage', 'whatsapp'):
+            wall = _parse_ts(raw_stamp)
+            if wall and wall.tzinfo is None:
+                stamp = wall.replace(tzinfo=now.tzinfo)
+        if stamp and stamp <= now:
+            local = stamp.astimezone(now.tzinfo)
+            item['source_timing'] = {'sent_at': local.isoformat(), 'as_of_date': now.date().isoformat()}
     # Admission is for one push. Deliver one primary item; the unselected items remain uncovered.
     def priority(item):
         deadline = delivery_effects.instant(item.get('deadline') or item.get('calendar_start'))
@@ -570,6 +617,15 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
             continue
         if not rendered:
             continue
+        timing = item.get('source_timing') or {}
+        stamp = parse_observed_time(timing.get('sent_at'))
+        if stamp and item['kind'] != 'meeting_prep' and (now - stamp).total_seconds() >= 3600:
+            local = stamp.astimezone(now.tzinfo)
+            when = (local.strftime('%I:%M %p').lstrip('0') + ' today' if local.date() == now.date()
+                    else local.strftime('%B ') + str(local.day)
+                    + (f', {local.year}' if local.year != now.year else ''))
+            label = 'Calendar update first seen' if (item.get('event') or {}).get('source') == 'calendar_change' else 'From'
+            rendered = f'{label} {when}: {rendered}'
         text, selected = rendered, [item]
         reference = delivery_effects.request_reference(item.get('event') or {})
         if reference:
@@ -591,6 +647,19 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
     return text or 'NO_NUDGES'
 
 
-if __name__ == '__main__':
+def main():
     request = json.loads(sys.argv[1])
-    print(compose(request['kind'], json.loads(Path(request['bundle_path']).read_text())))
+    try:
+        text = compose(request['kind'], json.loads(Path(request['bundle_path']).read_text()))
+    except Exception as error:
+        if work_queue.retryable_provider_error(error):
+            # Typed exit status, never provider bodies or traceback text as a retry protocol.
+            print('notification provider temporarily unavailable', file=sys.stderr)
+            return work_queue.PROVIDER_RETRY_EXIT
+        raise
+    print(text)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

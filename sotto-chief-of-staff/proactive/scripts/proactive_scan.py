@@ -353,6 +353,29 @@ def _prep_name(attendee, local, now):
                 return name
     except Exception:  # noqa: BLE001 - malformed optional graph data degrades to the meeting title
         pass
+    # Existing email envelopes can name a founder even after the research cache expires.
+    # Match the address/name pair itself, including To/Cc on an introduction the owner sent.
+    # Body mentions, signatures and names attached to a different address never qualify.
+    from email.utils import getaddresses
+    from personal_context import conversation_snapshot
+    from source_context import allowed
+    import preferences
+    if email and allowed('gmail'):
+        names = set()
+        explicit = preferences.load_explicit()
+        for event, _, _ in conversation_snapshot():
+            if event.get('source') not in ('email', 'gmail'):
+                continue
+            participants = getaddresses([_s(event[key]) for key in ('from', 'to', 'cc') if event.get(key)])
+            for display_name, address in participants:
+                if address.casefold() != email:
+                    continue
+                name = human_name(display_name)
+                if name and not preferences.proactively_muted(name, {**event, 'email': email}, explicit):
+                    names.add(name)
+        if len(names) == 1 and allowed('gmail'):
+            attendee['_name_source'] = 'gmail'
+            return names.pop()
     # Older graphs often contain only the email handle even though research knows the full name.
     for offset in range(CACHE_KEEP_DAYS + 1):
         day = (now - timedelta(days=offset)).strftime('%Y-%m-%d')
@@ -619,7 +642,8 @@ def scan(calendar, continuity, local, user_email, now_local,
     else:
         events = calendar if isinstance(calendar, list) else []
     for e in meeting_events(events):
-        if not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined":
+        if (not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined"
+                or _s(e.get("status")).lower() == "cancelled"):
             continue                  # a meeting you declined is not a room you're walking into
         st = _parse_ts(_s(e.get("start")))
         if st is None:
@@ -640,7 +664,8 @@ def scan(calendar, continuity, local, user_email, now_local,
         # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
         # own title/company for the first external attendee) and the one open loop with them, if
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
-        attendee = {**ext[0], "displayName": _prep_name(ext[0], local, now_local)}
+        name = _prep_name(ext[0], local, now_local)
+        attendee = {**ext[0], "displayName": name}
         who, loop = _prep_lines(attendee, continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{occurrence}",
                        "calendar_event_id": _s(e.get('id')), "calendar_start": st.isoformat(),
@@ -649,6 +674,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "valid_until": st.isoformat(),
                        "title": _s(e.get("summary")) or "Meeting",
                        "person": attendee["displayName"],
+                       "name_source": attendee.get('_name_source', ''),
                        "identifier": _s(ext[0].get("email")).lower().strip(),
                        # Preserve provider-supplied exact linkage. The composer treats absent
                        # linkage honestly: attendee mail remains recent background, never proof of

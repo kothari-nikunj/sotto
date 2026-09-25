@@ -425,10 +425,8 @@ def test_setup_page_pairing_not_ready_without_domain_or_token(monkeypatch):
     assert "sotto-bridge://pair?" in page and "Pairing isn't ready" not in page
 
 
-def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
-    """The wizard→app handoff: .hero-cta (and the connected footer) render iff Mac + Google + timezone are
-    done and the delivery channel is POSITIVELY linked — never over a never-scanned ("unknown") or
-    mid-pairing WhatsApp. Tile 5 (optional services) never gates it."""
+def test_setup_page_accepts_either_context_source_and_requires_channel(monkeypatch):
+    """One source and timezone are enough, but the delivery channel must be linked."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
     monkeypatch.setattr(rec, "RELAY_TOKEN", "tok123")
@@ -439,7 +437,7 @@ def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st))
     page = rec._setup_page("abc")
     assert "class='hero-cta' href='/app'" in page and "Open your dashboard" in page
-    assert "You're connected" in page
+    assert "prepare your first brief automatically" in page
     # WhatsApp never linked ("unknown" — no session creds on disk) → NO celebration
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st, channel_status="unknown"))
     page = rec._setup_page("abc")
@@ -447,8 +445,12 @@ def test_setup_page_hero_cta_only_when_steps_1_to_4_done(monkeypatch):
     # WhatsApp mid-pairing → no handoff yet
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st, channel_status="pairing"))
     assert "hero-cta" not in rec._setup_page("abc")
-    # any of steps 1-3 missing → no handoff either
+    # Mac context and Google are independent options.
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st, google_connected=False))
+    assert "hero-cta" in rec._setup_page("abc")
+    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, bridge_connected=False))
+    assert "hero-cta" in rec._setup_page("abc")
+    monkeypatch.setattr(rec, "setup_status", lambda: dict(st, bridge_connected=False, google_connected=False))
     assert "hero-cta" not in rec._setup_page("abc")
     monkeypatch.setattr(rec, "setup_status", lambda: dict(st, timezone=""))
     assert "hero-cta" not in rec._setup_page("abc")
@@ -602,7 +604,7 @@ def test_setup_page_tile_three_follows_the_channel(tmp_path, monkeypatch):
                    "bot_username": "sotto_brief_bot"}, f)
     page = rec._setup_page("abc")
     assert "Telegram is linked" in page and "hero-cta" in page
-    assert "Message your bot on Telegram" in page
+    assert "prepare your first brief automatically" in page
 
 
 def test_setup_page_google_box_has_the_full_recipe(monkeypatch):
@@ -1936,7 +1938,7 @@ def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
     out = cc.calendar_changes(base, cur, now, me)
     kinds = {(c["kind"], c["summary"]) for c in out}
     assert kinds == {("declined", "Coffee"), ("moved", "Sync"),
-                     ("invited", "Last minute"), ("cancelled", "Gone")}
+                     ("invited", "Last minute"), ("removed", "Gone")}
     assert cc.INVITE_SOON_HOURS < cc.CHANGE_WINDOW_HOURS      # the asymmetry IS the design
     d = next(c for c in out if c["kind"] == "declined")
     assert d["who"] == "Ali Panju"
@@ -4746,3 +4748,18 @@ def test_managed_briefs_use_direct_runner_for_wake_and_cron(monkeypatch):
     monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
     assert rec._managed_brief('sotto-morning-brief', 'brief:sotto-morning-brief') is True
     assert json.loads(calls[-1][0][1])['kind'] == 'morning'
+
+
+@pytest.mark.parametrize('phase,copy', [
+    ('composing', 'preparing your first brief'), ('queued', 'waiting to be sent'),
+    ('retrying', 'first brief is delayed'), ('delivered', 'first brief was sent')])
+def test_self_host_setup_shows_first_brief_without_requesting_duplicate(monkeypatch, phase, copy):
+    monkeypatch.setattr(rec, 'setup_status', lambda: {
+        'bridge_connected': False, 'google_connected': True, 'google_detail': 'ok',
+        'google_client_present': True, 'timezone': 'America/Los_Angeles',
+        'channel': 'telegram', 'channel_status': 'linked', 'first_brief': phase})
+    page = rec._setup_page('fixture')
+    assert copy in page
+    assert 'give me my morning brief' not in page
+    if phase != 'delivered':
+        assert 'first brief was sent' not in page

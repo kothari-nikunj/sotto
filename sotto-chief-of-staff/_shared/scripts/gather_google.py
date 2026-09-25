@@ -220,7 +220,8 @@ def normalize_event(e: dict) -> dict:
     }
     # Preserve exact provider linkage when present. These are opaque identifiers only; callers may
     # use an exact Gmail thread binding but must not infer one from a shared attendee or title.
-    for key in ("threadId", "thread_id", "iCalUID", "conferenceData", "hangoutLink", "htmlLink"):
+    for key in ("threadId", "thread_id", "iCalUID", "recurringEventId", "originalStartTime",
+                "status", "conferenceData", "hangoutLink", "htmlLink"):
         if e.get(key) not in (None, "", [], {}):
             normalized[key] = e[key]
     return normalized

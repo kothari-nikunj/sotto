@@ -14,9 +14,20 @@ import re
 import secrets
 import sqlite3
 import time
+from urllib.error import HTTPError
 
 LEASE_SECONDS = 120
 MAX_ATTEMPTS = 3
+# Known provider refusals get a separate, finite recovery allowance. Unknown outcomes still
+# spend fault attempts. Shared with model_work so a queue retry can actually dispatch a call.
+MAX_PROVIDER_RECOVERIES = 4
+PROVIDER_RETRY_EXIT = 76
+RETRYABLE_PROVIDER_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def retryable_provider_error(error):
+    return isinstance(error, HTTPError) and error.code in RETRYABLE_PROVIDER_CODES
+
 RETENTION_SECONDS = 7 * 86400
 MAX_WORKERS = 2
 BACKGROUND_PRIORITY = 50
@@ -48,6 +59,8 @@ def _db(root):
         columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
         if 'handoff_attempts' not in columns:
             db.execute('ALTER TABLE jobs ADD COLUMN handoff_attempts INTEGER NOT NULL DEFAULT 0')
+        if 'provider_recoveries' not in columns:
+            db.execute('ALTER TABLE jobs ADD COLUMN provider_recoveries INTEGER NOT NULL DEFAULT 0')
         db.execute('''CREATE TABLE IF NOT EXISTS work_items (
             kind TEXT NOT NULL, item_key TEXT NOT NULL, job_id TEXT NOT NULL,
             PRIMARY KEY(kind,item_key))''')
@@ -128,7 +141,7 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
         if terminal and terminal['status'] in ('failed', 'expired'):
             db.execute('''UPDATE jobs SET kind=?,payload=?,status='pending',created=?,due=?,
                        valid_until=?,priority=?,attempts=0,owner=NULL,lease_until=NULL,result=NULL,
-                       handoff_attempts=0,error=NULL,finished=NULL WHERE id=?''',
+                       handoff_attempts=0,provider_recoveries=0,error=NULL,finished=NULL WHERE id=?''',
                        (kind, encoded, now, now if not_before is None else not_before,
                         valid_until, priority, job_id))
         if item_keys is not None:
@@ -187,7 +200,7 @@ def claim(root, owner, now=None):
                 return None
             # Composition and its delivery handoff have independent bounded budgets: a saved result
             # never recomposes, but it also cannot retry a broken handoff forever.
-            exhausted = (row['attempts'] >= MAX_ATTEMPTS if row['result'] is None
+            exhausted = (row['attempts'] - row['provider_recoveries'] >= MAX_ATTEMPTS if row['result'] is None
                          else row['handoff_attempts'] >= MAX_ATTEMPTS)
             if not exhausted:
                 break
@@ -225,21 +238,34 @@ def finish(root, job_id, owner):
                           (time.time(), job_id, owner)).rowcount == 1
 
 
-def fail(root, job_id, owner, error, now=None):
+def fail(root, job_id, owner, error, now=None, *, retry_provider=False):
+    """Return the committed disposition, or None when this worker no longer owns the job."""
     now = time.time() if now is None else now
     with _db(root) as db:
         row = db.execute("SELECT * FROM jobs WHERE id=? AND owner=? AND status='leased'", (job_id, owner)).fetchone()
         if row is None:
-            return
-        terminal = (row['attempts'] >= MAX_ATTEMPTS if row['result'] is None
-                    else row['handoff_attempts'] >= MAX_ATTEMPTS)
-        diagnostic = ('delivery handoff attempts exhausted'
-                      if terminal and row['result'] is not None else str(error)[:120])
-        db.execute('''UPDATE jobs SET status=?,due=?,owner=NULL,error=?,finished=?,payload=?,result=? WHERE id=?''',
-                   ('failed' if terminal else ('ready' if row['result'] else 'pending'),
-                    now + min(900, 60 * 2 ** max(0, max(row['attempts'], row['handoff_attempts']) - 1)), diagnostic,
-                    now if terminal else None, '{}' if terminal else row['payload'],
-                    None if terminal else row['result'], job_id))
+            return None
+        provider_failure = retry_provider and row['kind'] == 'event' and row['result'] is None
+        recoveries = row['provider_recoveries']
+        if provider_failure:
+            terminal = recoveries >= MAX_PROVIDER_RECOVERIES
+            recoveries += int(not terminal)
+        else:
+            terminal = (row['attempts'] - recoveries >= MAX_ATTEMPTS if row['result'] is None
+                        else row['handoff_attempts'] >= MAX_ATTEMPTS)
+        due = now + min(900, 60 * 2 ** max(0, max(row['attempts'], row['handoff_attempts']) - 1))
+        expired = row['valid_until'] is not None and due >= row['valid_until']
+        status = 'failed' if terminal else 'expired' if expired else 'ready' if row['result'] else 'pending'
+        final = status in ('failed', 'expired')
+        diagnostic = ('delivery handoff attempts exhausted' if terminal and row['result'] is not None
+                      else 'provider recovery attempts exhausted' if terminal and provider_failure
+                      else 'retry would exceed relevance deadline' if expired and not terminal
+                      else str(error)[:120])
+        db.execute("""UPDATE jobs SET status=?,due=?,owner=NULL,lease_until=NULL,error=?,finished=?,
+                   payload=?,result=?,provider_recoveries=? WHERE id=?""",
+                   (status, due, diagnostic, now if final else None, '{}' if final else row['payload'],
+                    None if final else row['result'], recoveries, job_id))
+        return status
 
 
 def release(root, job_id, owner, now=None):

@@ -8,6 +8,8 @@ tick goes in as one bundle, what comes back is delivered, and the dedup state re
 import importlib.util, os, sys
 from datetime import datetime, timezone, timedelta
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
 spec = importlib.util.spec_from_file_location("ps", os.path.join(ROOT, "proactive", "scripts", "proactive_scan.py"))
@@ -1018,3 +1020,25 @@ def test_malformed_optional_name_data_does_not_drop_prep(tmp_path, monkeypatch):
     path.write_text('---\nname: [unterminated\n---\n')
     monkeypatch.setattr(kg, 'find_person_file', lambda **kw: str(path))
     assert ps._prep_name({'email': 'person@acme.example'}, {}, _at(10)) == ''
+
+
+@pytest.mark.parametrize('field', ['from', 'to', 'cc'])
+def test_prep_names_founder_from_exact_cached_envelope_without_research(tmp_path, monkeypatch, field):
+    import personal_context
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    now = _at(10)
+    rows = [({'source': 'email', field: 'Jordan Smith <jordan@acme.example>'}, '', ''),
+            ({'source': 'email', 'from': 'Other <other@example.com>',
+              'body': 'Jordan Invented jordan@acme.example'}, '', '')]
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: rows)
+    event = {'id': 'meeting', 'summary': 'Acme <> Fund', 'start': (now + timedelta(minutes=20)).isoformat(),
+             'attendees': [{'email': 'jordan@acme.example'}]}
+    result, = ps.scan([event], [], {}, 'me@fund.example', now)['nudges']
+    assert result['person'] == 'Jordan Smith' and result['name_source'] == 'gmail'
+    assert ps.scan([{**event, 'status': 'cancelled'}], [], {}, 'me@fund.example', now)['nudges'] == []
+    monkeypatch.setattr(source_context, 'allowed', lambda _: False)
+    assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    rows.append(({'source': 'email', 'from': 'Jordan Jones <jordan@acme.example>'}, '', ''))
+    assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''

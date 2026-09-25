@@ -35,6 +35,7 @@ import errno
 import fcntl
 import json
 import os
+import threading
 from contextlib import contextmanager
 
 LOCK_SUFFIX = ".lock"          # the shared convention — connectors.py must match
@@ -103,37 +104,44 @@ def lock(path: str):
     markdown rather than one JSON file) takes it directly. Same suffix, same timeout, one
     implementation — two writers that lock differently are two writers that don't lock.
 
-    Reentrant WITHIN this process, by a depth counter: flock would block a second exclusive open of
+    Reentrant within the owning thread, by a depth counter: flock would block a second exclusive open of
     the same lock file even from the process that holds it, and the tree genuinely nests —
     `knowledge_edit --op merge` takes the apply lock so a human-confirmed merge can't race a brief's
     Learn step, and `apply()` itself calls the same merge machinery from inside its own locked body.
-    Cross-PROCESS exclusion (the point of the lock) is untouched; these scripts are single-threaded
-    one-shot CLIs, so a process-level counter is the whole story."""
+    Other threads and processes still acquire flock. A process-wide counter would let a concurrent
+    approval claimant enter while another thread was consuming the same approval."""
     return _ReentrantLock(path)
 
 
 class _ReentrantLock:
-    _depth: dict = {}          # lock path → how many times THIS process currently holds it
+    _depth: dict = {}          # (process, thread, lock path) → nesting depth
 
     def __init__(self, path: str):
         self._path = path
         self._lf = None
+        self._key = None
 
     def __enter__(self):
         lk = lock_path(self._path)
-        if _ReentrantLock._depth.get(lk, 0) == 0:
+        self._key = (os.getpid(), threading.get_ident(), lk)
+        if _ReentrantLock._depth.get(self._key, 0) == 0:
             parent = os.path.dirname(self._path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self._lf = os.open(lk, os.O_CREAT | os.O_RDWR, 0o600)
-            _flock_with_timeout(self._lf, lk)
-        _ReentrantLock._depth[lk] = _ReentrantLock._depth.get(lk, 0) + 1
+            try:
+                _flock_with_timeout(self._lf, lk)
+            except BaseException:
+                os.close(self._lf)
+                self._lf = None
+                raise
+        _ReentrantLock._depth[self._key] = _ReentrantLock._depth.get(self._key, 0) + 1
         return self
 
     def __exit__(self, *exc):
-        lk = lock_path(self._path)
-        _ReentrantLock._depth[lk] -= 1
-        if _ReentrantLock._depth[lk] == 0 and self._lf is not None:
+        _ReentrantLock._depth[self._key] -= 1
+        if _ReentrantLock._depth[self._key] == 0 and self._lf is not None:
+            del _ReentrantLock._depth[self._key]
             try:
                 fcntl.flock(self._lf, fcntl.LOCK_UN)
             finally:

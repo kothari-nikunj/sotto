@@ -292,6 +292,9 @@ def test_delivery_outbox():
     # composed archive (a body is a brief only if compose_brief archived one) and the Learn receipt.
     _same("outbox.composed_brief_max_age_hours", R["outbox"]["composed_brief_max_age_hours"] * 3600,
           rec.COMPOSED_BRIEF_MAX_AGE_SECS)
+    _same("work.max_provider_recoveries", R["work"]["max_provider_recoveries"],
+          rec.WORK_QUEUE.MAX_PROVIDER_RECOVERIES)
+    _anchor("at most four additional provider recoveries")
     _same("work.max_attempts", R["work"]["max_attempts"], rec.WORK_QUEUE.MAX_ATTEMPTS)
     _same("work.max_workers", R["work"]["max_workers"], rec.WORK_QUEUE.MAX_WORKERS)
     _same("work.background_max_wait_seconds", R["work"]["background_max_wait_seconds"],

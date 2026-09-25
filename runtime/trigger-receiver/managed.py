@@ -49,14 +49,18 @@ def has_sources(data):
 
 def connection_status(data):
     """Metadata for the setup UI, read from the existing gates and delivery receipt."""
-    try:
-        first = json.loads((Path(data) / 'config/onboarding.json').read_text())
-        phase = first.get('phase', 'waiting') if isinstance(first, dict) else 'waiting'
-    except (OSError, ValueError):
-        phase = 'waiting'
-    if phase not in ('waiting', 'composing', 'queued', 'delivered', 'existing'):
-        phase = 'waiting'
-    return {'messaging_active': messaging_activated(data), 'context_connected': has_sources(data),
+    import onboarding
+    phase = onboarding.status(data)
+    # This line is configured by the operator for this isolated instance. It is
+    # never inferred from the Google address or supplied by a browser request.
+    number = os.environ.get('SOTTO_IMESSAGE_NUMBER', '')
+    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    configured = (enabled() and owner and os.environ.get('PHOTON_ALLOWED_USERS') == owner
+                  and os.environ.get('SOTTO_CRON_DELIVER') == 'photon'
+                  and re.fullmatch(r'\+[1-9][0-9]{6,14}', number))
+    return {'tenant_id': os.environ.get('SOTTO_TENANT_ID', ''),
+            'messaging_number': number if configured else None,
+            'messaging_active': messaging_activated(data), 'context_connected': has_sources(data),
             'first_brief': phase}
 
 

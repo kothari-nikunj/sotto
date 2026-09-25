@@ -84,7 +84,13 @@ When bumping `hermes.commit`:
    so the real-pin test runs instead of skipping.
 
 Both the container boot and local installer apply the reviewed provider-error gateway boundary and reconcile Hermes' per-platform
-`gateway_restart_notification: false` for Telegram, Photon and configured channels.
+`gateway_restart_notification: false` for Telegram, Photon and configured channels, plus
+`display.busy_ack_enabled: false`. Hermes routes corrections before checking the latter, so busy
+redirect, steer, queue and interruption acknowledgments disappear without losing input.
+The same writer disables displayed reasoning, automatic memory-update notices, runtime footers
+(including per-channel overrides), and routine compression progress. It does not change approval
+policy, hide a failed operation, or stop memory/compression work. The shared writing rules explain
+results and recovery steps in ordinary language, with technical detail available when requested.
 This suppresses infrastructure lifecycle chatter at its origin, preserving ordinary replies,
 typing, Tapbacks and actionable source/provider failures. The digest procedure invokes
 `digest_check.py` without a mode flag: checking is its default CLI action, and an empty

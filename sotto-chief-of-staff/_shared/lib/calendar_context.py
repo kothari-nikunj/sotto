@@ -68,6 +68,11 @@ def work_attendees(event, self_email=''):
 _CONTEXT_TITLE = re.compile(r'^(?:meeting\s+)?(?:context|prep notes|briefing notes|meeting notes)\s*:\s*(.+)$', re.I)
 
 
+def is_context_event(event):
+    """Explicitly labelled prep notes do not assert that another meeting exists."""
+    return bool(_CONTEXT_TITLE.match(str(event.get('summary') or event.get('title') or '')))
+
+
 def _interval(event):
     try:
         times = [datetime.fromisoformat(str(event[key]).replace('Z', '+00:00')) for key in ('start', 'end')]

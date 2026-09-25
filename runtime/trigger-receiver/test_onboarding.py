@@ -80,3 +80,52 @@ def test_zero_sources_do_not_start_background_model_work(tmp_path, monkeypatch):
     monkeypatch.setattr(managed, 'has_sources', lambda _: False)
     monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *args: 1/0)
     rec._background_context_tick()
+
+
+def test_setup_progress_follows_acceptance_and_recovers_without_writing(tmp_path):
+    assert onboarding.status(tmp_path, 100) == 'waiting'
+    assert not (tmp_path / 'config').exists()
+    onboarding.tick(tmp_path, True, lambda: None, 100)
+    assert onboarding.status(tmp_path, 101) == 'composing'
+    assert onboarding.status(tmp_path, 2000) == 'retrying'
+    path = tmp_path / 'events/outbox.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'rows': [{'status': 'pending', 'payload': {'label': onboarding.LABEL}}]}))
+    assert onboarding.status(tmp_path, 2000) == 'queued'
+    path.write_text(json.dumps({'rows': [{'status': 'delivered', 'payload': {'label': onboarding.LABEL}}]}))
+    # Acceptance before a crash is enough even if the completion callback has not run.
+    assert onboarding.status(tmp_path, 2000) == 'delivered'
+    assert json.loads((tmp_path / 'config/onboarding.json').read_text())['phase'] == 'composing'
+
+
+def test_granola_only_self_host_gets_automatic_first_look(tmp_path, monkeypatch):
+    import receiver as rec
+    import managed
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(managed, 'enabled', lambda: False)
+    monkeypatch.setattr(rec.RELAY, 'bridge_connected', lambda: False)
+    from types import SimpleNamespace
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda _: SimpleNamespace(home_path=lambda _: tmp_path / 'absent'))
+    monkeypatch.setattr(rec.CONNECTORS, 'service_status', lambda: [{'service': 'granola', 'connected': True}])
+    monkeypatch.setattr(rec, '_delivery_channel_ready', lambda _: True)
+    monkeypatch.setattr(rec, '_find_sotto_script', lambda *a: None)
+    runs = []
+    monkeypatch.setattr(rec, '_managed_brief', lambda *args: runs.append(args))
+    rec._background_context_tick()
+    rec._background_context_tick()
+    assert runs == [('sotto-welcome-brief', onboarding.LABEL)]
+
+
+def test_failed_granola_connection_does_not_start_first_look(tmp_path, monkeypatch):
+    import receiver as rec
+    import managed
+    from types import SimpleNamespace
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(managed, 'enabled', lambda: False)
+    monkeypatch.setattr(rec.RELAY, 'bridge_connected', lambda: False)
+    monkeypatch.setattr(rec, '_hermes_adapter', lambda _: SimpleNamespace(home_path=lambda _: tmp_path / 'absent'))
+    monkeypatch.setattr(rec.CONNECTORS, 'service_status', lambda: [{'service': 'granola', 'connected': True}])
+    monkeypatch.setattr(rec, '_connector_error', lambda _: 'authorization expired')
+    monkeypatch.setattr(rec, '_managed_brief', lambda *args: 1 / 0)
+    rec._background_context_tick()
+    assert not (tmp_path / 'config/onboarding.json').exists()

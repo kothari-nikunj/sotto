@@ -641,3 +641,101 @@ def test_worker_failure_retains_safe_category_without_private_stderr(tmp_path, m
     assert row['error'] == 'worker_exit_1:ValueError'
     assert 'private-token-and-message-body' not in str(reports)
     assert 'worker_exit_1:ValueError' in str(reports)
+
+
+def test_provider_recovery_is_bounded_persistent_and_truthful(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q.time, 'time', lambda: clock[0])
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    reports = []
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: reports.append(a))
+    identity = q.enqueue(tmp_path, 'event', {'bundle': {}}, key='provider-down', valid_until=10000)
+    def fail(job):
+        error = rec._WorkerError(q.PROVIDER_RETRY_EXIT, 'private provider payload')
+        error.retry_provider = True
+        raise error
+    monkeypatch.setattr(rec, '_execute_work', fail)
+    for attempt in range(q.MAX_PROVIDER_RECOVERIES + 1):
+        job = q.claim(tmp_path, 'worker')
+        assert job and job['id'] == identity
+        rec._work_one(job)
+        row = q.get(tmp_path, identity)
+        if attempt < q.MAX_PROVIDER_RECOVERIES:
+            assert row['status'] == 'pending'
+            assert row['provider_recoveries'] == attempt + 1
+            assert reports[-1][2].endswith('; retry queued')
+            clock[0] = row['due']
+        else:
+            assert row['status'] == 'failed' and row['payload'] == {}
+            assert reports[-1][2].endswith('; attempt limit reached; no retry queued')
+    assert 'private provider payload' not in str(reports)
+    assert q.claim(tmp_path, 'worker', now=clock[0] + 2000) is None
+
+
+def test_provider_retry_never_extends_deadline_or_refunds_handoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(q.time, 'time', lambda: 1000.0)
+    identity = q.enqueue(tmp_path, 'event', {}, key='expiring', valid_until=1059)
+    q.claim(tmp_path, 'worker')
+    assert q.fail(tmp_path, identity, 'worker', 'provider refused', retry_provider=True) == 'expired'
+    assert q.get(tmp_path, identity)['payload'] == {}
+    identity = q.enqueue(tmp_path, 'event', {}, key='handoff')
+    job = q.claim(tmp_path, 'worker')
+    q.save_result(tmp_path, identity, 'worker', {'text': 'already composed'})
+    for attempt in range(q.MAX_ATTEMPTS):
+        assert q.fail(tmp_path, identity, 'worker', 'handoff failed', retry_provider=True)
+        row = q.get(tmp_path, identity)
+        assert row['provider_recoveries'] == 0
+        if attempt < q.MAX_ATTEMPTS - 1:
+            job = q.claim(tmp_path, 'worker', now=row['due'])
+            assert job['result']['text'] == 'already composed'
+    assert row['status'] == 'failed'
+
+
+def test_event_recovers_after_three_503s_through_real_worker_and_model_accounting(tmp_path, monkeypatch):
+    """Provider and channel are fixtures; the queue, subprocess, composer and model ledger are real."""
+    import textwrap
+    pack = HERE.parents[1] / 'sotto-chief-of-staff'
+    worker = tmp_path / 'notification-fixture.py'
+    worker.write_text(textwrap.dedent(f'''
+        import sys, json
+        from urllib.error import HTTPError
+        sys.path.insert(0, {str(pack / '_shared/scripts')!r})
+        import compose_notification as notification
+        import gemini, model_work
+        item = {{'id': 'fixture', 'kind': 'urgent', 'person': 'Sam', 'detail': 'Review the deck'}}
+        notification.candidates = lambda *a: [item]
+        notification.enrich = lambda items, now: items
+        gemini.provider_key = lambda *a: 'fixture-key'
+        def respond(*a, **k):
+            if model_work.current()['attempt'] <= 3:
+                raise HTTPError('https://fixture.invalid', 503, 'private provider body', {{}}, None)
+            return json.dumps({{'items': [{{'id': 'fixture', 'text': 'Sam needs the deck reviewed.', 'draft': '', 'decline': ''}}]}})
+        gemini._gemini_once = respond
+        sys.exit(notification.main())
+    '''))
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
+    monkeypatch.setenv('SOTTO_COMPOSE_PROVIDER', 'gemini')
+    monkeypatch.setattr(rec, '_find_sotto_script', lambda *a: str(worker))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'test:owner')
+    sent = []
+    monkeypatch.setattr(rec, '_send_via_channel', lambda body, target:
+                        (sent.append(body) is None, '', {'message_id': 'fixture-accepted'}))
+    monkeypatch.setattr(rec, '_on_delivered', lambda payload: True)
+    identity = q.enqueue(tmp_path, 'event', {'bundle': {'events': []}}, key='recover-after-503',
+                         valid_until=time.time() + 3600)
+    for attempt in range(4):
+        row = q.get(tmp_path, identity)
+        job = q.claim(tmp_path, 'worker', now=row['due'])
+        assert job and job['id'] == identity
+        rec._work_one(job)
+        row = q.get(tmp_path, identity)
+        assert row['status'] == ('pending' if attempt < 3 else 'done'), row['error']
+    assert len(sent) == 1 and 'Sam needs the deck reviewed.' in sent[0]
+    assert row['attempts'] == 4 and row['provider_recoveries'] == 3
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert db.execute('SELECT status FROM attempts ORDER BY attempt').fetchall() == [
+            ('http_503',), ('http_503',), ('http_503',), ('succeeded',)]
+    assert q.claim(tmp_path, 'worker', now=time.time() + 2000) is None

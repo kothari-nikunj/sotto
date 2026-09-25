@@ -65,7 +65,8 @@ def test_failed_read_retains_valid_cache_age_and_does_not_cancel_then_recovers(c
     assert cc.refresh_once()
     assert cc.snapshot()['events'] == []
     assert cc.change_tick(now) == 1
-    assert changes[0]['change'] == 'cancelled'
+    assert changes[0]['change'] == 'removed'
+    assert 'cancelled' not in changes[0]['text']
 
 
 def test_no_prior_success_has_no_fabricated_fresh_timestamp(calendar):
@@ -100,6 +101,58 @@ def test_supporting_context_does_not_create_another_invite_or_prep(calendar):
     assert cc.refresh_once()
     assert len(cc.snapshot()['events']) == 1
     assert cc.change_tick(now) == 0 and changes == []
+
+
+def test_removing_orphan_prep_note_does_not_cancel_moved_meeting(calendar):
+    cc, state, now, changes = calendar
+    meeting = {**state['events'][0], 'summary': 'Meeting with Acme'}
+    # Before a move, the prep note can have a different end time and remain unfused.
+    note = {**meeting, 'id': 'notes', 'summary': 'CONTEXT: Acme',
+            'end': (now + timedelta(hours=3)).isoformat()}
+    state['events'] = [meeting, note]
+    cc.refresh_once()
+    cc.change_tick(now)
+    state['events'] = [{**meeting, 'start': (now + timedelta(minutes=30)).isoformat()}]
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once() and cc.change_tick(now) == 1
+    assert [row['change'] for row in changes] == ['moved']
+    assert 'CONTEXT' not in changes[0]['text']
+
+
+def test_only_explicit_status_proves_cancellation(calendar):
+    cc, state, now, _ = calendar
+    meeting = state['events'][0]
+    rows = cc.calendar_changes([meeting], [{**meeting, 'status': 'cancelled'}], now, 'owner@example.com')
+    assert len(rows) == 1 and rows[0]['kind'] == 'cancelled'
+    assert 'cancelled' in cc.change_event(rows[0])['text']
+    removed, = cc.calendar_changes([meeting], [], now, 'owner@example.com')
+    assert removed['kind'] == 'removed' and 'cancelled' not in cc.change_event(removed)['text']
+
+
+def test_replaced_id_uses_unique_uid_to_recognize_move(calendar):
+    cc, state, now, _ = calendar
+    old = {**state['events'][0], 'iCalUID': 'stable@example.com'}
+    new = {**old, 'id': 'replacement', 'start': (now + timedelta(minutes=30)).isoformat()}
+    move, = cc.calendar_changes([old], [new], now, 'owner@example.com')
+    assert move['kind'] == 'moved' and move['calendar_event_id'] == 'replacement'
+    assert 'moved to' in cc.change_event(move)['text']
+    assert now.strftime('%b') in cc.change_event(move)['text']
+    # Two occurrences of a recurring event share a UID; never pair by similarity.
+    another = {**old, 'id': 'another', 'start': (now + timedelta(days=1)).isoformat()}
+    rows = cc.calendar_changes([old, another], [new], now, 'owner@example.com')
+    assert all(row['kind'] != 'moved' for row in rows)
+    cc._LAST_RAW.update(observed_at=now.isoformat())
+    assert cc._change_events([old])[0]['iCalUID'] == old['iCalUID']
+
+
+def test_single_recurring_occurrence_is_not_joined_to_another_occurrence(calendar):
+    cc, state, now, _ = calendar
+    old = {**state['events'][0], 'iCalUID': 'recurring@example.com',
+           'recurringEventId': 'series', 'originalStartTime': {'dateTime': state['events'][0]['start']}}
+    new = {**old, 'id': 'next-occurrence', 'start': (now + timedelta(hours=4)).isoformat(),
+           'originalStartTime': {'dateTime': (now + timedelta(hours=4)).isoformat()}}
+    rows = cc.calendar_changes(cc._change_events([old]), [new], now, 'owner@example.com')
+    assert all(row['kind'] != 'moved' for row in rows)
 
 
 def _restart_change_detector(cc):

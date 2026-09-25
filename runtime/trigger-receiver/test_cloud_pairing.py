@@ -160,6 +160,7 @@ def test_readiness_endpoint_accepts_device_or_control_and_reports_receipts_not_a
     assert request('another-device')[0] == 401
     assert request(paired['bridge_token'], 'https://attacker.invalid')[0] == 400
     assert request(paired['bridge_token']) == (200, {
+        'tenant_id': 'tenant', 'messaging_number': None,
         'messaging_active': False, 'context_connected': False, 'first_brief': 'waiting'})
     assert request('test-control') == request(paired['bridge_token'])
     assert request('test-control', path='/cloud/consent')[0] == 401  # status access cannot consent for the Mac
@@ -233,3 +234,18 @@ def test_interrupted_handoff_is_not_retried_after_newer_authorization(pairing, m
     with pytest.raises(PermissionError, match='newer'):
         service.bootstrap(older)
     assert installed == [None, None]
+
+
+def test_setup_number_requires_exact_operator_route(pairing, monkeypatch):
+    service, _ = pairing
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550000')
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550000')
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
+    state = cp.managed.connection_status(service.root)
+    assert state['messaging_number'] == '+15555551234'
+    assert not state['messaging_active']
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '*')
+    assert cp.managed.connection_status(service.root)['messaging_number'] is None
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550000')
+    monkeypatch.setenv('SOTTO_IMESSAGE_NUMBER', 'https://untrusted.example')
+    assert cp.managed.connection_status(service.root)['messaging_number'] is None

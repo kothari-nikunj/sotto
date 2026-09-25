@@ -33,6 +33,13 @@ def test_event_normalization_preserves_exact_provider_linkage():
     assert ev['hangoutLink'] == 'https://meet.google.com/abc'
 
 
+def test_event_normalization_preserves_cancellation_and_recurring_identity():
+    raw = {'id': 'occurrence', 'status': 'cancelled', 'recurringEventId': 'series',
+           'originalStartTime': {'dateTime': '2026-09-25T10:00:00-07:00'}}
+    ev = gg.normalize_event(raw)
+    assert all(ev[key] == raw[key] for key in ('status', 'recurringEventId', 'originalStartTime'))
+
+
 def test_as_list_unwraps_common_envelopes():
     assert gg._as_list([1, 2]) == [1, 2]
     assert gg._as_list({"messages": [1]}) == [1]

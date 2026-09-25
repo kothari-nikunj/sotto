@@ -72,11 +72,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 try:
-    from calendar_context import human_attendees, user_participates, meeting_events
+    from calendar_context import human_attendees, user_participates, meeting_events, is_context_event
 except ModuleNotFoundError:  # source checkout; the image copies the same module beside us
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                    'sotto-chief-of-staff', '_shared', 'lib'))
-    from calendar_context import human_attendees, user_participates, meeting_events
+    from calendar_context import human_attendees, user_participates, meeting_events, is_context_event
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -137,8 +137,8 @@ TAP_SKIP_INTERNAL = True           # skip taps for internal-only standups/syncs 
 #                                    everyone on the user's own domain) — the one meeting class
 #                                    nobody wants a follow-up draft for.
 # Internal-only *standups* are the one meeting class nobody wants a follow-up draft for. Recurrence
-# isn't in the cache shape (normalize_event drops recurringEventId), so the cheap test is
-# title-shape × everyone-shares-the-user's-domain — narrow on purpose: a founder whose whole day is
+# alone is not a useful signal, so the cheap test is title-shape × everyone-shares-the-user's-domain
+# — narrow on purpose: a founder whose whole day is
 # internal still gets taps for everything that isn't literally a standup/sync.
 STANDUP_RE = re.compile(r"\b(stand[\s-]?up|scrum|daily sync|daily huddle|team sync|weekly sync|"
                         r"all[\s-]?hands)\b", re.I)
@@ -767,7 +767,7 @@ def _change_account() -> str:
 
 def _change_events(events: list) -> list:
     """Keep only fields the diff consumes; descriptions and links do not belong in durable state."""
-    fields = ("id", "summary", "start", "end", "status", "attendees", "organizer",
+    fields = ("id", "iCalUID", "recurringEventId", "originalStartTime", "summary", "start", "end", "status", "attendees", "organizer",
               "my_response")
     return [{key: ev[key] for key in fields if key in ev}
             for ev in meeting_events(events) if isinstance(ev, dict)]
@@ -864,11 +864,25 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
     interrupt); the other person declining the user's one-to-one meeting within
     DECLINE_WINDOW_HOURS is a decline (group RSVPs stay quiet); a changed start on a
     meeting within the window is a move; an event that vanished (or turned status=cancelled)
-    within the window is a cancellation. Skipped, silently: all-day events, solo blocks,
+    within the window is a removal (explicit cancelled status proves a cancellation).
+    Skipped, silently: supporting prep entries, all-day events, solo blocks,
     internal-only standups (the tap's own rule), and anything already past."""
     baseline, current = meeting_events(baseline), meeting_events(current)
     old_by_id = {_s(e.get("id")): e for e in baseline if _s(e.get("id"))}
     new_by_id = {_s(e.get("id")): e for e in current if _s(e.get("id"))}
+    # Providers can replace the event ID during a move. Only a unique, shared calendar UID
+    # joins those records; recurring or ambiguous UIDs and title/attendee similarity cannot.
+    replacements = {}
+    for eid, ev in new_by_id.items():
+        uid = _s(ev.get('iCalUID'))
+        if eid in old_by_id or not uid or ev.get('status') == 'cancelled':
+            continue
+        old_matches = [key for key, row in old_by_id.items() if row.get('iCalUID') == uid]
+        new_matches = [row for row in new_by_id.values() if row.get('iCalUID') == uid]
+        recurring = any(row.get('recurringEventId') or row.get('originalStartTime')
+                        for row in [ev] + [old_by_id[key] for key in old_matches])
+        if not recurring and len(old_matches) == len(new_matches) == 1 and old_matches[0] not in new_by_id:
+            replacements[eid] = old_matches[0]
     out = []
 
     def _relevant(ev, window_h, allow_started_min=0.0):
@@ -876,6 +890,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         return h is not None and (-allow_started_min / 60.0) <= h <= window_h
 
     def _eligible(ev):
+        if is_context_event(ev):
+            return None  # Moving/removing supporting notes never cancels the actual meeting.
         others = _raw_others(ev, self_email)
         if not others:
             return None
@@ -884,11 +900,13 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         return others
 
     for eid, ev in new_by_id.items():
+        if _s(ev.get('status')).lower() == 'cancelled':
+            continue  # A cancelled tombstone is neither a new invitation nor a move.
         others = _eligible(ev)
         if others is None:
             continue
         summary, start = _s(ev.get("summary")), _s(ev.get("start"))
-        old = old_by_id.get(eid)
+        old = old_by_id.get(replacements.get(eid, eid))
         if old is None:
             if _relevant(ev, INVITE_SOON_HOURS, allow_started_min=INVITE_GRACE_MIN):
                 out.append({"kind": "invited", "key": f"{eid}:invited:{start}",
@@ -918,6 +936,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
                                 "summary": summary, "start": start, "old_start": "",
                                 "who": r["name"] or r["email"], "attendees": others})
     for eid, old in old_by_id.items():
+        if eid in replacements.values():
+            continue
         gone = eid not in new_by_id
         cancelled = not gone and _s(new_by_id[eid].get("status")).lower() == "cancelled"
         if not (gone or cancelled):
@@ -925,7 +945,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         others = _eligible(old)
         if others is None or not _relevant(old, CHANGE_WINDOW_HOURS):
             continue
-        out.append({"kind": "cancelled", "key": f"{eid}:cancelled",
+        kind = 'removed' if gone else 'cancelled'
+        out.append({"kind": kind, "key": f"{eid}:{kind}",
                     "summary": _s(old.get("summary")), "start": _s(old.get("start")),
                     "old_start": "", "who": "", "attendees": others})
     out.sort(key=lambda c: c["start"])
@@ -936,18 +957,23 @@ def change_event(cand: dict) -> dict:
     """The synthetic event triage_event.py's calendar_change branch consumes. `text` is the human
     sentence the Record and the agent both read — composed HERE so detection and phrasing can't
     drift apart. `timestamp` is when this change was first detected and stays stable across retries."""
-    when = _wall(cand["start"])
+    def dated(value):
+        parsed = _parse_aware(value)
+        return (parsed.strftime('%a, %b ') + str(parsed.day) + ' at ' + _wall(value)) if parsed else ''
+    when = dated(cand["start"])
     title = cand["summary"] or "a meeting"
     kind = cand["kind"]
     if kind == "declined":
         text = f"{cand['who']} just declined your {when or title}" + (f" — {title}" if when else "")
     elif kind == "invited":
         first = next((r["name"] or r["email"] for r in cand["attendees"]), "")
-        text = f"last-minute invite: {title} at {when}" + (f" with {first}" if first else "")
+        text = f"last-minute invite: {title} on {when}" + (f" with {first}" if first else "")
     elif kind == "moved":
-        text = f"{title} moved to {when}" + (f" (was {_wall(cand['old_start'])})" if cand.get("old_start") else "")
+        text = f"{title} moved to {when}" + (f" (was {dated(cand['old_start'])})" if cand.get("old_start") else "")
+    elif kind == 'removed':
+        text = f"{title} on {when} is no longer on your calendar."
     else:
-        text = f"your {when or ''} {title} was cancelled".replace("  ", " ")
+        text = f"{title} on {when} was cancelled."
     return {
         "source": CALENDAR_CHANGE_SOURCE,
         "rowid": cand["key"],
@@ -961,9 +987,9 @@ def change_event(cand: dict) -> dict:
         "is_from_me": False,
         "text": text,
         **({"calendar_event_id": cand['calendar_event_id'], "calendar_start": cand['start']}
-           if kind != 'cancelled' and cand.get('calendar_event_id') else {}),
+           if kind not in ('cancelled', 'removed') and cand.get('calendar_event_id') else {}),
         **({"calendar_observed_at": cand['calendar_observed_at']}
-           if kind != 'cancelled' and cand.get('calendar_observed_at') else {}),
+           if kind not in ('cancelled', 'removed') and cand.get('calendar_observed_at') else {}),
     }
 
 
@@ -1004,7 +1030,7 @@ def change_tick(now_utc: datetime | None = None) -> int:
     cands = calendar_changes(baseline, current, now_utc, self_email)
     coverage = _LAST_RAW.get("coverage") or {}
     since, until = _parse_aware(coverage.get("since")), _parse_aware(coverage.get("until"))
-    cands = [c for c in cands if c["kind"] != "cancelled" or
+    cands = [c for c in cands if c["kind"] not in ("cancelled", "removed") or
              (since is not None and until is not None and _parse_aware(c["start"]) is not None
               and since <= _parse_aware(c["start"]) < until)]
     dispatched = 0

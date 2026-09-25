@@ -36,6 +36,52 @@ def test_empty_and_templates_make_no_model_call(isolated, monkeypatch):
     assert not (isolated / 'pending_offer.json').exists()
 
 
+@pytest.mark.parametrize('sent, expected', [
+    ('Fri, 18 Sep 2026 16:34:02 +0000', 'From September 18:'),
+    ('2026-09-25T14:00:00Z', 'From 7:00 AM today:'),
+    ('2025-09-18T16:34:02Z', 'From September 18, 2025:'),
+])
+def test_old_ask_keeps_original_date_not_queue_arrival(isolated, monkeypatch, sent, expected):
+    from zoneinfo import ZoneInfo
+    now = datetime(2026, 9, 25, 9, tzinfo=ZoneInfo('America/Los_Angeles'))
+    captured = []
+    def write(items, llm):
+        captured.extend(notification._writer_item(i) for i in items)
+        return [{'id': 'old-ask', 'text': 'Alex asked about meeting the founder.', 'draft': '', 'decline': ''}]
+    monkeypatch.setattr(notification, '_write', write)
+    bundle = {'events': [{'decision_id': 'old-ask', 'class': 'scheduling_ask', 'ts': now.isoformat(),
+                          'event': {'source': 'email', 'date': sent, 'body': 'Want to join me?'}}]}
+    text = notification.compose('event', bundle, now=now)
+    assert text.startswith(expected) and 'Alex asked' in text
+    assert captured[0]['source_timing']['sent_at'].startswith(sent[:4] if sent[:4].isdigit() else '2026-09-18')
+    assert captured[0]['source_timing']['as_of_date'] == '2026-09-25'
+
+
+def test_calendar_claim_cannot_be_rewritten_as_cancellation(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_write', lambda *a: pytest.fail('detector claim reached writer'))
+    bundle = {'events': [{'class': 'calendar_change', 'event': {'source': 'calendar_change',
+        'change': 'removed', 'text': 'Acme on Fri, Sep 25 at 10:00 AM is no longer on your calendar.'}}]}
+    assert notification.compose('event', bundle) == bundle['events'][0]['event']['text']
+
+
+@pytest.mark.parametrize('source', ['imessage', 'whatsapp'])
+def test_bridge_wall_time_does_not_turn_today_into_yesterday(isolated, monkeypatch, source):
+    from zoneinfo import ZoneInfo
+    now = datetime(2026, 9, 25, 9, tzinfo=ZoneInfo('America/Los_Angeles'))
+    monkeypatch.setattr(notification, '_write', lambda *a: [
+        {'id': 'x', 'text': 'Sam asked for a call.', 'draft': '', 'decline': ''}])
+    bundle = {'events': [{'decision_id': 'x', 'class': 'urgent',
+        'event': {'source': source, 'timestamp': '2026-09-25 06:00:00', 'text': 'Call me'}}]}
+    assert notification.compose('event', bundle, now=now).startswith('From 6:00 AM today:')
+
+
+def test_cached_name_permission_is_rechecked_before_offer(isolated, monkeypatch):
+    monkeypatch.setattr(notification, 'allowed', lambda _: False)
+    text = notification.compose('proactive', [_prep_item(name_source='gmail', title='Acme meeting')],
+                                now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
+    assert 'Sam' not in text and text.startswith('Acme meeting')
+
+
 def _prep_item(**values):
     return {'kind': 'meeting_prep', 'key': 'meeting-1', 'decision_id': 'prep-1',
             'person': 'Sam', 'who': 'Partner at Example', 'identifier': 'sam@example.com',
@@ -45,7 +91,7 @@ def _prep_item(**values):
 def test_prep_reminder_joins_intro_and_reason_without_losing_offer(isolated, monkeypatch):
     calls = []
     context = 'Alex connected you through Priya. Sam suggested this coffee to discuss the robotics fund.'
-    monkeypatch.setattr(notification, '_prep_threads', lambda item: [
+    monkeypatch.setattr(notification, '_prep_threads', lambda item, now=None: [
         {'date': '2026-09-16', 'subject': 'Coffee', 'snippet': 'Sam suggested coffee to discuss the robotics fund.', 'from_me': False}])
 
     def write(*args, **kwargs):
@@ -74,7 +120,7 @@ def test_prep_reminder_joins_intro_and_reason_without_losing_offer(isolated, mon
 
 @pytest.mark.parametrize('failure', ['lookup', 'held', 'provider', 'invalid', 'empty'])
 def test_optional_prep_context_cannot_swallow_the_reminder(isolated, monkeypatch, failure):
-    def lookup(item):
+    def lookup(item, now=None):
         if failure == 'lookup':
             raise OSError('source unavailable')
         return []
@@ -97,26 +143,32 @@ def test_optional_prep_context_cannot_swallow_the_reminder(isolated, monkeypatch
     assert any(e['kind'] == 'pending_offer' for e in doc['effects'])
 
 
-def test_prep_uses_exact_attendee_and_skips_revoked_gmail(isolated, monkeypatch):
-    from types import SimpleNamespace
-    calls = []
-    gather = SimpleNamespace(_find_google_api=lambda: 'google_api.py',
-        _fetch_attendee_comms=lambda api, email: calls.append(email) or (email, [{'snippet': 'Useful context'}]))
-    monkeypatch.setattr(notification, '_load', lambda *a: gather)
+def test_prep_uses_cached_exact_attendee_and_skips_revoked_gmail(isolated, monkeypatch):
+    import personal_context
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    event = {'source': 'email', 'from': 'Sam Founder <sam@example.com>',
+             'to': 'Owner <owner@fund.example>', 'date': '2026-09-16T12:00:00Z',
+             'body': 'Useful context', 'threadId': 'known-thread'}
+    unrelated = {**event, 'from': 'other@example.com', 'body': 'sam@example.com mentioned only'}
+    old = {**event, 'date': '2026-08-01T12:00:00Z', 'body': 'Obsolete context'}
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [(r, '', '') for r in (event, unrelated, old)])
+    monkeypatch.setattr(notification.subprocess, 'run', lambda *a, **k: pytest.fail('prep fetched a source'))
     monkeypatch.setattr(notification, 'allowed', lambda _: False)
-    assert notification._prep_threads(_prep_item()) == [] and calls == []
+    assert notification._prep_threads(_prep_item(), now) == []
     monkeypatch.setattr(notification, 'allowed', lambda _: True)
-    assert notification._prep_threads(_prep_item(identifier='Sam')) == [] and calls == []
-    assert notification._prep_threads(_prep_item()) == [
-        {'snippet': 'Useful context', 'relation_to_event': 'recent_background'}]
-    assert calls == ['sam@example.com']
+    assert notification._prep_threads(_prep_item(identifier='Sam'), now) == []
+    row, = notification._prep_threads(_prep_item(), now)
+    assert row['snippet'] == 'Useful context' and row['sender_name'] == 'Sam Founder'
+    assert row['relation_to_event'] == 'recent_background' and row['from_me'] is None
+    bound, = notification._prep_threads(_prep_item(event={'threadId': 'known-thread'}), now)
+    assert bound['relation_to_event'] == 'event_thread'
     consent = iter([True, False])
     monkeypatch.setattr(notification, 'allowed', lambda _: next(consent))
-    assert notification._prep_threads(_prep_item()) == []
+    assert notification._prep_threads(_prep_item(), now) == []
 
 
 def test_prep_permission_change_during_write_keeps_plain_reminder(isolated, monkeypatch):
-    monkeypatch.setattr(notification, '_prep_threads', lambda item: [{'snippet': 'Introduced by Alex'}])
+    monkeypatch.setattr(notification, '_prep_threads', lambda item, now=None: [{'snippet': 'Introduced by Alex'}])
     monkeypatch.setattr(notification, 'allowed', lambda _: False)
     monkeypatch.setattr(gemini, '_gemini_once', lambda *a, **kw: json.dumps({'items': [
         {'id': 'prep-1', 'text': 'Alex introduced you.', 'draft': '', 'decline': ''}]}))
@@ -126,24 +178,26 @@ def test_prep_permission_change_during_write_keeps_plain_reminder(isolated, monk
     assert not any(e['kind'] == 'source_permissions' for e in doc['effects'])
 
 
-def test_prep_thread_context_honors_muted_introducers_and_drops_oversized_excerpts(isolated, monkeypatch):
-    from types import SimpleNamespace
-    rows = [{'sender_name': 'Muted', 'sender_identifier': 'muted@example.com', 'snippet': 'Private'},
-            {'sender_name': 'Priya', 'sender_identifier': 'priya@example.com', 'snippet': 'You two should meet.'},
-            {'snippet': 'Long excerpt ' * 250}]
-    gather = SimpleNamespace(_find_google_api=lambda: 'google_api.py',
-                              _fetch_attendee_comms=lambda *a: ('sam@example.com', rows))
-    monkeypatch.setattr(notification, '_load', lambda *a: gather)
+@pytest.mark.parametrize('mute', [{'mute_senders': ['muted@example.com']}, {'mute_people': ['Muted']}])
+def test_cached_prep_context_honors_mutes_and_bounds_text(isolated, monkeypatch, mute):
+    import personal_context
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    base = {'source': 'email', 'to': 'sam@example.com', 'date': '2026-09-16T12:00:00Z'}
+    rows = [{**base, 'from': 'Muted <muted@example.com>', 'body': 'Private'},
+            {**base, 'from': 'Priya <priya@example.com>', 'body': 'You two should meet.'},
+            {**base, 'from': 'Sam <sam@example.com>', 'body': 'Long excerpt ' * 250}]
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [(r, '', '') for r in rows])
     monkeypatch.setattr(notification, 'allowed', lambda _: True)
-    monkeypatch.setattr(notification.preferences, 'load_explicit', lambda: {'mute_senders': ['muted@example.com']})
-    assert notification._prep_threads(_prep_item()) == [rows[1]]
-    assert rows[1]['relation_to_event'] == 'recent_background'
-    projected = notification._writer_item({'id': 'prep-1', **_prep_item(), 'attendee_comms': [rows[1]]})
+    monkeypatch.setattr(notification.preferences, 'load_explicit', lambda: mute)
+    context = notification._prep_threads(_prep_item(), now)
+    assert len(context) == 2 and 'Private' not in json.dumps(context)
+    assert all(len(row['snippet']) <= personal_context.CONVERSATION_TEXT_CHARS for row in context)
+    projected = notification._writer_item({'id': 'prep-1', **_prep_item(), 'attendee_comms': context})
     assert 'Priya' in json.dumps(projected) and 'priya@example.com' not in json.dumps(projected)
 
 
 def test_unselected_or_started_prep_never_fetches_or_writes_context(isolated, monkeypatch):
-    monkeypatch.setattr(notification, '_prep_threads', lambda item: pytest.fail('unselected read'))
+    monkeypatch.setattr(notification, '_prep_threads', lambda item, now=None: pytest.fail('unselected read'))
     monkeypatch.setattr(notification, '_write', lambda *a: pytest.fail('unselected model call'))
     now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
     first = {'kind': 'intention', 'key': 'x', 'title': 'Call Alex', 'deadline': now.isoformat()}
@@ -544,3 +598,21 @@ def test_notification_thread_context_still_honors_mutes_and_source_consent(real_
     import source_context
     monkeypatch.setattr(source_context, 'allowed', lambda source: False)
     assert notification.enrich([item], now)[0]['current_conversation'] == []
+
+
+@pytest.mark.parametrize('code', [429, 500, 502, 503, 504, 400, 401, 402, 403])
+def test_notification_cli_uses_typed_provider_retry_without_payload(isolated, monkeypatch, capsys, code):
+    from urllib.error import HTTPError
+    bundle = isolated / 'bundle.json'
+    bundle.write_text('{}')
+    monkeypatch.setattr(sys, 'argv', ['compose_notification.py', json.dumps({'kind': 'event', 'bundle_path': str(bundle)})])
+    def fail(*args):
+        raise HTTPError('https://private-provider', code, 'private response body', {}, None)
+    monkeypatch.setattr(notification, 'compose', fail)
+    if code in (429, 500, 502, 503, 504):
+        assert notification.main() == notification.work_queue.PROVIDER_RETRY_EXIT
+        captured = capsys.readouterr()
+        assert captured.out == '' and captured.err == 'notification provider temporarily unavailable\n'
+    else:
+        with pytest.raises(HTTPError):
+            notification.main()

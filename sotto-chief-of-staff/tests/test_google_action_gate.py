@@ -449,6 +449,41 @@ def test_two_concurrent_claimants_execute_only_one_effect(monkeypatch, tmp_path)
     assert sorted(refused for _, refused in results) == [False, True]
 
 
+def test_approval_claim_waits_for_another_thread_to_consume_it(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    monkeypatch.setattr(ga, '_pending_offer', lambda: po)
+    payload = _send_payload()
+    offer = _bind(tmp_path, monkeypatch, payload)
+    owner = threading.get_ident()
+    started, read_by_worker = threading.Event(), threading.Event()
+    original_read = po.jsonstore.read
+    effects = []
+
+    def observed_read(*args, **kwargs):
+        if threading.get_ident() != owner:
+            read_by_worker.set()
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(po.jsonstore, 'read', observed_read)
+
+    def attempt():
+        started.set()
+        return ga._gated('gmail-send', {'to': 'alex@acme.com'}, payload,
+                         lambda: effects.append(1) or {'status': 'sent'}, True, offer['offer_id'])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with po.jsonstore.lock(po._path()):
+            waiting = pool.submit(attempt)
+            assert started.wait(2)
+            assert not read_by_worker.wait(.1), 'another thread bypassed the approval lock'
+            _, refused = attempt()  # The owning thread may nest its approval claim.
+            assert not refused
+        _, refused = waiting.result(timeout=2)
+        assert refused
+    assert effects == [1]
+
+
 @pytest.mark.parametrize("prepare, reason", [
     (lambda tmp, mp: None,
      "selected offer is absent, expired, already claimed, or ambiguous"),

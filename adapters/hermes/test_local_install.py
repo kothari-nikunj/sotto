@@ -217,6 +217,11 @@ else:
     assert result.returncode == 0, result.stdout + result.stderr
     home = Path(env['HERMES_HOME'])
     config = yaml.safe_load((home / 'config.yaml').read_text())
+    assert config['display']['busy_ack_enabled'] is False
+    assert config['display']['show_reasoning'] is False
+    assert config['display']['memory_notifications'] == 'off'
+    assert config['display']['runtime_footer']['enabled'] is False
+    assert config['compression']['progress_notices'] is False
     assert config['mcp_servers']['sotto-local']['command'] == str(bridge)
     assert '--allow-send' not in config['mcp_servers']['sotto-local'].get('args', [])
     assert (home / 'skills/sotto/SKILL.md').read_text() == 'fixture skill'

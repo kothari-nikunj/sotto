@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -62,6 +63,38 @@ def owner_destination(chat_id):
                     and state.get('chat_id') == chat_id)
     except (OSError, ValueError):
         return False
+
+
+def record_owner_activation(source):
+    """Only an authenticated owner DM can open this instance's first-brief gate."""
+    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    chat = getattr(source, 'chat_id', None)
+    if not permits(source, owner) or not isinstance(chat, str) or not chat:
+        return False
+    root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'config'
+    root.mkdir(parents=True, exist_ok=True)
+    receipt = root / 'photon-activation.json'
+    payload = {'tenant_id': os.environ['SOTTO_TENANT_ID'], 'owner': owner,
+               'chat_id': chat, 'activated': True}
+    try:
+        if json.loads(receipt.read_text()) == payload:
+            return True
+    except (OSError, ValueError):
+        pass
+    # A receipt for an earlier owner/tenant/conversation must not strand a new
+    # invited user. Unique temporary files also tolerate simultaneous callbacks.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix='.photon-', delete=False) as out:
+            temporary = Path(out.name)
+            json.dump(payload, out)
+            out.flush()
+            os.fsync(out.fileno())
+        temporary.replace(receipt)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
 
 
 def register(ctx):
@@ -191,18 +224,8 @@ def register(ctx):
                 owner = os.environ.get("PHOTON_HOME_CHANNEL", "")
                 if not permits(event.source, owner):
                     return
-                # A content-free receipt separates infrastructure readiness from the first
-                # owner-initiated conversation required by Photon's shared-line policy.
-                root = Path(os.environ.get("SOTTO_DATA", "/data")) / "config"
-                root.mkdir(parents=True, exist_ok=True)
-                receipt = root / "photon-activation.json"
-                payload = {"tenant_id": os.environ["SOTTO_TENANT_ID"], "owner": owner,
-                           "chat_id": event.source.chat_id, "activated": True}
-                if not receipt.exists():
-                    tmp = receipt.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(payload))
-                    tmp.chmod(0o600)
-                    tmp.replace(receipt)
+                if not record_owner_activation(event.source):
+                    return
             if managed() and missing_download_link(event):
                 return await self.send(event.source.chat_id, "Send me the link you want saved as a PDF.",
                                        reply_to=getattr(event, 'message_id', None))

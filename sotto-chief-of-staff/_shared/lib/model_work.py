@@ -15,6 +15,7 @@ import sqlite3
 import time
 import uuid
 from urllib.error import HTTPError
+from work_queue import MAX_PROVIDER_RECOVERIES, RETRYABLE_PROVIDER_CODES
 
 
 @dataclass(frozen=True)
@@ -164,7 +165,16 @@ def attempt(provider, model, prompt, system=None, schema=None):
             recovered += 1
         parked = db.execute('SELECT 1 FROM parked_requests WHERE operation=? AND revision=?',
                             (value['contract_id'], request_revision)).fetchone()
-        if attempts - recovered >= POLICIES[value['task']].attempts or parked:
+        # A known 429/5xx refusal did not produce a candidate to validate. Preserve every
+        # attempt/usage row, but let notification work recover within the queue's finite allowance.
+        # Other workloads and ambiguous transport failures retain their existing limits.
+        provider_recoveries = 0
+        if value['task'] == 'notification':
+            codes = tuple('http_' + str(code) for code in sorted(RETRYABLE_PROVIDER_CODES))
+            provider_recoveries = min(MAX_PROVIDER_RECOVERIES, db.execute(
+                "SELECT COUNT(*) FROM attempts WHERE operation=? AND status IN (" +
+                ','.join('?' for _ in codes) + ")", (value['id'], *codes)).fetchone()[0])
+        if attempts - recovered - provider_recoveries >= POLICIES[value['task']].attempts or parked:
             raise ModelWorkHeldError('unchanged model operation exhausted')
         value['attempt'] = attempts + 1
         db.execute('INSERT OR REPLACE INTO operations VALUES(?,?,?,?,?)',

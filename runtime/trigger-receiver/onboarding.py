@@ -86,3 +86,41 @@ def scheduled_hold(data, now=None):
                 or (state.get('phase') == 'delivered' and state.get('completed_at', 0) + RETRY_SECONDS > now))
     except (OSError, ValueError, AttributeError, TypeError):
         return False
+
+
+def status(data, now=None):
+    """Read-only setup progress. Composition is never presented as a sent brief."""
+    now = time.time() if now is None else now
+    root = Path(data)
+    try:
+        state = json.loads((root / 'config/onboarding.json').read_text())
+        if not isinstance(state, dict):
+            return 'waiting'
+    except (OSError, ValueError):
+        state = {}
+    try:
+        rows = json.loads((root / 'events/outbox.json').read_text()).get('rows', [])
+        welcome = [r for r in rows if isinstance(r, dict) and
+                   isinstance(r.get('payload'), dict) and r['payload'].get('label') == LABEL]
+    except (OSError, ValueError, AttributeError, TypeError):
+        welcome = []
+    if any(r.get('status') == 'delivered' for r in welcome):
+        return 'delivered'
+    if any(r.get('status') == 'pending' for r in welcome):
+        return 'queued'
+    phase = state.get('phase')
+    if phase in ('delivered', 'existing'):
+        return phase  # These terminal states are written by delivery/legacy adoption.
+    if not phase and any(list((root / 'briefs').glob('*.' + kind + '.delivered'))
+                         for kind in ('morning', 'evening')):
+        return 'existing'
+    if phase == 'composing':
+        try:
+            if float(state.get('lease_until', 0)) > now:
+                return 'composing'
+        except (TypeError, ValueError):
+            pass
+        return 'retrying'
+    if phase == 'queued' or any(r.get('status') == 'failed' for r in welcome):
+        return 'retrying'
+    return 'waiting'

@@ -59,8 +59,8 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
 - **Calendar** — a background thread refreshes today's events every `SOTTO_CALENDAR_REFRESH_SECS`
   (default 15 min). It powers the in-meeting hold, detects meetings that just ended, and **diffs
   each refresh against the last** to catch what changed about the imminent calendar: a decline, a
-  last-minute invite, a moved meeting, a cancellation (`SOTTO_CALENDAR_NUDGES=0` disables). Only
-  *imminent* changes count: a move or cancellation within 24 hours, a decline within 48 — and a
+  last-minute invite, a moved meeting, a removed slot or cancellation (`SOTTO_CALENDAR_NUDGES=0` disables). Only
+  *imminent* changes count: a move, removal or cancellation within 24 hours, a decline within 48 — and a
   NEW invite only within 4 hours (plus a 15-min grace for a meeting that just started): a next-day
   invite is ordinary scheduling, not an interrupt — the email lane already nudges a real invite
   with a draft, and tomorrow's brief covers tomorrow. Solo blocks, all-day events and internal
@@ -71,6 +71,11 @@ named here is documented in [RAILWAY.md](../RAILWAY.md) § *Environment variable
   partial reads cannot prove a cancellation. Calendar permission removal, an account change, or
   an unknown account identity starts a fresh comparison once the account is known; disabling
   calendar nudges advances it quietly without replay.
+  Explicitly labelled context/prep notes never generate a meeting-change notification, including
+  after their meeting moves. A missing entry is described as removed from the calendar; only an
+  explicit cancelled status proves cancellation. A replacement event ID is joined only through
+  a unique shared iCalUID in both observations for a nonrecurring event, never a title or a
+  recurring occurrence. The detector supplies dated old/new times and its exact copy survives composition.
 
 **What arrives is untrusted.** A message's text is written by whoever sent it, so nothing in the
 text can steer Sotto: the deterministic gates below read only metadata (sender, channel, clock,
@@ -151,17 +156,29 @@ is a table lookup, not a code search.
 
 An admitted pre-meeting reminder carries the known role, countdown and open item, plus at most
 two short sentences about the introduction or meeting purpose when supported by existing memory,
-the invitation or recent correspondence. Only the selected attendee gets the focused prep's bounded
-Gmail lookup. The existing notification writer and artifact cache own composition; no extra research
-agent or scheduler runs. Missing evidence, source failures and held/failed model work retain the
-basic reminder and its named prep offer. Gmail consent is checked before and after the read, after
+the invitation or recent correspondence. The selected attendee reuses up to five dated excerpts
+from the existing consented mail snapshot/queue within the shared seven-day conversation window;
+no fresh mail fetch or research runs for the offer. Exact sender/recipient addresses select this
+background, while only an explicit thread binding establishes this invitation's provenance.
+The existing notification writer and artifact cache own composition. Missing evidence, source
+failures and held/failed model work retain the basic reminder and its named prep offer.
+Gmail consent is checked before and after the read, after
 composition and at delivery. Accepting that offer runs the focused meeting prep, presented as four
 photos on iMessage when it fits; the initial reminder is text.
 
 Automatic meeting prep and background attendee research require an external work email. Personal
 mailboxes are excluded, including when the owner uses a personal mailbox; explicit prep requests
 remain available for anyone. Prep names come from exact-email contacts, calendar names or the
-existing research cache, never a prettified email handle. Missing names use the meeting title.
+existing research cache, never a prettified email handle. A missing name can also use an unambiguous
+display name paired with that exact email in a cached From/To/Cc header; body mentions and names
+attached to other addresses cannot name them. That source permission is checked again at delivery. Missing names use the meeting title.
+
+Notifications based on messages at least an hour old carry their source time: a local clock time
+for today, otherwise the original month/day (and year when different). Bridge chat wall times
+stay in the user's configured zone; queue arrival never resets the date. The writer gets the
+original timestamp and current local date so an old "today" is not
+reinterpreted as today. Signature reminders are attributed requests, not proof a document remains
+unsigned; explicit user completion closes the matching obligation through the existing ledger edit.
 
 Before notification composition, held asks and due commitments get current thread and calendar
 context. The writer omits scheduling questions already settled by a matching invitation or later
@@ -511,7 +528,13 @@ agent's, so a scheduled brief is written down before the first send attempt and 
 everything else — the 6:30 brief no longer disappears because the channel was down at 6:30. A
 scheduled run that dies mid-compose is retried by the durable work queue, with at most three
 execution attempts. A saved completed output is reused for at most three handoff attempts without
-another model call. Graceful stops refund the active phase; ambiguous crashes consume an attempt.
+another model call. Graceful stops refund the active phase; ambiguous crashes consume an attempt. Incoming-event
+notification writing has at most four additional provider recoveries for explicit HTTP 429, 500,
+502, 503 or 504 responses. These refusals keep their model attempt receipts but do not consume
+notification validation attempts. Recovery waits 1, 2, 4, then 8 minutes; a further refusal stops.
+The original relevance deadline still wins, and each retry rechecks current eligibility. Unknown
+transport outcomes, authentication failures and delivery handoffs retain their ordinary limits.
+The final failure receipt says that no retry is queued.
 That marker used to be claimed only because
 the skill was told to; on August 30 a run wasn't listening and the evening brief arrived twice, so
 the claim now lives in the machinery every message passes through rather than in an instruction.
@@ -530,7 +553,14 @@ and stops after three attempts per UTC day; ancillary follow-up work remains rec
 
 Infrastructure lifecycle notices (gateway shutdown, restart, startup and interrupted native cron)
 stay in operator logs across Sotto channels. They do not become chat interruptions; ordinary
-replies and actionable source/provider failures keep their existing behavior.
+replies and actionable source/provider failures keep their existing behavior. Mid-run corrections
+still reach the active task, without a separate redirected, steered, queued or interrupting notice.
+This uses Hermes' existing busy-acknowledgment setting in both Cloud and self-host. Displayed
+reasoning, automatic memory-update notices, runtime footers and routine compression progress are
+also disabled, including existing per-channel display overrides. This changes presentation only:
+memory work, compression, approval policy and actionable failure reporting remain. Shared writing
+rules describe the outcome and next useful step in ordinary language; technical detail is for
+a user who asks for it.
 
 Every message is persisted **before** its first send attempt. The adapter requires structured
 success and a provider message ID; an exit code alone cannot mark delivery. The outbox retries every

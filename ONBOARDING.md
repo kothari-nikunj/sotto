@@ -1,14 +1,20 @@
-# Set up Sotto — step by step (cloud)
+# Set up Sotto on your own server
 
-The friendliest path: an always-on Sotto in the cloud + the read-only Mac Bridge. Budget **~30 minutes
-the first time** — only ~15 of it active (a few Railway settings, three variables, then one wizard
-page); the rest is waiting on builds. You'll finish with a morning brief in Telegram and a Mac link
-that survives sleep, redeploys, and laptop lids. (Telegram is the **default**, not a requirement —
-WhatsApp is the appendix at the end of this page.)
+This guide is for self-hosting: you run Sotto on your own Railway account and use your own Gemini key.
+It does not require a Sotto Cloud account. The optional Mac Bridge connects your selected local sources.
+Choose delivery first: **Telegram** is the default; **iMessage through your own Photon connection**
+is also included. Budget about 30 minutes for the server and source setup after you have the
+provider accounts. Photon access and provisioning are separate prerequisites.
+
+**For iMessage:** follow [the Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs) for the
+channel variables, use the manual Railway deployment in step 1, then continue with the same setup
+page in step 2. Skip BotFather and Telegram pairing. This is still self-hosting: choose **Use my own
+server instead** in the Mac app. WhatsApp has an appendix at the end of this page.
 
 > **The one-click Deploy link** at the end of step 1 sets up the build, the `/data` volume and
 > `BRIDGE_TOKEN` for you and prompts for exactly two values: your Gemini key and your Telegram bot
-> token. The manual path below is the same result, click by click — do either.
+> token. It is a Telegram template, not a Photon account or iMessage number allocator. For iMessage,
+> use the manual path with your Photon credentials.
 
 > **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
 > fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
@@ -20,12 +26,12 @@ WhatsApp is the appendix at the end of this page.)
 | You need | Why | Where it goes |
 |---|---|---|
 | A **Railway** account (**paid/verified plan** — volumes + always-on need it) | hosts the agent + storage | — |
-| A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the LLM (only key Sotto needs) | once, into Railway |
-| A **Telegram bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`, ~1 min *(default channel — WhatsApp instead? the appendix)* | where briefs are delivered | once, into Railway |
+| A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the model calls | once, into Railway |
+| **One delivery provider:** a Telegram bot token from [@BotFather](https://t.me/BotFather), or your own [Photon connection and credentials](CHANNELS.md#photon-imessage-and-photo-briefs) for iMessage | where briefs are delivered | once, into Railway |
 | A **Google OAuth client** (5-minute console task, step 3②) | Gmail + Calendar | pasted in the wizard |
 | *(optional)* The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) — if you have a Mac and want iMessage, WhatsApp, calls, Notes and Contacts in your briefs; without it Sotto runs on Gmail + Calendar alone, a supported deploy | reads your Mac | drag to /Applications |
 
-Everything else — linking your Mac, connecting Google, your channel, your timezone, and optional
+Everything else, including linking your Mac, connecting Google, your channel, your timezone, and optional
 extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
 
 **You can change either default. Each channel and model has its own setup requirements.** Full detail (and
@@ -34,12 +40,13 @@ how tested each one is) in **[CHANNELS.md — Choosing your channel and model](C
 | Your channel | | Your model |
 |---|---|---|
 | **Telegram** — default. **One variable** (`TELEGRAM_BOT_TOKEN`): you tap the pairing link boot prints and it captures your chat id — no id hunting, no phone pairing. The path this guide follows. | | **Gemini** — default, and what the brief pipeline calls today. One key covers everything. |
+| **iMessage (Photon)** — your own provider connection, project credentials and exact owner identity. [Setup and variable table](CHANNELS.md#photon-imessage-and-photo-briefs). Delivery continues while your Mac sleeps. | | Same model settings as the other channels. |
 | **WhatsApp** — a real contact instead of a bot, at the price of a QR scan. Three variables (`WHATSAPP_ENABLED=true`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`) plus `SOTTO_CRON_DELIVER=whatsapp` — the **[appendix](#appendix--whatsapp-instead-of-telegram)** at the end of this page. | | **Anthropic / OpenAI** can also compose briefs through `SOTTO_BRIEF_MODEL`; chat is configured separately. Other Hermes chat providers do not automatically support every Sotto capability. See [model limits](docs/MODELS.md). |
 | **iMessage (BlueBubbles)** — blue bubbles, but an always-on Mac + Firebase + a tunnel. Hand-wired recipe, hours not minutes. | | **Exa / Parallel** — web research only, and independent of the rest: set the key and research stops going through Gemini. |
 
 ## 1 · Deploy the backend on Railway
 
-**First, make your bot** (~1 min): in Telegram, message [@BotFather](https://t.me/BotFather) →
+**Telegram only: first, make your bot** (~1 min): in Telegram, message [@BotFather](https://t.me/BotFather) →
 `/newbot` → name it → it replies with a **bot token**. That token is the only channel setting you
 need; your chat id is captured for you on the first message you send the bot.
 
@@ -52,10 +59,12 @@ from GitHub repo** → pick it. Set **all four** before the first deploy finishe
 1. **Settings → Root Directory**: leave blank — the Dockerfile is at the repo root (leave *Dockerfile Path* blank too; both are auto-detected).
    *Get this wrong and the build dies with `COPY … not found` — the Dockerfile's `COPY` paths are
    relative to the build context this setting picks.*
-2. **Variables → New Variable** — add three:
+2. **Variables → New Variable** — add your model key, channel settings and Bridge secret:
    - `GOOGLE_AI_API_KEY` = your Gemini key *(Google's own docs sometimes call it `GEMINI_API_KEY` or
      `GOOGLE_API_KEY` — Sotto accepts any of the three names, so paste it under whichever you copied)*
-   - `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you
+   - For Telegram, `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you. For iMessage, omit this
+     and use all five [Photon settings](CHANNELS.md#photon-imessage-and-photo-briefs), including
+     `SOTTO_CRON_DELIVER=photon` and your exact owner identity.
    - `BRIDGE_TOKEN` = a long random secret — run `openssl rand -hex 24` and paste the output.
      *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
    *(WhatsApp instead? [The appendix](#appendix--whatsapp-instead-of-telegram) — three variables, one
@@ -65,8 +74,10 @@ from GitHub repo** → pick it. Set **all four** before the first deploy finishe
 4. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2,
    then redeploy once. Without a domain the logged link falls back to a dead `localhost` URL.
 
-Deploy and wait for the build (the container installs Hermes + Sotto automatically), and **while it
-boots, tap the pairing link in the logs** — the `[sotto] telegram: ➜ TAP THIS TO LINK YOUR CHAT:`
+Deploy and wait for the build (the container installs Hermes + Sotto automatically). **For Photon,
+verify the gateway connection and send a hello from your configured identity to its iMessage
+address**, as described in the channel guide. For Telegram, **while it boots, tap the pairing link
+in the logs** — the `[sotto] telegram: ➜ TAP THIS TO LINK YOUR CHAT:`
 line. It opens your bot and sends a one-time code, which is how the deploy knows the chat is *yours*
 and not a stranger's who guessed the bot's name. Two success signals in the deploy logs:
 `[sotto] Gemini key OK (model … available)` and `[sotto] telegram linked ✓ — briefs and nudges
@@ -75,7 +86,7 @@ of quota — fix it before going further, because every brief depends on it. A
 `[sotto] telegram NOT linked yet` just means you hadn't tapped within the five-minute window: tap the
 link and restart the deploy, and it links then. Nothing else is lost either way.
 
-**Or one click.** The button below does all four settings above and prompts for exactly two values —
+**Or use the Telegram template.** The button below sets up Telegram and prompts for two values —
 your Gemini key and your bot token:
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
@@ -107,7 +118,8 @@ drag it to `/Applications`, open it.
   [Issues](https://github.com/kothari-nikunj/sotto/issues) link if you don't have a code yet.
 - **Choose hosting in the one Sotto setup window.** Cloud is an invite-only pilot for registered accounts. Cloud uses Google → Mac sources / Full Disk
   Access → Messages → First brief. Google sign-in alone does not start reading this Mac.
-- **For self-host, the steps are Connect → Choose sources → Disk access.**
+- **For self-host, choose Use my own server instead; the steps are Connect → Choose sources → Disk access.**
+  This also applies to Photon iMessage delivery. The Bridge adds sources; it does not supply a number.
   1. **Connect.** On your host's `/setup` page, click **Open in Sotto Bridge** or paste its pairing
      link. Continue becomes available once the host and token are present.
   2. **Choose sources.** Every supported Mac reader starts on, just like the existing Mac app.
@@ -162,7 +174,10 @@ Deployments ▸ ⋮ ▸ Restart) and it links within seconds; your message is st
 servers, because an unlinked deploy leaves its gateway down rather than consuming it. Details and the by-hand fallback:
 **[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup-default)**.
 > **On WhatsApp instead?** This tile becomes **Link WhatsApp** with a **Show WhatsApp QR** button —
-> see the [appendix](#appendix--whatsapp-instead-of-telegram). **On iMessage/BlueBubbles?** The tile
+> see the [appendix](#appendix--whatsapp-instead-of-telegram). **On Photon iMessage?** There is no
+> Telegram pairing step. Verify a real reply through your own Photon connection; the generic
+> channel tile does not prove it can send. See [Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs).
+> **On iMessage/BlueBubbles?** The tile
 > says there is nothing to link and never blocks the wizard;
 > [CHANNELS.md § iMessage via BlueBubbles](CHANNELS.md#imessage-via-bluebubbles) is a hand-wired
 > recipe measured in hours, not minutes.
@@ -179,15 +194,21 @@ It works on **any Granola plan** (it's your login, not an API key), the tokens l
 everything else works without it. More lanes + adding other services:
 [INTEGRATIONS.md](INTEGRATIONS.md).
 
-## 4 · Say hello
+## 4 · Check your first brief
 
-Message your bot on Telegram: **"set up Sotto."** *(On WhatsApp, message yourself in self-chat —
-same words.)*
+Once a context source and your message channel are connected, Sotto prepares its first brief
+automatically. The setup page shows whether it is preparing, waiting to send, delayed for a retry,
+or sent. You do not need to request a second brief. Google can work without a Mac, and selected
+Mac sources can work without Google. Granola can also provide the initial context.
 
-**One-time approval:** the first time Sotto runs its pipeline it asks permission to run code
-(`execute_code`). Approve with **always** (reply `/approve always`) so it never re-asks. This is a
-one-time, interactive-only step — scheduled briefs run the same scripts through the terminal
-tool, which needs no approval.
+You can message your bot on Telegram, your Photon connection's address in iMessage, or yourself
+in WhatsApp self-chat to ask for help. Your own Gemini key pays for the model calls. You do not need a
+Sotto Cloud subscription.
+
+Confirm the first brief actually appears on your device. Photon can send four photos when the
+layout and provider support it; Telegram and WhatsApp use text by default. A send receipt alone
+does not prove device display. If an interactive tool requests permission, review the specific
+action; blanket approval is not a setup step, and the automatic first brief needs no second chat run.
 
 The guided setup verifies connections and reports the installed schedule. The receiver sends
 its first useful look once a context source and delivery channel are ready. It uses recent
@@ -222,7 +243,8 @@ preferences. Works great on your phone.
 
 Day one is quiet on purpose — quiet ≠ broken:
 
-- **Your first brief** arrives at the next 6:30am / 5:30pm — or the moment you wake your Mac after 7am.
+- **Your first brief** is prepared automatically once a context source and your delivery channel
+  are ready. Regular morning and evening briefs follow the installed schedule.
 - **Few or no nudges at first** — the triage funnel is deliberately strict; only a real ask from
   someone you know or a missed call gets through.
 - **The 12:30 digest stays silent on light days** by design — no news is the feature.

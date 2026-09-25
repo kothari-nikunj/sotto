@@ -252,3 +252,37 @@ def test_live_claim_is_not_recovered_before_lease_expiry(tmp_path, monkeypatch):
         clock[0] += model_work.ATTEMPT_LEASE_SECONDS + 1
         with model_work.attempt('gemini', 'model', 'body'):
             assert operation['attempt'] == 3
+
+
+@pytest.mark.parametrize('code', [429, 500, 502, 503, 504])
+def test_notification_provider_refusals_do_not_spend_validation_attempts(tmp_path, monkeypatch, code):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    for _ in range(model_work.MAX_PROVIDER_RECOVERIES):
+        with model_work.scope('notification', 'outage'), pytest.raises(HTTPError):
+            with model_work.attempt('gemini', 'model', 'private'):
+                raise HTTPError('https://provider', code, 'private payload', {}, io.BytesIO())
+    importlib.reload(model_work)
+    # Both normal attempts remain, but no unlimited reset and no lost accounting rows.
+    for _ in range(2):
+        with model_work.scope('notification', 'outage'), model_work.attempt('gemini', 'model', 'private'):
+            pass
+    with model_work.scope('notification', 'outage'), pytest.raises(model_work.ModelWorkHeldError):
+        with model_work.attempt('gemini', 'model', 'private'):
+            pytest.fail('unbounded recovery')
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0] == 6
+        assert db.execute("SELECT COUNT(*) FROM attempts WHERE status=?", ('http_' + str(code),)).fetchone()[0] == 4
+    assert b'private payload' not in (tmp_path / 'events/model-work.sqlite3').read_bytes()
+
+
+@pytest.mark.parametrize('task,code', [('notification', 401), ('notification', 402),
+                                     ('notification', 403), ('memory_extract', 503)])
+def test_nonrecoverable_errors_and_other_workloads_keep_original_budget(tmp_path, monkeypatch, task, code):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    for _ in range(2):
+        with model_work.scope(task, 'failure'), pytest.raises(HTTPError):
+            with model_work.attempt('gemini', 'model', 'prompt'):
+                raise HTTPError('https://provider', code, 'denied', {}, io.BytesIO())
+    with model_work.scope(task, 'failure'), pytest.raises(model_work.ModelWorkHeldError):
+        with model_work.attempt('gemini', 'model', 'prompt'):
+            pytest.fail('budget reset')
