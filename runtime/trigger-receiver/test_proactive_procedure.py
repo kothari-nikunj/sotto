@@ -252,7 +252,7 @@ def test_terminal_memory_bucket_is_consumed_but_next_bucket_runs(rec, monkeypatc
     import onboarding
     monkeypatch.setattr(managed, 'enabled', lambda: True)
     monkeypatch.setattr(managed, 'has_sources', lambda _: True)
-    monkeypatch.setattr(onboarding, 'tick', lambda *args: None)
+    monkeypatch.setattr(onboarding, 'tick', lambda *args, **kwargs: None)
     monkeypatch.setattr(rec, '_CONTEXT_LAST_STARTED', 0)
     monkeypatch.setattr(rec, '_RUNS_INFLIGHT', {})
     clock, attempts = [1500], []
@@ -277,7 +277,7 @@ def test_transient_memory_admission_failure_still_retries(rec, monkeypatch):
     import onboarding
     monkeypatch.setattr(managed, 'enabled', lambda: True)
     monkeypatch.setattr(managed, 'has_sources', lambda _: True)
-    monkeypatch.setattr(onboarding, 'tick', lambda *args: None)
+    monkeypatch.setattr(onboarding, 'tick', lambda *args, **kwargs: None)
     monkeypatch.setattr(rec, '_CONTEXT_LAST_STARTED', 0)
     calls = []
     def enqueue(*args):

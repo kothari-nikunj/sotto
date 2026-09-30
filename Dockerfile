@@ -139,6 +139,12 @@ RUN runuser -u sotto -- python3 -I -B /app/trigger-receiver/check_runtime.py
 # adapters/hermes/README.md: re-review the new gateway source and regenerate the two constants.
 RUN python3 /app/adapters/hermes/provider_error_compat.py --check \
       /usr/local/lib/hermes-agent/gateway/run.py
+RUN python3 /app/adapters/hermes/first_contact_compat.py --check \
+      /usr/local/lib/hermes-agent/gateway/run_turn.py
+RUN python3 /app/adapters/hermes/gallery_obligation_compat.py --check \
+      /usr/local/lib/hermes-agent/gateway/platforms/base.py \
+ && python3 /app/adapters/hermes/gallery_obligation_compat.py --check \
+      /usr/local/lib/hermes-agent/gateway/run_startup.py
 # The two interactive playgrounds live in docs/ (one source of truth) and are SERVED from
 # /static/* — so they are copied in beside the frontend assets at build time. That keeps
 # dashboard.py's whitelist an exact-name lookup against a single root; the alternative (a second

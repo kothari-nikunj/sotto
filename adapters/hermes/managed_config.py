@@ -53,6 +53,10 @@ def reconcile(home, env):
     cfg['model'] = model
     # Match the established Sotto Telegram runtime's conversational behavior.
     cfg.setdefault('agent', {}).update({'name': 'Sotto', 'reasoning_effort': 'medium', 'max_turns': 60})
+    # Dedicated Cloud has its own consent and automatic first brief. Keep the upstream
+    # first-contact profile offer and /help intro out of the owner's activation reply.
+    cfg.setdefault('onboarding', {}).update({'profile_build': 'off',
+                                             'sotto_quiet_first_contact': True})
     cfg['fallback_model'] = []
     cfg['fallback_providers'] = []
     cfg['custom_providers'] = []

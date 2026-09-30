@@ -54,6 +54,8 @@ from textutil import _looks_like_phone_number, _s  # noqa: E402
 from timeutil import _parse_ts  # noqa: E402
 import relevance  # noqa: E402
 import preferences  # noqa: E402
+from gemini_transport import ModelBudgetUnavailableError, proxy_budget_exhausted  # noqa: E402
+from work_queue import MODEL_BUDGET_EXIT  # noqa: E402
 from personal_context import conversation_key, conversation_message  # noqa: E402
 
 REVIEW_CONVERSATION_CAP = 100
@@ -359,6 +361,8 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
             result['_reviewed_silent'] = reviewed_silent
         return result
     except Exception as err:  # noqa: BLE001 — a failed relevance review must never become a digest
+        if isinstance(err, ModelBudgetUnavailableError) or proxy_budget_exhausted(err):
+            return {"deliver": False, "status": "budget_exhausted", "budget_exhausted": True}
         print(f"[digest] relevance review failed ({type(err).__name__}); staying silent", file=sys.stderr)
         return {"deliver": False, "status": "retry", "retryable": True, "error": type(err).__name__}
 
@@ -368,7 +372,7 @@ def run_check(now: datetime) -> dict:
     entries = [e for e in entries_since(read_stamp())
                if (_parse_iso(e.get('ts')) or now) <= now]
     result = check(entries, track_review=True)
-    if result.get('retryable'):
+    if result.get('retryable') or result.get('budget_exhausted'):
         return result
     reviewed_silent = result.pop('_reviewed_silent', [])
     if reviewed_silent and not accept_items(reviewed_silent):
@@ -394,6 +398,8 @@ def main():
         return
     result = run_check(now)
     print(json.dumps(result))
+    if result.get("budget_exhausted"):
+        sys.exit(MODEL_BUDGET_EXIT)
     if result.get("retryable"):
         sys.exit(75)
 

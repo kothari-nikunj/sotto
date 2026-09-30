@@ -162,7 +162,7 @@ def test_a_bot_token_and_no_chat_id_captures_one_and_forwards_it(tmp_path):
     written, argv, log = _capture(tmp_path, fake_id="8675309",
                                   TELEGRAM_BOT_TOKEN="<bot-token>")
     assert written == ["TELEGRAM_ALLOWED_USERS=8675309", "TELEGRAM_HOME_CHANNEL=8675309"]
-    assert "telegram_link.py --token <bot-token> --phrase Xk2p-9fQzR7t --boot" in argv
+    assert "telegram_link.py --token=<bot-token> --phrase=Xk2p-9fQzR7t --boot" in argv
     assert "telegram linked" in log
 
 
@@ -172,10 +172,10 @@ def test_the_pairing_phrase_is_this_deploys_setup_code_and_nothing_new(tmp_path)
     resolver (env override first, else the code the receiver persisted to the volume)."""
     _, argv, _ = _capture(tmp_path / "file", fake_id="1", setup_code="on-volume",
                           TELEGRAM_BOT_TOKEN="<bot-token>")
-    assert "--phrase on-volume" in argv
+    assert "--phrase=on-volume" in argv
     _, argv, _ = _capture(tmp_path / "env", fake_id="1", setup_code="on-volume",
                           SOTTO_SETUP_CODE="from-env", TELEGRAM_BOT_TOKEN="<bot-token>")
-    assert "--phrase from-env" in argv
+    assert "--phrase=from-env" in argv
 
 
 def test_no_setup_code_fails_closed_rather_than_linking_a_stranger(tmp_path):

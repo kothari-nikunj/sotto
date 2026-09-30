@@ -27,6 +27,10 @@ class BriefBusyError(Exception):
     """Another generation operation owns the inputs; retry without charging a failed attempt."""
 
 
+class BriefModelBudgetError(Exception):
+    """Fresh composition needs an account allowance update, not repeated source reads."""
+
+
 @contextmanager
 def _generation_lock(scratch):
     import jsonstore
@@ -43,6 +47,7 @@ def run(request):
     sys.path.insert(0, str(pack / '_shared' / 'lib'))
     import jsonstore
     import work_queue
+    from gemini_transport import brief_model_preflight, ModelBudgetUnavailableError
     from source_context import allowed, project_local, project_x, read_local, record_bridge_status, used_sources
     from textutil import unwrap_tool_result
     from timeutil import configured_tz, _user_local_date
@@ -59,6 +64,9 @@ def run(request):
         result = subprocess.run([sys.executable, str(pack / relative), *map(str, args)],
                                 capture_output=True, text=True, timeout=timeout)
         if result.returncode:
+            if (relative == '_shared/scripts/compose_brief.py'
+                    and result.returncode == work_queue.MODEL_BUDGET_EXIT):
+                raise BriefModelBudgetError('Model allowance reached')
             # The receiver's sanitizer, not a second one: only an allowlisted exception name or
             # a presence flag may cross from a subprocess's stderr into a persisted error.
             raise RuntimeError(f'{Path(relative).name} failed (exit {result.returncode}; '
@@ -66,6 +74,12 @@ def run(request):
         if output:
             jsonstore.write_atomic(str(output), json.loads(result.stdout))
         return result.stdout
+
+    def check_model():
+        try:
+            brief_model_preflight()
+        except ModelBudgetUnavailableError as error:
+            raise BriefModelBudgetError('Model allowance reached') from error
 
     def paths_at(directory):
         directory.mkdir(exist_ok=True, mode=0o700)
@@ -167,6 +181,7 @@ def run(request):
             previous = load(scratch / 'prepared.json', {})
             if previous.get('complete') and time.time() - previous.get('observed_at', 0) < PREPARATION_MAX_AGE_SECONDS:
                 return 'NO_NUDGES'
+            check_model()
             paths = paths_at(scratch / 'prepared')
             # Only Calendar is needed to prepare people ahead of time; the deadline pass gathers
             # current communications once. Existing graph research freshness prevents repeat buys.
@@ -205,6 +220,7 @@ def run(request):
             artifact = {}
         paths = paths_at(scratch / 'current')
         if not isinstance(artifact.get('brief_text'), str) or not artifact['brief_text'].strip():
+            check_model()
             # Retire the old generation before touching its inputs. Learning uses this same lock
             # and a revision-bound job, so a crash during replacement cannot consume partial files
             # or mistake old completion receipts for learning the new actions.
@@ -222,7 +238,13 @@ def run(request):
             record_bridge_status(local)
             local = project_local(local)
             save(paths['local'], local)
-            extra = ['--window-days', '7', '--max', '200', '--bodies', '60'] if request['kind'] == 'welcome' else []
+            # The pinned Google search makes a metadata GET for every hit. The former two
+            # 200-hit slices cost 8,000 quota units before reading a single body (new Google
+            # projects allow 6,000/user/minute). Keep a seven-day starter sample, both date
+            # slices and the sent lane; capped slices are disclosed by the source receipt.
+            # With 50 hits/slice and 20 bodies, even the attachment/fallback allowance stays
+            # below 5,000 units. Concurrent jobs can still hit quota and must report partial.
+            extra = ['--window-days', '7', '--max', '50', '--bodies', '20'] if request['kind'] == 'welcome' else []
             command('_shared/scripts/gather_google.py', '--gmail-out', paths['gmail'], '--cal-out', paths['cal'],
                     '--source-results-out', paths['source_results'], *extra)
             # Source status is required for an honest current brief, even when legacy arrays are empty.
@@ -338,6 +360,10 @@ if __name__ == '__main__':
     except BriefBusyError:
         print('[brief_runner] BriefBusyError', file=sys.stderr)
         sys.exit(75)  # Receiver refunds only this runner's explicit contention signal.
+    except BriefModelBudgetError:
+        from work_queue import MODEL_BUDGET_EXIT
+        print('[brief_runner] Model allowance reached', file=sys.stderr)
+        sys.exit(MODEL_BUDGET_EXIT)
     except Exception as error:
         print(f'[brief_runner] {type(error).__name__}: {error}', file=sys.stderr)
         sys.exit(1)

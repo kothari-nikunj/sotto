@@ -284,6 +284,12 @@ def record_bridge_status(payload, data_root=None):
             if applied:
                 current.update(status=status, observed_at=received_stamp.isoformat(),
                                observed_epoch=received_stamp.timestamp(), order_epoch=stamp.timestamp())
+                if previous.get('status') == 'disabled' and status != 'disabled':
+                    # Only a new read begun after this consent restoration can open a fresh
+                    # first brief. Fence at server acceptance, not probe start: a read may
+                    # begin while a slow regrant probe is still in flight. Ordinary healthy
+                    # probes must not advance this watermark.
+                    current['consent_regrant_epoch'] = now.timestamp()
                 current.pop('request_epoch', None)
                 if requested is not None:
                     current['request_epoch'] = requested

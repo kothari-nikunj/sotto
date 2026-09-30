@@ -12,7 +12,7 @@ drop-in across Hermes versions. Idempotent.
   # HTTP transport for the receiver's /mcp: pass the ROOT secret plus --derive-mcp, and Hermes is
   # handed the derived bearer instead — the agent never holds the root (receiver.derive_mcp_token
   # is the same derivation; a parity test pins the two):
-  configure_mcp.py --url http://127.0.0.1:8787/mcp --token "$BRIDGE_TOKEN" --derive-mcp
+  configure_mcp.py --url http://127.0.0.1:8787/mcp --token="$BRIDGE_TOKEN" --derive-mcp
 
   # stdio transport (e.g. a Granola MCP server):
   configure_mcp.py --name granola --command uvx --arg some-granola-mcp \

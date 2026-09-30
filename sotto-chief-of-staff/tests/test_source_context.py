@@ -87,6 +87,7 @@ def test_self_host_status_receipt_records_source_revocation_without_storing_hist
 def test_google_source_receipts_distinguish_failed_empty_from_complete_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(gg, '_find_google_api', lambda: 'synthetic-api.py')
     monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, '_refresh_google_token', lambda: None)
     outputs = [str(tmp_path / name) for name in ('gmail.json', 'cal.json', 'sources.json')]
     monkeypatch.setattr('sys.argv', ['gather_google', '--skip-gmail', '--gmail-out', outputs[0],
                                     '--cal-out', outputs[1], '--source-results-out', outputs[2]])

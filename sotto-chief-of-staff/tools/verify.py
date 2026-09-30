@@ -156,6 +156,8 @@ def commands(root):
         *([(root, [python, 'tools/sync-usage.py', '--check'])] if (root / 'cloud/model-proxy').is_dir() else []),
         (pack, [python, '-m', 'pytest', 'tests', '-q']),
         (pack, [python, 'tools/validate_skills.py']),
+        (root, [python, 'tools/verify_railway_photon_preset.py']),
+        (root, [python, '-m', 'pytest', 'tools/test_setup_selfhost_railway.py', '-q']),
         # One contract, two trees: the public distribution has no cloud/accounts (the hosted broker
         # never ships), so a suite runs where its directory is and is simply absent otherwise.
         *((root, [python, '-m', 'pytest', suite, '-q']) for suite in suites if (root / suite).is_dir()),

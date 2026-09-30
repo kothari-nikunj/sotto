@@ -47,6 +47,7 @@ def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     policy = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff/_shared/references/writing-style.md'
     assert (tmp_path / 'SOUL.md').read_text().endswith(policy.read_text())
     assert cfg['agent'] == {'name': 'Sotto', 'reasoning_effort': 'medium', 'max_turns': 60}
+    assert cfg['onboarding'] == {'profile_build': 'off', 'sotto_quiet_first_contact': True}
     assert cfg['model']['base_url'] == 'https://proxy.example/openai/v1'
     assert cfg['auxiliary']['vision'] == {'provider': 'main', 'model': ''}
     assert cfg['plugins']['enabled'] == ['photon-platform']
@@ -60,6 +61,15 @@ def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     env['PHOTON_ALLOWED_USERS'] += ',+15555550101'
     with pytest.raises(ValueError, match='only the tenant owner'):
         module.reconcile(tmp_path, env)
+
+
+def test_dedicated_gateway_wiring_does_not_change_shared_install():
+    start = Path(__file__).with_name('start.sh').read_text()
+    install = Path(__file__).with_name('install.sh').read_text()
+    docker = Path(__file__).resolve().parents[2] / 'Dockerfile'
+    assert 'quiet_first_contact.py "$HSTATE/config.yaml"' in start
+    assert 'first_contact_compat.py' in start and 'first_contact_compat.py' in docker.read_text()
+    assert 'if [ "$DEDICATED" -eq 1 ]; then\n  # Opt in only a dedicated Sotto install' in install
 
 
 def test_probe_patch_fails_closed_on_an_unreviewed_upstream_file(tmp_path):

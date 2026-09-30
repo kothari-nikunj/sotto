@@ -76,6 +76,8 @@ def photon(request, monkeypatch):
     gallery.recovery_receipt = lambda *a: None
     monkeypatch.setitem(sys.modules, gallery.__name__, gallery)
     monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'chat')
+    # Managed activation requires the same exact owner allowlist as production.
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', 'chat')
     spec.loader.exec_module(plugin)
     plugin.register(types.SimpleNamespace(register_platform=lambda **kw: captured.update(kw)))
     monkeypatch.setattr(plugin, 'TYPING_START_DELAY_SECONDS', 0.01)
@@ -155,8 +157,10 @@ def test_focused_prep_gallery_does_not_duplicate_uncertain_send(photon, acceptan
         calls.append(args)
         return acceptance == 'accepted', 'unconfirmed', {'acceptance': acceptance, 'message_id': 'parent', 'message_ids': ['child']}
     photon.gallery_test.send_once = send
-    result = asyncio.run(photon._send_with_retry('chat', 'Complete original prep'))
+    result = asyncio.run(photon._send_with_retry('chat', 'Complete original prep',
+                         metadata={'sotto_obligation_id': 'a' * 24}))
     assert len(calls) == 1
+    assert calls[0][-2:] == ('a' * 24, 'Complete original prep')
     texts = [c for c in photon.calls if c[0] == '/send']
     if acceptance == 'accepted':
         assert result.success and result.message_id == 'parent'
@@ -170,6 +174,12 @@ def test_focused_prep_gallery_does_not_duplicate_uncertain_send(photon, acceptan
 def test_ordinary_chat_uses_existing_delivery(photon):
     assert asyncio.run(photon._send_with_retry('chat', 'Hello')).success
     assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Hello'})]
+
+
+def test_prep_without_gateway_identity_uses_existing_text_delivery(photon):
+    photon.gallery_test.prepare_prep = lambda _: pytest.fail('missing obligation identity must not render')
+    assert asyncio.run(photon._send_with_retry('chat', 'Complete original prep')).success
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Complete original prep'})]
 
 
 @pytest.mark.parametrize('acceptance', ['accepted', 'unknown'])

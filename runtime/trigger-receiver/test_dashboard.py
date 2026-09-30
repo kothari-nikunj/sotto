@@ -2286,7 +2286,8 @@ def test_api_runs_gates_on_the_deliver_once_marker(tmp_path):
         _write(os.path.join(str(tmp_path), "briefs", f"{day}.morning.delivered"), "")
         jobs = json.loads(_get(base, "/api/runs", headers=cookie)[1])["jobs"]
         morning = next(j for j in jobs if j["kind"] == "morning")
-        assert morning["available"] is False and morning["reason"] == "delivered" and morning["at"]
+        assert morning["available"] is False and morning["reason"] == "unconfirmed"
+        assert morning["at"] is None  # marker mtime is not a provider acceptance time
         # a live claim without that flag means a run is already in flight
         _write(os.path.join(str(tmp_path), "briefs", f"{day}.evening.claim"), "")
         evening = next(j for j in json.loads(_get(base, "/api/runs", headers=cookie)[1])["jobs"]
@@ -2300,6 +2301,42 @@ def test_api_runs_gates_on_the_deliver_once_marker(tmp_path):
             assert "digest" not in kinds
         finally:
             os.environ.pop("SOTTO_DIGEST", None)
+    finally:
+        srv.shutdown()
+
+
+def test_api_runs_separates_the_deliver_once_gate_from_channel_acceptance(tmp_path):
+    m, srv, base = _server(tmp_path)
+    day = m.DASHBOARD._local_today()
+    marker = os.path.join(str(tmp_path), "briefs", f"{day}.morning.delivered")
+    _write(marker, "")
+    try:
+        _, authed = _login_with_csrf(base)
+
+        def morning():
+            return next(j for j in json.loads(_get(base, "/api/runs", headers=authed)[1])["jobs"]
+                        if j["kind"] == "morning")
+
+        assert morning()["reason"] == "unconfirmed"
+        # A gate that closed on a failed or still-queued send must not claim success,
+        # and it must never re-enable the run-now button or POST path.
+        outbox = os.path.join(str(tmp_path), "events", "outbox.json")
+        row = {"id": "a" * 16, "kind": "brief", "day": day, "created_at": time.time(),
+               "status": "pending", "payload": {"label": "brief:sotto-morning-brief"}}
+        _write(outbox, json.dumps({"rows": [row]}))
+        assert morning()["reason"] == "pending"
+        row["status"] = "failed"
+        _write(outbox, json.dumps({"rows": [row]}))
+        assert morning()["reason"] == "failed"
+        assert _post_json(base, "/api/runs", {"name": "sotto-morning-brief"}, headers=authed)[0] == 409
+
+        # Only a provider acceptance receipt may produce Sent and its clock time.
+        accepted = m.DASHBOARD._iso()
+        _write(os.path.join(str(tmp_path), "events", "delivery.jsonl"), json.dumps({
+            "ts": accepted, "label": "brief:sotto-morning-brief", "status": "delivered"}) + "\n")
+        confirmed = morning()
+        assert confirmed == {"name": "sotto-morning-brief", "kind": "morning",
+                             "available": False, "reason": "delivered", "at": accepted}
     finally:
         srv.shutdown()
 
@@ -2354,7 +2391,7 @@ def test_post_runs_fires_the_cron_prompt_and_refuses_what_it_reported_closed(tmp
         _write(os.path.join(str(tmp_path), "briefs", f"{day}.morning.delivered"), "")
         code, body, _ = _post_json(base, "/api/runs", {"name": "sotto-morning-brief"},
                                    headers=authed)
-        assert code == 409 and json.loads(body)["error"] == "delivered"
+        assert code == 409 and json.loads(body)["error"] == "unconfirmed"
         assert spawned == ["sotto-evening-brief"]         # the closed job never spawned
         (w,) = _audit_writes(tmp_path)
         assert w["endpoint"] == "/api/runs" and w["target"] == "sotto-evening-brief"

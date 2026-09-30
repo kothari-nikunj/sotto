@@ -1,10 +1,12 @@
 """Shared procedures honor the real CLI shapes and stage effects without sending."""
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -129,3 +131,86 @@ def test_digest_silence_failure_and_acceptance_cutoff(result, expected, tmp_path
         assert effects[0] == {'kind': 'digest_accept', 'item_ids': result['item_ids']}
         assert result['effects'][0] in effects
         assert {'kind': 'eligibility', 'valid_until': result['valid_until']} in effects
+
+
+def test_digest_child_budget_exit_is_typed_and_other_child_exit_is_not(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    from work_queue import MODEL_BUDGET_EXIT
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', lambda *a, **k:
+                        SimpleNamespace(returncode=MODEL_BUDGET_EXIT, stdout='', stderr='private'))
+    with pytest.raises(procedure_runner.ProcedureModelBudgetError):
+        procedure_runner.run({'pack': str(PACK), 'kind': 'digest'})
+    # The same exit from a gatherer is just an ordinary child error.
+    with pytest.raises(RuntimeError, match='gather_google.py exit 77') as error:
+        procedure_runner.run({'pack': str(PACK), 'kind': 'proactive'})
+    assert not isinstance(error.value, procedure_runner.ProcedureModelBudgetError)
+
+
+def test_procedure_cli_emits_budget_exit_only_for_typed_denial(monkeypatch):
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    from gemini_transport import ModelBudgetUnavailableError
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({'pack': str(PACK), 'kind': 'digest'})])
+    def denied(_request):
+        raise ModelBudgetUnavailableError('private')
+    monkeypatch.setattr(procedure_runner, 'run', denied)
+    from work_queue import MODEL_BUDGET_EXIT
+    assert procedure_runner.main() == MODEL_BUDGET_EXIT
+    def child_denied(_request):
+        raise procedure_runner.ProcedureModelBudgetError('private')
+    monkeypatch.setattr(procedure_runner, 'run', child_denied)
+    assert procedure_runner.main() == MODEL_BUDGET_EXIT
+    def transient(_request):
+        raise RuntimeError('private')
+    monkeypatch.setattr(procedure_runner, 'run', transient)
+    assert procedure_runner.main() == 1
+
+
+@pytest.mark.parametrize('arguments,diagnostic', [([], 'IndexError'), (['{'], 'JSONDecodeError'),
+                                                   ([json.dumps({'kind': 'digest'})], 'KeyError')])
+def test_malformed_request_cli_reports_original_error_without_pack_import(arguments, diagnostic):
+    child = subprocess.run([sys.executable, str(Path(procedure_runner.__file__)), *arguments],
+                           capture_output=True, text=True, timeout=20)
+    assert child.returncode == 1
+    assert child.stdout == ''
+    assert child.stderr.strip() == f'[procedure_runner] {diagnostic}'
+
+
+@pytest.mark.parametrize('url,body,terminal', [
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"sotto_budget_exhausted"}}', True),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"other_payment_error"}}', False),
+    ('https://unrelated.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"sotto_budget_exhausted"}}', False),
+])
+def test_proactive_compose_preserves_only_validated_proxy_402(
+        tmp_path, monkeypatch, url, body, terminal):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_TOKEN', 'fixture-token')
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    monkeypatch.syspath_prepend(str(PACK / '_shared/scripts'))
+    import source_context
+    import delivery_effects
+    import compose_notification
+    import gemini
+    from work_queue import MODEL_BUDGET_EXIT
+    monkeypatch.setattr(source_context, 'read_local', lambda: {})
+    monkeypatch.setattr(compose_notification, 'enrich', lambda items, now: items)
+    proof = delivery_effects.for_bundle({'events': [{'event': {'valid_until': time.time() + 600}}]})['effects']
+    result = {'nudges': [{'kind': 'chase', 'key': 'fixture-chase', 'detail': 'Reply is due'}],
+              'quiet': False, '_eligibility': proof}
+    def child(argv, **kwargs):
+        output = 'Calendar gathered\n' if Path(argv[1]).name == 'gather_google.py' else json.dumps(result)
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', child)
+    requests = []
+    def denied(request, timeout):
+        requests.append(request.full_url)
+        raise urllib.error.HTTPError(url, 402, 'fixture', {}, io.BytesIO(body))
+    monkeypatch.setattr(gemini.urllib.request, 'urlopen', denied)
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({'pack': str(PACK), 'kind': 'proactive'})])
+    assert procedure_runner.main() == (MODEL_BUDGET_EXIT if terminal else 1)
+    assert requests == ['https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent']

@@ -159,7 +159,7 @@ def test_photon_policy_rejects_groups_even_from_owner():
 
 
 @pytest.mark.parametrize('mode', ['managed', 'self-host'])
-def test_photon_formats_chat_and_standalone_at_registered_boundary(monkeypatch, mode):
+def test_photon_formats_chat_and_standalone_at_registered_boundary(tmp_path, monkeypatch, mode):
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
     import asyncio
     import sys
@@ -187,7 +187,11 @@ def test_photon_formats_chat_and_standalone_at_registered_boundary(monkeypatch, 
         deliveries.append(content)
         return SimpleNamespace(success=not fail_delivery)
 
-    upstream.PhotonAdapter = type('Adapter', (), {'send': deliver})
+    async def original_handle(self, event):
+        return 'handled'
+
+    upstream.PhotonAdapter = type('Adapter', (), {'send': deliver,
+                                                   'handle_message': original_handle})
     upstream.SendResult = SimpleNamespace
     gateway = types.ModuleType('gateway.run')
     gateway._PROVIDER_ERROR_REPLIES = ()
@@ -228,6 +232,29 @@ def test_photon_formats_chat_and_standalone_at_registered_boundary(monkeypatch, 
     rejected = asyncio.run(registration['standalone_sender_fn'](None, 'stranger', raw))
     if mode == 'self-host':
         assert rejected['message_id'] == 'provider-fixture' and len(sent) == 2
+        monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+        monkeypatch.delenv('SOTTO_TENANT_ID', raising=False)
+        monkeypatch.setenv('PHOTON_ALLOWED_USERS', 'owner')
+        monkeypatch.setenv('PHOTON_PROJECT_ID', 'project')
+        monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'false')
+        receipt = tmp_path / 'config/photon-activation.json'
+        group = SimpleNamespace(source=SimpleNamespace(chat_type='group', user_id='owner',
+                                                       chat_id='group-chat'))
+        outsider = SimpleNamespace(source=SimpleNamespace(chat_type='dm', user_id='stranger',
+                                                          chat_id='stranger-chat'))
+        owner = SimpleNamespace(source=SimpleNamespace(chat_type='dm', user_id='owner',
+                                                       chat_id='owner-chat'))
+        assert asyncio.run(adapter.handle_message(group)) == 'handled'
+        assert asyncio.run(adapter.handle_message(outsider)) == 'handled'
+        assert not receipt.exists()
+        assert asyncio.run(adapter.handle_message(owner)) == 'handled'
+        assert json.loads(receipt.read_text()) == {'tenant_id': '', 'owner': 'owner',
+                                                    'chat_id': 'owner-chat', 'activated': True,
+                                                    'project_fingerprint': module.project_fingerprint('project')}
+        receipt.unlink()
+        monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'true')
+        assert asyncio.run(adapter.handle_message(owner)) == 'handled'
+        assert not receipt.exists()
         return  # tenant budget/owner restrictions apply only to managed mode
     assert 'error' in rejected and len(sent) == 1
     # The rejection is the owner-only guard in `owner_send` (product code), not a provider/gateway

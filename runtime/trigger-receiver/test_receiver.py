@@ -39,6 +39,7 @@ def test_rejects_path_traversal_date(tmp_path):
 
 def test_enqueue_failure_leaves_no_delivered_flag(tmp_path, monkeypatch):
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     def boom(*_):
         raise FileNotFoundError("hermes missing")
     monkeypatch.setattr(rec, "run_skill", boom)
@@ -154,10 +155,65 @@ def test_set_timezone_validates_and_persists(tmp_path, monkeypatch):
     # rejects junk / bare offsets (we want a real IANA zone for DST correctness)
     assert rec.set_timezone("")[0] is False
     assert rec.set_timezone("Mars/Phobos zzz")[0] is False
+    assert rec.set_timezone("Mars/Phobos")[0] is False
     assert rec.set_timezone("+05:30")[0] is False          # no '/', not IANA
     ok, val = rec.set_timezone("America/Los_Angeles")
     assert ok and val == "America/Los_Angeles"
     assert rec.read_settings()["timezone"] == "America/Los_Angeles"
+
+
+def test_authenticated_cloud_zone_sets_first_schedule_but_preserves_explicit_zone(tmp_path, monkeypatch):
+    from datetime import timezone
+
+    monkeypatch.setattr(rec, "SETTINGS_FILE", str(tmp_path / "config" / "settings.json"))
+    monkeypatch.delenv("SOTTO_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(rec, "_hermes_adapter", lambda *_: type("A", (), {"set_timezone": lambda *a, **k: False})())
+    instant = datetime(2026, 9, 27, 15, 14, tzinfo=timezone.utc)
+    monkeypatch.setattr(rec, "_local_now", lambda: instant.astimezone(
+        rec.TZCHAIN.resolve(rec._configured_tz_name()) or timezone.utc))
+    assert rec._scheduled_slot("30 12 * * *") == "2026-09-27"  # UTC fallback would fire midday.
+    rec.accept_cloud_timezone("America/Los_Angeles")
+    assert rec.read_settings()["timezone"] == "America/Los_Angeles"
+    assert rec._scheduled_slot("30 12 * * *") is None  # 08:14 on the owner's first morning.
+    rec.accept_cloud_timezone("Europe/Paris")
+    assert rec.read_settings()["timezone"] == "America/Los_Angeles"
+    monkeypatch.setenv("SOTTO_TIMEZONE", "Asia/Tokyo")
+    rec.accept_cloud_timezone("Europe/Paris")
+    assert rec.read_settings()["timezone"] == "America/Los_Angeles"
+
+
+def test_manual_timezone_write_and_cloud_first_zone_are_serialized(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, "SETTINGS_FILE", str(tmp_path / "config" / "settings.json"))
+    monkeypatch.delenv("SOTTO_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(rec, "_hermes_adapter", lambda *_: type("A", (), {"set_timezone": lambda *a, **k: False})())
+    entered, release, manual_done = threading.Event(), threading.Event(), threading.Event()
+    real_write = rec.write_setting
+    def delayed_write(key, value):
+        if threading.current_thread().name == "cloud-timezone":
+            entered.set()  # Cloud already saw no configured zone, but has not persisted its own.
+            assert release.wait(3)
+        return real_write(key, value)
+    monkeypatch.setattr(rec, "write_setting", delayed_write)
+    automatic = threading.Thread(name="cloud-timezone",
+                                 target=lambda: rec.accept_cloud_timezone("America/Los_Angeles"))
+    def manual_set():
+        rec.set_timezone("Europe/Paris")
+        manual_done.set()
+    manual = threading.Thread(target=manual_set)
+    automatic.start()
+    assert entered.wait(3)
+    manual.start()
+    try:
+        assert not manual_done.wait(0.1), "manual choice must wait for the in-flight automatic write"
+    finally:
+        release.set()
+    automatic.join(3)
+    manual.join(3)
+    assert not manual.is_alive() and not automatic.is_alive()
+    assert manual_done.is_set()
+    assert rec.read_settings()["timezone"] == "Europe/Paris"
 
 
 class _CronCLI:
@@ -335,10 +391,149 @@ def test_setup_google_client_rejects_bad_input(tmp_path, monkeypatch):
     assert ok is False and "OAuth client" in msg
 
 
+@pytest.mark.parametrize(("client", "expected"), [
+    ({"web": {"client_id": "web-client", "client_secret": "not-a-real-secret"}},
+     "OAuth client JSON is incomplete"),
+    ({"installed": None}, "Choose a Web application"),
+    ({"installed": []}, "Choose a Web application"),
+    ({"installed": {}}, "Choose a Web application"),
+    ({"installed": {"client_id": "desktop-client"}}, "Choose a Web application"),
+    ({"web": {"client_id": "web-client", "client_secret": "secret",
+              "auth_uri": "https://attacker.example/authorize",
+              "token_uri": "https://oauth2.googleapis.com/token",
+              "redirect_uris": ["https://myapp.up.railway.app/google/oauth/callback"]}},
+     "downloaded from Google Cloud"),
+    ({"web": {"client_id": "web-client", "client_secret": "secret",
+              "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+              "token_uri": "https://attacker.example/token",
+              "redirect_uris": ["https://myapp.up.railway.app/google/oauth/callback"]}},
+     "downloaded from Google Cloud"),
+    ({"web": {"client_id": "web-client", "client_secret": "secret",
+              "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+              "token_uri": "https://oauth2.googleapis.com/token",
+              "redirect_uris": ["https://other.example/google/oauth/callback"]}},
+     "Authorized redirect URI"),
+])
+def test_setup_google_client_rejects_unsupported_or_malformed_without_overwriting(
+        tmp_path, monkeypatch, client, expected):
+    monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
+    home = tmp_path / ".hermes"
+    monkeypatch.setattr(rec, "_google_setup_py", lambda: "/fake/setup.py")
+    monkeypatch.setattr(
+        rec, "_hermes_adapter",
+        lambda _name: types.SimpleNamespace(home_path=lambda name: str(home / name)))
+    home.mkdir()
+    configured_client = home / "google_client_secret.json"
+    original = '{"installed":{"client_id":"existing-desktop-client"}}'
+    configured_client.write_text(original)
+
+    def unexpected_subprocess(*_args, **_kwargs):
+        raise AssertionError("unsupported client reached Google setup subprocess")
+
+    monkeypatch.setattr(rec.subprocess, "run", unexpected_subprocess)
+
+    ok, msg = rec.setup_google_client(json.dumps(client))
+
+    assert ok is False
+    assert expected in msg
+    assert configured_client.read_text() == original
+
+
 def test_setup_google_client_missing_tool(monkeypatch):
+    monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "_google_setup_py", lambda: None)
-    ok, msg = rec.setup_google_client('{"installed": {"client_id": "x"}}')
+    client = {"web": {"client_id": "x", "client_secret": "y",
+                      "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                      "token_uri": "https://oauth2.googleapis.com/token",
+                      "redirect_uris": ["https://myapp.up.railway.app/google/oauth/callback"]}}
+    ok, msg = rec.setup_google_client(json.dumps(client))
     assert ok is False and "setup tool not found" in msg
+
+
+def test_setup_google_client_saves_web_client_without_minting_authorization(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(rec, "_google_setup_py", lambda: "/fake/setup.py")
+    monkeypatch.setattr(
+        rec, "_hermes_adapter",
+        lambda _name: types.SimpleNamespace(home_path=lambda name: str(home / name)))
+    monkeypatch.setattr(rec, "GAUTH_FILE", str(tmp_path / "google-auth-url.txt"))
+    monkeypatch.setattr(rec.subprocess, "run", lambda *_a, **_k: pytest.fail("save launched consent"))
+    client = {"web": {
+        "client_id": "web-client", "client_secret": "web-secret",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["https://myapp.up.railway.app/google/oauth/callback"],
+    }}
+
+    ok, msg = rec.setup_google_client(json.dumps(client))
+
+    assert ok is True and "Client saved" in msg
+    assert json.loads((home / "google_client_secret.json").read_text()) == client
+    assert not (home / "google_oauth_pending.json").exists()
+    assert not Path(rec.GAUTH_FILE).exists()
+
+
+@pytest.mark.parametrize('mode', ['self-host', 'managed'])
+def test_google_setup_uses_real_adapter_cli_and_preserves_callback_state(tmp_path, monkeypatch, mode):
+    import sys
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    home = tmp_path / '.hermes'
+    # Reproduce an installed upstream helper whose CLI lacks Sotto's flags.
+    legacy = home / 'skills/google-workspace/scripts/setup.py'
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('raise SystemExit("unrecognized arguments: --services --format")')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
+    monkeypatch.setenv('RAILWAY_PUBLIC_DOMAIN', 'myapp.up.railway.app')
+    monkeypatch.setattr(rec, 'RAILWAY_DOMAIN', 'myapp.up.railway.app')
+    monkeypatch.setattr(rec.shutil, 'which', lambda _name: sys.executable)
+    monkeypatch.setattr(rec, 'GAUTH_FILE', str(tmp_path / 'google-auth-url.txt'))
+    assert Path(rec._google_setup_py()).name == 'google_setup.py'
+    client = {'web': {
+        'client_id': 'offline-fixture', 'client_secret': 'not-a-real-secret',
+        'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+        'token_uri': 'https://oauth2.googleapis.com/token',
+        'redirect_uris': ['https://myapp.up.railway.app/google/oauth/callback'],
+    }}
+    # No subprocess/Flow mock: this is the exact receiver-to-CLI boundary that broke.
+    ok, message = rec.setup_google_client(json.dumps(client))
+    assert ok, message
+    browser_binding = hashlib.sha256(b'browser-cookie').hexdigest()
+    url = rec.start_google_authorization(browser_binding)
+    pending_path = home / 'google_oauth_pending.json'
+    pending = json.loads(pending_path.read_text())
+    query = parse_qs(urlparse(url).query)
+    assert query['state'] == [pending['state']]
+    assert query['redirect_uri'] == ['https://myapp.up.railway.app/google/oauth/callback']
+    assert pending['browser_binding'] == browser_binding
+    assert query['code_challenge_method'] == ['S256']
+    assert set(query['scope'][0].split()) == {
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/calendar',
+    }
+    assert not (home / 'google_token.json').exists()
+    # The complete callback URL and browser binding must reach the helper in both
+    # modes. A stripped state would no longer be rejected before token exchange.
+    real_run = rec.subprocess.run
+
+    def exchange_command(argv, **kwargs):
+        assert argv[argv.index('--auth-code') + 1] == (
+            'https://myapp.up.railway.app/google/oauth/callback?code=fixture&state=wrong')
+        assert argv[argv.index('--browser-binding') + 1] == browser_binding
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(rec.subprocess, 'run', exchange_command)
+    ok, message = rec.exchange_google_code(
+        'https://myapp.up.railway.app/google/oauth/callback?code=fixture&state=wrong',
+        browser_binding)
+    assert not ok and message == 'Google could not finish connecting. Please try again.'
+    assert json.loads(pending_path.read_text()) == pending
+    assert not (home / 'google_token.json').exists()
 
 
 def test_setup_status_shape(tmp_path, monkeypatch):
@@ -607,10 +802,82 @@ def test_setup_page_tile_three_follows_the_channel(tmp_path, monkeypatch):
     assert "prepare your first brief automatically" in page
 
 
+def test_photon_setup_requires_provider_and_authenticated_owner_dm(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'self-host')
+    monkeypatch.delenv('SOTTO_TENANT_ID', raising=False)
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550123')
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550123')
+    monkeypatch.delenv('PHOTON_PROJECT_ID', raising=False)
+    monkeypatch.delenv('PHOTON_PROJECT_SECRET', raising=False)
+    monkeypatch.setattr(rec, 'RAILWAY_DOMAIN', 'myapp.up.railway.app')
+    monkeypatch.setattr(rec, 'MCP_TOKEN', 'tok123')
+    monkeypatch.setattr(rec, 'RELAY_TOKEN', 'tok123')
+    st = {'bridge_connected': True, 'google_connected': True, 'google_detail': 'ok',
+          'google_client_present': True, 'timezone': 'America/Los_Angeles', 'whatsapp': 'unknown'}
+    monkeypatch.setattr(rec, 'setup_status', lambda: dict(st, channel='photon',
+                                                          channel_status=rec._photon_status()))
+    assert rec._photon_status() == 'unknown'
+    page = rec._setup_page('abc')
+    assert 'Photon is not ready' in page and 'hero-cta' not in page
+    assert '+15555550123' not in page
+
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'project')
+    monkeypatch.setenv('PHOTON_PROJECT_SECRET', 'private-secret')
+    assert rec._photon_status() == 'pairing'
+    page = rec._setup_page('abc')
+    assert 'Send one hello' in page
+    assert 'ending in 0123' in page and 'hero-cta' not in page
+    path = tmp_path / 'config/photon-activation.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'tenant_id': '', 'owner': '+15555550123',
+                                'chat_id': 'owner-dm', 'activated': True}))
+    assert rec._photon_status() == 'pairing'  # no old-project proof for a self-host receipt
+    path.write_text(json.dumps({'tenant_id': '', 'owner': '+15555550123',
+                                'chat_id': 'owner-dm', 'activated': True,
+                                'project_fingerprint': rec._hermes_adapter('sotto_photon').project_fingerprint('project')}))
+    assert rec._photon_status() == 'linked'
+    page = rec._setup_page('abc')
+    assert 'Owner iMessage ending in 0123 was received' in page and 'hero-cta' in page
+
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'other-project')
+    assert rec._photon_status() == 'pairing'
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'project')
+    monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'true')
+    assert rec._photon_status() == 'unknown'
+    monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'false')
+    assert rec._photon_status() == 'linked'
+
+    path.write_text(json.dumps({'tenant_id': '', 'owner': '+15555550999',
+                                'chat_id': 'owner-dm', 'activated': True}))
+    assert rec._photon_status() == 'pairing'
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550999')
+    assert rec._photon_status() == 'unknown'
+
+
+def test_managed_photon_legacy_receipt_keeps_existing_owner(tmp_path, monkeypatch):
+    rec.DATA = str(tmp_path)
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'owner@example.test')
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', 'owner@example.test')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'managed-project')
+    monkeypatch.setenv('PHOTON_PROJECT_SECRET', 'private-secret')
+    monkeypatch.delenv('PHOTON_ALLOW_ALL_USERS', raising=False)
+    path = tmp_path / 'config/photon-activation.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'tenant_id': 'pilot', 'owner': 'owner@example.test',
+                                'chat_id': 'owner-dm', 'activated': True}))
+    assert rec._photon_status() == 'linked'
+    monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'true')
+    assert rec._photon_status() == 'unknown'
+
+
 def test_setup_page_google_box_has_the_full_recipe(monkeypatch):
     """When no OAuth client is saved yet, the Google box must walk the user through ALL of it:
     enable the two APIs, publish the consent screen to In production (else the token dies in ~7
-    days), create a Desktop-app client, download + paste the JSON. Omitting any step strands a
+    days), create a Web-application client, download + paste the JSON. Omitting any step strands a
     fresh Google Cloud project at 'Save client' with a client that can't authorize."""
     monkeypatch.setattr(rec, "RAILWAY_DOMAIN", "myapp.up.railway.app")
     monkeypatch.setattr(rec, "MCP_TOKEN", "tok123")
@@ -621,7 +888,7 @@ def test_setup_page_google_box_has_the_full_recipe(monkeypatch):
     page = rec._setup_page("abc")
     assert "Gmail API" in page and "Google Calendar API" in page          # step 1: enable APIs
     assert "In production" in page and "~7 days" in page                  # step 2: consent published
-    assert "Desktop app" in page and "Download JSON" in page              # step 3: client + JSON
+    assert "Web application" in page and "Download JSON" in page              # step 3: client + JSON
     assert "/setup/google-client?code=abc" in page                        # step 4: paste form
 
 
@@ -629,6 +896,7 @@ def test_stale_claim_retries_when_never_delivered(tmp_path, monkeypatch):
     """A claim with no .delivered marker after 30 min = the spawned run died silently. A fresh
     trigger must reclaim and retry instead of losing the day's brief."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls = []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     flag = rec.delivered_flag("2026-06-24", "morning")
@@ -662,6 +930,7 @@ def test_stale_reclaim_is_serialized_single_spawn(tmp_path, monkeypatch):
     racing on a stale claim can't both reclaim: the winner reclaims (fresh mtime), the loser sees a
     fresh claim and dedupes. Exercised sequentially — the lock makes the interleaving equivalent."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls = []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     flag = rec.delivered_flag("2026-06-27", "morning")
@@ -679,6 +948,7 @@ def test_stale_reclaim_is_serialized_single_spawn(tmp_path, monkeypatch):
 def test_fresh_claim_still_dedupes(tmp_path, monkeypatch):
     """A recent claim (run plausibly in flight) must keep deduping even without .delivered yet."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls = []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     flag = rec.delivered_flag("2026-06-26", "morning")
@@ -737,6 +1007,7 @@ def test_wake_after_delivered_folds_payload_into_snapshot(tmp_path, monkeypatch)
 def _wake_fixture(tmp_path, monkeypatch):
     """The trigger's spawn + seed seams, both recorded; the seed runs inline so nothing races."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls, seeded = [], []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     monkeypatch.setattr(rec, "_seed_snapshot_from", lambda p: seeded.append(p))
@@ -1083,6 +1354,7 @@ def test_the_setup_surface_is_defended_like_the_dashboard(tmp_path, monkeypatch)
 
 def test_enqueue_then_dedupe(tmp_path, monkeypatch):
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls = []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     code1, r1 = rec.handle_trigger({"type": "morning_ready", "date": "2026-06-23", "local_data": {"window_hours": 24}})
@@ -1197,6 +1469,7 @@ def test_morning_ready_path_unchanged_by_proactive_branch(tmp_path, monkeypatch)
     """The proactive_wake branch must not disturb the brief path: morning_ready still stages the
     payload and enqueues the brief skill."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     calls = []
     monkeypatch.setattr(rec, "run_skill", lambda s, p: calls.append((s, p)))
     code, r = rec.handle_trigger({"type": "morning_ready", "date": "2026-07-06",
@@ -2600,6 +2873,13 @@ def _cron_spec(tmp_path, monkeypatch, rows):
     monkeypatch.setattr(rec, "_CRON_UNPARSED", set())
 
 
+def _established_brief_install(tmp_path):
+    """Cron mechanics below exercise an installation that already sent its first brief."""
+    config = tmp_path / 'config'
+    config.mkdir(exist_ok=True)
+    (config / 'onboarding.json').write_text(json.dumps({'phase': 'delivered', 'completed_at': 1}))
+
+
 def _cron_fires(monkeypatch):
     """Record what the tick spawns, at the one seam a skill is ever started from."""
     fired = []
@@ -2621,6 +2901,7 @@ def test_the_cron_tick_fires_a_receiver_run_job_at_its_minute(tmp_path, monkeypa
     fires HERE — through the same spawn seam every other lane uses, so it lands in the outbox with
     retries and a receipt instead of being delivered in-Hermes with neither."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW, HERMES_ROW])
     fired = _cron_fires(monkeypatch)
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 29))
@@ -2645,6 +2926,7 @@ def test_the_cron_tick_fires_once_a_day_however_often_it_ticks(tmp_path, monkeyp
     first line: one fire per job per local day. The deliver-once marker is the real guarantee — a
     restart mid-window re-fires and the gate supersedes that copy — but nothing should NEED it."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
     fired = _cron_fires(monkeypatch)
     for minute in range(30, 40):
@@ -2678,6 +2960,7 @@ def test_the_cron_tick_honors_the_gate_and_the_schedule_override(tmp_path, monke
     """Same env keys as every other registrar, because it is the same reader: a gated-off job is not
     in the list at all, and `schedule_env` moves the minute the tick fires at."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [
         {**BRIEF_ROW, "gate": "SOTTO_MORNING", "schedule_env": "SOTTO_MORNING_CRON"}])
     fired = _cron_fires(monkeypatch)
@@ -2815,6 +3098,7 @@ def test_a_nudge_lane_is_held_by_the_channel_gate_and_a_brief_is_not(tmp_path, m
     fixed daily lane leaves its slot open for the catch-up window (see the next test). A brief is
     never held: the outbox keeps it until the channel comes back."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [WATCHER_ROW, DIGEST_ROW, BRIEF_ROW])
     fired = _cron_fires(monkeypatch)
     asked = []
@@ -4124,6 +4408,7 @@ def test_a_failed_spawn_does_not_burn_the_whole_day(tmp_path, monkeypatch):
     """A spawn that fails must retry on the next tick — the window bounds that to a handful of
     attempts. Stamping the day on a failure silenced the brief until tomorrow."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     _cron_spec(tmp_path, monkeypatch, [BRIEF_ROW])
     monkeypatch.setattr(rec, "_local_now", lambda: datetime(2026, 8, 31, 6, 31))
     boom = {"on": True}
@@ -4231,6 +4516,7 @@ def test_fire_cron_job_surfaces_terminal_work_and_still_swallows_spawn_failures(
     terminal RuntimeError. _fire_cron_job used to swallow it as "spawn failed", so a receiver
     restarted after a terminal day logged that every minute of the four-hour catch-up window."""
     rec.DATA = str(tmp_path)
+    _established_brief_install(tmp_path)
     monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [
         ('sotto-morning-brief', '30 6 * * *', 'Run my morning brief', 'sotto-morning-brief')])
     monkeypatch.setattr(rec, '_managed_brief', lambda *a, **k: (_ for _ in ()).throw(
@@ -4690,6 +4976,9 @@ def test_managed_scheduled_nudges_wait_for_activation_and_sources(tmp_path, monk
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
     monkeypatch.setenv('SOTTO_TENANT_ID', 'pilot')
     monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550100')
+    monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550100')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture-project')
+    monkeypatch.setenv('PHOTON_PROJECT_SECRET', 'fixture-secret')
     monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
     monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda *a: [(name, '*', 'scheduled check', name)])
     spawned = []
@@ -4698,7 +4987,8 @@ def test_managed_scheduled_nudges_wait_for_activation_and_sources(tmp_path, monk
     root = tmp_path / 'config'
     root.mkdir()
     (root / 'photon-activation.json').write_text(json.dumps({
-        'tenant_id': 'pilot', 'owner': '+15555550100', 'activated': True}))
+        'tenant_id': 'pilot', 'owner': '+15555550100',
+        'chat_id': 'owner-dm', 'activated': True}))
     assert rec._fire_cron_job(name, 'cron:' + name)['error'] == 'capability'
     assert spawned == []
     (root / 'managed-capabilities.json').write_text(json.dumps({

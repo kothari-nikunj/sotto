@@ -1,0 +1,73 @@
+{
+  "name": "Sotto self-host with Photon",
+  "status": "definition only; create in Railway Template Editor before sharing a deploy link",
+  "source": {
+    "repository": "https://github.com/kothari-nikunj/sotto",
+    "rootDirectory": null,
+    "configFile": "railway.toml",
+    "dockerfilePath": "Dockerfile"
+  },
+  "service": {
+    "volumeMountPath": "/data",
+    "healthcheckPath": "/health",
+    "publicHttpDomain": "required; generate in Railway Networking",
+    "port": "8080; the helper creates the public domain with this target, verified live with the receiver's injected PORT"
+  },
+  "variables": {
+    "BRIDGE_TOKEN": {
+      "templateValue": "${{secret(48)}}",
+      "required": true,
+      "description": "Unique Bridge bearer for this deployment"
+    },
+    "GOOGLE_AI_API_KEY": {
+      "required": true,
+      "prompt": true,
+      "aliasesAcceptedByBoot": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+      "description": "Owner-provided Google AI Studio API key"
+    },
+    "SOTTO_CRON_DELIVER": {
+      "value": "photon",
+      "required": true
+    },
+    "PHOTON_PROJECT_ID": {
+      "required": true,
+      "prompt": true,
+      "description": "Owner's independent Photon project ID"
+    },
+    "PHOTON_PROJECT_SECRET": {
+      "required": true,
+      "prompt": true,
+      "secret": true,
+      "description": "Owner's independent Photon project secret"
+    },
+    "PHOTON_HOME_CHANNEL": {
+      "required": true,
+      "prompt": true,
+      "description": "Owner's registered phone number in exact E.164 form (+ and country code); an Apple ID email never activates self-host"
+    },
+    "PHOTON_ALLOWED_USERS": {
+      "required": true,
+      "prompt": true,
+      "mustEqual": "PHOTON_HOME_CHANNEL",
+      "description": "Exact owner identity only; no wildcard or extra users"
+    }
+  },
+  "mustNotSet": [
+    "TELEGRAM_BOT_TOKEN",
+    "SOTTO_DEPLOYMENT_MODE"
+  ],
+  "verification": {
+    "railwayDashboard": [
+      "Repository is the public Sotto distribution or owner's fork; root directory is blank",
+      "Service has a /data volume and generated public domain",
+      "BRIDGE_TOKEN is nonempty and differs from other deployments",
+      "SOTTO_CRON_DELIVER is photon",
+      "PHOTON_ALLOWED_USERS exactly equals PHOTON_HOME_CHANNEL"
+    ],
+    "runtimeSignals": [
+      "Logs show Gemini key/model OK and Photon gateway connected",
+      "Owner sends an inbound hello from the configured identity and receives a reply",
+      "The first brief is visibly received on the owner's device"
+    ]
+  }
+}

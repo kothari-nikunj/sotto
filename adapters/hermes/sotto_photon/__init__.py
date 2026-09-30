@@ -1,5 +1,6 @@
 """Shared Sotto Photon behavior with additional managed tenant guards."""
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,18 @@ def managed():
     return os.environ.get("SOTTO_DEPLOYMENT_MODE") == "managed"
 
 
+def project_fingerprint(project_id):
+    """Bind an activation receipt to a project without persisting its credential."""
+    if not isinstance(project_id, str) or not project_id.strip():
+        return None
+    return hashlib.sha256(('sotto-photon-project-v1:' + project_id).encode()).hexdigest()
+
+
+def restricted_allowlist():
+    return (os.environ.get('PHOTON_ALLOW_ALL_USERS', '').strip().lower()
+            in ('', 'false', '0', 'no', 'off'))
+
+
 def permits(source, owner):
     return bool(owner and source and source.chat_type == "dm" and source.user_id == owner)
 
@@ -69,13 +82,20 @@ def record_owner_activation(source):
     """Only an authenticated owner DM can open this instance's first-brief gate."""
     owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
     chat = getattr(source, 'chat_id', None)
-    if not permits(source, owner) or not isinstance(chat, str) or not chat:
+    if (not restricted_allowlist() or os.environ.get('PHOTON_ALLOWED_USERS') != owner
+            or not permits(source, owner)
+            or not isinstance(chat, str) or not chat):
+        return False
+    fingerprint = project_fingerprint(os.environ.get('PHOTON_PROJECT_ID'))
+    if not managed() and not fingerprint:
         return False
     root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'config'
     root.mkdir(parents=True, exist_ok=True)
     receipt = root / 'photon-activation.json'
-    payload = {'tenant_id': os.environ['SOTTO_TENANT_ID'], 'owner': owner,
+    payload = {'tenant_id': os.environ.get('SOTTO_TENANT_ID', ''), 'owner': owner,
                'chat_id': chat, 'activated': True}
+    if fingerprint:
+        payload['project_fingerprint'] = fingerprint
     try:
         if json.loads(receipt.read_text()) == payload:
             return True
@@ -164,10 +184,14 @@ def register(ctx):
             from . import gallery  # noqa: PLC0415 - installed by photon_setup
             if managed() and not owner_destination(chat_id):
                 return upstream.SendResult(success=False, error='Gallery destination refused')
-            presentation = await asyncio.to_thread(gallery.prepare_prep, content)
+            obligation_id = metadata.get('sotto_obligation_id') if isinstance(metadata, dict) else None
+            # Without the gateway's durable obligation identity, a gallery could not be
+            # distinguished from an identical later reply after a crash. Keep text delivery.
+            presentation = await asyncio.to_thread(gallery.prepare_prep, content) if obligation_id else None
             if presentation:
                 ok, error, receipt = await asyncio.to_thread(
-                    gallery.send_once, presentation['images'], presentation['summary'], 'photon:' + chat_id, reply_to)
+                    gallery.send_once, presentation['images'], presentation['summary'],
+                    'photon:' + chat_id, reply_to, obligation_id, content)
                 if ok:
                     self._record_sent_message(receipt['message_id'])
                     for identifier in receipt.get('message_ids', []):
@@ -176,12 +200,19 @@ def register(ctx):
                 if receipt.get('acceptance') == 'unknown':
                     return upstream.SendResult(success=False, error=error, raw_response=receipt)
                 # Proven unsent/rejected media can safely use the original complete text.
-            return await super()._send_with_retry(chat_id, content, reply_to, metadata,
+            # Base _send_with_retry calls this class's send(). Mark its initial path so
+            # a direct send never consults an unrelated recovery receipt.
+            initial_metadata = {**(metadata if isinstance(metadata, dict) else {}),
+                                'sotto_initial_delivery': True}
+            return await super()._send_with_retry(chat_id, content, reply_to, initial_metadata,
                                                   max_retries=max_retries, base_delay=base_delay)
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             from . import gallery  # noqa: PLC0415 - installed by photon_setup
-            receipt = await asyncio.to_thread(gallery.recovery_receipt, content, 'photon:' + chat_id)
+            obligation_id = metadata.get('sotto_obligation_id') if isinstance(metadata, dict) else None
+            initial = bool(isinstance(metadata, dict) and metadata.get('sotto_initial_delivery'))
+            receipt = (None if initial else await asyncio.to_thread(
+                gallery.recovery_receipt, content, 'photon:' + chat_id, obligation_id))
             if receipt:
                 accepted = receipt.get('acceptance') == 'accepted'
                 return upstream.SendResult(success=accepted, message_id=receipt.get('message_id'),
@@ -226,6 +257,10 @@ def register(ctx):
                     return
                 if not record_owner_activation(event.source):
                     return
+            elif permits(event.source, os.environ.get('PHOTON_HOME_CHANNEL', '')):
+                # The public helper preselects exactly one owner. Keep the same
+                # authenticated DM receipt in self-host mode for setup status.
+                record_owner_activation(event.source)
             if managed() and missing_download_link(event):
                 return await self.send(event.source.chat_id, "Send me the link you want saved as a PDF.",
                                        reply_to=getattr(event, 'message_id', None))

@@ -57,6 +57,8 @@ print(json.dumps(json.loads((root / 'transport.json').read_text())['text']))
     executable.chmod(0o700)
     os.environ['PATH'] = str(executable.parent) + os.pathsep + os.defpath
 
+    gallery_receipts = {}
+
     class Sidecar(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -66,13 +68,21 @@ print(json.dumps(json.loads((root / 'transport.json').read_text())['text']))
             value = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             if self.path == '/gallery-capability':
                 reply = {'galleryVersion': 1}
+            elif self.path == '/gallery-receipt':
+                receipt = gallery_receipts.get(value['dispatchId'])
+                reply = {'found': receipt is not None, **({'receipt': receipt} if receipt else {})}
             else:
                 assert self.path == '/send-gallery' and value['spaceId'] == 'synthetic-owner'
+                assert value['dispatchId']
                 assert value['summary'] and len(value['paths']) == 4
                 assert all(Path(p).read_bytes().startswith(b'\x89PNG\r\n\x1a\n') for p in value['paths'])
                 with calls.open('a') as stream:
                     stream.write(json.dumps({'kind': 'gallery', 'images': len(value['paths'])}) + '\n')
                 reply = json.loads(state.read_text())['gallery']
+                gallery_receipts[value['dispatchId']] = ({'dispatchId': value['dispatchId'],
+                    'acceptance': 'accepted', 'messageId': reply['messageId'],
+                    'messageIds': reply.get('messageIds', [])} if reply.get('messageId') else
+                    {'dispatchId': value['dispatchId'], 'acceptance': 'unknown'})
             encoded = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')

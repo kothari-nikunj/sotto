@@ -6,6 +6,7 @@ operation, retryable with the same device for ten minutes after an ambiguous res
 This service adopts an existing tenant; it does not allocate customer infrastructure.
 """
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -14,7 +15,11 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -26,6 +31,125 @@ except ModuleNotFoundError:
     control_token = lambda: os.environ.get('SOTTO_CONTROL_TOKEN', '')
 
 TTL = 600
+DASHBOARD_GRANT_TTL = 120
+
+
+def iana_timezone(value):
+    if (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_+./-]{0,63}', value)
+            or ('/' not in value and value not in ('UTC', 'GMT'))):
+        raise ValueError('Invalid IANA timezone')
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ValueError('Invalid IANA timezone') from error
+    return value
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _open_broker(request, timeout):
+    return build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def dashboard_grants_db(root):
+    path = Path(root) / 'config/cloud-pairing.sqlite'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=15)
+    db.execute('CREATE TABLE IF NOT EXISTS dashboard_grants ('
+               'grant_hash TEXT PRIMARY KEY, challenge TEXT NOT NULL, expires REAL NOT NULL, '
+               'broker_origin TEXT NOT NULL)')
+    path.chmod(0o600)
+    return db
+
+
+def issue_dashboard_grant(root, body):
+    if (body.get('tenant_id') != os.environ.get('SOTTO_TENANT_ID')
+            or not isinstance(body.get('grant'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', body['grant'])
+            or not isinstance(body.get('challenge'), str)
+            or not re.fullmatch(r'[a-f0-9]{64}', body['challenge'])
+            or type(body.get('expires_at')) not in (int, float)
+            or not time.time() < body['expires_at'] <= time.time() + DASHBOARD_GRANT_TTL):
+        raise ValueError('Invalid dashboard grant')
+    broker = body.get('broker_origin')
+    parsed = urlsplit(broker) if isinstance(broker, str) else None
+    if (not parsed or parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.port not in (None, 443) or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+        raise ValueError('Invalid broker origin')
+    with dashboard_grants_db(root) as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DELETE FROM dashboard_grants WHERE expires<=?', (time.time(),))
+        db.execute('INSERT INTO dashboard_grants VALUES (?,?,?,?)',
+                   (hashlib.sha256(body['grant'].encode()).hexdigest(),
+                    body['challenge'], body['expires_at'], broker))
+    return {'tenant_id': body['tenant_id'], 'accepted': True}
+
+
+def consume_dashboard_grant(root, grant, binding):
+    if (not isinstance(grant, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', grant)
+            or not isinstance(binding, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', binding)):
+        return False
+    challenge = hashlib.sha256(binding.encode()).hexdigest()
+    with dashboard_grants_db(root) as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT challenge,broker_origin FROM dashboard_grants WHERE grant_hash=? AND expires>?',
+                         (hashlib.sha256(grant.encode()).hexdigest(), time.time())).fetchone()
+        if not row or not hmac.compare_digest(row[0], challenge):
+            return False
+        body = json.dumps({'tenant_id': os.environ.get('SOTTO_TENANT_ID'), 'grant': grant}).encode()
+        request = Request(row[1] + '/v1/dashboard/validate', data=body,
+                          headers={'Authorization': 'Bearer ' + control_token(),
+                                   'Content-Type': 'application/json'}, method='POST')
+        try:
+            with _open_broker(request, timeout=5) as response:
+                accepted = json.load(response)
+        except (OSError, ValueError):
+            return False
+        if (not isinstance(accepted, dict) or accepted.get('accepted') is not True
+                or accepted.get('tenant_id') != os.environ.get('SOTTO_TENANT_ID')
+                or type(accepted.get('expires_at')) not in (int, float)
+                or accepted['expires_at'] <= time.time()):
+            return False
+        db.execute('DELETE FROM dashboard_grants WHERE grant_hash=?', (hashlib.sha256(grant.encode()).hexdigest(),))
+    return {'broker_origin': row[1], 'grant': grant, 'expires_at': accepted['expires_at']}
+
+
+def dashboard_session_active(cloud):
+    """Recheck the broker's live account, tenant and logout-sensitive lease."""
+    if not managed.enabled() or not control_token():
+        return False
+    if not isinstance(cloud, dict) or type(cloud.get('expires_at')) not in (int, float):
+        return False
+    if cloud['expires_at'] <= time.time():
+        return False
+    origin, grant = cloud.get('broker_origin'), cloud.get('grant')
+    if not isinstance(origin, str) or not isinstance(grant, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', grant):
+        return False
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or port not in (None, 443) or parsed.path not in ('', '/')
+            or parsed.query or parsed.fragment):
+        return False
+    try:
+        body = json.dumps({'tenant_id': os.environ.get('SOTTO_TENANT_ID'), 'grant': grant}).encode()
+        request = Request(origin + '/v1/dashboard/session', data=body,
+                          headers={'Authorization': 'Bearer ' + control_token(),
+                                   'Content-Type': 'application/json'}, method='POST')
+        with _open_broker(request, timeout=5) as response:
+            result = json.load(response)
+    except (OSError, ValueError):
+        return False
+    return (isinstance(result, dict) and result.get('accepted') is True
+            and result.get('tenant_id') == os.environ.get('SOTTO_TENANT_ID')
+            and type(result.get('expires_at')) in (int, float)
+            and result['expires_at'] > time.time())
 
 
 def device_key(raw):
@@ -36,8 +160,8 @@ def device_key(raw):
 
 
 class Pairing:
-    def __init__(self, root, adapter):
-        self.root, self.adapter = Path(root), adapter
+    def __init__(self, root, adapter, on_timezone=None):
+        self.root, self.adapter, self.on_timezone = Path(root), adapter, on_timezone
         self.path = self.root / 'config/cloud-pairing.sqlite'
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.db() as db:
@@ -68,11 +192,26 @@ class Pairing:
         if entry not in ('mac', 'browser'):
             raise ValueError('Invalid sign-in entry')
         if entry == 'mac':
-            device_key(body['public_key'])
+            key = device_key(body['public_key'])
             if not isinstance(body['challenge'], str) or not 32 <= len(body['challenge']) <= 128:
                 raise ValueError('Invalid device challenge')
+            if 'timezone' in body or 'timezone_signature' in body:
+                if 'timezone' not in body or 'timezone_signature' not in body:
+                    raise ValueError('Timezone requires device signature')
+                native_zone = iana_timezone(body['timezone'])
+                try:
+                    key.verify(base64.b64decode(body['timezone_signature'], validate=True),
+                               ('sotto-cloud-timezone\n' + body['challenge'] + '\n' + native_zone).encode(),
+                               ec.ECDSA(hashes.SHA256()))
+                except (ValueError, TypeError, binascii.Error, InvalidSignature) as error:
+                    raise ValueError('Invalid signed timezone') from error
+            else:
+                native_zone = None
         elif 'public_key' in body or 'challenge' in body:
             raise ValueError('Browser sign-in cannot enroll a device')
+        else:
+            native_zone = None
+        browser_zone = iana_timezone(body['timezone']) if entry == 'browser' and 'timezone' in body else None
         if not isinstance(body['sub'], str) or not 1 <= len(body['sub']) <= 255:
             raise ValueError('Invalid account')
         fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -130,12 +269,17 @@ class Pairing:
             accepted = db.execute('SELECT COALESCE(MAX(generation),0) FROM bootstraps').fetchone()[0]
             if generation < accepted or pending['expires'] <= time.time():
                 raise PermissionError('Handoff expired or superseded by a newer Google connection')
+            zone = browser_zone or native_zone
+            if zone and self.on_timezone:
+                self.on_timezone(zone)
             scopes = self.adapter.install_cloud_google(body['credentials'])
             managed.record_google_consent(self.root, scopes)
             if entry == 'mac':
                 db.execute('INSERT INTO grants VALUES (?,?,?,?,?)', (body['request_id'], body['public_key'],
                            body['challenge'], pending['expires'], 'issued'))
             result = result_for(pending['expires'])
+            if zone and self.on_timezone:
+                result['timezone_applied'] = True
             db.execute('UPDATE bootstraps SET result=?,applied=1 WHERE id=?',
                        (json.dumps(result), body['request_id']))
         return result
@@ -206,12 +350,12 @@ def bridge_authenticated(root, credential):
         return False
 
 
-def handle(handler, path, root, adapter=None, *, adapter_factory=None):
+def handle(handler, path, root, adapter=None, *, adapter_factory=None, on_timezone=None):
     """Called before legacy receiver auth; no managed control credential, no route."""
     control = control_token()
-    if not managed.enabled() or not control or path not in ('/cloud/bootstrap', '/cloud/pair', '/cloud/consent', '/cloud/devices', '/cloud/status'):
+    if not managed.enabled() or not control or path not in ('/cloud/bootstrap', '/cloud/pair', '/cloud/consent', '/cloud/devices', '/cloud/status', '/cloud/dashboard-grant'):
         return handler._send(404, {'error': 'Not found'})
-    if path in ('/cloud/bootstrap', '/cloud/devices') and not handler._authed(control):
+    if path in ('/cloud/bootstrap', '/cloud/devices', '/cloud/dashboard-grant') and not handler._authed(control):
         return handler._send(401, {'error': 'Unauthorized'})
     if path in ('/cloud/consent', '/cloud/status'):
         authorization = handler.headers.get('Authorization', '')
@@ -225,6 +369,8 @@ def handle(handler, path, root, adapter=None, *, adapter_factory=None):
         if not 0 < length <= 32768:
             raise ValueError('Invalid request')
         body = json.loads(handler.rfile.read(length))
+        if path == '/cloud/dashboard-grant':
+            return handler._send(200, issue_dashboard_grant(root, body))
         if path == '/cloud/status':
             return handler._send(200, managed.connection_status(root))
         if path == '/cloud/consent':
@@ -233,7 +379,7 @@ def handle(handler, path, root, adapter=None, *, adapter_factory=None):
             return handler._send(200, {'ok': True})
         if path == '/cloud/bootstrap' and adapter_factory is not None:
             adapter = adapter_factory()
-        pairing = Pairing(root, adapter)
+        pairing = Pairing(root, adapter, on_timezone=on_timezone)
         if path == '/cloud/devices':
             if body.get('operation') == 'list':
                 return handler._send(200, {'devices': pairing.devices(), 'scope': 'bridge_access'})

@@ -27,6 +27,12 @@ def rec(tmp_path, monkeypatch):
     return module
 
 
+def _established_brief_install(tmp_path):
+    config = tmp_path / 'config'
+    config.mkdir(exist_ok=True)
+    (config / 'onboarding.json').write_text(json.dumps({'phase': 'delivered', 'completed_at': 1}))
+
+
 def test_worker_preserves_artifact_coverage_and_delivery_deadline_on_replay(rec, tmp_path, monkeypatch):
     cutoff = '2026-09-07T13:20:00Z'
     monkeypatch.setattr(rec, '_read_delivery_effects', lambda run_id: {
@@ -44,6 +50,8 @@ def test_worker_preserves_artifact_coverage_and_delivery_deadline_on_replay(rec,
 @pytest.mark.parametrize('mode', ['selfhost', 'managed'])
 def test_early_brief_is_one_job_per_calendar_and_consent_revision_in_both_modes(rec, tmp_path, monkeypatch, mode):
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
+    if mode == 'selfhost':
+        _established_brief_install(tmp_path)
     import managed
     import onboarding
     import source_context
@@ -103,6 +111,7 @@ def test_delivered_brief_skips_all_preparation(rec, tmp_path, monkeypatch):
 
 
 def test_terminal_prepare_key_isolated_and_not_retried_each_tick(rec, tmp_path, monkeypatch):
+    _established_brief_install(tmp_path)
     import managed
     import onboarding
     monkeypatch.setattr(managed, 'brief_hold', lambda root: None)

@@ -31,8 +31,73 @@ def handoff():
 
 
 def signed(key, grant, challenge):
-    signature = key.sign(('sotto-cloud-pair\n' + grant + '\n' + challenge).encode(), ec.ECDSA(hashes.SHA256()))
+    message = 'sotto-cloud-pair\n' + grant + '\n' + challenge
+    signature = key.sign(message.encode(), ec.ECDSA(hashes.SHA256()))
     return {'pairing_grant': grant, 'signature': base64.b64encode(signature).decode()}
+
+
+def test_native_timezone_is_bound_to_device_challenge_before_google_source_install(pairing):
+    service, _ = pairing
+    events = []
+    def apply(zone):
+        assert service.devices() == []
+        events.append(('zone', zone))
+    service.on_timezone = apply
+    key, body = handoff()
+    service.adapter.install_cloud_google = lambda value: events.append(('install', value)) or []
+    zone = 'America/Los_Angeles'
+    signature = base64.b64encode(key.sign(('sotto-cloud-timezone\n' + body['challenge'] + '\n' + zone).encode(),
+                                          ec.ECDSA(hashes.SHA256()))).decode()
+    request = {**body, 'timezone': zone, 'timezone_signature': signature}
+    with pytest.raises(ValueError, match='signed timezone'):
+        service.bootstrap({**request, 'timezone': 'Europe/Paris'})
+    with pytest.raises(ValueError, match='IANA timezone'):
+        service.bootstrap({**request, 'timezone': 'Mars/Phobos'})
+    assert events == [] and service.devices() == []
+    result = service.bootstrap(request)
+    assert result['timezone_applied'] is True
+    assert events == [('zone', zone), ('install', None)]
+    paired = service.redeem(signed(key, result['pairing_grant'], body['challenge']))
+    assert service.authenticated(paired['bridge_token'])
+
+
+def test_browser_timezone_precedes_source_install_and_is_bound_to_handoff(pairing):
+    service, installed = pairing
+    events = []
+    service.on_timezone = lambda zone: events.append(('zone', zone))
+    service.adapter.install_cloud_google = lambda value: events.append(('install', value)) or []
+    body = {'entry': 'browser', 'tenant_id': 'tenant', 'request_id': 'd' * 64,
+            'sub': 'google-sub', 'credentials': None, 'timezone': 'America/Los_Angeles'}
+    assert service.bootstrap(body)['account_connected']
+    assert events == [('zone', 'America/Los_Angeles'), ('install', None)]
+    assert service.bootstrap(body)['account_connected'] and len(events) == 2
+    with pytest.raises(PermissionError):
+        service.bootstrap({**body, 'timezone': 'Europe/Paris'})
+    with pytest.raises(ValueError, match='IANA timezone'):
+        service.bootstrap({**body, 'request_id': 'e' * 64, 'timezone': 'Mars/Phobos'})
+    assert installed == []
+
+
+def test_superseded_pending_browser_handoff_cannot_set_older_timezone(pairing):
+    service, _ = pairing
+    events = []
+    def apply(zone):
+        if zone == 'America/Los_Angeles':
+            raise OSError('transient settings failure')
+        events.append(('zone', zone))
+    service.on_timezone = apply
+    first = {'entry': 'browser', 'tenant_id': 'tenant', 'request_id': 'd' * 64,
+             'sub': 'google-sub', 'credentials': None, 'credential_generation': 1,
+             'timezone': 'America/Los_Angeles'}
+    second = {**first, 'request_id': 'e' * 64, 'credential_generation': 2,
+              'timezone': 'Europe/Paris'}
+    service.adapter.install_cloud_google = lambda _: events.append(('install', None)) or []
+    with pytest.raises(OSError):
+        service.bootstrap(first)
+    service.bootstrap(second)
+    with pytest.raises(PermissionError, match='superseded'):
+        service.bootstrap(first)
+    assert events == [('zone', 'Europe/Paris'), ('install', None)]
 
 
 def test_google_install_once_pairing_requires_device_key_and_retry_is_stable(pairing):

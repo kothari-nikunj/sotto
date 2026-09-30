@@ -549,6 +549,23 @@ def test_provider_failure_goes_silent_and_below_gate_makes_no_call(monkeypatch):
     assert dc.check([_entry(1)]) == {"deliver": False}
 
 
+def test_typed_budget_denial_preserves_window_and_exits_without_retry(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DIGEST_MIN", "1")
+    _write_queue(tmp_path, [_entry(1)])
+    def denied(_conversations):
+        raise dc.ModelBudgetUnavailableError("private budget detail")
+    monkeypatch.setattr(dc, "review_conversations", denied)
+    monkeypatch.setattr("sys.argv", ["digest_check.py", "--now", NOW.isoformat()])
+    with pytest.raises(SystemExit) as exit_info:
+        dc.main()
+    assert exit_info.value.code == dc.MODEL_BUDGET_EXIT
+    assert json.loads(capsys.readouterr().out) == {
+        "deliver": False, "status": "budget_exhausted", "budget_exhausted": True}
+    assert dc.read_stamp() is None
+    assert not (tmp_path / "events/digest_accepted.json").exists()
+
+
 def test_reviewed_urgency_precedes_recency_at_the_cap(monkeypatch):
     entries = [_entry(i, sender=f"Person {i}") for i in range(8)]
     monkeypatch.setattr(dc, "review_conversations", lambda cs: [

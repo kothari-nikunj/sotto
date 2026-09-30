@@ -38,13 +38,18 @@ def messaging_activated(data):
             and state.get("owner") == os.environ.get("PHOTON_HOME_CHANNEL"))
 
 
+def eligible_context_source(name):
+    """Contacts identify people but cannot establish context for a personal brief."""
+    return name not in ("contacts", "google_contacts")
+
+
 def has_sources(data):
     # Written by authenticated consent/provisioning, not from event counts or Bridge
     # liveness: an established local source stays connected when its Mac sleeps.
     sources = read_state(data, "managed-capabilities.json").get("sources", {})
     return isinstance(sources, dict) and any(
         isinstance(v, dict) and v.get("consented") is True and v.get("connected") is True
-        for key, v in sources.items() if key not in ("contacts", "google_contacts"))
+        for key, v in sources.items() if eligible_context_source(key))
 
 
 def connection_status(data):

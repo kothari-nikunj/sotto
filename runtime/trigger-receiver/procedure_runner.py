@@ -9,6 +9,10 @@ import time
 from datetime import datetime, timezone
 
 
+class ProcedureModelBudgetError(RuntimeError):
+    """A declared model-capable child reported typed budget exhaustion."""
+
+
 def run(request):
     pack = Path(request['pack'])
     sys.path.insert(0, str(pack / '_shared/lib'))
@@ -17,6 +21,10 @@ def run(request):
     def command(relative, *args, decode=True, incomplete_exit=None):
         result = subprocess.run([sys.executable, str(pack / relative), *map(str, args)],
                                 capture_output=True, text=True, timeout=600)
+        if relative == 'event-triage/scripts/digest_check.py':
+            from work_queue import MODEL_BUDGET_EXIT
+            if result.returncode == MODEL_BUDGET_EXIT:
+                raise ProcedureModelBudgetError('digest model allowance reached')
         if result.returncode and result.returncode == incomplete_exit:
             # The script's own "not done yet, ask again" verdict (EX_TEMPFAIL): a retry with the
             # same inputs is the right next step, so it is named as such rather than as a crash.
@@ -93,9 +101,29 @@ def run(request):
     raise ValueError('unknown scheduled procedure')
 
 
-if __name__ == '__main__':
+def main():
     try:
         print(run(json.loads(sys.argv[1])))
     except Exception as error:
+        budget_exhausted = isinstance(error, ProcedureModelBudgetError)
+        if not budget_exhausted:
+            # Malformed requests can fail before run() adds the pack's shared library to
+            # sys.path. Their original diagnostic must not be replaced by an import failure.
+            try:
+                from gemini_transport import ModelBudgetUnavailableError, proxy_budget_exhausted
+            except ImportError:
+                pass
+            else:
+                budget_exhausted = (isinstance(error, ModelBudgetUnavailableError)
+                                    or proxy_budget_exhausted(error))
+        if budget_exhausted:
+            from work_queue import MODEL_BUDGET_EXIT
+            print('[procedure_runner] model allowance reached', file=sys.stderr)
+            return MODEL_BUDGET_EXIT
         print(f'[procedure_runner] {type(error).__name__}', file=sys.stderr)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

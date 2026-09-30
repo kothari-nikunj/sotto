@@ -25,6 +25,74 @@ _BACKGROUND_PROXY = ContextVar('sotto_background_proxy', default=False)
 _BACKGROUND_ACTIVE = ContextVar('sotto_background_active', default=False)
 
 
+class ModelBudgetUnavailableError(RuntimeError):
+    """The authenticated proxy cannot admit another model reservation."""
+
+
+class _NoProxyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # Never forward a tenant bearer to a redirected destination.
+
+
+def brief_model_preflight():
+    """Check one managed reservation before fresh gathering; this buys no model call.
+
+    Direct self-host keys keep their existing behavior. An unlimited managed route is
+    valid too. Availability here is not a promise that a whole brief will fit.
+    """
+    if not managed():
+        return
+    token = credential()
+    req = urllib.request.Request(
+        _proxy_base() + '/v1/capabilities/background-budget',
+        headers={'Authorization': f'Bearer {token}'}, method='GET')
+    with urllib.request.build_opener(_NoProxyRedirect()).open(req, timeout=30) as response:
+        raw = response.read(4097)
+    if len(raw) > 4096:
+        raise ValueError('Model allowance capability is too large')
+    result = json.loads(raw)
+    if (not isinstance(result, dict) or type(result.get('version')) is not int
+            or result['version'] != 1 or type(result.get('finite')) is not bool
+            or type(result.get('can_admit')) is not bool
+            or not isinstance(result.get('supported_native_models'), list)):
+        raise ValueError('Model allowance capability is unsupported')
+    provider, model = effective_compose_model()
+    if provider != 'gemini' or model not in result['supported_native_models']:
+        raise ValueError('Brief model is unsupported by this proxy')
+    remaining = result.get('remaining_cents')
+    if not result['finite']:
+        if remaining is not None:
+            raise ValueError('Model allowance capability is invalid')
+        return
+    if (type(remaining) is not int or remaining < 0
+            or result['can_admit'] != (remaining >= 200)):
+        raise ValueError('Model allowance capability is invalid')
+    if not result['can_admit']:
+        raise ModelBudgetUnavailableError('Model allowance reached; an account update is needed')
+
+
+def proxy_budget_exhausted(error):
+    """Recognize only this proxy's typed denial, not an arbitrary provider HTTP 402."""
+    if (not isinstance(error, urllib.error.HTTPError) or error.code != 402
+            or not (managed() or background_proxy_required())):
+        return False
+    try:
+        prefix = _proxy_base() + '/native/v1beta/models/'
+        url = error.geturl()
+        if not isinstance(url, str) or not url.startswith(prefix):
+            return False
+        if not re.fullmatch(r'[A-Za-z0-9._-]+:generateContent', url[len(prefix):]):
+            return False
+        raw = error.read(4097)
+        if len(raw) > 4096:
+            return False
+        result = json.loads(raw)
+        return (isinstance(result, dict) and isinstance(result.get('error'), dict)
+                and result['error'].get('code') == 'sotto_budget_exhausted')
+    except (OSError, ValueError, KeyError):
+        return False
+
+
 class BackgroundModelHeldError(RuntimeError):
     """Background learning has no explicitly authorized model-spend path."""
 

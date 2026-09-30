@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import time
 import urllib.parse
 import urllib.request
@@ -79,11 +80,15 @@ def _hermes_adapter(name):
     for directory in (Path(__file__).resolve().parents[2] / 'adapters' / 'hermes',
                       Path('/app/adapters/hermes')):
         path = directory / (name + '.py')
+        if not path.is_file():
+            path = directory / name / '__init__.py'
         if path.is_file():
             key = (name, str(path.resolve()))
             if key in _HERMES_ADAPTERS:
                 return _HERMES_ADAPTERS[key]
-            spec = importlib.util.spec_from_file_location('sotto_hermes_' + name, path)
+            spec = importlib.util.spec_from_file_location(
+                'sotto_hermes_' + name, path,
+                submodule_search_locations=[str(path.parent)] if path.name == '__init__.py' else None)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             _HERMES_ADAPTERS[key] = module
@@ -315,8 +320,9 @@ OUTBOX.HOOKS.update({
     # The ONE call that touches the channel. When a channel offers a real receipt (a gateway send
     # API returning an id), this is the single function that gets stronger and every lane inherits it.
     "send": lambda body, target: _send_via_channel(body, target),
-    "send_gallery": lambda presentation, target: _hermes_adapter('runtime_api').send_gallery(
-        presentation, target, SEND_TIMEOUT_SECS),
+    "send_gallery": lambda presentation, target, dispatch_id: _hermes_adapter('runtime_api').send_gallery(
+        presentation, target, dispatch_id, SEND_TIMEOUT_SECS),
+    "gallery_receipt": lambda dispatch_id: _hermes_adapter('runtime_api').gallery_receipt(dispatch_id),
     "record": lambda label, status, detail="", usage=None, decision_ids=None, run_id="": _record_delivery(
         label, status, detail, usage=usage, decision_ids=decision_ids, run_id=run_id),
     # A chase is only counted once the message that chased actually landed — wherever it landed,
@@ -771,12 +777,27 @@ def _invalid_delivery(payload):
         if active is not None and active['id'] == payload.get('run_id'):
             return False
         try:
+            if _validated_invalid_brief_recovery(payload, label):
+                return _fire_cron_job(name, label, _invalid_recovery=True).get('ok') is True
             return _fire_cron_job(name, label).get('ok') is True
         except RuntimeError as error:
             if _is_terminal_work(error):
                 return True  # the slot's budget is spent; nothing is left to recompose from
             raise
     return True
+
+
+def _validated_invalid_brief_recovery(payload, label):
+    """Only an exact, unaccepted old handoff can resume through first-use setup gating."""
+    run_id, day = payload.get('run_id'), payload.get('day')
+    if not run_id or day != str(_local_now().date()):
+        return False
+    if not OUTBOX.invalidated_claim(run_id, day, label):
+        return False
+    job = WORK_QUEUE.get(DATA, run_id)
+    # A completed handoff deliberately scrubs its work payload and result. The outbox retains
+    # the exact label/day/claim and rejection evidence until this effect completes.
+    return bool(job and job['kind'] == 'run' and job['status'] == 'done')
 
 
 def _delivery_valid(payload):
@@ -1050,6 +1071,10 @@ def _execute_work(job):
             raise _WorkDeferredError('brief generation is busy')
         if process.returncode:
             error = _WorkerError(process.returncode, _stderr)
+            error.model_budget_exhausted = (
+                job['kind'] == 'run' and process.returncode == WORK_QUEUE.MODEL_BUDGET_EXIT
+                and runner in ([sys.executable, str(Path(__file__).with_name('brief_runner.py'))],
+                               [sys.executable, str(Path(__file__).with_name('procedure_runner.py'))]))
             error.retry_provider = (job['kind'] == 'event'
                                     and process.returncode == WORK_QUEUE.PROVIDER_RETRY_EXIT
                                     and runner == [sys.executable, _find_sotto_script('_shared', 'scripts', 'compose_notification.py')])
@@ -1147,11 +1172,19 @@ def _work_one(job):
                          run_id=job['id'])
     except Exception as error:
         diagnostic = error.diagnostic if isinstance(error, _WorkerError) else type(error).__name__
+        budget_denied = getattr(error, 'model_budget_exhausted', False) and job.get('result') is None
         disposition = WORK_QUEUE.fail(DATA, job['id'], owner, diagnostic,
-                                      retry_provider=getattr(error, 'retry_provider', False))
+                                      retry_provider=getattr(error, 'retry_provider', False),
+                                      model_budget_exhausted=budget_denied)
         if disposition is None:
             return  # a newer lease owns both the retry and its receipt
-        detail = ('retry queued' if disposition in ('pending', 'ready') else
+        if budget_denied and disposition == 'failed':
+            import onboarding
+            diagnostic = WORK_QUEUE.MODEL_BUDGET_EXHAUSTED
+            if job['payload'].get('label') == onboarding.LABEL:
+                onboarding.model_budget_held(DATA)
+        detail = ('model allowance reached; no retry queued' if budget_denied and disposition == 'failed' else
+                  'retry queued' if disposition in ('pending', 'ready') else
                   'relevance deadline reached; no retry queued' if disposition == 'expired' else
                   'attempt limit reached; no retry queued')
         _record_delivery(job['payload'].get('label', job['kind']), 'failed',
@@ -1262,6 +1295,16 @@ def _cron_run_is_dead(skill: str) -> bool:
     return _CRON_FIRED.get(skill) == today and _RUNS_INFLIGHT.get(f"cron:{skill}", 0) == 0
 
 
+def _brief_model_ready() -> bool:
+    """Content-free re-admission check; auth/network failures never clear a budget hold."""
+    from gemini_transport import brief_model_preflight
+    try:
+        brief_model_preflight()
+        return True
+    except Exception:
+        return False
+
+
 def _managed_brief(skill: str, label: str, payload_path: str = "",
                    work_not_before: float | None = None, retry_terminal: bool = False) -> bool:
     if skill not in MARKED_BRIEF_KINDS or os.environ.get('SOTTO_RUN_SKILL', 'hermes -z') != 'hermes -z':
@@ -1275,6 +1318,16 @@ def _managed_brief(skill: str, label: str, payload_path: str = "",
     work_key = f'{day}:{kind}:{_brief_revision(kind)}' if not label.startswith('run-now:') else secrets.token_hex(12)
     request = {'kind': kind, 'pack': pack, 'payload_path': payload_path,
                'day': day, 'work_key': work_key}
+    queue_key = _job_key(label, '')
+    prior = WORK_QUEUE.get(DATA, WORK_QUEUE.job_id_for('run', queue_key)) if queue_key is not None else None
+    if prior and prior['status'] == 'failed' and prior.get('error') == WORK_QUEUE.MODEL_BUDGET_EXHAUSTED:
+        if not _brief_model_ready():
+            import onboarding
+            if label == onboarding.LABEL:
+                onboarding.model_budget_held(DATA)
+                return False  # Do not claim a welcome was admitted when nothing was queued.
+            return True  # Handled, but no duplicate gather or new failed attempt while held.
+        retry_terminal = True  # The existing request may resume only after confirmed availability.
     if label.startswith('cron:'):
         schedule = next((job[1] for job in _sotto_cron_jobs() if job[0] == skill), '')
         at = _fixed_daily_minute(schedule)
@@ -1536,7 +1589,8 @@ def _prepare_briefs():
     now = _local_now()
     import managed
     import onboarding
-    if managed.brief_hold(DATA) or onboarding.scheduled_hold(DATA):
+    if (managed.brief_hold(DATA) or onboarding.scheduled_hold(DATA)
+            or _fresh_selfhost_brief_hold()):
         return
     composer = _find_sotto_script('_shared', 'scripts', 'compose_brief.py')
     if not composer:
@@ -1558,8 +1612,12 @@ def _prepare_briefs():
         # eight-minute head start. At T-2 composition proceeds with whatever prep is committed and
         # still has time to reach the outbox before the declared delivery minute.
         try:
-            _managed_brief(skill, f'cron:{name}',
-                           work_not_before=due.timestamp() - BRIEF_COMPOSE_LEAD_SECONDS)
+            import onboarding
+            with _CLAIM_LOCK:
+                if _welcome_admission_active():
+                    continue
+                _managed_brief(skill, f'cron:{name}',
+                               work_not_before=due.timestamp() - BRIEF_COMPOSE_LEAD_SECONDS)
         except Exception as error:
             if _is_terminal_work(error):
                 _CRON_FIRED[name] = str(now.date())
@@ -1618,6 +1676,16 @@ def _fold_into_snapshot(kind: str, date: str, local: dict, status: str,
 
 
 def handle_trigger(body: dict) -> tuple[int, dict]:
+    # The heartbeat's welcome reservation and wake's brief enqueue share this
+    # admission lock. A wake already committed to the durable queue is checked
+    # by the next welcome tick; a reserved welcome makes the wake fold context.
+    if body.get('type') in SKILL:
+        with _CLAIM_LOCK:
+            return _handle_trigger(body)
+    return _handle_trigger(body)
+
+
+def _handle_trigger(body: dict) -> tuple[int, dict]:
     kind = body.get("type")
     if kind == "proactive_wake":  # event-driven proactive nudge — no date/payload needed
         return handle_proactive_wake()
@@ -1631,6 +1699,12 @@ def handle_trigger(body: dict) -> tuple[int, dict]:
     if reason:
         return 200, {'status': 'held', 'reason': reason}
     kind_short = kind.replace("_ready", "")
+    if _welcome_admission_active():
+        local = body.get('local_data') or {}
+        if not local:
+            return 200, {'status': 'onboarding'}
+        return _fold_into_snapshot(kind, date, local, 'onboarding',
+                                   'first brief is arriving — wake payload folded into the snapshot')
     # ── Brief already delivered? Fold the wake payload into the snapshot instead. ──────────────────
     # The owner's design (Aug 2026): the 6:31 cron brief goes out even when the Mac was asleep
     # (degraded to the snapshot), and it is THE brief for the day. When the Bridge wakes hours later
@@ -1648,6 +1722,14 @@ def handle_trigger(body: dict) -> tuple[int, dict]:
         return _fold_into_snapshot(kind, date, local, "already_delivered",
                                    "already delivered — wake payload folded into the snapshot; "
                                    "nudges/digest surface the catch-up")
+    if _fresh_selfhost_brief_hold():
+        local = body.get('local_data') or {}
+        if not local:
+            return 200, {'status': 'held', 'reason':
+                         'Connect a context source and delivery channel for your first brief'}
+        return _fold_into_snapshot(kind, date, local, 'waiting_for_setup',
+                                   'first brief waits for source and delivery setup; wake payload '
+                                   'folded into the snapshot')
     # ── Inside the cron's own window? Its run is composing; don't burn a second one. ──────────────
     # The Aug 30 double-delivery started here: the Mac woke at 17:31, one minute into the 17:30
     # cron's compose, and with no `.delivered` marker yet (the cron claims just before it SENDS)
@@ -1671,24 +1753,23 @@ def handle_trigger(body: dict) -> tuple[int, dict]:
     # check raced on; _CLAIM_LOCK closes the remaining remove→re-create window in the stale-reclaim
     # path. We release the claim if enqueue fails, so a misconfigured runner never silently
     # suppresses the day's brief (the original intent).
-    with _CLAIM_LOCK:
+    # handle_trigger holds _CLAIM_LOCK through this durable queue admission.
+    try:
+        os.close(os.open(flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        if not _claim_is_stale(flag, date, kind_short):
+            return 200, {"status": "already_delivered"}
+        # Stale claim, brief never delivered: release it and re-claim.
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
         try:
             os.close(os.open(flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except FileExistsError:
-            if not _claim_is_stale(flag, date, kind_short):
-                return 200, {"status": "already_delivered"}
-            # Stale claim, brief never delivered: release it and re-claim (atomic under the lock)
-            # so THIS trigger retries.
-            try:
-                os.remove(flag)
-            except OSError:
-                pass
-            try:
-                os.close(os.open(flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-            except (FileExistsError, OSError):
-                return 200, {"status": "already_delivered"}
-            print(f"[sotto] stale claim for {date} {kind_short}: no .delivered after "
-                  f"{CLAIM_STALE_SECS // 60} min — retrying the brief", flush=True)
+        except (FileExistsError, OSError):
+            return 200, {"status": "already_delivered"}
+        print(f"[sotto] stale claim for {date} {kind_short}: no .delivered after "
+              f"{CLAIM_STALE_SECS // 60} min — retrying the brief", flush=True)
     payload_path = os.path.join(DATA, "briefs", f"{date}.{kind}.payload.json")
     # The payload write shares the enqueue's claim-release guard: an OSError here (full/read-only
     # volume) must not leave the .claim held, or briefs are blocked for CLAIM_STALE_SECS.
@@ -2080,15 +2161,14 @@ _DELIVERY_GATE_STATE: dict = {}     # label → last logged state, so a shut gat
 
 def _delivery_ready(status: str | None = None) -> bool:
     """THE delivery rule, in one sentence: a channel Sotto CAN probe must be linked, and a channel
-    with no probe at all counts as linked. WhatsApp and Telegram both have complete probes (session
-    creds on the volume; a captured chat id or a configured allowlist), so anything but "linked"
-    holds — including Telegram's "unknown", which on a fresh deploy means no token, nothing linked
-    and no way to deliver, not "a setup we cannot see". Discord, Slack, Signal, BlueBubbles and local
-    have no probe and may not be denied for a setup this process cannot see. Silent — callers that
+    with no probe at all counts as linked. WhatsApp, Telegram, and Photon have setup probes
+    (session credentials, a bot recipient, and an authenticated owner DM respectively), so
+    anything but "linked" holds. Discord, Slack, Signal, BlueBubbles and local have no probe and
+    may not be denied for a setup this process cannot see. Silent — callers that
     run on a timer use _delivery_channel_ready below; the setup wizard's completion gate calls this
     directly, passing the channel state it already rendered from rather than re-probing."""
     channel = _deliver_target()
-    if channel in ("whatsapp", "telegram"):
+    if channel in ("whatsapp", "telegram", "photon"):
         return (status or _channel_status(channel)) == "linked"
     return True
 
@@ -2253,7 +2333,7 @@ def _spawn_prompt(skill: str, payload_path: str = "", job_prompt: str = "") -> s
     )
 
 
-def _fire_cron_job(name: str, label: str) -> dict:
+def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False) -> dict:
     """Fire one crons.json job by name, now. {"ok": True, "skill": …} or {"ok": False, "error"}."""
     job = next((j for j in _sotto_cron_jobs() if j[0] == name), None)
     if job is None:
@@ -2266,9 +2346,22 @@ def _fire_cron_job(name: str, label: str) -> dict:
         reason = managed.brief_hold(DATA)
         if reason:
             return {"ok": False, "error": "capability", "reason": reason}
+        if name in MARKED_BRIEF_KINDS and not _invalid_recovery and _fresh_selfhost_brief_hold():
+            return {"ok": False, "error": "capability",
+                    "reason": "Connect a context source and delivery channel for your first brief"}
     _, _, prompt, skill = job
     try:
-        if _managed_brief(skill, label):
+        if label.startswith('cron:') and skill in MARKED_BRIEF_KINDS:
+            import onboarding
+            with _CLAIM_LOCK:
+                if _welcome_admission_active():
+                    return {"ok": False, "error": "onboarding", "reason": "first useful look is arriving"}
+                if _managed_brief(skill, label):
+                    return {"ok": True, "skill": skill}
+                runner = shlex.split(os.environ.get("SOTTO_RUN_SKILL", "hermes -z"))
+                _spawn_and_deliver(runner, _spawn_prompt(skill, job_prompt=prompt), label)
+                return {"ok": True, "skill": skill}
+        elif _managed_brief(skill, label):
             return {"ok": True, "skill": skill}
         if name == 'sotto-proactive':
             return ({'ok': True, 'skill': skill} if _run_proactive(label) else
@@ -2345,6 +2438,151 @@ _CRON_UNPARSED: set = set()  # names logged once for a schedule this side can't 
 
 MEMORY_INTERVAL_SECONDS = 15 * 60
 _CONTEXT_LAST_STARTED = 0.0
+# A first-use source read that leaves setup unready doubles the wait before the next, from one
+# minute up to one hour, and starts over when the Mac's source health or consent changes.
+SOURCE_PROBE_MIN_WAIT_SECS = CRON_TICK_SECS
+SOURCE_PROBE_MAX_WAIT_SECS = 60 * 60
+_SOURCE_PROBE_LAST_STARTED = 0.0
+_SOURCE_PROBE_WAIT = 0.0         # 0 until a read leaves setup unready
+_SOURCE_PROBE_BASIS = None       # the source health that wait was measured against
+_SOURCE_PROBE_INFLIGHT = False
+_SOURCE_PROBE_LOCK = threading.Lock()
+
+
+def _scheduled_brief_work_active() -> bool:
+    """Durable work accepted before the outbox marker must precede welcome."""
+    return any(WORK_QUEUE.active_job(DATA, 'run', f'{lane}:sotto-{kind}-brief') is not None
+               for lane in ('cron', 'brief') for kind in ('morning', 'evening'))
+
+
+def _welcome_admission_active() -> bool:
+    import onboarding
+    return (onboarding.scheduled_hold(DATA) or onboarding.status(DATA) == 'queued'
+            or WORK_QUEUE.active_job(DATA, 'run', onboarding.LABEL) is not None)
+
+
+def _context_sources_ready() -> bool:
+    """Use the same source gate for first-use welcome and scheduled work."""
+    import managed
+    return (managed.has_sources(DATA) if managed.enabled() else
+            _local_source_ready() or Path(_hermes_adapter('runtime_api').home_path('google_token.json')).exists()
+            or any(s.get('connected') and s.get('service') in managed.MANAGED_CONNECTOR_SOURCES
+                   and not _connector_error(s['service'])
+                   and (not s.get('expires_at') or s['expires_at'] >= time.time()
+                        or _connector_has_refresh(s['service']))
+                   for s in CONNECTORS.service_status()))
+
+
+def _local_source_ready() -> bool:
+    """A live relay is transport, not evidence that an enabled Mac source was read."""
+    import managed
+    source = _source_context()
+    health = source.source_health(DATA)
+    if health.get('status') != 'ok':
+        return False
+    try:
+        rows = source._source_rows(source._read_source_state(source._state_path(DATA)))
+    except (OSError, ValueError, TypeError, AttributeError, source.jsonstore.Unreadable):
+        return False
+
+    def read_after_regrant(row):
+        watermark = row.get('consent_regrant_epoch')
+        if watermark is None:
+            return True
+        request = row['read'].get('request_epoch')
+        return (type(watermark) in (int, float) and source.math.isfinite(watermark)
+                and watermark > 0
+                and type(request) in (int, float) and source.math.isfinite(request)
+                and request > watermark)
+
+    return any(row.get('source') in source.SOURCE_FIELDS
+               and managed.eligible_context_source(row['source'])
+               and row.get('status') in ('ok', 'empty')
+               and isinstance(rows.get(row['source'], {}).get('read'), dict)
+               and rows[row['source']]['read'].get('status') == 'ok'
+               and rows[row['source']]['read'].get('payload_valid') is True
+               and read_after_regrant(rows[row['source']])
+               for row in health['sources'])
+
+
+def _source_probe_basis():
+    """Retry promptly when source health or an explicit consent generation changes."""
+    source = _source_context()
+    health = source.source_health(DATA)
+    try:
+        rows = source._source_rows(source._read_source_state(source._state_path(DATA)))
+    except (OSError, ValueError, TypeError, AttributeError, source.jsonstore.Unreadable):
+        rows = {}
+    return tuple((row['source'], row['status'],
+                  rows.get(row['source'], {}).get('consent_regrant_epoch'))
+                 for row in health['sources'])
+
+
+def _bootstrap_selfhost_source_read() -> None:
+    """Collect one normal, consent-aware Mac receipt before admitting a first brief."""
+    global _SOURCE_PROBE_INFLIGHT, _SOURCE_PROBE_WAIT, _SOURCE_PROBE_BASIS
+    try:
+        import managed
+        source = _source_context()
+        health = source.bridge_call('health')
+        statuses = health.get('sources') if isinstance(health, dict) else None
+        # A capability probe reports the Mac's switches before any extraction. The Mac's
+        # read_local also enforces those switches; never read when it reports none enabled.
+        if (isinstance(statuses, dict) and any(
+                status == 'ok' and name in source.SOURCE_FIELDS
+                and managed.eligible_context_source(name) and source.allowed(name)
+                for name, status in statuses.items())):
+            source.read_local(24)
+    except Exception as error:  # best-effort first-use collection, retried by the heartbeat
+        print(f'[sotto] first source read: {type(error).__name__}', flush=True)
+    finally:
+        try:
+            basis, ready = _source_probe_basis(), _context_sources_ready()
+        except Exception:
+            basis, ready = None, False
+        with _SOURCE_PROBE_LOCK:
+            _SOURCE_PROBE_BASIS = basis
+            _SOURCE_PROBE_WAIT = 0.0 if ready else min(
+                max(2 * _SOURCE_PROBE_WAIT, SOURCE_PROBE_MIN_WAIT_SECS), SOURCE_PROBE_MAX_WAIT_SECS)
+            _SOURCE_PROBE_INFLIGHT = False
+
+
+def _maybe_bootstrap_selfhost_source_read() -> None:
+    """One in-flight read while a fresh self-host is held for context, backing off as above."""
+    global _SOURCE_PROBE_INFLIGHT, _SOURCE_PROBE_LAST_STARTED, _SOURCE_PROBE_WAIT
+    import onboarding
+    if (not _first_brief_pending() or onboarding.scheduled_inflight(DATA)
+            or not RELAY.bridge_connected() or _context_sources_ready()):
+        return
+    basis = _source_probe_basis()
+    with _SOURCE_PROBE_LOCK:
+        now = time.time()
+        if basis != _SOURCE_PROBE_BASIS:
+            _SOURCE_PROBE_WAIT = 0.0
+        if _SOURCE_PROBE_INFLIGHT or now - _SOURCE_PROBE_LAST_STARTED < _SOURCE_PROBE_WAIT:
+            return
+        _SOURCE_PROBE_INFLIGHT = True
+        _SOURCE_PROBE_LAST_STARTED = now
+    try:
+        threading.Thread(target=_bootstrap_selfhost_source_read, daemon=True).start()
+    except RuntimeError:
+        with _SOURCE_PROBE_LOCK:
+            _SOURCE_PROBE_INFLIGHT = False
+            _SOURCE_PROBE_LAST_STARTED = 0.0
+        raise
+
+
+def _first_brief_pending() -> bool:
+    """A self-host install without a delivered or adopted first brief is still in first-use setup."""
+    import managed
+    import onboarding
+    return not managed.enabled() and onboarding.status(DATA) not in ('delivered', 'existing')
+
+
+def _fresh_selfhost_brief_hold() -> bool:
+    """Automatic first briefs wait for setup; accepted installations keep recovery."""
+    return _first_brief_pending() and (not _context_sources_ready()
+                                       or not _delivery_channel_ready('cron:first-brief'))
 
 
 def _background_context_tick() -> None:
@@ -2353,17 +2591,22 @@ def _background_context_tick() -> None:
     import managed
     import onboarding
     try:
-        has_sources = (managed.has_sources(DATA) if managed.enabled() else
-                       RELAY.bridge_connected() or Path(_hermes_adapter('runtime_api').home_path('google_token.json')).exists()
-                       or any(s.get('connected') and s.get('service') in managed.MANAGED_CONNECTOR_SOURCES
-                              and not _connector_error(s['service'])
-                              and (not s.get('expires_at') or s['expires_at'] >= time.time()
-                                   or _connector_has_refresh(s['service']))
-                              for s in CONNECTORS.service_status()))
+        _maybe_bootstrap_selfhost_source_read()
+        has_sources = _context_sources_ready()
         # Check durable completion before touching the channel or doing any work.
-        onboarding.tick(DATA, lambda: has_sources and (not managed.enabled() or managed.messaging_activated(DATA))
-                        and _delivery_channel_ready(onboarding.LABEL),
-                        lambda: _managed_brief('sotto-welcome-brief', onboarding.LABEL))
+        with _CLAIM_LOCK:
+            # Recover a crash between the queue's committed denial and its onboarding projection.
+            welcome_key = _job_key(onboarding.LABEL, '')
+            welcome_job = WORK_QUEUE.get(DATA, WORK_QUEUE.job_id_for('run', welcome_key))
+            if (welcome_job and welcome_job['status'] == 'failed'
+                    and welcome_job.get('error') == WORK_QUEUE.MODEL_BUDGET_EXHAUSTED):
+                onboarding.model_budget_held(DATA)
+            onboarding.tick(DATA, lambda: has_sources and (not managed.enabled() or managed.messaging_activated(DATA))
+                            and _delivery_channel_ready(onboarding.LABEL)
+                            and not _scheduled_brief_work_active()
+                            and not onboarding.scheduled_inflight(DATA),
+                            lambda: _managed_brief('sotto-welcome-brief', onboarding.LABEL),
+                            model_ready=_brief_model_ready)
         if not has_sources:
             return
         label = 'background:sotto-memory'
@@ -2891,15 +3134,19 @@ def _extract_google_code(raw: str) -> str:
     return ((urllib.parse.parse_qs(q).get("code") or [""])[0] or "").strip()
 
 
-def exchange_google_code(code: str) -> tuple[bool, str]:
+def exchange_google_code(code: str, browser_binding: str = "") -> tuple[bool, str]:
     """Exchange a Google auth code for a token LIVE (no Railway redeploy). Runs the same
     `setup.py --auth-code` start.sh runs, against the PKCE verifier the /google/auth step persisted.
     Best-effort: on any miss it returns a clear reason so the user can fall back to the env+redeploy
     path. Never raises."""
     import managed
-    code = (code or "").strip() if managed.enabled() else _extract_google_code(code)
-    if not code:
+    # Keep callback state intact in both modes; the shared helper validates it
+    # before exchanging a pasted URL. Bare codes remain bound by PKCE.
+    code = (code or "").strip()
+    if not _extract_google_code(code):
         return False, "No code provided."
+    if not code.startswith("http"):
+        code = _extract_google_code(code)
     setup = _google_setup_py()
     if not setup:
         return False, "Google setup tool not found in this image (is the google-workspace skill installed?)."
@@ -2908,10 +3155,11 @@ def exchange_google_code(code: str) -> tuple[bool, str]:
         return False, "Google client not set up yet — set GOOGLE_OAUTH_CLIENT_JSON in Railway and redeploy, then authorize."
     py = shutil.which("python") or shutil.which("python3") or "python3"
     try:
-        r = subprocess.run([py, setup, "--auth-code", code, "--format", "json"],
+        r = subprocess.run([py, setup, "--auth-code", code, "--format", "json",
+                            *(["--browser-binding", browser_binding] if browser_binding else [])],
                            capture_output=True, text=True, timeout=60)
-    except Exception as e:  # noqa: BLE001
-        return False, f"Could not run the exchange: {e}"
+    except Exception:  # noqa: BLE001
+        return False, "Google could not finish connecting. Please try again."
     if r.returncode == 0:
         try:
             os.remove(GAUTH_FILE)
@@ -2926,7 +3174,7 @@ def exchange_google_code(code: str) -> tuple[bool, str]:
             token = json.loads(Path(_hermes_adapter('runtime_api').home_path('google_token.json')).read_text())
             managed.record_google_consent(DATA, token.get("scopes", []))
         return True, "Connected ✓"
-    return False, (r.stderr or r.stdout or "exchange failed").strip()[:600]
+    return False, "Google could not finish connecting. Please try again."
 
 
 SETTINGS_FILE = os.path.join(DATA, "config", "settings.json")
@@ -2948,6 +3196,7 @@ def write_setting(key: str, value) -> None:
 
 
 _IANA_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_+./-]{0,63}\Z")
+_CLOUD_TIMEZONE_LOCK = threading.RLock()
 
 
 def _configured_tz_name() -> str:
@@ -3042,13 +3291,22 @@ def _reregister_sotto_crons(tz: str) -> None:
 
 
 def set_timezone(tz: str) -> tuple[bool, str]:
+    with _CLOUD_TIMEZONE_LOCK:
+        return _set_timezone_locked(tz)
+
+
+def _set_timezone_locked(tz: str) -> tuple[bool, str]:
     """Persist the browser-detected IANA zone to the volume so compose_brief/brief_marker pick it up
     (the Railway SOTTO_TIMEZONE var becomes OPTIONAL — this kills the UTC-briefs footgun). Also nudge
     the host's cron/system-prompt zone live, and — when that lands AND the zone actually changed —
     re-register the sotto crons so the very first night's briefs fire at the local 6:30/17:30 instead
     of UTC (see _reregister_sotto_crons). Never raises."""
     tz = (tz or "").strip()
-    if not tz or "/" not in tz or not _IANA_RE.match(tz):
+    if not tz or ("/" not in tz and tz not in ("UTC", "GMT")) or not _IANA_RE.match(tz):
+        return False, "That doesn't look like an IANA timezone (e.g. America/Los_Angeles)."
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
         return False, "That doesn't look like an IANA timezone (e.g. America/Los_Angeles)."
     # The zone the boot-time cron registration ran under (start.sh: SOTTO_TIMEZONE env, else the
     # wizard zone persisted by a PREVIOUS boot, else UTC) — read BEFORE persisting the new one.
@@ -3075,43 +3333,148 @@ def set_timezone(tz: str) -> tuple[bool, str]:
     return True, tz
 
 
+def accept_cloud_timezone(tz: str) -> None:
+    """Set the first Cloud zone before a verified handoff becomes ready; never follow travel."""
+    with _CLOUD_TIMEZONE_LOCK:
+        if _configured_tz_name():
+            return
+        ok, detail = _set_timezone_locked(tz)
+        if not ok:
+            raise ValueError(detail)
+
+
+_GOOGLE_FLOW_LOCK = threading.RLock()
+GOOGLE_BROWSER_COOKIE = "sotto_google_browser"
+
+
+def google_redirect_uri() -> str:
+    # Only deployment configuration may choose where Google returns credentials.
+    # Never trust the request Host or forwarded headers for this address.
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", RAILWAY_DOMAIN or ""):
+        raise ValueError("Add a public domain to this deployment before connecting Google.")
+    return f"https://{RAILWAY_DOMAIN}/google/oauth/callback"
+
+
+def _validate_google_web_client(obj):
+    if not isinstance(obj, dict) or not isinstance(obj.get("web"), dict):
+        raise ValueError("Choose a Web application OAuth client in Google Cloud and paste its JSON. "
+                         "Desktop clients cannot return to this Sotto page.")
+    client = obj["web"]
+    required = ("client_id", "client_secret", "auth_uri", "token_uri")
+    if not all(isinstance(client.get(k), str) and client[k].strip() for k in required):
+        raise ValueError("That OAuth client JSON is incomplete. Paste the full downloaded file.")
+    if (client['auth_uri'] not in ('https://accounts.google.com/o/oauth2/auth',
+                                   'https://accounts.google.com/o/oauth2/v2/auth')
+            or client['token_uri'] != 'https://oauth2.googleapis.com/token'):
+        raise ValueError("Use a Google OAuth client downloaded from Google Cloud.")
+    redirect = google_redirect_uri()
+    if not isinstance(client.get('redirect_uris'), list) or redirect not in client['redirect_uris']:
+        raise ValueError("Add this Authorized redirect URI in Google Cloud, then download the JSON again: "
+                         + redirect)
+    return redirect
+
+
 def setup_google_client(client_json: str) -> tuple[bool, str]:
-    """Load a Google OAuth *client* LIVE from a pasted JSON — no Railway var, no redeploy. Writes the
-    client secret and mints the auth URL + PKCE verifier (same setup.py start.sh runs at boot). After
-    this the user authorizes at /google/auth and pastes the code, all without touching the dashboard."""
-    client_json = (client_json or "").strip()
-    if not client_json:
+    """Save a validated Web client; consent starts only in its initiating browser."""
+    if not isinstance(client_json, str) or not client_json.strip():
         return False, "Paste your OAuth client JSON first."
     try:
         obj = json.loads(client_json)
-    except (json.JSONDecodeError, ValueError):
-        return False, "That doesn't look like valid JSON — paste the full client secret file."
-    if not (isinstance(obj, dict) and ("installed" in obj or "web" in obj)):
-        return False, "That JSON isn't a Google OAuth client (expected an 'installed' or 'web' key)."
-    setup = _google_setup_py()
-    if not setup:
-        return False, "Google setup tool not found in this image (is the google-workspace skill installed?)."
-    secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
-    os.makedirs(os.path.dirname(secret), exist_ok=True)
-    with open(secret, "w", encoding="utf-8") as f:
-        f.write(client_json)
-    os.chmod(secret, 0o600)
-    py = shutil.which("python") or shutil.which("python3") or "python3"
+        _validate_google_web_client(obj)
+    except (ValueError, TypeError) as exc:
+        return False, ("That doesn't look like valid JSON — paste the full downloaded file."
+                       if isinstance(exc, json.JSONDecodeError) else str(exc))
+    if not _google_setup_py():
+        return False, "Google setup tool not found in this image."
     try:
-        r = subprocess.run([py, setup, "--auth-url", "--services", "email,calendar", "--format", "json"],
-                           capture_output=True, text=True, timeout=60)
-    except Exception as e:  # noqa: BLE001
-        return False, f"Saved the client, but couldn't generate the auth link: {e}"
-    if r.returncode != 0:
-        return False, (r.stderr or r.stdout or "auth-url failed").strip()[:600]
-    # setup.py persists the URL (and the PKCE verifier exchange_google_code will reuse). Surface it.
-    last = _hermes_adapter('runtime_api').home_path('google_oauth_last_url.txt')
-    try:
-        if os.path.exists(last):
-            shutil.copy(last, GAUTH_FILE)
+        with _GOOGLE_FLOW_LOCK:
+            secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+            CONNECTORS.write_json(secret, obj, mode=0o600)
+            # A client change invalidates consent in flight, never an existing grant.
+            for name in ('google_oauth_pending.json', 'google_oauth_last_url.txt'):
+                Path(_hermes_adapter('runtime_api').home_path(name)).unlink(missing_ok=True)
+            Path(GAUTH_FILE).unlink(missing_ok=True)
     except OSError:
-        pass
-    return True, "Client saved — now authorize Google below."
+        return False, "Your client could not be saved. Please try again."
+    return True, "Client saved — now connect Google below."
+
+
+def start_google_authorization(browser_binding: str) -> str:
+    """Return this browser's unexpired consent URL, else a fresh one, without logging it."""
+    with _GOOGLE_FLOW_LOCK:
+        secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+        redirect = _validate_google_web_client(json.loads(Path(secret).read_text()))
+        setup = _google_setup_py()
+        if not setup:
+            raise ValueError("Google setup is unavailable. Please try again later.")
+        py = shutil.which("python") or shutil.which("python3") or "python3"
+        r = subprocess.run([py, setup, '--auth-url', '--services', 'email,calendar',
+                            '--format', 'json', '--redirect-uri', redirect,
+                            '--browser-binding', browser_binding, '--reuse-pending'],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            raise ValueError("Google sign-in could not start. Please try again.")
+        url = Path(_hermes_adapter('runtime_api').home_path('google_oauth_last_url.txt')).read_text().strip()
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != 'https' or parsed.netloc != 'accounts.google.com':
+            raise ValueError("Google sign-in could not start. Please try again.")
+        return url
+
+
+def _google_client_form(qs: str = "") -> str:
+    import html
+    try:
+        redirect = google_redirect_uri()
+    except ValueError as exc:
+        return f"<p>{html.escape(str(exc))}</p>"
+    return (
+        "<p>Connect Gmail and Calendar using your own Google account.</p>"
+        "<ol class='tile-hint'><li>In <a href='https://console.cloud.google.com' target='_blank'>Google Cloud</a>, "
+        "enable the Gmail API and Google Calendar API. Set up your consent screen and publish it to In production (Testing access expires after ~7 days).</li>"
+        "<li>Create an OAuth client of type <b>Web application</b>.</li>"
+        f"<li>Add this <b>Authorized redirect URI</b>: <code>{html.escape(redirect)}</code></li>"
+        "<li>Choose Download JSON and paste the file below.</li></ol>"
+        f"<form action='/setup/google-client{qs}' method='post'>"
+        "<textarea name='client_json' rows='4' class='field' aria-label='Google client JSON' "
+        "placeholder='{&quot;web&quot;:{...}}'></textarea>"
+        "<p><button class='btn-primary'>Save client</button></p></form>")
+
+
+def _google_replace_client(qs: str = "", expanded: bool = False) -> str:
+    """The saved client can be structurally valid yet unusable (rotated or deleted secret, another
+    project, unregistered callback). Replacing it clears only consent in flight, never a grant."""
+    return (f"<details{' open' if expanded else ''}><summary>Use a different Google client</summary>"
+            "<p class='tile-hint'>Use this if the saved client's secret was rotated or deleted, it belongs "
+            "to another Google Cloud project, or this page's redirect URI isn't registered on it. Any "
+            "existing Google connection keeps working until the new client connects.</p>"
+            + _google_client_form(qs) + "</details>")
+
+
+def _google_authorization_page(qs: str = "", csrf: str = "", reconnect: bool = False,
+                               replace_client: bool = False) -> str:
+    import html
+    if google_connected()[0] and not (reconnect or replace_client):
+        body = ("<p>Gmail and Calendar are connected. You can return to Sotto.</p>"
+                f"<p><a href='/google/auth{qs}{'&' if qs else '?'}reconnect=1'>Reconnect Google</a></p>")
+        title = "Google is connected"
+    else:
+        title = "Connect Google to Sotto"
+        try:
+            secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+            _validate_google_web_client(json.loads(Path(secret).read_text()))
+            body = ("<p>Choose your Google account and allow Gmail and Calendar access. "
+                    "Google will bring you back here automatically.</p>"
+                    f"<form action='/google/start{qs}' method='post'>"
+                    f"<input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'>"
+                    "<button class='btn-primary'>Continue with Google</button></form>"
+                    + _google_replace_client(qs, replace_client))
+        except (OSError, ValueError, TypeError):
+            body = ("<p>Finish the one-time Google client setup below. If you previously used a Desktop "
+                    "client, choose Web application instead so sign-in returns directly to Sotto.</p>"
+                    + _google_client_form(qs))
+    return _narrow_page(title, f"<section class='tile'><div class='tile-head'>"
+                       f"<h2 class='tile-title'>{html.escape(title)}</h2></div>"
+                       f"<div class='tile-body'>{body}</div></section>", back_href=f"/setup{qs}")
 
 
 def _humanize_ago(secs: float) -> str:
@@ -3207,7 +3570,44 @@ def _channel_status(channel: str | None = None) -> str:
         return _whatsapp_status()
     if channel == "telegram":
         return _telegram_status()
+    if channel == "photon":
+        return _photon_status()
     return "unknown"
+
+
+def _photon_status() -> str:
+    """Configuration is pairing; only an authenticated owner DM is linked."""
+    photon = _hermes_adapter('sotto_photon')
+    owner = (os.environ.get('PHOTON_HOME_CHANNEL') or '').strip()
+    allowed = (os.environ.get('PHOTON_ALLOWED_USERS') or '').strip()
+    managed_mode = os.environ.get('SOTTO_DEPLOYMENT_MODE') == 'managed'
+    fingerprint = photon.project_fingerprint(os.environ.get('PHOTON_PROJECT_ID'))
+    if ((not managed_mode and not re.fullmatch(r'\+[1-9][0-9]{7,14}', owner))
+            or (managed_mode and not owner) or allowed != owner
+            or not photon.restricted_allowlist()
+            or not os.environ.get('PHOTON_PROJECT_ID')
+            or not os.environ.get('PHOTON_PROJECT_SECRET')):
+        return 'unknown'
+    try:
+        with open(os.path.join(DATA, 'config/photon-activation.json'), encoding='utf-8') as stream:
+            receipt = json.load(stream)
+    except FileNotFoundError:
+        if not managed_mode:
+            # Self-host Photon installs made before owner receipts existed never wrote one.
+            # An accepted brief already proves this channel delivers; do not hold its nudges.
+            import onboarding
+            if onboarding.status(DATA) in ('existing', 'delivered'):
+                return 'linked'
+        return 'pairing'
+    except (OSError, ValueError):
+        return 'pairing'
+    return ('linked' if isinstance(receipt, dict) and receipt.get('activated') is True
+            and receipt.get('owner') == owner
+            and receipt.get('tenant_id') == os.environ.get('SOTTO_TENANT_ID', '')
+            and isinstance(receipt.get('chat_id'), str) and receipt['chat_id']
+            and (receipt.get('project_fingerprint') == fingerprint
+                 or (managed_mode and 'project_fingerprint' not in receipt))
+            else 'pairing')
 
 
 def _whatsapp_status() -> str:
@@ -3404,6 +3804,8 @@ def setup_status() -> dict:
     return {
         "bridge_connected": RELAY.bridge_connected(),
         "google_connected": gok,
+        # The first brief is held until a source is really read; a linked Bridge is only transport.
+        "context_waiting": _first_brief_pending() and not _context_sources_ready(),
         "first_brief": onboarding.status(DATA),
         "google_detail": gmsg,
         "google_client_present": client_present,
@@ -3457,9 +3859,13 @@ def _setup_page(code: str = "") -> str:
             ev_line = f"<p class='tile-meta'>last event {_humanize_ago(ago)}</p>"
         except OSError:
             pass
+    waiting = st.get("context_waiting", False)
     if st["bridge_connected"]:
         mac = ("<p class='tile-status'>Your Mac is linked and reachable. "
-               "(Grant Full Disk Access in the app if you haven't.)</p>" + ev_line)
+               "(Grant Full Disk Access in the app if you haven't.)</p>"
+               + ("<p class='tile-hint'>Sotto hasn't read a Mac source besides "
+                  "Contacts yet — turn one on in the Bridge, or connect Google.</p>" if waiting else "")
+               + ev_line)
     elif not RAILWAY_DOMAIN or not RELAY_TOKEN:
         # An empty host or token would render a dead sotto-bridge://pair?host=&token= link — name
         # what's missing instead of handing out a pairing code that can't pair.
@@ -3481,24 +3887,14 @@ def _setup_page(code: str = "") -> str:
 
     # 2 · Google
     if st["google_connected"]:
-        google = "<p class='tile-status'>Gmail + Calendar connected.</p>"
+        google = ("<p class='tile-status'>Gmail + Calendar connected.</p>"
+                  f"<p class='tile-hint'><a href='/google/auth{qs}{'&' if qs else '?'}replace=1'>"
+                  "Use a different Google client</a></p>")
     elif not st["google_client_present"]:
-        google = (
-            "<p>One-time Google Cloud setup (~2 min), then paste the client JSON below. "
-            "No Railway variable, no redeploy:</p>"
-            "<ol class='tile-hint'>"
-            "<li><a href='https://console.cloud.google.com' target='_blank'>console.cloud.google.com</a> → "
-            "create (or pick) a project → enable the <b>Gmail API</b> and the <b>Google Calendar API</b>.</li>"
-            "<li><b>OAuth consent screen</b> → External → publish to <b>In production</b> "
-            "(left in Testing, your token expires after ~7 days; no Google review is needed for your own data).</li>"
-            "<li><b>Create credentials → OAuth client ID → Desktop app → Download JSON</b>.</li>"
-            "<li>Paste that JSON here:</li></ol>"
-            f"<form action='/setup/google-client{qs}' method='post'>"
-            "<textarea name='client_json' rows='4' class='field' placeholder='{\"installed\":{...}}'></textarea>"
-            "<p><button class='btn-primary'>Save client →</button></p></form>")
+        google = _google_client_form(qs)
     else:
-        google = (f"<p><a class='btn-primary' href='/google/auth{qs}'>Authorize Gmail + Calendar →</a> "
-                  "<span class='tile-hint'>(then paste the code on that page)</span></p>")
+        google = (f"<p><a class='btn-primary' href='/google/auth{qs}'>Connect Gmail + Calendar →</a></p>"
+                  + _google_replace_client(qs))
 
     # 3 · Your channel — the tile follows SOTTO_CRON_DELIVER, because a Telegram deploy asking for a
     # WhatsApp QR is a lie the wizard used to tell. Telegram links itself at boot (start.sh runs
@@ -3537,11 +3933,28 @@ def _setup_page(code: str = "") -> str:
             ch_body = (f"<p><a class='btn-primary' href='/whatsapp/qr{qs}'>Show WhatsApp QR →</a> "
                        "<span class='tile-hint'>(WhatsApp ▸ Linked Devices ▸ Link a Device — scan "
                        "with your phone)</span></p>")
+    elif channel == "photon":
+        ch_title = "Connect iMessage"
+        owner = (os.environ.get('PHOTON_HOME_CHANNEL') or '').strip()
+        owner_hint = (f" ending in {_html.escape(owner[-4:])}" if
+                      re.fullmatch(r'\+[1-9][0-9]{7,14}', owner) else '')
+        owner_label = 'your number' + owner_hint if owner_hint else 'your owner identity'
+        if ch_state == 'linked':
+            ch_body = (f"<p class='tile-status'>Owner iMessage{owner_hint} was received. "
+                       "Confirm Sotto's reply in Messages.</p>")
+        elif ch_state == 'pairing':
+            ch_body = (f"<p class='tile-status'>Photon is configured for {owner_label}. "
+                       "Send one hello from that number to your Sotto iMessage line, then reload "
+                       "this page. Sotto will mark this step done after receiving your direct message.</p>")
+        else:
+            ch_body = ("<p class='tile-status'>Photon is not ready. Complete the protected "
+                       "self-host setup with your owner number and Photon project credentials, "
+                       "then reload this page.</p>")
     else:
         ch_title = "Your channel"
         ch_body = (f"<p class='tile-status'>Briefs and nudges deliver to <b>{_html.escape(channel)}</b> "
                    "— nothing to link here.</p>")
-    # "done" is the honest state whenever delivery can leave: linked, or a channel with no probe.
+    # "done" requires an authenticated owner DM for Photon, as for the other probed channels.
     ch_done = _delivery_ready(ch_state)
 
     # 4 · Timezone (auto-detected by the browser; posted once)
@@ -3629,12 +4042,12 @@ def _setup_page(code: str = "") -> str:
                   "headers:{'Content-Type':'application/json'},body:JSON.stringify({service:s})})"
                   ".then(function(){location.reload();});return false;}</script>")
 
-    # Any connected context source is enough; Mac and Google are independent.
+    # Mac and Google are independent; before the first brief a source counts once it was read.
     # Setup can open the dashboard while showing the first brief's actual progress. The delivery step uses the SAME
     # rule the valve and the meeting tap use (_delivery_ready): the active channel must be linked —
     # a never-scanned WhatsApp or an un-texted Telegram bot must not celebrate over a dead delivery
     # channel — while a channel with no probe never blocks the wizard from finishing.
-    context_connected = st["bridge_connected"] or st["google_connected"] or svc_connected
+    context_connected = not waiting and (st["bridge_connected"] or st["google_connected"] or svc_connected)
     done = (context_connected and bool(st["timezone"]) and ch_done)
     hero = "<a class='hero-cta' href='/app'>Open your dashboard →</a>" if done else ""
     first_brief = st.get('first_brief', 'waiting')
@@ -3643,6 +4056,7 @@ def _setup_page(code: str = "") -> str:
         'composing': "Sotto is preparing your first brief. You can close this page.",
         'queued': "Your first brief is ready and waiting to be sent. You do not need to request another.",
         'retrying': "Your first brief is delayed. Sotto will retry automatically; you do not need to reconnect.",
+        'model_held': "Sotto needs an account allowance update before preparing your first brief.",
         'delivered': "Your first brief was sent. Check your connected chat.",
         'existing': "Your setup is connected. Scheduled briefs continue in your connected chat.",
     }.get(first_brief, "Checking your first brief.")
@@ -3683,7 +4097,7 @@ def _setup_page(code: str = "") -> str:
         "<h1 class='page-title'>What Sotto connects to</h1>"
         "<p class='page-sub'>Your agent is live. Everything connects on this page — the last step is optional.</p>"
         f"{hero}"
-        + _tile(1, "Link your Mac", "done" if st["bridge_connected"] else "todo", mac)
+        + _tile(1, "Link your Mac", "done" if st["bridge_connected"] and not waiting else "todo", mac)
         + _tile(2, "Connect Google", "done" if st["google_connected"] else "todo", google)
         + _tile(3, ch_title, "done" if ch_done else "todo", ch_body)
         + _tile(4, "Timezone", "done" if st["timezone"] else "todo", tz_block + tz_js)
@@ -3700,9 +4114,9 @@ def _setup_page(code: str = "") -> str:
 
 # Setup/pairing/debug-status surface — everything here can leak the MCP bearer (pairing link), the
 # live WhatsApp QR, or accept config writes, so it's gated behind the setup code (see resolve_setup_code).
-SETUP_GET_PATHS = frozenset({"/setup", "/pair", "/google/auth", "/google/submit-code",
+SETUP_GET_PATHS = frozenset({"/setup", "/pair", "/google/auth", "/google/connected", "/google/submit-code",
                              "/whatsapp/qr", "/debug/google"})
-SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client", "/setup/disconnect"})
+SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client", "/setup/disconnect", "/google/start"})
 
 # The wizard cookie carries the SAME attribute set as the dashboard's session cookie
 # (dashboard._login_redirect): Secure so it never rides a plaintext hop, HttpOnly so no script can
@@ -3780,10 +4194,49 @@ class Handler(BaseHTTPRequestHandler):
 
     def _grant_header(self):
         """Emit the authenticate-once wizard cookie if this request just presented a valid ?code=."""
+        google_cookie = getattr(self, '_google_cookie_header', None)
+        if google_cookie:
+            self.send_header('Set-Cookie', google_cookie)
+            self._google_cookie_header = None
         granted = getattr(self, "_grant_cookie", None)
         if granted:
             self.send_header("Set-Cookie", f"sotto_setup={granted}; {SETUP_COOKIE_ATTRS}")
             self._grant_cookie = None
+
+    def _google_cookie(self):
+        for part in (self.headers.get('Cookie') or '').split(';'):
+            key, _, value = part.strip().partition('=')
+            if key == GOOGLE_BROWSER_COOKIE and re.fullmatch(r'[A-Za-z0-9_-]{43}', value):
+                return value
+        return ''
+
+    def _google_callback(self):
+        # No setup secret in Google's URL. Single-use state + PKCE + the initiating
+        # browser's separate cookie authorize this exchange, including after reboot.
+        cookie = self._google_cookie()
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        ok = False
+        if (cookie and set(q).issuperset({'code', 'state'}) and 'error' not in q
+                and len(q['code']) == len(q['state']) == 1):
+            try:
+                binding = hashlib.sha256(cookie.encode()).hexdigest()
+                pending = json.loads(Path(_hermes_adapter('runtime_api').home_path(
+                    'google_oauth_pending.json')).read_text())
+                # Only this browser's pending flow may spawn the exchange; google_setup owns expiry.
+                if hmac.compare_digest(pending['browser_binding'], binding):
+                    callback = google_redirect_uri() + '?' + urllib.parse.urlsplit(self.path).query
+                    with _GOOGLE_FLOW_LOCK:
+                        ok, _ = exchange_google_code(callback, binding)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        self._google_cookie_header = (f'{GOOGLE_BROWSER_COOKIE}=; Path=/google; Max-Age=0; '
+                                      'Secure; HttpOnly; SameSite=Lax')
+        if ok:
+            self._grant_cookie = resolve_setup_code()
+            return self._redirect('/google/connected')
+        # Fixed clean URL: no authorization code, provider error text, or state in
+        # the landing page, referrers, logs, or links.
+        return self._redirect('/google/retry')
 
     def _redirect(self, url: str):
         """302, carrying the authenticate-once wizard cookie when the request just presented a valid
@@ -3907,6 +4360,20 @@ class Handler(BaseHTTPRequestHandler):
                         "since run a brief and still see this, the agent likely improvised instead of "
                         "running compose_brief.py.)\n")
             return self._write(200, "text/plain; charset=utf-8", body.encode())
+        if path == '/google/oauth/callback':
+            return self._google_callback()
+        if path == '/google/retry':
+            return self._html(200, _narrow_page('Let’s try connecting again',
+                "<section class='tile'><div class='tile-body'>"
+                "<h2>Google couldn’t finish connecting</h2>"
+                "<p>Your existing connection hasn’t changed. Common causes:</p><ul>"
+                "<li>Sign-in was cancelled, or Gmail or Calendar access wasn’t allowed.</li>"
+                "<li>Sign-in started in another browser or tab, or took longer than an hour.</li>"
+                "<li>The saved Google client is wrong: its secret was rotated or deleted, it belongs "
+                "to another project, or this page’s redirect URI isn’t registered on it.</li></ul>"
+                "<p><a class='btn-primary' href='/google/auth'>Return to setup</a></p>"
+                "<p><a href='/google/auth?replace=1'>Use a different Google client</a></p>"
+                "</div></section>"))
         # Connector OAuth callback — the IdP's browser redirect lands here, so it is NOT setup-code
         # gated: the single-use `state` minted by the gated /connect/<service>/start is the auth.
         if path == "/connect/oauth/callback":
@@ -3936,55 +4403,20 @@ class Handler(BaseHTTPRequestHandler):
         # Legacy /pair → the wizard (keeps old links/QRs working; the deep link itself is in the page).
         if path == "/pair":
             return self._redirect(f"/setup{qs}")
-        # Live Google code exchange (no Railway redeploy). The /google/auth form posts the code here.
-        if path == "/google/submit-code":
-            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            ok, msg = exchange_google_code((q.get("code") or [""])[0])
-            import html as _html
-            badge = "Google connected" if ok else "Not connected"
-            extra = "" if ok else ("<p class='tile-hint'>Fallback: set <code>GOOGLE_AUTH_CODE</code> in Railway → Variables and "
-                                   f"redeploy. <a href='/google/auth{qs}'>← back</a></p>")
-            return self._html(200 if ok else 400, _narrow_page(
-                "Sotto — connect Google",
-                f"<section class='tile'><div class='tile-head'><h2 class='tile-title'>{badge}</h2></div>"
-                f"<div class='tile-body'><p>{_html.escape(msg)}</p>{extra}</div></section>",
-                back_href=f"/setup{qs}"))
-        # Google Workspace authorization page: a clickable auth URL + the copy-the-code instructions.
-        # The deterministic flow lives in start.sh; this just presents the one-time URL it generated.
-        if path == "/google/auth":
-            try:
-                url = open(GAUTH_FILE).read().strip()
-            except OSError:
-                return self._html(200, _narrow_page(
-                    "Connect Google",
-                    "<section class='tile'><div class='tile-body'>"
-                    "<p>No Google authorization pending — already connected, or set "
-                    "<code>GOOGLE_OAUTH_CLIENT_JSON</code> in Railway to begin.</p>"
-                    "</div></section>",
-                    back_href=f"/setup{qs}"))
-            import html as _html
-            u = _html.escape(url)
-            return self._html(200, _narrow_page(
-                "Connect Google",
-                "<section class='tile'><div class='tile-head'><h2 class='tile-title'>Connect Google to Sotto</h2></div>"
-                "<div class='tile-body'>"
-                f"<p><a class='btn-primary' href='{u}' target='_blank'>1 — Authorize Gmail + Calendar →</a></p>"
-                "<p>You'll see an \"unverified app\" screen (it's <i>your</i> client) → <b>Advanced → Continue</b> → <b>Allow</b>.</p>"
-                "<p><b>2</b> — You'll land on a <code>localhost:1/?code=…</code> page that won't load. Copy the "
-                "<code>code</code> value (everything after <code>code=</code>, before <code>&</code>).</p>"
-                "<p><b>3</b> — Paste it here and click <b>Connect</b> — no redeploy needed:</p>"
-                "<form action='/google/submit-code' method='get'>"
-                # a GET form replaces the action's query string, so the setup code rides along as a
-                # hidden field (`code` itself is Google's auth code here).
-                f"<input type='hidden' name='setup_code' value='{_html.escape(resolve_setup_code(), quote=True)}'>"
-                # off/off/false: phone keyboards otherwise capitalize/"correct" the pasted code
-                "<input name='code' class='field' placeholder='paste the code (or the whole localhost URL)' "
-                "autocapitalize='off' autocorrect='off' spellcheck='false'> "
-                "<button class='btn-primary'>Connect</button></form>"
-                "<p class='tile-hint'>Fallback if that fails: set <code>GOOGLE_AUTH_CODE</code> "
-                "in Railway → Variables and redeploy.</p>"
-                "</div></section>",
-                back_href=f"/setup{qs}"))
+        if path in ('/google/auth', '/google/connected'):
+            # Reuse this browser's binding so a reload or second tab cannot orphan a
+            # consent already in flight; mint one only when the browser has none.
+            cookie = self._google_cookie() or secrets.token_urlsafe(32)
+            self._google_cookie_header = (f'{GOOGLE_BROWSER_COOKIE}={cookie}; Path=/google; '
+                                          'Max-Age=3600; Secure; HttpOnly; SameSite=Lax')
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self._html(200, _google_authorization_page(
+                qs, hashlib.sha256(cookie.encode()).hexdigest(), query.get('reconnect') == ['1'],
+                query.get('replace') == ['1']))
+        if path == '/google/submit-code':
+            # Old bookmarks should recover into the new flow, never exchange a
+            # credential carried in a GET query or redisplay a broken-loopback link.
+            return self._redirect('/google/auth')
         # Serve the live WhatsApp pairing output (incl. the QR) with tight line-height so it scans in a
         # browser — Railway's log viewer distorts the terminal QR. Only available during pairing.
         if path != "/whatsapp/qr":
@@ -4066,7 +4498,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200 if ok else 400, {"ok": ok, "detail": msg})
         import html as _html
         qs = f"?code={urllib.parse.quote(resolve_setup_code())}"
-        more = (f"<p><a class='btn-primary' href='/google/auth{qs}'>Authorize Google →</a></p>"
+        more = (f"<p><a class='btn-primary' href='/google/auth{qs}&reconnect=1'>Connect Google →</a></p>"
                 if ok else "")
         return self._html(200 if ok else 400, _narrow_page(
             "Sotto — Google client",
@@ -4087,13 +4519,41 @@ class Handler(BaseHTTPRequestHandler):
                 adapter = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(adapter)
                 return adapter
-            return cloud_pairing.handle(self, path, DATA, adapter_factory=load_adapter)
+            return cloud_pairing.handle(self, path, DATA, adapter_factory=load_adapter,
+                                        on_timezone=accept_cloud_timezone)
         # Dashboard POSTs (login + the M2 write API) — dashboard.py owns auth/CSRF/lockout.
         if DASHBOARD.owns(path):
             return DASHBOARD.handle(self, "POST", path)
         if path in SETUP_POST_PATHS:
             if not self._setup_authed():
                 return self._forbid_setup()
+            if path == '/google/start':
+                # no-referrer pages can send Origin:null in Chrome. A form secret
+                # paired with a separate HttpOnly browser cookie authenticates the
+                # initiating page without weakening the shared setup credential.
+                cookie = self._google_cookie()
+                try:
+                    n = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < n <= 4096:
+                        raise ValueError('invalid form')
+                    fields = urllib.parse.parse_qs(self.rfile.read(n).decode('utf-8'))
+                    csrf = fields.get('csrf', [''])[0]
+                    binding = hashlib.sha256(cookie.encode()).hexdigest()
+                    if (not cookie or len(fields.get('csrf', [])) != 1
+                            or not hmac.compare_digest(csrf.encode(), binding.encode())
+                            or self.headers.get('Origin') not in (None, 'null', public_base())):
+                        raise ValueError('invalid form')
+                    url = start_google_authorization(binding)
+                except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+                    return self._redirect('/google/retry')
+                # A cross-origin redirect after a form POST is blocked by Chromium
+                # under form-action 'self'. Navigate from a normal page instead.
+                import html
+                return self._html(200, _narrow_page('Opening Google',
+                    "<section class='tile'><div class='tile-body'><h2>Opening Google…</h2>"
+                    f"<p><a class='btn-primary' href='{html.escape(url, quote=True)}'>Continue with Google</a></p>"
+                    "</div></section><script>window.location.replace("
+                    + json.dumps(url).replace('<', r'\u003c') + ");</script>"))
             return self._handle_setup_post(path)
         if path not in ("/sotto/trigger", "/mcp", "/bridge/respond", "/bridge/events"):
             return self._send(404, {"error": "not found"})

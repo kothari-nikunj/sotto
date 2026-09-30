@@ -40,6 +40,36 @@ def test_partial_reads_keep_valid_evidence_usable_in_the_actual_prompt(monkeypat
     assert 'Use the returned evidence' in prompt
 
 
+def test_welcome_prompt_distinguishes_google_quota_from_local_device_access():
+    inputs = {'type': 'welcome', 'google': {'events': [{'summary': 'Calendar meeting',
+        'start': '2026-09-26T10:00:00-07:00'}]},
+        'local': {'source_status': {'imessage': 'unavailable'}},
+        'source_results': {'gmail': {'status': 'unavailable', 'error': 'rate_limited'},
+                           'calendar': {'status': 'ok', 'complete': True}}}
+    prompt = cb.build_prompt(cb._load_prompt(), inputs)
+    assert 'Temporarily limited by Google: Gmail' in prompt
+    assert "Google's query quota was reached" in prompt
+    assert 'ask the user to reconnect Google' in prompt
+    assert 'Unavailable on this device: iMessage' in prompt
+    assert 'Unavailable on this device: Gmail' not in prompt
+    assert 'Calendar meeting' in prompt
+
+
+def test_welcome_prompt_keeps_partial_coverage_instruction_for_partial_google_quota():
+    inputs = {'type': 'welcome', 'first_run': True,
+              'google': {'emails': [{'id': 'm1', 'from': 'a@x.com', 'subject': 'Deal', 'snippet': 's'}],
+                         'events': []},
+              'local': {},
+              'source_results': {'gmail': {'status': 'partial', 'complete': False, 'error': 'rate_limited'}}}
+    prompt = cb.build_prompt(cb._load_prompt(), inputs)
+    section = prompt[prompt.index('## Data Source Availability'):]
+    assert 'Partial coverage: Gmail. Use the returned evidence, disclose the gap' in section
+    assert 'do not infer that missing results mean nothing happened' in section
+    assert "Google's query quota was reached before Gmail finished reading" in section
+    assert 'ask the user to reconnect Google' in section
+    assert 'Temporarily limited by Google: Gmail' not in section
+
+
 def test_x_health_distinguishes_configuration_success_and_failure(monkeypatch, tmp_path):
     for key in ('X_BEARER_TOKEN', 'X_USER_ACCESS_TOKEN', 'X_OWNER_USER_ID', 'SOTTO_X_STUB'):
         monkeypatch.delenv(key, raising=False)

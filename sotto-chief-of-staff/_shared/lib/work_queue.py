@@ -22,6 +22,8 @@ MAX_ATTEMPTS = 3
 # spend fault attempts. Shared with model_work so a queue retry can actually dispatch a call.
 MAX_PROVIDER_RECOVERIES = 4
 PROVIDER_RETRY_EXIT = 76
+MODEL_BUDGET_EXIT = 77
+MODEL_BUDGET_EXHAUSTED = 'model_budget_exhausted'
 RETRYABLE_PROVIDER_CODES = frozenset({429, 500, 502, 503, 504})
 
 
@@ -238,7 +240,7 @@ def finish(root, job_id, owner):
                           (time.time(), job_id, owner)).rowcount == 1
 
 
-def fail(root, job_id, owner, error, now=None, *, retry_provider=False):
+def fail(root, job_id, owner, error, now=None, *, retry_provider=False, model_budget_exhausted=False):
     """Return the committed disposition, or None when this worker no longer owns the job."""
     now = time.time() if now is None else now
     with _db(root) as db:
@@ -246,8 +248,11 @@ def fail(root, job_id, owner, error, now=None, *, retry_provider=False):
         if row is None:
             return None
         provider_failure = retry_provider and row['kind'] == 'event' and row['result'] is None
+        budget_failure = model_budget_exhausted and row['kind'] == 'run' and row['result'] is None
         recoveries = row['provider_recoveries']
-        if provider_failure:
+        if budget_failure:
+            terminal = True  # Repeating a denied model admission cannot produce a brief.
+        elif provider_failure:
             terminal = recoveries >= MAX_PROVIDER_RECOVERIES
             recoveries += int(not terminal)
         else:
@@ -257,7 +262,8 @@ def fail(root, job_id, owner, error, now=None, *, retry_provider=False):
         expired = row['valid_until'] is not None and due >= row['valid_until']
         status = 'failed' if terminal else 'expired' if expired else 'ready' if row['result'] else 'pending'
         final = status in ('failed', 'expired')
-        diagnostic = ('delivery handoff attempts exhausted' if terminal and row['result'] is not None
+        diagnostic = (MODEL_BUDGET_EXHAUSTED if budget_failure
+                      else 'delivery handoff attempts exhausted' if terminal and row['result'] is not None
                       else 'provider recovery attempts exhausted' if terminal and provider_failure
                       else 'retry would exceed relevance deadline' if expired and not terminal
                       else str(error)[:120])

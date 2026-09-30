@@ -12,6 +12,12 @@
 `sotto-chief-of-staff/` imports an agent runtime: it is `SKILL.md` + `execute_code` over
 `$SOTTO_DATA`, MCP for the Mac, plain HTTP for the receiver.
 
+For self-host Hermes, Google onboarding runs in the receiver's `/setup` browser page using the
+owner's Web application OAuth client and the exact HTTPS callback shown there. The callback is
+browser-bound, PKCE/state protected, and single-use; it returns automatically to Sotto. Existing
+Desktop-client tokens remain connected, while future authorization requires the Web client. The
+Mac Bridge is unchanged and self-host does not use a Sotto OAuth broker for this flow.
+
 | Portable core (no host coupling) | Built on |
 |---|---|
 | **Sotto Bridge** (Mac app) | **MCP** server (stdio + HTTP) — any MCP client |

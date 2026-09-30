@@ -42,8 +42,12 @@ def gallery_available():
     return sibling('gallery').available()
 
 
-def send_gallery(presentation, target, timeout=60):
-    return sibling('gallery').send(presentation['images'], presentation['summary'], target, timeout)
+def send_gallery(presentation, target, dispatch_id, timeout=60):
+    return sibling('gallery').send(presentation['images'], presentation['summary'], target, timeout, dispatch_id)
+
+
+def gallery_receipt(dispatch_id, timeout=5):
+    return sibling('gallery').receipt(dispatch_id, timeout)
 
 
 def send_capability(run=None):
@@ -119,12 +123,9 @@ def read_usage(path: str | None) -> dict | None:
 
 
 def google_setup_path(managed=False):
-    if managed:
-        return str(Path(__file__).with_name('google_setup.py'))
-    for base in map(Path, discovery_roots()):
-        for path in base.glob('**/google-workspace/scripts/setup.py'):
-            return str(path)
-    return None
+    # Both deployment modes use Sotto's CLI contract. The upstream skill's setup
+    # command does not accept the service selection or JSON flags used by setup.
+    return str(Path(__file__).with_name('google_setup.py'))
 
 
 def google_api_path():

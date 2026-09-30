@@ -182,8 +182,10 @@ Shared JSON sidecar locks allow nesting only within the owning thread; concurren
 processes remain excluded, including when consuming a one-use approval before a send.
 
 The receiver loads shared delivery code from the immutable image's `/app/sotto-skills/_shared/lib`
-or the equivalent source-checkout path, never from the writable Hermes home. Startup validates
-the mandatory delivery imports before serving health checks. The image build runs
+or the equivalent source-checkout path, never from the writable Hermes home. At container startup,
+`start.sh` seeds `/data/hermes/skills/sotto` and the Sotto bundle from those immutable `/app` copies
+before linking `/root/.hermes` to the volume; it must not use that link as its own refresh source.
+Startup validates the mandatory delivery imports before serving health checks. The image build runs
 `runtime/trigger-receiver/check_runtime.py` as the managed user. Its synthetic sources drive a
 nonempty proactive scan and both brief galleries through the real receiver, outbox, adapters,
 acceptance receipts and completion effects. It also tests retry recovery and duplicate suppression.
@@ -285,7 +287,8 @@ imports the receiver back.
 | `procedure_runner.py` | Shared proactive, digest and relationship-pulse procedures; eligible proactive results use deterministic templates or the bounded direct writer, and reviewed digest coverage advances only after delivery acceptance |
 | `work_queue.py` (shared library) | SQLite ownership of accepted work until output is handed to the outbox; stable input IDs, bounded leases/retries, two worker slots with at most one background worker |
 | `receiver.py` | The HTTP surface (`/health`, `/trigger`, `/bridge/*`, `/mcp`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`), brief trigger dedup, the brief schedule (`crons.json`'s `runner: receiver` jobs), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
-| `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels); Cadence also shows scheduled one-shots and read-only `user-*` Hermes routines |
+| `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels). Managed `/app/cloud/start` and `/app/cloud/consume` bind a Cloud grant to the receiver browser before minting a session; Cloud-issued sessions recheck their broker lease at most every 30 seconds. Existing local setup-code sessions remain an independent operator path, and self-host sessions need no Cloud broker. |
+| `cloud_pairing.py` | Managed account/Bridge handoff and device revocation; its control-authenticated dashboard grant endpoint writes the one-use grant into `config/cloud-pairing.sqlite` and checks the Cloud broker before redemption. No setup code or control bearer enters the dashboard handoff URL. |
 | `calendar_context.py` (copied from `_shared/lib/` by Docker) | Shared human-attendee normalization, explicit user participation and the schedule day grammar used by composition and card layout. Explicit context notes with the exact same interval and a unique matching meeting subject attach to that meeting as `supporting_context`; their descriptions remain available for prep, without creating a second busy block or invite. Calendar diffs only nudge for declines in the user's one-to-one meetings; prep and docket exclude resource rooms. |
 | `calcache.py` | The ONE calendar cache — the `gather_google.py --skip-gmail` fork, its 10-min TTL, the refresh thread that writes `cache/calendar_today.json`, the post-meeting tap detector, and the calendar-diff detector with a durable comparison baseline (declines, last-minute invites, moves, cancellations → `calendar_change` events into the funnel). A meeting the user DECLINED is dropped before the served list (the Today view and the funnel's in-meeting hold never see it) while the raw wire events keep it for the diff |
 | `connectors.py` | The connector registry, both kinds: remote-MCP OAuth 2.1 (discovery → DCR → PKCE → token file) for the Connect tiles, and the key-based search providers it renders read-only beside them — **and `write_text`/`write_json`, the one atomic-write helper the whole image uses** |
@@ -324,7 +327,7 @@ restarting a thread or process does not erase accepted work.
 | Gmail poll (`receiver.start_gmail_poll_thread`) | `SOTTO_EMAIL_POLL_SECS`, default 90s | Claims nothing while polling; feeds new mail through the same funnel as Bridge events, then acknowledges ids only after the receiver durably accepts them |
 | Release valve (`receiver.start_valve_thread`) | `receiver.VALVE_INTERVAL_SECS_DEFAULT` = 900s | Forks `triage_event.py --valve` so a nudge held during cooldown/quiet/catchup can still get out |
 | Sotto cron (`receiver.start_cron_thread`) | `receiver.CRON_TICK_SECS` = 60s | Reads the shared daily, weekly and interval declarations and durably admits due work. Briefs start up to ten minutes early with delivery held until due; missed daily jobs can catch up within four hours. Stable work IDs survive restart; the work queue owns bounded retries. The same heartbeat starts quiet memory work, renews the managed model lease, runs retention at 3:30 AM local, and archives sessions through the Hermes adapter. Timezone changes clear the process-local fired stamps; durable delivery markers still prevent a second accepted daily brief. |
-| Delivery outbox drain (`outbox.start_drain_thread`) | `outbox.DRAIN_INTERVAL_SECS` = 60s | Retries every message the channel hasn't acknowledged — backoff doubling from 60s to a 900s cap, then `failed` (a brief, loudly, when its local day ends) or `expired` (a nudge past 240 min). After acceptance, effects retry five times without resending, then quarantine with their receipt, label, run id and reason retained and their per-source addressing dropped. |
+| Delivery outbox drain (`outbox.start_drain_thread`) | `outbox.DRAIN_INTERVAL_SECS` = 60s | Retries eligible unaccepted sends with backoff doubling from 60s to a 900s cap, then `failed` (a brief, loudly, when its local day ends) or `expired` (a nudge past 240 min). An ambiguous gallery instead stays pending and checks its operation receipt on that capped cadence; expiry, source changes and retry exhaustion cannot authorize another send or erase its recovery identity. After acceptance, effects retry five times without resending, then quarantine with their receipt, label, run id and reason retained and their per-source addressing dropped. |
 | Update check (`receiver.start_update_check_thread`) | daily | One GitHub fetch → `cache/update_check.json` (the ONE writer); silent on an unstamped dev build |
 | Work dispatch (`receiver.start_work_thread`, thread `sotto-work-dispatch`) | every 5s, or the moment a job is admitted or finishes (`_WORK_WAKE`) | Claims due jobs from `events/work.sqlite3` under a fresh per-claim owner and starts one `sotto-work` thread per claim, within the queue's two worker slots |
 | Work execution (`receiver._work_one`, thread `sotto-work`, one per claimed job) | for the life of the job | Runs the declared procedure (or reuses a saved result), saves the exact output, renews the lease once more, hands the text to the outbox, then `finish`es or `fail`s the job for bounded retry. Incoming-event notification writing gets four separate provider recoveries for explicit 429/500/502/503/504 responses, with exponential delay inside its original deadline. `model_work` preserves every call receipt while leaving validation attempts available. Only the declared notification runner's typed exit can request recovery; saved delivery handoffs keep their own limit. Final receipts distinguish queued retries from stopped work. |
@@ -355,8 +358,15 @@ command, renews its lease, and saves the exact output before handing it to `rece
 The outbox persists that result under its stable run ID before the first send attempt.
 `adapters/hermes/runtime_api.py` owns the transport call: an exit code alone is insufficient;
 the adapter requires structured success and a provider message ID. This records provider acceptance,
-not device delivery or reading. Failed or uncertain sends remain retryable; acceptance followed by
-a process crash can still produce a duplicate without a provider idempotency contract.
+not device delivery or reading. Ordinary text sends retain their existing retry policy; acceptance
+followed by a process crash can still produce a duplicate without a provider idempotency contract.
+Gallery sends instead persist an operation receipt and hold unknown acceptance for read-only
+reconciliation, without repeating the provider call. A pin-checked gateway adaptation carries the
+ledger's durable obligation ID on the original interactive send and recovery. The adapter verifies
+that ID against the live ledger's target, original content and recoverable state, then accepts only
+its exact transport receipt. Identical text or a recent timestamp never proves identity. Receipt
+lookup by ID survives changes to card layout or formatting; legacy content-only matches remain
+unconfirmed. Without a durable obligation, a new interactive response keeps ordinary text delivery.
 This is also where deliver-once
 stopped being a prompt: a brief-kind row proves it owns `briefs/<date>.<kind>.delivered` before the
 channel is asked — no marker and the row claims it with its own run id, another run's id and the row
@@ -409,7 +419,8 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `knowledge/dreamer.json` | `dreamer.py` | Semantic fact-evidence selection and review receipt; full-file hashes still guard concurrent writes |
 | `knowledge/conflicts.json` | `knowledge_update.consolidate` | `knowledge_query.py` renders unresolved pairs with their source facts |
 | `setup_code` | receiver (boot) | receiver, `start.sh` |
-| `config/photon-activation.json` | managed Photon adapter (first owner DM) | managed receiver gate and owner destination check |
+| `config/photon-activation.json` | Photon adapter (first authenticated owner DM, managed and self-host) | receiver delivery gate and owner destination check; a self-host install with an accepted brief and no receipt, from before receipts existed, stays linked |
+| `config/cloud-pairing.sqlite` | `cloud_pairing.py` | managed Bridge device grants and one-use dashboard grants; dashboard redemption removes the latter, while the Cloud broker owns its account lease |
 | `Mac: cloud-policy.json` | personal pilot operator | Bridge readers and event watcher |
 | `config/managed-capabilities.json` | managed receiver after Google OAuth, Granola OAuth/disconnect and Bridge consent | managed receiver gate (missing state means zero sources). Startup repairs only a missing Granola row for an already linked connector on the same tenant; explicit revocation remains false. |
 | `config/managed-status.json` | receiver after outbox acceptance of `status:no-sources` | receiver's cron heartbeat (one-time notice) |
@@ -450,7 +461,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `cache/update_notice.json` | skills (`compose_brief.py`) | skills (`compose_brief.py` — the once-per-version marker) |
 | `connectors/<service>.json` | connectors (OAuth write; `/setup` Disconnect deletes) | skills (`connector_tokens.py`), receiver (presence only) |
 | `connectors/<service>.error` | skills (the gather; `/setup` Disconnect deletes) | receiver (`/setup` reconnect hint) |
-| `dashboard_sessions.json` · `dashboard_audit.jsonl` | dashboard | dashboard |
+| `dashboard_sessions.json` · `dashboard_audit.jsonl` | dashboard | dashboard; Cloud-issued session records carry a broker lease and fail closed when its bounded recheck cannot confirm active account/tenant state, while local setup-code sessions keep their own policy |
 | `decks/<view_id>.pdf` · `decks/<view_id>.json` | skills (`docsend_fetch.py` — the pdf is the deck's pages assembled, the json is the read cache that stops a re-ask logging a second view) | you (dashboard `GET /api/decks/<id>.pdf`), skills (cache hits, incl. unattended) |
 | `knowledge/master.md` | `_shared/knowledge/master_file.py` (the ONE writer — user-stated words; gateway confirms, dashboard edits shell out to it) | skills (`compose_brief.py`, `compose_meeting_prep.py` — always in the prompt), gateway chat, dashboard (Learned page card) |
 | `knowledge/last_local_snapshot.json` | skills (`compose_brief.py`) | skills — the RAW Bridge payload, overwritten each brief and never deleted; its 24h TTL stops reuse, not storage ([DATA-FLOW.md](DATA-FLOW.md)) |
@@ -660,16 +671,29 @@ same-UID modification of tenant data or denial of service; the Linux built-image
 
 `photon_probe_compat.py` applies one hash-checked compatibility patch to the pinned sidecar's synthetic message read classifier: only the exact GUID validation carrying Photon proxy provenance and gRPC INVALID_ARGUMENT is accepted as a server round trip. Authentication, transport and other failures remain inconclusive. A different source hash fails closed; upgrading the pin requires reviewing/removing this patch.
 
-`cloud/model-proxy/server.py` is a separate pilot service and volume. Its `proxy.sqlite3` ledger stores tenant ID, route, model, timestamp, reservation, status and token counts, never prompts or responses. Two fixed surfaces share one tenant bearer: `/openai/v1/chat/completions` for Hermes; `/native/v1beta/models/{model}:generateContent` for all Sotto pipeline calls. `gemini_transport.py` changes destination and authentication only and refuses direct-key fallback in managed mode. Admission accounting is deliberately not an invoice; the owner has disabled the pilot allowance cutoff while retaining usage records. The receiver renews the existing bearer’s expiry to 30 days through `/v1/lease/renew` using an independent control credential. The proxy stores only the lease expiry and token hash; `enabled: false` blocks both requests and renewal. Bearer-byte rotation remains an operator change.
+`cloud/model-proxy/server.py` is a separate pilot service and volume. Its `proxy.sqlite3` ledger stores tenant ID, route, model, timestamp, reservation, status and token counts, never prompts or responses. Two fixed surfaces share one tenant bearer: `/openai/v1/chat/completions` for Hermes; `/native/v1beta/models/{model}:generateContent` for all Sotto pipeline calls. `gemini_transport.py` changes destination and authentication only and refuses direct-key fallback in managed mode. Admission accounting is deliberately not an invoice; the owner has disabled the pilot allowance cutoff while retaining usage records. The receiver renews the existing bearer’s expiry to 30 days through `/v1/lease/renew` using an independent control credential. The proxy stores only the lease expiry and token hash; `enabled: false` blocks both requests and renewal. Bearer-byte rotation remains an operator change. Provisioning recovery checks the effective lease through the authenticated proxy capability endpoint after startup; the original configured expiry is only a floor. Before first startup, the configured expiry must still leave more than one hour.
 
 
 System jobs use the receiver in Cloud and receiver-based self-host. The weekly relationship pulse runs at 9 a.m. Monday in the user’s timezone. All managed scheduled jobs wait for messaging activation and a connected context source, then share the receiver’s outbox and silence handling.
 
-Managed Google authorization lives in `adapters/hermes/google_setup.py`: owner-approved Gmail/Calendar/Contacts read/write grants, managed web consent with a desktop loopback fallback, persisted PKCE state, and atomic 0600 Hermes-compatible token files. The receiver records only granted sources after its authenticated OAuth exchange. Self-host keeps its existing Google setup path. No runtime dependency installation occurs in the managed auth adapter.
+Google authorization lives in `adapters/hermes/google_setup.py`: owner-approved source grants, Web-client consent with an exact HTTPS callback, persisted PKCE state, and atomic 0600 Hermes-compatible token files. New self-host setup rejects Desktop client JSON; existing Desktop-client tokens remain usable until reconnection requires a Web client. The receiver records only granted sources after its authenticated exchange. Neither setup path calls the upstream skill setup CLI. Browser state and cookie binding protect the callback; users return to a Sotto result page without copying an authorization code. Environment-based boot seeds a client only when none is saved and does not start consent. No runtime dependency installation occurs in this auth adapter.
 
 Personal Cloud Bridge deployments additionally read local `cloud-policy.json` from the existing Sotto support directory. An explicit source allowlist gates each reader before database access; every supported Bridge reader, including Contacts, can be explicitly enabled; unconsented readers and Bridge sends are blocked. The Sotto identity exclusion covers iMessage history, per-handle, unread and event reads as well as phone calls, FaceTime and WhatsApp identities. Bridge’s Cloud onboarding and grouped source settings write this policy at mode 0600 and report consent plus successful reads to the receiver. A destination change clears the prior destination credential before deleting its policy, so returning to self-host cannot briefly reconnect with the old Cloud credential.
 
-Bridge cold-start pairing is queued until its store and menu-bar anchor exist. Supervisor restarts invalidate old child-exit callbacks, preventing an old credential from spawning a second outbound engine after pairing.
+Bridge cold-start pairing is queued until its store and menu-bar anchor exist. Supervisor restarts invalidate old child-exit callbacks, preventing an old credential from spawning a second outbound engine after pairing. Closing or finishing Settings preserves the current engine and active requests when its host, credential, send permission, wake-push setting and deployment mode are unchanged. Source choices are read from disk without a restart. Changes to engine launch inputs, explicit Reconnect and Quit use bounded shutdown: freeze the owned engine before stopping its verified private process group, so an interrupted download cannot spawn a replacement. A shared process group is never signalled; the fallback targets only the frozen engine and its children. A child that fails to stop remains owned and prevents a replacement from starting.
+
+### Managed model admission
+
+`gemini_transport.brief_model_preflight` reads the existing versioned proxy capability before a
+fresh managed gather. It sends no source content and makes no paid model call. `compose_brief`
+recognizes the proxy's exact native budget-denial envelope; the deterministic runner carries it as
+exit 77. Only that runner can make the receiver terminalize a composition for budget exhaustion.
+Saved artifacts and delivery handoffs remain usable. The existing queue records the terminal
+reason, and `config/onboarding.json` projects a held welcome without another gather. The receiver
+reconciles a committed queue denial after restart and checks availability before re-admission;
+provider acceptance always wins over a stale hold. No new scheduler, store or spend setting exists.
+The operator provisioner also verifies one finite native reservation before runtime startup/source
+upload and again before invitation registration. One reservation is not a whole-brief guarantee.
 
 ### Shared brief execution
 
@@ -686,10 +710,13 @@ The receiver owns job IDs, duplicate claims, declared delivery time, acceptance 
 Explicit nonstandard runner overrides retain their compatibility path. The shared `lib/google_cli.py`
 decoder recognizes Hermes' empty Gmail-search sentinel without swallowing authentication errors.
 
-The proxy settles successful standard 3.8 chat reservations to reported input plus the full
-model output ceiling at verified 2026 introductory prices. Missing usage, failed/ambiguous
-calls and native/grounded calls retain their original reservation. This is conservative
-admission accounting, not an invoice; the user’s overall $50 test authorization is unchanged.
+The proxy reserves 200 cents at admission, then settles successful standard 3.8 chat calls
+and verified text-only native calls to reported input plus the full model output ceiling
+within the dated tariff. Native settlement requires a complete ungrounded text response
+and valid native usage metadata. Missing usage, reported output (including thinking) that is
+missing or above that ceiling, failed or ambiguous calls, grounded/media calls and legacy native
+rows retain their original reservation. This is conservative
+admission accounting, not an invoice; settlement does not raise the configured cap or reset usage.
 
 Concurrent Gmail attachment fetches each own and close their Google API client. Sharing its httplib2 transport across worker threads caused TLS memory corruption in the live personal Cloud gather. The cohort size, attachment budget and result order are unchanged.
 
@@ -769,6 +796,22 @@ boot and the local Hermes installer then apply the adaptation and report a misma
 The native-stream finalizer applies that sanitizer before sealing its authoritative final payload;
 otherwise Photon could publish raw provider JSON before the later non-streaming boundary cleaned it.
 
+`gallery_obligation_compat.py` hash-checks the pinned `gateway/platforms/base.py` and
+`gateway/run_startup.py`. The final-send boundary replaces caller-supplied obligation metadata
+with the ledger's own ID; recovery carries the claimed row's ID. The image build checks both
+sources, and boot and local install apply the idempotent edits before starting the gateway.
+
+`first_contact_compat.py` separately hash-checks the pinned `gateway/run_turn.py` and changes
+only its first-contact sidecar. Dedicated Sotto Cloud config and the dedicated self-host startup
+set `onboarding.sotto_quiet_first_contact`; with the Sotto agent name, the gateway omits upstream
+Hermes' unsolicited `/help` introduction and profile offer. The separate missing-home-channel
+hint still runs. Self-host startup sets the Sotto name only when `agent.name` is missing or the
+generic Hermes default; a customized name is preserved (and keeps upstream first contact), and an
+unreadable `config.yaml` is logged in one line and left unchanged.
+General/shared Hermes keeps its upstream first-contact behavior, and the gateway's
+authorization, approval and send paths are unchanged. Image build checks the pin without writing;
+boot and the local installer apply the compatibility patch.
+
 The shared Photon adapter delays typing for two seconds, then uses Hermes' turn-owned refresh
 loop until completion or interruption. Isolated startup/progress callbacks cannot flash the
 indicator. The loop refreshes every two seconds without Photon's upstream five-second throttle,
@@ -799,7 +842,11 @@ remains ambiguous. Displayed freshness is bounded by server arrival. A disable r
 either clock says; only a strictly later probe restores access, and a completed read never does, so
 neither clock skew nor a clock correction can hold a disable back or let a delayed read undo it.
 An unreadable or invalid consent receipt fails closed for readers and is left untouched by metadata
-writers; the brief still composes with every local source withheld and says so.
+writers. A permitted brief can use other connected sources and disclose the withheld local context;
+fresh self-host setup waits when no eligible context source remains.
+A disabled-to-enabled probe also records `consent_regrant_epoch` at server acceptance. First-use
+readiness requires a valid read whose server request began after that watermark; an ordinary healthy
+probe does not advance it.
 Style learning rejects unknown channel labels; channel-less legacy rows follow iMessage consent,
 and email aliases follow Gmail consent. A drift test checks the Python receipt vocabulary against
 the statuses the Rust Bridge emits.
@@ -809,7 +856,7 @@ extraction, never by a connection heartbeat. The menu calls the heartbeat Last c
 Access is Ready only when the app grant and Bridge probe agree; after the existing one-time permission
 restart it stays Checking until a newer observation arrives. A blocked child gets quit/reopen and
 Full Disk Access recovery instructions; partial/degraded reader hints remain visible even with an
-app grant. The menu's View activity opens the existing authenticated `/app#record` with no credentials
+app grant. Settings → Account → Activity opens the existing authenticated `/app#record` with no credentials
 in the URL. The Record's expandable detail joins delivery to prior triage decisions by explicit
 `decision_ids` within the existing bounded ledger response. Missing evidence stays absent; later
 verdicts cannot explain earlier sends. This is a read-only projection, with no new store or writer.
@@ -893,11 +940,38 @@ owner's delivery channel are ready, `onboarding.tick` reserves a first-use run a
 before the normal composer; slower learning continues in the ancillary job. Public attendee research stays on the ordinary prep
 schedule; the welcome selection is empty. The composer requests up to three useful findings, a
 proposal in observed voice, and one explicit next-step command. It omits routine loop/update
-appendices. An existing morning/evening delivery marker identifies an established installation.
-The welcome has its own archive/claim; only channel acknowledgement completes onboarding. A
+appendices. A morning/evening marker alone is only a claim: new onboarding adopts an installation
+as established only when matching positive acceptance evidence confirms a scheduled brief for
+that marked day and kind. Positive evidence is the matching accepted outbox receipt or a matching
+historical receiver delivery record. An already-established `existing` phase is preserved,
+including when old evidence is pruned or a later scheduled brief fails. Historical adoption is
+never reset automatically. For fresh onboarding, scheduled work accepted by the queue or outbox
+waits before welcome. The receiver serializes welcome reservation with wake and cron brief
+admission; wake context is folded into the snapshot when welcome has the reservation. An ambiguous
+outcome remains held even after outbox pruning. A still-pending first brief with uncertain
+acceptance (such as a gallery held for its receipt) is that ambiguous outcome, not a queued one, so
+later scheduled briefs are not held behind it. An explicitly unaccepted terminal attempt may
+proceed to the welcome. The welcome has its own
+archive/claim; only channel acknowledgement completes onboarding. A
 20-minute onboarding reservation, 30-minute retry spacing and three attempts per UTC day bound
 first-use admission; the work queue separately leases and retries accepted execution. The
 scheduled brief is held while that first look is arriving, without claiming the normal daily slot.
+Self-host local context readiness requires a fresh valid successful extraction, including an
+explicitly empty read, from a context source. Contacts alone are identity metadata and cannot
+unlock a first brief in either hosting mode. Bridge transport or an access probe alone is insufficient. A fresh setup
+waiting for context can start a consent-aware health/read bootstrap on the existing minute
+heartbeat, outside the onboarding lock, with at most one collection in flight. It runs whenever the
+first-brief hold applies (the same `_first_brief_pending()` check); a bootstrap that leaves setup
+unready doubles the wait before the next, from one minute up to one hour, in memory, and restarts
+when per-source health or the existing consent-regrant generation changes. A disable and re-enable
+between heartbeats therefore resets the delay even if the final health label is unchanged. `/setup` finishes on the same
+readiness check before the first brief, and says when a linked Mac has not yet been read. Google-only setup
+and managed source capabilities retain their existing paths.
+Fresh self-hosted installations share welcome's context-source and delivery-readiness check for
+scheduled preparation, scheduled composition and automatic Bridge wakes. A held wake folds its
+payload into the existing snapshot. Accepted `delivered` or `existing` installations retain
+scheduled recovery when a source or provider goes offline; Google-only onboarding and explicit
+manual runs retain their behavior. Recovery of an already-composed first scheduled brief may pass this gate only for the same completed work ID, current day and invalidated, explicitly unaccepted outbox row; no onboarding phase is promoted by that recovery.
 
 Every 15 minutes the same heartbeat starts the quiet `memory_cycle.py` process, with the same
 unattended environment as other receiver work. It returns `NO_NUDGES`. No second agent, scheduler,
@@ -1054,6 +1128,17 @@ consent gates; the image copies that same leaf beside the receiver. Contacts alo
 context for a personal brief. The device- or control-authenticated `/cloud/status` exposes only existing
 messaging activation, context readiness and onboarding delivery phase, with no private content.
 
+Self-host Google onboarding uses the user's own Google OAuth **Web application** client. `/setup`
+shows the exact `https://<RAILWAY_PUBLIC_DOMAIN>/google/oauth/callback` URI to register. The user
+uploads the downloaded Web client JSON and starts consent in the same browser; PKCE, state, and a
+single-use browser-bound session protect the callback, which returns to Sotto with a clean success
+page. It does not route through localhost code copy/paste, the Mac Bridge, or a Sotto OAuth broker.
+Existing connected Desktop-client tokens remain valid; another authorization requires replacing
+the client in setup, which setup and the retry page offer without touching an existing token. Boot
+seeds `GOOGLE_OAUTH_CLIENT_JSON` only when no client is saved, never mints a consent URL, and never
+exchanges `GOOGLE_AUTH_CODE` (it only logs a reminder to remove it). Managed boot leaves Google to
+the Cloud broker.
+
 The Mac first-run flow lives in `SetupWizard.swift`: Welcome → Google → Mac sources / Full Disk
 Access → Messages → First brief. `AppConfig` persists hosting choice, stage, source confirmation
 and completion independently of host/token presence. Legacy configured installs retain
@@ -1073,6 +1158,14 @@ in the Mac and transport activation remain later integration gates.
 `_shared/lib/visual_brief.py` owns the common brief/prep templates and licensed local fonts. `visual_delivery.py` selects presentation at the receiver seam and supplies fixed fallback reason codes to the existing delivery receipt; the Hermes gallery adapter sends one multipart message through the existing outbox. Temporary PNGs/manifests use `cache/visual-briefs/` and the seven-day staged-artifact retention rule. [Visual briefs](VISUAL-BRIEFS.md) documents the opt-in and test gates.
 
 The shared writing policy lives at `sotto-chief-of-staff/_shared/references/writing-style.md`. Existing provider request builders attach it to system instructions, and Hermes installation/startup appends that same file to the persona. Cloud and self-host share this policy; no channel-specific prose policy or new persistent store is introduced.
+
+The Photon sidecar writes content-free operation receipts in `events/gallery-receipts/`, keyed by
+the stable outbox or interactive dispatch ID. It durably records in-flight state before the provider
+call and acceptance before returning a response. `/gallery-receipt` can reconcile a lost response
+without dispatching again. Unknown, corrupt and active receipts are retained; terminal receipts
+are pruned under bounded age and capacity. Exhausting capacity with unresolved receipts refuses a
+new dispatch. Outbox and interactive artifact receipts retain their own duplicate-suppression
+responsibilities. A historic unknown send without an operation receipt remains unknown.
 
 Focused iMessage meeting-prep replies use that same renderer at the Photon final-send boundary. A private acceptance receipt alongside the rendered manifest prevents duplicate sends across Hermes retries/restarts; Hermes retains the response obligation. Morning/evening scheduled delivery continues through the receiver outbox.
 

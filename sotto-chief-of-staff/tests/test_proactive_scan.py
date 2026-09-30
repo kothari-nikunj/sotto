@@ -1022,6 +1022,22 @@ def test_malformed_optional_name_data_does_not_drop_prep(tmp_path, monkeypatch):
     assert ps._prep_name({'email': 'person@acme.example'}, {}, _at(10)) == ''
 
 
+def test_prep_name_reads_the_message_snapshot_once_per_scan(tmp_path, monkeypatch):
+    import personal_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    now = _at(10)
+    reads = []
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: reads.append(1) or [
+        ({'source': 'email', 'from': 'Jordan Smith <jordan@acme.example>'}, '', ''),
+        ({'source': 'email', 'from': 'Riley Chen <riley@beta.example>'}, '', '')])
+    events = [{'id': ident, 'summary': ident, 'start': (now + timedelta(minutes=minutes)).isoformat(),
+               'attendees': [{'email': email}]}
+              for ident, minutes, email in (('acme', 10, 'jordan@acme.example'), ('beta', 20, 'riley@beta.example'))]
+    nudges = ps.scan(events, [], {}, 'me@fund.example', now)['nudges']
+    assert sorted(n['person'] for n in nudges) == ['Jordan Smith', 'Riley Chen']
+    assert len(reads) == 1
+
+
 @pytest.mark.parametrize('field', ['from', 'to', 'cc'])
 def test_prep_names_founder_from_exact_cached_envelope_without_research(tmp_path, monkeypatch, field):
     import personal_context

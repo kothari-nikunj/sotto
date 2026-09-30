@@ -76,12 +76,14 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
 
 @pytest.fixture
 def procedure(tmp_path, monkeypatch):
+    import gemini_transport
+    monkeypatch.setattr(gemini_transport, 'brief_model_preflight', lambda: None)
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
     monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
     payload = tmp_path / 'payload.json'
     payload.write_text(json.dumps({'imessage': [{'text': 'Synthetic local context'}]}))
-    state = {'fail_phase': '', 'calls': [], 'seed_timeout': False, 'clock': 0}
+    state = {'fail_phase': '', 'calls': [], 'seed_timeout': False, 'clock': 0, 'google_args': []}
     monkeypatch.setattr(brief_runner.time, 'monotonic', lambda: state['clock'])
     def invoke(argv, **kwargs):
         name = Path(argv[1]).name
@@ -96,6 +98,7 @@ def procedure(tmp_path, monkeypatch):
             raise brief_runner.subprocess.TimeoutExpired(argv, kwargs['timeout'])
         result = {}
         if name == 'gather_google.py':
+            state['google_args'].append(argv)
             output('--gmail-out', [])
             output('--cal-out', [{'id': 'meeting-1', 'start': '2026-09-08T10:00:00-07:00'}])
             output('--source-results-out', {'gmail': {'status': 'ok'},
@@ -113,6 +116,73 @@ def procedure(tmp_path, monkeypatch):
     request = {'pack': str(PACK), 'payload_path': str(payload), 'kind': 'morning',
                'day': '2026-09-08', 'work_key': 'synthetic-brief-generation'}
     return request, state
+
+
+def test_welcome_read_allowance_leaves_quota_headroom_without_dropping_sent_or_week(procedure):
+    import math
+    import runpy
+
+    request, state = procedure
+    assert brief_runner.run({**request, 'kind': 'welcome'}) == 'A useful brief'
+    argv, = state['google_args']
+    assert argv[argv.index('--window-days') + 1] == '7'
+    assert '--skip-sent' not in argv
+    hits_per_slice = int(argv[argv.index('--max') + 1])
+    bodies = int(argv[argv.index('--bodies') + 1])
+    gather = runpy.run_path(str(PACK / '_shared/scripts/gather_google.py'))
+    slices = math.ceil((7 + 2) / gather['GMAIL_SLICE_DAYS'])
+    # Provider contract, including the retained sent lane (15 hits/slice, 10 bodies total)
+    # and worst-case three attachment reads + one fallback full read per body. Four
+    # list requests cost 5 each; each metadata/full/attachment GET costs 20. Reserve
+    # at least 1,000 of the new-project 6,000-unit minute for overlapping ordinary work.
+    get_count = (slices * hits_per_slice + bodies * (2 + gather['MAX_ATTACHMENTS_PER_EMAIL'])
+                 + slices * gather['SENT_MAX'] + min(gather['SENT_BODIES'], gather['SENT_MAX']))
+    assert slices * 2 * 5 + get_count * 20 <= 5000
+    assert hits_per_slice >= 40 and bodies >= 12  # at least the ordinary gather's context
+
+
+@pytest.mark.parametrize('prepare', [False, True])
+def test_budget_denial_precedes_all_fresh_source_access(procedure, monkeypatch, tmp_path, prepare):
+    import gemini_transport
+    request, state = procedure
+    def denied():
+        raise gemini_transport.ModelBudgetUnavailableError('fixture denial')
+    monkeypatch.setattr(gemini_transport, 'brief_model_preflight', denied)
+    monkeypatch.setattr('source_context.read_local', lambda *a, **k: pytest.fail('local source read'))
+    for _ in range(2):
+        with pytest.raises(brief_runner.BriefModelBudgetError):
+            brief_runner.run({**request, 'prepare': prepare})
+    assert state['calls'] == []  # Neither Google nor optional research/learning started.
+    assert not list(tmp_path.rglob('artifact.json'))
+
+
+def test_saved_brief_delivery_does_not_need_another_model_allowance(procedure, monkeypatch):
+    import gemini_transport
+    request, state = procedure
+    assert brief_runner.run(request) == 'A useful brief'
+    before = list(state['calls'])
+    monkeypatch.setattr(gemini_transport, 'brief_model_preflight',
+                        lambda: pytest.fail('saved artifact must remain deliverable'))
+    assert brief_runner.run(request) == 'A useful brief'
+    assert state['calls'] == before
+
+
+@pytest.mark.parametrize('failing_script,expected', [
+    ('compose_brief.py', brief_runner.BriefModelBudgetError),
+    ('gather_google.py', RuntimeError),
+])
+def test_typed_denial_mid_run_only_comes_from_composer(procedure, monkeypatch, failing_script, expected):
+    import work_queue
+    request, state = procedure
+    original = brief_runner.subprocess.run
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == failing_script:
+            return SimpleNamespace(returncode=work_queue.MODEL_BUDGET_EXIT, stdout='', stderr='private fixture')
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(expected) as caught:
+        brief_runner.run(request)
+    assert 'private fixture' not in str(caught.value)
 
 
 def test_optional_learning_failure_keeps_deliverable_and_retries_from_durable_inputs(procedure, tmp_path):

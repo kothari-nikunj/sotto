@@ -13,6 +13,90 @@ import gemini
 SUPPORTED = ['gemini-3-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.8-flash']
 
 
+@pytest.fixture
+def brief_capability(monkeypatch, managed_proxy):
+    from types import SimpleNamespace
+    state = {'value': capability(), 'requests': []}
+    def open_request(request, timeout):
+        assert timeout == 30
+        assert request.get_method() == 'GET' and request.data is None
+        assert request.full_url == 'https://proxy.example/v1/capabilities/background-budget'
+        assert request.get_header('Authorization') == 'Bearer tenant-test-token'
+        state['requests'].append(request)
+        if 'error' in state:
+            raise state['error']
+        return io.BytesIO(state.get('raw', json.dumps(state['value']).encode()))
+    def opener(handler):
+        assert isinstance(handler, transport._NoProxyRedirect)
+        return SimpleNamespace(open=open_request)
+    monkeypatch.setattr(transport.urllib.request, 'build_opener', opener)
+    return state
+
+
+def test_brief_admission_checks_without_buying_a_model_call(brief_capability):
+    transport.brief_model_preflight()
+    assert len(brief_capability['requests']) == 1
+    brief_capability['value'] = capability(finite=False, can_admit=False)
+    transport.brief_model_preflight()  # The original unlimited managed route remains supported.
+
+
+def test_exhausted_brief_admission_is_distinct_from_invalid_capability(brief_capability):
+    brief_capability['value'].update(remaining_cents=149, can_admit=False)
+    with pytest.raises(transport.ModelBudgetUnavailableError):
+        transport.brief_model_preflight()
+
+
+@pytest.mark.parametrize('change', [
+    {'version': True}, {'finite': 'true'}, {'remaining_cents': True},
+    {'remaining_cents': -1}, {'remaining_cents': 149, 'can_admit': True},
+    {'remaining_cents': 200, 'can_admit': False}, {'supported_native_models': []},
+    {'finite': False, 'remaining_cents': 100},
+])
+def test_malformed_brief_capability_never_becomes_a_budget_denial(brief_capability, change):
+    brief_capability['value'].update(change)
+    with pytest.raises(ValueError):
+        transport.brief_model_preflight()
+
+
+def test_brief_capability_bounds_response_and_refuses_redirects(brief_capability):
+    brief_capability['raw'] = b' ' * 4097
+    with pytest.raises(ValueError, match='too large'):
+        transport.brief_model_preflight()
+    assert transport._NoProxyRedirect().redirect_request(None, None, 302, '', {}, 'https://other.example') is None
+
+
+@pytest.mark.parametrize('code', [401, 403, 404, 500])
+def test_brief_auth_network_and_version_failures_are_not_budget_denials(brief_capability, code):
+    error = transport.urllib.error.HTTPError('https://proxy.example', code, 'fixture', {}, io.BytesIO(b'{}'))
+    brief_capability['error'] = error
+    with pytest.raises(transport.urllib.error.HTTPError) as caught:
+        transport.brief_model_preflight()
+    assert caught.value is error
+
+
+def test_direct_key_brief_has_no_proxy_probe(monkeypatch):
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    monkeypatch.setattr(transport.urllib.request, 'build_opener', lambda *a: pytest.fail('direct key probed'))
+    transport.brief_model_preflight()
+
+
+@pytest.mark.parametrize('url,body,code,expected', [
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"sotto_budget_exhausted"}}', 402, True),
+    ('https://proxy.example.evil/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"sotto_budget_exhausted"}}', 402, False),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"upstream_billing"}}', 402, False),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent', b'not json', 402, False),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent', b' ' * 4097, 402, False),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+     b'{"error":{"code":"sotto_budget_exhausted"}}', 500, False),
+])
+def test_only_exact_proxy_budget_envelope_is_terminal(managed_proxy, url, body, code, expected):
+    error = transport.urllib.error.HTTPError(url, code, 'fixture', {}, io.BytesIO(body))
+    assert transport.proxy_budget_exhausted(error) is expected
+
+
 def capability(*, finite=True, can_admit=True):
     return {'version': 1, 'finite': finite, 'remaining_cents': 200 if finite else None,
             'can_admit': can_admit, 'supported_native_models': SUPPORTED}

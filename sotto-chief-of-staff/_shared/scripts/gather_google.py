@@ -36,8 +36,10 @@ import datetime
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import getaddresses
 
@@ -106,11 +108,46 @@ def _find_google_api():
     return None
 
 
+class GoogleCLIError(RuntimeError):
+    """Failure from the trusted Google provider CLI, distinct from local runtime errors."""
+
+
+def _refresh_google_token():
+    """Refresh through Sotto's locked compare-and-write so the upstream CLI never refreshes an
+    expired token itself and overwrites a reconnect that landed meanwhile (source tree, then image)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (os.path.join(here, "..", "..", ".."), "/app"):
+        setup = os.path.join(root, "adapters", "hermes", "google_setup.py")
+        if os.path.isfile(setup):
+            r = subprocess.run([sys.executable or "python3", setup, "--check"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode:
+                raise GoogleCLIError("Google token check failed")
+            return
+
+
+_HTTP_STATUS = re.compile(r"(?:HttpError\s+|HTTP\s*|Error\s+|status(?: code)?\s*[=: ]\s*)(403|429)\b", re.I)
+_QUOTA_REASON = re.compile(r"\b(?:userRateLimitExceeded|rateLimitExceeded|quotaExceeded)\b|"
+                           r"\bquota\s+exceeded\b|\bTotal Query Cost Units per minute per user\b", re.I)
+
+
+def _source_error(exc):
+    """Return only a bounded code; provider text never enters a source receipt."""
+    response = getattr(exc, 'resp', None)
+    status = getattr(response, 'status', None)
+    if isinstance(exc, GoogleCLIError):
+        match = _HTTP_STATUS.search(str(exc))
+        status = int(match.group(1)) if match else None
+    if status == 429 or (status == 403 and _QUOTA_REASON.search(str(exc))):
+        return 'rate_limited'
+    return type(exc).__name__
+
+
 def _run(api, args, timeout=60):
     py = sys.executable or "python3"
     r = subprocess.run([py, api, *args], capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"google_api {' '.join(args)} failed")
+        raise GoogleCLIError(r.stderr.strip() or f"google_api {' '.join(args)} failed")
     from google_cli import decode_output
     return decode_output(r.stdout, args)
 
@@ -235,8 +272,17 @@ def my_response(e: dict) -> str:
     return ""
 
 
-def _fetch_body(api, mid):
-    """One full-message fetch. A failure just means that email stays snippet-only."""
+class GmailRows(list):
+    """Usable rows plus per-search coverage facts lost by a plain list."""
+
+    rate_limited = False
+    capped = False
+
+
+def _fetch_body(api, mid, quota_stop=None):
+    """One full-message fetch; retain a snippet if this individual read fails."""
+    if quota_stop is not None and quota_stop.is_set():
+        return mid, None
     try:
         if _token_path():
             service = _gmail_service()
@@ -247,7 +293,9 @@ def _fetch_body(api, mid):
                 if callable(close):
                     close()
         return mid, _run(api, ["gmail", "get", str(mid)], timeout=30)
-    except Exception:
+    except Exception as error:
+        if quota_stop is not None and _source_error(error) == 'rate_limited':
+            quota_stop.set()
         return mid, None
 
 
@@ -321,7 +369,7 @@ def _attachment_bytes(service, mid: str, part: dict) -> bytes:
     return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
 
 
-def _fetch_attachments(service, mid: str, payload=None) -> list:
+def _fetch_attachments(service, mid: str, payload=None, quota_stop=None) -> list:
     """One message → its attachment rows, ready to hang on the normalized email.
 
     EVERY attachment is named. The first MAX_ATTACHMENTS_PER_EMAIL that are also under
@@ -335,6 +383,9 @@ def _fetch_attachments(service, mid: str, payload=None) -> list:
     rows, converted = [], 0
     for part in parts:
         name = part["filename"]
+        if quota_stop is not None and quota_stop.is_set():
+            rows.append({"filename": name, "unreadable": "could not be downloaded"})
+            continue
         if part["size"] > MAX_ATTACHMENT_BYTES:
             rows.append({"filename": name, "unreadable": "too large to read"})
             continue
@@ -345,14 +396,16 @@ def _fetch_attachments(service, mid: str, payload=None) -> list:
         converted += 1
         try:
             data = _attachment_bytes(service, mid, part)
-        except Exception:  # noqa: BLE001  (one attachment failing to download names it, nothing more)
+        except Exception as error:  # noqa: BLE001  (one failed file stays named)
+            if quota_stop is not None and _source_error(error) == 'rate_limited':
+                quota_stop.set()
             rows.append({"filename": name, "unreadable": "could not be downloaded"})
             continue
         rows.append(convert_attachment(name, data))
     return rows
 
 
-def _attachments_for(mids: list, payloads=None) -> dict:
+def _attachments_for(mids: list, payloads=None, quota_stop=None) -> dict:
     """{message_id: [attachment rows]} for the bodies-cohort inbox messages that have any.
 
     NEVER RAISES. Google not connected, the client libs missing, an API error, one bad message —
@@ -362,6 +415,8 @@ def _attachments_for(mids: list, payloads=None) -> dict:
     if not mids or not _token_path():
         return {}
     def _one(mid):
+        if quota_stop is not None and quota_stop.is_set():
+            return mid, []
         # googleapiclient's httplib2 transport is not thread-safe. A shared client
         # corrupted concurrent TLS reads in the first live Cloud gather (SIGSEGV).
         # Each worker owns and closes its connection; cohort ordering stays unchanged.
@@ -369,9 +424,13 @@ def _attachments_for(mids: list, payloads=None) -> dict:
         try:
             service = _gmail_service()
             payload = (payloads or {}).get(mid)
+            if quota_stop is not None:
+                return mid, _fetch_attachments(service, mid, payload, quota_stop=quota_stop)
             return mid, (_fetch_attachments(service, mid, payload) if payload is not None
                          else _fetch_attachments(service, mid))
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if quota_stop is not None and _source_error(error) == 'rate_limited':
+                quota_stop.set()
             return mid, []
         finally:
             if service is not None:
@@ -397,9 +456,10 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
     # Output order is preserved: `full` is a lookup, the emit loop below follows `items`.
     mids = [it.get("id") for it in items[:bodies] if it.get("id")]
     full = {}
+    quota_stop = threading.Event()
     if mids:
         with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(mids))) as ex:
-            for mid, msg in ex.map(lambda m: _fetch_body(api, m), mids):
+            for mid, msg in ex.map(lambda m: _fetch_body(api, m, quota_stop), mids):
                 if msg is not None:
                     full[mid] = msg
     # The attachment lane rides the SAME cohort as the bodies: an email thin enough to be
@@ -408,11 +468,14 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
     # concurrency decides when the bytes arrive, never who gets the budget.
     payloads = {mid: msg.get("payload") for mid, msg in full.items()
                 if isinstance(msg, dict) and isinstance(msg.get("payload"), dict)}
-    atts = _attachments_for(mids, payloads) if attachments else {}
+    atts = (_attachments_for(mids, payloads, quota_stop)
+            if attachments and not quota_stop.is_set() else {})
     if atts:
         budgeted = apply_attachment_budget([atts.get(m) or [] for m in mids])
         atts = {m: rows for m, rows in zip(mids, budgeted) if rows}
-    rows = []
+    rows = GmailRows()
+    rows.rate_limited = quota_stop.is_set()
+    rows.capped = max_n > 0 and len(items) >= max_n
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -452,16 +515,27 @@ def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int,
         bounds.append((lo, hi))
         hi = lo
     per = max(0, bodies // len(bounds))
-    out, seen = [], set()
+    out, seen = GmailRows(), set()
     for i, (lo, hi) in enumerate(bounds):
         q = f"{base_query} after:{lo:%Y/%m/%d} before:{hi:%Y/%m/%d}".strip()
-        for e in _search_gmail(api, q, max_n, per + (bodies % len(bounds) if i == 0 else 0),
-                               timeout=BACKFILL_TIMEOUT, attachments=attachments):
+        try:
+            rows = _search_gmail(api, q, max_n, per + (bodies % len(bounds) if i == 0 else 0),
+                                 timeout=BACKFILL_TIMEOUT, attachments=attachments)
+        except Exception as error:
+            if out and _source_error(error) == 'rate_limited':
+                out.rate_limited = True
+                break
+            raise
+        out.capped = out.capped or getattr(rows, 'capped', False)
+        for e in rows:
             mid = str(e.get("id") or "")
             if mid and mid in seen:
                 continue
             seen.add(mid)
             out.append(e)
+        if getattr(rows, 'rate_limited', False):
+            out.rate_limited = True
+            break
     return out
 
 
@@ -496,9 +570,12 @@ def gather_sent(api, max_n: int = SENT_MAX, bodies: int = SENT_BODIES, days: int
     NO ATTACHMENTS, deliberately: this lane exists to teach the style fingerprint the user's email
     VOICE and to close loops against what they sent. Converting the files they attached to their own
     mail would cost API calls and prompt budget to tell them what they already know."""
-    if days <= 1:
-        return [mark_sent(e) for e in _search_gmail(api, "in:sent newer_than:1d", max_n, bodies)]
-    return [mark_sent(e) for e in _sliced_gmail(api, "in:sent", max_n, bodies, days)]
+    rows = (_search_gmail(api, "in:sent newer_than:1d", max_n, bodies) if days <= 1
+            else _sliced_gmail(api, "in:sent", max_n, bodies, days))
+    result = GmailRows(mark_sent(e) for e in rows)
+    result.rate_limited = getattr(rows, 'rate_limited', False)
+    result.capped = getattr(rows, 'capped', False)
+    return result
 
 
 def merge_sent(inbox: list, sent: list) -> list:
@@ -591,17 +668,28 @@ def gather_stale_sent(api, service=None, now=None) -> list:
             tids.append(tid)
     tids = tids[:STALE_MAX_THREADS]
     if not tids:
-        return []
+        return GmailRows()
     svc = service or _gmail_service()
-    threads = {}
-    for tid in tids:
-        try:
-            threads[tid] = svc.users().threads().get(
-                userId="me", id=tid, format="metadata",
-                metadataHeaders=["From", "To", "Cc", "Subject"]).execute()
-        except Exception:  # noqa: BLE001 — one unreadable thread is not a broken lane
-            continue
-    return stale_from_threads(rows, threads, now)
+    threads, rate_limited = {}, False
+    try:
+        for tid in tids:
+            try:
+                threads[tid] = svc.users().threads().get(
+                    userId="me", id=tid, format="metadata",
+                    metadataHeaders=["From", "To", "Cc", "Subject"]).execute()
+            except Exception as error:  # noqa: BLE001 — one unreadable thread costs only itself
+                if _source_error(error) == 'rate_limited':
+                    rate_limited = True
+                    break
+                continue
+    finally:
+        if service is None:
+            close = getattr(svc, 'close', None)
+            if callable(close):
+                close()
+    result = GmailRows(stale_from_threads(rows, threads, now))
+    result.rate_limited = rate_limited
+    return result
 
 
 def gather_calendar(api, back_days: int = 0, service=None, observation=None):
@@ -902,6 +990,16 @@ def main():
         if a.source_results_out:
             jsonstore.write_atomic(a.source_results_out, source_results)
 
+    def mark_gmail_lane_rate_limited():
+        # A sent/stale lane hit the quota after the inbox read. Merge, never replace: a complete
+        # inbox becomes partial but keeps its coverage window; a failed inbox keeps its own status
+        # and error; an existing, more specific error wins.
+        result = source_results['gmail']
+        if result['status'] == 'ok':
+            result.update(status='partial', complete=False, error='rate_limited')
+        elif result['status'] == 'partial':
+            result.setdefault('error', 'rate_limited')
+
 
     if a.ensure_deps:
         # Setup-time heal: pay the (up to 240s) pip install during onboarding, so the first brief's
@@ -923,6 +1021,7 @@ def main():
         else:
             _ensure_google_deps()
             try:
+                _refresh_google_token()
                 comms = gather_attendee_comms(api, a.attendee_comms)
             except Exception as e:  # noqa: BLE001
                 comms, err = {}, f"attendee-comms: {e}"
@@ -969,31 +1068,51 @@ def main():
     else:
         _diag(f"[gather_google] using {api}")
         _ensure_google_deps()   # guarantee googleapiclient in THIS interpreter before any fetch
-        if not a.skip_gmail and allowed('gmail'):
+        try:
+            _refresh_google_token()
+        except Exception as e:  # noqa: BLE001 — both sources keep their "unavailable" receipt
+            api, err = None, f"google token: {e}"
+        if api and not a.skip_gmail and allowed('gmail'):
+            gmail_rate_limited = False
             try:
                 emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
-                capped = a.max > 0 and len(emails) >= a.max
-                source_results['gmail'] = source_result('partial' if capped else 'ok', complete=not capped,
+                capped = (getattr(emails, 'capped') if isinstance(emails, GmailRows)
+                          else a.max > 0 and len(emails) >= a.max)
+                gmail_rate_limited = getattr(emails, 'rate_limited', False)
+                source_results['gmail'] = source_result('partial' if capped or gmail_rate_limited else 'ok',
+                    complete=not capped and not gmail_rate_limited,
                     since=(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.window_days)).isoformat(),
-                    until=observed_at)
+                    until=observed_at, error='rate_limited' if gmail_rate_limited else None)
             except Exception as e:  # noqa: BLE001
                 err = f"gmail: {e}"
-                source_results["gmail"] = source_result("unavailable", error=type(e).__name__)
+                error_code = _source_error(e)
+                gmail_rate_limited = error_code == 'rate_limited'
+                source_results["gmail"] = source_result("unavailable", error=error_code)
             # Sent lane is exhaust, not brief content — its own try so a failure here can never
             # cost the brief its inbox.
-            if not a.skip_sent and a.sent_max > 0:
+            if not gmail_rate_limited and not a.skip_sent and a.sent_max > 0:
                 try:
                     sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max), days=a.window_days)
+                    gmail_rate_limited = getattr(sent, 'rate_limited', False)
+                    if gmail_rate_limited:
+                        mark_gmail_lane_rate_limited()
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; sent: {e}") if err else f"sent: {e}"
+                    gmail_rate_limited = _source_error(e) == 'rate_limited'
+                    if gmail_rate_limited:
+                        mark_gmail_lane_rate_limited()
             # The stale-sent lane: its own try, and only on the daily window (a backfill has no
             # "today" to be stale against).
-            if not a.skip_stale and a.window_days <= 1:
+            if not gmail_rate_limited and not a.skip_stale and a.window_days <= 1:
                 try:
                     stale = gather_stale_sent(api)
+                    if getattr(stale, 'rate_limited', False):
+                        mark_gmail_lane_rate_limited()
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; stale: {e}") if err else f"stale: {e}"
-        if not a.skip_calendar and allowed('calendar'):
+                    if _source_error(e) == 'rate_limited':
+                        mark_gmail_lane_rate_limited()
+        if api and not a.skip_calendar and allowed('calendar'):
             try:
                 observation = {}
                 events = gather_calendar(api, back_days=max(0, a.window_days - 1), observation=observation)
@@ -1002,7 +1121,7 @@ def main():
                     **observation.get('coverage', {}))
             except Exception as e:  # noqa: BLE001
                 err = (err + f"; calendar: {e}") if err else f"calendar: {e}"
-                source_results["calendar"] = source_result("unavailable", error=type(e).__name__)
+                source_results["calendar"] = source_result("unavailable", error=_source_error(e))
 
     # Recheck grants after I/O; a concurrent revocation must also discard staged results.
     for source in ('gmail', 'calendar'):
@@ -1014,21 +1133,28 @@ def main():
                 events = []
     write_source_results()
 
-    # Email-window honesty: the search returning EXACTLY the cap means the 24h window almost
-    # certainly held more — never silently truncate. Wrap the array in a metadata envelope
+    # Email-window honesty: any inbox search hitting its per-query cap may have more results.
+    # Wrap the array in a metadata envelope
     # ({"emails": [...], "truncated_at": N}) that compose_brief and triage_queue both accept, so the
     # brief's coverage/source-availability line can say "(inbox window truncated at N — more arrived)".
     # An un-truncated gather keeps the plain-array format (full back-compat).
     # NOTE: measured on the INBOX lane only, BEFORE the sent merge — the sent rows would otherwise
     # push the count past --max and either mask or fake a truncated window.
-    truncated_at = a.max if (not a.skip_gmail and a.max > 0 and len(emails) == a.max) else None
+    truncated_at = a.max if (not a.skip_gmail and a.max > 0 and
+                             (getattr(emails, 'capped') if isinstance(emails, GmailRows)
+                              else len(emails) >= a.max)) else None
     emails = merge_sent(emails, sent)
     n_sent = sum(1 for e in emails if e.get("isSent"))
     if truncated_at or stale:
         gmail_payload = {"emails": emails}
         if truncated_at:
             gmail_payload["truncated_at"] = truncated_at
-            gmail_payload["truncation_note"] = f"(inbox window truncated at {truncated_at} — more arrived)"
+            if a.window_days > 1:
+                gmail_payload["truncation_scope"] = "date_slices"
+                gmail_payload["truncation_note"] = (
+                    "(email history is partial — some date ranges reached the read limit)")
+            else:
+                gmail_payload["truncation_note"] = f"(inbox window truncated at {truncated_at} — more arrived)"
         if stale:
             gmail_payload["stale_threads"] = stale
     else:
@@ -1040,7 +1166,7 @@ def main():
     msg = (f"[gather_google] {len(emails)} emails ({n_sent} sent, {len(stale)} stale sent threads), "
            f"{len(events)} events → {a.gmail_out}, {a.cal_out}")
     if truncated_at:
-        msg += f"  (inbox window truncated at {truncated_at} — more arrived)"
+        msg += "  " + gmail_payload["truncation_note"]
     if err:
         msg += f"  (WARNING: {err})"
     print(msg)

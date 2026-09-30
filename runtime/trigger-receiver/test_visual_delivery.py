@@ -20,6 +20,7 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: True)
     monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: True)
     monkeypatch.setitem(box.HOOKS, 'send', lambda *a: pytest.fail('must use grouped transport'))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: None)
     return box
 
 
@@ -77,6 +78,169 @@ def test_crash_after_dispatch_does_not_replay_gallery(box, monkeypatch):
         box.deliver(payload())
     monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: pytest.fail('ambiguous send repeated'))
     retry(box)
+
+
+def test_late_sidecar_acceptance_settles_without_second_provider_call(box, monkeypatch):
+    calls = []
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key:
+                        {'acceptance': 'accepted', 'message_id': 'parent', 'message_ids': ['part']})
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: calls.append(a) or
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    assert not box.deliver(payload())
+    retry(box)
+    assert len(calls) == 1
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == 'delivered' and row['receipt']['message_id'] == 'parent'
+
+
+def test_late_acceptance_wins_before_expiry_and_applies_effect_once(box, monkeypatch):
+    effects = []
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a:
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key:
+                        {'acceptance': 'accepted', 'message_id': 'parent'})
+    monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: effects.append(payload['run_id']))
+    assert not box.deliver(payload())
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+        doc['rows'][0]['payload']['valid_until'] = 0
+    box.drain()
+    box.drain()
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == 'delivered' and effects == ['preview-once']
+
+
+def test_malformed_late_acceptance_remains_ambiguous_past_expiry(box, monkeypatch):
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a:
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: {'acceptance': 'accepted'})
+    assert not box.deliver(payload())
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+        doc['rows'][0]['payload']['valid_until'] = 0
+    box.drain()
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == 'pending' and row['acceptance'] == 'unknown'
+    assert row['payload']['presentation'] and not row.get('receipt')
+
+
+def test_expired_unknown_gallery_later_reconciles_once(box, monkeypatch):
+    sends = []
+    effects = []
+    late = {'value': {'acceptance': 'unknown'}}
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: sends.append(a) or
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: late['value'])
+    monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: effects.append(payload['run_id']))
+    assert not box.deliver(payload())
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+        doc['rows'][0]['payload']['valid_until'] = 0
+    box.drain()
+    held = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert held['status'] == 'pending' and held['payload']['presentation'] and len(sends) == 1
+    late['value'] = {'acceptance': 'accepted', 'message_id': 'parent'}
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+    box.drain()
+    box.drain()
+    settled = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert settled['status'] == 'delivered' and settled['receipt']['message_id'] == 'parent'
+    assert len(sends) == 1 and effects == ['preview-once']
+
+
+def test_historical_unknown_without_sidecar_receipt_stays_held(box, monkeypatch):
+    sends = []
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: sends.append(a) or
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: None)
+    assert not box.deliver(payload())
+    for _ in range(2):
+        with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+            doc['rows'][0]['next_at'] = 0
+            doc['rows'][0]['payload']['valid_until'] = 0
+        box.drain()
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == 'pending' and row['acceptance'] == 'unknown'
+    assert row['payload']['presentation'] and len(sends) == 1
+
+
+def test_changed_source_cannot_supersede_unknown_gallery(box, monkeypatch):
+    sends = []
+    invalidated = []
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: sends.append(a) or
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: None)
+    monkeypatch.setitem(box.HOOKS, 'on_invalid', lambda payload: invalidated.append(payload))
+    assert not box.deliver(payload())
+    monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: False)
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+    box.drain()
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == 'pending' and row['acceptance'] == 'unknown'
+    assert row['payload']['presentation'] and len(sends) == 1 and invalidated == []
+
+
+def test_sidecar_operation_still_resolving_cannot_release_a_fresh_brief(box, monkeypatch):
+    """The sidecar answers in_flight while its operation runs; the adapter holds it as unknown."""
+    adapter = importlib.util.spec_from_file_location(
+        'visual_test_gallery', HERE.parents[1] / 'adapters/hermes/gallery.py')
+    gallery = importlib.util.module_from_spec(adapter)
+    adapter.loader.exec_module(gallery)
+    monkeypatch.setattr(gallery, '_call', lambda endpoint, body, timeout=60: (True, 'accepted',
+                        {'found': True, 'receipt': {'dispatchId': body['dispatchId'], 'acceptance': 'in_flight'}}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', gallery.receipt)
+    monkeypatch.setitem(box.HOOKS, 'brief_gate', lambda *a: 'send')
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a:
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    item = {**payload(), 'label': 'sotto-morning-brief', 'run_id': 'run-1'}
+    assert not box.deliver(item)
+    monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: False)
+    retry(box)
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['acceptance'] == 'unknown' and row['acceptance_uncertain']
+    assert not box.invalidated_claim('run-1', row['day'], 'sotto-morning-brief')
+
+
+def test_gallery_refused_by_the_brief_gate_fails_as_unsent_not_held(box, monkeypatch):
+    """A not-a-brief refusal happens before any send, so it can never hold a gallery for a receipt."""
+    sends = []
+    monkeypatch.setitem(box.HOOKS, 'brief_gate', lambda *a: box.GATE_NOT_A_BRIEF)
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: sends.append(a) or (True, '', {}))
+    monkeypatch.setitem(box.HOOKS, 'on_not_a_brief', lambda payload: None)
+    assert not box.deliver({**payload(), 'label': 'sotto-morning-brief', 'run_id': 'run-1'})
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert sends == [] and row['status'] == 'failed'
+    assert row['acceptance'] == 'not_attempted' and not row.get('acceptance_uncertain')
+
+
+def test_final_attempt_unknown_keeps_reconciliation_identity(box, monkeypatch):
+    sends = []
+    effects = []
+    late = {'value': None}
+    monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a: sends.append(a) or
+                        (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', lambda key: late['value'])
+    monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: effects.append(payload['run_id']))
+    item = payload()
+    box._enqueue(item['run_id'], box.kind_for(item['label']), item,
+                 rec.time.time(), box.HOOKS['local_today']())
+    with rec.CONNECTORS.json_transaction(box.path(), default={'rows': []}) as doc:
+        doc['rows'][0]['attempts'] = box.MAX_ATTEMPTS - 1
+        doc['rows'][0]['next_at'] = 0
+    box.drain()
+    held = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert held['status'] == 'pending' and held['acceptance'] == 'unknown'
+    assert held['payload']['presentation'] and len(sends) == 1
+    late['value'] = {'acceptance': 'accepted', 'message_id': 'parent'}
+    with rec.CONNECTORS.json_transaction(box.path(), default={}) as doc:
+        doc['rows'][0]['next_at'] = 0
+    box.drain()
+    box.drain()
+    settled = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert settled['status'] == 'delivered' and settled['receipt']['message_id'] == 'parent'
+    assert len(sends) == 1 and effects == ['preview-once']
 
 
 def test_revoked_source_prevents_gallery(box, monkeypatch):

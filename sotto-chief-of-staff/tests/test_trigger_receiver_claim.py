@@ -15,7 +15,12 @@ spec.loader.exec_module(rec)
 
 
 def test_payload_write_failure_releases_claim_and_retry_succeeds(tmp_path, monkeypatch):
-    rec.DATA = str(tmp_path)
+    monkeypatch.setattr(rec, "DATA", str(tmp_path))
+    # Exercise disk recovery after setup: a fresh installation correctly holds a wake
+    # before writing its payload until sources and delivery are connected.
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "onboarding.json").write_text(json.dumps({"phase": "existing"}))
     spawned = []
     monkeypatch.setattr(rec, "run_skill", lambda *a: spawned.append(a))
     # This test exercises the normal trigger enqueue path regardless of the wall-clock cron slot.

@@ -17,6 +17,29 @@ import timeutil    # noqa: E402
 import render_local  # noqa: E402
 
 
+@pytest.mark.parametrize('error_code,expected', [('sotto_budget_exhausted', 77), ('upstream_billing', None)])
+def test_cli_distinguishes_proxy_budget_denial(monkeypatch, capsys, error_code, expected):
+    import io
+    import urllib.error
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    error = urllib.error.HTTPError(
+        'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+        402, 'fixture', {}, io.BytesIO(json.dumps({'error': {'code': error_code, 'message': 'private fixture'}}).encode()))
+    def fail():
+        raise error
+    monkeypatch.setattr(cb, 'main', fail)
+    if expected:
+        assert cb.cli() == expected
+        captured = capsys.readouterr()
+        assert captured.out == '' and 'private fixture' not in captured.err
+        assert 'Model allowance reached' in captured.err
+    else:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            cb.cli()
+        assert caught.value is error
+
+
 def test_compose_with_injected_llm():
     # inject a fake model (new-style: accepts system/schema): returns a minimal valid extraction
     def fake_llm(prompt, inputs, system=None, schema=None):
@@ -191,6 +214,19 @@ def test_email_truncation_note_reaches_prompt_and_coverage():
     assert "inbox window truncated" not in p2
 
 
+def test_date_slice_truncation_uses_fixed_coverage_not_total_cap_wording():
+    google = {"emails": [{"id": "m1"}], "events": [], "emailsTruncatedAt": 50,
+              "emailsTruncationScope": "date_slices", "truncationNote": "provider supplied text"}
+    note = cb._email_truncation_note(google)
+    assert note == "(email history is partial — some date ranges reached the read limit)"
+    prompt = cb.build_prompt(cb._load_prompt(), {"type": "welcome", "first_run": True,
+                                                 "google": google, "local": {}})
+    assert note in prompt
+    assert "truncated at 50" not in prompt and "provider supplied text" not in prompt
+    assert note in cb._coverage_line({}, {}, [], google['emails'], note)
+    assert cb._email_truncation_note({"emailsTruncationScope": "date_slices"}) == ""
+
+
 def test_cli_gmail_envelope_carries_truncation(tmp_path):
     import subprocess, sys as _sys
     (tmp_path / "gmail.json").write_text(json.dumps(
@@ -207,6 +243,28 @@ def test_cli_gmail_envelope_carries_truncation(tmp_path):
     assert _body(json.loads(out.stdout)["brief_markdown"]) == "# B"
     # the envelope was accepted: 1 email reached the pipeline (the inputs diag names it)
     assert "1 emails" in out.stderr
+
+
+def test_cli_carries_only_known_date_slice_scope_into_google_inputs(tmp_path, monkeypatch, capsys):
+    import sys as _sys
+    gmail = tmp_path / 'gmail.json'
+    gmail.write_text(json.dumps({'emails': [{'id': 'm1', 'snippet': 's'}],
+                                 'truncated_at': 50, 'truncation_scope': 'date_slices',
+                                 'truncation_note': 'untrusted provider wording'}))
+    captured = {}
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(cb, 'compose', lambda inputs, **kwargs:
+                        captured.update(inputs=inputs) or {'brief_markdown': '# Brief', 'actions': []})
+    monkeypatch.setattr(cb, '_archive_brief', lambda *a, **k: None)
+    monkeypatch.setattr(_sys, 'argv', ['compose_brief.py', '--type', 'morning', '--gmail', str(gmail)])
+    cb.main()
+    google = captured['inputs']['google']
+    assert google['emailsTruncatedAt'] == 50
+    assert google['emailsTruncationScope'] == 'date_slices'
+    assert 'truncationNote' not in google
+    assert cb._email_truncation_note(google) == (
+        '(email history is partial — some date ranges reached the read limit)')
+    assert capsys.readouterr().out
 
 
 def test_stub_env_path(tmp_path, monkeypatch):

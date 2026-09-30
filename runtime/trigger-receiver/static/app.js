@@ -1730,8 +1730,8 @@
 
   /* ---------------- Run it now (GET/POST /api/runs) ----------------
      The same prompt the cron fires, fired by hand. A brief is offered until it has
-     been delivered today (brief_marker's own deliver-once flag says so); the digest
-     is never blocked because it gates itself on a quiet day. */
+     claimed today's deliver-once slot. Receipt/outbox evidence says whether its
+     channel accepted it; the digest gates itself on a quiet day. */
 
   var RUN_LABELS = {
     morning: ["Compose the morning brief now", "your morning brief"],
@@ -1787,8 +1787,12 @@
     var folio = el("div", "row-folio");
     var when = parseWhen(job.at);
     if (job.available === false) {
-      folio.appendChild(el("span", null, str(job.reason) === "running"
-        ? "already running" : "delivered" + (when ? " at " + fmtClock(when) : "")));
+      var reason = str(job.reason);
+      var status = reason === "running" ? "already running"
+        : reason === "delivered" ? "sent" + (when ? " at " + fmtClock(when) : "")
+        : reason === "pending" ? "waiting for delivery"
+        : reason === "failed" ? "delivery failed" : "delivery not confirmed";
+      folio.appendChild(el("span", null, status));
     } else if (when) {
       folio.appendChild(el("span", null, "window since " + fmtClock(when)));
     }

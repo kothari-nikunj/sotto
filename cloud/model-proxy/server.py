@@ -4,8 +4,10 @@ Never log prompts, credentials, URLs with keys, images or upstream response bodi
 The pilot charges a conservative $2 allowance per attempted upstream call. This is
 an admission budget, not an invoice; provider billing remains authoritative. Holding
 the allowance across crashes/ambiguous failures avoids freeing spend already used.
-Successful 3.8 chat calls settle to reported input plus the FULL model output ceiling,
-covering unreported reasoning tokens. Native/grounded calls retain their allowance.
+Successful 3.8 chat and proven text-only native calls settle to reported input plus
+the FULL model output ceiling, covering unreported reasoning tokens. Grounded,
+multimodal and ambiguous native calls, and any reply whose reported output (with
+thinking) is missing or above that ceiling, retain their allowance.
 """
 import hashlib
 import hmac
@@ -80,12 +82,87 @@ def tool_result_sizes(payload):
 
 
 def settled_chat_allowance(route, model, created, status, input_tokens):
-    if (route == 'chat' and model == 'gemini-3.8-flash' and status == 200
+    return (settled_text_allowance(model, created, status, input_tokens)
+            if route == 'chat' else CALL_ALLOWANCE_CENTS)
+
+
+def settled_text_allowance(model, created, status, input_tokens):
+    if (model == 'gemini-3.8-flash' and status == 200
             and PRICING_START <= created < PRICING_END
             and isinstance(input_tokens, int) and not isinstance(input_tokens, bool)
             and 0 <= input_tokens <= 1048576):
         return min(CALL_ALLOWANCE_CENTS, math.ceil((input_tokens * 75 + MAX_OUTPUT * 375) / 1_000_000))
     return CALL_ALLOWANCE_CENTS
+
+
+def _text_parts(value):
+    return (isinstance(value, dict) and set(value) <= {'parts', 'role'}
+            and isinstance(value.get('parts'), list) and bool(value['parts'])
+            and all(isinstance(part, dict) and set(part) == {'text'}
+                    and isinstance(part['text'], str) for part in value['parts']))
+
+
+def _text_response_parts(value):
+    # Thinking models can annotate otherwise text-only output with an opaque
+    # signature or a thought marker. Keep request proof and media exclusion strict.
+    return (isinstance(value, dict) and set(value) <= {'parts', 'role'}
+            and isinstance(value.get('parts'), list) and bool(value['parts'])
+            and all(isinstance(part, dict) and 'text' in part
+                    and set(part) <= {'text', 'thoughtSignature', 'thought'}
+                    and isinstance(part['text'], str)
+                    and ('thoughtSignature' not in part
+                         or isinstance(part['thoughtSignature'], str))
+                    and ('thought' not in part or type(part['thought']) is bool)
+                    for part in value['parts']))
+
+
+def native_text_request(payload):
+    """Only the ordinary Gemini text/JSON shape; unknown billable features keep $2."""
+    if not isinstance(payload, dict) or not set(payload) <= {
+            'contents', 'systemInstruction', 'generationConfig'}:
+        return False
+    contents = payload.get('contents')
+    if not isinstance(contents, list) or not contents or not all(_text_parts(c) for c in contents):
+        return False
+    if 'systemInstruction' in payload and not _text_parts(payload['systemInstruction']):
+        return False
+    config = payload.get('generationConfig', {})
+    return (isinstance(config, dict) and set(config) <= {
+        'candidateCount', 'maxOutputTokens', 'temperature',
+        'thinkingConfig', 'responseSchema', 'response_mime_type', 'responseMimeType'}
+        and type(config.get('candidateCount', 1)) is int and config.get('candidateCount', 1) == 1
+        and config.get('response_mime_type', 'application/json') in ('text/plain', 'application/json')
+        and config.get('responseMimeType', 'application/json') in ('text/plain', 'application/json')
+        and ('thinkingConfig' not in config or (
+            isinstance(config['thinkingConfig'], dict)
+            and set(config['thinkingConfig']) <= {'thinkingLevel', 'includeThoughts'})))
+
+
+def native_text_response(item):
+    """A completed nonstreamed reply must prove native usage and no paid tools/media."""
+    if not isinstance(item, dict) or not set(item) <= {
+            'candidates', 'usageMetadata', 'modelVersion', 'responseId', 'createTime'}:
+        return False
+    usage = item.get('usageMetadata')
+    if not isinstance(usage, dict):
+        return False
+    prompt = usage.get('promptTokenCount')
+    if (type(prompt) is not int or not 0 <= prompt <= 1048576
+            or type(usage.get('toolUsePromptTokenCount', 0)) is not int
+            or usage.get('toolUsePromptTokenCount', 0) != 0
+            or any(any(label in key.lower() for label in ('tool', 'ground', 'search'))
+                   for key in usage if key != 'toolUsePromptTokenCount')):
+        return False
+    candidates = item.get('candidates')
+    return (isinstance(candidates, list) and len(candidates) == 1
+            and isinstance(candidates[0], dict)
+            and set(candidates[0]) <= {
+                'content', 'finishReason', 'finishMessage', 'index', 'safetyRatings',
+                'avgLogprobs', 'logprobsResult', 'tokenCount'}
+            # MAX_TOKENS is a completed model response; the full output ceiling
+            # already covers it. An interrupted transport never parses here.
+            and candidates[0].get('finishReason') in ('STOP', 'MAX_TOKENS')
+            and _text_response_parts(candidates[0].get('content')))
 
 
 
@@ -158,7 +235,7 @@ class Ledger:
             db.execute('CREATE TABLE IF NOT EXISTS proxy_migrations (name TEXT PRIMARY KEY, applied REAL NOT NULL)')
 
             # Backfill only receipted chat attempts, idempotently. Failed, interrupted,
-            # unknown-usage and grounded/native calls keep the original reservation. Record the
+            # unknown-usage and legacy native calls keep the original reservation. Record the
             # migration so a growing metering ledger is not scanned on every process restart.
             applied = db.execute('SELECT 1 FROM proxy_migrations WHERE name=?',
                                  (SETTLEMENT_MIGRATION,)).fetchone()
@@ -218,7 +295,8 @@ class Ledger:
                        (json.dumps(metadata or {}), cursor.lastrowid))
             return cursor.lastrowid
 
-    def finish(self, call, status, usage):
+    def finish(self, call, status, usage, *, proven_native_text=False,
+               native_text_request_eligible=None, native_text_response_eligible=None):
         # Missing usage or ambiguous outcomes never release an allowance.
         usage = usage if isinstance(usage, dict) else {}
         def count(*names):
@@ -231,18 +309,37 @@ class Ledger:
         thoughts = count('thoughtsTokenCount')
         if output is not None and thoughts is not None:
             output += thoughts
+        # Settlement prices the fixed output ceiling, so it only holds when the reported
+        # output (with separately reported thinking) is present, valid and within it.
+        output_within_ceiling = (output is not None and output <= MAX_OUTPUT
+                                 and ('thoughtsTokenCount' not in usage or thoughts is not None))
         with self.connect() as db:
             db.execute('UPDATE calls SET status=?,input_tokens=?,output_tokens=? WHERE id=?',
-                       (status, count('promptTokenCount', 'prompt_tokens'),
+                       (status, count('promptTokenCount') if proven_native_text else
+                        count('promptTokenCount', 'prompt_tokens'),
                         output, call))
             row = db.execute('SELECT route,model,created,status,input_tokens FROM calls WHERE id=?', (call,)).fetchone()
             counts = normalize(usage)
             counts.update(estimated_token_cost=estimate(row[1], counts, row[2]) if row else None,
                           token_cost_range=estimate_range(row[1], counts, row[2]) if row else None,
                           pricing_version=PRICING_VERSION, provider_fee_status='not_included')
+            allowance = (settled_chat_allowance(*row) if row and output_within_ceiling
+                         else CALL_ALLOWANCE_CENTS)
+            if row and row[0] == 'native' and proven_native_text and output_within_ceiling:
+                allowance = settled_text_allowance(row[1], row[2], row[3], row[4])
+                if allowance < CALL_ALLOWANCE_CENTS:
+                    counts['allowance_policy'] = 'native_text_v1'
+            if row and row[0] == 'native' and native_text_request_eligible is not None:
+                counts['native_text_request_eligible'] = native_text_request_eligible
+                counts['native_text_response_eligible'] = native_text_response_eligible is True
+                counts['native_text_settlement_reason'] = (
+                    'request_ineligible' if not native_text_request_eligible else
+                    'response_ineligible' if native_text_response_eligible is not True else
+                    'output_unbounded' if not output_within_ceiling else
+                    'settled' if allowance < CALL_ALLOWANCE_CENTS else 'tariff_unavailable')
             db.execute('UPDATE calls SET usage_json=? WHERE id=?', (json.dumps(counts), call))
             if row:
-                db.execute('UPDATE calls SET allowance=? WHERE id=?', (settled_chat_allowance(*row), call))
+                db.execute('UPDATE calls SET allowance=? WHERE id=?', (allowance, call))
 
     def budget_capability(self, tenant, budget):
         with self.connect() as db:
@@ -345,6 +442,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw, object_pairs_hook=unique_object)
             raw = json.dumps(payload, allow_nan=False, separators=(',', ':')).encode()
             lane, model, endpoint = route(self.path, payload)
+            text_request = lane == 'native' and native_text_request(payload)
             if (self.headers.get('X-Sotto-Require-Finite-Budget') == 'true'
                     and tenant['budget_cents'] is None):
                 raise PermissionError('finite tenant budget required')
@@ -368,7 +466,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             response = self.server.open_upstream(req, timeout=300)
         except urllib.error.HTTPError as error:
-            self.server.ledger.finish(call, error.code, {})
+            self.server.ledger.finish(call, error.code, {},
+                                      native_text_request_eligible=text_request if lane == 'native' else None,
+                                      native_text_response_eligible=False)
             # Preserve the native provider error envelope/status, including retry reasons.
             data = error.read(MAX_BODY)
             self.send_response(error.code)
@@ -378,7 +478,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         except (OSError, http.client.HTTPException):
-            self.server.ledger.finish(call, 502, {})
+            self.server.ledger.finish(call, 502, {},
+                                      native_text_request_eligible=text_request if lane == 'native' else None,
+                                      native_text_response_eligible=False)
             return self.respond(502, {'error': 'upstream unavailable'})
         with response:
             content_type = response.headers.get('Content-Type', 'application/json')
@@ -389,18 +491,27 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             captured = bytearray()
+            complete_capture = True
             try:
                 while chunk := response.read1(65536):
-                    if len(captured) < MAX_BODY:
-                        captured.extend(chunk)
+                    available = MAX_BODY - len(captured)
+                    if len(chunk) > available:
+                        complete_capture = False
+                    if available > 0:
+                        captured.extend(chunk[:available])
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except (OSError, TimeoutError):
-                self.server.ledger.finish(call, 502, {})
+                self.server.ledger.finish(call, 502, {},
+                                          native_text_request_eligible=text_request if lane == 'native' else None,
+                                          native_text_response_eligible=False)
                 return
             usage = {}
+            text_response = False
             try:
-                if 'text/event-stream' in content_type:
+                if not complete_capture:
+                    pass
+                elif 'text/event-stream' in content_type:
                     for line in captured.decode().splitlines():
                         if line.startswith('data: ') and line[6:] != '[DONE]':
                             item = json.loads(line[6:])
@@ -408,9 +519,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     item = json.loads(captured)
                     usage = item.get('usageMetadata') or item.get('usage') or {}
+                    text_response = native_text_response(item)
             except (ValueError, UnicodeError):
                 pass
-            self.server.ledger.finish(call, 200, usage)
+            self.server.ledger.finish(call, 200, usage,
+                                      proven_native_text=text_request and text_response,
+                                      native_text_request_eligible=text_request if lane == 'native' else None,
+                                      native_text_response_eligible=text_response)
 
     def renew_lease(self, digest):
         # No prompt, provider call, billing mutation or returned credential. A model token

@@ -21,6 +21,8 @@ Wires the portable Sotto backend into a [Hermes](https://hermes-agent.nousresear
 | `managed_volume.py` · `recovery.py` | Managed mount identity and verified offline tenant recovery; see [RECOVERY.md](RECOVERY.md) |
 | `model_lease.py` | Existing receiver heartbeat renews the proxy model lease; sanitized expiry receipt only |
 | `provider_error_compat.py` | Hash-checked pinned Hermes gateway adaptation: one plain-language provider failure at the shared chat boundaries, never the raw provider payload (see [Provider-error gateway pin](#provider-error-gateway-pin)) |
+| `gallery_obligation_compat.py` | Hash-checked gateway metadata binding so original gallery sends and recovery use the same durable reply ID |
+| `first_contact_compat.py` · `quiet_first_contact.py` | Hash-checked pinned first-contact seam and dedicated-Sotto config; owner activation answers omit generic `/help` and profile offers while ordinary Hermes and home-channel hints retain their behavior |
 | `managed_config.py` · `photon_setup.py` · `photon_probe_compat.py` · `sotto_photon/` | Managed model/channel reconciliation and the pinned Photon adapter compatibility seam |
 | `wa_pair.py` | drives `hermes whatsapp` non-interactively under a PTY (headless/cloud QR pairing) |
 
@@ -43,6 +45,15 @@ learned memory and owner preferences. Owner standing instructions belong in
 `knowledge/master.md`, not the product persona. Self-host persona customization
 is unchanged. The image build runs `check_identity.py` offline to verify permission
 denials and successful normal Hermes initialization across an existing-volume upgrade.
+
+Dedicated Cloud and receiver-based self-host set `onboarding.profile_build: off`,
+`onboarding.sotto_quiet_first_contact: true` and `agent.name: Sotto` unless already customized.
+`install.sh --dedicated` selects the same behavior for a local dedicated gateway;
+ordinary shared Hermes installs keep upstream first-contact onboarding. The pinned
+gateway patch only skips its first-message intro/profile directive for that exact
+config combination. It leaves the separate missing-home-channel hint, approval
+rules and delivery gates intact. The image verifies the reviewed gateway source
+before boot applies the patch; an unreviewed Hermes upgrade fails that check.
 
 Photon processing Tapbacks are owned by `sotto_photon/__init__.py` for both hosting modes.
 They select a small contextual working icon locally, then replace it on the same message
@@ -101,7 +112,7 @@ structured, unskipped provider success with a message ID. Direct `receiver.py` s
 same adapter capability preflight as boot and installation, so it cannot fall back to exit-code-only
 acceptance. This receipt proves provider acceptance, not delivery to the user's device.
 
-Managed personal-pilot Google consent uses `google_setup.py` with `--auth-url --services email,calendar`, `--auth-code`, and `--check`. It requests the selected granted scopes and writes the token format consumed by Hermes and the deterministic gather. The existing desktop client can be reused with fresh owner consent; no multi-user OAuth service is required for this pilot.
+Self-hosted Google consent uses `google_setup.py` with `--auth-url --services email,calendar`, `--auth-code`, and `--check`, driven by the receiver's `/setup` Web-client browser flow. It requests the selected granted scopes and writes the token format consumed by Hermes and the deterministic gather. Existing Desktop-client tokens keep refreshing, but new consent needs a Web application client; no multi-user OAuth service is required for this flow. Only browser-bound Web sessions are exchanged, and boot never creates a consent URL or exchanges `GOOGLE_AUTH_CODE`. `--check` refreshes under the consent lock and never overwrites a token a reconnect replaced meanwhile.
 
 Managed reconciliation declares the Sotto state, timezone, unattended/run identity and
 tenant model proxy pair in Hermes’ `terminal.env_passthrough`. Its code kernel otherwise

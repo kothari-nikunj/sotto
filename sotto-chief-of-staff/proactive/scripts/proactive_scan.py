@@ -317,7 +317,7 @@ def _delivered_prep_occurrences(date: str) -> set:
         return set()
 
 
-def _prep_name(attendee, local, now):
+def _prep_name(attendee, local, now, snapshot=None):
     """Display evidence bound to this email; never title-case an email handle into a person.
 
     Published research can fill a missing name, but never changes identity or overwrites a
@@ -363,7 +363,7 @@ def _prep_name(attendee, local, now):
     if email and allowed('gmail'):
         names = set()
         explicit = preferences.load_explicit()
-        for event, _, _ in conversation_snapshot():
+        for event, _, _ in (snapshot() if callable(snapshot) else conversation_snapshot()):
             if event.get('source') not in ('email', 'gmail'):
                 continue
             participants = getaddresses([_s(event[key]) for key in ('from', 'to', 'cc') if event.get(key)])
@@ -641,6 +641,15 @@ def scan(calendar, continuity, local, user_email, now_local,
         events = calendar.get("events") or calendar.get("items") or []
     else:
         events = calendar if isinstance(calendar, list) else []
+    loaded = []
+
+    def snapshot():
+        # Read the shared message snapshot at most once per scan, and only if a name lookup needs it.
+        if not loaded:
+            from personal_context import conversation_snapshot
+            loaded.append(conversation_snapshot())
+        return loaded[0]
+
     for e in meeting_events(events):
         if (not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined"
                 or _s(e.get("status")).lower() == "cancelled"):
@@ -664,7 +673,7 @@ def scan(calendar, continuity, local, user_email, now_local,
         # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
         # own title/company for the first external attendee) and the one open loop with them, if
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
-        name = _prep_name(ext[0], local, now_local)
+        name = _prep_name(ext[0], local, now_local, snapshot)
         attendee = {**ext[0], "displayName": name}
         who, loop = _prep_lines(attendee, continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{occurrence}",

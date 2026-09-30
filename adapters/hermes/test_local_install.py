@@ -27,6 +27,8 @@ def bootstrap(tmp_path):
     source.mkdir()
     (source / 'gateway').mkdir()
     compat = (HERE / 'provider_error_compat.py').read_text()
+    first_contact = (HERE / 'first_contact_compat.py').read_text()
+    gallery_compat = (HERE / 'gallery_obligation_compat.py').read_text()
     for name, fixture, constant in (
         ('run.py', 'provider_error_pinned_excerpt.py.txt', 'PINNED_SOURCE_SHA256'),
         ('run_turn_runner.py', 'provider_error_turn_runner_excerpt.py.txt', 'PINNED_TURN_RUNNER_SHA256'),
@@ -35,6 +37,36 @@ def bootstrap(tmp_path):
         (source / 'gateway' / name).write_bytes(data)
         compat = re.sub(rf'({constant}\s*=\s*)[\'"][a-f0-9]+[\'"]',
                         rf'\g<1>"{hashlib.sha256(data).hexdigest()}"', compat)
+    first_contact_source = (HERE / 'first_contact_pinned_excerpt.py.txt').read_bytes()
+    (source / 'gateway/run_turn.py').write_bytes(first_contact_source)
+    first_contact = re.sub(r'(PINNED_SOURCE_SHA256\s*=\s*)[\'\"][a-f0-9]+[\'\"]',
+                           rf'\g<1>"{hashlib.sha256(first_contact_source).hexdigest()}"', first_contact)
+    # These synthetic gateway sources retain the exact reviewed edit sites while their
+    # fixture-specific hashes are pinned into a private copy of the compatibility module.
+    gallery_sources = {
+        'base.py': (
+            source / 'gateway/platforms/base.py',
+            'class BasePlatform:\n'
+            '    async def send(self, event, text_content, metadata=None):\n'
+            '        result = await delivery_adapter._send_with_retry(\n'
+            '            chat_id=event.source.chat_id, content=text_content,\n'
+            '            reply_to=_reply_anchor_for_event(event), metadata=metadata)\n'),
+        'run_startup.py': (
+            source / 'gateway/run_startup.py',
+            'async def recover(adapter, row, content):\n'
+            '    async def deliver():\n'
+            '        if row["chat_id"]:\n'
+            '            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None\n'
+            '            try:\n'
+            '                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)\n'),
+    }
+    for name, (path, fixture_text) in gallery_sources.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = fixture_text.encode()
+        path.write_bytes(data)
+        gallery_compat = re.sub(
+            rf"('{re.escape(name)}':\s*)'[a-f0-9]{{64}}'",
+            rf'\g<1>"{hashlib.sha256(data).hexdigest()}"', gallery_compat, count=1)
     git(source, 'init', '-q')
     git(source, 'add', '.')
     git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
@@ -43,6 +75,8 @@ def bootstrap(tmp_path):
     adapter.mkdir()
     shutil.copy(HERE / 'install-runtime.sh', adapter)
     (adapter / 'provider_error_compat.py').write_text(compat)
+    (adapter / 'first_contact_compat.py').write_text(first_contact)
+    (adapter / 'gallery_obligation_compat.py').write_text(gallery_compat)
     (adapter / 'hermes.commit').write_text(git(source, 'rev-parse', 'HEAD') + '\n')
     (adapter / 'hermes-install.sh').write_text('''set -eu
 printf '%s\\n' "$@" > "$TEST_ARGS"
@@ -183,9 +217,11 @@ def test_local_wiring_installs_bridge_and_schedules_without_a_receiver(bootstrap
     adapter.mkdir(parents=True)
     for name in ('install.sh', 'local_preflight.py', 'notification_config.py', 'web_config.py',
                  'web_provider.py', 'configure_mcp.py', 'sotto.bundle.yaml', 'sotto-persona.md',
-                 'crons.json', 'hermes.commit'):
+                 'crons.json', 'hermes.commit', 'quiet_first_contact.py'):
         shutil.copy(HERE / name, adapter)
     shutil.copy(fixture_adapter / 'provider_error_compat.py', adapter)
+    shutil.copy(fixture_adapter / 'first_contact_compat.py', adapter)
+    shutil.copy(fixture_adapter / 'gallery_obligation_compat.py', adapter)
     shutil.copy(HERE.parents[1] / 'requirements.in', root)
     (root / 'sotto-chief-of-staff').mkdir()
     (root / 'sotto-chief-of-staff/SKILL.md').write_text('fixture skill')
@@ -215,6 +251,9 @@ else:
     result = subprocess.run(['/bin/bash', str(adapter / 'install.sh')],
                             env=env, text=True, capture_output=True)
     assert result.returncode == 0, result.stdout + result.stderr
+    installed = Path(env['HERMES_INSTALL_DIR']) / 'gateway'
+    assert 'sotto_obligation_id' in (installed / 'platforms/base.py').read_text()
+    assert 'sotto_obligation_id' in (installed / 'run_startup.py').read_text()
     home = Path(env['HERMES_HOME'])
     config = yaml.safe_load((home / 'config.yaml').read_text())
     assert config['display']['busy_ack_enabled'] is False

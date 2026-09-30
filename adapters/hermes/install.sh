@@ -73,6 +73,20 @@ elif ! run python3 "$HERE/provider_error_compat.py" "$HERMES_SOURCE_ROOT/gateway
   echo "in $HERE/README.md to re-review and regenerate the hashes first." >&2
   exit 1
 fi
+if [ -f "$HERMES_SOURCE_ROOT/gateway/run_turn.py" ]; then
+  run python3 "$HERE/first_contact_compat.py" "$HERMES_SOURCE_ROOT/gateway/run_turn.py"
+elif [ "$DRY_RUN" -eq 0 ]; then
+  echo "Cannot locate the reviewed Hermes first-contact gateway source." >&2
+  exit 1
+fi
+if [ -f "$HERMES_SOURCE_ROOT/gateway/platforms/base.py" ] && \
+   [ -f "$HERMES_SOURCE_ROOT/gateway/run_startup.py" ]; then
+  run python3 "$HERE/gallery_obligation_compat.py" "$HERMES_SOURCE_ROOT/gateway/platforms/base.py"
+  run python3 "$HERE/gallery_obligation_compat.py" "$HERMES_SOURCE_ROOT/gateway/run_startup.py"
+elif [ "$DRY_RUN" -eq 0 ]; then
+  echo "Cannot locate the reviewed Hermes gallery recovery gateway source." >&2
+  exit 1
+fi
 
 # 1) Model + scheduler.
 #    The brief has its own provider setting in compose_brief.py, independent of the chat model.
@@ -84,6 +98,10 @@ DEDICATED=0
 for a in "$@"; do [ "$a" = "--dedicated" ] && DEDICATED=1; done
 [ "$DEDICATED" -eq 1 ] && run hermes config set model gemini-3.8-flash \
   || echo "! Leaving the global model untouched (brief provider is configured separately)."
+if [ "$DEDICATED" -eq 1 ]; then
+  # Opt in only a dedicated Sotto install; shared Hermes keeps upstream onboarding.
+  run python3 "$HERE/quiet_first_contact.py" "$HERMES_HOME/config.yaml"
+fi
 # scheduler.enabled: Hermes v0.20 dropped the key and warns on it — probe with `config get` and set
 # only where supported. (hermes-missing is dry-run only — the guard above exits otherwise — so keep
 # the old dry-run output in that case.)
@@ -182,7 +200,7 @@ if [ -n "$BRIDGE_TOKEN" ]; then
   note "register sotto-local MCP (reverse relay) in $HERMES_HOME/config.yaml"
   if [ "$DRY_RUN" -eq 0 ]; then
     # --derive-mcp: Hermes gets the derived bearer, never the root (same rule as the cloud boot).
-    python3 "$HERE/configure_mcp.py" --url "http://127.0.0.1:$RELAY_PORT/mcp" --token "$BRIDGE_TOKEN" \
+    python3 "$HERE/configure_mcp.py" --url "http://127.0.0.1:$RELAY_PORT/mcp" --token="$BRIDGE_TOKEN" \
       --derive-mcp --config "$HERMES_HOME/config.yaml"
   else
     echo "+ python3 adapters/hermes/configure_mcp.py --url http://127.0.0.1:$RELAY_PORT/mcp --token *** --derive-mcp --config $HERMES_HOME/config.yaml"

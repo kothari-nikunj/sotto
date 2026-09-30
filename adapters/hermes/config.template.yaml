@@ -2,6 +2,14 @@
 model: gemini-3.7-flash                     # NATIVE Gemini id (gemini provider + GEMINI_API_KEY);
                                             # "google/…" would route via OpenRouter and need OPENROUTER_API_KEY
 
+# Dedicated Sotto installs handle consent and the first useful brief themselves. Shared
+# Hermes installs should leave these keys unset and keep upstream first-contact help.
+agent:
+  name: Sotto
+onboarding:
+  profile_build: "off"
+  sotto_quiet_first_contact: true
+
 mcp_servers:
   sotto-local:                               # the Bridge, via the receiver's ALWAYS-UP reverse relay:
     url: "http://127.0.0.1:8787/mcp"          # the Mac dials OUT to the container — no tunnel, no

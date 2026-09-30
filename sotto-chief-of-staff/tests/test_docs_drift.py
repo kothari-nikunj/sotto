@@ -318,6 +318,12 @@ def test_onboarding_brief_and_learning_caps():
     _same('onboarding.lease_minutes', R['onboarding']['lease_minutes'], on.LEASE_SECONDS // 60)
     _same('onboarding.retry_minutes', R['onboarding']['retry_minutes'], on.RETRY_SECONDS // 60)
     _same('onboarding.attempts_per_day', R['onboarding']['attempts_per_day'], on.ATTEMPTS_PER_DAY)
+    _same('onboarding.source_read_min_wait_minutes', R['onboarding']['source_read_min_wait_minutes'],
+          rec.SOURCE_PROBE_MIN_WAIT_SECS // 60)
+    _same('onboarding.source_read_max_wait_minutes', R['onboarding']['source_read_max_wait_minutes'],
+          rec.SOURCE_PROBE_MAX_WAIT_SECS // 60)
+    _anchor(f"twice as long before the next, from {rec.SOURCE_PROBE_MIN_WAIT_SECS // 60} minute up to "
+            f"{rec.SOURCE_PROBE_MAX_WAIT_SECS // 60} minutes")
     _same('brief.preparation_max_age_minutes', R['brief']['preparation_max_age_minutes'],
           br.PREPARATION_MAX_AGE_SECONDS // 60)
     _same('brief.artifact_max_age_hours', R['brief']['artifact_max_age_hours'],
@@ -377,7 +383,7 @@ def test_account_broker_capacity_guards():
           _literal_constant(accounts, 'DEVICE_CODE_ATTEMPTS'))
     _anchor('50 unverified pending sign-ins')
     _anchor('500 total sign-in sessions')
-    _anchor('five native code attempts')
+    _anchor('five proof attempts')
     _anchor('60 admitted requests per tenant in a rolling 60-second window')
 
 
@@ -889,6 +895,7 @@ _STR_LITERAL_RE = re.compile(r'''[fFrRbB]{0,2}("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)
 # THE ALLOWLIST — kept small and named on purpose; an allowlist that grows is this guard failing
 # quietly. Artifacts that are internal to one writer and cross no boundary:
 _INTERNAL_SUFFIXES = (".lock", ".tmp")      # jsonstore's flock sidecar · atomic-write temporaries
+_READ_ONLY_VOLUME_PATHS = {"lost+found"}   # Filesystem-owned recovery directory, inspected but never written by Sotto.
 # Directories are not on it and need no names: `os.path.join(DATA, "events")` is a mkdir/listdir
 # target, and it is allowed exactly when some documented row LIVES in that directory — derived
 # from the map itself below, so a new directory can never be allowed by accident.
@@ -1092,7 +1099,7 @@ def test_the_shared_file_map_covers_every_path_the_code_writes():
     file_matchers, dir_matchers = _documented_matchers()
     undocumented = {}
     for rel_path, sources in sorted(_scan_data_paths().items()):
-        if rel_path.endswith(_INTERNAL_SUFFIXES) or ".tmp." in rel_path:
+        if rel_path in _READ_ONLY_VOLUME_PATHS or rel_path.endswith(_INTERNAL_SUFFIXES) or ".tmp." in rel_path:
             continue
         if any(m.match(rel_path) for m in file_matchers):
             continue

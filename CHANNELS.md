@@ -45,7 +45,7 @@ Hermes' gateway supports 20+ surfaces (`hermes gateway setup`). What *this repo*
 | iMessage / Photon | Your own working Photon project, connection, credentials and exact owner identity | Yes | Four photos when the provider and layout support it |
 | iMessage / BlueBubbles | An always-on Mac, BlueBubbles and its server connection | No | Not the Photon gallery path |
 
-Telegram is the default template path. For iMessage, use Photon if you have provider access;
+Telegram is the default channel. For iMessage, use Photon if you have provider access;
 confirm its availability and charges separately. BlueBubbles is a different, manually configured
 alternative. The Sotto Bridge is an optional source reader, not either messaging provider.
 
@@ -59,13 +59,15 @@ access and pricing before starting; no Photon account or number is included with
 1. Sign in at [Photon](https://app.photon.codes/) and prepare a project, register your iMessage
    phone number, and obtain the assigned line plus runtime project ID and secret. If you need
    guided provisioning, [Hermes' Photon setup](https://github.com/NousResearch/hermes-agent/blob/245e48008fa814b3251f50755eb656bd9fb86cb1/plugins/platforms/photon/README.md#first-time-setup)
-   performs these steps. An operator can run it in an isolated Hermes environment; Sotto does not
-   require installing Hermes on your Mac. Use a separate project/connection for this installation.
-   Setup can rotate the project secret, so do not run it against someone else's live project.
+   performs these steps. An operator should use a fresh Hermes profile with no existing Photon
+   credentials and a unique `--project-name`; Sotto does not require installing Hermes on your Mac.
+   Setup reuses a cached project even when a different name is supplied, and can rotate its secret.
+   Never run it in another installation's profile. If your phone already uses another Photon
+   project, confirm separate routing with Photon before registering it again: separate credentials
+   alone do not prove that the existing shared-line connection will keep working.
 2. Follow [ONBOARDING step 1](ONBOARDING.md#1--deploy-the-backend-on-railway)'s **manual GitHub
-   deployment** using the public repository. The current Railway template is Telegram-oriented
-   and requests a bot token; it is not an iMessage provisioning template. Skip BotFather and
-   Telegram pairing. Keep the Gemini key, unique `BRIDGE_TOKEN`, `/data` volume and public domain.
+   deployment** using the public repository. No verified Railway template is published. Skip
+   BotFather and Telegram pairing. Keep the Gemini key, unique `BRIDGE_TOKEN`, `/data` volume and public domain.
 3. Set these additional Railway variables before deployment:
 
    | Variable | Value |
@@ -78,7 +80,8 @@ access and pricing before starting; no Photon account or number is included with
 
    The last two values identify **you**, the person receiving briefs and sending requests. They
    are not Sotto's provider-assigned number. For this setup, choose the registered phone number
-   in Messages' **Start new conversations from** setting, rather than an Apple ID email. Leave
+   in Messages' **Start new conversations from** setting; an Apple ID email never activates
+   self-host, so the value must be the exact `+`-prefixed phone number. Leave
    `SOTTO_DEPLOYMENT_MODE` unset for self-host and omit Telegram credentials.
 4. Deploy. Boot installs and enables Sotto's Photon plugin automatically. Check that the gateway
    connects without authentication errors. No separate Hermes install on your Mac is required.

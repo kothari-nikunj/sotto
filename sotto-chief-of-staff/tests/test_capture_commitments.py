@@ -1,6 +1,7 @@
 """Durable Granola commitment capture: overlap, receipt checkpoint and writer truth."""
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,9 @@ spec.loader.exec_module(capture)
 @pytest.fixture(autouse=True)
 def _allow_granola(monkeypatch):
     monkeypatch.setattr(capture.source_context, 'allowed', lambda source: source == 'granola')
+    # The fixtures' meetings end mid-September 2026; pin the capture window's clock to that week.
+    monkeypatch.setattr(capture.compose_followup, '_now_local',
+                        lambda _tz: datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
 
 
 def _meeting(notes="Alex: I'll send the deck."):

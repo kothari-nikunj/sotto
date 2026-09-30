@@ -6,6 +6,12 @@ import pytest
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("gg", os.path.join(HERE, "..", "_shared", "scripts", "gather_google.py"))
 gg = importlib.util.module_from_spec(spec); spec.loader.exec_module(gg)
+_real_refresh = gg._refresh_google_token
+
+
+@pytest.fixture(autouse=True)
+def _no_token_refresh(monkeypatch):
+    monkeypatch.setattr(gg, '_refresh_google_token', lambda: None)
 
 
 def test_email_normalization_maps_labels_and_body():
@@ -91,6 +97,269 @@ def test_main_writes_empty_files_when_api_missing(tmp_path, monkeypatch):
     assert json.load(open(g)) == [] and json.load(open(c)) == []
 
 
+@pytest.mark.parametrize('check_rc', [0, 1])
+def test_locked_refresh_runs_before_upstream_cli_and_failure_reads_unavailable(tmp_path, monkeypatch, check_rc):
+    calls = []
+    monkeypatch.setattr(gg, '_refresh_google_token', _real_refresh)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+
+    def run(argv, **kw):
+        assert argv[1].endswith(os.path.join('adapters', 'hermes', 'google_setup.py')) and argv[2:] == ['--check']
+        assert os.path.isfile(argv[1])
+        calls.append('check')
+        return type('R', (), {'returncode': check_rc})()
+    monkeypatch.setattr(gg.subprocess, 'run', run)
+    monkeypatch.setattr(gg, 'gather_gmail', lambda *a, **k: calls.append('inbox') or [])
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    receipt = tmp_path / 'sources.json'
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--skip-sent', '--skip-stale', '--gmail-out',
+                                    str(tmp_path / 'g.json'), '--cal-out', str(tmp_path / 'c.json'),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    results = json.loads(receipt.read_text())
+    if check_rc:
+        assert calls == ['check']
+        assert results['gmail']['status'] == results['calendar']['status'] == 'unavailable'
+    else:
+        assert calls == ['check', 'inbox', 'calendar']
+
+
+@pytest.mark.parametrize('message,expected', [
+    ('<HttpError 403: Quota exceeded for quota metric Queries and limit Total Query Cost Units per minute per user>', 'rate_limited'),
+    ('<HttpError 403: userRateLimitExceeded>', 'rate_limited'),
+    ('<HttpError 403: rateLimitExceeded>', 'rate_limited'),
+    ('<HttpError 403: quotaExceeded>', 'rate_limited'),
+    ('<HttpError 429: Too many requests>', 'rate_limited'),
+    ('<HttpError 403: insufficientPermissions>', 'GoogleCLIError'),
+    ('<HttpError 403: forbidden>', 'GoogleCLIError'),
+    ('local error: quota exceeded', 'GoogleCLIError'),
+])
+def test_google_cli_error_classification_requires_typed_status_and_quota_signal(message, expected):
+    assert gg._source_error(gg.GoogleCLIError(message)) == expected
+
+
+def test_typed_provider_http_error_classification():
+    class ProviderError(Exception):
+        def __init__(self, status, detail):
+            self.resp = type('Response', (), {'status': status})()
+            super().__init__(detail)
+
+    assert gg._source_error(ProviderError(429, 'Too many requests')) == 'rate_limited'
+    assert gg._source_error(ProviderError(403, 'quotaExceeded')) == 'rate_limited'
+    assert gg._source_error(ProviderError(403, 'insufficientPermissions')) == 'ProviderError'
+
+
+def test_quota_denial_skips_extra_gmail_reads_but_keeps_calendar(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+
+    def inbox(*args, **kwargs):
+        calls.append('inbox')
+        raise gg.GoogleCLIError('<HttpError 403: Quota exceeded for quota metric Queries and limit Total Query Cost Units per minute per user>')
+
+    monkeypatch.setattr(gg, 'gather_gmail', inbox)
+    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: calls.append('sent'))
+    monkeypatch.setattr(gg, 'gather_stale_sent', lambda *a, **k: calls.append('stale'))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert calls == ['inbox', 'calendar']
+    assert json.loads(gmail.read_text()) == [] and json.loads(cal.read_text()) == []
+    results = json.loads(receipt.read_text())
+    assert results['gmail']['status'] == 'unavailable' and results['gmail']['error'] == 'rate_limited'
+    assert results['calendar']['status'] == 'partial'
+
+
+def test_sent_quota_denial_keeps_inbox_and_skips_stale(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, 'gather_gmail', lambda *a, **k: calls.append('inbox') or [{'id': 'message'}])
+
+    def sent(*args, **kwargs):
+        calls.append('sent')
+        raise gg.GoogleCLIError('<HttpError 429: Too many requests>')
+
+    monkeypatch.setattr(gg, 'gather_sent', sent)
+    monkeypatch.setattr(gg, 'gather_stale_sent', lambda *a, **k: calls.append('stale'))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert calls == ['inbox', 'sent', 'calendar']
+    assert json.loads(gmail.read_text()) == [{'id': 'message'}]
+    assert json.loads(receipt.read_text())['gmail']['error'] == 'rate_limited'
+
+
+def _run_lane_quota(tmp_path, monkeypatch, inbox, sent, stale=None):
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, 'gather_gmail', inbox)
+    monkeypatch.setattr(gg, 'gather_sent', sent)
+    monkeypatch.setattr(gg, 'gather_stale_sent', stale or (lambda *a, **k: gg.GmailRows()))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    return json.loads(receipt.read_text())['gmail'], json.loads(gmail.read_text())
+
+
+def _lane_quota(*args, **kwargs):
+    raise gg.GoogleCLIError('<HttpError 429: Too many requests>')
+
+
+@pytest.mark.parametrize('lane', ['sent', 'stale'])
+def test_lane_quota_keeps_complete_inbox_coverage(tmp_path, monkeypatch, lane):
+    inbox = lambda *a, **k: gg.GmailRows([{'id': 'm1'}])
+    sent = _lane_quota if lane == 'sent' else (lambda *a, **k: gg.GmailRows())
+    result, emails = _run_lane_quota(tmp_path, monkeypatch, inbox, sent,
+                                     _lane_quota if lane == 'stale' else None)
+    assert emails == [{'id': 'm1'}]
+    assert result['status'] == 'partial' and result['complete'] is False
+    assert result['error'] == 'rate_limited'
+    assert result['coverage']['since'] and result['coverage']['until']
+
+
+def test_lane_quota_keeps_failed_inbox_unavailable_with_its_own_error(tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise gg.GoogleCLIError('<HttpError 500: backend error>')
+    result, emails = _run_lane_quota(tmp_path, monkeypatch, broken, _lane_quota)
+    assert emails == []
+    assert result['status'] == 'unavailable'
+    assert result['error'] == gg._source_error(gg.GoogleCLIError('<HttpError 500: backend error>'))
+    assert result['error'] != 'rate_limited'
+
+
+def test_lane_quota_keeps_capped_inbox_partial_and_its_coverage(tmp_path, monkeypatch):
+    def inbox(*args, **kwargs):
+        rows = gg.GmailRows([{'id': 'm1'}])
+        rows.capped = True
+        return rows
+    result, _ = _run_lane_quota(tmp_path, monkeypatch, inbox, _lane_quota)
+    assert result['status'] == 'partial' and result['complete'] is False
+    assert result['error'] == 'rate_limited'
+    assert result['coverage']['since'] and result['coverage']['until']
+
+
+def test_body_quota_keeps_search_snippet_and_marks_partial(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, '_token_path', lambda: '')
+
+    def run(api, args, timeout=60):
+        calls.append(args[1])
+        if args[1] == 'search':
+            return [{'id': 'one', 'subject': 'Useful search result', 'snippet': 'usable snippet'}]
+        raise gg.GoogleCLIError('<HttpError 403: Quota exceeded for quota metric Total Query Cost>')
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: pytest.fail('sent read after quota'))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--window-days', '7', '--bodies', '1',
+                                    '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert calls == ['search', 'get', 'calendar']  # no second date slice after quota
+    assert json.loads(gmail.read_text())[0]['snippet'] == 'usable snippet'
+    result = json.loads(receipt.read_text())
+    assert result['gmail']['status'] == 'partial'
+    assert result['gmail']['complete'] is False and result['gmail']['error'] == 'rate_limited'
+    assert result['calendar']['status'] == 'partial'
+
+
+def test_body_quota_does_not_start_queued_full_reads(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, 'BODY_FETCH_WORKERS', 1)
+    monkeypatch.setattr(gg, '_token_path', lambda: '')
+
+    def run(api, args, timeout=60):
+        if args[1] == 'search':
+            return [{'id': str(i), 'snippet': f'snippet-{i}'} for i in range(4)]
+        calls.append(args[2])
+        raise gg.GoogleCLIError('<HttpError 429: Too many requests>')
+
+    monkeypatch.setattr(gg, '_run', run)
+    rows = gg.gather_gmail('/fake/api.py', 4, 4)
+    assert calls == ['0']
+    assert rows.rate_limited is True
+    assert [row['snippet'] for row in rows] == [f'snippet-{i}' for i in range(4)]
+
+
+def test_later_slice_search_quota_keeps_earlier_rows(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+
+    def run(api, args, timeout=60):
+        calls.append('search')
+        if calls.count('search') == 1:
+            return [{'id': 'first', 'snippet': 'earlier slice survived'}]
+        raise gg.GoogleCLIError('<HttpError 403: quotaExceeded>')
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: pytest.fail('sent read after quota'))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--window-days', '7', '--bodies', '0',
+                                    '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert calls == ['search', 'search', 'calendar']
+    assert json.loads(gmail.read_text()) == [{'id': 'first', 'threadId': None, 'from': '',
+        'to': '', 'subject': '', 'date': '', 'snippet': 'earlier slice survived', 'body': '',
+        'labelIds': [], 'isSent': False}]
+    result = json.loads(receipt.read_text())['gmail']
+    assert result['status'] == 'partial' and result['complete'] is False
+    assert result['error'] == 'rate_limited'
+
+
+def test_later_slice_untyped_failure_is_not_disguised_as_quota(monkeypatch):
+    calls = []
+
+    def run(api, args, timeout=60):
+        calls.append(args[2])
+        if len(calls) == 1:
+            return [{'id': 'first'}]
+        raise RuntimeError('local error: quota exceeded')
+
+    monkeypatch.setattr(gg, '_run', run)
+    with pytest.raises(RuntimeError, match='local error'):
+        gg.gather_gmail('/fake/api.py', 2, 0, days=7)
+
+
+def test_nonquota_body_failure_remains_snippet_fallback_with_healthy_search(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, '_token_path', lambda: '')
+
+    def run(api, args, timeout=60):
+        if args[1] == 'search':
+            return [{'id': 'one', 'snippet': 'usable snippet'}]
+        raise RuntimeError('one message is unreadable')
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: calls.append('sent') or [])
+    monkeypatch.setattr(gg, 'gather_stale_sent', lambda *a, **k: calls.append('stale') or [])
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert json.loads(gmail.read_text())[0]['snippet'] == 'usable snippet'
+    assert calls == ['sent', 'stale', 'calendar']
+    result = json.loads(receipt.read_text())
+    assert result['gmail']['status'] == 'ok' and result['gmail']['complete'] is True
+
+
 def test_bodies_fetch_preserves_order_and_tolerates_failure(monkeypatch):
     # 4 search hits, --bodies 3: full bodies for the first 3 only; one fetch fails → that email
     # stays snippet-only; output order matches the search order regardless of fetch completion order.
@@ -150,6 +419,7 @@ def test_truncation_envelope_written_when_search_hits_cap(tmp_path, monkeypatch,
     gg.main()
     payload = json.load(open(g))
     assert payload["truncated_at"] == 3                              # exactly at cap → truncated
+    assert "truncation_scope" not in payload                        # single-day legacy wording
     assert [e["id"] for e in payload["emails"]] == ["m0", "m1", "m2"]
     assert payload["truncation_note"] == "(inbox window truncated at 3 — more arrived)"
     assert "truncated at 3 — more arrived" in capsys.readouterr().out  # operator line says so too
@@ -163,6 +433,69 @@ def test_no_envelope_when_under_cap(tmp_path, monkeypatch):
     gg.main()
     payload = json.load(open(g))
     assert isinstance(payload, list) and payload[0]["id"] == "m0"    # bare array — full back-compat
+
+
+def test_two_uncapped_slices_equal_aggregate_cap_stay_complete(tmp_path, monkeypatch):
+    calls = []
+
+    def run(api, args, timeout=60):
+        calls.append(args[2])
+        return [{'id': f'm{len(calls)}'}]
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--window-days', '7', '--max', '2',
+                                    '--bodies', '0', '--skip-sent', '--gmail-out', str(gmail),
+                                    '--cal-out', str(cal), '--source-results-out', str(receipt)])
+    gg.main()
+    assert len(calls) == 2
+    assert [row['id'] for row in json.loads(gmail.read_text())] == ['m1', 'm2']
+    result = json.loads(receipt.read_text())['gmail']
+    assert result['status'] == 'ok' and result['complete'] is True
+
+
+def test_capped_slice_disclosed_even_when_aggregate_exceeds_cap(tmp_path, monkeypatch):
+    calls = []
+
+    def run(api, args, timeout=60):
+        calls.append(args[2])
+        return ([{'id': 'm1'}, {'id': 'm2'}] if len(calls) == 1 else [{'id': 'm3'}])
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--window-days', '7', '--max', '2',
+                                    '--bodies', '0', '--skip-sent', '--gmail-out', str(gmail),
+                                    '--cal-out', str(cal), '--source-results-out', str(receipt)])
+    gg.main()
+    assert len(calls) == 2
+    payload = json.loads(gmail.read_text())
+    assert [row['id'] for row in payload['emails']] == ['m1', 'm2', 'm3']
+    assert payload['truncated_at'] == 2
+    assert payload['truncation_scope'] == 'date_slices'
+    assert payload['truncation_note'] == (
+        '(email history is partial — some date ranges reached the read limit)')
+    result = json.loads(receipt.read_text())['gmail']
+    assert result['status'] == 'partial' and result['complete'] is False
+
+
+def test_sent_slices_retain_per_search_cap_metadata(monkeypatch):
+    calls = []
+
+    def run(api, args, timeout=60):
+        calls.append(args[2])
+        return ([{'id': 's1'}, {'id': 's2'}] if len(calls) == 1 else [{'id': 's3'}])
+
+    monkeypatch.setattr(gg, '_run', run)
+    sent = gg.gather_sent('/fake/api.py', max_n=2, bodies=0, days=7)
+    assert sent.capped is True and sent.rate_limited is False
+    assert [row['id'] for row in sent] == ['s1', 's2', 's3']
+    assert all(row['isSent'] for row in sent)
 
 
 def test_default_max_raised_to_40(tmp_path, monkeypatch):
@@ -368,6 +701,58 @@ def test_gather_stale_sent_searches_once_and_reads_each_thread_once(monkeypatch)
     assert len(searches) == 1 and searches[0][2] == "in:sent older_than:3d newer_than:14d -in:chats"
     assert gets == ["t1", "t2"]                              # one read per thread, once
     assert [r["threadId"] for r in rows] == ["t1"]           # the unreadable thread costs itself only
+
+
+def test_stale_thread_quota_keeps_prior_evidence_and_marks_partial(tmp_path, monkeypatch):
+    import datetime as dt
+    calls = []
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=4)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, '_token_path', lambda: '')
+
+    def run(api, args, timeout=60):
+        if args[2].startswith('in:sent older_than:'):
+            calls.append('stale-search')
+            return [{'id': f'm{i}', 'threadId': f't{i}', 'to': 'owner@example.com'}
+                    for i in (1, 2, 3)]
+        calls.append('inbox-search')
+        return []
+
+    class QuotaError(Exception):
+        resp = type('Response', (), {'status': 403})()
+
+    class Get:
+        def __init__(self, tid): self.tid = tid
+        def execute(self):
+            calls.append(self.tid)
+            if self.tid == 't1':
+                return _thread('t1', [(old, True, 'recipient@example.com', 'Followup', 'checking in')])
+            if self.tid == 't2':
+                raise QuotaError('quotaExceeded')
+            pytest.fail('third thread read after quota')
+
+    class Service:
+        def users(self): return self
+        def threads(self): return self
+        def get(self, userId, id, format, metadataHeaders): return Get(id)
+        def close(self): calls.append('closed')
+
+    monkeypatch.setattr(gg, '_run', run)
+    monkeypatch.setattr(gg, '_gmail_service', Service)
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--bodies', '0', '--skip-sent',
+                                    '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    assert calls == ['inbox-search', 'stale-search', 't1', 't2', 'closed', 'calendar']
+    payload = json.loads(gmail.read_text())
+    assert [row['threadId'] for row in payload['stale_threads']] == ['t1']
+    result = json.loads(receipt.read_text())
+    assert result['gmail']['status'] == 'partial'
+    assert result['gmail']['complete'] is False and result['gmail']['error'] == 'rate_limited'
+    assert result['calendar']['status'] == 'partial'
 
 
 def test_stale_rows_ride_the_gmail_envelope(tmp_path, monkeypatch):
@@ -745,6 +1130,38 @@ def test_a_download_failure_names_that_one_attachment_only(monkeypatch):
     atts = gg.gather_gmail("/fake/api.py", 25, 12)[0]["attachments"]
     assert "text" in atts[0] and atts[1]["unreadable"] == "could not be downloaded"
     assert svc is not None
+
+
+def test_attachment_quota_marks_partial_and_stops_later_downloads(tmp_path, monkeypatch):
+    parts = [{'filename': name, 'mimeType': 'text/csv',
+              'body': {'size': 8, 'attachmentId': name}} for name in ('first.csv', 'second.csv')]
+    _wire_attachment_gather(monkeypatch, parts)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    calls = []
+
+    class QuotaError(Exception):
+        resp = type('Response', (), {'status': 403})()
+
+    def fetch(service, mid, part):
+        calls.append(part['filename'])
+        raise QuotaError('quotaExceeded')
+
+    monkeypatch.setattr(gg, '_attachment_bytes', fetch)
+    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: pytest.fail('sent read after quota'))
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
+    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--window-days', '7', '--bodies', '1',
+                                    '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--source-results-out', str(receipt)])
+    gg.main()
+    payload = json.loads(gmail.read_text())
+    assert payload[0]['subject'] == 'Q3 numbers'
+    assert [a['filename'] for a in payload[0]['attachments']] == ['first.csv', 'second.csv']
+    assert calls == ['first.csv', 'calendar']
+    result = json.loads(receipt.read_text())
+    assert result['gmail']['status'] == 'partial'
+    assert result['gmail']['complete'] is False and result['gmail']['error'] == 'rate_limited'
 
 
 def test_the_caps_have_one_owner():

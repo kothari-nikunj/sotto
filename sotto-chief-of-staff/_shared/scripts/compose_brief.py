@@ -362,7 +362,11 @@ def _email_truncation_note(google: dict) -> str:
         n = int(n)
     except (TypeError, ValueError):
         return ""
-    return f"(inbox window truncated at {n} — more arrived)" if n > 0 else ""
+    if n <= 0:
+        return ""
+    if (google or {}).get("emailsTruncationScope") == "date_slices":
+        return "(email history is partial — some date ranges reached the read limit)"
+    return f"(inbox window truncated at {n} — more arrived)"
 
 
 def _coverage_line(local: dict, sa: dict, events, emails, truncation_note: str = "") -> str:
@@ -1573,7 +1577,7 @@ def build_prompt(template: str, inputs: dict) -> str:
         "followup_context": opt(followup_context),
         "already_nudged": opt(already_nudged),
         "source_availability": (_stale_local_note(local) + _consent_receipt_note(local)
-                                + _format_source_availability(sa) + trunc_block),
+                                + _format_source_availability(sa, _obj(inputs, "source_results")) + trunc_block),
         "first_run_note": _first_run_note(inputs, local, sa, events, trimmed_emails) +
                           (_welcome_voice() if brief_type == "welcome" else ""),
         "user_preferences": opt(_format_user_preferences(prefs)),
@@ -3690,6 +3694,8 @@ def main():
     # honesty note through so the brief never presents a truncated window as the full inbox.
     if isinstance(gmail_raw, dict) and gmail_raw.get("truncated_at"):
         google["emailsTruncatedAt"] = gmail_raw["truncated_at"]
+        if gmail_raw.get("truncation_scope") == "date_slices":
+            google["emailsTruncationScope"] = "date_slices"
     # …and the stale-sent lane: emails the user sent that nobody answered (gather_google's
     # threads.get pass). _normalize_local filters them to people the user knows.
     if isinstance(gmail_raw, dict) and isinstance(gmail_raw.get("stale_threads"), list):
@@ -3774,5 +3780,18 @@ def main():
 
 
 
+def cli():
+    from gemini_transport import proxy_budget_exhausted
+    from work_queue import MODEL_BUDGET_EXIT
+    try:
+        main()
+    except Exception as error:
+        if not proxy_budget_exhausted(error):
+            raise
+        print('[compose_brief] Model allowance reached', file=sys.stderr)
+        return MODEL_BUDGET_EXIT
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(cli())

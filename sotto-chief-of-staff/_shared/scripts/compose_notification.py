@@ -49,11 +49,9 @@ message can be days old even if its meeting is still ahead. Omit a scheduling qu
 same meeting is booked or a later exchange settled it. Match the participants, subject and time;
 an unrelated meeting or a generic reply does not complete a promise to send a document. An open
 ledger entry alone does not prove that the original scheduling question still needs an answer.
-Use source_timing as the date of the original message, never the queue arrival or reminder run.
-Anchor relative dates in old messages to that source date, not today. Keep the useful reason for
-resurfacing an older ask. A signature request or automated reminder proves only that a request
-was sent, not that the document remains unsigned: attribute it to the dated reminder and say
-completion is unconfirmed unless supplied evidence establishes it. A user's completion wins.
+Use source_timing as the date of the original message, never the queue arrival or reminder run,
+and keep the useful reason for resurfacing an older ask. The relevance policy appended below
+governs relative dates and signature reminders in older messages.
 For each selected ID, text is at most two plain sentences explaining who/what/why now, without
 questions. draft is a short reply only when the user's direction is established; otherwise empty.
 For scheduling_ask with verified slots provide both draft and decline as alternatives. When
@@ -624,7 +622,7 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
             when = (local.strftime('%I:%M %p').lstrip('0') + ' today' if local.date() == now.date()
                     else local.strftime('%B ') + str(local.day)
                     + (f', {local.year}' if local.year != now.year else ''))
-            label = 'Calendar update first seen' if (item.get('event') or {}).get('source') == 'calendar_change' else 'From'
+            label = 'Noticed' if (item.get('event') or {}).get('source') == 'calendar_change' else 'From'
             rendered = f'{label} {when}: {rendered}'
         text, selected = rendered, [item]
         reference = delivery_effects.request_reference(item.get('event') or {})

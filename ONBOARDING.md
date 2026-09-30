@@ -2,19 +2,25 @@
 
 This guide is for self-hosting: you run Sotto on your own Railway account and use your own Gemini key.
 It does not require a Sotto Cloud account. The optional Mac Bridge connects your selected local sources.
-Choose delivery first: **Telegram** is the default; **iMessage through your own Photon connection**
-is also included. Budget about 30 minutes for the server and source setup after you have the
+Choose delivery first: **iMessage through your own Photon connection** is the primary assisted
+self-host route; **Telegram** is an alternative. Budget about 30 minutes for the server and source setup after you have the
 provider accounts. Photon access and provisioning are separate prerequisites.
+
+**Using Codex or Claude Code?** Open this repository with the agent and follow
+[`docs/AGENT-ONBOARDING.md`](docs/AGENT-ONBOARDING.md). It can prepare the protected config and run
+the resumable self-host Railway helper, or guide an invited Cloud user through hosted sign-in. Keep
+credentials out of chat and let the agent stop for Google consent, OS permissions, and provider
+approval. The helper has completed a fresh live install; each new setup still proves itself only
+through its own health, Google, Bridge and first-brief checks.
 
 **For iMessage:** follow [the Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs) for the
 channel variables, use the manual Railway deployment in step 1, then continue with the same setup
 page in step 2. Skip BotFather and Telegram pairing. This is still self-hosting: choose **Use my own
 server instead** in the Mac app. WhatsApp has an appendix at the end of this page.
 
-> **The one-click Deploy link** at the end of step 1 sets up the build, the `/data` volume and
-> `BRIDGE_TOKEN` for you and prompts for exactly two values: your Gemini key and your Telegram bot
-> token. It is a Telegram template, not a Photon account or iMessage number allocator. For iMessage,
-> use the manual path with your Photon credentials.
+> The checked-in Photon preset is a reviewable contract, not an importable Railway template. For a
+> guided CLI deployment, use the public helper in the agent playbook; the manual Railway steps below
+> remain available. The helper has completed a fresh live end-to-end install.
 
 > **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
 > fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
@@ -34,7 +40,7 @@ server instead** in the Mac app. WhatsApp has an appendix at the end of this pag
 Everything else, including linking your Mac, connecting Google, your channel, your timezone, and optional
 extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
 
-**You can change either default. Each channel and model has its own setup requirements.** Full detail (and
+**Each channel and model has its own setup requirements.** Full detail (and
 how tested each one is) in **[CHANNELS.md — Choosing your channel and model](CHANNELS.md)**:
 
 | Your channel | | Your model |
@@ -50,16 +56,13 @@ how tested each one is) in **[CHANNELS.md — Choosing your channel and model](C
 `/newbot` → name it → it replies with a **bot token**. That token is the only channel setting you
 need; your chat id is captured for you on the first message you send the bot.
 
-**Then the manual path — four settings, in this order.** Get this repo where Railway can
+**Use the manual deployment path.** Get this repo where Railway can
 see it: **Fork** it on GitHub (recommended — that's what **Sync fork** later updates), or point
 Railway straight at the public repo. Then in [Railway](https://railway.app): **New Project → Deploy
-from GitHub repo** → pick it. Set **all four** before the first deploy finishes; each one fails
-*quietly* if you skip it:
+from GitHub repo** → pick it. Leave Root Directory blank; Railway builds from the repository root.
+Set the channel and service settings before opening the private setup link:
 
-1. **Settings → Root Directory**: leave blank — the Dockerfile is at the repo root (leave *Dockerfile Path* blank too; both are auto-detected).
-   *Get this wrong and the build dies with `COPY … not found` — the Dockerfile's `COPY` paths are
-   relative to the build context this setting picks.*
-2. **Variables → New Variable** — add your model key, channel settings and Bridge secret:
+1. **Variables → New Variable** — add your model key, channel settings and Bridge secret:
    - `GOOGLE_AI_API_KEY` = your Gemini key *(Google's own docs sometimes call it `GEMINI_API_KEY` or
      `GOOGLE_API_KEY` — Sotto accepts any of the three names, so paste it under whichever you copied)*
    - For Telegram, `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you. For iMessage, omit this
@@ -69,9 +72,9 @@ from GitHub repo** → pick it. Set **all four** before the first deploy finishe
      *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
    *(WhatsApp instead? [The appendix](#appendix--whatsapp-instead-of-telegram) — three variables, one
    QR, nothing else about this guide changes.)*
-3. **⌘K → Add Volume**, mount path `/data` (your knowledge graph, your channel link and Google token
+2. **⌘K → Add Volume**, mount path `/data` (your knowledge graph, your channel link and Google token
    live here). *No volume = every redeploy wipes your login and memory.*
-4. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2,
+3. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2,
    then redeploy once. Without a domain the logged link falls back to a dead `localhost` URL.
 
 Deploy and wait for the build (the container installs Hermes + Sotto automatically). **For Photon,
@@ -86,10 +89,9 @@ of quota — fix it before going further, because every brief depends on it. A
 `[sotto] telegram NOT linked yet` just means you hadn't tapped within the five-minute window: tap the
 link and restart the deploy, and it links then. Nothing else is lost either way.
 
-**Or use the Telegram template.** The button below sets up Telegram and prompts for two values —
-your Gemini key and your bot token:
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
+For Telegram, use `TELEGRAM_BOT_TOKEN` and `SOTTO_CRON_DELIVER=telegram` instead of the Photon
+variables. A Railway template link will be added only after its owner settings and a fresh-account
+deployment have been verified.
 
 ## 2 · Open your setup link
 
@@ -97,7 +99,7 @@ Railway → your service → **Deployments → View logs** → find the line sta
 and open it. That's your `/setup` wizard plus its private access code — only someone with this link can
 see your pairing token or your channel's QR. Open it once and your browser is remembered for the rest of the
 wizard; lose it and it reprints on every boot (it's also on the volume at `/data/setup_code`).
-- *Link says `localhost`?* You have no public domain yet — go back and do step 1.4, redeploy, and use
+- *Link says `localhost`?* You have no public domain yet — go back and do step 1.3, redeploy, and use
   the freshly printed link. *A bare `https://<your-domain>/setup` with no `?code=` returns **403** by
   design.*
 
@@ -108,14 +110,13 @@ it's finished and **DONE** after — reload the page (the wizard's own **recheck
 
 **① Link your Mac** — [Download Sotto Bridge.app](https://github.com/kothari-nikunj/sotto/releases/latest),
 drag it to `/Applications`, open it.
-- **First run asks for an access code** — access to the distributed Bridge binary is invite-only
-  for now; self-host deployment itself is not. Paste the code from
-  your invite (it's verified on your Mac, nothing is sent anywhere), and if you don't have one yet,
-  ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
-- **Updating an existing Bridge to 1.2.7 or newer asks for a code too**, once, and that install stops
-  streaming to your cloud until you enter one — your pairing, Full Disk Access and settings are all
-  untouched, so entering the code resumes everything with nothing to re-pair. Same
-  [Issues](https://github.com/kothari-nikunj/sotto/issues) link if you don't have a code yet.
+- **For self-host, first run asks for a Bridge access code.** Paste the code from your invite;
+  the app verifies it on your Mac. Self-host deployment itself does not need a code. If you need
+  one, ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
+- **For invited Sotto Cloud accounts, choose Continue with Google instead.** Your verified Google
+  invitation unlocks Cloud setup without a Bridge access code. After Google consent, the browser
+  returns to Sotto Bridge automatically; if your browser asks, allow it to open the app. If the
+  return does not happen, choose **Open Sotto Bridge** on that browser page. No secret code is copied.
 - **Choose hosting in the one Sotto setup window.** Cloud is an invite-only pilot for registered accounts. Cloud uses Google → Mac sources / Full Disk
   Access → Messages → First brief. Google sign-in alone does not start reading this Mac.
 - **For self-host, choose Use my own server instead; the steps are Connect → Choose sources → Disk access.**
@@ -155,16 +156,16 @@ wall — it's your own data):
    briefs quietly lose email + calendar on day 8 — the single most common way a self-hosted Sotto
    dies. **In production** needs no Google review for you using your own data; the "needs
    verification" banner is about publishing to strangers, not about you.*
-4. **Credentials → Create credentials → OAuth client ID** → **Desktop app** → Create → **Download JSON**.
-5. Paste the JSON into the wizard's Google box → **Save client →** → **Authorize Google →** →
-   **1 — Authorize Gmail + Calendar →** → on the "unverified app" screen click **Advanced →
-   Continue → Allow** → you land on a `localhost:1/?code=…` page that won't load — that's expected;
-   copy the `code` value out of the URL (everything after `code=`, before any `&`), paste it into
-   the box on that same page and click **Connect**. **Success signal:** a page headed **"Google
-   connected"**.
-   *"Invalid code verifier"? You used a code from an older authorize link. Click **Authorize** again
-   for a fresh URL and use that one's code. Never do this step through chat — the agent mints a new
-   link each time, which is exactly what breaks it.*
+4. **Credentials → Create credentials → OAuth client ID** → **Web application**. Add the exact
+   redirect URI shown in `/setup` under **Authorized redirect URIs**:
+   `https://<RAILWAY_PUBLIC_DOMAIN>/google/oauth/callback`. Download the client JSON.
+5. Paste the downloaded JSON into the Google box in `/setup`, then click **Continue with Google**.
+   Approve Gmail and Calendar access on Google's page; the browser returns automatically to Sotto
+   and shows a clean **Google connected** success page. The callback is PKCE/state protected,
+   bound to the browser that started authorization, and single-use. There is no localhost page and
+   no code to copy and paste.
+   *Existing connected Desktop-client tokens keep working. New authorizations from a Desktop
+   client require replacing it with the Web client in `/setup`.*
 
 **③ Link Telegram** — nothing to click: this tile reports the handshake your deploy already did. It
 reads **"Waiting for your first message to @yourbot"** until you tap the pairing link in the deploy
@@ -210,12 +211,10 @@ layout and provider support it; Telegram and WhatsApp use text by default. A sen
 does not prove device display. If an interactive tool requests permission, review the specific
 action; blanket approval is not a setup step, and the automatic first brief needs no second chat run.
 
-The guided setup verifies connections and reports the installed schedule. The receiver sends
-its first useful look once a context source and delivery channel are ready. It uses recent
-context; progressive history learning has separate spending controls described below.
-It closes with a checklist based on actual probes, including any missing connection or memory hold.
-Do not start a second welcome run while the receiver's first look is pending. You can request
-an ordinary brief later by saying **"good morning"**.
+The guided setup reports connection and delivery states; check each against the actual probe or
+device result. The receiver uses recent context; progressive history learning has separate spending
+controls described below. Do not start a second welcome run while the first look is pending. An
+ordinary brief can be requested later by saying **"good morning"**.
 
 From here it's all conversation:
 - *"good morning"* / *"good evening"* — the briefs
@@ -318,8 +317,7 @@ per-binary approval dies at the next auto-update; a certificate rule covers ever
 **Staying current:** Sotto's skills update themselves on every redeploy, and your server tells you
 when a newer Sotto is published — one quiet line at the foot of your `/setup` (Integrations) page.
 On GitHub hit **Sync fork → Update branch** on your copy; Railway redeploys on the push, and that
-redeploy *is* the update. (Deployed with the one-click link instead? Railway opens the update as
-a pull request on your repo — merging it does the same thing.) The Bridge
+redeploy *is* the update. The Bridge
 flags updates in its own menu and installs them itself after verifying the signature (pairing +
 permissions persist). The full picture — including upgrading the underlying Hermes runtime — is
 **RAILWAY.md § Staying updated**.
@@ -332,7 +330,7 @@ WhatsApp is still first-class — the container pairs it for you, serves a clean
 until the link is live. It is simply no longer the default. Take it when you'd rather Sotto reached
 you as a **contact** than as a bot, and you don't mind scanning a QR.
 
-**Three variables in step 1.2 instead of `TELEGRAM_BOT_TOKEN`:**
+**Three variables in step 1.1 instead of `TELEGRAM_BOT_TOKEN`:**
 
 | Variable | Value |
 |---|---|

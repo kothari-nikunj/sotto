@@ -46,8 +46,10 @@ when supplied. This relies on the pinned SDK's native iMessage multipart impleme
 
 The canonical body remains the outbox identity and validity input. Source validity, expiry,
 brief ownership and post-acceptance effects stay in the existing outbox. A send with unknown
-acceptance (including a process crash) is held and ultimately expires; it is never blindly
-resent. Proven not-attempted/rejected sends can retry. A missing renderer/unsupported layout
+acceptance (including a process crash) remains held, even after relevance expiry, source changes
+or retry exhaustion; it is never blindly resent. A read-only lookup can settle a later positively
+accepted operation receipt and apply completion effects once. Missing or corrupt receipts remain
+unknown. Proven not-attempted/rejected sends retain normal expiry and retry rules. A missing renderer/unsupported layout
 falls back before enqueue. The receiver logs content-free fallback reasons (`gallery_unavailable`,
 `text_layout`, or a fixed layout reason plus card number), so an intentional short update can be
 distinguished from a failed render without recording private prose. The same presentation metadata
@@ -57,7 +59,15 @@ connect the send to recorded prior decisions by identity. Missing or later evide
 guessed, and acceptance never claims device display. An ambiguous provider result must not
 trigger a second text send.
 
-The shared Photon adapter recognizes the focused meeting-prep output before upstream text truncation and uses the same renderer and native gallery transport. It sends one group, records the returned parent/child IDs, and bypasses upstream retries on unknown acceptance. A private delivery receipt beside the card manifest is written before dispatch; matching gateway retries/restarts reuse accepted receipts or hold uncertain sends. The inbound reply anchor distinguishes a new request; without an anchor, identical cached content is deduplicated. Receipts expire with the seven-day artifact cache. The pinned gateway’s recovery markers are checked against existing manifests and target-scoped receipts before any plain-text resend; uncertain acceptance remains a failure, never a fabricated delivery receipt. Proven unsent media falls back to the original text. Ordinary chat and compact multi-meeting sweeps stay text. Ask Sotto now routes “expand that item” to `brief_detail.py`, a read-only lookup of the original
+The sidecar durably records an operation ID before calling the provider and stores accepted
+message IDs before replying. Its private `events/gallery-receipts/` files contain no message text,
+file paths or recipients. An active or interrupted operation reads in flight; only a failed chat
+lookup proves it unsent. In-flight, unknown, corrupt and active records are retained; terminal
+records have bounded age and capacity. Exhausted unresolved capacity refuses a new dispatch.
+These receipts can reconcile a lost response, but do not resolve a historic unknown send that
+never wrote one or prove device display.
+
+The shared Photon adapter recognizes the focused meeting-prep output before upstream text truncation and uses the same renderer and native gallery transport. It sends one group, records the returned parent/child IDs, and bypasses upstream retries on unknown acceptance. A private delivery receipt beside the card manifest is written before dispatch. The pinned gateway supplies its own durable reply-obligation ID on first send and recovery; only the exact ID, destination and original content can reuse an accepted receipt, even if a later renderer changes the manifest. The same identity keys the provider operation, so identical replies from different obligations cannot collide. Missing identity keeps ordinary text delivery; a legacy matching gallery without its exact obligation ID is held as uncertain. Receipts expire with the seven-day artifact cache, and unreadable unrelated manifests are skipped. Proven unsent media falls back to the original text. Ordinary chat and compact multi-meeting sweeps stay text. Ask Sotto now routes “expand that item” to `brief_detail.py`, a read-only lookup of the original
 composed text. Scheduled acceptance receipts retain the opaque gallery ID and owner-target hash
 before erasing the payload; interactive prep uses its existing adjacent receipt. Only accepted,
 non-preview owner galleries inside seven days qualify. The manifest records the source-permission

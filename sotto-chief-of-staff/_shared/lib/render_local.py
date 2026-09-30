@@ -1359,30 +1359,48 @@ def _consent_receipt_note(local) -> str:
             "the local channels were quiet.\n\n")
 
 
-def _format_source_availability(avail) -> str:
+def _format_source_availability(avail, observations=None) -> str:
     if not avail:
         return ""
-    unavailable, disabled, partial = [], [], []
+    unavailable, disabled, partial, rate_limited, partial_limited = [], [], [], [], []
+    observations = observations if isinstance(observations, dict) else {}
     for sid, status in avail.items():
         label = SOURCE_LABELS.get(sid, sid)
-        if status == "disabled":
+        observation = observations.get(sid)
+        quota = (sid in ("gmail", "calendar") and isinstance(observation, dict)
+                 and observation.get("error") == "rate_limited")
+        if quota and status == "unavailable":
+            rate_limited.append(label)
+        elif quota and status == "partial":
+            # Some rows were read before the quota hit: keep the partial-coverage instruction.
+            partial.append(label)
+            partial_limited.append(label)
+        elif status == "disabled":
             disabled.append(label)
         elif status in ("partial", "degraded"):
             partial.append(label)
         elif status != "available":
             unavailable.append(label)
-    if not unavailable and not disabled and not partial:
+    if not unavailable and not disabled and not partial and not rate_limited:
         return ""
     lines = ["## Data Source Availability"]
+    if rate_limited:
+        lines.append(f"Temporarily limited by Google: {', '.join(rate_limited)}. Google's query quota was reached. "
+                     "Use evidence from the other available sources and retry this source later. "
+                     "Do not describe this as a device permission problem or ask the user to reconnect Google.")
     if unavailable:
         lines.append(f"Unavailable on this device: {', '.join(unavailable)}")
     if disabled:
         lines.append(f"Disabled by user: {', '.join(disabled)}")
-    if unavailable or disabled:
-        lines.append("When a source is unavailable or disabled, do not create action items that depend on it.")
+    if unavailable or disabled or rate_limited:
+        lines.append("When a source cannot be read, do not create action items that depend on missing evidence.")
     if partial:
         lines.append(f"Partial coverage: {', '.join(partial)}. Use the returned evidence, disclose the gap, "
                      "and do not infer that missing results mean nothing happened.")
+    if partial_limited:
+        lines.append(f"Google's query quota was reached before {', '.join(partial_limited)} finished reading; "
+                     "the rest can be retried later. Do not describe this as a device permission problem "
+                     "or ask the user to reconnect Google.")
     return "\n".join(lines)
 
 

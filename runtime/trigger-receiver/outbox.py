@@ -121,6 +121,8 @@ HOOKS = {
     # (body, target) -> (ok, detail). receiver._send_via_channel — the ONE call that touches the
     # channel, and the ONE function to strengthen when a channel offers a real receipt.
     "send": _unwired("send"),
+    "send_gallery": _unwired("send_gallery"),
+    "gallery_receipt": lambda key: None,
     "record": lambda *a, **k: None,             # receiver._record_delivery — the receipt line
     "on_delivered": lambda payload: None,       # receiver: finalize the run's chase/handoff effects
     "on_not_a_brief": lambda payload: None,     # receiver: a brief-kind row with no composed brief
@@ -322,7 +324,8 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
 def _claim(key: str, now: float, today: str):
     """Charge one attempt and hand back what to send, or say why not. One transaction, three
     answers: `None` (nothing to do — terminal, or not due yet), `aged` (it timed out — terminal),
-    `send` (go, with `(attempts, day)` — the brief gate needs the row's own day, not the clock's).
+    `held` (an ambiguous gallery stays pending for receipt reconciliation), or `send` (go, with
+    `(attempts, day)` — the brief gate needs the row's own day, not the clock's).
 
     The attempt is charged BEFORE the send, under the lock: a crash mid-send then looks exactly like
     a failed attempt (backoff already set, budget already spent) instead of an unbounded replay."""
@@ -332,6 +335,16 @@ def _claim(key: str, now: float, today: str):
         row = _find(rows, key)
         if row is None or row.get("status") != STATUS_PENDING:
             return None
+        # Once a gallery crossed the provider boundary, relevance expiry cannot prove it was not
+        # accepted. Keep its replay inputs and poll only on the existing capped backoff; the
+        # deliver-once gate remains closed in `_begin_send`, so this never authorizes another send.
+        if ((row.get('payload') or {}).get('presentation')
+                and row.get('acceptance') in ('unknown', 'in_flight')):
+            if now < float(row.get('next_at') or 0):
+                return None
+            row['attempts'] = min(int(row.get('attempts') or 0) + 1, MAX_ATTEMPTS)
+            row['next_at'] = now + backoff_secs(row['attempts'])
+            return ('held', {}, (row['attempts'], str(row.get('day') or '')))
         aged = _expiry(row, now, today)
         if aged:
             row["status"], row["last_error"] = aged[0], aged[1]
@@ -423,10 +436,60 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
         if row['acceptance'] == 'unknown':
             row['acceptance_uncertain'] = True
         row["last_error"] = detail[:300]
+        if (row['acceptance'] == 'unknown'
+                and (row.get('payload') or {}).get('presentation')):
+            # Attempt exhaustion cannot turn an ambiguous provider commit into a definitive
+            # failure. Keep the reconciliation identity; `_claim` will hold it without resending.
+            return ("retry", dict(row.get("payload") or {}))
         if attempts >= MAX_ATTEMPTS:
             row["status"] = STATUS_FAILED
             return ("gave_up", _close(row))
         return ("retry", dict(row.get("payload") or {}))
+
+
+def _definitive_gallery_failure(key: str, acceptance: str) -> None:
+    """A sidecar receipt can prove a prior operation stopped before provider dispatch."""
+    if acceptance not in ('not_attempted', 'rejected'):
+        return
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), key)
+        if row and row.get('status') == STATUS_PENDING:
+            row['acceptance'] = acceptance
+            row['acceptance_uncertain'] = False
+
+
+def _reconcile_gallery(key: str) -> bool:
+    """Record a provider acceptance before expiry/validity can suppress future delivery.
+
+    This never sends. Only a bounded provider message id is acceptance evidence; every missing,
+    malformed or unresolved result leaves the existing outbox state authoritative.
+    """
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), key)
+        if (not row or row.get('status') != STATUS_PENDING or not (row.get('payload') or {}).get('presentation')
+                or row.get('acceptance') not in ('unknown', 'in_flight')):
+            return False
+        if time.time() < float(row.get('next_at') or 0):
+            return False
+        attempts = int(row.get('attempts') or 0)
+    try:
+        late = HOOKS['gallery_receipt'](key)
+    except Exception as e:  # lookup failure is never permission to replay an ambiguous gallery
+        print(f"[sotto] gallery receipt lookup failed ({type(e).__name__})", flush=True)
+        return False
+    if not isinstance(late, dict):
+        return False
+    acceptance = late.get('acceptance')
+    message_id = late.get('message_id')
+    if (acceptance == 'accepted' and isinstance(message_id, str)
+            and 0 < len(message_id) <= 512):
+        settled = _settle(key, True, '', attempts, late)
+        if settled is not None:
+            _payload_receipt(settled[1], STATUS_DELIVERED)
+            _apply_effects(key)
+        return True
+    _definitive_gallery_failure(key, acceptance)
+    return False
 
 
 def _payload_receipt(payload: dict, status: str, detail: str = "") -> None:
@@ -445,12 +508,16 @@ def _attempt(key: str) -> bool:
             return False          # another thread is already sending this exact message
         _INFLIGHT.add(key)
     try:
+        if _reconcile_gallery(key):
+            return True
         claim = _claim(key, now, today)
         if claim is None:
             return False
         state, payload, extra = claim
         if state == "aged":
             _payload_receipt(payload, extra[0], extra[1])
+            return False
+        if state == 'held':
             return False
         attempts, day = extra
         label = str(payload.get("label") or "")
@@ -493,7 +560,9 @@ def _attempt(key: str) -> bool:
             if gate == GATE_NOT_A_BRIEF:
                 # Failed, loudly, on the first attempt — retrying the same non-brief cannot help,
                 # and the day stays unclaimed for the lane that can still compose one.
-                settled = _settle(key, False, NOT_A_BRIEF_DETAIL, MAX_ATTEMPTS)
+                # Refused before any send, so nothing can have reached the provider.
+                settled = _settle(key, False, NOT_A_BRIEF_DETAIL, MAX_ATTEMPTS,
+                                  {'acceptance': 'not_attempted'})
                 if settled is not None:
                     print(f"[sotto] {label}: NOT SENT — {NOT_A_BRIEF_DETAIL}", flush=True)
                     _payload_receipt(settled[1], STATUS_FAILED, NOT_A_BRIEF_DETAIL)
@@ -508,7 +577,7 @@ def _attempt(key: str) -> bool:
             return False
         try:
             if payload.get('presentation'):
-                answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '')
+                answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '', key)
             else:
                 answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '')
             ok, detail = answer[:2]

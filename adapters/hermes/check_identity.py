@@ -14,6 +14,7 @@ import tempfile
 
 from managed_config import reconcile
 from managed_identity import protect, verify_home
+from sync_sotto_skills import sync as sync_sotto_skills
 
 HERE = Path(__file__).resolve().parent
 HERMES = Path('/usr/local/lib/hermes-agent')
@@ -95,21 +96,49 @@ def main():
             (data / name).write_text('fixture')
         outside = root / 'outside'
         outside.write_text('must not change')
-        # These image-owned seed copies run before permissions are installed.
-        # GNU cp -a alone follows an old volume's destination symlink.
+        # Run the actual image-owned skill refresh, including a second boot
+        # after /root/.hermes has become an alias of this writable volume.
+        # An old target symlink or hardlink must not write through to data
+        # outside the tenant home.
         start = (HERE / 'start.sh').read_text()
-        for command, source, destination in (
-            ('cp -a --remove-destination /root/.hermes/skill-bundles/sotto.yaml',
-             Path('/root/.hermes/skill-bundles/sotto.yaml'), home / 'skill-bundles/sotto.yaml'),
-            ('cp -a --remove-destination /app/hermes-image-version.txt',
-             Path('/app/hermes-image-version.txt'), home / '.image-version'),
-        ):
-            assert command in start
-            destination.parent.mkdir(exist_ok=True)
-            destination.symlink_to(outside)
-            subprocess.run(['cp', '-a', '--remove-destination', str(source), str(destination)], check=True)
-            assert outside.read_text() == 'must not change'
-            assert not destination.is_symlink()
+        assert 'sync_sotto_skills.py "$HSTATE"' in start
+        assert '/app/sotto-skills /app/adapters/hermes/sotto.bundle.yaml' in start
+        image_skills = Path('/app/sotto-skills')
+        image_bundle = HERE / 'sotto.bundle.yaml'
+        image_compose = image_skills / '_shared/scripts/compose_brief.py'
+        assert image_compose.is_file() and image_compose.stat().st_size > 0
+        assert image_bundle.is_file() and image_bundle.stat().st_size > 0
+        skill_target = home / 'skills/sotto'
+        bundle_target = home / 'skill-bundles/sotto.yaml'
+        skill_target.parent.mkdir(exist_ok=True)
+        bundle_target.parent.mkdir(exist_ok=True)
+        skill_target.symlink_to(outside)
+        bundle_target.symlink_to(outside)
+        sync_sotto_skills(home, image_skills, image_bundle)
+        assert outside.read_text() == 'must not change'
+        assert not skill_target.is_symlink() and not bundle_target.is_symlink()
+        assert (skill_target / '_shared/scripts/compose_brief.py').read_bytes() == image_compose.read_bytes()
+        assert bundle_target.read_bytes() == image_bundle.read_bytes()
+        # The launcher's /root/.hermes alias is not used as the next seed.
+        root_alias = root / 'root-home-alias'
+        root_alias.symlink_to(home, target_is_directory=True)
+        assert (root_alias / 'skills/sotto').resolve() == skill_target.resolve()
+        (skill_target / 'stale-generated-file').write_text('remove on next boot')
+        bundle_target.unlink()
+        os.link(outside, bundle_target)
+        sync_sotto_skills(home, image_skills, image_bundle)
+        assert outside.read_text() == 'must not change'
+        assert not (skill_target / 'stale-generated-file').exists()
+        assert (skill_target / '_shared/scripts/compose_brief.py').read_bytes() == image_compose.read_bytes()
+        assert bundle_target.read_bytes() == image_bundle.read_bytes()
+        # Keep the original image-version copy boundary in the image gate.
+        assert 'cp -a --remove-destination /app/hermes-image-version.txt' in start
+        version_target = home / '.image-version'
+        version_target.symlink_to(outside)
+        subprocess.run(['cp', '-a', '--remove-destination', '/app/hermes-image-version.txt',
+                        str(version_target)], check=True)
+        assert outside.read_text() == 'must not change'
+        assert not version_target.is_symlink()
         # Old volumes can contain a customized identity or an agent-created symlink.
         # Migration replaces that directory entry, never follows it as root.
         (home / 'SOUL.md').symlink_to(outside)

@@ -216,6 +216,194 @@ def test_native_thinking_tokens_are_included_in_output_usage(tmp_path):
         assert db.execute('SELECT input_tokens,output_tokens FROM calls').fetchone() == (10, 25)
 
 
+@pytest.mark.parametrize('finish_reason', ['STOP', 'MAX_TOKENS'])
+def test_proven_text_native_settles_prospectively_and_admits_again(proxy, finish_reason):
+    http, calls = proxy
+    http.tenants[0]['budget_cents'] = 227  # the next admission still reserves its full 200c
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'candidates': [{'content': {'role': 'model', 'parts': [{'text': '{}'}]},
+                        'finishReason': finish_reason}],
+        'usageMetadata': {'promptTokenCount': 20000, 'candidatesTokenCount': 2,
+                          'thoughtsTokenCount': 25}}).encode())
+    body = {'contents': [{'parts': [{'text': 'hello'}]}],
+            'systemInstruction': {'parts': [{'text': 'Answer as JSON.'}]},
+            'generationConfig': {'maxOutputTokens': 8192, 'temperature': .4,
+                                 'response_mime_type': 'application/json',
+                                 'thinkingConfig': {'thinkingLevel': 'low'},
+                                 'responseSchema': {'type': 'OBJECT'}}}
+    assert post(http, body=body)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == server.settled_text_allowance('gemini-3.8-flash', time.time(), 200, 20000)
+    assert allowance == 27
+    assert json.loads(usage_json)['allowance_policy'] == 'native_text_v1'
+    assert json.loads(usage_json)['native_text_settlement_reason'] == 'settled'
+    assert post(http, body=body)[0] == 200
+    assert len(calls) == 0  # the replacement upstream is the only provider used
+    reopened = server.Ledger(http.ledger.path)
+    with reopened.connect() as db:
+        assert db.execute('SELECT COUNT(*),SUM(allowance) FROM calls').fetchone() == (2, 54)
+
+
+@pytest.mark.parametrize('part', [
+    {'text': '{}', 'thoughtSignature': 'c2lnbmF0dXJl'},
+    {'text': '{}', 'thought': False, 'thoughtSignature': 'c2lnbmF0dXJl'},
+    {'text': 'reasoning', 'thought': True},
+])
+def test_native_text_annotations_settle_without_loosening_request_proof(proxy, part):
+    http, _ = proxy
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'candidates': [{'content': {'role': 'model', 'parts': [part]},
+                        'finishReason': 'STOP'}],
+        'usageMetadata': {'promptTokenCount': 7, 'candidatesTokenCount': 2,
+                          'thoughtsTokenCount': 2}}).encode())
+    assert post(http)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance < 200
+    assert json.loads(usage_json)['native_text_settlement_reason'] == 'settled'
+    assert not server.native_text_request({'contents': [{'parts': [part]}]})
+
+@pytest.mark.parametrize('usage', [
+    {'candidatesTokenCount': 100, 'thoughtsTokenCount': 500000},
+    {'candidatesTokenCount': server.MAX_OUTPUT + 1},
+    {'candidatesTokenCount': server.MAX_OUTPUT, 'thoughtsTokenCount': 1},
+    {},
+    {'candidatesTokenCount': '3'},
+    {'candidatesTokenCount': 3, 'thoughtsTokenCount': 1.5},
+])
+def test_native_text_output_missing_or_above_ceiling_keeps_full_allowance(proxy, usage):
+    http, _ = proxy
+    http.tenants[0]['budget_cents'] = 10000
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'candidates': [{'content': {'parts': [{'text': 'x'}]}, 'finishReason': 'STOP'}],
+        'usageMetadata': {'promptTokenCount': 1000, **usage}}).encode())
+    body = {'contents': [{'parts': [{'text': 'hello'}]}],
+            'generationConfig': {'maxOutputTokens': 8192, 'thinkingConfig': {'thinkingLevel': 'high'}}}
+    assert post(http, body=body)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert 'allowance_policy' not in json.loads(usage_json)
+    assert json.loads(usage_json)['native_text_settlement_reason'] == 'output_unbounded'
+
+
+def test_chat_output_missing_or_above_ceiling_keeps_full_allowance(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 86400)
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    for usage in ({'prompt_tokens': 20000}, {'prompt_tokens': 20000, 'completion_tokens': server.MAX_OUTPUT + 1},
+                  {'prompt_tokens': 20000, 'completion_tokens': server.MAX_OUTPUT}):
+        ledger.finish(ledger.reserve('a', None, 'chat', 'gemini-3.8-flash'), 200, usage)
+    with ledger.connect() as db:
+        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(200,), (200,), (27,)]
+
+
+@pytest.mark.parametrize('extra', [
+    {'tools': [{'google_search': {}}]},
+    {'contents': [{'parts': [{'inline_data': {'mime_type': 'image/png', 'data': 'AA=='}}]}]},
+    {'contents': [{'parts': [{'fileData': {'fileUri': 'gs://example'}}]}]},
+    {'contents': [{'parts': [{'functionResponse': {'name': 'lookup', 'response': {}}}]}]},
+    {'generationConfig': {'responseModalities': ['AUDIO']}},
+    {'toolConfig': {}},
+    {'cachedContent': ''},
+])
+def test_native_billable_or_unknown_request_shapes_keep_full_allowance(proxy, extra):
+    http, _ = proxy
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+        'usageMetadata': {'promptTokenCount': 7, 'candidatesTokenCount': 3}}).encode())
+    body = {'contents': [{'parts': [{'text': 'hello'}]}], **extra}
+    assert post(http, body=body)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert json.loads(usage_json)['native_text_settlement_reason'] == 'request_ineligible'
+
+
+@pytest.mark.parametrize('reply', [
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP',
+                     'groundingMetadata': {}}],
+     'usageMetadata': {'promptTokenCount': 7}},
+    {'candidates': [{'content': {'parts': [{'inlineData': {'data': 'AA=='}}]},
+                     'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 7}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usageMetadata': {}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': True}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 1048577}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}}],
+     'usageMetadata': {'promptTokenCount': 7}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'OTHER'}],
+     'usageMetadata': {'promptTokenCount': 7}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usage': {'prompt_tokens': 7}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 7, 'toolUsePromptTokenCount': 1}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 7, 'groundingTokenCount': 1}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello', 'inlineData': {}}]},
+                     'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 7}},
+    {'candidates': [{'content': {'parts': [{'text': 'hello', 'thoughtSignature': 42}]},
+                     'finishReason': 'STOP'}],
+     'usageMetadata': {'promptTokenCount': 7}},
+])
+def test_native_ambiguous_response_or_usage_keeps_full_allowance(proxy, reply):
+    http, _ = proxy
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps(reply).encode())
+    assert post(http)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert json.loads(usage_json)['native_text_settlement_reason'] == 'response_ineligible'
+
+
+@pytest.mark.parametrize('mode', ['malformed', 'truncated', 'stream'])
+def test_native_incomplete_or_streamed_reply_keeps_full_allowance(proxy, monkeypatch, mode):
+    http, _ = proxy
+    valid = json.dumps({'candidates': [{'content': {'parts': [{'text': 'hello'}]},
+                                        'finishReason': 'STOP'}],
+                        'usageMetadata': {'promptTokenCount': 7}}).encode()
+    if mode == 'truncated':
+        monkeypatch.setattr(server, 'MAX_BODY', 200)
+        body = valid[:-1] + b' ' * 200 + b'}'
+    elif mode == 'stream':
+        body = b'data: ' + valid + b'\n\n'
+    else:
+        body = valid[:-1]
+
+    class NativeResponse(Response):
+        headers = {'Content-Type': 'text/event-stream' if mode == 'stream' else 'application/json'}
+
+    http.open_upstream = lambda *_args, **_kwargs: NativeResponse(body)
+    assert post(http)[0] == 200
+    with http.ledger.connect() as db:
+        assert db.execute('SELECT allowance FROM calls').fetchone()[0] == 200
+
+
+def test_native_settlement_requires_current_tariff_and_new_request_proof(tmp_path, monkeypatch):
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_END)
+    expired = ledger.reserve('a', None, 'native', 'gemini-3.8-flash')
+    ledger.finish(expired, 200, {'promptTokenCount': 7, 'candidatesTokenCount': 1}, proven_native_text=True,
+                  native_text_request_eligible=True, native_text_response_eligible=True)
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 1)
+    legacy = ledger.reserve('a', None, 'native', 'gemini-3.8-flash')
+    ledger.finish(legacy, 200, {'promptTokenCount': 7})
+    alias_only = ledger.reserve('a', None, 'native', 'gemini-3.8-flash')
+    ledger.finish(alias_only, 200, {'prompt_tokens': 7}, proven_native_text=True)
+    failed = ledger.reserve('a', None, 'native', 'gemini-3.8-flash')
+    ledger.finish(failed, 502, {'promptTokenCount': 7}, proven_native_text=True)
+    with ledger.connect() as db:
+        assert [row[0] for row in db.execute('SELECT allowance FROM calls ORDER BY id')] == [200] * 4
+        first_usage = json.loads(db.execute('SELECT usage_json FROM calls WHERE id=?', (expired,)).fetchone()[0])
+        assert first_usage['native_text_settlement_reason'] == 'tariff_unavailable'
+    with server.Ledger(ledger.path).connect() as db:
+        assert [row[0] for row in db.execute('SELECT allowance FROM calls ORDER BY id')] == [200] * 4
+
+
 def test_settlement_keeps_ambiguous_and_native_calls_reserved(tmp_path, monkeypatch):
     monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 86400)
     ledger = server.Ledger(tmp_path / 'settlement.sqlite3')

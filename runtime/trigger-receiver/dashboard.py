@@ -16,8 +16,9 @@ Security model (M1 is read-only; the CSRF token is minted now for M2's writes):
     Only sha256(token) is stored — $SOTTO_DATA/dashboard_sessions.json, written atomically at
     0600 through THE one write helper (connectors.write_json, wired in as HOOKS["write_json"];
     every JSON write in this image goes through it). Cookie: HttpOnly, Secure, SameSite=Lax.
-  * 30-day idle expiry, checked on every authed request; last_seen bumped at most once/hour so a
-    busy dashboard doesn't hammer the volume.
+  * Self-host sessions have a 30-day idle expiry. Managed Cloud sessions additionally carry a
+    broker lease of at most 30 days that ends with the issuing Cloud setup session, revoked on
+    Cloud logout or account suspension, and rechecked with a 30-second in-memory cache.
   * Brute-force damping is PER CALLER: 5 failures from one client key (the first X-Forwarded-For
     entry Railway's edge sets, else the socket address) lock THAT key for 60s, doubling per repeat
     offense to a 15-minute ceiling. A much higher global backstop (100 failures in 5 min → 60s for
@@ -394,6 +395,9 @@ def parse_frontmatter(text: str):
 # ── Sessions ($SOTTO_DATA/dashboard_sessions.json: sha256(token) → record) ───────────────────────
 
 _SESS_LOCK = threading.Lock()
+_CLOUD_CHECK_LOCK = threading.Lock()
+_CLOUD_CHECK_CACHE = {}  # dashboard token hash -> (Cloud grant hash, next check deadline)
+CLOUD_CHECK_SECS = 30
 
 
 def _sessions_path() -> str:
@@ -415,9 +419,10 @@ def _write_sessions(sess: dict) -> None:
     HOOKS["write_json"](_sessions_path(), sess)
 
 
-def mint_session() -> str:
+def mint_session(cloud=None) -> str:
     """Mint a session: 32 random bytes out to the cookie, only the hash (plus a per-session CSRF
-    token for M2) on disk. Expired sessions are pruned on the way through. Returns the raw token."""
+    token for M2) on disk. Managed Cloud sessions carry a broker lease, never a control bearer.
+    Expired sessions are pruned on the way through. Returns the raw token."""
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
     now_iso = _iso()
@@ -427,6 +432,8 @@ def mint_session() -> str:
                 if isinstance(v, dict) and (_from_iso(v.get("last_seen")) or 0) >= cutoff}
         sess[digest] = {"created": now_iso, "last_seen": now_iso,
                         "csrf": secrets.token_urlsafe(32)}
+        if cloud is not None:
+            sess[digest]["cloud"] = cloud
         try:
             _write_sessions(sess)
         except OSError:
@@ -469,7 +476,36 @@ def _session_record(h):
                 _write_sessions(sess)
             except OSError:
                 pass
-        return rec
+    cloud = rec.get("cloud")
+    if cloud is not None:
+        import cloud_pairing
+        if not isinstance(cloud, dict) or type(cloud.get("expires_at")) not in (int, float):
+            return None
+        if cloud["expires_at"] <= time.time():
+            return None
+        lease = cloud.get("grant")
+        if not isinstance(lease, str):
+            return None
+        lease_hash = hashlib.sha256(lease.encode()).hexdigest()
+        with _CLOUD_CHECK_LOCK:
+            cached = _CLOUD_CHECK_CACHE.get(digest)
+            if cached and cached[0] == lease_hash and cached[1] > time.time():
+                return rec
+        if not cloud_pairing.dashboard_session_active(cloud):
+            with _CLOUD_CHECK_LOCK:
+                _CLOUD_CHECK_CACHE.pop(digest, None)
+            return None
+        with _CLOUD_CHECK_LOCK:
+            _CLOUD_CHECK_CACHE[digest] = (lease_hash, min(time.time() + CLOUD_CHECK_SECS,
+                                                          cloud["expires_at"]))
+            if len(_CLOUD_CHECK_CACHE) > 1024:
+                now = time.time()
+                for key, (_, until) in list(_CLOUD_CHECK_CACHE.items()):
+                    if until <= now:
+                        _CLOUD_CHECK_CACHE.pop(key, None)
+                if len(_CLOUD_CHECK_CACHE) > 1024:
+                    _CLOUD_CHECK_CACHE.clear()
+    return rec
 
 
 # ── Brute-force damping + audit ──────────────────────────────────────────────────────────────────
@@ -682,7 +718,7 @@ def _login_page(msg: str = "") -> str:
 # ── Route dispatch (receiver.do_GET/do_POST call owns() then handle()) ───────────────────────────
 
 def owns(path: str) -> bool:
-    return (path in ("/app", "/app/login")
+    return (path in ("/app", "/app/login", "/app/cloud/start", "/app/cloud/consume")
             or path.startswith("/static/")
             or path.startswith("/api/"))
 
@@ -699,11 +735,71 @@ def handle(h, method: str, path: str):
         return _json(h, 404, {"error": "not found"})
     if path == "/app":
         return _handle_app(h)
+    if path == "/app/cloud/start":
+        return _cloud_start(h)
+    if path == "/app/cloud/consume":
+        return _cloud_consume(h)
     if path == "/app/login":  # GETting the login endpoint just lands you on /app's login flow
         return _respond(h, 302, None, None, _headers() + [("Location", "/app")])
     if path.startswith("/static/"):
         return _handle_static(h, path)
     return _handle_api(h, path)
+
+
+_CLOUD_COOKIE = "__Host-sotto_dashboard_handoff"
+
+
+def _cloud_start(h):
+    import cloud_pairing
+    from urllib.parse import parse_qs, urlsplit, urlencode
+    if not cloud_pairing.managed.enabled() or not cloud_pairing.control_token():
+        return _json(h, 404, {"error": "not found"})
+    try:
+        query = parse_qs(urlsplit(h.path).query, max_num_fields=3)
+        if set(query) != {"intent", "broker", "signature"} or any(len(v) != 1 for v in query.values()):
+            raise ValueError()
+        intent, broker, signature = (query[key][0] for key in ("intent", "broker", "signature"))
+        parsed = urlsplit(broker)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.port not in (None, 443) or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", intent)
+                or not re.fullmatch(r"[a-f0-9]{64}", signature)):
+            raise ValueError()
+        expected = hmac.new(cloud_pairing.control_token().encode(),
+                            ("dashboard-start:" + intent + ":" + broker).encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError()
+    except ValueError:
+        return _json(h, 403, {"error": "dashboard sign-in expired"})
+    binding = secrets.token_urlsafe(32)
+    challenge = hashlib.sha256(binding.encode()).hexdigest()
+    location = broker.rstrip("/") + "/dashboard/authorize?" + urlencode({"intent": intent, "challenge": challenge})
+    return _respond(h, 303, None, None, _headers() + [
+        ("Location", location),
+        ("Set-Cookie", f"{_CLOUD_COOKIE}={binding}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=120")])
+
+
+def _cloud_consume(h):
+    import cloud_pairing
+    from urllib.parse import parse_qs, urlsplit
+    if not cloud_pairing.managed.enabled():
+        return _json(h, 404, {"error": "not found"})
+    try:
+        query = parse_qs(urlsplit(h.path).query, max_num_fields=1)
+        grant = query.get("grant", []) if set(query) == {"grant"} else []
+    except ValueError:
+        grant = []
+    binding = _cookie(h, _CLOUD_COOKIE)
+    clear = ("Set-Cookie", f"{_CLOUD_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+    cloud = (cloud_pairing.consume_dashboard_grant(_root(), grant[0], binding)
+             if len(grant) == 1 else None)
+    if not cloud:
+        return _respond(h, 403, "text/plain; charset=utf-8", b"Dashboard sign-in expired. Return to Cloud setup.",
+                        _headers() + [clear])
+    token = mint_session(cloud=cloud)
+    _audit("login_ok")
+    return _respond(h, 302, None, None, _headers() + [clear, ("Location", "/app"),
+                    ("Set-Cookie", f"sotto_session={token}; Path=/; HttpOnly; Secure; SameSite=Lax")])
 
 
 def _handle_app(h):
@@ -1720,25 +1816,34 @@ def _mtime_iso(*parts):
 def api_runs() -> dict:
     """GET /api/runs → the crons.json jobs this box will run on demand, each with its honest state.
 
-    The rule, in one sentence: a brief can be run by hand until it has been delivered today, and the
-    digest is never blocked because it gates itself. "Delivered" is brief_marker.py's own
-    `<date>.<kind>.delivered` flag — the deliver-once gate the cron and the wake-push already share,
-    so the button can never disagree with the machine about whether today's brief went out. A live
-    `.claim` without that flag means a run the receiver started is still in flight."""
+    A brief's `.delivered` marker closes its deliver-once gate, but does not prove that its channel
+    accepted the message. The receipt/outbox projection supplies that separate delivery status.
+    A live `.claim` without the marker means a receiver run is still in flight. The digest gates
+    itself and remains available here."""
     try:
         registered = set(HOOKS["job_names"]())
     except Exception:  # noqa: BLE001
         registered = set()
     day = _local_today()
+    try:
+        delivery = {row['kind']: row for row in _brief_delivery_states(day)}
+    except (OSError, ValueError, TypeError, KeyError):
+        # An unreadable receipt/outbox cannot turn a deliver-once claim into proof of a send.
+        delivery = {}
     jobs = []
     for name, kind in RUN_JOBS:
         if name not in registered:
             continue
         job = {"name": name, "kind": kind, "available": True, "reason": "", "at": None}
         if kind in ("morning", "evening"):
-            delivered = _mtime_iso("briefs", f"{day}.{kind}.delivered")
-            if delivered:
-                job.update({"available": False, "reason": "delivered", "at": delivered})
+            gate = _mtime_iso("briefs", f"{day}.{kind}.delivered")
+            if gate:
+                evidence = delivery.get(kind, {})
+                status = evidence.get('status')
+                reason = {'sent': 'delivered', 'pending': 'pending',
+                          'failed': 'failed'}.get(status, 'unconfirmed')
+                job.update({"available": False, "reason": reason,
+                            "at": evidence.get('at') if status == 'sent' else None})
             else:
                 claim = _mtime_iso("briefs", f"{day}.{kind}.claim")
                 claim_at = _from_iso(claim) if claim else None

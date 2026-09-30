@@ -2,24 +2,21 @@
 
 For an existing hosted deployment, verify its explicit service target and scheduler ownership using the [bounded work runbook](docs/BOUNDED-MODEL-WORK.md#deployment-ownership-and-rollout).
 
-This is the exact Railway setup for the cloud Sotto host (Hermes + skills + trigger receiver). Two
-ways in, same result: the **[one-click Deploy link](#one-click-deploy-railway)** — it sets up the
-build, the `/data` volume and `BRIDGE_TOKEN`, and prompts for just two values (your Gemini key and
-your Telegram bot token) — or the manual GitHub deploy below, click by click. The Mac side (Bridge)
-is tunnel-free —
+This is the click-by-click Railway setup for the public Sotto runtime (Hermes + skills + trigger receiver).
+The supported fresh-install route is a manual GitHub deployment. No verified Photon one-click
+deployment is currently published. The checked-in [Photon preset contract](deploy/railway-photon-preset.json)
+records the required settings and has a local validator; it is not a Railway-importable template file.
+Railway templates are created and managed in Railway's template editor. The Mac side (Bridge) is tunnel-free —
 [download the signed app from GitHub Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
 then see §8.
 
 **For self-hosted iMessage:** use the manual GitHub deployment with your own Photon project and
-connection. Replace the Telegram bot token with the [five Photon settings](CHANNELS.md#photon-imessage-and-photo-briefs).
-Keep the Gemini key, unique Bridge secret, volume and domain. The existing template is configured
-for Telegram; it does not provision a Photon connection. The same public runtime supports both.
+connection. Set the [Photon variables](CHANNELS.md#photon-imessage-and-photo-briefs), Gemini key and
+unique Bridge secret, and attach the volume and public domain. Railway does not provision Photon
+credentials or a messaging line. The same public runtime supports Telegram and Photon.
 
-> **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the friendly fresh-cloud walkthrough.
-> This page is the click-by-click reference behind it. Honest budget for the manual deploy: **~30
-> minutes the first time** (only ~15 of it active — four Railway settings, three variables, then the
-> one-page `/setup` wizard: paste your Google client JSON + auth code; the rest is waiting on
-> builds). The one-click link cuts the active part to ~5 (two prompts + the wizard).
+> **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the self-host walkthrough. Leave
+> Railway's Root Directory blank; the Dockerfile is at the repository root.
 
 ## 0. Before you start (prerequisites)
 
@@ -27,22 +24,23 @@ for Telegram; it does not provision a Photon connection. The same public runtime
   available on the free/trial tier, and Sotto needs both — the `/data` volume keeps your channel link
   + memory, and the 6:30/17:30 cron briefs need the container running around the clock.
 - **A Gemini API key** ([aistudio.google.com](https://aistudio.google.com) → Get API key).
-- **A Telegram bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`, about a minute. (Or
-  your own Photon project and connection for iMessage, or the WhatsApp variables in step 5.)
+- **A delivery provider** — your own Photon project and connection for iMessage, a Telegram bot token
+  from [@BotFather](https://t.me/BotFather), or the WhatsApp variables in step 5.
 - **This repo on your GitHub** (fork or push it) so Railway can deploy from it.
 
-## Manual-deploy checklist — 4 REQUIRED settings, in order
+## Manual-deploy essentials
 
-The one-click link automates exactly these; on a manual deploy **you** do them, and each one
-fails *quietly* if skipped:
+Complete these service settings before opening the setup link:
 
-1. **Root Directory: leave blank** (the Dockerfile is at the repo root) — Settings ▸
-   Build ▸ Builder. Details: [step 2](#2-builder--build-context-critical).
+1. **Root Directory** — leave blank; the Dockerfile is at the repository root. Details:
+   [step 2](#2-builder--build-context-critical).
 2. **Variables** — Settings ▸ Variables ([step 5](#5-variables)):
-   - `GOOGLE_AI_API_KEY` = your Gemini key
+   - `GOOGLE_AI_API_KEY` = your Gemini key. The boot script also accepts `GEMINI_API_KEY` or
+     `GOOGLE_API_KEY` and maps whichever is set to all three names.
    - For Telegram, `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) gave you —
      then use the private pairing link printed during boot. For iMessage, omit it and use the
      [Photon settings](CHANNELS.md#photon-imessage-and-photo-briefs). WhatsApp: step 5.
+   - For Photon, set `SOTTO_CRON_DELIVER=photon` and the four `PHOTON_*` values in the Photon guide.
    - `SOTTO_USER_EMAIL` = your primary email — **optional; auto-derived after you connect Google**
      on the `/setup` wizard. Set it only to force a different address than the account you connect.
    - `BRIDGE_TOKEN` = a long random secret — generate one: `openssl rand -hex 24`. **Not optional.**
@@ -61,8 +59,7 @@ With those four in place, steps 1–8 below are the full click-by-click.
 Railway dashboard ▸ **New Project** ▸ **Deploy from GitHub repo** ▸ pick your repo.
 
 ## 2. Builder + build context (CRITICAL)
-The `Dockerfile` sits at the **root of the Sotto folder**, and its `COPY` lines are relative to that
-folder — in this standalone repo that folder *is* the repo root:
+The `Dockerfile` sits at the **repository root**, and its `COPY` lines are relative to that folder.
 
 > The repo ships a `railway.toml` that already pins `builder = "DOCKERFILE"` — on most deploys
 > Railway honors it and the settings below are just what to verify (or set when the UI disagrees).
@@ -70,10 +67,7 @@ folder — in this standalone repo that folder *is* the repo root:
 - **Settings ▸ Build ▸ Builder** → **Dockerfile**
 - Leave **Root Directory** and **Dockerfile Path** blank. Railway auto-detects `./Dockerfile`; context = repo root. Done.
 
-
-> Why blank: Railway's "Dockerfile Path" is an **absolute path from the repo root** and does *not* follow
-> the Root Directory — a value there is the #1 source of confusion. With the `Dockerfile` at the (Root)
-> directory it's auto-detected and the context is that folder, so `COPY sotto-chief-of-staff/ …` resolves.
+> Why blank: Railway auto-detects the root `Dockerfile`, and its `COPY` paths resolve from the repository root.
 
 ## 3. Add a Volume (persistent storage — required)
 The knowledge graph, continuity ledger, style profile, briefs, **and the WhatsApp login session** live
@@ -118,7 +112,7 @@ The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container 
   it from the account you authorize (persisted to `/data/config/settings.json`). Set this variable
   only to override that with a different address.
 - `BRIDGE_TOKEN` = the Mac↔cloud shared bearer — **required on a manual deploy**; generate it with
-  `openssl rand -hex 24` (a one-click deploy auto-generates it). Plainly: without it the
+  `openssl rand -hex 24`. Plainly: without it the
   pairing link the `/setup` wizard renders carries an **empty token**, so Mac pairing **silently
   fails** — set it before you open the setup link. No `BRIDGE_URL` exists anymore — the Mac dials
   *out* to this host's relay.
@@ -177,35 +171,37 @@ pairing half of this section is the WhatsApp path, which runs only with `WHATSAP
   - WhatsApp ▸ **Linked Devices** ▸ Link a Device ▸ scan.
   `creds.json` persists on `/data`, so later boots skip pairing and go straight to the gateway.
 
-## 6b. Connect Google (Gmail + Calendar) — deterministic, headless
-Do **not** do this through the chat — the agent regenerates the auth URL and you get "Invalid code verifier."
-Use the built-in flow instead:
-1. **Create a Desktop OAuth client** (one-time): [console.cloud.google.com](https://console.cloud.google.com) →
+## 6b. Connect Google (Gmail + Calendar)
+Use the browser flow from `/setup`:
+1. **Create a Web application OAuth client** (one-time): [console.cloud.google.com](https://console.cloud.google.com) →
    new project → enable **Gmail API** + **Google Calendar API** → **OAuth consent screen** in the left
    nav (newer consoles call this page **Google Auth Platform**) → audience **External** → **Publish
-   app** so the status reads **In production** → Credentials → **OAuth client ID → Desktop app** →
-   **Download JSON**.
+   app** so the status reads **In production** → Credentials → **OAuth client ID → Web application**.
    > ⚠️ **The day-8 trap:** a consent screen left in **Testing** issues refresh tokens that **expire
    > after ~7 days** — Google silently disconnects and every brief loses Gmail/Calendar on day 8.
    > Set the app to **In production** (Google does *not* require verification for you using your own
    > data — ignore the scary "needs verification" banner).
 
+   Under **Authorized redirect URIs**, enter the exact callback displayed in `/setup`:
+   `https://<RAILWAY_PUBLIC_DOMAIN>/google/oauth/callback`. Download the Web client JSON.
    *(Workspace accounts: if your org blocks unverified apps, allowlist the client in Admin console, or use a personal account.)*
-2. **Paste that JSON into the `/setup` wizard's Google box → Save client** (open the wizard via the
-   setup link from the deploy logs — step 6). No Railway variable, no redeploy. *(Legacy fallback: set
-   `GOOGLE_OAUTH_CLIENT_JSON` in Railway Variables + redeploy.)*
-3. In the wizard, click **Authorize** (or open **`/google/auth`** — same setup code) → "unverified app"
-   → Advanced → Continue → Allow.
-4. You land on a `localhost:1/?code=…` page that won't load. Copy the **`code`** value.
-5. **Paste the code into the wizard → Connect.** It exchanges live and shows "✅ Google connected" —
-   **no redeploy**. The token persists on `/data` and auto-refreshes.
-   *(Fallback if the live exchange errors: set `GOOGLE_AUTH_CODE` in Railway → Variables → redeploy →
-   clear it, as before.)*
-6. **Verify any time:** open **`/debug/google`** (setup code/cookie required) — it returns `{"google_connected": true}` when the
+2. Paste the JSON into the `/setup` Google box and click **Continue with Google**. Approve access
+   on Google's page; the browser returns automatically to Sotto and shows a clean success page.
+   Authorization uses browser-bound, single-use PKCE and state. No code is copied from a
+   `localhost:1` page. The token persists on `/data` and auto-refreshes.
+   Existing connected Desktop-client tokens continue to work. To authorize again from a Desktop
+   client, replace the client in `/setup` with the Web client JSON. If sign-in fails because the
+   saved client's secret was rotated or deleted, it belongs to another project, or the callback is
+   not registered, choose **Use a different Google client** in `/setup` or on the retry page; an
+   existing token keeps working until the new client connects.
+   `GOOGLE_AUTH_CODE` is no longer used; boot logs a reminder to remove it. Boot seeds
+   `GOOGLE_OAUTH_CLIENT_JSON` only when no client is already saved. Boot does not create a consent URL.
+3. **Verify any time:** open **`/debug/google`** (setup code/cookie required) — it returns `{"google_connected": true}` when the
    token works. Google is **server-side and Bridge-independent**: if this says connected, every cron
    brief gets fresh Gmail + Calendar even with the Mac asleep. If a brief says "Google isn't connected"
    but this says `true`, the agent skipped the gather — not an auth problem. (Local data is the only
    thing that's cached as an offline backup; Google is always fetched live.)
+   This self-host flow leaves the Mac Bridge unchanged and uses no Sotto OAuth broker.
 
 ## 6c. Connect Granola (optional, one click)
 Granola connects from the **`/setup` wizard → Connected services** tile: click **Connect**, approve
@@ -268,8 +264,8 @@ Gmail + Calendar come from Google; your **local** signals come from the Sotto Br
 connects **tunnel-free**: the Mac dials *out* to this Railway host, so there's nothing to expose — no
 Cloudflare, no domain, no inbound port. How the reverse link works end to end: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (the relay module).
 
-1. **Railway → Variables:** make sure `BRIDGE_TOKEN` is set — the shared bearer. Template deploys
-   generate it automatically (you never see or type it); on a manual deploy, set a long random secret
+1. **Railway → Variables:** make sure `BRIDGE_TOKEN` is set — the shared bearer. The setup helper
+   generates it automatically (you never see or type it); on a manual deploy, set a long random secret
    you pick (`openssl rand -hex 24`) and redeploy. `start.sh` registers `sotto-local` at the host's own
    always-up relay (`/mcp`), so Hermes never 530s even when your Mac is asleep. Either way you won't
    type the token into the Mac app — the pairing link below carries it. *(The wake-push uses
@@ -300,39 +296,23 @@ Cloudflare, no domain, no inbound port. How the reverse link works end to end: *
 > the brief degrades to the last cached snapshot. And if a triggered brief dies mid-run, its claim goes
 > stale after **30 minutes** and the next trigger retries it — no silently lost briefs.
 
-## One-click deploy (Railway)
+## Railway template status
 
-The button below collapses the whole manual checklist above — build, `/data` volume, and
-`BRIDGE_TOKEN` — into one click, leaving just two prompts: your Gemini key and your Telegram bot
-token. Your email isn't one of them (Sotto learns it from the Google account you connect in the
-wizard), and neither is your chat id — you tap the link the boot log prints and the capture does the
-rest.
+The previous Telegram template button is not a verified deployment route and must not be presented
+as one-click setup. The checked-in [`deploy/railway-photon-preset.json`](deploy/railway-photon-preset.json)
+is a review contract for a future Photon template, not Railway's native template schema. Validate its
+local invariants with:
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lvprWx)
+```bash
+python3 tools/verify_railway_photon_preset.py
+python3 -m pytest -q tools/test_railway_photon_preset.py
+```
 
-**(Repo owner only)** The link is a Railway **template** shared by URL, not a marketplace listing. To
-(re)create it: Railway dashboard ▸ **Settings → Templates → New Template** ▸ add this repo, then in
-the template's **Variables** pre-declare these so the friend types as little as possible:
-
-| Variable | Template setting |
-|---|---|
-| `BRIDGE_TOKEN` | **default = generated secret**, e.g. `${{ secret(48) }}` — so it's auto-created, never typed |
-| `GOOGLE_AI_API_KEY` | prompt (their Gemini key) |
-| `TELEGRAM_BOT_TOKEN` | prompt (their @BotFather token) |
-| `SOTTO_CRON_DELIVER` | fixed `telegram` for this self-host template (managed boot sets `photon` itself and ignores the template value) |
-| `WHATSAPP_ENABLED` | fixed `false` |
-| `GOOGLE_OAUTH_CLIENT_JSON` | **no longer needed** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy) |
-
-The two prompts encode the two **defaults** — Telegram for delivery, Gemini for the brief. Either can
-be changed after deploy without touching the template: `SOTTO_CRON_DELIVER` moves the channel, and
-WhatsApp is `WHATSAPP_ENABLED=true` plus its two number variables ([CHANNELS.md](CHANNELS.md)).
-
-The template also bundles the **Dockerfile build** + the **`/data` volume** (mount `/data`) so those
-aren't manual steps. After deploy, the friend generates a domain, then opens the **setup link from
-the deploy logs** (the line starting `[sotto] Setup link` — it's the `/setup` wizard plus its access
-code): one page that links the Mac, connects Google (paste client → authorize → paste code, all
-live — and Sotto learns your own address from the account you authorize), reports the channel link,
-and auto-detects the timezone.
+Before sharing a Railway template link, create it in Railway's Template Editor from a clean service,
+verify its generated secret, service source, `/data` volume, networking/domain, variables and owner
+allowlist against that contract, then deploy it from a fresh Railway account and verify first visible
+delivery. Railway's documented template functions include `${{secret(48)}}`; the template itself is
+created and published in Railway, not imported from this JSON contract.
 
 ## The dashboard
 
@@ -375,13 +355,14 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_VOLUME_ID` | Identity of the real attached managed volume. Initialize `.sotto-volume.json` explicitly before first upgraded boot; a missing/mismatched mount stops startup. | required in managed mode |
 | `SOTTO_IMESSAGE_NUMBER` | This tenant's assigned Sotto number, displayed after pairing and excluded from Bridge iMessage context. | managed operator only |
 | `SOTTO_PROXY_TENANTS` | Proxy service only: configured tenant token hashes, expiry and admission budgets; never set on a tenant instance. Pilot provisioning only. | proxy operator only |
-| `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface) | never |
+| `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface). The setup helper sets the same `/data` value explicitly; leave it. | never (helper sets `/data`) |
+| `SOTTO_SETUP_REQUEST` | ownership marker written by the setup helper; a resume refuses a service whose marker is missing or different ("not owned by this setup"). Set by the helper — leave it alone; a manual deploy never sets it. | helper only |
 | `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for self-host briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
 | `TELEGRAM_BOT_TOKEN` | your bot's token from [@BotFather](https://t.me/BotFather) — **the one channel variable on the default path**. Boot validates it, prints a one-tap `https://t.me/<bot>?start=<setup code>` link, waits up to five minutes for a message carrying that code (anything else is ignored, so a stranger who finds your bot can't claim it), and writes the chat id into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` (remembered on `/data`, so it happens once; a timeout just retries next boot). | **required** (default channel) |
 | `WHATSAPP_ALLOWED_USERS` | WhatsApp path only: who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | optional (channel) |
 | `WHATSAPP_HOME_CHANNEL` | WhatsApp path only: where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery there:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | optional (channel) |
 | `SOTTO_TIMEZONE` | IANA zone (e.g. `America/Los_Angeles`) for the **6:30 morning / 17:30 evening** briefs + time injection. **Now optional** — the `/setup` wizard auto-detects your zone from the browser and persists it to `/data/config/settings.json`; the briefs move to the new zone on the next minute (the receiver's scheduler reads it every tick) and the agent's own crons are re-registered on the spot, no redeploy. Set this only to override the auto-detected zone. | optional |
-| `SOTTO_CRON_DELIVER` | **THE channel choice.** Where everything scheduled is delivered — briefs, midday digest, weekly pulse, proactive watcher, and your personal `user-` routines; there is no per-job override by design. Defaults to **`telegram`**, except on a volume that already holds a paired WhatsApp session with no `TELEGRAM_BOT_TOKEN` set, which stays `whatsapp` (so an existing deploy never loses its channel); set `whatsapp`, `local`, or whatever name `hermes gateway setup` registered to choose. It is also the nudge delivery-gate — a channel Sotto can probe (Telegram's captured chat id, WhatsApp's session) must be linked, and a channel with no probe at all never holds a nudge. An unlinked Telegram also keeps the gateway down, so your pairing message survives for the next boot. The boot log states the channel and why. See [CHANNELS.md](CHANNELS.md). | optional |
+| `SOTTO_CRON_DELIVER` | **THE channel choice.** Where everything scheduled is delivered — briefs, midday digest, weekly pulse, proactive watcher, and your personal `user-` routines; there is no per-job override by design. Defaults to **`telegram`**, except on a volume that already holds a paired WhatsApp session with no `TELEGRAM_BOT_TOKEN` set, which stays `whatsapp` (so an existing deploy never loses its channel); set `photon`, `whatsapp`, `local`, or whatever name `hermes gateway setup` registered to choose. It is also the nudge delivery-gate — a channel Sotto can probe (Telegram's captured chat id, WhatsApp's session, Photon's authenticated owner DM) must be linked, and a channel with no probe at all never holds a nudge. An unlinked Telegram also keeps the gateway down, so your pairing message survives for the next boot. The boot log states the channel and why. See [CHANNELS.md](CHANNELS.md). | optional |
 | `WHATSAPP_ENABLED` | `true` runs the boot-time WhatsApp pairing step and the WhatsApp gateway. **Defaults to `false`**, except when WhatsApp is the resolved delivery channel (then `true`) — so nobody waits 15 minutes for a QR scan they never intended. | optional (channel) |
 | `WHATSAPP_*` · `TELEGRAM_*` · `BLUEBUBBLES_*` · `SIGNAL_*` · `DISCORD_*` · `SLACK_*` | **your channel's own variables** — these names belong to Hermes, not Sotto (run `hermes gateway setup` once to see the ones your version wants). Every variable you set with one of these prefixes is forwarded into `~/.hermes/.env` on boot, by prefix and with no channel special-cased; the boot log names each one it forwarded. Set none and nothing happens. | optional (channel) |
 | `SOTTO_USER_EMAIL` | your own email address; used to exclude yourself from attendee research and post-meeting taps, and to list you as a guest on invites Sotto creates. **Optional override — derived automatically from your Google account when you connect it** (the `From` of your own sent mail, persisted as `google_account_email` in `/data/config/settings.json`); set this only to force a different address. | optional |
@@ -395,7 +376,7 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_BACKGROUND_UNMETERED` | Exact `true` explicitly allows self-host history learning and Dreamer to use direct BYOK without a finite proxy budget. Unset is the safe default: background learning waits for the proxy URL/token and a finite tenant `budget_cents`. Foreground chat and ordinary briefs are unaffected. | optional owner choice |
 | `SOTTO_ALLOW_SELF_IMPROVE` | `1` to allow Hermes' skill self-writes + Curator on this instance. Default (unset) **protects** Sotto's skills: gates `skills.write_approval`, disables curator pruning. Set `1` only on a shared general-purpose Hermes. | optional |
 | `SOTTO_SPAWN_TOOLSETS` | comma-separated **Hermes toolset ids** the spawned one-shot runs (briefs, nudges, event agents) are scoped to — e.g. `sotto-local,google-workspace`. **Unset by design, and usually should stay unset:** toolset ids vary by install, so a wrong guess would break *every* brief and no default can be safely picked for you. Run `hermes tools --summary` to see the ids this deploy actually has before setting it. Ignored unless the runner is `hermes` (`SOTTO_RUN_SKILL` may name another agent, which would choke on the flag). | optional |
-| `SOTTO_REFRESH_HERMES` | `1` for **one boot** adopts the image's Hermes runtime onto the `/data` volume (see *Staying updated*). A denylist protects WhatsApp login, sessions, config, SOUL, and the knowledge graph. Unset after the version line confirms the upgrade. | optional (upgrade) |
+| `SOTTO_REFRESH_HERMES` | `1` for **one boot** refreshes installer-owned Hermes home files on `/data` from the image (see *Staying updated*). A denylist protects WhatsApp login, sessions, config, SOUL, and the knowledge graph. The installed Hermes code is pinned in the image at `/usr/local/lib/hermes-agent`; this setting does not replace that code. | optional (upgrade) |
 | `SOTTO_RESEARCH_DEEP` | `1` (default) runs the second, recency-focused attendee-research pass (recent posts/news, not just a bio); `0` keeps only the cheap first pass. | optional |
 | `SOTTO_PREWARM_RESEARCH` | first-run seed: background-researches your most-frequent contacts while pre-warming the knowledge graph (stored as clearly-labeled low-confidence notes). Default **on**; `=0` skips the research and seeds plain identity stubs only. | optional |
 | `SOTTO_DASHBOARD` | `0` disables the web dashboard entirely — `/app` and `/api/*` answer 404 (default: on). See *The dashboard* above. | optional |
@@ -430,8 +411,9 @@ research caps — are named constants in the code that owns them, not variables 
 | `SOTTO_TOOL_PROGRESS` | what streams into chat while Sotto works: `off` (default — nothing mid-turn; the typing indicator and the periodic "⏳ Working" heartbeat cover the wait) · `new` (plain-language narration + one edit-in-place tool bubble, cleaned up on delivery) · `all`/`verbose` (debugging). | optional (UX) |
 | `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Photon iMessage uses contextual working icons (🔎 research, 📝 drafting, 📅 calendar, 🧠 memory, 💭 general), then replaces directly with ✅ finished, ⚠️ failed or ⏸️ interrupted. Standalone thanks keep ❤️. Replacement never removes first. This is reply status, not a receipt for an external action. Hermes has no bot reactions on WhatsApp. | optional (UX) |
 | `GATEWAY_ALLOW_ALL_USERS` | `true` = open access (testing only). | optional |
+| `PHOTON_ALLOW_ALL_USERS` | Photon only. Unset or `false` keeps Photon restricted to `PHOTON_ALLOWED_USERS` (the setup helper sets `false`); any other value is treated as unrestricted, so owner activation never completes and Photon never counts as linked. Leave it unset or `false`. | optional (channel) |
 | `GOOGLE_OAUTH_CLIENT_JSON` | **optional now** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy). This var remains as a legacy/headless fallback (loaded at boot). | optional (legacy) |
-| `GOOGLE_AUTH_CODE` | the one-time code from `/google/auth`; **clear it** after `Google: connected ✓`. | during Google connect |
+| `GOOGLE_AUTH_CODE` | no longer used — remove it; boot only logs a reminder. Connect from `/setup`. | remove |
 | *(none — use `/setup`)* | **Granola connects with zero variables**: the wizard's Connected-services tile (step 6c) runs the OAuth flow and stores tokens on `/data`. | — |
 | `GRANOLA_API_KEY` | break-glass Granola **REST** mode (official API, Business/Enterprise plans) instead of the Connect tile. | optional |
 | `EXA_API_KEY` | web-research key ([exa.ai](https://exa.ai)). Present = Sotto searches with Exa instead of Gemini grounding, and uses it for deep research when Parallel isn't set. **Shown on the Connections page** alongside Granola, connected or not. | optional (research) |
@@ -486,11 +468,7 @@ version and never again. A new version is housekeeping, so it never arrives as i
 never spends your daily interrupt budget, and it never repeats. `SOTTO_UPDATE_CHECK=0` turns the
 daily check off and, with it, all three notices — there is no separate switch to find.
 
-**1. If you deployed with the one-click link (Railway template).** When the template's repo is
-updated, Railway opens a **pull request** on your copy of the repo with the new code. Merge it and
-Railway redeploys automatically — that's the whole update.
-
-**2. If you deployed manually, from a fork or your own copy.** On GitHub, open your repo → **Sync
+**For a manual deployment from a fork or your own copy:** On GitHub, open your repo → **Sync
 fork** → **Update branch**. That lands the new code on your `main`, and Railway — which redeploys on
 every push to the repo it tracks — rebuilds and restarts on its own. (Deployed straight from the
 public repo rather than a fork? Then you're already tracking it: hit **Deploy** in Railway, or push
@@ -508,11 +486,12 @@ rebuild is also a Hermes install. Two caveats, both already handled:
   Hermes upgrade is a deliberate act: re-fetch the script, review the diff, commit
   (`tools/ship.sh --refresh-hermes` does all three) — the changed file busts the cache and the
   next build installs the latest.
-- Your `/data` volume holds a first-boot copy of `~/.hermes`, which can **shadow** a newer image.
-  Every boot log prints `[sotto] hermes running: <ver> | image built with: <ver>`, and `/setup`
-  shows the same pair. When they differ, set `SOTTO_REFRESH_HERMES=1` (see the variables table
-  above) and redeploy **once** — the boot adopts the image's runtime, protecting your WhatsApp
-  login, sessions, config and knowledge — then unset it.
+- Your `/data` volume holds a first-boot copy of `~/.hermes`. The installed Hermes code runs from
+  `/usr/local/lib/hermes-agent`, and boot checks its Git commit against the image pin. The boot log
+  and `/setup` show Hermes version strings without the changing upstream hash. A different upstream
+  hash alone does not mean the volume is stale or call for `SOTTO_REFRESH_HERMES=1`. Use that setting
+  for one boot only when adopting newer installer-owned home files from the image; it preserves
+  WhatsApp login, sessions, config and knowledge. Then unset it.
 
 **4. The Mac Bridge updates itself.** The Bridge checks
 [Releases](https://github.com/kothari-nikunj/sotto/releases/latest) once a day and shows

@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from source_context import BRIDGE_STATUSES
 
 
@@ -14,6 +16,9 @@ def _function(source: str, name: str, next_name: str) -> str:
 
 
 def test_python_accepts_exact_rust_bridge_status_vocabulary():
+    if not RUST_MAIN.exists():
+        # The public distribution ships without Bridge source; its CI must still reach the image build.
+        pytest.skip("sotto-bridge/ is excluded from the distribution tree")
     source = RUST_MAIN.read_text()
     production = source.split("#[cfg(test)]", 1)[0]
 

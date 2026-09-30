@@ -643,6 +643,173 @@ def test_worker_failure_retains_safe_category_without_private_stderr(tmp_path, m
     assert 'worker_exit_1:ValueError' in str(reports)
 
 
+def test_only_canonical_brief_runner_budget_exit_parks_one_attempt_and_welcome(tmp_path, monkeypatch):
+    import onboarding
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    reports = []
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: reports.append(a))
+    rec._WORK_STOP.clear()
+
+    class DeniedProcess:
+        returncode = q.MODEL_BUDGET_EXIT
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private account and source details'
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(rec.subprocess, 'Popen', DeniedProcess)
+    canonical = [sys.executable, str(HERE / 'brief_runner.py')]
+    identity = q.enqueue(tmp_path, 'run', {'runner': canonical, 'prompt': '{}',
+                                          'label': onboarding.LABEL}, key='budget-welcome')
+    rec._work_one(q.claim(tmp_path, 'budget-worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'failed' and row['attempts'] == 1
+    assert row['error'] == q.MODEL_BUDGET_EXHAUSTED and row['payload'] == {}
+    assert onboarding.status(tmp_path) == 'model_held'
+    failed = [report for report in reports if report[1] == 'failed']
+    assert len(failed) == 1
+    assert 'model allowance reached; no retry queued' in failed[0][2]
+    assert 'private account and source details' not in str(reports)
+    assert q.claim(tmp_path, 'again') is None
+
+
+def test_foreign_runner_exit_77_keeps_normal_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    rec._WORK_STOP.clear()
+
+    class DeniedProcess:
+        returncode = q.MODEL_BUDGET_EXIT
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private foreign stderr'
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(rec.subprocess, 'Popen', DeniedProcess)
+    identity = q.enqueue(tmp_path, 'run', {'runner': [sys.executable, '-c', 'pass'],
+                                          'prompt': '{}', 'label': 'synthetic'}, key='foreign-77')
+    rec._work_one(q.claim(tmp_path, 'worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'pending' and row['attempts'] == 1
+    assert row['error'].startswith('worker_exit_77:')
+
+
+@pytest.mark.parametrize('runner_name,exit_code,terminal', [
+    ('procedure_runner.py', q.MODEL_BUDGET_EXIT, True),
+    ('procedure_runner.py', 1, False),
+    ('brief_runner.py', q.MODEL_BUDGET_EXIT, True),
+])
+def test_declared_runner_budget_exit_is_terminal_only_for_exit_77(
+        tmp_path, monkeypatch, runner_name, exit_code, terminal):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    rec._WORK_STOP.clear()
+    class Process:
+        returncode = exit_code
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private stderr'
+        def poll(self):
+            return self.returncode
+    monkeypatch.setattr(rec.subprocess, 'Popen', Process)
+    identity = q.enqueue(tmp_path, 'run', {
+        'runner': [sys.executable, str(HERE / runner_name)], 'prompt': '{}',
+        'label': 'cron:sotto-midday-digest'}, key=f'{runner_name}:{exit_code}')
+    rec._work_one(q.claim(tmp_path, 'worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == ('failed' if terminal else 'pending')
+    assert row['attempts'] == 1
+    if terminal:
+        assert row['error'] == q.MODEL_BUDGET_EXHAUSTED
+    else:
+        assert row['error'].startswith('worker_exit_1:')
+
+
+def test_stale_budget_worker_cannot_hold_welcome_or_record_receipt(tmp_path, monkeypatch):
+    import onboarding
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    reports = []
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: reports.append(a))
+    identity = q.enqueue(tmp_path, 'run', {'label': onboarding.LABEL}, key='stale-budget')
+    old = q.claim(tmp_path, 'old')
+    current = q.claim(tmp_path, 'new', now=old['lease_until'] + 1)
+    def denied(job):
+        error = rec._WorkerError(q.MODEL_BUDGET_EXIT, 'private stderr')
+        error.model_budget_exhausted = True
+        raise error
+    monkeypatch.setattr(rec, '_execute_work', denied)
+    rec._work_one(old)
+    assert q.get(tmp_path, identity)['owner'] == current['owner']
+    assert not reports and onboarding.status(tmp_path) == 'waiting'
+
+
+def test_budget_flag_cannot_discard_saved_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    identity = q.enqueue(tmp_path, 'run', {'label': 'synthetic'}, key='saved-budget')
+    job = q.claim(tmp_path, 'worker')
+    result = {'text': 'Already prepared', 'label': 'synthetic'}
+    q.save_result(tmp_path, identity, 'worker', result)
+    job = q.get(tmp_path, identity)
+    def denied(*args, **kwargs):
+        error = rec._WorkerError(q.MODEL_BUDGET_EXIT, 'private stderr')
+        error.model_budget_exhausted = True
+        raise error
+    monkeypatch.setattr(rec, '_deliver_text', denied)
+    rec._work_one(job)
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'ready' and row['result'] == result
+    assert row['error'] != q.MODEL_BUDGET_EXHAUSTED
+
+
+def test_budget_terminal_key_readmits_only_after_positive_capability(tmp_path, monkeypatch):
+    import onboarding
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_RUN_SKILL', raising=False)
+    monkeypatch.setattr(rec, '_find_sotto_script', lambda *parts: '/fixture/_shared/scripts/compose_brief.py')
+    monkeypatch.setattr(rec, '_brief_revision', lambda kind: 'fixed')
+    assert rec._managed_brief('sotto-welcome-brief', onboarding.LABEL)
+    identity = q.job_id_for('run', rec._job_key(onboarding.LABEL, ''))
+    q.claim(tmp_path, 'worker')
+    assert q.fail(tmp_path, identity, 'worker', 'private', model_budget_exhausted=True) == 'failed'
+    denied = q.get(tmp_path, identity)
+    assert denied['error'] == q.MODEL_BUDGET_EXHAUSTED
+    monkeypatch.setattr(rec, '_brief_model_ready', lambda: False)
+    assert rec._managed_brief('sotto-welcome-brief', onboarding.LABEL) is False
+    assert q.get(tmp_path, identity) == denied
+    monkeypatch.setattr(rec, '_brief_model_ready', lambda: True)
+    assert rec._managed_brief('sotto-welcome-brief', onboarding.LABEL)
+    resumed = q.get(tmp_path, identity)
+    assert resumed['status'] == 'pending' and resumed['attempts'] == 0
+
+
+def test_welcome_capability_race_does_not_claim_nonexistent_work(tmp_path, monkeypatch):
+    import onboarding
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_RUN_SKILL', raising=False)
+    monkeypatch.setattr(rec, '_find_sotto_script', lambda *parts: '/fixture/_shared/scripts/compose_brief.py')
+    monkeypatch.setattr(rec, '_brief_revision', lambda kind: 'fixed')
+    assert onboarding.tick(tmp_path, True,
+                           lambda: rec._managed_brief('sotto-welcome-brief', onboarding.LABEL), 100) == 'started'
+    identity = q.job_id_for('run', rec._job_key(onboarding.LABEL, ''))
+    q.claim(tmp_path, 'worker')
+    assert q.fail(tmp_path, identity, 'worker', 'private', model_budget_exhausted=True) == 'failed'
+    onboarding.model_budget_held(tmp_path)
+    denied = q.get(tmp_path, identity)
+    monkeypatch.setattr(rec, '_brief_model_ready', lambda: False)
+    assert onboarding.tick(tmp_path, True,
+                           lambda: rec._managed_brief('sotto-welcome-brief', onboarding.LABEL),
+                           2000, model_ready=lambda: True) == 'model_held'
+    state = json.loads((tmp_path / 'config/onboarding.json').read_text())
+    assert state['phase'] == 'model_held' and state['attempts'] == 0
+    assert q.get(tmp_path, identity) == denied
+
+
 def test_provider_recovery_is_bounded_persistent_and_truthful(tmp_path, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(q.time, 'time', lambda: clock[0])

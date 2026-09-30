@@ -454,9 +454,9 @@ to connect!" never earns an interrupt.
 
 ## Managed Cloud pilot activation
 
-In managed mode, scheduled morning/evening briefs and Bridge wake-triggered briefs wait until the owner has texted Sotto and at least one consented context source is connected. A sleeping Mac and a source with zero events are not disconnected sources. Missing capability state means zero sources. After the first owner DM, the receiver delivers one `status:no-sources` notice through the nudge outbox and remembers its acceptance on disk; no daily quiet-day or sources-unavailable brief is generated. Manual run-now remains an explicit action. Self-host keeps its current behavior.
+In managed mode, scheduled morning/evening briefs and Bridge wake-triggered briefs wait until the owner has texted Sotto and at least one consented context source is connected. A sleeping Mac and a source with zero events are not disconnected sources. Missing capability state means zero sources. After the first owner DM, the receiver delivers one `status:no-sources` notice through the nudge outbox and remembers its acceptance on disk; no daily quiet-day or sources-unavailable brief is generated. Manual run-now remains an explicit action. Fresh self-host first briefs also wait for context and the linked delivery channel; local readiness needs a valid successful extraction rather than a Bridge connection alone. Established self-host installations retain their existing recovery behavior.
 
-The managed model credential is a lease: the receiver's heartbeat renews it once it is within 72 hours of expiry (`model_lease.RENEW_BEFORE_SECONDS`) and, after a failed attempt, retries hourly (`model_lease.RETRY_SECONDS`); a failed renewal never invalidates the current credential.
+The managed model credential is a lease: the receiver's heartbeat renews it once it is within 72 hours of expiry (`model_lease.RENEW_BEFORE_SECONDS`) and, after a failed attempt, retries hourly (`model_lease.RETRY_SECONDS`); a failed renewal never invalidates the current credential. Before the first runtime starts, provisioning requires more than one hour before its configured expiry. Later recovery checks the effective renewed lease through the authenticated proxy capability endpoint, along with the existing finite-budget and remaining-allowance checks.
 
 ## Shared relevance — before choosing how to surface it
 
@@ -497,7 +497,7 @@ eligible, and a failed send consumes nothing; no extra model route, per-item cal
 
 | | When | What |
 |---|---|---|
-| Morning brief | 6:30 local (or the moment your Mac wakes past 7am) | opens with the time of day and the date in your zone ("Good morning — Saturday, September 6"; good afternoon when the wake path composes it after noon), then your day across messages, email, calendar, plus open loops. One per day, always: if your Mac slept through 6:30 the brief still goes out from the last saved snapshot, and when the Mac wakes later its fresh data is folded into that snapshot instead of composing a second brief — the nudges and the midday digest surface whatever the morning brief couldn't see |
+| Morning brief | 6:30 local (or the moment your Mac wakes past 7am) | opens with the time of day and the date in your zone ("Good morning — Saturday, September 6"; good afternoon when the wake path composes it after noon), then your day across messages, email, calendar, plus open loops. At most one accepted morning brief per day. After setup is established and the source/channel gates permit delivery, a sleeping Mac can use the last saved snapshot; fresh setup waits for context and a linked channel, and when the Mac wakes later its fresh data is folded into that snapshot instead of composing a second brief — the nudges and the midday digest surface whatever the morning brief couldn't see |
 | Evening brief | 17:30 local | opens with "Good evening — <the date>", then accountability, tomorrow, follow-up drafts, and **What moved today**. On Friday only, it adds a short review of up to three stale or repeatedly surfaced obligations plus a count/link for the rest and a count of parked loops. No stale or parked items and no eligible candidate means no review; a stated `weekly_review` section mute suppresses it. It never silently expires them and sends no separate Sunday review message. **At most one review question**, shared with a *"make that a standing rule?"* confirmation when today's transcripts showed you stating one; that confirmation takes precedence. Explicit "mute Bob" instructions still work |
 | Midday digest | 12:30 local | reviews what queued **since the last delivered brief** when at least `SOTTO_DIGEST_MIN` (default 8) known-sender ambient/deferred events justify review; sends only relevant items, otherwise silent. Nudges Sotto raised itself never count toward that 8 (they aren't people), though they may ride along in the message |
 | Nudges | any time, subject to every rule above | one short message with a reply already drafted — and an offer to act on it: an email asks ("want this in your Gmail drafts?" — on your yes it saves a real, threaded Gmail draft you send yourself; a `mailto:` is removed at the delivery seam, so one can never reach you from a scheduled run), every other channel gets a one-tap link — and a tap link is kept only when its recipient validates (a real phone of 7-15 digits, a Messages short code, or an Apple ID email), so a model-masked or non-recipient link (`imessage://+141****3682`, an RCS business handle, a group identifier) is removed at that same seam while the draft text around it stays, because a dead link is worse than none |
@@ -550,6 +550,28 @@ Missed daily jobs can be admitted within four hours, subject to activation and s
 Preparation is reusable for 30 minutes, cached meeting notes for 24 hours, and a welcome run gives
 its optional seeders 20 seconds. Welcome admission uses a 20-minute lease, retries after 30 minutes,
 and stops after three attempts per UTC day; ancillary follow-up work remains recoverable for seven days.
+When adopting a pre-existing installation, a brief marker is only a claim: matching provider
+acceptance evidence must confirm that the scheduled brief for that day and kind was delivered.
+An established installation is never reset automatically, even if old receipts were pruned and a
+later scheduled brief failed. Fresh onboarding waits for scheduled work already accepted by the
+durable queue or outbox. Welcome reservation and wake or cron admission share one receiver lock:
+an arriving wake folds its context into the snapshot while welcome is pending, and a scheduled
+brief admitted first gets its delivery chance before welcome. Fresh onboarding retains an
+ambiguous hold through outbox pruning. Only an explicitly unaccepted terminal attempt permits a
+fresh welcome; unknown outcomes are never treated as safe to replay. A first scheduled brief whose
+acceptance is uncertain counts as that ambiguous case even while its outbox row stays pending, as a
+gallery awaiting its receipt does: no welcome follows it, but later scheduled briefs still run.
+
+Before gathering a fresh managed brief or its optional preparation, Sotto checks the authenticated,
+content-free proxy capability. A finite allowance must admit one native reservation; this does not
+promise enough for the entire brief. Unlimited managed routes and direct self-host keys retain their
+existing policy. An exact proxy budget denial stops composition retries immediately; authentication,
+network and unsupported-capability errors are distinct. A saved useful composition remains eligible
+for delivery. Optional critic/revision failures do not discard an otherwise valid draft.
+A welcome held for allowance reports that account attention is needed. The denied admission does
+not spend a welcome fault attempt, but queue and model-call evidence remain recorded. The existing
+tick resumes only after availability is verified, and accepted or pending delivery takes precedence.
+No allowance is increased or reset automatically.
 
 Infrastructure lifecycle notices (gateway shutdown, restart, startup and interrupted native cron)
 stay in operator logs across Sotto channels. They do not become chat interruptions; ordinary
@@ -561,6 +583,11 @@ also disabled, including existing per-channel display overrides. This changes pr
 memory work, compression, approval policy and actionable failure reporting remain. Shared writing
 rules describe the outcome and next useful step in ordinary language; technical detail is for
 a user who asks for it.
+
+On dedicated Sotto Cloud and self-host gateways, Hermes does not inject its unsolicited
+`/help` introduction and profile offer into the first chat reply. The missing-home-channel hint
+still appears when needed;
+shared Hermes installations keep their original first-contact behavior.
 
 Every message is persisted **before** its first send attempt. The adapter requires structured
 success and a provider message ID; an exit code alone cannot mark delivery. The outbox retries every
@@ -656,8 +683,8 @@ nudged about that?", the answer is a row there: *muted sender*, *quiet hours*, *
 budget spent (4 nudges today)*, *in a meeting until 2:30 PM — Sarah Chen*, and so on. Nothing is
 silently discarded without a reason you can read. Provider acceptance is labelled Sent, not proof
 that a device displayed it. Photo briefs record whether four photos were sent or why they used text;
-that explanation comes from the existing outbox receipt and survives its retries. Expandable Activity details connect a send to its recorded prior decisions by identity; missing or later evidence is never guessed. The Mac menu's
-View activity opens this same record. Full Disk Access on the Mac stays Checking after a permission
+that explanation comes from the existing outbox receipt and survives its retries. Expandable Activity details connect a send to its recorded prior decisions by identity; missing or later evidence is never guessed. On the Mac,
+Settings → Account → Activity opens this same record. Full Disk Access on the Mac stays Checking after a permission
 restart until the Bridge confirms access; source read failures stay visible independently of the
 app's permission check.
 
@@ -681,7 +708,7 @@ Local sources follow these rules:
 - Both setup/prewarm and recurring Contacts/style writers recheck contributing source consent before writing learned data.
 - Unknown style channels are rejected; legacy channel-less messages require iMessage consent and email aliases require Gmail consent.
 - A disable reported by a Bridge probe takes effect on arrival whatever either clock says, only a strictly later probe restores access, and a completed read never does.
-- An unreadable consent receipt withholds every local source and is left for repair rather than rewritten, while the brief still ships and says why.
+- An unreadable consent receipt withholds every local source and is left for repair rather than rewritten. A permitted brief can use other connected sources and says why local context is absent; fresh self-host setup waits if no eligible source remains.
 - A healthy access probe cannot erase failed extraction or make an old read fresh.
 - Relayed reads and probes retain server request order through snapshot replay, independent of Mac clock corrections; older unsolicited wake uploads still rely on Mac timestamps.
 - The Bridge serializes status-file updates, and a failed deferred-unread reader makes its messaging source partial without discarding valid messages.
@@ -776,6 +803,22 @@ A new installation prepares a short first useful look after a context source and
 channel connect. It uses recent conversations, calendar and the user's actual writing samples;
 there is no mandatory profile questionnaire. Existing installations keep their memory and current
 conversation. A connected source is not proof that all of its history has been reviewed.
+For local first-use readiness, an enabled source must have a fresh valid successful read; an
+explicitly empty read counts. Contacts alone cannot unlock a first brief in either hosting mode.
+A quiet newly paired self-host Mac gets a consent-aware collection
+on the existing heartbeat, with at most one in flight. A collection that leaves setup unready waits
+twice as long before the next, from 1 minute up to 60 minutes, and a change in source health or
+consent starts over at once, including re-enabling a source between heartbeats when its health label
+is unchanged. Until then the setup page says the Mac is linked but not yet read. Re-enabling a source requires a read started
+after the server accepted restored consent. A healthy probe does not make an older extraction fresh.
+Quitting the Mac app or changing its connection stops its owned engine and pending requests together.
+The engine is stopped from starting another request before its downloads are terminated; unrelated
+processes are left running.
+Before a self-hosted installation has its first accepted brief, scheduled preparation and
+composition also wait for a context source and linked delivery channel. A Bridge wake during
+that wait retains its context in the existing snapshot without composing. Google-only setup
+remains supported; after an accepted first brief, temporary source or messaging outages retain
+normal scheduled delivery and recovery. An already-composed scheduled request can also recover through this gate only when its exact completed work and invalidated outbox receipt prove it was not accepted; this does not unlock later fresh runs. Explicit manual requests keep their existing behavior.
 
 Background learning progressively reviews the last six weeks of direct iMessage, WhatsApp and
 Gmail exchanges, with per-source coverage receipts. Only durable cited facts enter the graph;
@@ -963,7 +1006,7 @@ release gate.
 
 ### Visual presentation
 
-Morning/evening briefs and focused meeting backgrounds default to four-photo galleries on iMessage; other channels, short updates and consent questions stay text. The shared renderer changes presentation only. After mandatory brief sections, the composer can use spare space in a readable four-card gallery to name quiet active obligations, ordered by deadline then age. It uses the same layout to check fit; the remaining items stay a count. The named details enter the canonical text before delivery attribution, so all channels and chase suppression agree. This does not make an item urgent. It makes no additional relevance or model call. Crowded briefs first redistribute complete paragraphs using measured height, preserving font size and source labels. Needs-you and today can share one card, leaving room for follow-ups on two. A brief with an action that still cannot fit stays text; uncertain multipart acceptance is held rather than blindly retried. See [visual briefs](VISUAL-BRIEFS.md).
+Morning/evening briefs and focused meeting backgrounds default to four-photo galleries on iMessage; other channels, short updates and consent questions stay text. The shared renderer changes presentation only. After mandatory brief sections, the composer can use spare space in a readable four-card gallery to name quiet active obligations, ordered by deadline then age. It uses the same layout to check fit; the remaining items stay a count. The named details enter the canonical text before delivery attribution, so all channels and chase suppression agree. This does not make an item urgent. It makes no additional relevance or model call. Crowded briefs first redistribute complete paragraphs using measured height, preserving font size and source labels. Needs-you and today can share one card, leaving room for follow-ups on two. A brief with an action that still cannot fit stays text; uncertain multipart acceptance is held rather than blindly retried. A content-free operation receipt can confirm late acceptance without sending again. Unknown galleries retain their recovery identity through expiry, source changes and exhausted retries; missing or corrupt receipts remain unknown. Interactive gallery recovery verifies the gateway-owned durable reply-obligation ID, original content and destination before reusing an accepted receipt. Identical text, a recent receipt, or a matching old manifest alone cannot confirm a newer obligation; ambiguous legacy sends remain held. Receipt lookup follows the existing capped outbox backoff. See [visual briefs](VISUAL-BRIEFS.md).
 
 ## Shared writing rule
 

@@ -64,6 +64,26 @@ def test_calendar_claim_cannot_be_rewritten_as_cancellation(isolated, monkeypatc
     assert notification.compose('event', bundle) == bundle['events'][0]['event']['text']
 
 
+def test_held_calendar_change_gets_a_short_detection_prefix(isolated, monkeypatch):
+    from zoneinfo import ZoneInfo
+    now = datetime(2026, 9, 25, 9, tzinfo=ZoneInfo('America/Los_Angeles'))
+    monkeypatch.setattr(notification, '_write', lambda *a: pytest.fail('detector claim reached writer'))
+    text = 'Acme on Fri, Sep 25 at 10:00 AM is no longer on your calendar.'
+    bundle = {'events': [{'class': 'calendar_change', 'event': {'source': 'calendar_change',
+        'change': 'removed', 'timestamp': '2026-09-25T14:00:00Z', 'text': text}}]}
+    assert notification.compose('event', bundle, now=now) == 'Noticed 7:00 AM today: ' + text
+
+
+def test_dated_ask_rules_reach_the_writer_once():
+    # _write appends relevance.md to SYSTEM; the writer-specific field stays here, the shared
+    # rules live only in the policy, so the combined prompt carries each rule exactly once.
+    policy = (notification.PACK / '_shared/references/relevance.md').read_text()
+    combined = notification.SYSTEM + '\n' + policy
+    assert 'source_timing' in notification.SYSTEM
+    for rule in ('automated reminder', 'Interpret "today" and "tomorrow"'):
+        assert combined.count(rule) == 1, rule
+
+
 @pytest.mark.parametrize('source', ['imessage', 'whatsapp'])
 def test_bridge_wall_time_does_not_turn_today_into_yesterday(isolated, monkeypatch, source):
     from zoneinfo import ZoneInfo

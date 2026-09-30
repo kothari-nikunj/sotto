@@ -15,14 +15,15 @@ meeting notes — and turns it into a few moments a day that actually matter:
 - **Ask it anything, in chat:** *"prep me for my 2pm"* · *"what am I waiting on?"* · *"draft a reply
   to Sarah"* · *"find 30 min with Alex next week"* · *"who am I losing touch with?"*
 
-Two principles, everywhere: **Sotto drafts; you decide.** It can send an explicitly approved message when the relevant
+For **self-hosted** use, two principles: **Sotto drafts; you decide.** It can send an explicitly approved message when the relevant
 connection and send permission are enabled. It never treats a drafted suggestion as approval. And
-**it runs on YOUR infrastructure** — your Railway container, your API key, your Mac. There is no
-Sotto server and no Sotto account: nothing phones home to us, because there is no us to phone.
-And the memory it builds — the people, the open loops, your voice — is markdown and JSON on a
-volume you own: readable, movable, deletable, never trapped in someone's cloud.
+**self-hosted Sotto runs on YOUR infrastructure** — your Railway container, your API key, your Mac.
+That path has no Sotto account or Sotto-operated runtime; its memory — the people, the open loops,
+your voice — is markdown and JSON on a volume you own: readable, movable, and deletable. Sotto Cloud
+is a separate, invite-only hosted service; its infrastructure and providers process data under the
+boundaries described in [docs/DATA-FLOW.md](docs/DATA-FLOW.md).
 
-**What that does *not* mean.** Your data still passes through the infrastructure and the model
+**For self-hosted deployments:** your data still passes through the infrastructure and the model
 provider *you* configure. To write a brief, Sotto sends the gathered material — including the text
 of your messages, emails, notes and calendar events — to your chosen LLM provider, and it is
 processed on that provider's servers under their terms. Self-hosted means **no third party of
@@ -59,16 +60,18 @@ catches up quietly — old messages go to the digest, never a barrage of stale p
 About **35 minutes** the first time — only ~15 of it active; the rest is waiting on builds. Full
 walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. The shape:
 
-1. **Deploy the agent** on Railway from your own copy of this repo — four settings and three
-   variables, all listed in [ONBOARDING.md § 1](ONBOARDING.md) (a
-   [Gemini API key](https://aistudio.google.com/apikey) covers model calls, plus a
-   [@BotFather](https://t.me/BotFather) bot token, a `/data` volume and a public domain). *One-click
-   Deploy is in there too — same result, two prompts.* *Telegram and Gemini are the **defaults**, not
-   requirements. WhatsApp, iMessage and other models have their own setup requirements:*
-   **[Choosing your channel and model](CHANNELS.md)**.
+Want an AI coding agent to guide setup? Open this public repository in Codex or Claude Code and use
+[`docs/AGENT-ONBOARDING.md`](docs/AGENT-ONBOARDING.md). It branches between your own Railway
+self-host and an invited Sotto Cloud account, keeps credentials out of chat, and makes consent,
+permissions, and delivery checks explicit. Invited Cloud users do not need Railway credentials.
+
+1. **Deploy the agent** on Railway from your own copy of this repo, following
+   [ONBOARDING.md § 1](ONBOARDING.md). The primary assisted self-host route uses your own Photon
+   connection and Gemini API key, a `/data` volume and a public domain. Telegram is an alternative;
+   each channel has its own setup requirements in **[Choosing your channel and model](CHANNELS.md)**.
    **For iMessage, [follow the Photon self-host setup](CHANNELS.md#photon-imessage-and-photo-briefs)**
-   using your own provider connection. It ships in this public runtime; the Telegram template does
-   not allocate an iMessage number. The Mac Bridge is independent of the delivery channel.
+   using your own provider connection. It ships in this public runtime; Railway does not allocate an
+   iMessage number. The Mac Bridge is independent of the delivery channel.
 2. **Connect your sources; add your Mac if wanted** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
    drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
    click from the `/setup` page it opens. First run asks for an **access code** — the distributed Bridge binary's first-run access is invite-only for now (self-host deployment
@@ -147,6 +150,7 @@ local material, and the escape hatch) plus how to add a service:
 | Doc | What |
 |---|---|
 | **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
+| [docs/AGENT-ONBOARDING.md](docs/AGENT-ONBOARDING.md) | Agent-guided setup for self-hosting or invited Sotto Cloud users |
 | [adapters/hermes/RECOVERY.md](adapters/hermes/RECOVERY.md) | Managed volume migration, model lease continuity, scoped device access and offline tenant restore |
 | [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
 | [docs/DATA-FLOW.md](docs/DATA-FLOW.md) | **Where your data goes** — every destination, every file written, how long each stays, and the gaps stated plainly. Read this before installing |

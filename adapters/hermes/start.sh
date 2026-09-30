@@ -76,10 +76,10 @@ if [ ! -d "$HSTATE" ]; then
   cp -a /root/.hermes/. "$HSTATE/" 2>/dev/null || true          # first boot: seed everything from image
   cp -a --remove-destination /app/hermes-image-version.txt "$HSTATE/.image-version" 2>/dev/null || true
 fi
-mkdir -p "$HSTATE/skills" "$HSTATE/skill-bundles"
-rm -rf "$HSTATE/skills/sotto" 2>/dev/null || true                # always refresh skills from the image
-cp -a /root/.hermes/skills/sotto "$HSTATE/skills/" 2>/dev/null || true
-cp -a --remove-destination /root/.hermes/skill-bundles/sotto.yaml "$HSTATE/skill-bundles/" 2>/dev/null || true
+# /root/.hermes becomes a symlink to this volume later in boot, and Railway can
+# restart the same container filesystem. Always seed from immutable /app copies.
+python3 /app/adapters/hermes/sync_sotto_skills.py "$HSTATE" \
+  /app/sotto-skills /app/adapters/hermes/sotto.bundle.yaml
 # Hermes runtime upgrade (opt-in): the volume's ~/.hermes copy is seeded ONCE, so if the installer
 # keeps any runtime under ~/.hermes, a rebuilt image with newer Hermes can be shadowed by the stale
 # volume copy. SOTTO_REFRESH_HERMES=1 re-seeds every INSTALLER-owned top-level entry (from the
@@ -115,12 +115,6 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" != "managed" ] && [ -f "$HSTATE/SOUL.
   printf '\n' >> "$HSTATE/SOUL.md"
   cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> "$HSTATE/SOUL.md"
 fi
-if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-  test -s "$HSTATE/skills/sotto/_shared/scripts/compose_brief.py" \
-    && diff -qr /root/.hermes/skills/sotto "$HSTATE/skills/sotto" >/dev/null \
-    && cmp -s /root/.hermes/skill-bundles/sotto.yaml "$HSTATE/skill-bundles/sotto.yaml" \
-    || { echo "[sotto] managed skill initialization failed" >&2; exit 1; }
-fi
 rm -rf /root/.hermes && ln -s "$HSTATE" /root/.hermes            # ~/.hermes → volume (sessions persist)
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   rm -rf /home/sotto/.hermes
@@ -136,6 +130,10 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   # Hermes' own home setup chmods the active home to 0700. Run boot-time CLI
   # calls as the workload UID so they cannot undo the supervisor's boundary.
   hermes() { run_as_sotto env HOME=/home/sotto HERMES_HOME="$HSTATE" /usr/local/bin/hermes "$@"; }
+else
+  # This image is a dedicated Sotto self-host runtime. Shared Hermes installs
+  # opt into the same setting only with install.sh --dedicated.
+  python3 /app/adapters/hermes/quiet_first_contact.py "$HSTATE/config.yaml"
 fi
 run_as_sotto() {
   env -u SOTTO_CONTROL_TOKEN -u BRIDGE_TOKEN -u PHOTON_PROJECT_SECRET \
@@ -151,16 +149,23 @@ runtime_python() {
   fi
 }
 
-# Version visibility: every boot log states the Hermes actually RUNNING vs the one this image was
-# built with. If they differ, the volume seed is shadowing a newer image — SOTTO_REFRESH_HERMES=1
-# adopts it (see above). This line is the first thing to check when "is my Hermes current?" comes up.
-IMG_HVER="$(cat /app/hermes-image-version.txt 2>/dev/null | head -1 || echo unknown)"
-RUN_HVER="$( { hermes --version 2>/dev/null || hermes version 2>/dev/null || echo unknown; } | head -1)"
+# Hermes' CLI includes the current upstream HEAD in --version. That remote hash
+# can move between image build and boot while the installed checkout stays pinned.
+# Remove only that volatile field from the displayed versions. The executable
+# points into /usr/local/lib/hermes-agent, not the /data home seed; compare its
+# actual Git HEAD with the image pin for provenance instead of blaming the volume.
+stable_hermes_version() {
+  sed -E 's/[[:space:]]*·[[:space:]]*upstream[[:space:]]+[[:xdigit:]]+//g'
+}
+IMG_HVER="$(head -1 /app/hermes-image-version.txt 2>/dev/null | stable_hermes_version || echo unknown)"
+RUN_HVER="$( { hermes --version 2>/dev/null || hermes version 2>/dev/null || echo unknown; } | head -1 | stable_hermes_version)"
+IMG_HCOMMIT="$(cat /app/hermes-image-commit.txt 2>/dev/null || true)"
+RUN_HCOMMIT="$(git -C /usr/local/lib/hermes-agent rev-parse HEAD 2>/dev/null || true)"
 echo "[sotto] hermes running: ${RUN_HVER:-unknown} | image built with: ${IMG_HVER:-unknown}"
 if ! hermes send --help 2>&1 | grep -q -- '--json'; then
   echo "[sotto] FATAL: this Hermes cannot return structured provider send receipts (--json missing)." >&2
   echo "[sotto] Refusing to start: a plain-send fallback could duplicate delivery on retry." >&2
-  echo "[sotto] Set SOTTO_REFRESH_HERMES=1 for one redeploy to adopt the pinned image runtime." >&2
+  echo "[sotto] Inspect the deployed image and its pinned Hermes checkout; /data refresh cannot replace installed code." >&2
   exit 1
 fi
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
@@ -174,17 +179,28 @@ fi
 if ! python3 /app/adapters/hermes/provider_error_compat.py \
      /usr/local/lib/hermes-agent/gateway/run.py; then
   echo "[sotto] Refusing to start: chat would show raw provider error payloads." >&2
-  echo "[sotto] Set SOTTO_REFRESH_HERMES=1 for one redeploy to adopt the pinned image runtime." >&2
+  echo "[sotto] Inspect the deployed image and its pinned Hermes checkout; /data refresh cannot replace installed code." >&2
   exit 1
 fi
-if [ -n "$RUN_HVER" ] && [ -n "$IMG_HVER" ] && [ "$RUN_HVER" != "unknown" ] && \
-   [ "$IMG_HVER" != "unknown" ] && [ "$RUN_HVER" != "$IMG_HVER" ]; then
-  echo "[sotto] WARNING: running Hermes differs from this image's — the volume seed is stale."
-  echo "[sotto]          Set SOTTO_REFRESH_HERMES=1 and redeploy once to adopt the image's Hermes."
+if ! python3 /app/adapters/hermes/first_contact_compat.py \
+     /usr/local/lib/hermes-agent/gateway/run_turn.py; then
+  echo "[sotto] Refusing to start: the reviewed first-contact gateway pin changed." >&2
+  exit 1
 fi
-# Same two strings, where the Integrations page can read them: the boot log is the right place to
-# check "is my Hermes current?" from a terminal, and $SOTTO_DATA/cache/hermes-version.json is the
-# right place to check it from the browser. Rewritten every boot, read by nothing else, never state.
+if ! python3 /app/adapters/hermes/gallery_obligation_compat.py \
+     /usr/local/lib/hermes-agent/gateway/platforms/base.py || \
+   ! python3 /app/adapters/hermes/gallery_obligation_compat.py \
+     /usr/local/lib/hermes-agent/gateway/run_startup.py; then
+  echo "[sotto] Refusing to start: gallery recovery obligation identity is unavailable." >&2
+  exit 1
+fi
+if [ -z "$RUN_HCOMMIT" ] || [ -z "$IMG_HCOMMIT" ]; then
+  echo "[sotto] WARNING: installed Hermes checkout provenance could not be verified." >&2
+elif [ "$RUN_HCOMMIT" != "$IMG_HCOMMIT" ]; then
+  echo "[sotto] WARNING: installed Hermes checkout differs from the image pin." >&2
+fi
+# Same stable version strings are shown on the Integrations page. The boot log
+# above carries the authoritative installed-checkout provenance check.
 # (Quotes/backslashes stripped so the hand-built JSON can't be broken by a version string.)
 if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   run_as_sotto mkdir -p "${SOTTO_DATA:-/data}/cache" 2>/dev/null || true
@@ -344,7 +360,7 @@ if [ -n "${BRIDGE_TOKEN:-}" ]; then
   # --derive-mcp: Hermes is handed HMAC(root, "sotto-mcp"), never the root — the agent talks to
   # prompt-injectable content, and with only the derived bearer it cannot act as the Bridge.
   runtime_python /app/adapters/hermes/configure_mcp.py --url "http://127.0.0.1:${PORT:-8787}/mcp" \
-    --token "$BRIDGE_TOKEN" --derive-mcp --config "$HOME/.hermes/config.yaml"
+    --token="$BRIDGE_TOKEN" --derive-mcp --config "$HOME/.hermes/config.yaml"
   echo "[sotto] sotto-local → reverse relay (tunnel-free); the Mac dials out to /bridge/poll."
 fi
 
@@ -682,64 +698,38 @@ if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
   chown -h sotto:sotto "$HSTATE/config.yaml" "$HSTATE/.env"
 fi
 
-# 3.7) Google Workspace auth — DETERMINISTIC + headless. Doing this through the agent breaks: every
-#      `--auth-url` mints a NEW PKCE verifier, so a re-run invalidates a code you got from an earlier URL
-#      ("Invalid code verifier"). Here `--auth-url` runs at most ONCE (guarded by the pending file), and
-#      `--auth-code` runs once against that same persisted verifier. Set GOOGLE_OAUTH_CLIENT_JSON (the
-#      Desktop OAuth client JSON contents) in Railway; authorize at /google/auth; set GOOGLE_AUTH_CODE and
-#      redeploy. Token persists on /data and auto-refreshes.
+# 3.7) Google Workspace auth. The wizard's uploaded client on the volume wins over an old
+#      GOOGLE_OAUTH_CLIENT_JSON Railway variable. Boot may seed that variable on first use, but a
+#      browser session starts only from the authenticated receiver, which binds
+#      the PKCE state to that browser. Boot never creates an authorization URL.
 GAUTH_URL_FILE="${SOTTO_DATA:-/data}/google-auth-url.txt"
-if [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
-  # Same search bases as receiver._google_setup_py — keep the two in step. (/root/.hermes is not
-  # listed: HOME is /root in this image, so "$HOME/.hermes" already covers it.)
-  GSETUP_PY=$(find "$HOME/.hermes" /usr/local/lib/hermes-agent -path '*google-workspace/scripts/setup.py' 2>/dev/null | head -1)
-  if [ "${SOTTO_DEPLOYMENT_MODE:-}" = managed ]; then
-    GSETUP_PY=/app/adapters/hermes/google_setup.py
-  fi
+CS="$HOME/.hermes/google_client_secret.json"
+# This file was published by the old headless flow. A URL in it is not bound
+# to the current browser and must never be offered after a restart.
+rm -f "$GAUTH_URL_FILE" 2>/dev/null || true
+if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
+  # Managed workloads receive Google through their own pairing path, not this page.
+  :
+elif [ -s "$CS" ] || [ -s "$HOME/.hermes/google_token.json" ] || [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
+  # Same Sotto CLI as receiver._google_setup_py.
+  GSETUP_PY=/app/adapters/hermes/google_setup.py
   PYBIN=$(command -v python || command -v python3)
-  if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-    PYBIN=runtime_python
-  fi
-  if [ -z "$GSETUP_PY" ]; then
-    echo "[sotto] Google: setup.py not found (google-workspace skill missing?) — skipping."
+  if [ ! -f "$GSETUP_PY" ]; then
+    echo "[sotto] Google: connection helper missing — skipping."
   elif "$PYBIN" "$GSETUP_PY" --check >/dev/null 2>&1; then
     echo "[sotto] Google: already connected ✓"
     rm -f "$GAUTH_URL_FILE" 2>/dev/null || true
   else
-    CS="$HOME/.hermes/google_client_secret.json"
-    if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-      printf '%s' "$GOOGLE_OAUTH_CLIENT_JSON" | run_as_sotto tee "$CS" >/dev/null
-    else
+    if [ ! -s "$CS" ] && [ -n "${GOOGLE_OAUTH_CLIENT_JSON:-}" ]; then
       printf '%s' "$GOOGLE_OAUTH_CLIENT_JSON" > "$CS"
+      "$PYBIN" "$GSETUP_PY" --client-secret "$CS" >/dev/null 2>&1 || true
     fi
-    "$PYBIN" "$GSETUP_PY" --client-secret "$CS" >/dev/null 2>&1 || true
+    # The pre-browser GOOGLE_AUTH_CODE redeploy path is gone: its pending files carry no
+    # client or browser binding, so a Railway variable can never complete consent.
     if [ -n "${GOOGLE_AUTH_CODE:-}" ]; then
-      echo "[sotto] Google: exchanging auth code…"
-      if "$PYBIN" "$GSETUP_PY" --auth-code "$GOOGLE_AUTH_CODE" --format json; then
-        echo "[sotto] Google: connected ✓  (now clear GOOGLE_AUTH_CODE from Railway)"
-        rm -f "$GAUTH_URL_FILE" 2>/dev/null || true
-      else
-        echo "[sotto] Google: code exchange FAILED — unset GOOGLE_AUTH_CODE, redeploy for a fresh URL, retry."
-      fi
-    else
-      # No code yet. Generate the URL ONCE (only if there's no pending verifier), else reuse it.
-      if [ ! -f "$HOME/.hermes/google_oauth_pending.json" ]; then
-        echo "[sotto] Google: generating auth URL (one time)…"
-        "$PYBIN" "$GSETUP_PY" --auth-url --services email,calendar --format json || true
-      fi
-      if [ -f "$HOME/.hermes/google_oauth_last_url.txt" ]; then
-        if [ "${SOTTO_DEPLOYMENT_MODE:-self-host}" = "managed" ]; then
-          run_as_sotto cp "$HOME/.hermes/google_oauth_last_url.txt" "$GAUTH_URL_FILE" 2>/dev/null || true
-        else
-          cp "$HOME/.hermes/google_oauth_last_url.txt" "$GAUTH_URL_FILE" 2>/dev/null || true
-        fi
-      fi
-      if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
-        GQS="$(setup_qs)"
-        echo "[sotto] ➜ Authorize Google: https://${RAILWAY_PUBLIC_DOMAIN}/google/auth${GQS}"
-        [ -n "$GQS" ] || echo "[sotto]   (if that says Forbidden, open the [sotto] Setup link from these logs first)"
-      fi
+      echo "[sotto] Google: GOOGLE_AUTH_CODE is no longer used — remove it from Railway and connect from /setup."
     fi
+    echo "[sotto] Google: finish connecting on your Sotto setup page."
   fi
 fi
 
@@ -792,8 +782,8 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_ALLOWED_USERS:-}" ]; the
     echo "[sotto]   hand your briefs to whoever finds the bot first. Set SOTTO_SETUP_CODE, redeploy."
   else
     echo "[sotto] telegram: linking your chat — tap the link below (nothing to paste back)."
-    TG_ID="$(python3 /app/trigger-receiver/telegram_link.py --token "$TELEGRAM_BOT_TOKEN" \
-      --phrase "$TG_PHRASE" --boot || true)"
+    TG_ID="$(python3 /app/trigger-receiver/telegram_link.py --token="$TELEGRAM_BOT_TOKEN" \
+      --phrase="$TG_PHRASE" --boot || true)"
     if [ -n "$TG_ID" ]; then
       upsert_env TELEGRAM_ALLOWED_USERS "$TG_ID"
       upsert_env TELEGRAM_HOME_CHANNEL "$TG_ID"

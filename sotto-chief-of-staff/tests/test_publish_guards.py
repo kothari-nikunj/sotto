@@ -489,6 +489,18 @@ def test_every_doc_the_readme_links_actually_ships():
         assert not missing, (
             f"README links these, but the generator never copies them: {missing}\n"
             "Add each to tools/prepare-public-repo.sh's copy list.")
+        preset = os.path.join(target, "deploy", "railway-photon-preset.json")
+        validator = os.path.join(target, "tools", "verify_railway_photon_preset.py")
+        assert os.path.isfile(preset), "RAILWAY.md links a preset missing from the distribution"
+        assert os.path.isfile(validator), "the public Photon preset has no shipped validator"
+        setup_helper = os.path.join(target, "tools", "setup_selfhost_railway.py")
+        setup_test = os.path.join(target, "tools", "test_setup_selfhost_railway.py")
+        assert os.path.isfile(setup_helper), "the agent setup guide links an unshipped Railway helper"
+        assert os.path.isfile(setup_test), "the public helper has no shipped offline contract tests"
+        assert os.path.isfile(os.path.join(target, "AGENTS.md")), "agent entrypoint instructions are missing"
+        assert os.path.isfile(os.path.join(target, "docs", "AGENT-ONBOARDING.md")), "agent setup playbook is missing"
+        checked = subprocess.run(["python3", validator], capture_output=True, text=True)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
     finally:
         shutil.rmtree(target, ignore_errors=True)
 
