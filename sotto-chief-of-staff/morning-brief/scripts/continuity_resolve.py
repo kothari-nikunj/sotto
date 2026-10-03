@@ -28,6 +28,7 @@ import yaml
 # wizard settings) and ledger_io's frontmatter loader — one parser for all three ledger readers.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
+import jsonstore  # noqa: E402
 import ledger_io  # noqa: E402
 import log_outcome  # noqa: E402
 from brief_validate import is_name_shaped  # noqa: E402  (one owner for "is this a person's name")
@@ -38,6 +39,8 @@ TERMINAL_RETENTION_DAYS = 30          # continuity.rs:13
 DEADLINE_GRACE_DAYS = 2              # legacy undated meeting-shadow retirement grace
 CHASE_AFTER_DAYS = 3                 # default for SOTTO_CHASE_AFTER_DAYS (deadline-less waiting_ons)
 CHASE_MAX = ledger_io.CHASE_MAX      # after two chases, stop nudging and hand it to sotto-loops
+# A loop-update quote shorter than this is a fragment, not evidence ("T", "done", "sent").
+MIN_EVIDENCE_QUOTE_CHARS = 12
 # The direction eligible for reminder chases — defined once in ledger_io so the resolver,
 # loops_query and retune_scan cannot disagree about which way an obligation points.
 is_waiting_on = ledger_io.is_waiting_on
@@ -109,6 +112,16 @@ def normalize_channel(ch: str) -> str:
     return ch
 
 
+def _observed_group_id(message: dict, source: str) -> str:
+    """A chat GUID exists for one-to-one iMessage too; it proves a group only with group metadata."""
+    if source == "email":
+        return ""
+    handle = _s(message.get("handle") or message.get("contact_jid"))
+    if message.get("is_group_chat") or handle.endswith("@g.us"):
+        return _s(message.get("chat_guid")) or handle
+    return ""
+
+
 # The spelling normalizer lives in ledger_io so the writer and every read view classify a
 # `Waiting-On ` exactly the same way (one concept, one implementation).
 _normalize_action_type = ledger_io.normalize_action_type
@@ -147,15 +160,17 @@ def _normalize_name_for_dedup(name: str) -> str:
 
 
 def _normalize_identifier_for_anchor(value: str):
-    # continuity.rs:257-270 — email lowercased; phone → last 10 digits; else lowercased.
+    # Phone punctuation may be stripped, but an opaque platform id containing digits is not a
+    # phone. In particular, stripping iMessage group GUIDs invented a different counterpart.
     trimmed = (value or "").strip()
     if not trimmed:
         return None
     if "@" in trimmed:
         return trimmed.lower()
-    digits = re.sub(r"\D", "", trimmed)
-    if len(digits) >= 10:
-        return digits[-10:]
+    if re.fullmatch(r"\+?[\d\s().-]+", trimmed):
+        digits = re.sub(r"\D", "", trimmed)
+        if len(digits) >= 10:
+            return digits[-10:]
     return trimmed.lower()
 
 
@@ -240,11 +255,23 @@ def _same_counterpart(a: dict, b: dict) -> bool:
     return _counterpart_key(a) == _counterpart_key(b)
 
 
+def _same_verified_counterpart(a: dict, b: dict) -> bool:
+    """An explicit loopId may target a row only through a verified counterpart identity.
+
+    A shared display name is too weak to let a model-supplied ID rewrite another obligation.
+    Task identity is still the loop ID, origin, or source reference; this only checks the person
+    or group boundary around it.
+    """
+    anchor = contact_anchor(a.get("canonical_id"), a.get("contact_identifier"),
+                            a.get("contact_name", ""), a.get("group_id"))
+    return _is_strong_anchor(anchor) and _same_counterpart(a, b)
+
+
 def _obligation_key(a: dict, items: dict, origin_key: str = "") -> str:
     named = _s(a.get("loop_id"))
     if named:
         row = items.get(named)
-        if row and _same_counterpart(a, row):
+        if row and _same_verified_counterpart(a, row):
             return named
     base = compute_anchor_key(a)
     if origin_key:
@@ -291,6 +318,32 @@ def _prior_anchor_keys(a: dict) -> set:
     if tid and not _s(a.get("group_id")).strip():
         keys.add(_thread_key(a, tid))
     return keys
+
+
+def _legacy_group_phone_keys(a: dict, group_index: dict) -> set:
+    """Exact anchors the old digit-stripping rule minted from a verified opaque group ID.
+
+    Never apply this provenance exception to a real phone or an unverified model identifier.
+    Task-specific/custom keys are intentionally absent.
+    """
+    identifier = _s(a.get("contact_identifier")).strip()
+    if not identifier or _s(a.get("group_id")).strip() or not _render_local:
+        return set()
+    group_key = _render_local.group_id_key(identifier)
+    if (group_key not in (group_index.get("by_id") or {})
+            and group_key not in group_index.get("known_ledger_ids", set())):
+        return set()
+    digits = re.sub(r"\D", "", identifier)
+    if "@" in identifier or len(digits) < 10:
+        return set()
+    old_phone = digits[-10:]
+    if _normalize_identifier_for_anchor(identifier) == old_phone:
+        return set()
+    channel = normalize_channel(a.get("channel", ""))
+    families = (action_family(a.get("action_type", "")),
+                _normalize_action_type(a.get("action_type")))
+    return {f"{fam}:id:{old_phone}" for fam in families} | {
+        f"{channel}:{fam}:id:{old_phone}" for fam in families}
 
 
 # ── Is this a DEBT? (the ledger's one entry gate) ─────────────────────────────
@@ -439,20 +492,28 @@ def canonicalize_counterpart(a: dict, group_index: dict, person_index: dict | No
 
 def _canonicalize_group(a: dict, group_index: dict) -> dict:
     """A group ask is owed by the GROUP, whose identity is its platform id — iMessage's chat_guid,
-    WhatsApp's `…@g.us` JID — and whose name is only a label. An id the action carries counts ONLY
-    when this snapshot actually contains it (source-verified, never model-asserted); a group ask
-    with no id at all falls back to matching the label the renderer showed. Either way the action
-    comes back carrying `group_id` and the group's own name."""
-    if not (group_index and _render_local):
+    WhatsApp's `…@g.us` JID — and whose name is only a label. A snapshot can verify a copied id;
+    an exact contact identifier or thread id can also match a previously tracked group when the
+    local read is empty. A model-supplied groupId alone cannot make that match."""
+    if not _render_local:
         return a
-    by_id = group_index.get("by_id") or {}
+    by_id = (group_index or {}).get("by_id") or {}
     for candidate in (a.get("group_id"), a.get("contact_identifier"), a.get("source_thread_id")):
-        hit = by_id.get(_render_local.group_id_key(_s(candidate)))
+        key = _render_local.group_id_key(_s(candidate))
+        hit = by_id.get(key)
         if hit:
             channel, label = hit
-            return {**a, "group_id": _render_local.group_id_key(_s(candidate)),
+            return {**a, "group_id": key,
                     "channel": a.get("channel") or channel,
                     "contact_name": label or a.get("contact_name")}
+        # A previously verified ledger group remains identifiable when this run's local read is
+        # empty. The copied identifier must be the exact opaque ID, not a matching display label.
+        if (candidate == a.get("contact_identifier") and key
+                and key in (group_index or {}).get("known_ledger_ids", set())):
+            return {**a, "group_id": key}
+    # An unverified model groupId cannot redirect a loop. The identifier is retained below as an
+    # opaque id, so a GUID never falls through to a fabricated phone anchor.
+    a = {**a, "group_id": None}
     if _s(a.get("contact_identifier")).strip():
         return a                       # a 1:1 ask already has a person identifier — not a group
     hit = (group_index.get("by_label") or {}).get(
@@ -479,7 +540,14 @@ def _digits(s: str) -> str:
     return "".join(c for c in (s or "") if c.isdigit())
 
 
+_PHONE_HANDLE = re.compile(r"\+?[0-9\s().-]+\Z")
+_WHATSAPP_PHONE_JID = re.compile(r"([0-9]+)@(s\.whatsapp\.net|c\.us)\Z", re.I)
+
+
 def _phone_matches(a: str, b: str) -> bool:
+    if not (_PHONE_HANDLE.fullmatch((a or "").strip())
+            and _PHONE_HANDLE.fullmatch((b or "").strip())):
+        return False
     da, db = _digits(a), _digits(b)
     if len(da) < 7 or len(db) < 7:
         return False
@@ -491,11 +559,14 @@ def _handle_matches(handle: str, ident: str) -> bool:
         return True
     if "@" in handle and "@" in ident:
         return handle.lower() == ident.lower()
+    if "@" in handle or "@" in ident:
+        return False
     return _phone_matches(handle, ident)
 
 
 def _jid_matches_phone(jid: str, phone: str) -> bool:
-    return _phone_matches((jid or "").split("@")[0], phone)
+    match = _WHATSAPP_PHONE_JID.fullmatch((jid or "").strip())
+    return bool(match and _phone_matches(match.group(1), phone))
 
 
 def _collect_all_identifiers(primary: str, contact_name: str, local: dict) -> list:
@@ -506,6 +577,62 @@ def _collect_all_identifiers(primary: str, contact_name: str, local: dict) -> li
         if primary and any(_handle_matches(primary, _s(value)) for value in values):
             ids.extend(_s(value) for value in values if value)
     return list(dict.fromkeys(ids))
+
+
+def _verified_identifiers(row: dict, local: dict, person_index: dict) -> list:
+    """Use only aliases linked to the row's primary identifier in Contacts or the person graph.
+
+    The graph's name index may be useful for display and anchoring, but a shared name cannot
+    authenticate evidence from a different address or phone number.
+    """
+    primary = _s(row.get("contact_identifier")).strip()
+    ids = _collect_all_identifiers(primary, "", local)
+    if not (primary and person_index and _kg):
+        return ids
+    index = person_index.get("index") or {}
+    key = _kg.normalize_identifier(primary)
+    path = (index.get("by_identifier") or {}).get(key)
+    if not path:
+        return ids
+    cid = _s(row.get("canonical_id"))
+    if cid and os.path.realpath(_s((index.get("by_cid") or {}).get(cid))) != os.path.realpath(path):
+        return ids
+    real_path = os.path.realpath(path)
+    for alias, owner in (index.get("by_identifier") or {}).items():
+        if os.path.realpath(owner) == real_path:
+            ids.append(alias)
+    return list(dict.fromkeys(ids))
+
+
+def _group_email_matches(group_id: str, handles: list, local: dict,
+                         person_index: dict) -> bool:
+    """An email pays a group obligation only when it is addressed to the group's whole roster.
+
+    The roster is the `group_participants` list the group's own source messages carry, never an
+    action's label, model text or the senders seen so far. Every participant must reach a
+    recipient through an exact verified alias; mail to one member is that member's conversation.
+    """
+    if not (_render_local and group_id):
+        return False
+    wanted = _render_local.group_id_key(group_id)
+    participants = set()
+    for field in ("imessage", "whatsapp"):
+        for message in local.get(field) or []:
+            observed = _observed_group_id(message, field)
+            if observed and _render_local.group_id_key(observed) == wanted:
+                participants.update(value for value in (message.get("group_participants") or [])
+                                    if isinstance(value, str) and value.strip())
+    if not participants:
+        return False
+    recipients = {handle.lower() for handle in handles}
+    for participant in participants:
+        if not (re.fullmatch(r"\+?[\d\s().-]{7,}", participant)
+                or ("@" in participant and not participant.lower().endswith("@g.us"))):
+            return False  # A display name or opaque id cannot be verified as a recipient.
+        aliases = _verified_identifiers({"contact_identifier": participant}, local, person_index)
+        if not any(alias.lower() in recipients for alias in aliases if "@" in alias):
+            return False
+    return True
 
 
 def _is_sent_email(m: dict) -> bool:
@@ -618,11 +745,15 @@ def _observed_action_source(action: dict, local: dict,
                     observed = parsedate_to_datetime(_s(timestamp))
                 except (TypeError, ValueError, OverflowError):
                     observed = None
-            text = _s(message.get("body") or message.get("text") or message.get("snippet"))
+            from source_context import email_evidence_text, email_quote_found
+            text = (email_evidence_text(message) if source == "email" else
+                    _s(message.get("body") or message.get("text") or message.get("snippet")))
             if (observed is None or not _is_answer(text)
                     or _message_is_after(timestamp, observed_before)):
                 continue
-            if quote and quote not in " ".join(text.split()):
+            # Email: the quote must sit inside one verbatim part, never across the joining label.
+            if quote and not (email_quote_found(message, quote) if source == "email" else
+                              quote in " ".join(text.split())):
                 continue
             if source == "email":
                 outgoing = _is_sent_email(message)
@@ -631,14 +762,15 @@ def _observed_action_source(action: dict, local: dict,
                 group = ""
             else:
                 handles = [_s(message.get("handle") or message.get("contact_jid"))]
-                group = _s(message.get("chat_guid")) or (handles[0] if handles[0].endswith("@g.us") else "")
+                group = _observed_group_id(message, source)
             if action.get("group_id"):
                 matches = bool(_render_local and group and
                     _render_local.group_id_key(group) == _render_local.group_id_key(action["group_id"]))
             else:
                 matches = not (group or message.get("is_group_chat")) and any(
-                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
-                    for handle in handles for ident in identifiers)
+                    (handle.lower() == ident.lower() if source == "email" else
+                     _handle_matches(handle, ident) or _jid_matches_phone(handle, ident))
+                    for handle in handles for ident in identifiers if source != "email" or "@" in ident)
             if matches:
                 found = _to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S")
                 break
@@ -649,131 +781,120 @@ def _observed_action_source(action: dict, local: dict,
     return tuple(sorted(set(bound))), min(observed_times)
 
 
-# Captured promises name concrete deliverables. The model still proposes completion, but a
-# counterpart's unrelated reply (or a cherry-picked phrase inside a negation) cannot prove it.
-_COMPLETION_FILLER = frozenset("a an the to of and for with on in at from by as into "
-    "i we you he she they me us him her them my our your his their its it this that "
-    "please complete finish make do get have has had will would can could "
-    "should commit committed promise promised need needs".split())
-_FULFILLMENT_CUE = re.compile(
-    r"\b(?:sent|shared|forwarded|provided|delivered|submitted|attached|uploaded|completed|"
-    r"finished|confirmed|updated|reviewed|signed|paid|booked|scheduled|introduced|enclosed)\b"
-    r"|\bhere(?:'s| is| are)\b", re.I)
-_UNFINISHED_CUE = re.compile(
-    r"\b(?:not|never|haven't|hasn't|hadn't|didn't|don't|doesn't|can't|cannot|couldn't|"
-    r"won't|wouldn't|isn't|aren't|wasn't|weren't|will|would|could|should|might|may|"
-    r"plan|planning|hope|hoping|intend|intending|pending|without|almost|nearly|thought|mistaken)\b|\b\w+'ll\b|\b(?:going|need|needs) to\b|\?", re.I)
-
-# The object alone is insufficient: reviewing a deck is not sending it. These conservative
-# action families accept affirmative evidence; unfamiliar wording waits for user correction.
-_CAPTURED_ACTIONS = (
-    (frozenset("send share forward provide deliver attach upload submit".split()),
-     re.compile(r"\b(?:sent|shared|forwarded|provided|delivered|attached|uploaded|submitted|enclosed)\b|\bhere(?:'s| is| are)\b", re.I)),
-    (frozenset("review read".split()), re.compile(r"\b(?:reviewed|read)\b", re.I)),
-    (frozenset("sign".split()), re.compile(r"\bsigned\b", re.I)),
-    (frozenset("pay".split()), re.compile(r"\bpaid\b", re.I)),
-    (frozenset("book schedule".split()), re.compile(r"\b(?:booked|scheduled|confirmed)\b", re.I)),
-    (frozenset("confirm".split()), re.compile(r"\bconfirmed\b", re.I)),
-    (frozenset("update".split()), re.compile(r"\bupdated\b", re.I)),
-    (frozenset("introduce".split()), re.compile(r"\bintroduced\b", re.I)),
-)
+def critic_review_receipt(update: dict) -> str:
+    """Public identifier of the exact proposal, not evidence that a review occurred."""
+    evidence = [{key: _s(ref.get(key)) for key in ("sourceType", "sourceId", "snippet")}
+                for ref in (update.get("evidence") or []) if isinstance(ref, dict)]
+    body = json.dumps(["sotto-critic-reviewed-v1", _s(update.get("loopId")),
+                       _s(update.get("loopVersion")), _s(update.get("status")), evidence],
+                      sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()[:32]
 
 
-def _captured_fulfillment(row: dict, quote: str, text: str) -> bool:
-    """Require the deliverable in an affirmative source clause; uncertain shorthand stays open.
+REVIEW_RECEIPTS_MAX = 512
+REVIEW_RECEIPTS_TTL = 14 * 86400
 
-    This is a conservative necessary check, not another semantic model. Existing proposal,
-    identity, direction, chronology and verbatim-source checks still apply. User corrections do
-    not go through this guard. Legacy captured rows without `ask` retain their summary fallback.
+
+def _review_path():
+    return os.path.join(_data_root(), "events", "loop-reviews.json")
+
+
+def record_critic_approval(update: dict) -> str:
+    """Persist a positive critic verdict before projection/Learn; no source text is retained.
+
+    The model-visible proposal hash alone is insufficient. This is an application provenance
+    check, not a security boundary against a process with write access to the data volume.
     """
-    def words(value):
-        return set(re.findall(r"[^\W_]+", _s(value).casefold()))
-
-    task = _s(row.get("ask")).strip()
-    if not task:
-        task = re.sub(r"^(?:you committed to:|.+? owes:)\s*", "", _s(row.get("summary")), flags=re.I)
-        task = re.split(r' \(from "| [—–] due ', task, maxsplit=1)[0]
-    people = words(row.get("contact_name")) | words(os.environ.get("SOTTO_USER_NAME", ""))
-    # Only action positions are verbs: "review" in "send the review deck" is an object qualifier.
-    action_words = set()
-    actions = []
-    for verbs, cue in _CAPTURED_ACTIONS:
-        matched = {verb for verb in verbs if re.search(
-            r"(?:^|\b(?:please|to|and|then)\s+)" + verb + r"\b", task, re.I)}
-        if matched:
-            action_words.update(matched)
-            actions.append(cue)
-    terms = words(task) - _COMPLETION_FILLER - people - action_words
-    if not terms or not terms <= words(quote):
-        return False
-    # Inspect the source sentence around the quote, not just the model's chosen substring:
-    # `sent the deck` inside `I haven't sent the deck` must remain an outstanding promise.
-    normalized = " ".join(text.replace("’", "'").split())
-    quoted = " ".join(quote.replace("’", "'").split())
-    start = normalized.find(quoted)
-    if start < 0:
-        return False
-    left = max(normalized.rfind(mark, 0, start) for mark in ('.', '!', '?')) + 1
-    end = start + len(quoted)
-    ends = [pos + 1 for mark in ('.', '!', '?')
-            if (pos := normalized.find(mark, end)) >= 0]
-    clause = normalized[left:min(ends) if ends else len(normalized)]
-    if _UNFINISHED_CUE.search(clause):
-        return False
-    return (all(cue.search(clause) for cue in actions) if actions
-            else bool(_FULFILLMENT_CUE.search(clause)))
+    ident = critic_review_receipt(update)
+    now = datetime.now(timezone.utc).timestamp()
+    with jsonstore.transaction(_review_path(), default={}, strict=True) as records:
+        fresh = {key: stamp for key, stamp in records.items()
+                 if isinstance(stamp, (int, float)) and 0 <= now - stamp < REVIEW_RECEIPTS_TTL}
+        fresh[ident] = now
+        records.clear()
+        records.update(sorted(fresh.items(), key=lambda item: item[1])[-REVIEW_RECEIPTS_MAX:])
+    return ident
 
 
-def _completion_evidence(row: dict, update: dict, local: dict):
+def _has_critic_approval(update: dict) -> bool:
+    ident = critic_review_receipt(update)
+    if _s(update.get("criticReceipt")) != ident:
+        return False
+    records = jsonstore.read(_review_path(), default={})
+    stamp = records.get(ident) if isinstance(records, dict) else None
+    return (isinstance(stamp, (int, float))
+            and 0 <= datetime.now(timezone.utc).timestamp() - stamp < REVIEW_RECEIPTS_TTL)
+
+
+def _completion_evidence_result(row: dict, update: dict, local: dict,
+                                person_index: dict | None = None):
     """Validate identity, direction, time and a verbatim quotation; the existing brief judges meaning.
 
     Raw text is data, never a request to change the ledger. An unsupported/missing proposal leaves
     the obligation open. One proposal names one row; meeting attendees and thread IDs alone prove
-    nothing. Local contact expansion requires the primary identifier to be present on that card.
+    nothing. Alias expansion requires the primary identifier on a contact card or graph person.
     """
-    primary = _s(row.get("contact_identifier"))
-    identifiers = _collect_all_identifiers(primary, "", local)
+    if person_index is None:
+        person_index = person_identity()
+    identifiers = _verified_identifiers(row, local, person_index)
     wanted_inbound = is_waiting_on(row.get("action_type"))
     refs = update.get("evidence")
     if not isinstance(refs, list) or not refs:
-        return None
+        return None, "malformed_shape"
+    # Code checks identity, direction, time and the quote; only the critic judges meaning, so a
+    # closure the critic did not review stays open (the brief projection and Learn both call this).
+    if (update.get("status") == "resolved"
+            and not _has_critic_approval(update)):
+        return None, "unreviewed_resolution"
     for evidence in refs:
         if not isinstance(evidence, dict):
-            return None
+            return None, "malformed_shape"
         source = normalize_channel(_s(evidence.get("sourceType")))
         field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp"}.get(source)
         quote = " ".join(_s(evidence.get("snippet")).split())
         source_id = _s(evidence.get("sourceId"))
         if not field or not source_id or not quote:
-            return None
+            return None, "malformed_shape"
+        if len(quote) < MIN_EVIDENCE_QUOTE_CHARS:
+            return None, "quote_too_short"
         found = None
+        reason = "missing_source"
         for message in local.get(field) or []:
             ids = {_s(message.get(k)) for k in ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
             if source != "email" and _render_local:
                 ids.add(_render_local.message_evidence_id(message, source))
             if source_id not in ids:
                 continue
+            reason = "direction_mismatch"
             outgoing = _is_sent_email(message) if source == "email" else bool(message.get("is_from_me"))
             if outgoing == wanted_inbound:
                 continue
+            reason = "time_mismatch"
             timestamp = message.get("date") or message.get("timestamp")
             if not _message_is_after(timestamp, _inbound_cutoff(row.get("created_at"))):
                 continue
-            text = _s(message.get("body") or message.get("text") or message.get("snippet"))
-            if quote not in " ".join(text.split()):
+            reason = "quote_mismatch"
+            from source_context import email_evidence_text, email_quote_found
+            text = (email_evidence_text(message) if source == "email" else
+                    _s(message.get("body") or message.get("text") or message.get("snippet")))
+            # Email: the quote must sit inside one verbatim part, never across the joining label.
+            if not (email_quote_found(message, quote) if source == "email" else
+                    quote in " ".join(text.split())):
                 continue
-            if (row.get("resolution_mode") == "source_grounded"
-                    and update.get("status") == "resolved"
-                    and not _captured_fulfillment(row, quote, text)):
-                continue
+            reason = "identity_mismatch"
             if source == "email":
                 handles = _email_recipients(message) if outgoing else [parseaddr(_s(message.get("from") or message.get("sender")))[1]]
                 group = ""
             else:
                 handles = [_s(message.get("handle") or message.get("contact_jid"))]
-                group = _s(message.get("chat_guid")) or (handles[0] if handles[0].endswith("@g.us") else "")
+                # A direct iMessage also has a chat GUID. Only a group flag or group JID makes
+                # that GUID a group identity; treating every GUID as a group rejected real replies.
+                group = _observed_group_id(message, source)
             if row.get("group_id"):
-                matches = bool(_render_local and group and _render_local.group_id_key(group) == _render_local.group_id_key(row["group_id"]))
+                matches = (bool(_render_local and group and
+                    _render_local.group_id_key(group) == _render_local.group_id_key(row["group_id"]))
+                    if source != "email" else _group_email_matches(
+                        _s(row["group_id"]), handles, local, person_index))
             else:
                 matches = not (group or message.get("is_group_chat")) and any(
                     _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
@@ -783,11 +904,17 @@ def _completion_evidence(row: dict, update: dict, local: dict):
                          "description": f"{'Inbound' if wanted_inbound else 'Outgoing'} {source}: {quote}"}
                 break
         if not found:
-            return None
-    return found
+            return None, reason
+    return found, "evidence_verified"
 
 
-def _new_request_since_closure(action: dict, closed: dict, local: dict) -> str:
+def _completion_evidence(row: dict, update: dict, local: dict):
+    """Compatibility wrapper for callers that only need the verified proof."""
+    return _completion_evidence_result(row, update, local)[0]
+
+
+def _new_request_since_closure(action: dict, closed: dict, local: dict,
+                               person_index: dict | None = None) -> str:
     """A person is not a dismissed request. Reopen only for a newly sourced incoming message
     after the user's closure, never a new extraction timestamp or a paraphrase of old evidence.
     Existing evidence fields bind local messages; a new email thread can bind without message ID.
@@ -796,8 +923,8 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict) -> str:
     cutoff = _s(closed.get("closed_at")) or _inbound_cutoff(closed.get("resolved_at"))
     if not cutoff or not _parse_dt(cutoff):
         return ""
-    identifiers = _collect_all_identifiers(action.get("contact_identifier") or "",
-                                           action.get("contact_name") or "", local)
+    identifiers = _verified_identifiers(action, local,
+                                         person_identity() if person_index is None else person_index)
     fresh_refs = _request_evidence(action) - _request_evidence(closed)
     thread = _s(action.get("source_thread_id"))
     new_thread = bool(thread and thread != _s(closed.get("source_thread_id"))
@@ -820,7 +947,7 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict) -> str:
             else:
                 handle = _s(message.get("handle") or message.get("contact_jid"))
             group = _s(action.get("group_id"))
-            message_group = _s(message.get("chat_guid"))
+            message_group = _observed_group_id(message, source)
             if group:
                 counterpart_matches = bool(_render_local and message_group
                     and _render_local.group_id_key(message_group) == _render_local.group_id_key(group))
@@ -830,7 +957,9 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict) -> str:
                     _handle_matches(handle, ident) or _jid_matches_phone(handle, ident) for ident in identifiers)
             if not bound or not counterpart_matches:
                 continue
-            if not _is_answer(message.get("body") or message.get("text") or message.get("snippet")):
+            from source_context import email_evidence_text
+            if not _is_answer(email_evidence_text(message) if source == "email" else
+                              message.get("body") or message.get("text") or message.get("snippet")):
                 continue
             observed = _parse_dt(timestamp)
             if observed is None:
@@ -1374,20 +1503,31 @@ def _migrate_identity(items: dict, group_index: dict, today: str,
         if it is None or it.get("status", "open") in TERMINAL:
             continue
         identity = _row_identity(it)
-        if (_s(it.get("anchor_key")) or old_key) not in _prior_anchor_keys(identity):
+        stored_key = _s(it.get("anchor_key")) or old_key
+        legacy_group_phone = stored_key in _legacy_group_phone_keys(identity, group_index)
+        if stored_key not in _prior_anchor_keys(identity) and not legacy_group_phone:
             continue                      # not an anchor this file composed — not ours to move
-        canon = canonicalize_counterpart(identity, group_index, person_index)
-        new_key = _obligation_key(canon, {k: v for k, v in items.items() if k != old_key})
+        canon = (identity if _s(identity.get("group_id")).strip()
+                 else canonicalize_counterpart(identity, group_index, person_index))
+        if legacy_group_phone:
+            # The broken anchor proves only that this is the GROUP, not that it is the same task
+            # as a correctly anchored row. Preserve both obligations for task-specific review.
+            base = compute_anchor_key(canon)
+            new_key = (base if base not in items else
+                       f"{base}:legacy:{hashlib.sha256(old_key.encode()).hexdigest()[:16]}")
+        else:
+            new_key = _obligation_key(canon, {k: v for k, v in items.items() if k != old_key})
         adopted = {k: canon[k] for k in ("group_id", "canonical_id", "contact_name")
                    if _s(canon.get(k)).strip() and _s(canon.get(k)) != _s(it.get(k))}
         if new_key == old_key and not adopted:
             continue                      # already anchored on the truth — the idempotent case
         twin = items.get(new_key) if new_key != old_key else None
-        if twin is not None and twin.get("status", "open") in TERMINAL:
+        if not legacy_group_phone and twin is not None and twin.get("status", "open") in TERMINAL:
             _retire_into_terminal(items, old_key, it, twin, today)
             folded.append(it)
             continue                      # the same debt already closed — never resurrect it
-        terminal_twin = _terminal_twin(items, canon, old_key) if twin is None else None
+        terminal_twin = (_terminal_twin(items, canon, old_key)
+                         if twin is None and not legacy_group_phone else None)
         if terminal_twin is not None:
             _retire_into_terminal(items, old_key, it, terminal_twin, today)
             folded.append(it)
@@ -1421,18 +1561,30 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     # The read_local snapshot supplies source messages for proposal validation and fresh-request
     # reopening. The SKILL passes it AS-IS and it may still be the raw MCP tool-result wrapper, so
     # unwrap it as compose_brief does or every evidence check sees {}.
-    local_data = unwrap_tool_result(payload.get("local") or {})
-    if payload.get("events") and "events" not in local_data:
+    from source_context import allowed, project_emails, project_local
+    local_data = project_local(unwrap_tool_result(payload.get("local") or {}))
+    if not allowed("gmail"):
+        local_data.pop("emails", None)
+    elif "emails" in local_data:
+        local_data["emails"] = project_emails(local_data["emails"])
+    if not allowed("calendar"):
+        local_data.pop("events", None)
+    if allowed("calendar") and payload.get("events") and "events" not in local_data:
         local_data = {**local_data, "events": payload["events"]}
     email_data = payload.get("emails")
     if isinstance(email_data, dict):
-        email_data = email_data.get("emails") or email_data.get("items") or []
-    if isinstance(email_data, list) and "emails" not in local_data:
+        email_data = email_data.get("emails") or email_data.get("messages") or email_data.get("items") or []
+    email_data = project_emails(email_data)
+    if allowed("gmail") and isinstance(email_data, list) and "emails" not in local_data:
         local_data = {**local_data, "emails": email_data}
     items, shadowed = _load_items(with_shadowed=True)
     from delivery_effects import loop_version
     # Group identity, straight from the snapshot the model was shown (see canonicalize_counterpart).
     group_index = group_identity(local_data)
+    group_index["known_ledger_ids"] = {
+        _render_local.group_id_key(_s(row.get("group_id")))
+        for row in items.values() if _render_local and _s(row.get("group_id")).strip()
+    }
     # Person identity, straight from the knowledge graph — built once, read by every anchor below.
     person_index = person_identity()
 
@@ -1459,7 +1611,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     versions = {key: loop_version(row) for key, row in items.items()}
     proposed_updates = payload.get("loop_updates") or payload.get("loopUpdates") or []
     if not isinstance(proposed_updates, list):
-        proposed_updates = []
+        # A malformed top-level proposal is one rejected item, not silent success.
+        proposed_updates = [proposed_updates]
     update_ids = {_s(u.get("loopId")) for u in proposed_updates if isinstance(u, dict)}
 
     # 1) merge new actions by anchor_key. Capture is not delivery: only an accepted outbox effect
@@ -1470,7 +1623,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     skipped_user_terminal = []
     origin_ordinals = {}
     for raw in (payload.get("new_actions", []) if merge else []):
-        a = canonicalize_counterpart(_normalize_action(raw), group_index, person_index)
+        candidate = _normalize_action(raw)
+        # A model may copy a canonical ID, but only the graph can attest that it belongs to this
+        # identifier. Existing stored rows keep their historical identity during migration.
+        candidate["canonical_id"] = None
+        a = canonicalize_counterpart(candidate, group_index, person_index)
+        if candidate.get("group_id") and not a.get("group_id") and not a.get("contact_identifier"):
+            rejected.append(f"{_s(a.get('contact_name'))}: unverified group identity")
+            continue
         # The ledger holds COMMUNICATION DEBTS — replies owed, follow-ups, commitments,
         # waiting-ons. Meeting prep/info actions are calendar shadows: the docket is their
         # surface and the calendar already resolves them by passing. Creating loops for them
@@ -1491,9 +1651,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             continue
         named = _s(a.get("loop_id"))
         named_row = items.get(named) if named else None
-        if named and (not named_row or not _same_counterpart(a, named_row)):
-            # A hallucinated ID may neither discard a real extraction nor edit another person's
-            # row. Record the bad reference, then apply the stable counterpart default.
+        copied_group = _render_local.group_id_key(_s(candidate.get("group_id"))) if _render_local else ""
+        # A graph match chosen from a name alone may resolve to a different same-named person.
+        copied_identity = bool(candidate.get("contact_identifier") or
+                               (copied_group and copied_group in (group_index.get("by_id") or {})))
+        if named and (not named_row or not copied_identity
+                      or not _same_verified_counterpart(a, named_row)):
+            # A hallucinated or unverifiable ID may neither discard a real extraction nor edit
+            # another person's row. Record the bad reference, then apply the counterpart default.
             rejected.append(f"{_s(a.get('contact_name'))}: unknown or mismatched loopId; used counterpart base")
             a["loop_id"] = None
             named = ""
@@ -1525,7 +1690,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             closed = [it for it in items.values() if it.get("status") in TERMINAL
                       and _same_counterpart(a, it)]
             if closed:
-                observed = max((_new_request_since_closure(a, it, local_data) for it in closed), default="")
+                observed = max((_new_request_since_closure(a, it, local_data, person_index)
+                                for it in closed), default="")
                 if not observed:
                     skipped_user_terminal.append(_s(a.get("contact_name")) or "(unnamed)")
                     continue
@@ -1533,7 +1699,7 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if ak in items:
             it = items[ak]
             if it.get("status") in TERMINAL:
-                observed = _new_request_since_closure(a, it, local_data)
+                observed = _new_request_since_closure(a, it, local_data, person_index)
                 if not observed:
                     skipped_user_terminal.append(
                         f"{_s(it.get('contact_name')) or '(unnamed)'} ({_s(it.get('resolution'))})")
@@ -1565,6 +1731,9 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 it.pop("resolution", None)
                 it.pop("resolved_at", None)
                 it.pop("closed_at", None)
+                it.pop("resolution_reason", None)
+                it.pop("resolution_evidence", None)
+                it.pop("resolution_source_refs", None)
                 for field in ("source_thread_id", "source_message_id", "source_refs"):
                     it[field] = a.get(field)
                 it["status"] = "open"
@@ -1609,15 +1778,27 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
               + "; ".join(skipped_user_terminal), file=sys.stderr)
 
     rejected_updates = {}
+    update_items = {"accepted": [], "rejected": [], "truncated": 0}
+    max_item_receipts = 128
     accepted_updates = 0
     reply_history = None          # relationship_state.json, read at most once per pass
     proposal_observed_at = datetime.now(timezone.utc).isoformat()
 
     def reject_update(reason):
         rejected_updates[reason] = rejected_updates.get(reason, 0) + 1
+        if update_index < max_item_receipts:
+            update_items["rejected"].append({"index": update_index,
+                                              "digest": proposal_digest(update), "reason": reason})
+        else:
+            update_items["truncated"] += 1
         log_outcome.record_loop_proposal(update, row, "rejected", reason, proposal_observed_at)
 
-    for update in proposed_updates:
+    def proposal_digest(proposal):
+        # Per-item disposition without names, raw IDs or message quotes in the Learn receipt.
+        canonical = json.dumps(proposal, sort_keys=True, default=str, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()[:24]
+
+    for update_index, update in enumerate(proposed_updates):
         row = None
         if not isinstance(update, dict):
             reject_update("malformed_update")
@@ -1634,14 +1815,20 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if not update.get("loopVersion") or update["loopVersion"] != versions.get(key):
             reject_update("stale_revision")
             continue
-        proof = _completion_evidence(row, update, local_data)
+        if update.get("status") not in ("resolved", "waiting"):
+            reject_update("malformed_shape" if "status" not in update else "unsupported_status")
+            continue
+        proof, evidence_reason = _completion_evidence_result(row, update, local_data, person_index)
         if not proof:
-            reject_update("unsupported_evidence")
+            reject_update(evidence_reason)
             continue
         if update.get("status") == "resolved":
             _terminate(row, "resolved", "delivered" if is_waiting_on(row.get("action_type")) else "replied", today)
             row["resolution_evidence"] = proof["description"]
             row["resolution_source_refs"] = update["evidence"]
+            explanation = " ".join(_s(update.get("reason")).split())[:240]
+            if explanation:
+                row["resolution_reason"] = explanation
             resolved.append(row)
         elif update.get("status") == "waiting" and is_waiting_on(row.get("action_type")):
             # A specific promise postpones only this obligation. Replayed evidence never buys time.
@@ -1674,6 +1861,11 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         _persist(row)
         log_outcome.record_loop_proposal(update, proposal_row, "accepted", "evidence_verified",
                                         proposal_observed_at)
+        if update_index < max_item_receipts:
+            update_items["accepted"].append({"index": update_index,
+                                             "digest": proposal_digest(update)})
+        else:
+            update_items["truncated"] += 1
         accepted_updates += 1
 
     if rejected_updates:
@@ -1686,6 +1878,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                        "total": len(proposed_updates)}
     print("[continuity_resolve] loop update outcomes: "
           + json.dumps(update_outcomes, sort_keys=True), file=sys.stderr)
+    print("[continuity_resolve] loop update items: "
+          + json.dumps(update_items, sort_keys=True), file=sys.stderr)
 
     if not resolve_existing:
         # --merge-only: persist exactly what this pass touched (nothing else is rewritten, so a

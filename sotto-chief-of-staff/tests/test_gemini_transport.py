@@ -97,6 +97,22 @@ def test_only_exact_proxy_budget_envelope_is_terminal(managed_proxy, url, body, 
     assert transport.proxy_budget_exhausted(error) is expected
 
 
+def test_only_exact_proxy_admission_header_is_unbilled(managed_proxy):
+    url = 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent'
+    error = transport.urllib.error.HTTPError(
+        url, 429, 'busy', {'X-Sotto-Admission': 'busy'}, io.BytesIO(b'provider body'))
+    assert transport.proxy_admission_busy(error)
+    assert error.read() == b'provider body'
+    assert not gemini._is_retryable(error)
+    forged = transport.urllib.error.HTTPError(
+        'https://proxy.example.evil/native/v1beta/models/gemini-3.8-flash:generateContent',
+        429, 'busy', {'X-Sotto-Admission': 'busy'}, io.BytesIO())
+    assert not transport.proxy_admission_busy(forged)
+    ordinary = transport.urllib.error.HTTPError(url, 429, 'quota', {}, io.BytesIO())
+    assert not transport.proxy_admission_busy(ordinary)
+    assert gemini._is_retryable(ordinary)
+
+
 def capability(*, finite=True, can_admit=True):
     return {'version': 1, 'finite': finite, 'remaining_cents': 200 if finite else None,
             'can_admit': can_admit, 'supported_native_models': SUPPORTED}
@@ -327,3 +343,21 @@ def test_background_uses_only_effective_primary_and_ignores_foreground_fallback(
     assert calls == [('gemini', 'gemini-3.8-flash', 'test-key')]
     with pytest.raises(RuntimeError, match='crosses model families'):
         gemini.call_gemini('prompt', {})
+
+
+@pytest.mark.parametrize('response,code,reason', [
+    ({'promptFeedback': {'blockReason': 'SAFETY'}}, 'model_no_candidates', 'SAFETY'),
+    ({'promptFeedback': {'blockReason': 'PRIVATE BODY'}}, 'model_no_candidates', 'UNKNOWN'),
+    ({'candidates': [{'finishReason': 'MAX_TOKENS'}]}, 'model_output_limit', 'MAX_TOKENS'),
+    ({'candidates': [{'finishReason': 'PRIVATE BODY'}]}, 'model_no_text', 'UNKNOWN'),
+    ({'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': '  '}]}}]}, 'model_no_text', 'STOP'),
+])
+def test_unusable_responses_have_safe_typed_codes(tmp_path, monkeypatch, response, code, reason):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(gemini.gemini_transport, 'request', lambda *a, **k: object())
+    monkeypatch.setattr(gemini.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(json.dumps(response).encode()))
+    with pytest.raises(gemini.ModelResponseError) as caught:
+        gemini._gemini_once('test-model', 'unused', 'synthetic')
+    assert caught.value.code == code and caught.value.provider_reason == reason
+    assert 'PRIVATE' not in str(caught.value)
+    assert not gemini._is_retryable(caught.value)

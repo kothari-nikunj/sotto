@@ -35,7 +35,7 @@ def test_history_health_is_honest_and_disappears_on_recovery(volume):
     stalled = {"sources": {"gmail": {"error_code": "provider_request_rejected"},
                            "imessage": {"error": "ConnectionError"}}}
     text = health(volume, stalled)
-    assert "Older Gmail history isn't up to date" in text
+    assert "Learning from older Gmail messages is paused" in text
     assert "iMessage" not in text and "provider_request" not in text
     assert "past context" in text and "Alex: reply" in text
     assert "past context" not in health(volume, {"sources": {"gmail": {"last_success": NOW.isoformat()}}})
@@ -70,7 +70,7 @@ def test_a_source_whose_live_feed_is_already_reported_down_gets_no_second_line(v
     assert "past context" not in health(volume, state, down)
     # …but a feed that is up today and a history that stopped is still a real disclosure
     up = {"local": {"source_status": {"imessage": "ok"}}}
-    assert "Older iMessage history isn't up to date" in health(volume, state, up)
+    assert "Learning from older iMessage messages is paused" in health(volume, state, up)
     # a stale Bridge snapshot saying "ok" never outranks what this brief derived: unavailable now
     stale = {"local": {"source_status": {"imessage": "ok"}, "_source_availability": {"imessage": "unavailable"}}}
     assert "past context" not in health(volume, state, stale)
@@ -79,7 +79,7 @@ def test_a_source_whose_live_feed_is_already_reported_down_gets_no_second_line(v
 def test_real_source_failure_wins_over_background_hold(volume):
     text = health(volume, {"sources": {"gmail": {"error_code": "provider_request_rejected"}},
                            "receipt": {"dreamer": {"reason": "background_budget_exhausted"}}})
-    assert "Older Gmail history isn't up to date" in text
+    assert "Learning from older Gmail messages is paused" in text
     assert "spending limit" not in text and "provider_request_rejected" not in text
 
 
@@ -250,11 +250,15 @@ def test_selfhost_nested_disabled_status_overrides_old_success(volume, monkeypat
     assert out["brief_markdown"] == "Good morning"
 
 
-def test_named_loop_suppression_is_conservative_but_delivery_count_is_strict(volume):
+def test_named_loop_suppression_requires_the_specific_ask(volume):
     entry = row("one", "Send the signed agreement")
     prose = "Alex Chen still needs an answer. <!--id:alex@example.com-->"
     assert cb._represented_loop_rows([entry], prose) == []
     cb._record_named_loops([entry], prose, "2026-09-18", "evening")
+    saved = json.loads((volume / "briefs/2026-09-18.evening.named.json").read_text())
+    assert saved == {"anchor_keys": []}
+    cb._record_named_loops([entry], "Alex Chen: Send the signed agreement.",
+                           "2026-09-18", "evening")
     saved = json.loads((volume / "briefs/2026-09-18.evening.named.json").read_text())
     assert saved == {"anchor_keys": ["one"]}
 
@@ -274,3 +278,17 @@ def test_exact_delivery_counts_all_active_states_but_not_closed():
         entry = {**row("one", "Send the signed agreement"), "status": status}
         got = cb._represented_loop_rows([entry], "Alex Chen: Send the signed agreement")
         assert got == ([entry] if status in ledger_io.ACTIVE else [])
+
+
+def test_history_warning_distinguishes_recent_access_and_excluded_pages(volume, monkeypatch):
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'imessage')
+    inputs = {'local': {'source_status': {'imessage': 'ok'}}}
+    state = {'sources': {'imessage': {'error': 'ModelResponseError'}}}
+    text = health(volume, state, inputs)
+    assert 'iMessage: recent messages are available.' in text
+    assert 'Learning from older iMessage messages is paused' in text
+    state['sources']['imessage'] = {'last_success': NOW.isoformat(), 'excluded_pages': {'opaque': {'rows': 1}}}
+    text = health(volume, state, inputs)
+    assert "Some older iMessage messages couldn't be learned" in text
+    assert 'past context has gaps' in text and 'is paused' not in text
+    assert 'recent messages are available' not in health(volume, {'sources': {'imessage': {'error': 'error'}}})

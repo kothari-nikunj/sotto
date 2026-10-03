@@ -314,7 +314,7 @@ def test_later_slice_search_quota_keeps_earlier_rows(tmp_path, monkeypatch):
     gg.main()
     assert calls == ['search', 'search', 'calendar']
     assert json.loads(gmail.read_text()) == [{'id': 'first', 'threadId': None, 'from': '',
-        'to': '', 'subject': '', 'date': '', 'snippet': 'earlier slice survived', 'body': '',
+        'to': '', 'cc': '', 'subject': '', 'date': '', 'snippet': 'earlier slice survived', 'body': '',
         'labelIds': [], 'isSent': False}]
     result = json.loads(receipt.read_text())['gmail']
     assert result['status'] == 'partial' and result['complete'] is False
@@ -701,6 +701,7 @@ def test_gather_stale_sent_searches_once_and_reads_each_thread_once(monkeypatch)
     assert len(searches) == 1 and searches[0][2] == "in:sent older_than:3d newer_than:14d -in:chats"
     assert gets == ["t1", "t2"]                              # one read per thread, once
     assert [r["threadId"] for r in rows] == ["t1"]           # the unreadable thread costs itself only
+    assert set(rows.threads) == {"t1"}                      # reuse only successful current inventories
 
 
 def test_stale_thread_quota_keeps_prior_evidence_and_marks_partial(tmp_path, monkeypatch):
@@ -1244,3 +1245,26 @@ def test_calendar_native_fails_on_repeated_page_and_closes_owned_client(monkeypa
     with pytest.raises(RuntimeError, match='repeated a page token'):
         gg.gather_calendar('unused.py')
     assert closed == [True]
+
+
+def test_gmail_grant_restored_between_inbox_and_loop_gates_does_not_fail_the_gather(tmp_path, monkeypatch):
+    import ledger_io
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
+    monkeypatch.setattr(gg, '_refresh_google_token', lambda: None)
+    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: [])
+    monkeypatch.setattr(ledger_io, 'load_active', lambda: [])
+    gmail_checks = []
+    # Off at the inbox gate, re-granted by the loop gate: the inbox lane never ran.
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: source != 'gmail' or bool(gmail_checks.append(1) or len(gmail_checks) > 1))
+    local, gmail, cal, receipt = [tmp_path / name for name in ('local.json', 'g.json', 'c.json', 'r.json')]
+    local.write_text('{}')
+    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
+                                    '--loop-local', str(local), '--source-results-out', str(receipt)])
+    gg.main()
+    assert json.loads(gmail.read_text()) == []
+    assert len(gmail_checks) >= 2 and json.loads(cal.read_text()) == []
+    assert json.loads(receipt.read_text())['gmail']['status'] == 'unavailable'

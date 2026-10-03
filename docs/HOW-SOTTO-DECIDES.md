@@ -154,9 +154,15 @@ is a table lookup, not a code search.
 | **Proactive watcher** (intention · meeting prep · commitment · chase · birthday · handoff) | `proactive_scan.main`, the `*/15` cron | `triage_event.triage` — the tick goes in as ONE bundle of synthetic `source: "proactive"` events, classified by `_classify_proactive` (snooze → quiet hours → mutes; the nudge's kind is its class) and then through every gate below. The bundle that comes back is what the watcher delivers |
 | **"Nudge me now"** (you promote a held item from the dashboard) | `dashboard._post_cadence` → `receiver.run_promote` | `triage_event.promote_one` — the same `_valve_candidate` rule the valve uses; the explicit request bypasses the unsolicited budget |
 
-An admitted pre-meeting reminder carries the known role, countdown and open item, plus at most
-two short sentences about the introduction or meeting purpose when supported by existing memory,
-the invitation or recent correspondence. The selected attendee reuses up to five dated excerpts
+An admitted pre-meeting reminder carries the known role and countdown, plus one or two short
+sentences (at most 60 words and 500 characters) of grounded relationship context, such as where
+things left off, a dated development, why this meeting exists or a commitment later evidence still
+supports, written by the existing bounded notification writer from stored person memory, the
+invitation, current conversation text, recent correspondence and open items joined by identifier
+(a shared first name joins only when one side has no identifier). With no such text, a held or
+failed writer, or a writer already spent on another candidate in the same job, it is the basic
+reminder; the scanner's unchecked open item is never appended to it or carried into the offer a
+yes answers. The selected attendee reuses up to five dated excerpts
 from the existing consented mail snapshot/queue within the shared seven-day conversation window;
 no fresh mail fetch or research runs for the offer. Exact sender/recipient addresses select this
 background, while only an explicit thread binding establishes this invitation's provenance.
@@ -379,13 +385,14 @@ to connect!" never earns an interrupt.
   back when today's brief already named it — a loop chased once is urgent by contract and the brief
   names it every day afterwards as a still-open line, so treating that as "already told you" a
   second time would mean the loop never reached its two chases or the hand-off question.
-- **An email you sent that nobody answered is a debt owed to you** — the gather asks Gmail, for
+- **An email you sent that nobody answered is context, not a debt** — the gather asks Gmail, for
   each thread you wrote on 3 to 14 days ago, whether the last word is still yours (20 threads at
-  most, the same 3-day clock the chase uses), and the composer mints a `waiting_on` for each one
-  that went to somebody in your contacts or your graph. Never for a stranger, a no-reply address,
-  an intro you made for two other people, a two-word thanks, or a calendar RSVP your Gmail sent to
-  an organizer ("Accepted: …", "Updated invitation: …"). The row is dated the day you wrote,
-  so the first chase ripens on the silence that already happened.
+  most, the same 3-day clock the chase uses), and the brief model sees the ones that went to
+  somebody in your contacts or your graph — never a stranger, a no-reply address, or a calendar
+  RSVP your Gmail sent to an organizer ("Accepted: …", "Updated invitation: …"). Silence alone
+  never mints a `waiting_on`: the model may propose one, or a `loopUpdates` change to a tracked
+  loop, only when the source shows a specific outstanding request or deliverable, with the
+  recipient, the original date and the message evidence.
 - **They replied, they just haven't delivered** — any inbound from the counterpart of something
   you're owed (a text, an email on the thread, a call — answered or missed) restarts that loop's
   chase clock without counting a chase: to the date they named ("by Friday", "the 16th of July",
@@ -394,12 +401,19 @@ to connect!" never earns an interrupt.
   gather reads your own answer to each invite. A declined event never reaches the brief, a research
   call, the prep nudge, or the in-meeting hold. An unanswered invite with somebody else on it
   becomes an `rsvp` ask once it is within 48 hours — minted by code, and closed by the calendar
-  (you answer, or it passes), never a ledger row.
+  (you answer, or it passes), never a ledger row. An FYI/context notice or drill, or a hold or
+  prep block with nobody else on it, never becomes an `rsvp`; it still shows in Coming Up.
 - **Contact is not completion.** The brief model may propose a `loopUpdates` change only for one
   ledger ID and revision, backed by an original source message ID and verbatim quote. Code verifies
   the counterpart, direction, original timestamp and quote against the snapshot. A generic reply,
   call, calendar attendee, unrelated link, or appearance in Already Handled cannot close a debt.
+  A closure applies only after the brief's critic explicitly approved that exact update, so one the critic
+  skipped, could not run, or could not fit stays open; a quote under 12 characters is never evidence.
+  An email closes a group's debt only when it went to everyone on the group's roster.
   Missing or ambiguous evidence leaves it open; explicit user corrections remain authoritative.
+  The gather gives carried-over loops one bounded Gmail refresh of at most 6 exact targets,
+  10 requests, 24 messages and 48,000 characters, admitting no new read after 20 seconds, and a
+  partial read is context, never proof that nothing happened.
 - **A loop you closed by hand stays closed** — when tomorrow's extraction reads the same thread
   again, a loop Sotto itself expired or auto-resolved re-opens (the person coming back is evidence
   the guess was wrong), but one you dismissed or resolved yourself needs new incoming request evidence after your closure.
@@ -510,9 +524,22 @@ which run may send; it does not claim that its content was accepted. A successfu
 closes the window it reviewed, while a failed relevance review preserves it for retry.
 
 The Learn step remains **one command** (`learn_step.py`) with two execution phases and one
-`briefs/<date>.<kind>.learned.json` receipt. Required knowledge and continuity writes precede delivery.
+`briefs/<date>.<kind>.learned.json` receipt. Knowledge and continuity writes are attempted before
+delivery; a failed write stays in the durable learning follow-up rather than suppressing a valid brief.
 Draft outcomes, voice learning, meeting-note learning and Contacts synchronization run as a durable
 background follow-up; their failure is visible in the receipt and cannot suppress the brief.
+The receipt remains partial while follow-up work is queued or an item was rejected. A draft with no
+observed response after its matching window becomes **unknown**, never a presumed failed send or
+rejection. A later-ingested send from inside that original window can still establish its outcome.
+
+The brief projects only evidence-verified updates to an exact open task before presenting its final
+handled/open sections. The durable resolver repeats those checks under its lock. Identity, source
+permission, message direction, chronology, quoted evidence and task fulfillment must all agree.
+An ambiguous older paragraph without a task marker cannot safely close or hide a different task
+involving the same person. Older open items show when they entered the ledger. The critic sees the
+source-derived schedule and birthday evidence, and its draft score is kept separate from final
+deterministic validation. Mechanical revisions use a bounded evidence manifest; semantic changes
+retain the original evidence context.
 Unattended briefs and nudges propose actions. Sending email or changing a calendar still requires
 the separate action authorization gate; a suggestion is never approval.
 The send seam also strips machine markers (`<!--id:…-->` / `<!--meeting:…-->`) from every outgoing
@@ -827,7 +854,12 @@ Other sources keep their existing learning paths. The receiver starts a backgrou
 most once every 15 minutes (`receiver.MEMORY_INTERVAL_SECONDS`), never while the previous one is
 still running, and each pass advances at most 3 rotating history pages
 (`memory_cycle.PAGES_PER_RUN`) and one unfinished Dreamer batch; the Dreamer selects useful existing facts for person
-summaries, archives exact duplicates and records contradictions. Facts record `archived_reason`
+summaries, archives exact duplicates and selected equivalent assertions, and records contradictions.
+The same existing model pass selects bounded groups of existing IDs; it cannot invent replacement
+prose. User corrections remain active. Archived originals retain their own sources and evidence;
+curation never increases confidence or pools evidence across source permissions. The curation
+contract revision makes existing memory eligible for one ordinary bounded review, without a
+new scheduled call. Bare numeric Apple Contacts notes are kept out of active assertions. Facts record `archived_reason`
 separately from their source. Only an exact observation of a fact archived for age (`stale`) may
 revive it. User archives, corrections, superseded facts, duplicates and legacy archives with unknown
 reasons stay archived. It cannot change source grants,
@@ -871,6 +903,13 @@ returned counts as a malformed response: a transport or configuration fault rais
 answer arrives is an ordinary failure and spends none of those attempts. Availability, network,
 timeout, HTTP 429 and HTTP 503 failures keep their ordinary retry behavior. These are retry bounds,
 not a new daily model allowance or work counter.
+Gemini responses with no candidates, missing/blank text or truncated output are also unusable
+responses: both history extraction and Dreamer stop after two attempts across scheduled runs.
+History keeps its unfinished page and waits for a changed extraction contract; Dreamer also
+resumes on changed candidate evidence. Neither silently skips evidence or treats it as learned.
+Receipts retain fixed response codes and allowlisted provider finish/block reasons, never message
+bodies. Bridge fetch receipts distinguish offline, timeout, permission denial and tool errors;
+these availability failures retain the ordinary retry clock and do not park extraction.
 Only the Gmail adapter decides that a continuation token is dead: it names a page-token request the
 provider rejected as an invalid argument, and it names it with a code, never with the provider's
 message. Any other deterministic Gmail rejection — a bad query, impossible window bounds, an adapter
@@ -992,8 +1031,8 @@ requests cannot restore permissions superseded by newer consent. Completed retri
 
 
 The model proxy rejects duplicate JSON keys and forwards canonical JSON after validation. Admission
-uses one atomic SQLite ledger and permits 60 admitted requests per tenant in a rolling 60-second
-window. This short rate bound is separate from the optional spending admission cutoff. Self-host
+uses one atomic SQLite ledger and permits 45 admitted requests per tenant and 60 across tenants in a rolling
+60-second window. This short rate bound is separate from the optional spending admission cutoff. Self-host
 background learning marks its native requests as requiring a finite tenant budget, so an unlimited
 tenant is rejected before an upstream call; the same ledger and reservation allowance are used.
 The allowance is conservative admission accounting rather than a provider invoice.
@@ -1039,6 +1078,7 @@ receipt, even when the pass succeeds. This is one summary per pass, not a log of
 The operator's read-only `release_one_proof.py --days 30` report uses existing Learn receipts
 and ledger files. It states the retained date range and coverage.
 New Learn receipts count accepted and rejected completion proposals, including zero proposals.
+A pass marked partial because it rejected proposals still counts.
 Older receipts without this field are unknown. A quick dismissal is a review signal, not proof of
 an incorrect capture. Missing rejected-proposal, reopening or manual-resolution links are reported
 as unavailable, never reconstructed from today's status.
@@ -1119,3 +1159,18 @@ metadata require a fresh source read. The lookup neither sends nor recomposes th
 partial day and reports which morning/evening receipts contain exact counters for each local day.
 Two exact scheduled Learn receipts establish that day's observation coverage, not model accuracy.
 Missing historical counters remain unknown; a zero observed error candidate count is not zero errors.
+
+### Short answers and relationship importance
+
+A short yes resolves against the last delivered question in the transport-identified conversation,
+using the incoming message timestamp. If another question was accepted after the reply, or within
+a few seconds of it, Sotto asks which one was meant instead of choosing the older question. Reply-to messages
+and thumbs-up tapbacks keep their exact original message target, including older questions. Two
+questions in one message remain ambiguous. A later conversational topic or question takes precedence
+over an unrelated stored offer. Real effects still require the exact action and payload hash and
+consume the offer once; this introduces no additional model call. Legacy unbound offers cannot
+use automatic recency selection.
+
+The person page shows automatic VIP/VVIP from the existing 42-day sustained reciprocal activity
+classifier, separately from manual quiet-hours overrides. A busy one-sided sender is not promoted.
+This is a local read of saved activity, not new research or a model request.

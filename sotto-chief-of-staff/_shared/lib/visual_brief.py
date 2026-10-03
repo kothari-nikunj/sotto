@@ -17,11 +17,12 @@ from chatfmt import to_imessage
 from brief_validate import is_calendar_preview_note
 from calendar_context import SCHEDULE_DAY as _DAY
 
-VERSION = 15
+VERSION = 17
 MAX_CARDS = 4
 MAX_WORDS = 200
 MAX_PREP_WORDS = 200
 WIDTH, HEIGHT = 1080, 1920
+TALL_HEIGHT = 2560
 FONT_DIR = Path(__file__).resolve().parents[1] / 'assets/card-fonts'
 SEAL_PATH = Path(__file__).resolve().parents[1] / 'assets/wax-seal.png'
 
@@ -58,7 +59,7 @@ def build(text, kind='brief', preview=False):
         match = re.match(r'^\s*(?:[-•]\s+)?(?P<mark>\*\*|\*)(?P<label>[^*\n]+)(?P=mark)', raw)
         if match:
             key = to_imessage(raw, normalize_style=False).strip().lstrip('• ').strip()
-            source_emphasis[key] = len(match['label'])
+            source_emphasis[key] = len(match['label'].strip())
     lines = plain.splitlines()
     title = lines[0].strip()
     sections, active = [], None
@@ -273,8 +274,8 @@ def _rich_lines(draw, text, regular, bold, width, emphasis_end):
     return lines
 
 
-def _content_top(top, height):
-    available = HEIGHT - 106 - top
+def _content_top(top, height, canvas_height=HEIGHT):
+    available = canvas_height - 106 - top
     if height > available:
         raise LayoutError('card_height', 'card exceeds readable height; use text')
     return top
@@ -283,6 +284,9 @@ def _content_top(top, height):
 def _render_pages(deck, *, measure_only=False):
     """One layout path for fit checks and PNG delivery; never shrink text to fit."""
     from PIL import Image, ImageDraw, ImageFont
+    canvas_height = deck.get('canvas_height', HEIGHT)
+    if canvas_height not in (HEIGHT, TALL_HEIGHT):
+        raise LayoutError('card_height', 'unsupported canvas height')
     if not measure_only and len(deck['cards']) != MAX_CARDS:
         raise LayoutError('card_count', 'an image brief must contain exactly four cards')
     def font(size, weight=400):
@@ -298,7 +302,7 @@ def _render_pages(deck, *, measure_only=False):
     row_font, time_font = font(48), font(36, 650)
     location_font = font(36)
     for index, card in enumerate(deck['cards'], 1):
-        image = Image.new('RGB', (1, 1) if measure_only else (WIDTH, HEIGHT), '#F5F5F7')
+        image = Image.new('RGB', (1, 1) if measure_only else (WIDTH, canvas_height), '#F5F5F7')
         draw = ImageDraw.Draw(image)
         if measure_only:
             # Text measurement still uses Pillow; measuring must not paint or trigger
@@ -309,7 +313,10 @@ def _render_pages(deck, *, measure_only=False):
         blocks = [b['text'] for b in card['blocks']]
         agenda = card['title'] == 'Your day'
         # These are typographic splits of the source, never inferred people/actions.
-        title = 'Your day' if agenda else card['title']
+        # Evening editions can span tomorrow's meetings and today's birthdays. The date
+        # labels below stay authoritative; do not imply every row is happening today.
+        title = ('Coming up' if agenda and re.match(r'^Good evening\b', deck['title'], re.I)
+                 else 'Your day' if agenda else card['title'])
         if deck['kind'] == 'prep':
             subject = re.split(r' [—–-] ', deck['title'], maxsplit=1)[0]
             company = re.search(r'\(([^()]+)\)', subject)
@@ -363,7 +370,7 @@ def _render_pages(deck, *, measure_only=False):
                 height = max(100, len(lines) * 62 + 32 + len(location_lines) * 44) if time else len(lines) * 62 + 30
                 rows.append((time, lines, height + padding + (46 if label else 0),
                              location_lines, padding, label))
-            y = _content_top(y, sum(row[2] for row in rows))
+            y = _content_top(y, sum(row[2] for row in rows), canvas_height)
             for time, lines, height, location_lines, padding, label in rows:
                 y += padding
                 height -= padding
@@ -401,10 +408,10 @@ def _render_pages(deck, *, measure_only=False):
             fixed_height = (sum(len(lines) * line_height for lines, line_height in zip(laid_out, line_heights)) + 56
                             + sum(bool(x) for x in starts) * 46
                             + sum(bool(x) for x in starts[1:]) * section_gap)
-            available = HEIGHT - 106 - y
+            available = canvas_height - 106 - y
             paragraph_gap = max(12, min(24, (available - fixed_height) // gaps)) if gaps else 24
             height = fixed_height + gaps * paragraph_gap
-            y = _content_top(y, height)
+            y = _content_top(y, height, canvas_height)
             draw.rounded_rectangle((64, y, 1016, y + height), radius=32, fill='#FFFFFF')
             y += 24
             for position, lines in enumerate(laid_out):
@@ -426,11 +433,11 @@ def _render_pages(deck, *, measure_only=False):
         # Keep historical context explicit without repeating a second headline.
         footer = 'Historical preview' if deck['preview'] else ''
         seal_bounds = seal.getbbox()
-        image.paste(seal, (64 - seal_bounds[0], HEIGHT - 90), seal)
-        draw.text((154, HEIGHT - 65), footer, font=meta_font, fill='#6E6E73')
+        image.paste(seal, (64 - seal_bounds[0], canvas_height - 90), seal)
+        draw.text((154, canvas_height - 65), footer, font=meta_font, fill='#6E6E73')
         for dot in range(MAX_CARDS):
             x = 928 + dot * 22
-            draw.ellipse((x, HEIGHT - 56, x + 9, HEIGHT - 47), fill='#1D1D1F' if dot == index - 1 else '#D1D1D6')
+            draw.ellipse((x, canvas_height - 56, x + 9, canvas_height - 47), fill='#1D1D1F' if dot == index - 1 else '#D1D1D6')
         yield image
 
 
@@ -460,7 +467,7 @@ def _split_to_four(cards):
     return cards
 
 
-def _packed(deck):
+def _packed_at_height(deck):
     """Keep ordinary layouts; repair crowded briefs at complete paragraph boundaries."""
     cards = deck['cards']
     try:
@@ -524,12 +531,23 @@ def _packed(deck):
     return dict(deck, cards=packed)
 
 
-def fits(deck):
+def _packed(deck):
+    try:
+        return _packed_at_height(deck)
+    except LayoutError as error:
+        if deck['kind'] != 'brief' or error.reason not in ('card_height', 'card_count'):
+            raise
+    # A crowded edition can use taller photos at the same width and type size.
+    # Still bounded to four, with every paragraph retained and measured before writing.
+    return _packed_at_height(dict(deck, canvas_height=TALL_HEIGHT))
+
+
+def fits(deck, *, allow_tall=True):
     """Measure the delivery layout, including reflow, without writing artifacts."""
     if not deck:
         return False
     try:
-        _packed(deck)
+        (_packed if allow_tall else _packed_at_height)(deck)
         return True
     except (ImportError, OSError, ValueError):
         return False

@@ -10,7 +10,9 @@ import itertools
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -2748,3 +2750,72 @@ def test_prefs_edit_only_stated_rules_and_preserve_history(tmp_path):
         assert (os.stat(prefs_path).st_mode & 0o777) == 0o600
     finally:
         srv.shutdown()
+
+
+def test_person_facts_keep_wrapped_yaml_text_and_quotes():
+    import yaml
+    values = ['Has a career break and is evaluating roles in areas such as program management and operations.',
+              "Per web search: Writes publicly about parenting: children's routines and family time.",
+              'A quoted title: "Markers Den" with a long descriptive subtitle that wraps to the next line.']
+    doc = {'facts': {str(i): {'text': text, 'source': 'observed_message', 'conf': .7}
+                     for i, text in enumerate(values)}}
+    raw = '---\n' + yaml.safe_dump(doc, width=40, allow_unicode=True) + '---\n'
+    parsed, _ = _dash.parse_frontmatter(raw)
+    assert [parsed['facts'][str(i)]['text'] for i in range(len(values))] == values
+    assert all(f['source'] == 'observed_message' for f in parsed['facts'].values())
+
+
+def test_wrapped_double_quoted_and_escaped_fact_text_round_trips():
+    """safe_dump folds long double-quoted scalars with `\\` continuations and escapes tabs and
+    line separators; the person page must show the stored wording, not the raw escapes."""
+    import yaml
+    values = ['Tab\there plus long text long text long text long text long text long text long text.',
+              'Line\u2028separator in a fact that is long enough to be wrapped by the dumper too.',
+              "It's a single 'quoted' fact\u2029with a paragraph separator and more words to wrap."]
+    doc = {'updated_at': '2026-09-06T10:00:00Z',
+           'facts': {f'f_{i}': {'text': t, 'first': '2026-09-06'} for i, t in enumerate(values)}}
+    raw = '---\n' + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=40) + '---\nbody'
+    meta, body = _dash.parse_frontmatter(raw)
+    assert [meta['facts'][f'f_{i}']['text'] for i in range(len(values))] == values
+    # Dates stay the strings the writer stored (the API serializes them as JSON).
+    assert meta['updated_at'] == '2026-09-06T10:00:00Z' and meta['facts']['f_0']['first'] == '2026-09-06'
+    assert body == 'body'
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+@pytest.mark.parametrize('importance, expected, absent', [
+    ({'tier': 'vvip', 'reason': 'frequent two-way activity across several weeks',
+      'active_days': 18, 'held_meetings': 0, 'window_days': 42},
+     'frequent two-way activity across several weeks. 18 active days in the last 42 days. ', 'meeting'),
+    ({'tier': 'vip', 'reason': 'meetings actually held across several weeks',
+      'active_days': 0, 'held_meetings': 4, 'window_days': 42},
+     'meetings actually held across several weeks. 4 meetings held in the last 42 days. ', 'active day'),
+    ({'tier': 'vip', 'reason': 'you marked this person VIP', 'active_days': '3'},
+     'you marked this person VIP. Updates with your activity', 'in the last'),
+])
+def test_automatic_importance_note_renders_its_counts(importance, expected, absent):
+    js = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'app.js'),
+              encoding='utf-8').read()
+    fns = [re.search(r'\n  function %s\(.*?\n  \}\n' % name, js, re.S).group(0)
+           for name in ('str', 'num', 'importanceNote')]
+    assert 'el("div", "row-note", importanceNote(importance))' in js
+    prog = ''.join(fns) + f'console.log(importanceNote({json.dumps(importance)}));'
+    out = subprocess.run(['node', '-e', prog], capture_output=True, text=True, check=True).stdout
+    assert expected in out and absent not in out, out
+
+
+def test_person_auto_importance_is_separate_from_manual_override(tmp_path, monkeypatch):
+    root = tmp_path / 'knowledge/people'
+    root.mkdir(parents=True)
+    (root / 'c_a8f3e2.md').write_text(PERSON_MD)
+    monkeypatch.setitem(_dash.HOOKS, 'data_root', lambda: str(tmp_path))
+    calls = []
+    def classifier(contact, history, now):
+        calls.append(contact)
+        return {'tier': 'vvip', 'reason': 'frequent two-way activity',
+                'active_days': 18, 'window_days': 42}
+    monkeypatch.setitem(_dash.HOOKS, 'relationship_importance', classifier)
+    result = _dash.api_person('c_a8f3e2')
+    assert result['importance']['tier'] == 'vvip'
+    assert result['controls']['vip'] is False
+    assert calls[0]['canonical_id'] == 'c_a8f3e2'

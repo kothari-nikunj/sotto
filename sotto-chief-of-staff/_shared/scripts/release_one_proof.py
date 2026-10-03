@@ -199,12 +199,14 @@ def build_report(data_root=None, days=30, now=None, *, complete_days=False, time
         if not isinstance(continuity, dict):
             invalid_step_metadata += 1
             continue
-        if continuity.get("status") == "ok":
-            successful_continuity += 1
         proof_envelope = continuity.get("proof") or {}
         proof = proof_envelope.get("loop_updates") if isinstance(proof_envelope, dict) else None
-        if continuity.get("status") != "ok":
+        # learn_step marks a finished pass "partial" when it rejected proposals; with its proof it
+        # is a completed pass, and dropping it would make the rejection rate read zero.
+        if not (continuity.get("status") == "ok"
+                or (continuity.get("status") == "partial" and proof_envelope)):
             continue
+        successful_continuity += 1
         if (not isinstance(proof_envelope, dict)
                 or proof_envelope.get("coverage") != "exact_resolver_outcomes"
                 or not isinstance(proof, dict)):

@@ -38,8 +38,8 @@ def test_quiet_lifecycle_preserves_channel_access_and_reply_behavior(tmp_path, c
     assert result['compression'] == {**original['compression'], 'progress_notices': False}
     assert result['display'] == {
         **original['display'], 'busy_ack_enabled': False, 'show_reasoning': False,
-        'memory_notifications': 'off', 'runtime_footer': {'enabled': False},
-        'platforms': {'photon': {'show_reasoning': False, 'memory_notifications': 'off',
+        'memory_notifications': 'off', 'long_running_notifications': 'generic', 'runtime_footer': {'enabled': False},
+        'platforms': {'photon': {'show_reasoning': False, 'memory_notifications': 'off', 'long_running_notifications': 'generic',
                                'runtime_footer': {'enabled': False, 'fields': ['model']}, 'streaming': False}},
     }
     assert 'local' not in result['platforms']
@@ -54,7 +54,7 @@ def test_new_install_keeps_both_chat_channels_quiet_without_enabling_them(tmp_pa
     module.reconcile(tmp_path / 'fresh')
     assert yaml.safe_load((tmp_path / 'fresh/config.yaml').read_text()) == {
         'display': {'busy_ack_enabled': False, 'show_reasoning': False,
-                    'memory_notifications': 'off', 'runtime_footer': {'enabled': False}},
+                    'memory_notifications': 'off', 'long_running_notifications': 'generic', 'runtime_footer': {'enabled': False}},
         'compression': {'progress_notices': False},
         'platforms': {'photon': {'gateway_restart_notification': False},
                       'telegram': {'gateway_restart_notification': False}},

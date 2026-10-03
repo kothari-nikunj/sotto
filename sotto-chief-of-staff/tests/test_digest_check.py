@@ -593,6 +593,91 @@ def test_same_display_name_and_matching_time_do_not_merge_distinct_threads(monke
     assert len(seen) == 2 and all(len(c['messages']) == 1 for c in seen)
 
 
+def test_proxy_admission_busy_preserves_digest_window_for_uncharged_retry(tmp_path, monkeypatch):
+    import urllib.error
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    _write_queue(tmp_path, [_entry(i, sender=f'Person {i}') for i in range(8)])
+    def busy(_conversations):
+        raise urllib.error.HTTPError(
+            'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+            429, 'private response', {'X-Sotto-Admission': 'busy'}, None)
+    monkeypatch.setattr(dc, 'review_conversations', busy)
+    result = dc.run_check(NOW)
+    assert result == {'deliver': False, 'status': 'admission_busy', 'admission_busy': True}
+    assert dc.read_stamp() is None
+    assert len(dc.entries_since(None)) == 8
+
+
+def test_single_unreviewed_triage_busy_item_gets_digest_review_after_busy_retry(tmp_path, monkeypatch):
+    import urllib.error
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    _write_queue(tmp_path, [_entry(991, sender='Sarah Chen', cls='admission_busy',
+                                  text='Please call about the launch')])
+    calls = []
+    def review(conversations):
+        calls.append(conversations)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                429, 'private response', {'X-Sotto-Admission': 'busy'}, None)
+        return [{'id': 0, 'class': 'actionable', 'sender_role': 'person',
+                 'why': 'Launch call needs a reply'}]
+    monkeypatch.setattr(dc, 'review_conversations', review)
+    first = dc.run_check(NOW)
+    assert first['admission_busy'] is True and dc.read_stamp() is None
+    assert len(dc.entries_since(None)) == 1
+    second = dc.run_check(NOW + timedelta(minutes=1))
+    assert second['deliver'] is True
+    assert second['items'][0]['sender'] == 'Sarah Chen'
+    assert len(calls) == 2 and dc.read_stamp() is None  # delivery, not review, commits coverage
+
+
+def test_unreviewed_triage_busy_item_survives_digest_review_cap(monkeypatch):
+    entries = [_entry(0, sender='Sarah Chen', cls='admission_busy', text='Please call today')]
+    entries += [_entry(i, sender=f'Person {i}', cls='ambient') for i in range(1, 102)]
+    reviewed = []
+    def review(conversations):
+        reviewed.extend(conversations)
+        return [{'id': row['id'], 'class': 'actionable', 'sender_role': 'person',
+                 'why': 'Needs attention'} for row in conversations]
+    monkeypatch.setattr(dc, 'review_conversations', review)
+    out = dc.check(entries)
+    assert out['deliver'] is True
+    assert len(reviewed) == dc.REVIEW_CONVERSATION_CAP
+    assert reviewed[0]['sender'] == 'Sarah Chen'
+    assert sum(row['sender'] == 'Sarah Chen' for row in reviewed) == 1
+
+
+def test_over_hundred_busy_items_keep_coverage_open_until_remaining_ids_reviewed(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    entries = [_entry(i, sender=f'Person {i}', cls='admission_busy') for i in range(101)]
+    _write_queue(tmp_path, entries)
+    batches = []
+    def review(conversations):
+        batches.append([row['sender'] for row in conversations])
+        return [{'id': row['id'], 'class': 'actionable', 'sender_role': 'person',
+                 'why': 'Needs attention'} for row in conversations]
+    monkeypatch.setattr(dc, 'review_conversations', review)
+    first = dc.run_check(NOW)
+    assert first['deliver'] and 'coverage_until' not in first
+    assert len(batches[0]) == 100 and dc.read_stamp() is None
+    unreviewed = {f'Person {i}' for i in range(101)} - set(batches[0])
+    assert len(unreviewed) == 1
+    assert dc.accept_items(first['item_ids'])
+    second = dc.run_check(NOW)
+    assert second['deliver'] and unreviewed <= set(batches[1])
+    assert set(first['item_ids']).isdisjoint(second['item_ids'])
+    assert dc.read_stamp() is None
+
+
 def test_provider_failure_preserves_review_window_and_success_can_ack_exact_cutoff(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     _write_queue(tmp_path, [_entry(1, cls='actionable', minutes_ago=1)])

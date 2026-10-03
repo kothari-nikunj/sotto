@@ -231,8 +231,13 @@ def _counts_toward_threshold(entry: dict) -> bool:
 
 
 def _band(entry: dict) -> int:
-    """Item priority band: 0 = known deferred-actionable, 1 = known ambient, 2 = the rest
-    (unknown/group/error/Sotto's own held nudges) — below the fold."""
+    """Review order: 0 = deferred asks or never-judged busy items, 1 = ambient, 2 = other.
+
+    A busy item has no semantic judgment; ranking it first only guarantees that the bounded
+    review sees it before delivery can commit the digest's coverage window.
+    """
+    if _s(entry.get('verdict_class')) == 'admission_busy':
+        return 0
     if _from_a_person(entry):
         cls = _s(entry.get("verdict_class"))
         if cls in ACTIONABLE_CLASSES:
@@ -286,6 +291,7 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
                   and e.get("verdict") != "drop"
                   and not relevance.is_automated_assistant(e.get("event") or {})]
     actionable = any((_s(e.get('verdict_class')) in ACTIONABLE_CLASSES
+                      or _s(e.get('verdict_class')) == 'admission_busy'
                       or _s(e.get('held_class')) in ('urgent', 'actionable', 'scheduling_ask'))
                      and _s((e.get('event') or {}).get('source')) != PROACTIVE_SOURCE
                      for e in candidates)
@@ -357,10 +363,18 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
                 deadlines.append(descriptor['valid_until'])
         result = {'deliver': True, 'items': items, 'item_ids': [i['item_id'] for i in items],
                   'effects': eligibility, 'valid_until': min(deadlines) if deadlines else None}
+        if len(ranked_all) > REVIEW_CONVERSATION_CAP:
+            # queue.jsonl plus the accepted-item IDs are the durable replay cursor. Do not offer
+            # a time stamp while any conversation, especially an unjudged busy row, sits beyond
+            # the bounded review slice; the next check must see those remaining identities.
+            result['_review_incomplete'] = True
         if track_review:
             result['_reviewed_silent'] = reviewed_silent
         return result
     except Exception as err:  # noqa: BLE001 — a failed relevance review must never become a digest
+        from gemini_transport import proxy_admission_busy
+        if proxy_admission_busy(err):
+            return {"deliver": False, "status": "admission_busy", "admission_busy": True}
         if isinstance(err, ModelBudgetUnavailableError) or proxy_budget_exhausted(err):
             return {"deliver": False, "status": "budget_exhausted", "budget_exhausted": True}
         print(f"[digest] relevance review failed ({type(err).__name__}); staying silent", file=sys.stderr)
@@ -372,15 +386,17 @@ def run_check(now: datetime) -> dict:
     entries = [e for e in entries_since(read_stamp())
                if (_parse_iso(e.get('ts')) or now) <= now]
     result = check(entries, track_review=True)
-    if result.get('retryable') or result.get('budget_exhausted'):
+    if result.get('retryable') or result.get('budget_exhausted') or result.get('admission_busy'):
         return result
     reviewed_silent = result.pop('_reviewed_silent', [])
+    review_incomplete = result.pop('_review_incomplete', False)
     if reviewed_silent and not accept_items(reviewed_silent):
         return {"deliver": False, "status": "retry", "retryable": True,
                 "error": "DigestReceiptError"}
     if result.get('deliver'):
-        result['coverage_until'] = now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    elif not result.pop('_review_incomplete', False):
+        if not review_incomplete:
+            result['coverage_until'] = now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    elif not review_incomplete:
         advance_stamp(now)  # successfully reviewed silence is a completed window
     return result
 
@@ -400,6 +416,9 @@ def main():
     print(json.dumps(result))
     if result.get("budget_exhausted"):
         sys.exit(MODEL_BUDGET_EXIT)
+    if result.get("admission_busy"):
+        from work_queue import MODEL_ADMISSION_BUSY_EXIT
+        sys.exit(MODEL_ADMISSION_BUSY_EXIT)
     if result.get("retryable"):
         sys.exit(75)
 

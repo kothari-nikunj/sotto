@@ -93,6 +93,22 @@ def proxy_budget_exhausted(error):
         return False
 
 
+def proxy_admission_busy(error):
+    """Identify an unbilled proxy refusal without consuming the provider error body."""
+    if (not isinstance(error, urllib.error.HTTPError) or error.code != 429
+            or error.headers.get('X-Sotto-Admission') != 'busy'
+            or not (managed() or background_proxy_required())):
+        return False
+    try:
+        url = error.geturl()
+        base = _proxy_base()
+        return (url == base + '/openai/v1/chat/completions'
+                or bool(re.fullmatch(re.escape(base) +
+                                     r'/native/v1beta/models/[A-Za-z0-9._-]+:generateContent', url)))
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 class BackgroundModelHeldError(RuntimeError):
     """Background learning has no explicitly authorized model-spend path."""
 

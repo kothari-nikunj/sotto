@@ -1486,6 +1486,10 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
         ctx['relevance_deadline'] = _s(e.pop('_sotto_relevance_deadline', ''))
         return verdict, cls, reason, name
     except Exception as err:  # noqa: BLE001
+        if _gemini.gemini_transport.proxy_admission_busy(err):
+            # The original event remains in the durable ambient queue for digest/brief review.
+            # A capacity refusal is not a semantic verdict about its message.
+            return "queue", "admission_busy", "tier1 model admission busy", name
         return "queue", "ambient", f"tier1 error → queue: {err}", name
 
 

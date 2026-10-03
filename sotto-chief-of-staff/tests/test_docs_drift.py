@@ -367,6 +367,10 @@ def test_proxy_capacity_guards():
           _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW'))
     _same('proxy.rate_window_seconds', R['proxy']['rate_window_seconds'],
           _literal_constant(model_proxy, 'RATE_WINDOW_SECONDS'))
+    shared = _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW')
+    tenant = shared * _literal_constant(model_proxy, 'TENANT_SHARE_PERCENT') // 100
+    _anchor(f'{tenant} admitted requests per tenant and {shared} across tenants in a rolling '
+            '60-second window')
 
 
 def test_account_broker_capacity_guards():
@@ -384,7 +388,6 @@ def test_account_broker_capacity_guards():
     _anchor('50 unverified pending sign-ins')
     _anchor('500 total sign-in sessions')
     _anchor('five proof attempts')
-    _anchor('60 admitted requests per tenant in a rolling 60-second window')
 
 
 def test_the_learn_step_is_one_command_with_a_receipt():
@@ -562,13 +565,10 @@ def test_chase_and_birthday_cadence():
 # ── the attachment lane ─────────────────────────────────────────────────────────────────────────
 
 def test_the_stale_sent_lane_and_the_rsvp_ask():
-    """Three rules a chief of staff would not need told (Sep 2026): an email you sent that nobody
-    answered is a debt owed to you; a meeting you declined is not on your day; a meeting you haven't
-    answered is an ask. The stale lane's silence clock IS the chase clock — one number, twice."""
+    """Stale sent mail is candidate context; RSVP rules still mirror their documented constants."""
     gg = _load("dd_gather_google", PACK, "_shared", "scripts", "gather_google.py")
     cb = _load("dd_compose_brief", PACK, "_shared", "scripts", "compose_brief.py")
     _same("stale.silent_days", R["stale"]["silent_days"], gg.STALE_SILENT_DAYS)
-    _same("stale.silent_days (the chase clock)", gg.STALE_SILENT_DAYS, cr.CHASE_AFTER_DAYS)
     _same("stale.max_days", R["stale"]["max_days"], gg.STALE_MAX_DAYS)
     _same("stale.max_threads", R["stale"]["max_threads"], gg.STALE_MAX_THREADS)
     _same("calendar.rsvp_ask_hours", R["calendar"]["rsvp_ask_hours"], cb.RSVP_ASK_HOURS)
@@ -580,6 +580,18 @@ def test_the_stale_sent_lane_and_the_rsvp_ask():
     _anchor(f"within {cb.RSVP_ASK_HOURS} hours")
     _anchor("A meeting you declined is not on your day")
     _anchor("They replied, they just haven't delivered")
+    _anchor("An email you sent that nobody answered is context, not a debt")
+    for page in ("playground-architecture.html", "playground-feedback-loops.html"):
+        with open(os.path.join(DOCS, page), encoding="utf-8") as f:
+            assert "_stale_debt_actions" not in f.read(), f"{page} names a removed debt minter.\n{RULE}"
+
+
+def test_loop_context_refresh_caps():
+    """The carried-over-loop Gmail refresh states its caps in prose, built from its constants."""
+    lc = _load("dd_loop_context", PACK, "_shared", "scripts", "loop_context.py")
+    _anchor(f"at most {lc.MAX_TARGETS} exact targets")
+    _anchor(f"{lc.MAX_REQUESTS} requests, {lc.MAX_MESSAGES} messages and {lc.MAX_CONTEXT_CHARS:,} characters")
+    _anchor(f"no new read after {lc.READ_BUDGET_SECONDS} seconds")
 
 
 def test_attachment_caps():
@@ -1288,3 +1300,15 @@ def test_notification_context_policy_is_documented():
     _anchor('held asks and due commitments get current thread and calendar context.')
     _anchor('Exact source-message evidence also suppresses an ask')
     _anchor('the cloud reader cannot use the Mac browser session')
+
+
+def test_the_relationship_state_row_names_every_dashboard_reader():
+    """The person page reads relationship_state.json for automatic importance, not only the
+    attention queue; both renderings of the shared-file map must name that reader."""
+    assert 'relationship_state.json' in inspect.getsource(dsh.api_person)
+    with open(os.path.join(DOCS, "ARCHITECTURE.md"), encoding="utf-8") as f:
+        arch = next(line for line in f if line.startswith("| `knowledge/relationship_state.json`"))
+    with open(os.path.join(DOCS, "playground-architecture.html"), encoding="utf-8") as f:
+        page = next(line for line in f if '["knowledge/relationship_state.json"' in line)
+    for row in (arch, page):
+        assert "person page" in row and "automatic importance" in row, f"{row}\n{RULE}"

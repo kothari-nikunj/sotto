@@ -11,9 +11,13 @@ dr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dr)
 
 
-def test_dry_run_full_loop(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_dry_run_full_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     bundle = json.load(open(os.path.join(ROOT, "tools", "fixtures", "brief_bundle.json")))
+    # Simulate the separate positive critic verdict, not a self-authored receipt in model JSON.
+    cr = dr._load("morning-brief/scripts/continuity_resolve.py", "dry_run_critic_fixture")
+    for update in bundle.get("loop_updates", []):
+        update["criticReceipt"] = cr.record_critic_approval(update)
     result = dr.run(bundle)
 
     # brief has all four sections rendered

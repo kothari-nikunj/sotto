@@ -286,6 +286,22 @@
     return typeof v === "number" && isFinite(v) ? v : 0;
   }
 
+  /* The automatic-importance note: the classifier's reason, then whichever of its counts are
+     nonzero (a meeting-based tier can have no message days), then who controls what. */
+  function importanceNote(importance) {
+    var reason = str(importance.reason);
+    var days = num(importance.active_days);
+    var held = num(importance.held_meetings);
+    var windowDays = num(importance.window_days);
+    var counts = [];
+    if (days > 0) counts.push(days + (days === 1 ? " active day" : " active days"));
+    if (held > 0) counts.push(held + (held === 1 ? " meeting held" : " meetings held"));
+    return (reason ? reason + ". " : "") +
+      (counts.length && windowDays > 0
+        ? counts.join(" and ") + " in the last " + windowDays + " days. " : "") +
+      "Updates with your activity; quiet-hours permissions stay under your control.";
+  }
+
   function isDateOnly(v) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(v || ""));
   }
@@ -2326,10 +2342,20 @@
     muteRow.appendChild(muteActions);
     ledger.appendChild(muteRow);
 
+    var importance = data.importance || {};
+    if (importance.tier === "vip" || importance.tier === "vvip") {
+      var learnedRow = el("div", "ledger-row");
+      var learnedMain = el("div", "row-main");
+      learnedMain.appendChild(el("div", "row-title", "Automatic " + importance.tier.toUpperCase()));
+      learnedMain.appendChild(el("div", "row-note", importanceNote(importance)));
+      learnedRow.appendChild(learnedMain);
+      ledger.appendChild(learnedRow);
+    }
+
     var vipRow = el("div", "ledger-row");
     var vipMain = el("div", "row-main");
     var vipLine = el("div", "row-line");
-    vipLine.appendChild(el("div", "row-title", "VIP"));
+    vipLine.appendChild(el("div", "row-title", "VIP quiet-hours override"));
     vipLine.appendChild(hintBtn(
       "A VIP's missed call reaches you even during quiet hours.", vipMain));
     vipMain.appendChild(vipLine);

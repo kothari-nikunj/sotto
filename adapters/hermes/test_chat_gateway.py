@@ -39,6 +39,54 @@ def test_loader_never_writes_persisted_config(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_gateway_model_attribution_is_scoped_to_exact_proxy_endpoint():
+    class Request:
+        def __init__(self, url):
+            self.url = url
+            self.headers = {}
+
+    class Client:
+        def send(self, request, *args, **kwargs):
+            return dict(request.headers)
+
+    class AsyncClient:
+        async def send(self, request, *args, **kwargs):
+            return dict(request.headers)
+
+    httpx = SimpleNamespace(Client=Client, AsyncClient=AsyncClient)
+    importer = lambda name: httpx
+    chat_gateway.install_model_attribution('https://proxy.example', importer)
+    # Reinstall must not stack wrappers or stamp a different ID twice.
+    chat_gateway.install_model_attribution('https://proxy.example', importer)
+    target = 'https://proxy.example/openai/v1/chat/completions'
+    headers = Client().send(Request(target))
+    assert headers['X-Sotto-Workload'] == 'chat'
+    assert len(headers['X-Sotto-Operation']) == 64
+    assert headers['X-Sotto-Attempt'] == '1'
+    assert Client().send(Request(target))['X-Sotto-Operation'] != headers['X-Sotto-Operation']
+    assert Client().send(Request(target + '?elsewhere=1')) == {}
+    assert Client().send(Request('https://other.example/openai/v1/chat/completions')) == {}
+    assert asyncio.run(AsyncClient().send(Request(target)))['X-Sotto-Workload'] == 'chat'
+
+
+def test_main_chat_turn_carries_hashed_session_without_changing_other_routes():
+    class Transport:
+        def build_kwargs(self, model, messages, tools=None, **params):
+            return {'model': model, 'messages': messages, 'extra_headers': {'Existing': 'kept'}}
+
+    module = SimpleNamespace(ChatCompletionsTransport=Transport)
+    chat_gateway.install_session_attribution('https://proxy.example', lambda name: module)
+    chat_gateway.install_session_attribution('https://proxy.example', lambda name: module)
+    result = Transport().build_kwargs('model', [], base_url='https://proxy.example/openai/v1',
+                                      session_id='private-session-key')
+    assert result['extra_headers']['Existing'] == 'kept'
+    assert result['extra_headers']['X-Sotto-Session'] == chat_gateway.hashlib.sha256(
+        b'private-session-key').hexdigest()
+    other = Transport().build_kwargs('model', [], base_url='https://other.example/openai/v1',
+                                     session_id='private-session-key')
+    assert 'X-Sotto-Session' not in other['extra_headers']
+
+
 @pytest.mark.parametrize('url', [
     'http://localhost:8787/mcp', 'http://127.0.0.1:8788/mcp',
     'https://127.0.0.1:8787/mcp', 'http://127.0.0.1:8787/mcp/',
@@ -175,6 +223,28 @@ def test_main_erases_child_environment_and_runs_pinned_gateway(tmp_path, monkeyp
     assert seen['argv'] == [str(entrypoint), 'gateway']
     assert seen['env'] == {'PORT': '9999', 'HOME': '/home/sotto'}
     assert seen['loaded']['sotto-local']['headers']['X-Sotto-Chat-Send'] == 'private'
+
+
+def test_optional_attribution_interface_drift_keeps_managed_gateway_available(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'path', list(sys.path))
+    entrypoint = tmp_path / 'hermes'
+    entrypoint.write_text('# fixture')
+    env = {'SOTTO_CHAT_SEND_TOKEN': 'private', 'SOTTO_MODEL_PROXY_URL': 'https://proxy.example'}
+    loader = SimpleNamespace(_load_mcp_config=lambda: {'sotto-local': {
+        'url': 'http://127.0.0.1:8787/mcp', 'headers': {}}})
+    health = fake_health_module()
+    seen = []
+    def importer(name):
+        if name == 'tools.mcp_tool_config':
+            return loader
+        if name == 'tools.mcp_tool_health':
+            return health
+        raise ImportError('private upstream details')
+    chat_gateway.main(env=env, importer=importer,
+                      run_path=lambda path, run_name: seen.append((path, run_name)),
+                      nondumpable_fn=lambda: None, root=tmp_path, entrypoint=entrypoint)
+    assert seen == [(str(entrypoint), '__main__')]
+    assert 'private upstream details' not in capsys.readouterr().err
 
 
 def test_missing_token_or_pinned_loader_fails_closed(tmp_path, monkeypatch):

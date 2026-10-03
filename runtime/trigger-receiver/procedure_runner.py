@@ -13,6 +13,10 @@ class ProcedureModelBudgetError(RuntimeError):
     """A declared model-capable child reported typed budget exhaustion."""
 
 
+class ProcedureModelAdmissionBusyError(RuntimeError):
+    """A declared model-capable child reported an unbilled proxy capacity refusal."""
+
+
 def run(request):
     pack = Path(request['pack'])
     sys.path.insert(0, str(pack / '_shared/lib'))
@@ -22,9 +26,11 @@ def run(request):
         result = subprocess.run([sys.executable, str(pack / relative), *map(str, args)],
                                 capture_output=True, text=True, timeout=600)
         if relative == 'event-triage/scripts/digest_check.py':
-            from work_queue import MODEL_BUDGET_EXIT
+            from work_queue import MODEL_BUDGET_EXIT, MODEL_ADMISSION_BUSY_EXIT
             if result.returncode == MODEL_BUDGET_EXIT:
                 raise ProcedureModelBudgetError('digest model allowance reached')
+            if result.returncode == MODEL_ADMISSION_BUSY_EXIT:
+                raise ProcedureModelAdmissionBusyError('digest model admission busy')
         if result.returncode and result.returncode == incomplete_exit:
             # The script's own "not done yet, ask again" verdict (EX_TEMPFAIL): a retry with the
             # same inputs is the right next step, so it is named as such rather than as a crash.
@@ -106,16 +112,23 @@ def main():
         print(run(json.loads(sys.argv[1])))
     except Exception as error:
         budget_exhausted = isinstance(error, ProcedureModelBudgetError)
+        admission_busy = isinstance(error, ProcedureModelAdmissionBusyError)
         if not budget_exhausted:
             # Malformed requests can fail before run() adds the pack's shared library to
             # sys.path. Their original diagnostic must not be replaced by an import failure.
             try:
-                from gemini_transport import ModelBudgetUnavailableError, proxy_budget_exhausted
+                from gemini_transport import (ModelBudgetUnavailableError, proxy_budget_exhausted,
+                                              proxy_admission_busy)
             except ImportError:
                 pass
             else:
                 budget_exhausted = (isinstance(error, ModelBudgetUnavailableError)
                                     or proxy_budget_exhausted(error))
+                admission_busy = admission_busy or proxy_admission_busy(error)
+        if admission_busy:
+            from work_queue import MODEL_ADMISSION_BUSY_EXIT
+            print('[procedure_runner] model admission busy', file=sys.stderr)
+            return MODEL_ADMISSION_BUSY_EXIT
         if budget_exhausted:
             from work_queue import MODEL_BUDGET_EXIT
             print('[procedure_runner] model allowance reached', file=sys.stderr)

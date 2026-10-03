@@ -369,6 +369,20 @@ def test_deep_research_with_no_provider_answers_nothing():
     assert obj is None and provider == ""     # the Gemini rung isn't even offered without its key
 
 
+def test_deep_research_reports_unbilled_admission_when_no_provider_answers(monkeypatch):
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    busy = HTTPError('https://proxy.example/native/v1beta/models/fixture:generateContent',
+                     429, 'busy', {'X-Sotto-Admission': 'busy'}, None)
+    monkeypatch.setattr(wr.gemini_transport, 'proxy_admission_busy', lambda error: error is busy)
+    with pytest.raises(wr.ResearchAdmissionBusyError):
+        wr.deep_research('prompt', {}, 60, lambda *args: (_ for _ in ()).throw(busy))
+
+    monkeypatch.setenv('EXA_API_KEY', 'fixture')
+    monkeypatch.setattr(wr, '_exa_deep', lambda *args: {'attendees': [{'email': 'a@example.com'}]})
+    rows, provider = wr.deep_research('prompt', {}, 60, lambda *args: (_ for _ in ()).throw(busy))
+    assert provider == 'exa' and rows['attendees'][0]['email'] == 'a@example.com'
+
+
 def test_gemini_schema_keyword_is_stripped_for_plain_json_schema_providers():
     # ONE schema constant, three providers: Gemini's OpenAPI-subset `nullable` is not JSON Schema.
     src = {"type": "object", "properties": {"title": {"type": "string", "nullable": True},

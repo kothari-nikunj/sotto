@@ -23,6 +23,7 @@ MAX_ATTEMPTS = 3
 MAX_PROVIDER_RECOVERIES = 4
 PROVIDER_RETRY_EXIT = 76
 MODEL_BUDGET_EXIT = 77
+MODEL_ADMISSION_BUSY_EXIT = 78
 MODEL_BUDGET_EXHAUSTED = 'model_budget_exhausted'
 RETRYABLE_PROVIDER_CODES = frozenset({429, 500, 502, 503, 504})
 
@@ -63,6 +64,8 @@ def _db(root):
             db.execute('ALTER TABLE jobs ADD COLUMN handoff_attempts INTEGER NOT NULL DEFAULT 0')
         if 'provider_recoveries' not in columns:
             db.execute('ALTER TABLE jobs ADD COLUMN provider_recoveries INTEGER NOT NULL DEFAULT 0')
+        if 'feedback' not in columns:
+            db.execute('ALTER TABLE jobs ADD COLUMN feedback TEXT')
         db.execute('''CREATE TABLE IF NOT EXISTS work_items (
             kind TEXT NOT NULL, item_key TEXT NOT NULL, job_id TEXT NOT NULL,
             PRIMARY KEY(kind,item_key))''')
@@ -90,7 +93,7 @@ def event_item_key(event) -> str:
 
 
 def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, priority=20,
-            item_keys=None, retry_terminal=False):
+            item_keys=None, retry_terminal=False, feedback=None):
     """Commit before acknowledging ingress/removing a held item. Replays keep one ID."""
     now = time.time()
     identity = str(key) if key is not None else secrets.token_hex(16)
@@ -136,16 +139,16 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
                     raise RuntimeError(f"work request is terminal ({terminal['status']})")
                 db.execute("DELETE FROM work_items WHERE job_id=?", (job_id,))
         db.execute('''INSERT OR IGNORE INTO jobs
-            (id,kind,payload,status,created,due,valid_until,priority)
-            VALUES (?,?,?,'pending',?,?,?,?)''',
+            (id,kind,payload,status,created,due,valid_until,priority,feedback)
+            VALUES (?,?,?,'pending',?,?,?,?,?)''',
             (job_id, kind, encoded, now, now if not_before is None else not_before,
-             valid_until, priority))
+             valid_until, priority, json.dumps(feedback) if feedback else None))
         if terminal and terminal['status'] in ('failed', 'expired'):
             db.execute('''UPDATE jobs SET kind=?,payload=?,status='pending',created=?,due=?,
                        valid_until=?,priority=?,attempts=0,owner=NULL,lease_until=NULL,result=NULL,
-                       handoff_attempts=0,provider_recoveries=0,error=NULL,finished=NULL WHERE id=?''',
+                       handoff_attempts=0,provider_recoveries=0,error=NULL,finished=NULL,feedback=? WHERE id=?''',
                        (kind, encoded, now, now if not_before is None else not_before,
-                        valid_until, priority, job_id))
+                        valid_until, priority, json.dumps(feedback) if feedback else None, job_id))
         if item_keys is not None:
             db.executemany('INSERT OR IGNORE INTO work_items(kind,item_key,job_id) VALUES (?,?,?)',
                            [(kind, k, job_id) for k in item_keys])
@@ -288,6 +291,35 @@ def release(root, job_id, owner, now=None):
                           ''', (now, job_id, owner)).rowcount == 1
 
 
+def defer(root, job_id, owner, *, delay_seconds=60, max_age_seconds=None, now=None):
+    """Release known unbilled contention with a bounded due date, without spending a fault attempt.
+
+    Return pending/ready/expired or None for a stale lease. The original relevance deadline is
+    never extended. Callers can put a finite age on work admitted without a deadline.
+    """
+    now = time.time() if now is None else now
+    due = now + max(1, delay_seconds)
+    with _db(root) as db:
+        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner=? AND status='leased'",
+                         (job_id, owner)).fetchone()
+        if row is None:
+            return None
+        deadline = row['valid_until']
+        if deadline is None and max_age_seconds is not None:
+            deadline = row['created'] + max_age_seconds
+        if deadline is not None and due >= deadline:
+            db.execute("""UPDATE jobs SET status='expired',payload='{}',result=NULL,
+                       owner=NULL,lease_until=NULL,error='retry would exceed relevance deadline',
+                       finished=? WHERE id=?""", (now, job_id))
+            return 'expired'
+        status = 'ready' if row['result'] is not None else 'pending'
+        db.execute("""UPDATE jobs SET status=?,
+                   attempts=max(0,attempts-?),handoff_attempts=max(0,handoff_attempts-?),
+                   owner=NULL,lease_until=NULL,due=? WHERE id=?""",
+                   (status, int(row['result'] is None), int(row['result'] is not None), due, job_id))
+        return status
+
+
 def active_job(root, kind, label):
     """The one non-terminal job carrying this label (its payload's `label`), or None."""
     with _db(root) as db:
@@ -342,3 +374,17 @@ def status(root):
 def get(root, job_id):
     with _db(root) as db:
         return _decode(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+
+
+def feedback_jobs(root):
+    """Terminal work with opt-in, content-free delivery feedback; retained with its queue row."""
+    with _db(root) as db:
+        rows = db.execute("SELECT id,status,created,finished,feedback FROM jobs "
+                          "WHERE feedback IS NOT NULL AND status IN ('done','failed','expired')").fetchall()
+        return [{**dict(row), 'feedback': json.loads(row['feedback'])} for row in rows]
+
+
+def clear_feedback(root, job_id):
+    """Only after the outbox durably owns the notice, or delivery needs no notice."""
+    with _db(root) as db:
+        db.execute('UPDATE jobs SET feedback=NULL WHERE id=?', (job_id,))

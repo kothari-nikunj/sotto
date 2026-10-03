@@ -1,7 +1,7 @@
 # Visual briefs and meeting backgrounds
 
 One shared renderer turns an already composed brief or focused meeting prep into exactly four
-1080 × 1920 PNG cards. Cloud and self-host ship identical templates, fonts, and content selection.
+1080 × 1920 PNG cards (up to 1080 × 2560 for crowded briefs). Cloud and self-host ship identical templates, fonts, and content selection.
 The first version quotes complete source paragraphs: no extra model, research, hosted renderer,
 or new memory. It does not improve a weak relevance decision by disguising it as a card.
 
@@ -12,6 +12,10 @@ a model omitting the schedule cannot turn a meeting-filled day into a thin text-
 The five-line preview includes the nearest remaining meetings and a slot for the nearest birthday,
 with further birthdays filling spare lines. Calendar dates and birthdays use the brief's local date.
 Explicit calendar mutes and source permissions are honored before this final pass.
+Agenda cards say **Coming up** when the brief's greeting is "Good evening" (composed from 5 PM
+local time, whatever the brief kind), with each row retaining its source-derived date; earlier
+briefs keep **Your day**. Leading bold labels tolerate whitespace inside the emphasis
+markers, so a padded label does not print literal asterisks in Messages or on a card.
 
 Morning and evening cards cover needs-you, today, and calendar highlights. Every action, calendar event, and follow-up paragraph in the composed brief
 must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent offers,
@@ -20,7 +24,7 @@ shrinking. Layouts that already fit keep their existing section pages. A crowded
 at complete paragraph boundaries using the same font and height calculation as rendering. Adjacent
 needs-you and today sections can share a labelled card to leave room for follow-ups on two cards;
 calendar rows stay together in their own layout. Every selected paragraph and source offset survives.
-If the result still cannot form exactly four readable cards, the original text is sent instead.
+If the usual height still overflows, briefs try a bounded 2560px canvas at the same 1080px width and unchanged font sizes. Optional quiet-loop expansion still uses the ordinary height, so the extra space does not invite more filler. All four photos use that height; paragraph provenance and calendar layout remain intact. If this still cannot form exactly four readable cards, the original text is sent instead.
 
 ## Try it without changing scheduled messages
 
@@ -103,7 +107,7 @@ Calendar cards start directly with their day groups and meetings. Legacy calenda
 
 Cards and captions use no em dashes; canonical source text remains unchanged. Calendar preview lines may carry ` | Location: <exact event location>`, rendered in smaller text under the meeting title and wrapped at measured word boundaries when needed. The shared composer receives the event location and is instructed to preserve supplied physical locations only. Missing locations remain absent. Wrapped locations consume their measured row height; the complete brief falls back to text only when the resulting page cannot fit at the normal readable sizes.
 
-Readability: one Inter family, four sizes (76px title, 48px body/meeting title, 36px subtitle/section/time/location, 28px date/footer) and two weights (400, 650). Paragraph gaps use 24px where space permits and tighten to no less than 12px based on measured line wrapping. Open-item count lines use the 36px supporting-text size; action paragraphs stay at 48px. Section labels are separated from the preceding paragraphs. The four-card gallery remains unchanged. Content that cannot fit at those minimum gaps still falls back to text. Receiver rendering failures emit a content-free `visual_brief_fallback` diagnostic with the error class. Brief cards carry a fixed time-of-day brief label and the source date. Birthday rows use plain headings such as “Birthdays today” or “Birthdays tomorrow”, including archived parenthesized birthday formats. The decorative cake is not sent to a font that cannot render it. Rows get 44px extra separation after meetings. Text colors meet 4.5:1 against their background; small text never uses the seal’s decorative opacity.
+Readability: one Inter family, four sizes (76px title, 48px body/meeting title, 36px subtitle/section/time/location, 28px date/footer) and two weights (400, 650). Paragraph gaps use 24px where space permits and tighten to no less than 12px based on measured line wrapping. Open-item count lines use the 36px supporting-text size; action paragraphs stay at 48px. Section labels are separated from the preceding paragraphs. The four-card gallery remains unchanged. Content that cannot fit at those minimum gaps and the bounded taller canvas still falls back to text. Receiver rendering failures emit a content-free `visual_brief_fallback` diagnostic with the error class. Brief cards carry a fixed time-of-day brief label and the source date. Birthday rows use plain headings such as “Birthdays today” or “Birthdays tomorrow”, including archived parenthesized birthday formats. The decorative cake is not sent to a font that cannot render it. Rows get 44px extra separation after meetings. Text colors meet 4.5:1 against their background; small text never uses the seal’s decorative opacity.
 
 Calendar rows recognize date-prefixed times and either colon or dash separators, as well as all-day events.
 Blue time labels, black event titles, explicit day groups, and smaller address lines are preserved across

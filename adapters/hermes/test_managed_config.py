@@ -50,6 +50,10 @@ def test_reconcile_removes_stale_credentials_and_route_overrides(tmp_path):
     assert cfg['onboarding'] == {'profile_build': 'off', 'sotto_quiet_first_contact': True}
     assert cfg['model']['base_url'] == 'https://proxy.example/openai/v1'
     assert cfg['auxiliary']['vision'] == {'provider': 'main', 'model': ''}
+    assert cfg['compression']['threshold_tokens'] == 120_000
+    assert cfg['compression']['proactive_prune_tokens'] == 48_000
+    assert cfg['compression']['abort_on_summary_failure'] is True
+    assert cfg['compression']['min_tail_user_messages'] == 2
     assert cfg['plugins']['enabled'] == ['photon-platform']
     assert 'SOTTO_MODEL_PROXY_TOKEN' in cfg['terminal']['env_passthrough']
     assert not {'BRIDGE_TOKEN', 'SOTTO_SETUP_CODE', 'GOOGLE_AI_API_KEY'} & set(cfg['terminal']['env_passthrough'])

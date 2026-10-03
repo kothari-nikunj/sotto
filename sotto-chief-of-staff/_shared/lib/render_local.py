@@ -43,6 +43,7 @@ from attachments import (  # noqa: E402
 # Mirrors api/src/lib/constants.ts
 DEFERRED_UNREAD_PROMPT_CAP = 15
 EMAIL_BODY_MAX = 30000
+LOOP_EVIDENCE_BODY_MAX = 2000  # an archived row shown only as loop evidence (its excerpt)
 
 
 def build_contact_lookup(contacts: list) -> dict:
@@ -814,11 +815,17 @@ def _is_sent_email(e) -> bool:
 
 
 def _trim_email(e, lookup: dict | None = None) -> dict:
+    from source_context import EVIDENCE_EXCERPT_LABEL, email_evidence_parts
     headers = e.get("headers") or {}
     from_ = headers.get("from") or e.get("from") or ""
     subject = headers.get("subject") or e.get("subject") or ""
     labels = e.get("labelIds") or e.get("labels") or []
-    body = (e.get("body") or e.get("snippet") or "")[:EMAIL_BODY_MAX]
+    parts = email_evidence_parts(e)
+    # An inbox or sent row the loop lane also fetched keeps its whole body: a new ask (or a
+    # completion line) late in the reply must still reach the writer and revise prompts. Only the
+    # excerpt shown for an archived loop row is bounded, and it is the loop lane's own read.
+    body = EVIDENCE_EXCERPT_LABEL.join(parts)[:EMAIL_BODY_MAX]
+    loop_body = (parts[-1] if parts else '')[:LOOP_EVIDENCE_BODY_MAX]
     m = re.search(r"<([^>]+)>", from_)
     sender_email = m.group(1) if m else (from_.strip() if "@" in from_ else "")
     # Reconcile the sender with Apple Contacts (the single biggest cross-channel identity gap):
@@ -832,9 +839,12 @@ def _trim_email(e, lookup: dict | None = None) -> dict:
         "from": from_,
         "resolvedName": resolved_name,
         "to": headers.get("to") or e.get("to") or "",
+        "cc": headers.get("cc") or e.get("cc") or "",
         "subject": subject,
         "date": headers.get("date") or e.get("date") or "",
         "body": body,
+        "_loop_context": e.get('_loop_context') is True,
+        "_loop_context_body": loop_body,
         "senderEmail": sender_email,
         "isSent": "SENT" in labels or bool(e.get("isSent")),
         "isArchived": "INBOX" not in labels if labels else bool(e.get("isArchived")),
@@ -894,12 +904,15 @@ def _format_attachments(attachments) -> str:
 def _format_emails(emails) -> str:
     if not emails:
         return "(no emails)"
-    sent, active, archived = [], [], []
+    sent, active, archived, loop_evidence = [], [], [], []
     for e in emails:
         if e["isSent"]:
             sent.append(e)
         elif e["isArchived"]:
-            archived.append(e)
+            if e.get('_loop_context'):
+                loop_evidence.append({**e, 'body': e.get('_loop_context_body', ''), 'attachments': []})
+            else:
+                archived.append(e)
         else:
             active.append(e)
 
@@ -907,6 +920,8 @@ def _format_emails(emails) -> str:
         flags = []
         if e["isSent"]:
             flags.append("SENT_BY_USER")
+        if e.get('_loop_context'):
+            flags.append('LOOP_EVIDENCE')
         if e["isPrimary"]:
             flags.append("PRIMARY")
         if e["isImportant"]:
@@ -929,6 +944,8 @@ def _format_emails(emails) -> str:
         else:
             addr = f"From: {e['from']}\nSenderEmail: {e['senderEmail']}"
         body = (e.get("body") or "").strip()
+        if e.get('cc'):
+            addr += f"\nCc: {e['cc']}"
         atts = _format_attachments(e.get("attachments"))
         return (f"### {e['subject'] or '(no subject)'}{flag_str}\n{addr}\n"
                 f"Date: {e['date']}\nMessageId: {e.get('messageId') or 'none'}\n"
@@ -946,6 +963,9 @@ def _format_emails(emails) -> str:
                           f"(from: {(e.get('resolvedName') + ' <' + e['senderEmail'] + '>') if e.get('resolvedName') else e['from']})"
                           + (f" [threadId: {e['threadId']}]" if e["threadId"] else "") for e in archived)
         sections.append(f"### Archived/Handled Emails ({len(archived)})\n{lines}")
+    if loop_evidence:
+        sections.append("### Archived emails selected as loop evidence (archive status is not completion)\n"
+                        + "\n\n".join(fmt(e) for e in loop_evidence))
     return "\n\n".join(sections)
 
 
@@ -1460,11 +1480,11 @@ def _format_stale_threads(local) -> str:
         f"- **{t.get('to')}**: \"{t.get('subject')}\" — sent {t.get('daysSinceSent')} days ago ({_s(t.get('sentDate')).split('T')[0]})\n"
         f"  Thread ID: {t.get('threadId')}\n  {t.get('snippet')}"
         for t in visible)
-    return ("### Emails you sent that nobody answered (PRE-COMPUTED from Gmail — authoritative)\n"
-            "Each is a debt owed TO the user; code already records it as a `waiting_on` loop with the\n"
-            "recipient as the counterpart, so do NOT emit an action for it and do NOT re-scan raw\n"
-            "emails for stale threads. Mention one in prose only when today's data adds something\n"
-            "(a meeting with them tomorrow, a related thread).\n\n"
+    return ("### Emails you sent that nobody answered (Gmail candidates)\n"
+            "Silence alone does not establish a debt. Check the original request and subsequent\n"
+            "thread context before proposing a waiting_on action; an introduction, FYI, thanks,\n"
+            "or handoff may need no answer. If the available snippet cannot establish what was\n"
+            "owed and by whom, leave the thread as context rather than opening a loop.\n\n"
             f"{body}\n")
 
 

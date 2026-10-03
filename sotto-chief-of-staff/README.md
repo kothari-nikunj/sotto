@@ -58,6 +58,7 @@ _shared/
   lib/relevance.py                  # shared policy loader + native-model judgment seam
   lib/personal_context.py           # ONE conversation renderer (thread keys, message caps) for triage, digest and learning; --feedback-only prints the owner's usefulness examples
   lib/source_context.py             # authenticated source reads, observation receipts and consent projection
+  lib/local_snapshot.py             # consent-filtered local snapshot resolution shared by brief composition and its runner
   lib/work_queue.py                 # durable accepted work, per-lease ownership and bounded worker admission
   lib/calendar_context.py           # shared human attendees and explicit calendar participation
   lib/delivery_effects.py           # current-item eligibility and replayable post-acceptance effects
@@ -95,6 +96,7 @@ _shared/
   scripts/context_learning.py        # cited durable facts from consented direct-message history
   scripts/dreamer.py                 # bounded evidence selection, duplicate archival and conflict flags
   scripts/gather_google.py           # deterministic Gmail+Calendar gather (CLI or MCP normalize)
+  scripts/loop_context.py            # bounded Gmail refresh of carried-over loops' exact threads/counterparts; context, never a loop-state writer
   scripts/gather_granola.py          # deterministic Granola gather (MCP lane + REST break-glass)
   scripts/google_action.py           # granted capabilities + gated Gmail draft/send and calendar writes
   scripts/research_attendees.py      # batched two-pass attendee research (deep_research capability)

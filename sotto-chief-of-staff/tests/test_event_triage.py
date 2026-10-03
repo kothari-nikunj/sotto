@@ -2583,6 +2583,26 @@ def test_tier1_rides_the_provider_seam(tmp_path, monkeypatch):
     assert out2["verdict"] == "queue"
 
 
+def test_tier1_proxy_busy_keeps_event_in_queue_without_provider_details(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    _seed_snapshot(tmp_path)
+    def busy(*args):
+        raise HTTPError('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                        429, 'private provider reason', {'X-Sotto-Admission': 'busy'}, None)
+    monkeypatch.setattr(te, '_classify_tier1', busy)
+    out = te.triage({'events': [_im('Please review this', rowid=744)]},
+                    now_local=DAY, now_utc=NOW_UTC)
+    assert out['verdict'] == 'queue'
+    assert out['reason'] == 'tier1 model admission busy'
+    assert 'private' not in json.dumps(out)
+    queued = [json.loads(line) for line in (tmp_path / 'events/queue.jsonl').read_text().splitlines()]
+    assert queued[-1]['verdict_class'] == 'admission_busy'
+    assert queued[-1]['event']['text'] == 'Please review this'
+
+
 def test_tier1_masking_hides_identity_but_not_dates():
     """The mask is identity-only: sender name, phones, and emails go; a date-time survives —
     "2026-08-24 10" is classification signal the phone regex would otherwise eat as [phone]."""

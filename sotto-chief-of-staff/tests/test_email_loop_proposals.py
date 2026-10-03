@@ -48,8 +48,14 @@ def _loop(tmp_path, action_type: str, summary: str) -> dict:
 
 def _compose_with_proposal(row: dict, email: dict, source_id: str, snippet: str) -> dict:
     version = loop_version(row)
+    proposed = {"loopId": row["anchor_key"], "loopVersion": version, "status": "resolved",
+                "evidence": [{"sourceType": "email", "sourceId": source_id, "snippet": snippet}]}
 
     def fake_llm(prompt, inputs, system=None, schema=None):
+        if inputs.get("_critic"):
+            # The fixture explicitly approves its supported proposal, not merely an empty patch list.
+            return json.dumps({"patches": [], "score": 90, "summary": "ok",
+                "loop_verdicts": [{"proposal_id": cr.critic_review_receipt(proposed), "verdict": "approve"}]})
         assert f"loop_id: {row['anchor_key']}" in prompt
         assert f"loop_version: {version}" in prompt
         assert f"MessageId: {email['id']}" in prompt
@@ -65,7 +71,7 @@ def _compose_with_proposal(row: dict, email: dict, source_id: str, snippet: str)
 
     return cb.compose({"type": "morning", "now": "2026-06-24T09:00:00Z",
                        "google": {"emails": [email]},
-                       "local": {"action_ledger": [row]}}, llm=fake_llm)
+                       "local": {"action_ledger": [row]}}, llm=fake_llm, critic=True)
 
 
 @pytest.mark.parametrize(("action_type", "summary", "email", "resolution"), [

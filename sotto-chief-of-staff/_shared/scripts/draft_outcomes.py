@@ -251,7 +251,7 @@ def _run_locked(now=None) -> dict:
                         "claimed": identity in claimed, "who": _signal_counterparts(ev)})
 
     summary = {"graded": 0, "executed": 0, "edited_and_sent": 0, "dismissed": 0,
-               "pending": 0, "skipped_unobservable": 0, "style_confirmed": 0}
+               "pending": 0, "unknown": 0, "skipped_unobservable": 0, "style_confirmed": 0}
     window = timedelta(hours=MATCH_WINDOW_HOURS)
     drafts, candidates = [], []
     for draft in _rows(action_links_drafts_path()):
@@ -264,7 +264,7 @@ def _run_locked(now=None) -> dict:
                     and _similarity(draft.get("text", ""), observed["text"]) >= VERBATIM_SIM
                     and _confirm_style_sample(observed["text"], key)):
                 summary["style_confirmed"] += 1
-        if prior and not _legacy_inferred(prior):
+        if prior and prior.get("outcome") != "unknown" and not _legacy_inferred(prior):
             continue
         ts = _parse_ts(draft.get("ts", ""))
         channel = (draft.get("channel") or "").lower()
@@ -309,7 +309,19 @@ def _run_locked(now=None) -> dict:
 
     for index, (_draft, _key, _ts, _prior) in enumerate(drafts):
         if index not in matched_drafts:
-            summary["pending"] += 1
+            _draft, key, ts, _prior = drafts[index]
+            if now >= ts + window:
+                # The observation window is closed. Silence is still not a rejection or a send
+                # failure; record only that this draft's outcome can no longer be observed here.
+                # The stable event_id makes replays idempotent through log_outcome.
+                log_outcome.log({"event_id": "draft-window-expired:" + key,
+                                 "action_id": key, "outcome": "unknown",
+                                 "reason": "observation_window_elapsed",
+                                 "source": "draft_matcher",
+                                 "offered_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                summary["unknown"] += 1
+            else:
+                summary["pending"] += 1
     return summary
 
 

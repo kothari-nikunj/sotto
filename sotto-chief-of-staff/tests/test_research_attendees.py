@@ -1,5 +1,6 @@
 """research_attendees.py — batched grounded research (port of gemini-research.ts): stub, dedup/cap, batching."""
 import importlib.util, json, os
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -255,6 +256,66 @@ def test_deep_batch_failure_never_kills_profile_results(monkeypatch):
     monkeypatch.setattr(ra, "_deep_batch", boom)
     out = ra.research([{"name": "A B", "email": "a@b.com"}], "")
     assert [a["email"] for a in out["attendees"]] == ["a@b.com"]       # Pass A survives Pass B crash
+
+
+def test_busy_research_batch_defers_whole_preparation_without_writing_empty_result(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    monkeypatch.setenv('SOTTO_RESEARCH_DEEP', '0')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ra, '_research_batch',
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            ra.wr.ResearchAdmissionBusyError('busy')))
+    attendees = tmp_path / 'attendees.json'
+    attendees.write_text(json.dumps([{'name': 'A B', 'email': 'a@example.com'}]))
+    output = tmp_path / 'research.json'
+    monkeypatch.setattr('sys.argv', ['research_attendees.py', '--attendees', str(attendees),
+                                     '--out', str(output)])
+    from work_queue import MODEL_ADMISSION_BUSY_EXIT
+    assert ra.cli() == MODEL_ADMISSION_BUSY_EXIT
+    assert not output.exists()
+
+
+def test_successful_research_batch_artifact_is_reused_after_deferred_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ra.wr, 'provider_chain', lambda capability: ['gemini'])
+    calls = []
+    def answer(*args):
+        calls.append(1)
+        return [{'email': 'a@example.com', 'summary': 'Grounded fixture'}]
+    monkeypatch.setattr(ra, '_grounded_json_once', answer)
+    args = ('same prompt', 'fixture-key', {'type': 'object'}, 60, 1024, '{}', 'profile')
+    first = ra._grounded_json(*args)
+    assert first[0]['summary'] == 'Grounded fixture'
+    assert ra._grounded_json(*args) == first
+    assert calls == [1]
+
+
+def test_artifact_lock_timeout_defers_before_provider_call(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import jsonstore
+
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ra.wr, 'provider_chain', lambda capability: ['gemini'])
+    @contextmanager
+    def busy_lock(path):
+        raise TimeoutError('fixture artifact lock contention')
+        yield
+    monkeypatch.setattr(jsonstore, 'lock', busy_lock)
+    monkeypatch.setattr(ra, '_grounded_json_once',
+                        lambda *args: (_ for _ in ()).throw(AssertionError('provider called')))
+    with pytest.raises(ra.wr.ResearchAdmissionBusyError, match='artifact busy'):
+        ra._grounded_json('prompt', 'key', {'type': 'object'}, 60, 1024, '{}', 'profile')
+
+
+def test_provider_timeout_inside_artifact_lock_is_not_reclassified(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(ra.wr, 'provider_chain', lambda capability: ['gemini'])
+    monkeypatch.setattr(ra, '_grounded_json_once',
+                        lambda *args: (_ for _ in ()).throw(TimeoutError('provider timed out')))
+    with pytest.raises(TimeoutError, match='provider timed out'):
+        ra._grounded_json('prompt', 'key', {'type': 'object'}, 60, 1024, '{}', 'profile')
 
 
 def test_deep_horizon_gate():

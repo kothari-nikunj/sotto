@@ -40,6 +40,31 @@ def test_cli_distinguishes_proxy_budget_denial(monkeypatch, capsys, error_code, 
         assert caught.value is error
 
 
+def test_cli_marks_only_typed_proxy_admission_as_uncharged(monkeypatch, capsys):
+    import io
+    import urllib.error
+    from work_queue import MODEL_ADMISSION_BUSY_EXIT
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    url = 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent'
+    for headers, expected in (({'X-Sotto-Admission': 'busy'}, MODEL_ADMISSION_BUSY_EXIT),
+                              ({}, None)):
+        error = urllib.error.HTTPError(url, 429, 'private provider reason', headers,
+                                       io.BytesIO(b'private body'))
+        def fail():
+            raise error
+        monkeypatch.setattr(cb, 'main', fail)
+        if expected is None:
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                cb.cli()
+            assert caught.value is error
+        else:
+            assert cb.cli() == expected
+            captured = capsys.readouterr()
+            assert 'Model admission busy' in captured.err
+            assert 'private' not in captured.err
+
+
 def test_compose_with_injected_llm():
     # inject a fake model (new-style: accepts system/schema): returns a minimal valid extraction
     def fake_llm(prompt, inputs, system=None, schema=None):
@@ -606,6 +631,31 @@ def test_critic_passes_clean_brief_unchanged(monkeypatch):
     assert out["_critic"]["actionable"] == 0
 
 
+def test_critic_receives_task_and_original_clause_for_loop_proposal(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    seen = []
+    def critic_stub(prompt, _options):
+        seen.append(prompt)
+        return '{"patches": [], "score": 90, "summary": "reviewed"}'
+
+    inputs = {'type': 'morning', 'local': {'action_ledger': [{
+        'anchor_key': 'deck-loop', 'status': 'open', 'ask': 'send Dana the deck',
+        'summary': 'Send Dana the deck'}]},
+        'google': {'emails': [{'id': 'mail-1', 'isSent': True,
+            'date': '2026-09-19T10:00:00Z', 'from': 'me@example.com',
+            'to': 'dana@example.com', 'body': "I haven't sent the deck yet."}],
+                   'events': []}}
+    out = {'brief_markdown': 'Brief.', 'actions': [], 'loop_updates': [{
+        'loopId': 'deck-loop', 'status': 'resolved',
+        'reason': 'The deck was sent.', 'evidence': [{
+            'sourceType': 'email', 'sourceId': 'mail-1', 'snippet': 'sent the deck'}]}]}
+    cb.critique_and_revise(out, inputs, llm=critic_stub)
+    assert len(seen) == 1
+    assert 'send Dana the deck' in seen[0]
+    assert "I haven't sent the deck yet." in seen[0]
+    assert 'sent the deck' in seen[0]
+
+
 # --- conditional critic (SOTTO_CRITIC auto/always/off) -------------------------
 
 def _one_call_llm(brief='{"brief_markdown": "# B", "actions": []}'):
@@ -641,6 +691,9 @@ def test_critic_decision_matrix():
     # a measured violation is the one thing the revise pass exists for — it outranks the quiet skip
     assert cb._critic_decision("auto", 0, 0, n_violations=1) == (True, "1 validator violation(s) to fix")
     assert cb._critic_decision("off", 0, 0, n_violations=3)[0] is False                      # off wins
+    # only a reviewed closure is applied, so a proposed closure outranks the quiet skip too
+    assert cb._critic_decision("auto", 0, 0, n_closures=1) == (True, "1 proposed task closure(s) to review")
+    assert cb._critic_decision("off", 0, 0, n_closures=1)[0] is False
     # unknown mode string falls back to auto
     import os as _os
     _os.environ["SOTTO_CRITIC"] = "banana"
@@ -1109,9 +1162,8 @@ def _stale(tid="t-victor", to="Victor Yeung <victor@acme.com>", email="victor@ac
             "sentDate": f"2026-08-{31 - days:02d}T09:00:00Z", "snippet": snippet}
 
 
-def test_stale_sent_threads_become_waiting_on_debts_for_people_you_know(tmp_path, monkeypatch):
-    """An email you sent that nobody answered is a debt owed to you — when it went to someone you
-    know. A stranger, a no-reply address, an intro you made, or a two-word "thanks" is not."""
+def test_stale_sent_threads_are_candidates_not_automatic_debts(tmp_path, monkeypatch):
+    """Silence identifies threads worth considering; it cannot establish who owes what."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     local = {"contacts": [{"name": "Victor Yeung", "emails": ["victor@acme.com"], "phones": []},
                           {"name": "Dana Roe", "emails": ["dana@acme.com"], "phones": []},
@@ -1135,24 +1187,18 @@ def test_stale_sent_threads_become_waiting_on_debts_for_people_you_know(tmp_path
     ]}}
     local["contacts"].append({"name": "Team Acme", "emails": ["team@acme.com"], "phones": []})
     norm = cb._normalize_local(inputs)
-    assert [t["threadId"] for t in norm["stale_threads"]] == ["t-victor", "t-reminder"]
-    actions = cb._stale_debt_actions(norm, cb.build_contact_lookup(local["contacts"]))
-    assert [x["emailThreadId"] for x in actions] == ["t-victor", "t-reminder"]
-    a = actions[0]
-    assert a["type"] == "waiting_on" and a["channel"] == "gmail"
-    assert a["contactName"] == "Victor Yeung" and a["contactIdentifier"] == "victor@acme.com"
-    assert a["emailThreadId"] == "t-victor" and a["created_at"] == "2026-08-27"
-    assert a["contextSummary"] == 'Victor Yeung hasn\'t answered "Re: allocation"'
-    assert "4 days" in a["contextUrgencyReason"]       # the day count lives where it is live, not in frozen prose
-    # …and the prompt names it as already-tracked information, not as a job for the model
+    assert [t["threadId"] for t in norm["stale_threads"]] == [
+        "t-victor", "t-intro", "t-thanks", "t-reminder"]
+    assert not hasattr(cb, "_stale_debt_actions")
+    # The prompt gives the model source context and explicitly leaves the debt decision open.
     p = cb.build_prompt(cb._load_prompt(), inputs)
-    assert "Emails you sent that nobody answered" in p and "do NOT emit an action" in p
-    # a thread the ledger already tracks is neither minted nor rendered
+    assert "Emails you sent that nobody answered" in p
+    assert "Silence alone does not establish a debt" in p
+    # A thread the ledger already tracks is not presented as a second opening candidate.
     tracked = dict(norm, action_ledger=[{"status": "waiting", "action_type": "waiting_on",
                                          "contact_name": "Victor Yeung", "source_thread_id": "t-victor",
                                          "created_at": "2026-08-27", "summary": "the allocation"}])
-    assert [x["emailThreadId"] for x in cb._stale_debt_actions(tracked)] == ["t-reminder"]
-    assert "Re: allocation" not in cb._format_stale_threads(tracked)
+    assert "Thread ID: t-victor" not in cb._format_stale_threads(tracked)
 
 
 def test_minted_actions_never_displace_the_models_row_for_the_same_debt():
@@ -1759,7 +1805,7 @@ def test_still_open_backstop_appends_dropped_urgent_items(monkeypatch):
 
     out = cb.compose(_open_ledger_inputs(), llm=fake_llm, critic=True)
     body = out["brief_markdown"]
-    assert "## Still open\n- **Priya Raman**: Send the diligence memo (1d)" in body
+    assert "## Still open\n- **Priya Raman**: Send the diligence memo (open since " in body
     assert body.index("Still open") < body.index("## Filtered")   # before the last section, not after
     assert out["brief_text"].count("Priya Raman") == 1            # and it survives into the chat text
 
@@ -1804,8 +1850,9 @@ def test_one_line_per_person_however_many_debts(monkeypatch):
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": debts}},
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
-    assert lines == ["- **Spencer Schneier**: send the deck; the Onshore intro; "
-                     "coffee next week (3d)"]
+    assert len(lines) == 1
+    assert lines[0].startswith("- **Spencer Schneier**: send the deck; the Onshore intro; "
+                               "coffee next week (open since ")
     assert body.count("Spencer Schneier") == 1
 
 
@@ -1821,7 +1868,7 @@ def test_a_nameless_row_renders_without_a_placeholder_noun(monkeypatch):
 
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [nameless]}},
                       llm=fake_llm, critic=True)["brief_markdown"]
-    assert "## Still open\n- Return the Redwood term sheet (1d)" in body
+    assert "## Still open\n- Return the Redwood term sheet (open since " in body
     assert "Open loop" not in body
 
 
@@ -1833,7 +1880,8 @@ def test_backstop_never_repeats_what_the_brief_already_said(monkeypatch):
              "channel": "imessage", "chased_count": 1, "created_at": _iso_hours_ago(30),
              "summary": "asked for an intro to Insight Partners"}
     said = ("## Should Handle Today\n**FPV / Piston** wants the Insight Partners intro.\n\n"
-            "**Priya Raman**<!--id:p@x.com|ch:email--> is waiting on the diligence memo.\n")
+            "**Priya Raman**<!--id:p@x.com|ch:email--> is waiting on the diligence memo."
+            " <!--loop:priyaa-->\n")
 
     def fake_llm(prompt, inputs, system=None, schema=None):
         return json.dumps({"brief_markdown": said, "actions": []})
@@ -1850,7 +1898,8 @@ def test_backstop_stays_silent_when_the_brief_named_the_loop(monkeypatch):
     def fake_llm(prompt, inputs, system=None, schema=None):
         return json.dumps({"brief_markdown": handled, "actions": []})
 
-    assert "Still open" not in cb.compose(_open_ledger_inputs(), llm=fake_llm, critic=True)["brief_markdown"]
+    # A handled claim without verified completion cannot hide the still-open ledger task.
+    assert "Still open" in cb.compose(_open_ledger_inputs(), llm=fake_llm, critic=True)["brief_markdown"]
 
 
 def test_dropped_loop_goes_to_the_critic_first(monkeypatch):
@@ -1859,7 +1908,7 @@ def test_dropped_loop_goes_to_the_critic_first(monkeypatch):
     monkeypatch.setenv("SOTTO_CRITIC", "always")
     seen = {}
     fixed = ("## Should Handle Today\n**Priya Raman**<!--id:p@x.com|ch:email--> is still waiting on "
-             "the diligence memo, open two days.\n")
+             "the diligence memo, open two days. <!--loop:priyaa-->\n")
 
     def fake_llm(prompt, inputs, system=None, schema=None):
         if inputs.get("_critic"):
@@ -1998,6 +2047,19 @@ def test_research_unavailable_envelope_reaches_the_prompt_via_compose():
     cb.compose(inputs, llm=fake_llm)
     assert "Data Source Availability" in seen["prompt"]
     assert "Attendee Research (web search)" in seen["prompt"]
+
+
+def test_research_capacity_pending_is_partial_without_claiming_calendar_is_broken():
+    seen = {}
+    def fake_llm(prompt, inputs):
+        seen['prompt'] = prompt
+        return json.dumps({'brief_markdown': '# B', 'actions': []})
+    cb.compose({'type': 'morning', 'google': {'events': []}, 'local': {},
+                'attendee_research': {'attendees': [], 'status': 'capacity_pending'}},
+               llm=fake_llm)
+    assert 'Partial coverage: Attendee Research (web search)' in seen['prompt']
+    assert 'shared model capacity was busy' in seen['prompt']
+    assert 'Unavailable on this device: Attendee Research' not in seen['prompt']
 
 
 def test_cli_attendee_research_envelope_accepted(tmp_path):
@@ -2287,10 +2349,9 @@ def test_evening_receipts_report_what_moved(monkeypatch, tmp_path):
     body = out["brief_markdown"]
     assert ("## What moved today\n"
             "- Reminded you to chase Maya about the contract (second reminder).\n"
-            "- Closed 2 loops — Ron delivered the deck; the RSVP resolved.\n"
-            "- Held 3 interruptions until a better moment.\n"
-            "- Prepped 4 people for tomorrow.\n"
-            "- Offered follow-ups after 2 meetings.\n") in body
+            "- Closed 2 loops — Ron delivered the deck; the RSVP resolved.\n") in body
+    assert out['_activity_receipts'] == {'held_interruptions': 3, 'prepped_people': 4,
+                                          'followup_taps': 2}
     # Maya's loop was reminded today: it is reported ONCE, here — never again under Still open
     # (the third mention of one debt in one brief, Sep 5, 2026)
     assert "## Still open" not in body
@@ -2367,8 +2428,8 @@ def test_prep_is_only_a_receipt_when_tomorrow_has_meetings(monkeypatch, tmp_path
     _cache_file(tmp_path, f"research_{today}.json", {"attendees": [{"name": "Dana"}]})
     assert cb._receipt_lines(_evening(), today, "+00:00") == []       # nothing on the books tomorrow
     tomorrow = [{"start": _next_day(today) + "T10:00:00+00:00"}]
-    assert cb._receipt_lines(_evening(events=tomorrow), today, "+00:00") == [
-        "Prepped 1 person for tomorrow."]
+    assert cb._receipt_lines(_evening(events=tomorrow), today, "+00:00") == []
+    assert cb._activity_counts(_evening(events=tomorrow), today, "+00:00")['prepped_people'] == 1
 
 
 def test_a_broken_record_costs_no_lines_and_no_brief(monkeypatch, tmp_path):
@@ -2530,8 +2591,9 @@ def test_a_fourth_ask_from_one_person_is_named_not_sliced_off(monkeypatch):
     body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": debts}},
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
-    assert lines == ["- **Maya Chen**: the signed contract; the vendor list; the Q3 numbers; "
-                     "+1 more (1d)"]
+    assert len(lines) == 1
+    assert lines[0].startswith("- **Maya Chen**: the signed contract; the vendor list; the Q3 numbers; "
+                               "+1 more (open since ")
 
 
 # --- what the brief NAMED, recorded for the chase lane -------------------------------------------
@@ -2869,7 +2931,7 @@ def test_optional_loop_details_stop_at_readable_space_and_leave_count():
     shown = cb._represented_loop_rows(rows, expanded['brief_markdown'])
     assert 0 < len(shown) < len(rows)
     assert f"{len(rows) - len(shown)} other open loops" in expanded['brief_markdown']
-    assert visual_brief.fits(visual_brief.build(expanded['brief_markdown']))
+    assert visual_brief.fits(visual_brief.build(expanded['brief_markdown']), allow_tall=False)
     assert all(row['summary'] in expanded['brief_markdown'] for row in shown)
 
 
@@ -2882,7 +2944,7 @@ def test_optional_loop_details_never_repeat_an_evening_receipt_or_break_fallback
     original = out['brief_markdown']
     cb._expand_quiet_loops(out, [row], today='2026-09-20', reported={'already-reported'})
     assert out['brief_markdown'] == original
-    monkeypatch.setattr(visual_brief, 'fits', lambda deck: False)
+    monkeypatch.setattr(visual_brief, 'fits', lambda deck, **kwargs: False)
     cb._expand_quiet_loops(out, [row], today='2026-09-20')
     assert out['brief_markdown'] == original
 
@@ -2898,6 +2960,434 @@ def test_spare_space_does_not_repeat_a_handoff_question_already_delivered():
     assert '1 other open loop' in out['brief_markdown']
     assert 'Robin Green' not in out['brief_markdown']
 
+
+def test_revision_requires_task_update_contract_and_preserves_draft(monkeypatch):
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    seen = []
+    def llm(prompt, inputs, system=None, schema=None):
+        if inputs.get('_critic'):
+            return json.dumps({'patches': [{'type': 'mark_handled', 'detail': 'synthetic',
+                                             'severity': 'critical'}], 'score': 55, 'summary': 'fix'})
+        seen.append(schema)
+        return json.dumps({'brief_markdown': 'revised', 'actions': [],
+                           'loop_updates': [{'loopId': 'one', 'evidence': {'sourceId': 'm1'}}]})
+    draft = {'brief_markdown': 'draft', 'actions': [], 'loop_updates': []}
+    out = cb.critique_and_revise(draft, {}, llm=llm, source_prompt='fixture')
+    assert out['brief_markdown'] == 'draft'
+    assert out['loop_updates'] == []
+    assert seen == [cb.BRIEF_REVISION_SCHEMA]
+
+
+def test_critic_manifest_includes_contact_birthday_evidence():
+    manifest = cb.build_data_manifest({'type': 'morning', 'now': '2026-09-21T13:30:00Z',
+        'google': {'userTimezone': 'America/Los_Angeles'},
+        'local': {'contacts': [{'name': 'Robin Green', 'birthday': '09-21'}]}})
+    assert any('Robin Green' in line for line in manifest['birthday_evidence'])
+
+
+def test_fact_reference_cannot_bind_to_disabled_local_source():
+    out = {'extracted_knowledge': {'person_updates': [{'person_name': 'Robin Green',
+        'facts': [{'fact': 'synthetic fact', 'source_ref': 'imessage:private-row'}]}]}}
+    cb._bind_brief_fact_evidence(out, {'local': {
+        'source_status': {'imessage': 'disabled'},
+        'imessage': [{'id': 'private-row', 'timestamp': '2026-09-21 09:00:00'}]}})
+    assert out['extracted_knowledge']['person_updates'][0]['facts'] == []
+    assert out['learning_evidence']['rejected'] == 1
+
+
+def test_loop_projection_removes_only_verified_task_and_keeps_distinct_sibling(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    from delivery_effects import loop_version
+    from render_local import message_evidence_id
+    row = {'anchor_key': 'task-one', 'status': 'open', 'action_type': 'reply',
+           'contact_name': 'Robin Green', 'contact_identifier': '+14155552222',
+           'channel': 'imessage', 'created_at': '2026-09-20 08:00:00',
+           'summary': 'Send the pricing document'}
+    sibling = {**row, 'anchor_key': 'task-two', 'summary': 'Review the draft agreement'}
+    msg = {'rowid': 19, 'is_from_me': True, 'handle': '+14155552222',
+           'timestamp': '2026-09-21 09:00:00', 'text': 'The pricing document is sent.'}
+    update = {'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
+              'status': 'resolved', 'evidence': [{'sourceType': 'imessage',
+                  'sourceId': message_evidence_id(msg, 'imessage'),
+                  'snippet': 'pricing document is sent'}]}
+    update['criticReceipt'] = cb._continuity().record_critic_approval(update)
+    inputs = {'type': 'morning', 'local': {'imessage': [msg]}, 'google': {}}
+    out = {'brief_markdown': '## ✅ Already Handled\n- **Robin Green**: Send the pricing document. <!--loop:task-one-->\n'
+                             '## Still Pending\n- **Robin Green**: Review the draft agreement.\n',
+           'loop_updates': [update]}
+    projected = cb._project_loop_updates(out, inputs, [row, sibling])
+    assert projected == [sibling]
+    cb._reconcile_task_sections(out, [row, sibling], projected)
+    assert 'Send the pricing document' in out['brief_markdown']
+    assert 'Review the draft agreement' in out['brief_markdown']
+    assert out['_loop_projection']['resolved'] == ['task-one']
+
+
+def _closure_fixture(tmp_path, monkeypatch, n=1):
+    """A captured `send Dana ...` task per item, plus a sent email saying it has NOT been sent."""
+    import yaml
+    from delivery_effects import loop_version
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
+    monkeypatch.delenv('SOTTO_CRITIC', raising=False)
+    (tmp_path / 'briefs').mkdir()
+    (tmp_path / 'briefs/2026-09-18.morning.delivered').write_text('x')  # not the first brief
+    ledger = tmp_path / 'knowledge/continuity'
+    ledger.mkdir(parents=True)
+    email = {'id': 'm-neg', 'isSent': True, 'labelIds': ['SENT'], 'from': 'me@x.com',
+             'to': 'Dana <dana@acme.com>', 'date': '2026-09-19T10:00:00Z', 'subject': 'deck',
+             'body': "I haven't sent the deck yet, will do next week."}
+    rows, updates = [], []
+    for i in range(n):
+        row = {'anchor_key': f'deck-{i}', 'status': 'open', 'action_type': 'follow_up',
+               'channel': 'gmail', 'contact_name': 'Dana', 'contact_identifier': 'dana@acme.com',
+               'created_at': '2026-09-18 08:00:00', 'summary': 'You committed to: send Dana the deck',
+               'ask': 'send Dana the deck', 'resolution_mode': 'source_grounded', 'source': 'granola'}
+        (ledger / f'deck-{i}.md').write_text('---\n' + yaml.safe_dump(row, sort_keys=False) + '---\n')
+        rows.append(row)
+        updates.append({'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
+                        'status': 'resolved', 'evidence': [{'sourceType': 'email',
+                        'sourceId': 'm-neg', 'snippet': 'sent the deck'}]})
+    inputs = {'type': 'morning', 'now': '2026-09-19T12:00:00Z', 'google': {'emails': [email]},
+              'local': {'action_ledger': rows}}
+    return inputs, updates
+
+
+def test_auto_critic_reviews_any_proposed_closure_on_a_quiet_brief(tmp_path, monkeypatch):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    critic_calls = []
+
+    def llm(prompt, inputs_, system=None, schema=None):
+        if inputs_.get('_critic'):
+            critic_calls.append(prompt)
+            return json.dumps({'patches': [], 'score': 90, 'summary': 'ok',
+                'loop_verdicts': [{'proposal_id': cb._continuity().critic_review_receipt(updates[0]),
+                                   'verdict': 'approve'}]})
+        return json.dumps({'markdown': '# Brief\n\nQuiet day.', 'actionItems': [],
+                           'loopUpdates': updates})
+    out = cb.compose(inputs, llm=llm, critic=True)
+    assert len(critic_calls) == 1 and 'sent the deck' in critic_calls[0]
+    assert 'loop_update_review' in critic_calls[0]
+    # An explicit verdict binds approval to this exact proposal.
+    assert out['loop_updates'][0]['criticReceipt']
+    assert out['_loop_projection']['resolved'] == ['deck-0']
+
+
+@pytest.mark.parametrize('failure', ['skipped', 'held', 'error', 'malformed', 'revise_failed'])
+def test_closure_without_completed_critic_review_stays_open(tmp_path, monkeypatch, failure):
+    """Fail closed for closures only: the brief still ships, the task stays open and visible."""
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    updates.append({**updates[0], 'status': 'waiting'})  # other update kinds are unaffected
+    if failure == 'skipped':
+        monkeypatch.setenv('SOTTO_CRITIC', 'off')
+
+    def llm(prompt, inputs_, system=None, schema=None):
+        if inputs_.get('_critic'):
+            if failure == 'held':
+                raise cb.model_work.ModelWorkHeldError('attempts exhausted')
+            if failure == 'error':
+                raise RuntimeError('critic down')
+            if failure == 'malformed':  # no patch list: the review contract was not followed
+                return json.dumps({'score': 90, 'summary': 'ok'})
+            return json.dumps({'patches': [{'type': 'mark_handled', 'severity': 'critical',
+                                            'detail': 'deck is not sent'}], 'score': 40})
+        if inputs_.get('_revise'):
+            raise RuntimeError('revise down')
+        return json.dumps({'markdown': '# Brief\n\nQuiet day.', 'actionItems': [],
+                           'loopUpdates': updates})
+    out = cb.compose(inputs, llm=llm, critic=True)
+    assert out['_loop_projection']['resolved'] == []
+    assert out['_loop_projection']['rejected_by_reason'].get('unreviewed_resolution') == 1
+    assert [u['status'] for u in out['loop_updates']] == ['resolved', 'waiting']
+    assert not any('criticReceipt' in u for u in out['loop_updates'])
+
+
+def test_model_written_review_receipt_is_not_trusted(tmp_path, monkeypatch):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv('SOTTO_CRITIC', 'off')
+    forged = {**updates[0], 'criticReceipt': cb._continuity().critic_review_receipt(updates[0])}
+
+    def llm(prompt, inputs_, system=None, schema=None):
+        return json.dumps({'markdown': '# Brief', 'actionItems': [], 'loopUpdates': [forged]})
+    out = cb.compose(inputs, llm=llm, critic=True)
+    assert out['_loop_projection']['resolved'] == []
+
+
+def test_closures_past_the_review_cap_are_held_not_applied(tmp_path, monkeypatch):
+    n = cb.LOOP_REVIEW_MAX_UPDATES + 1
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch, n=n)
+    waiting = {**updates[0], 'status': 'waiting'}
+    reviewed = set()
+    out = {'loop_updates': [waiting] + updates}
+    review = cb._loop_update_review_context(out, inputs, reviewed)
+    # Closures take review slots before a waiting update; exactly the reviewed ones get receipts.
+    assert [r['loopId'] for r in review] == [u['loopId'] for u in updates[:cb.LOOP_REVIEW_MAX_UPDATES]]
+    cb._stamp_loop_reviews(out, reviewed)
+    assert [bool(u.get('criticReceipt')) for u in out['loop_updates']] == (
+        [False] + [True] * cb.LOOP_REVIEW_MAX_UPDATES + [False])
+    # Source excerpts share one fixed budget however many updates are reviewed.
+    assert sum(len(e['original_context']) for r in review for e in r['evidence']) <= (
+        cb.LOOP_REVIEW_BUDGET_CHARS)
+    # A closure citing more messages than the critic is shown is not reviewed either.
+    extra = {**updates[0], 'evidence': updates[0]['evidence'] * (cb.LOOP_REVIEW_MAX_EVIDENCE + 1)}
+    reviewed = set()
+    cb._loop_update_review_context({'loop_updates': [extra]}, inputs, reviewed)
+    assert reviewed == set()
+
+
+def test_unverified_handled_claim_is_removed_for_exact_open_task_only():
+    row = {'anchor_key': 'task-one', 'status': 'open', 'contact_name': 'Robin Green',
+           'summary': 'Send the pricing document'}
+    sibling = {**row, 'anchor_key': 'task-two', 'summary': 'Review the draft agreement'}
+    out = {'brief_markdown': '## ✅ Already Handled\n- **Robin Green**: Send the pricing document. <!--loop:task-one-->\n'
+                             '## Needs Attention Now\n- **Robin Green**: Review the draft agreement.\n'}
+    cb._reconcile_task_sections(out, [row, sibling], [row])
+    assert 'Send the pricing document' not in out['brief_markdown']
+    assert 'Review the draft agreement' in out['brief_markdown']
+
+
+def test_unverified_confirmed_meeting_paraphrase_does_not_hide_separate_task():
+    meeting = {'anchor_key': 'meeting-one', 'contact_name': 'Robin Green', 'status': 'open',
+               'summary': 'Schedule the 9:30 meeting with Robin'}
+    deck = {'anchor_key': 'deck-two', 'contact_name': 'Robin Green', 'status': 'open',
+            'summary': 'Send the strategy deck to Robin'}
+    out = {'brief_markdown': '## ✅ Already Handled\n**Robin Green**: The 9:30 meeting is confirmed. <!--loop:meeting-one-->\n'
+                             '## Needs Attention Now\n**Robin Green**: Send the strategy deck.\n'}
+    cb._reconcile_task_sections(out, [meeting, deck], [meeting, deck])
+    assert '9:30 meeting is confirmed' not in out['brief_markdown']
+    assert 'Send the strategy deck' in out['brief_markdown']
+
+
+def test_pending_repeat_of_needs_you_is_deduped_by_task_not_person():
+    first = {'anchor_key': 'contract', 'contact_name': 'Robin Green', 'status': 'open',
+             'summary': 'Sign the partnership contract'}
+    second = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'status': 'open',
+              'summary': 'Send the strategy deck'}
+    out = {'brief_markdown': '## Needs Attention Now\n- **Robin Green**: Sign the partnership contract. <!--loop:contract-->\n'
+                             '**Still Pending**\n- **Robin Green**: Sign the partnership contract. <!--loop:contract-->\n'
+                             '- **Robin Green**: Send the strategy deck. <!--loop:deck-->\n'}
+    cb._reconcile_task_sections(out, [first, second], [first, second])
+    assert out['brief_markdown'].count('Sign the partnership contract') == 1
+    assert 'Send the strategy deck' in out['brief_markdown']
+
+
+def test_unmarked_same_person_similar_task_is_preserved():
+    open_task = {'anchor_key': 'new-pricing', 'contact_name': 'Robin Green', 'status': 'open',
+                 'summary': 'Send the pricing document'}
+    out = {'brief_markdown': '## ✅ Already Handled\n- **Robin Green**: Sent the pricing document.\n'}
+    cb._reconcile_task_sections(out, [open_task], [open_task])
+    assert 'Sent the pricing document' in out['brief_markdown']
+
+
+def test_one_persons_visible_task_cannot_hide_a_different_urgent_open_task():
+    first = {'anchor_key': 'walk', 'contact_name': 'Robin Green', 'status': 'open',
+             'summary': 'Confirm the afternoon walk', 'chased_count': 1,
+             'created_at': '2026-09-20 08:00:00'}
+    second = {**first, 'anchor_key': 'deck', 'summary': 'Send the strategy deck'}
+    out = {'brief_markdown': '## Should Handle Today\n- **Robin Green**: Confirm the afternoon walk. '
+                             '<!--loop:walk-->\n## ✅ Already Handled\n- **Robin Green**: The deck was sent.'}
+    cb._append_still_open(out, [first, second], today='2026-09-21')
+    assert out['brief_markdown'].count('Confirm the afternoon walk') == 1
+    assert '## Still open\n- **Robin Green**: Send the strategy deck' in out['brief_markdown']
+
+
+def test_waiting_projection_rejects_replayed_promise():
+    from delivery_effects import loop_version
+    from render_local import message_evidence_id
+    row = {'anchor_key': 'waiver', 'status': 'waiting', 'action_type': 'waiting_on',
+           'contact_name': 'Robin Green', 'contact_identifier': '+14155552222',
+           'channel': 'imessage', 'created_at': '2026-09-20 08:00:00',
+           'last_heard_at': '2026-09-21 09:00:00', 'summary': 'Robin owes the signed waiver'}
+    msg = {'rowid': 20, 'is_from_me': False, 'handle': '+14155552222',
+           'timestamp': '2026-09-21 09:00:00', 'text': 'I will send the waiver Friday.'}
+    update = {'loopId': 'waiver', 'loopVersion': loop_version(row), 'status': 'waiting',
+              'evidence': [{'sourceType': 'imessage',
+                            'sourceId': message_evidence_id(msg, 'imessage'),
+                            'snippet': 'I will send the waiver Friday.'}]}
+    out = {'loop_updates': [update]}
+    assert cb._project_loop_updates(out, {'local': {'imessage': [msg]}, 'google': {}}, [row]) == [row]
+    assert out['_loop_projection']['rejected_by_reason'] == {'replayed_promise': 1}
+
+
+def test_notices_and_solo_holds_owe_no_rsvp_and_every_event_stays_scheduled():
+    from datetime import datetime, timezone
+    inputs = _calendar_inputs([
+        {'id': 'personal', 'summary': 'Conference reception', 'start': '2026-09-21',
+         'my_response': 'needsAction', 'attendees': [{'email': 'host@example.com'}]},
+        {'id': 'context', 'summary': 'CONTEXT: building evacuation drill', 'start': '2026-09-21',
+         'my_response': 'needsAction', 'attendees': [{'email': 'me@example.com', 'self': True}]},
+        {'id': 'board', 'summary': 'HOLD: Acme board meeting', 'start': '2026-09-21',
+         'my_response': 'needsAction',
+         'attendees': [{'email': 'ea@acme.com'}, {'email': 'me@example.com', 'self': True}]},
+    ])
+    personal, context, board = inputs['google']['events']
+    assert not cb._owes_no_rsvp(personal)
+    assert cb._owes_no_rsvp(context)
+    # A labelled hold with another attendee, or sent by another organizer, is a real invite.
+    assert not cb._owes_no_rsvp(board)
+    # A notice or drill owes no answer even when someone else sent it to everyone.
+    drill = {**context, 'id': 'drill', 'organizer': {'email': 'facilities@example.com'},
+             'attendees': [{'email': 'all@example.com'}, {'email': 'me@example.com', 'self': True}]}
+    assert cb._owes_no_rsvp(drill)
+    inputs['google']['events'].append(drill)
+    actions = cb._rsvp_actions(inputs, datetime(2026, 9, 20, 18, tzinfo=timezone.utc))
+    assert [action['contactIdentifier'] for action in actions] == ['personal', 'board']
+    schedule = cb._schedule_lines(inputs, {})
+    for title in ('Conference reception', 'evacuation drill', 'Acme board meeting'):
+        assert any(title in line for line in schedule)
+
+
+def test_accepted_prep_block_stays_in_coming_up():
+    schedule = cb._schedule_lines(_calendar_inputs([
+        _meeting(11, id='prep', summary='Prep: Sequoia pitch', my_response='accepted')]), {})
+    assert any('Sequoia pitch' in line for line in schedule)
+
+
+@pytest.mark.parametrize('critic', [False, True])
+def test_compose_keeps_model_rsvp_only_for_visible_unanswered_real_events(tmp_path, monkeypatch, critic):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CRITIC', 'always')
+    inputs = _calendar_inputs([
+        _meeting(10, id='context-event', summary='CONTEXT: building evacuation drill',
+                 my_response='needsAction'),
+        _meeting(11, id='personal-event', summary='Conference reception',
+                 my_response='needsAction', attendees=[{'email': 'host@example.com'}]),
+        _meeting(12, id='other-event', summary='Lunch with Robin',
+                 my_response='accepted', attendees=[{'email': 'robin@example.com'}]),
+        _meeting(13, id='declined-event', summary='Declined pitch',
+                 my_response='declined', attendees=[{'email': 'vc@example.com'}]),
+        _meeting(14, id='hold-invite', summary='HOLD: Acme board meeting',
+                 my_response='needsAction', attendees=[{'email': 'ea@acme.com'}]),
+    ])
+    model_actions = [
+        {'type': 'rsvp', 'channel': 'calendar', 'contactIdentifier': 'context-event',
+         'contactName': 'Building drill', 'contextAsk': 'accept the invite'},
+        {'type': 'rsvp', 'channel': 'calendar', 'contactIdentifier': 'hold-invite',
+         'contactName': 'Acme board meeting', 'contextAsk': 'accept the invite'},
+        {'type': 'rsvp', 'channel': 'calendar', 'contactIdentifier': 'personal-event',
+         'contactName': 'Conference reception', 'contextAsk': 'accept the invite'},
+        {'type': 'rsvp', 'channel': 'calendar', 'contactIdentifier': 'other-event',
+         'contactName': 'Lunch with Robin', 'contextAsk': 'accept the invite'},
+        {'type': 'rsvp', 'channel': 'calendar', 'contactIdentifier': 'declined-event',
+         'contactName': 'Declined pitch', 'contextAsk': 'accept the invite'},
+        {'type': 'reply', 'channel': 'calendar', 'contactIdentifier': 'other-event',
+         'contactName': 'Robin', 'contextAsk': 'send agenda'},
+    ]
+
+    def llm(prompt, source_inputs, **kwargs):
+        if source_inputs.get('_critic'):
+            return json.dumps({'score': 40, 'summary': 'Tighten the brief', 'patches': [
+                {'type': 'clarity', 'severity': 'minor', 'detail': 'Shorten an action'}]})
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nReply to Robin.',
+                           'actions': model_actions})
+
+    out = cb.compose(inputs, llm=llm, critic=critic)
+    identifiers = {action.get('contactIdentifier') for action in out['actions']}
+    assert not {'context-event', 'declined-event'} & identifiers
+    assert not any(action.get('type') == 'rsvp' and action.get('contactIdentifier') == 'other-event'
+                   for action in out['actions'])
+    assert {'personal-event', 'other-event', 'hold-invite'} <= identifiers
+
+
+def test_quiet_copy_only_scoped_when_another_section_has_action():
+    busy = {'brief_markdown': '## Needs Attention Now\n- **Robin Green**: Reply.\n'
+                              '## Should Handle Today\nNothing needs your attention right now.'}
+    quiet = {'brief_markdown': 'Nothing needs your attention right now.\n## ✅ Already Handled\nQuiet.'}
+    assert 'Nothing else needs your attention in this section.' in cb._finish_brief_presentation(busy)['brief_markdown']
+    assert 'Nothing needs your attention right now.' in cb._finish_brief_presentation(quiet)['brief_markdown']
+
+
+
+def test_quiet_copy_ignores_handled_items_and_reads_unbulleted_entries():
+    handled = {'brief_markdown': 'Nothing needs your attention right now.\n\n'
+                                 '## ✅ Already Handled\n- **Robin Green**: Sent the signed lease.\n'}
+    assert cb._finish_brief_presentation(handled) == handled
+    busy = {'brief_markdown': '## Needs Attention Now\n**Robin Green**<!--id:r@x.com|ch:email--> - Reply.\n'
+                              '## Should Handle Today\nNothing needs your attention right now.\n'}
+    assert ('## Should Handle Today\nNothing else needs your attention in this section.'
+            in cb._finish_brief_presentation(busy)['brief_markdown'])
+
+
+def test_task_prose_saying_still_pending_or_handled_is_not_a_section_heading():
+    lease = {'anchor_key': 'lease', 'status': 'open', 'contact_name': 'Robin Green',
+             'summary': 'Sign the lease'}
+    deck = {'anchor_key': 'deck', 'status': 'open', 'contact_name': 'Maya Chen',
+            'summary': 'Send the strategy deck'}
+    md = ('## Needs Attention Now\n'
+          '**Robin Green**<!--id:r@x.com|ch:email--> - The lease is still pending your signature. '
+          '<!--loop:lease-->\n'
+          '**Maya Chen**<!--id:m@x.com|ch:email--> - Deposit already handled; send the strategy deck. '
+          '<!--loop:deck-->\n'
+          '## Coming Up\n- Mon Sep 21 9 AM: Standup\n')
+    out = cb._reconcile_task_sections({'brief_markdown': md}, [lease, deck], [lease, deck])
+    assert out['brief_markdown'] == md
+    assert '_task_section_reconciliation' not in out
+
+
+def test_compose_keeps_canonical_needs_attention_entries_that_say_still_pending(monkeypatch):
+    monkeypatch.setenv("SOTTO_CRITIC", "off")
+    rows = [{"anchor_key": "memo", "contact_name": "Priya Raman", "status": "open",
+             "action_type": "follow_up", "channel": "email", "summary": "Send the diligence memo",
+             "chased_count": 1, "created_at": _iso_hours_ago(30)},
+            {"anchor_key": "loi", "contact_name": "Dana Wu", "status": "open", "action_type": "reply",
+             "channel": "email", "summary": "Return the signed LOI", "created_at": _iso_hours_ago(30)}]
+    md = ("## Needs Attention Now\n"
+          "**Priya Raman**<!--id:p@x.com|ch:email--> - The diligence memo is still pending; she "
+          "needs it before Thursday's IC. Send the diligence memo. <!--loop:memo-->\n\n"
+          "**Dana Wu**<!--id:dana@x.com|ch:email--> - Return the signed LOI today so the close "
+          "stays on track. <!--loop:loi-->\n\n## Filtered\n\n12 promotional emails\n")
+    out = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": rows}},
+                     llm=lambda *a, **k: json.dumps({"brief_markdown": md, "actions": []}),
+                     critic=True)
+    assert "before Thursday's IC" in out["brief_markdown"]
+    assert "signed LOI today" in out["brief_markdown"]
+    assert "_task_section_reconciliation" not in out
+
+
+def test_paraphrased_anchored_task_without_marker_is_not_repeated_and_is_recorded(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_CRITIC", "off")
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    row = {"anchor_key": "memo", "contact_name": "Priya Raman", "status": "open",
+           "action_type": "follow_up", "channel": "email", "summary": "Send the diligence memo",
+           "chased_count": 1, "created_at": _iso_hours_ago(30)}
+    md = ("## Should Handle Today\n**Priya Raman**<!--id:p@x.com|ch:email--> is still waiting on "
+          "the diligence memo you promised; send it today.\n")
+    out = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [row]}},
+                     llm=lambda *a, **k: json.dumps({"brief_markdown": md, "actions": []}),
+                     critic=True)
+    assert out["brief_markdown"].count("Priya Raman") == 1
+    assert cb._visible_open_task_keys(md, [row]) == {"memo"}
+    named = list((tmp_path / "briefs").glob("*.named.json"))
+    assert [json.loads(p.read_text())["anchor_keys"] for p in named] == [["memo"]]
+    # A marker for this task elsewhere (here: a handled claim) means only the marked line counts.
+    marked = md + "## ✅ Already Handled\n- **Priya Raman**: memo sent. <!--loop:memo-->\n"
+    assert cb._visible_open_task_keys(marked, [row]) == set()
+
+
+@pytest.mark.parametrize('bad_actions', [["reply to Robin"], {"type": "reply"}, [{"type": "reply"}, 7]])
+def test_malformed_revision_actions_keep_the_validated_draft(monkeypatch, tmp_path, bad_actions):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CRITIC', 'always')
+
+    def llm(prompt, inputs, system=None, schema=None):
+        if inputs.get('_critic'):
+            return json.dumps({'score': 40, 'summary': 'x', 'patches': [
+                {'type': 'add_item', 'severity': 'critical', 'detail': 'add Robin'}]})
+        if inputs.get('_revise'):
+            return json.dumps({'brief_markdown': '## Needs Attention Now\n- **Robin**: revised.',
+                               'actions': bad_actions, 'loop_updates': []})
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nReply to Robin.', 'actions': []})
+
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm, critic=True)
+    assert 'Reply to Robin.' in out['brief_markdown'] and 'revised.' not in out['brief_markdown']
+    assert all(isinstance(action, dict) for action in out['actions'])
+
+
+def test_rsvp_filter_keeps_only_action_objects():
+    keep = {'type': 'reply', 'contactIdentifier': 'x'}
+    assert cb._drop_informational_rsvp_actions(['reply', keep, None], {}) == [keep]
+    assert cb._drop_informational_rsvp_actions({'type': 'reply'}, {}) == []
 
 
 def test_legacy_ask_only_loop_is_counted_only_when_its_actual_ask_is_shown():
@@ -3034,3 +3524,144 @@ def test_schedule_keeps_first_brief_closing_offer_and_welcome_untouched(tmp_path
     out = cb._ensure_schedule(original, _calendar_inputs([_meeting()], first_run=True))
     assert 'Ask me to draft 3 replies today.\n- You can ask about tomorrow too.' in out['brief_markdown']
     assert cb._ensure_schedule(original, _calendar_inputs([_meeting()], type='welcome')) == original
+
+
+@pytest.mark.parametrize('verdict', [None, 'reject', 'duplicate', 'unknown'])
+def test_rejected_or_unbound_critic_verdict_never_closes_repeated_revision(tmp_path, monkeypatch, verdict):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    ident = cb._continuity().critic_review_receipt(updates[0])
+    def llm(prompt, data, **kwargs):
+        if data.get('_critic'):
+            votes = [] if verdict is None else [{'proposal_id': ident, 'verdict': verdict}]
+            if verdict == 'duplicate':
+                votes = [{'proposal_id': ident, 'verdict': v} for v in ('approve', 'reject')]
+            return json.dumps({'patches': [{'type': 'mark_handled', 'severity': 'critical',
+                'detail': 'Reject closure: email says it has NOT been sent.'}],
+                'score': 20, 'loop_verdicts': votes})
+        return json.dumps({'markdown': '# Brief\n\nQuiet day.', 'actionItems': [], 'loopUpdates': updates})
+    result = cb.compose(inputs, llm=llm, critic=True)
+    assert result['_loop_projection']['resolved'] == []
+    assert not result['loop_updates'][0].get('criticReceipt')
+
+
+def test_critic_verdict_is_bound_to_exact_proposal(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    first = {'loopId': 'one', 'loopVersion': 'v1', 'status': 'resolved', 'evidence': []}
+    ident = cb._continuity().critic_review_receipt(first)
+    approved = cb._approved_loop_reviews({'loop_verdicts': [
+        {'proposal_id': ident, 'verdict': 'approve'},
+        {'proposal_id': 'not-presented', 'verdict': 'approve'}]}, {ident})
+    out = {'loop_updates': [first, {**first, 'loopVersion': 'v2'}]}
+    cb._stamp_loop_reviews(out, approved)
+    assert out['loop_updates'][0].get('criticReceipt') == ident
+    assert not out['loop_updates'][1].get('criticReceipt')
+
+
+def test_supplemental_email_completion_is_shared_by_critic_and_resolver(tmp_path, monkeypatch):
+    import loop_context
+    import source_context
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    email = inputs['google']['emails'][0]
+    email['body'] = 'Hello Dana.'
+    full = 'Hello Dana. I sent the deck as promised.'
+    refreshed = {**email, 'body': full, '_loop_context': True,
+                 '_loop_context_sources': ['gmail', 'imessage']}
+    inputs['google']['emails'] = loop_context.merge_context([email], [refreshed])
+    update = updates[0]
+    update['evidence'][0]['snippet'] = 'I sent the deck as promised.'
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    reviews = cb._loop_update_review_context({'loop_updates': updates}, inputs)
+    assert reviews[0]['evidence'][0]['original_context'] == full
+    update['criticReceipt'] = cb._continuity().record_critic_approval(update)
+    local = {**inputs['local'], 'emails': inputs['google']['emails']}
+    proof, reason = cb._continuity()._completion_evidence_result(inputs['local']['action_ledger'][0], update, local, {})
+    assert proof is not None, reason
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source != 'imessage')
+    reviews = cb._loop_update_review_context({'loop_updates': updates}, inputs)
+    assert reviews[0]['evidence'][0]['original_context'] == 'Hello Dana.'
+    proof, reason = cb._continuity()._completion_evidence_result(inputs['local']['action_ledger'][0], update, local, {})
+    assert proof is None and reason == 'quote_mismatch'
+
+
+@pytest.mark.parametrize('sent', [False, True])
+def test_loop_selected_inbox_or_sent_email_keeps_its_late_lines_in_the_source_prompt(
+        tmp_path, monkeypatch, sent):
+    """The loop lane re-reading an inbox/sent message must not shrink it to the 2,000-char excerpt:
+    a new ask (or a completion line) late in the reply has to reach the writer (and revise) prompt."""
+    import loop_context
+    import source_context
+    inputs, _ = _closure_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    tail = 'NEW ASK: please also send the signed SOW by Friday.'
+    prior = {'id': 'm-long', 'threadId': 't-long', 'subject': 'Deck', 'date': '2026-09-19T09:00:00Z',
+             'from': 'Me <me@x.com>' if sent else 'Dana <dana@acme.com>',
+             'to': 'Dana <dana@acme.com>' if sent else 'me@x.com',
+             'labelIds': ['SENT'] if sent else ['INBOX', 'UNREAD'], 'isSent': sent,
+             'body': 'Context paragraph. ' * 200 + tail}
+    fresh = {**prior, 'body': prior['body'][:2000], '_loop_context': True,
+             '_loop_context_sources': ['gmail']}
+    inputs['google']['emails'] = loop_context.merge_context([prior], [fresh])
+    prompts = []
+
+    def llm(prompt, data, **kwargs):
+        prompts.append((bool(data.get('_critic')), prompt))
+        if data.get('_critic'):
+            return json.dumps({'patches': [], 'score': 90, 'loop_verdicts': []})
+        return json.dumps({'markdown': '# Brief\n\nQuiet day.', 'actionItems': [], 'loopUpdates': []})
+
+    cb.compose(inputs, llm=llm, critic=True)
+    writer = [p for critic, p in prompts if not critic]
+    assert writer and tail in writer[0]
+    trimmed = cb._trim_email(inputs['google']['emails'][0])
+    assert tail in trimmed['body'] and len(trimmed['_loop_context_body']) <= 2000
+
+
+@pytest.mark.parametrize('revision', ['none', 'repeats', 'drops_update', 'invalid'])
+def test_rejected_closure_cannot_survive_as_unmarked_handled_prose(tmp_path, monkeypatch, revision):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    draft = {'brief_markdown': '## Already Handled\n- Dana: The deck was sent.\n\n## Coming Up\nQuiet.',
+             'actions': [], 'loop_updates': updates}
+    ident = cb._continuity().critic_review_receipt(updates[0])
+    def llm(prompt, data, **kwargs):
+        if data.get('_critic'):
+            return json.dumps({'patches': [] if revision == 'none' else [
+                {'type': 'remove_item', 'severity': 'critical', 'detail': 'Remove unsupported completion.'}],
+                'score': 30, 'loop_verdicts': [{'proposal_id': ident, 'verdict': 'reject'}]})
+        if revision == 'invalid':
+            return '{}'
+        return json.dumps({**draft, 'loop_updates': [] if revision == 'drops_update' else updates})
+    result = cb.critique_and_revise(draft, inputs, llm=llm)
+    cb._stamp_loop_reviews(result, result.pop('_approved_loop_receipts', set()))
+    ledger = inputs['local']['action_ledger']
+    projected = cb._project_loop_updates(result, inputs, ledger)
+    cb._reconcile_task_sections(result, ledger, projected)
+    assert projected == ledger
+    assert 'The deck was sent' not in result['brief_markdown']
+    assert 'Coming Up' in result['brief_markdown']
+
+
+@pytest.mark.parametrize("failure", ["disk", "corrupt"])
+def test_review_record_failure_keeps_delivery_available_and_task_open(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    update = {'loopId': 'one', 'loopVersion': 'v1', 'status': 'resolved', 'evidence': []}
+    ident = cb._continuity().critic_review_receipt(update)
+    def unavailable(_):
+        if failure == 'corrupt':
+            raise cb._continuity().jsonstore.Unreadable('corrupt review record')
+        raise OSError('disk unavailable')
+    monkeypatch.setattr(cb._continuity(), 'record_critic_approval', unavailable)
+    out = {'brief_markdown': 'The rest of the brief.', 'loop_updates': [update], '_critic': {}}
+    cb._stamp_loop_reviews(out, {ident})
+    assert not out['loop_updates'][0].get('criticReceipt')
+    assert out['_critic']['unreviewed_closures'] == 1
+    assert out['brief_markdown'] == 'The rest of the brief.'
+
+
+def test_held_completion_omits_unbound_continuations_but_keeps_verified_task():
+    ledger = [{'anchor_key': 'open'}, {'anchor_key': 'closed'}]
+    out = {'_held_loop_ids': ['open'], 'brief_markdown':
+           '## Already Handled\nThe deck was sent.\n  Everyone has it now.\n'
+           '- Different verified task. <!--loop:closed-->\n\n## Coming Up\nKeep this.'}
+    cb._reconcile_task_sections(out, ledger, ledger[:1])
+    assert 'deck' not in out['brief_markdown'] and 'Everyone' not in out['brief_markdown']
+    assert 'Different verified task' in out['brief_markdown'] and 'Keep this' in out['brief_markdown']

@@ -33,6 +33,7 @@ def test_tools_call_offline_is_graceful_error_result():
     resp = r.mcp_call({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                        "params": {"name": "read_local", "arguments": {}}})
     assert resp["result"]["isError"] is True
+    assert resp["result"]["structuredContent"] == {"error_code": "bridge_offline"}
     assert "offline" in resp["result"]["content"][0]["text"].lower()
 
 

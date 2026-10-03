@@ -2,17 +2,82 @@
 """Launch the managed chat gateway with a process-private local-send credential."""
 import asyncio
 import copy
+import hashlib
 import importlib
 import os
 from pathlib import Path
 import runpy
 import sys
+import uuid
 
 HERMES_ROOT = Path('/usr/local/lib/hermes-agent')
 HERMES_ENTRYPOINT = HERMES_ROOT / 'hermes'
 TOKEN_ENV = 'SOTTO_CHAT_SEND_TOKEN'
 HEADER = 'X-Sotto-Chat-Send'
 REFRESH_SECONDS = 30.0
+
+
+def install_session_attribution(base, importer=importlib.import_module):
+    """Use Hermes' pinned chat transport session parameter for main-turn calls."""
+    if not base:
+        return None
+    module = importer('agent.transports.chat_completions')
+    transport = module.ChatCompletionsTransport
+    original = transport.build_kwargs
+    if not callable(original):
+        raise TypeError('pinned chat transport build_kwargs is unavailable')
+    endpoint = base.rstrip('/') + '/openai/v1'
+    if getattr(original, '_sotto_session_endpoint', None) == endpoint:
+        return module
+
+    def build_kwargs(self, model, messages, tools=None, **params):
+        result = original(self, model, messages, tools, **params)
+        session = params.get('session_id')
+        base_url = params.get('base_url')
+        if (isinstance(result, dict) and isinstance(base_url, str) and base_url.rstrip('/') == endpoint
+                and isinstance(session, str) and session):
+            result = dict(result)
+            result['extra_headers'] = {**(result.get('extra_headers') or {}),
+                                       'X-Sotto-Session': hashlib.sha256(session.encode()).hexdigest()}
+        return result
+
+    build_kwargs._sotto_session_endpoint = endpoint
+    transport.build_kwargs = build_kwargs
+    return module
+
+
+def install_model_attribution(base, importer=importlib.import_module):
+    """Label gateway calls at the transport seam without inspecting chat content.
+
+    Hermes owns turn/session state, which is unavailable at this seam. Each HTTP
+    attempt gets an opaque request identity; it must not be reported as a user turn.
+    Only the configured Sotto chat endpoint receives these headers.
+    """
+    if not base:
+        return None
+    endpoint = base.rstrip('/') + '/openai/v1/chat/completions'
+    httpx = importer('httpx')
+    for client_type in (httpx.Client, httpx.AsyncClient):
+        original = client_type.send
+        if getattr(original, '_sotto_attribution_endpoint', None) == endpoint:
+            continue
+        if client_type is httpx.AsyncClient:
+            async def send(client, request, *args, _original=original, **kwargs):
+                if str(request.url) == endpoint:
+                    request.headers['X-Sotto-Workload'] = 'chat'
+                    request.headers['X-Sotto-Operation'] = uuid.uuid4().hex * 2
+                    request.headers['X-Sotto-Attempt'] = '1'
+                return await _original(client, request, *args, **kwargs)
+        else:
+            def send(client, request, *args, _original=original, **kwargs):
+                if str(request.url) == endpoint:
+                    request.headers['X-Sotto-Workload'] = 'chat'
+                    request.headers['X-Sotto-Operation'] = uuid.uuid4().hex * 2
+                    request.headers['X-Sotto-Attempt'] = '1'
+                return _original(client, request, *args, **kwargs)
+        send._sotto_attribution_endpoint = endpoint
+        client_type.send = send
+    return httpx
 
 
 def expected_url(env=os.environ):
@@ -131,6 +196,13 @@ def main(*, env=os.environ, importer=importlib.import_module,
     sys.path.insert(0, root_text)
     install_loader(token, expected_url(env), importer)
     install_local_tool_refresh(expected_url(env), importer)
+    for install in (install_session_attribution, install_model_attribution):
+        try:
+            install(env.get('SOTTO_MODEL_PROXY_URL', ''), importer)
+        except (ImportError, AttributeError, TypeError) as error:
+            # Attribution is observability only. The pinned MCP security hooks above still fail
+            # closed; a changed optional transport interface must not take chat offline.
+            print(f'[chat_gateway] attribution unavailable: {type(error).__name__}', file=sys.stderr)
     sys.argv = [str(entrypoint), 'gateway']
     run_path(str(entrypoint), run_name='__main__')
 

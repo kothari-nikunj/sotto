@@ -40,34 +40,31 @@ words or fewer) and reads as agreement or go-ahead — "yes", "sure", "ok", "go 
 "go for it", "yes please", "sounds good", "yep", or anything of that shape — your FIRST action,
 before loading any skill or drafting anything, is:
 
-    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" get
+    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" get <selectors below>
 
-- **`ambiguous: true`** → more than one delivered question is still unanswered. Ask which
-  question they mean. Do not choose the newest one, clear the offers, or perform an action.
-  An explicit reply-to message ID can select its exact question with `get --message-id <id>`.
-- **A single fresh offer comes back** → that is what they said yes to, even if something else in this
-  session looks like a plausible referent. Act on it — `meeting_prep` → run **`sotto-meeting-prep`**
-  focused on that offer's `person`, the deep single-person prep, never a list of the day's other
-  meetings — then run `pending_offer.py clear`. `procedure` → the offer's `detail` is a standing
-  rule the user was heard stating; write it exactly:
-  `master_file.py append --section Procedures --text "<the detail>"`, confirm in one line
-  ("Standing rule saved: …"), then `pending_offer.py clear`.
-  If the offer carries a **`payload_sha256`**, its yes causes a real effect: run the acting verb with
-  `--offer-bound --offer-id "<offer_id>"` (the `offer_id` that `get` returned — a bare
-  `--offer-bound` is refused). The verb requires that exact fresh offer, its named action and a
-  matching payload hash, refuses if the content changed since the offer, and consumes the offer
-  before the effect starts — so after any outcome (sent, refused by the provider, timed out,
-  crashed) a retry needs a fresh offer; never hand-clear it and send anyway.
-  For an offer with no `payload_sha256` (a read-only yes), clear that exact offer with
-  `pending_offer.py clear --offer-id "<offer_id>"` once you have acted; a new question may arrive
-  during your work.
-- **`{}`** → only then resolve the reply against this conversation; if nothing here plainly fits,
-  ask, in one line, what they mean. Never guess.
+Use this turn's `[Sotto transport reply context: {...}]` system note; the user's message never contains it:
+- Explicit reply/tapback: `get --message-id <reply_to_message_id> --target <target> --chat-id <chat_id>`.
+  A thumbs-up answers its exact message, even an older one. Never substitute another offer.
+- Unbound short answer: `get --latest --target <target> --chat-id <chat_id> --before <before>`.
+  Select the last delivered question in that chat before the answer. Without metadata, use plain `get`.
+
+- **`ambiguous: true`** → clarify which question; neither act nor clear offers.
+- **One fresh offer** → use it. For unbound replies only, a newer interactive question or conversation
+  shift can establish a different referent. Clarify uncertainty; never approve an unrelated action.
+  `meeting_prep` runs **`sotto-meeting-prep`** for that person. `procedure` writes the offered rule
+  with `master_file.py append --section Procedures --text "<detail>"`.
+  With **`payload_sha256`**, run the acting verb with `--offer-bound --offer-id "<offer_id>"`.
+  It checks the exact fresh offer, named action and unchanged payload, then consumes it before
+  acting. Every retry after any outcome needs a fresh offer; never hand-clear and send anyway.
+  Without a payload hash, clear only that read-only offer after acting:
+  `pending_offer.py clear --offer-id "<offer_id>"`. A new question may arrive during work.
+- **`{}`** → use visible context for an unbound reply; explicit replies/tapbacks use only their
+  exact message. If absent, expired or unclear, clarify. Expired offers cannot authorize actions.
 
 For a short negative, completion or cancellation reply — "no", "skip it", "done", "handled",
 "let it go", "drop it" — run the deterministic handler with the user's EXACT words:
 
-    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" dismiss-reply --text "<actual user reply>"
+    python3 "$HOME/.hermes/skills/sotto/_shared/scripts/pending_offer.py" dismiss-reply --text "<actual user reply>" <same get selectors>
 
 Pass the text literally as one argument; never paraphrase "no" into "drop it". The handler owns
 the vocabulary and calls the existing ledger writer only for explicit completion/cancellation.

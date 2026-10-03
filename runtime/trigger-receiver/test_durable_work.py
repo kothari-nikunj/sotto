@@ -643,6 +643,119 @@ def test_worker_failure_retains_safe_category_without_private_stderr(tmp_path, m
     assert 'worker_exit_1:ValueError' in str(reports)
 
 
+def test_proxy_admission_busy_retries_uncharged_until_success_without_duplicate_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    rec._WORK_STOP.clear()
+    sent = []
+    monkeypatch.setattr(rec, '_deliver_text', lambda text, *a, **k: sent.append(text))
+    exits = iter([q.MODEL_ADMISSION_BUSY_EXIT] * 3 + [0])
+
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.returncode = next(exits)
+        def communicate(self, **kwargs):
+            return ('synthetic-output' if self.returncode == 0 else '', 'private provider body')
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(rec.subprocess, 'Popen', Process)
+    canonical = [sys.executable, str(HERE / 'brief_runner.py')]
+    deadline = time.time() + 300
+    identity = q.enqueue(tmp_path, 'run', {'runner': canonical, 'prompt': '{}',
+                                          'label': 'synthetic', 'decision_ids': []},
+                         key='brief-capacity', valid_until=deadline)
+    for attempt in range(3):
+        job = q.claim(tmp_path, 'worker', now=time.time() + attempt * 61)
+        assert job['id'] == identity
+        rec._work_one(job)
+        row = q.get(tmp_path, identity)
+        assert row['status'] == 'pending' and row['attempts'] == 0
+        assert row['valid_until'] == deadline and row['result'] is None
+        assert sent == []
+    job = q.claim(tmp_path, 'worker', now=time.time() + 3 * 61)
+    rec._work_one(job)
+    assert q.get(tmp_path, identity)['status'] == 'done'
+    assert sent == ['synthetic-output']
+
+
+def test_proxy_admission_busy_still_obeys_original_deadline_and_foreign_exit_is_charged(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    rec._WORK_STOP.clear()
+
+    class Process:
+        returncode = q.MODEL_ADMISSION_BUSY_EXIT
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private provider body'
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(rec.subprocess, 'Popen', Process)
+    canonical = [sys.executable, str(HERE / 'brief_runner.py')]
+    now = time.time()
+    identity = q.enqueue(tmp_path, 'run', {'runner': canonical, 'prompt': '{}',
+                                          'label': 'synthetic'}, key='deadline', valid_until=now + 30)
+    rec._work_one(q.claim(tmp_path, 'worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'expired' and row['result'] is None
+    assert row['valid_until'] == now + 30
+    assert q.claim(tmp_path, 'later', now=now + 61) is None
+
+    foreign = q.enqueue(tmp_path, 'run', {'runner': [sys.executable, '-c', 'pass'],
+                                          'prompt': '{}', 'label': 'synthetic'}, key='foreign-78')
+    rec._work_one(q.claim(tmp_path, 'worker', now=now + 62))
+    assert q.get(tmp_path, foreign)['attempts'] == 1
+
+
+@pytest.mark.parametrize('runner_name,kind', [('procedure_runner.py', 'run'),
+                                               ('compose_notification.py', 'event')])
+def test_other_declared_model_runners_refund_typed_proxy_busy(tmp_path, monkeypatch, runner_name, kind):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    rec._WORK_STOP.clear()
+    class Process:
+        returncode = q.MODEL_ADMISSION_BUSY_EXIT
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private provider response'
+        def poll(self):
+            return self.returncode
+    monkeypatch.setattr(rec.subprocess, 'Popen', Process)
+    runner = ([sys.executable, str(HERE / runner_name)] if kind == 'run'
+              else [sys.executable, rec._find_sotto_script('_shared', 'scripts', runner_name)])
+    payload = ({'runner': runner, 'prompt': '{}', 'label': 'synthetic', 'decision_ids': []}
+               if kind == 'run' else {'bundle': {'events': []}, 'label': 'synthetic'})
+    identity = q.enqueue(tmp_path, kind, payload, key=runner_name, valid_until=time.time() + 300)
+    if kind == 'event':
+        monkeypatch.setattr(rec, '_shared_effects', lambda: type('Effects', (), {
+            'for_bundle': staticmethod(lambda bundle: {'effects': [], 'valid_until': None}),
+            'valid': staticmethod(lambda effects, now: True)})())
+        monkeypatch.setattr(rec, '_stage_bundle', lambda bundle: tmp_path / 'staged.json')
+        monkeypatch.setattr(rec, '_event_request', lambda staged: {
+            'runner': runner, 'prompt': '{}', 'label': 'synthetic', 'decision_ids': []})
+    rec._work_one(q.claim(tmp_path, 'worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'pending' and row['attempts'] == 0
+
+
+def test_admission_deferral_preserves_existing_longer_deadline(tmp_path):
+    now = time.time()
+    deadline = now + 20_000
+    identity = q.enqueue(tmp_path, 'run', {'prompt': 'synthetic'},
+                         key='long-validity', valid_until=deadline)
+    job = q.claim(tmp_path, 'worker')
+    assert job['id'] == identity
+    # A busy refusal hours after enqueue remains eligible under the admitted job's own deadline.
+    assert q.defer(tmp_path, identity, 'worker', max_age_seconds=3600, now=now + 4000) == 'pending'
+    row = q.get(tmp_path, identity)
+    assert row['status'] == 'pending' and row['valid_until'] == deadline
+    assert row['due'] == now + 4060 and row['attempts'] == 0
+
+
 def test_only_canonical_brief_runner_budget_exit_parks_one_attempt_and_welcome(tmp_path, monkeypatch):
     import onboarding
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))

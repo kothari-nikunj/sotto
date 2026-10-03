@@ -8,6 +8,7 @@ Two claims are worth a test, and they are the two a user is trusting:
      the whole design of the tool.
 """
 import importlib.util
+import fcntl
 import json
 import multiprocessing
 import os
@@ -40,12 +41,17 @@ LOG_SPEC.loader.exec_module(sotto_log)
 # name → (relative path, contents). One byte count per file so a summary can be checked by size.
 EXHAUST = {
     "snapshot": ("knowledge/last_local_snapshot.json", '{"messages": []}'),
+    "wake_payload": ("briefs/2026-08-12.morning.payload.json", '{"imessage": ["private"]}'),
+    "brief_artifact": ("events/work-inputs/brief-test/artifact.json", '{"brief_text": "private"}'),
+    "brief_current": ("events/work-inputs/brief-test/current/inputs.json", '{"local": "private"}'),
+    "brief_prepared": ("events/work-inputs/brief-test/prepared/inputs.json", '{"events": "private"}'),
     "research": ("cache/research_2026-08-12.json", '{"cards": 1}'),
     "research2": ("cache/research_2026-08-11.json", '{"cards": 2}'),
     "calendar": ("cache/calendar_today.json", '{"events": 0}'),
     "log": ("logs/compose_brief.log", "line one\nline two\n"),
     "delivery": ("events/delivery.jsonl", '{"status": "delivered"}\n'),
     "sends": ("events/sends.jsonl", '{"result": "sent"}\n'),
+    "learning_diagnostics": ("events/learning-diagnostics/brief-test.json", '{"rejected": []}'),
 }
 
 # …and everything that must be there afterwards, whatever was asked for.
@@ -63,11 +69,16 @@ MEMORY = {
 }
 
 VERB_FILES = {
-    "snapshot": ["knowledge/last_local_snapshot.json"],
+    "snapshot": ["briefs/2026-08-12.morning.payload.json",
+                 "events/work-inputs/brief-test/artifact.json",
+                 "events/work-inputs/brief-test/current/inputs.json",
+                 "events/work-inputs/brief-test/prepared/inputs.json",
+                 "knowledge/last_local_snapshot.json"],
     "caches": ["cache/calendar_today.json", "cache/research_2026-08-11.json",
                "cache/research_2026-08-12.json"],
     "logs": ["logs/compose_brief.log"],
-    "receipts": ["events/delivery.jsonl", "events/sends.jsonl"],
+    "receipts": ["events/delivery.jsonl", "events/learning-diagnostics/brief-test.json",
+                 "events/sends.jsonl"],
 }
 
 
@@ -253,6 +264,55 @@ def test_the_protected_guard_refuses_a_memory_path_whatever_asks(vol):
         assert not fg._protected(rel), rel
 
 
+def test_receipts_also_erase_diagnostic_lock_sidecars(vol):
+    """Per-file locks go; the directory consent gate stays to coordinate future writers."""
+    diagnostics = os.path.join(vol, "events", "learning-diagnostics")
+    _write(vol, "events/learning-diagnostics/brief-test.json.lock", "")
+    _write(vol, "events/learning-diagnostics/brief-orphan.json.lock", "")   # its file aged out
+    summary = fg.forget({"receipts"})
+    assert summary["errors"] == []
+    assert "events/learning-diagnostics/brief-orphan.json.lock" in {
+        r["path"] for r in summary["removed"]}
+    assert os.listdir(diagnostics) == ['.consent.lock']
+
+
+def test_receipt_forget_releases_file_lock_before_unlinking_sidecar(vol, monkeypatch):
+    original_remove = fg.os.remove
+    checked = []
+
+    def remove(path):
+        if path.endswith('brief-test.json.lock'):
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                checked.append(path)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        original_remove(path)
+
+    monkeypatch.setattr(fg.os, 'remove', remove)
+    summary = fg.forget({'receipts'})
+    assert summary['errors'] == []
+    assert len(checked) == 1
+
+
+def test_receipt_forget_enumerates_after_in_flight_diagnostic_writer(vol):
+    diagnostics = os.path.join(vol, "events", "learning-diagnostics")
+    gate = os.path.join(diagnostics, ".consent")
+    result = {}
+    with fg.jsonstore.lock(gate):
+        eraser = threading.Thread(target=lambda: result.update(fg.forget({"receipts"})))
+        eraser.start()
+        time.sleep(0.05)
+        assert eraser.is_alive()
+        _write(vol, "events/learning-diagnostics/brief-late.json", '{"snippet":"private"}')
+    eraser.join(timeout=5)
+    assert not eraser.is_alive()
+    assert result["errors"] == []
+    assert not os.path.exists(os.path.join(diagnostics, "brief-late.json"))
+
+
 def test_no_verb_is_a_usage_error_not_a_silent_success(capsys):
     assert fg.main([]) == 2
     assert "at least one verb" in capsys.readouterr().err
@@ -266,7 +326,12 @@ def test_cli_prints_one_json_object_and_exits_zero(vol):
     assert proc.returncode == 0, proc.stderr
     summary = json.loads(proc.stdout)
     assert sorted(r["path"] for r in summary["removed"]) == [
-        "events/delivery.jsonl", "events/sends.jsonl", "knowledge/last_local_snapshot.json"]
+        "briefs/2026-08-12.morning.payload.json", "events/delivery.jsonl",
+        "events/learning-diagnostics/brief-test.json", "events/sends.jsonl",
+        "events/work-inputs/brief-test/artifact.json",
+        "events/work-inputs/brief-test/current/inputs.json",
+        "events/work-inputs/brief-test/prepared/inputs.json",
+        "knowledge/last_local_snapshot.json"]
 
 
 def test_an_unknown_verb_is_rejected_rather_than_ignored(vol):

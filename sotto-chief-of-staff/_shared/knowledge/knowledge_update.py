@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import difflib
 import glob
+import hashlib
 import json
 import os
 import re
@@ -584,12 +585,15 @@ def company_knowledge(company_name: str = "", domain: str = "", company_slug: st
             "updated_by": _s(fm.get("updated_by")), "last_researched": _s(fm.get("last_researched"))}
 
 
-def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict) -> None:
+def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict) -> dict:
     """One extracted fact onto one person: the bump / supersede / new decision and its bookkeeping.
     THE fact writer — apply()'s person loop and the relations fallback both land here, so an
     "unlinked" relation is stored by exactly the code that stores every other fact."""
     if float(fu.get("confidence", 0.8)) < 0.5:
-        return
+        return {'disposition': 'rejected', 'reason': 'low_confidence'}
+    if (fu.get('source') == 'apple_contacts' and fu.get('change_type') != 'correction'
+            and not any(c.isalpha() for c in str(fu.get('fact') or ''))):
+        return {'disposition': 'rejected', 'reason': 'non_assertion'}
     observed = str(fu.get('observed_date') or '')
     has_observed_date = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', observed) and observed <= today)
     if has_observed_date:
@@ -610,7 +614,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         if isinstance(v, str) and 0 < len(v) <= 500
     ))[-64:]
     if existing_id and p.facts[existing_id].source == 'user_edit' and source != 'user_edit':
-        return  # Neither historical ingestion nor a model revisiting its own memory can undo a correction.
+        return {'disposition': 'rejected', 'reason': 'protected_owner_correction'}
+    folded_refs = set()
     if source == 'observed_message' and not force:
         # Overlapping words do not prove two historical statements agree. Keep both assertions
         # for evidence-based curation instead of strengthening or overwriting one heuristically.
@@ -618,51 +623,68 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         # live copy of the same words and turn a re-observation into a SKIP.
         exact = next((fid for fid, fact in sorted(p.facts.items(), key=lambda kv: kv[1].status == 'archived')
                       if ' '.join(fact.text.split()).casefold() == ' '.join(fu['fact'].split()).casefold()), None)
-        action, existing_id = ((kg.BUMP if (p.facts[exact].status == 'active'
-                                               or kg.can_revive_fact(p.facts[exact], fu['fact'])) else kg.SKIP, exact)
+        revivable = exact and kg.can_revive_fact(p.facts[exact], fu['fact'])
+        # Evidence for a curation-folded duplicate's wording is evidence for the copy it was folded
+        # into: follow duplicate_of to that keeper (reviving it only from an age-prune), so ongoing
+        # evidence keeps the fact alive. The folded copies' own refs are not new evidence.
+        visited = set()
+        while (exact and exact not in visited and p.facts[exact].archived_reason == 'duplicate'
+               and p.facts[exact].status == 'archived' and p.facts[exact].duplicate_of in p.facts):
+            visited.add(exact)
+            folded_refs.update([*p.facts[exact].evidence_refs, p.facts[exact].source_ref])
+            exact = p.facts[exact].duplicate_of
+            revivable = p.facts[exact].archived_reason == 'stale' and p.facts[exact].source != 'user_edit'
+        action, existing_id = ((kg.BUMP if p.facts[exact].status == 'active' or revivable else kg.SKIP, exact)
                                if exact else (kg.NEW, None))
+        if visited and p.facts[exact].source == 'user_edit':
+            return {'disposition': 'rejected', 'reason': 'protected_owner_correction', 'fact_id': exact}
     if action == kg.BUMP:
         ex = p.facts[existing_id]
+        revived = ex.status == 'archived'
         if ex.status == 'archived':
             # Re-observed, so re-learned (kg.find_similar_fact): drop the tombstone and keep the
             # id, then let the bookkeeping below decide whether this sighting is independent.
-            ex.status, ex.archived_text, ex.archived_reason = 'active', None, None
+            ex.status, ex.archived_text, ex.archived_reason, ex.duplicate_of = 'active', None, None, None
         if source == 'user_edit':
             # An explicit confirmation upgrades authority once; automatic replay never does.
-            if ex.source != 'user_edit':
+            upgraded = ex.source != 'user_edit'
+            if upgraded:
                 ex.seen += 1
                 counts['confirmed'] += 1
             ex.source, ex.source_ref = 'user_edit', ref or 'user-confirmation'
             ex.conf = float(fu.get('confidence', 1.0))
             ex.last = max(ex.last or today, today)
-            return
+            return {'disposition': 'confirmed' if upgraded else 'updated',
+                    'reason': 'owner_confirmation', 'fact_id': existing_id}
         refs = list(dict.fromkeys([*(ex.evidence_refs or []),
                                    *([ex.source_ref] if ex.source_ref else [])]))
-        retained = set(refs)
+        retained = set(refs) | folded_refs
         novel = [value for value in new_refs if value not in retained]
         if not novel:
             # Re-reading the same evidence is not independent confirmation: no seen/conf bump.
             # Nor is it a fresh observation: repeated or ref-less extraction can be the model
             # proposing the same words from the same input. Only distinct source evidence (or the
             # explicit user-confirmation branch above) may refresh evidence recency.
-            return
+            return {'disposition': 'updated' if revived else 'duplicate',
+                    'reason': 'revived' if revived else 'no_new_evidence', 'fact_id': existing_id}
         saturated = len(refs) >= 64
         ex.evidence_refs = list(dict.fromkeys([*refs, *novel]))[-64:]
         if saturated and not (has_observed_date and observed > (ex.last or '')):
             # A bounded exact set cannot remember every evicted reference. Keep rolling provenance,
             # but after saturation require source-bound chronology before granting corroboration:
             # processing on a later day alone must not make replayed old evidence look new.
-            return
+            return {'disposition': 'updated', 'reason': 'evidence_refs_only', 'fact_id': existing_id}
         ex.seen += 1
         ex.conf = min(ex.conf + 0.1, 1.0)
         ex.first = min(ex.first or today, today)
         ex.last = max(ex.last or today, today)
         counts["confirmed"] += 1
+        return {'disposition': 'confirmed', 'reason': 'independent_evidence', 'fact_id': existing_id}
     elif action in (kg.SUPERSEDE, kg.NEW):
         if action == kg.SUPERSEDE:
             ex = p.facts[existing_id]
             if today < ex.last and not force:
-                return
+                return {'disposition': 'rejected', 'reason': 'older_observation', 'fact_id': existing_id}
             ex.status = "archived"
             ex.archived_text = ex.text
             ex.archived_reason = "user_corrected" if source == "user_edit" else "superseded"
@@ -677,7 +699,9 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
             source_ref=ref, first=today, last=today,
         )
         counts["new"] += 1
-    # SKIP: silently ignore
+        return {'disposition': 'superseded' if action == kg.SUPERSEDE else 'added',
+                'reason': 'accepted', 'fact_id': fid}
+    return {'disposition': 'ignored', 'reason': 'archived_match', 'fact_id': existing_id}
 
 
 def _apply_relations(pending: list, index: dict, counts: dict, dropped: list,
@@ -789,6 +813,18 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     today = kg.today_str(now)
     iso = kg.now_iso(now)
     counts = {"new": 0, "confirmed": 0, "superseded": 0, "pruned": 0, "relations": 0}
+    fact_outcomes = {'total': 0, 'counts': {}, 'items': [], 'truncated': False}
+
+    def record_fact(person_index, fact_index, fact, outcome):
+        fact_outcomes['total'] += 1
+        disposition = outcome['disposition']
+        fact_outcomes['counts'][disposition] = fact_outcomes['counts'].get(disposition, 0) + 1
+        if len(fact_outcomes['items']) < 256:
+            digest = hashlib.sha256(json.dumps(fact, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            fact_outcomes['items'].append({'person_index': person_index, 'fact_index': fact_index,
+                                           'digest': digest, **outcome})
+        else:
+            fact_outcomes['truncated'] = True
     person_files: list[str] = []
     company_files: list[str] = []
     # (subject cid, subject name, [extracted relation]) — resolved AFTER every person file in this
@@ -811,7 +847,7 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     auto_merged = auto_merge_by_identifier(now)
     index = kg.build_people_index()
 
-    for upd in extracted.get("person_updates", []):
+    for person_index, upd in enumerate(extracted.get("person_updates", [])):
         ident = (upd.get("identifier") or "").strip()
         ident = ident.lower() if "@" in ident else ident
         name = upd.get("person_name") or ""
@@ -819,6 +855,9 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
         if not kg.valid_canonical_id(cid):
             cid = ""  # malformed/LLM-invented id → resolve by identifier/name instead
         if not cid and not ident and not _slug_for(name):
+            for fact_index, fact in enumerate(upd.get('facts', [])):
+                record_fact(person_index, fact_index, fact,
+                            {'disposition': 'rejected', 'reason': 'missing_person_identity'})
             continue  # nothing usable to key this person by (garbage-name-only update)
 
         path = kg.find_person_file(name=name, identifier=ident, cid=cid, index=index)
@@ -878,8 +917,9 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
         if upd.get("last_researched"):
             p.last_researched = str(upd["last_researched"])[:10]
 
-        for fu in upd.get("facts", []):
-            _apply_fact(p, cid, fu, today, counts)
+        for fact_index, fu in enumerate(upd.get("facts", [])):
+            outcome = _apply_fact(p, cid, fu, today, counts)
+            record_fact(person_index, fact_index, fu, outcome)
 
         before_archived = sum(1 for f in p.facts.values() if f.status == "archived")
         kg.prune_stale_facts(p.facts, now)
@@ -1015,7 +1055,8 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     except Exception:  # noqa: BLE001 — memory hygiene must never cost the Learn step its writes
         suggestions = []
 
-    return {"applied": counts, "person_files": person_files, "company_files": company_files,
+    return {"applied": counts, "fact_outcomes": fact_outcomes,
+            "person_files": person_files, "company_files": company_files,
             "auto_merged": auto_merged, "merge_suggestions": suggestions,
             "dropped_relation_types": sorted(set(dropped_relation_types))}
 
@@ -1112,11 +1153,26 @@ def unlink_relation(*a, **k):
         return _unlink_relation_unlocked(*a, **k)
 
 
-def consolidate(slug, expected_hash, summary_refs, conflicts, now=None):
+def validate_equivalent_groups(groups, facts, conflicts):
+    """Validate the entire ID-only plan before any write, including overlap with conflicts."""
+    if not isinstance(groups, list) or len(groups) > 8:
+        raise ValueError('invalid equivalence groups')
+    used = set()
+    conflicted = {fid for pair in conflicts for fid in pair}
+    for group in groups:
+        if (not isinstance(group, list) or not 2 <= len(group) <= 8
+                or any(not isinstance(fid, str) or fid not in facts for fid in group)
+                or len(set(group)) != len(group) or used.intersection(group)
+                or conflicted.intersection(group)):
+            raise ValueError('invalid equivalence references')
+        used.update(group)
+
+
+def consolidate(slug, expected_hash, summary_refs, conflicts, now=None, *, equivalent_groups=None):
     """Apply a Dreamer selection through the graph writer, preserving evidence and human edits.
 
     The model selects existing fact IDs. It cannot supply replacement prose, confidence,
-    instructions, identity, or deletion targets. Only exact duplicate text is archived.
+    instructions, identity, or deletion targets. Equivalents retain their original archived evidence.
     """
     import hashlib
     import jsonstore
@@ -1138,24 +1194,61 @@ def consolidate(slug, expected_hash, summary_refs, conflicts, now=None):
         for pair in conflicts:
             if not isinstance(pair, list) or len(pair) != 2 or len(set(pair)) != 2 or any(fid not in active for fid in pair):
                 raise ValueError('invalid contradiction references')
+        groups = equivalent_groups if equivalent_groups is not None else []
+        validate_equivalent_groups(groups, active, conflicts)
         # Never overwrite a human-maintained summary or turn uncertain facts into confident prose.
         prior_text = ' '.join(person.facts[fid].text for fid in person.summary_refs if fid in person.facts)
         protected_summary = (person.summary and (
             (person.summary_refs and person.summary != prior_text)
             or (not person.summary_refs and person.updated_by == 'user_edit')))
-        if not protected_summary:
-            person.summary_refs = summary_refs
-            person.summary = ' '.join(active[fid].text for fid in summary_refs)
-        duplicates, seen = 0, {}
-        # User-corrected facts are never archived; every original and source ref remains stored.
-        for fid, fact in sorted(active.items(), key=lambda kv: (kv[1].source != 'user_edit', kv[0])):
+        duplicates, seen, representatives = 0, {}, {}
+        protected_refs = set(person.summary_refs) if protected_summary else set()
+        # The chosen existing fact keeps its own provenance, dates, seen count and confidence.
+        # Other assertions remain in the file with their independent source/consent ownership.
+        # Never pool source refs across grants or make repeated paraphrases stronger evidence.
+        # Keeper rule: a user correction, else the most corroborated copy (seen, then effective
+        # confidence); the model's order only breaks ties. Its wording preference must not archive
+        # a corroborated copy (never age-pruned) behind a heard-once one that ages out at day 60.
+        def rank(fid):
+            fact = active[fid]
+            return (fact.source == 'user_edit', fact.seen, kg.effective_confidence(fact, now))
+
+        def fold(fid, keeper):
+            nonlocal duplicates
+            fact = active[fid]
+            fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'duplicate'
+            fact.duplicate_of = representatives[fid] = keeper
+            duplicates += 1
+
+        for group in groups:
+            keeper = max(group, key=rank)  # max() keeps the first of equals: model order breaks ties
+            for fid in group:
+                if fid != keeper and active[fid].source != 'user_edit' and fid not in protected_refs:
+                    fold(fid, keeper)
+        for fid in sorted(active, key=lambda fid: (tuple(-v for v in rank(fid)), fid)):
+            fact = active[fid]
+            if fact.status != 'active':
+                continue
             key = (fact.type, ' '.join(fact.text.split()).casefold())
-            if key in seen and fact.source != 'user_edit' and fid not in summary_refs:
-                fact.status, fact.archived_text = 'archived', fact.text
-                fact.archived_reason = 'duplicate'
-                duplicates += 1
+            if key in seen and fact.source != 'user_edit' and fid not in protected_refs:
+                fold(fid, seen[key])
             else:
                 seen[key] = fid
+        # A bare contact-note number is not an assertion. Keep the original in the archive,
+        # but stop displaying it as a learned fact. Human-authored facts are never filtered.
+        for fid, fact in active.items():
+            if (fact.status == 'active' and fact.source == 'apple_contacts'
+                    and not any(c.isalpha() for c in fact.text) and fid not in protected_refs):
+                fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'non_assertion'
+        if not protected_summary:
+            def representative(fid):
+                while fid in representatives:
+                    fid = representatives[fid]
+                return fid
+            summary_refs = list(dict.fromkeys(representative(fid) for fid in summary_refs))
+            summary_refs = [fid for fid in summary_refs if active[fid].status == 'active']
+            person.summary_refs = summary_refs
+            person.summary = ' '.join(active[fid].text for fid in summary_refs)
         # Curation is not a new observation: preserve each fact's date/confidence and file recency.
         kg.write_person_file(path, person, now)
         written_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()

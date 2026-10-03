@@ -6,6 +6,8 @@ passed at the top level but the renderers read everything from `local`, so they 
 import importlib.util
 import json
 import os
+from datetime import datetime, timedelta, timezone
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -126,6 +128,108 @@ def test_cli_separate_files_assembles_inputs(tmp_path):
     md = json.loads(out.stdout)["brief_markdown"]
     assert md.startswith("# Good ") and md.endswith("\n\n# Real")   # the code-owned greeting, then the model's text
     assert json.loads(out.stdout)['_source_permissions'] == ['calendar', 'imessage']
+
+
+def test_cli_effective_local_handoff_keeps_snapshot_provenance_and_consent(tmp_path, monkeypatch):
+    """The runner's local path becomes the exact view composition and Learn can both verify."""
+    import subprocess, sys as _sys
+    from source_context import record_bridge_status
+
+    stamp = lambda hours: (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    script = os.path.join(ROOT, "_shared", "scripts", "compose_brief.py")
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps({"brief_markdown": "# Brief", "actions": []}))
+    local_path = tmp_path / "local.json"
+    env = {**os.environ, "SOTTO_DATA": str(tmp_path), "SOTTO_LLM_STUB": str(stub)}
+
+    # An unavailable Bridge read receives cached messages, marked with their old observation.
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    cb._save_local_snapshot({"generated_at": stamp(2), "source_status": {"imessage": "ok"},
+                             "imessage": [{"text": "cached message", "handle": "+15551234567"}]})
+    local_path.write_text("{}")
+    argv = [_sys.executable, script, "--type", "morning", "--local", str(local_path),
+            "--effective-local-out", str(local_path)]
+    result = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    effective = json.loads(local_path.read_text())
+    assert effective["imessage"][0]["text"] == "cached message"
+    assert effective["_source_availability"]["imessage"] == "unavailable"
+    assert effective["_source_observed_at"]["imessage"] == effective["_local_stale_since"]
+    snapshot_before = json.loads(open(cb._snapshot_path(), encoding="utf-8").read())
+    result = subprocess.run([*argv, "--local-resolved"], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(open(cb._snapshot_path(), encoding="utf-8").read()) == snapshot_before
+    assert json.loads(local_path.read_text())["_source_observed_at"]["imessage"] == snapshot_before["captured_at"]
+
+    # A partial fresh pull retains its fresh messages and carries stable contact identity.
+    cb._save_local_snapshot({"generated_at": stamp(2), "source_status": {"contacts": "ok"},
+                             "contacts": [{"name": "Sarah", "phones": ["+15551234567"]}]})
+    local_path.write_text(json.dumps({"generated_at": stamp(0),
+        "source_status": {"imessage": "ok", "contacts": "unavailable"},
+        "imessage": [{"text": "fresh message", "handle": "+15551234567"}]}))
+    result = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    effective = json.loads(local_path.read_text())
+    assert effective["imessage"][0]["text"] == "fresh message"
+    assert effective["contacts"][0]["name"] == "Sarah"
+    assert effective["_source_availability"]["contacts"] == "unavailable"
+    assert effective["_source_observed_at"]["contacts"] != effective["_source_observed_at"]["imessage"]
+
+    # A later revocation removes the old messages even though the snapshot still has them.
+    record_bridge_status({"generated_at": stamp(0), "source_status": {"imessage": "disabled"}})
+    local_path.write_text("{}")
+    result = subprocess.run(argv, capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert "imessage" not in json.loads(local_path.read_text())
+
+
+def test_composer_filters_revoked_google_before_model_and_rechecks_consumed_grant(tmp_path, monkeypatch):
+    import sys
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    gmail = tmp_path / 'gmail.json'
+    calendar = tmp_path / 'calendar.json'
+    research = tmp_path / 'research.json'
+    x_context = tmp_path / 'x.json'
+    gmail.write_text(json.dumps([{'id': 'mail', 'body': 'private email'}]))
+    calendar.write_text(json.dumps([{'id': 'event', 'summary': 'private event'}]))
+    research.write_text(json.dumps({'attendees': [{'name': 'Calendar attendee'}]}))
+    x_context.write_text(json.dumps({'attendees': [{'name': 'Calendar-selected X profile'}]}))
+    monkeypatch.setattr(sys, 'argv', ['compose_brief.py', '--gmail', str(gmail),
+                        '--calendar', str(calendar), '--attendee-research', str(research),
+                        '--x-context', str(x_context)])
+    original_allowed = source_context.allowed
+    grants = {'gmail': False, 'calendar': False}
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: grants.get(source, original_allowed(source)))
+    seen = []
+
+    def compose(inputs, **_kwargs):
+        seen.append(inputs)
+        return {'brief_markdown': '# Brief', 'actions': []}
+
+    monkeypatch.setattr(cb, 'compose', compose)
+    cb.main()
+    assert seen[-1]['google']['emails'] == [] and seen[-1]['google']['events'] == []
+    assert seen[-1]['attendee_research'] == [] and seen[-1]['x_context'] == {'attendees': [], 'connected': False}
+
+    grants.update(gmail=True, calendar=True)
+    def revoke_during_compose(inputs, **_kwargs):
+        grants['gmail'] = False
+        return {'brief_markdown': '# Brief', 'actions': []}
+    monkeypatch.setattr(cb, 'compose', revoke_during_compose)
+    with pytest.raises(RuntimeError, match='source permission changed while composing'):
+        cb.main()
+
+    # Calendar-derived research stays permission-bound even when this run has no events.
+    calendar.write_text('[]')
+    grants.update(gmail=False, calendar=True)
+    def revoke_calendar_during_compose(inputs, **_kwargs):
+        grants['calendar'] = False
+        return {'brief_markdown': '# Brief', 'actions': []}
+    monkeypatch.setattr(cb, 'compose', revoke_calendar_during_compose)
+    with pytest.raises(RuntimeError, match='source permission changed while composing'):
+        cb.main()
 
 
 def test_cli_local_reaches_prompt():

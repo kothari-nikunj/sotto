@@ -788,9 +788,10 @@ def test_skill_resolves_a_bare_yes_to_focus_mode():
 
 def test_proactive_offer_names_the_person_so_the_yes_is_answerable():
     line = next(l for l in PROACTIVE_SKILL.splitlines() if l.strip().startswith("- `meeting_prep`"))
-    # the nudge CARRIES the prep (who they are, what's open) and names the person — never invents
-    assert "give useful context" in line and "never invent a title or introduction" in line
-    assert "a yes runs `sotto-meeting-prep` focused on that person" in line
-    assert "no list of the user's other meetings" in line
+    # the nudge CARRIES useful context and names the person — never invents a title or intro
+    assert "make the reminder useful" in line and "Name the person" in line
+    assert "never invent a title or introduction" in line
+    assert "A bare yes runs `sotto-meeting-prep` focused on that person" in line
+    assert "with no list of other meetings" in line
     for jargon in ("--focus", "focus mode", "sweep"):    # the DELIVERED text stays plain English
         assert jargon not in line.split('"')[1]

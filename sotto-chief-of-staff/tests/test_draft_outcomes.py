@@ -109,17 +109,33 @@ def test_verbatim_send_is_executed_and_edit_is_edited_and_sent(tmp_path, monkeyp
     assert "similarity" in by_contact["16505550000"]["edits"]
 
 
-def test_absence_of_a_send_stays_unknown_even_when_lane_is_alive(tmp_path, monkeypatch):
+def test_expired_send_observation_is_unknown_not_a_dismissal(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _write_draft(tmp_path, NOW - timedelta(hours=30), "imessage", "+14155551234", "Want to grab lunch?")
     _write_draft(tmp_path, NOW - timedelta(hours=1), "imessage", "+16505550000", "Sounds good!")
     s = do.run(now=NOW)
-    assert (s["dismissed"], s["pending"]) == (0, 2)      # silent lane → no verdict at all
+    assert (s["dismissed"], s["unknown"], s["pending"]) == (0, 1, 1)
+    expired = next(r for r in _outcomes(tmp_path) if r["outcome"] == "unknown")
+    assert expired["reason"] == "observation_window_elapsed"
+    assert "source_event_id" not in expired  # no send failure or no-send claim
     # Unrelated activity is telemetry about the lane, not evidence that this draft was rejected.
     _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550000", "totally unrelated text")
     s2 = do.run(now=NOW)
-    assert (s2["dismissed"], s2["pending"]) == (0, 2)
-    assert _outcomes(tmp_path) == []
+    assert (s2["dismissed"], s2["unknown"], s2["pending"]) == (0, 1, 1)
+    assert len(_outcomes(tmp_path)) == 1
+
+
+def test_late_ingested_signal_can_resolve_a_previously_unknown_draft(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    offered = NOW - timedelta(hours=30)
+    _write_draft(tmp_path, offered, "imessage", "+14155551234", "Want to grab lunch?")
+    assert do.run(now=NOW)["unknown"] == 1
+    # The queue row arrives late, but its original event timestamp is still inside the offer window.
+    _write_signal(tmp_path, offered + timedelta(hours=20), "+14155551234", "Want to grab lunch?")
+    summary = do.run(now=NOW)
+    assert summary["executed"] == 1 and summary["unknown"] == 0
+    outcomes = _outcomes(tmp_path)
+    assert [row['outcome'] for row in outcomes] == ['unknown', 'executed']
 
 
 def test_grading_is_idempotent(tmp_path, monkeypatch):

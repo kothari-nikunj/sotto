@@ -321,6 +321,60 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
         return str(row.get("status") or STATUS_PENDING)
 
 
+def enqueue_work_feedback(job: dict) -> bool:
+    """Atomically inspect delivery and enqueue one content-free requested-work outcome.
+
+    Work completion is only a handoff, not proof of delivery. Unknown acceptance gets an honest
+    status notice after ten minutes, never a replacement send or a claim that nothing arrived.
+    The existing drain owns feedback retries; feedback itself cannot create further work.
+    """
+    if job.get('status') not in ('done', 'failed', 'expired'):
+        return False
+    meta = job['feedback']
+    now, today = time.time(), str(HOOKS['local_today']() or '')
+    key = message_key('request-feedback', job['id'])
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        rows = _rows(doc)
+        doc['rows'] = rows
+        if _find(rows, key) is not None:
+            return True
+        original = _find(rows, job['id'])
+        uncertain = False
+        if original is not None:
+            if original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted':
+                return True
+            uncertain = bool(original.get('acceptance_uncertain') or original.get('acceptance') in (
+                'unknown', 'in_flight'))
+            if original.get('status') == STATUS_PENDING and (not uncertain or not (
+                    original.get('payload') or {}).get('presentation')):
+                return False  # Delivery still has a retry budget; the work row being done isn't failure.
+            stamp = float(original.get('finished_at') or original.get('created_at') or now)
+            if uncertain:
+                stamp = float(original.get('created_at') or now) + 600
+        else:
+            stamp = float(job.get('finished') or now)
+        # Do not surprise an owner with ancient failures after a long outage. The normal durable
+        # metadata remains available, but these conversational notices have a four-hour window.
+        if now < stamp:
+            return False
+        if now - stamp >= 4 * 3600:
+            return True
+        kind = 'morning' if meta['label'].endswith('sotto-morning-brief') else 'evening'
+        body = (f"I couldn't confirm whether your requested {kind} brief arrived. "
+                "Please check the conversation before requesting another copy." if uncertain else
+                f"I couldn't finish your requested {kind} brief. I won't keep retrying this request. "
+                "Please ask me for it again when you're ready.")
+        payload = {'label': 'request-feedback:' + job['id'], 'body': body, 'target': meta['target'],
+                   'run_id': key, 'effects': [], 'valid_until': stamp + 4 * 3600,
+                   'feedback_for': job['id'], 'feedback_owner': meta['owner'],
+                   'feedback_chat_id': meta['chat_id']}
+        rows.append({'id': key, 'kind': KIND_NUDGE, 'created_at': now, 'day': today,
+                     'attempts': 0, 'next_at': now, 'last_error': '', 'status': STATUS_PENDING,
+                     'payload': payload, 'acceptance': 'not_attempted', 'acceptance_uncertain': False})
+
+    return True
+
+
 def _claim(key: str, now: float, today: str):
     """Charge one attempt and hand back what to send, or say why not. One transaction, three
     answers: `None` (nothing to do — terminal, or not due yet), `aged` (it timed out — terminal),
@@ -334,6 +388,13 @@ def _claim(key: str, now: float, today: str):
         doc["rows"] = rows
         row = _find(rows, key)
         if row is None or row.get("status") != STATUS_PENDING:
+            return None
+        feedback_for = (row.get('payload') or {}).get('feedback_for')
+        original = _find(rows, feedback_for) if feedback_for else None
+        if original and (original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted'):
+            row['status'] = STATUS_SUPERSEDED
+            row['last_error'] = 'requested delivery confirmed before feedback send'
+            _close(row)
             return None
         # Once a gallery crossed the provider boundary, relevance expiry cannot prove it was not
         # accepted. Keep its replay inputs and poll only on the existing capped backoff; the

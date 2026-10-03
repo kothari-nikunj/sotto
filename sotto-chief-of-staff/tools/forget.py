@@ -12,15 +12,16 @@ nobody who installed Sotto can run is not a retention tool.
 
 Verbs (combine freely; `--all` is every one of them):
 
-    --snapshot    delete knowledge/last_local_snapshot.json — the RAW Bridge payload, the widest
-                  file Sotto keeps and the one DATA-FLOW.md singles out
+    --snapshot    delete knowledge/last_local_snapshot.json, staged brief wake payloads, and
+                  resumable brief inputs/artifacts under events/work-inputs/brief-*/
     --caches      delete cache/research_*.json and cache/calendar_today.json — render caches, both
                   rebuilt on the next run
     --logs        TRUNCATE logs/compose_brief.log — truncate, not delete: a running receiver or a
                   mid-flight brief holds the file open, and unlinking it under them would send
                   every later line to a file nobody can read
     --receipts    delete events/delivery.jsonl and events/sends.jsonl — the "did it land" and
-                  "what did Sotto send" ledgers
+                  "what did Sotto send" ledgers, plus bounded unresolved-learning diagnostics
+                  and their content-free lock sidecars
 
 Prints ONE JSON object saying exactly what went, with byte counts, and exits 0 — including when
 there was nothing to do, because "already clean" is a success, not an error.
@@ -33,6 +34,7 @@ a decision a person makes about their own graph, not hygiene a script performs, 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import glob
 import json
 import os
@@ -71,6 +73,10 @@ def _targets(verbs: set) -> list:
 
     if "snapshot" in verbs:
         add("knowledge/last_local_snapshot.json", "deleted")
+        add("briefs/????-??-??.*.payload.json", "deleted")
+        add("events/work-inputs/brief-*/*.json", "deleted")
+        add("events/work-inputs/brief-*/current/*.json", "deleted")
+        add("events/work-inputs/brief-*/prepared/*.json", "deleted")
     if "caches" in verbs:
         add("cache/research_*.json", "deleted")
         add("events/notification-artifacts/*.json", "deleted")
@@ -83,10 +89,12 @@ def _targets(verbs: set) -> list:
     if "receipts" in verbs:
         add("events/delivery.jsonl", "deleted")
         add("events/sends.jsonl", "deleted")
+        add("events/learning-diagnostics/*.json", "deleted")
+        add("events/learning-diagnostics/*.json.lock", "deleted")
     return out
 
 
-def forget(verbs) -> dict:
+def _forget_selected(verbs) -> dict:
     """Apply the verbs; return the summary dict that main() prints. Every removal is independent —
     one unwritable file is reported and the rest still go."""
     root = _root()
@@ -113,10 +121,25 @@ def forget(verbs) -> dict:
                 # Receipt writers and retention rewrites use this same sidecar. Hold it across
                 # stat+unlink so a rewrite that already read the ledger cannot replace it after
                 # erasure and resurrect the user's history.
-                if rel in ("events/delivery.jsonl", "events/sends.jsonl"):
+                diagnostic = rel.startswith("events/learning-diagnostics/")
+                if diagnostic and rel.endswith(".lock"):
+                    # A content-free sidecar goes once the diagnostic it guarded is gone; one whose
+                    # diagnostic was just erased below already went with it.
+                    if not os.path.exists(path) or os.path.exists(path[:-len(".lock")]):
+                        continue
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                elif rel in ("events/delivery.jsonl", "events/sends.jsonl") or diagnostic:
                     with jsonstore.lock(path):
                         size = os.path.getsize(path)
                         os.remove(path)
+                    if diagnostic:
+                        # The outer directory gate excludes every current diagnostic locker;
+                        # release our per-file flock before unlinking its inode.
+                        try:
+                            os.remove(jsonstore.lock_path(path))
+                        except OSError:
+                            pass   # the diagnostic is erased; a stray sidecar is content-free
                 else:
                     size = os.path.getsize(path)
                     os.remove(path)
@@ -136,11 +159,22 @@ def forget(verbs) -> dict:
     }
 
 
+def forget(verbs) -> dict:
+    """Fence diagnostic enumeration and erasure against in-flight learning writers."""
+    verbs = set(verbs)
+    root = _root()
+    diagnostic_dir = os.path.join(root, "events", "learning-diagnostics")
+    gate = (jsonstore.lock(os.path.join(diagnostic_dir, ".consent"))
+            if "receipts" in verbs and os.path.isdir(diagnostic_dir) else nullcontext())
+    with gate:
+        return _forget_selected(verbs)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="forget.py",
         description="Delete Sotto's exhaust from $SOTTO_DATA. Never touches the knowledge graph.")
-    p.add_argument("--snapshot", action="store_true", help="knowledge/last_local_snapshot.json")
+    p.add_argument("--snapshot", action="store_true", help="raw snapshot and staged brief inputs")
     p.add_argument("--caches", action="store_true",
                    help="cache/research_*.json, cache/calendar_today.json")
     p.add_argument("--logs", action="store_true", help="truncate logs/compose_brief.log")

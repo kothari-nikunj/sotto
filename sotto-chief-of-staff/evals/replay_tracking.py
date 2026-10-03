@@ -120,7 +120,10 @@ def replay():
             return drafts._draft_key(row)
 
         def outcome(key):
-            return next((r['outcome'] for r in _rows(root/'outcomes.jsonl') if r.get('action_id') == key), None)
+            # Outcomes are append-only. A late-ingested send may validly upgrade an earlier
+            # unknown observation, so report the most recent durable disposition for the action.
+            return next((r['outcome'] for r in reversed(_rows(root/'outcomes.jsonl'))
+                         if r.get('action_id') == key), None)
 
         cross_key = late_key = pre_key = None
         duplicate_keys = []
@@ -186,6 +189,8 @@ def replay():
                 new = [_action('Ada', people['Ada'], 'Review the new budget',
                                evidence=budget_refs, newObligation=True)]
 
+            # These closures stand for brief proposals the critic pass reviewed and stamped.
+            loop_updates = [{**u, "criticReceipt": cr.record_critic_approval(u)} for u in loop_updates]
             resolved_pass = cr.resolve({"today": now.strftime('%Y-%m-%d'), "new_actions": new,
                                         "local": local, "loopUpdates": loop_updates}, now)
             with patch.object(drafts.log_outcome, 'datetime', wraps=datetime) as clock:

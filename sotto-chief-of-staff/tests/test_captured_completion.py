@@ -1,4 +1,4 @@
-"""Captured promises require fulfillment of their deliverable, not contact alone."""
+"""Captured obligations use source integrity checks; the brief model judges fulfillment."""
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -12,10 +12,10 @@ import continuity_resolve as cr
 from delivery_effects import loop_version
 
 
-def _capture(tmp_path, monkeypatch, *, waiting=False, ask='send Dana the deck'):
+def _capture(tmp_path, monkeypatch, *, ask='send Dana the deck'):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
-    action = {'action_type': 'waiting_on' if waiting else 'follow_up', 'channel': 'email',
+    action = {'action_type': 'follow_up', 'channel': 'email',
               'contact_identifier': 'dana@acme.com', 'contact_name': 'Dana',
               'summary': 'You committed to: ' + ask, 'ask': ask,
               'resolution_mode': 'source_grounded', 'source': 'granola',
@@ -25,63 +25,111 @@ def _capture(tmp_path, monkeypatch, *, waiting=False, ask='send Dana the deck'):
     return result['active'][0]
 
 
-def _propose(row, body, *, quote=None, waiting=False):
-    message = {'id': 'later-message', 'date': '2026-09-19T10:00:00Z', 'body': body,
-               'isSent': not waiting, 'from': 'dana@acme.com', 'to': 'dana@acme.com'}
-    update = {'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
+def _reviewed(update):
+    """The receipt compose_brief stamps once a completed critic pass reviewed this closure."""
+    return {**update, 'criticReceipt': cr.record_critic_approval(update)}
+
+
+def _propose(row, body, *, quote=None, message_id='later-message', reviewed=True,
+             recipient='dana@acme.com', sent=True, version=None, date='2026-09-19T10:00:00Z'):
+    message = {'id': message_id, 'date': date, 'body': body,
+               'isSent': sent, 'from': 'dana@acme.com', 'to': recipient}
+    update = {'loopId': row['anchor_key'], 'loopVersion': version or loop_version(row),
               'status': 'resolved', 'evidence': [{'sourceType': 'email',
-              'sourceId': message['id'], 'snippet': quote or body}]}
+              'sourceId': message_id, 'snippet': body if quote is None else quote}]}
+    if reviewed:
+        update = _reviewed(update)
     return cr.resolve({'today': '2026-09-19', 'emails': [message], 'loop_updates': [update]},
                       datetime(2026, 9, 19, 12), resolve_existing=False)
 
 
-@pytest.mark.parametrize('body,quote', [
-    ('Thanks for lunch yesterday.', None),
-    ('Dana, it was good to meet.', None),
-    ('I sent the invoice.', None),
-    ("I'll send the deck tomorrow.", None),
-    ("I haven't sent the deck yet.", 'sent the deck'),
-    ('Have you sent the deck?', None),
-    ('The deck looks interesting.', None),
-    ('I reviewed the deck.', None),
-    ('I need to have the deck sent.', None),
-    ('I plan to have the deck sent next week.', None),
-    ('Without having sent the deck, I asked for feedback.', 'sent the deck'),
-    ('I nearly sent the deck before the meeting.', 'sent the deck'),
-    ('I almost sent the deck.', 'sent the deck'),
-    ('I thought I sent the deck, but I was mistaken.', 'sent the deck'),
+@pytest.mark.parametrize('ask,body', [
+    ('send Dana the deck', 'I shared the slides with Dana.'),
+    ('enviar el informe a Dana', 'Ya le envié el informe a Dana.'),
 ])
-def test_bad_resolution_proposals_do_not_close_captured_work(tmp_path, monkeypatch, body, quote):
+def test_source_grounded_proposal_can_use_paraphrase_or_multilingual_evidence(
+        tmp_path, monkeypatch, ask, body):
+    row = _capture(tmp_path, monkeypatch, ask=ask)
+    result = _propose(row, body)
+    assert [item['anchor_key'] for item in result['resolved']] == [row['anchor_key']]
+
+
+@pytest.mark.parametrize('change', ['wrong_quote', 'wrong_source', 'wrong_person',
+                                     'wrong_direction', 'old_message', 'stale_version'])
+def test_source_grounded_proposal_still_needs_integrity_and_identity(tmp_path, monkeypatch, change):
     row = _capture(tmp_path, monkeypatch)
-    result = _propose(row, body, quote=quote)
+    kwargs = {
+        'wrong_quote': {'quote': 'This text does not appear in the source'},
+        'wrong_source': {'message_id': 'other-message', 'quote': 'The deck is sent.'},
+        'wrong_person': {'recipient': 'stranger@example.com'},
+        'wrong_direction': {'sent': False},
+        'old_message': {'date': '2026-09-17T10:00:00Z'},
+        'stale_version': {'version': 'stale-revision'},
+    }[change]
+    if change == 'wrong_source':
+        # Proposal cites an ID that is absent from the source bundle.
+        result = cr.resolve({'today': '2026-09-19', 'emails': [{
+            'id': 'later-message', 'date': '2026-09-19T10:00:00Z',
+            'body': 'The deck is sent.', 'isSent': True, 'to': 'dana@acme.com'}],
+            'loop_updates': [_reviewed({'loopId': row['anchor_key'],
+                              'loopVersion': loop_version(row),
+                              'status': 'resolved', 'evidence': [{'sourceType': 'email',
+                              'sourceId': 'other-message', 'snippet': 'The deck is sent.'}]})]},
+            datetime(2026, 9, 19, 12), resolve_existing=False)
+    else:
+        result = _propose(row, 'The deck is sent.', **kwargs)
     assert result['resolved'] == []
     assert cr._load_items()[row['anchor_key']]['status'] == 'open'
 
 
-@pytest.mark.parametrize('waiting', [False, True])
-@pytest.mark.parametrize('body', ['Here is the deck I promised.', 'Sent the deck.',
-                                  'The deck is attached.'])
-def test_specific_fulfillment_closes_once_in_both_directions(tmp_path, monkeypatch, waiting, body):
-    row = _capture(tmp_path, monkeypatch, waiting=waiting)
-    result = _propose(row, body, waiting=waiting)
-    assert [x['anchor_key'] for x in result['resolved']] == [row['anchor_key']]
-    assert _propose(row, body, waiting=waiting)['resolved'] == []
+def test_one_verified_proposal_does_not_close_a_separate_obligation(tmp_path, monkeypatch):
+    deck = _capture(tmp_path, monkeypatch)
+    # Explicitly separate another ask from the same counterpart, as a captured commitment can be.
+    memo = dict(deck, anchor_key='memo-commitment', summary='Review Dana\'s memo', ask='review memo')
+    cr._persist(memo)
+    result = _propose(deck, 'I shared the slides with Dana.')
+    assert [item['anchor_key'] for item in result['resolved']] == [deck['anchor_key']]
+    assert [item['anchor_key'] for item in result['active']] == [memo['anchor_key']]
 
 
-def test_matching_generic_object_does_not_complete_a_different_deliverable(tmp_path, monkeypatch):
-    row = _capture(tmp_path, monkeypatch, ask='send the Q3 investor deck')
-    assert _propose(row, 'Here is the Q2 sales deck.')['resolved'] == []
-    assert _propose(row, 'The Q3 investor deck is attached.')['resolved']
+def test_verified_model_reason_is_bounded_on_existing_loop_record(tmp_path, monkeypatch):
+    row = _capture(tmp_path, monkeypatch)
+    body = 'I shared the slides with Dana.'
+    message = {'id': 'later-message', 'date': '2026-09-19T10:00:00Z', 'body': body,
+               'isSent': True, 'to': 'dana@acme.com'}
+    reason = 'The slide handoff completes this request. ' * 20
+    update = {'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
+              'status': 'resolved', 'reason': reason, 'evidence': [{'sourceType': 'email',
+              'sourceId': 'later-message', 'snippet': body}]}
+    result = cr.resolve({'today': '2026-09-19', 'emails': [message],
+                         'loop_updates': [_reviewed(update)]}, datetime(2026, 9, 19, 12),
+                        resolve_existing=False)
+    assert result['resolved'][0]['resolution_reason'] == reason[:240]
 
 
-@pytest.mark.parametrize('modifier', ['signed', 'updated', 'reviewed'])
-def test_deliverable_qualifiers_must_be_present(tmp_path, monkeypatch, modifier):
-    row = _capture(tmp_path, monkeypatch, ask=f'send Dana the {modifier} agreement')
-    assert _propose(row, 'Here is the agreement.')['resolved'] == []
-    assert _propose(row, f'Here is the {modifier} agreement.')['resolved']
+def test_closure_the_critic_did_not_review_stays_open(tmp_path, monkeypatch):
+    """Code cannot read meaning: a quote inside "I haven't sent the deck yet" passes every integrity
+    check, so without the critic's review receipt (skipped, held, failed, native path) it stays open."""
+    row = _capture(tmp_path, monkeypatch)
+    body = "I haven't sent the deck yet, will do next week."
+    result = _propose(row, body, quote='sent the deck', reviewed=False)
+    assert result['resolved'] == []
+    assert cr._load_items()[row['anchor_key']]['status'] == 'open'
+    # A receipt is bound to the exact proposal: one minted for another quote does not carry over.
+    stale = _reviewed({'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
+                       'status': 'resolved', 'evidence': [{'sourceType': 'email',
+                       'sourceId': 'later-message', 'snippet': 'will do next week'}]})
+    stale['evidence'][0]['snippet'] = 'sent the deck'
+    message = {'id': 'later-message', 'date': '2026-09-19T10:00:00Z', 'body': body,
+               'isSent': True, 'to': 'dana@acme.com'}
+    result = cr.resolve({'today': '2026-09-19', 'emails': [message], 'loop_updates': [stale]},
+                        datetime(2026, 9, 19, 12), resolve_existing=False)
+    assert result['resolved'] == []
 
 
-def test_object_noun_is_not_mistaken_for_a_second_action(tmp_path, monkeypatch):
-    row = _capture(tmp_path, monkeypatch, ask='send Dana the review deck')
-    assert _propose(row, 'Here is the deck.')['resolved'] == []
-    assert _propose(row, 'Here is the review deck.')['resolved']
+@pytest.mark.parametrize('quote', ['T', 'Thanks', 'see you Tue'])
+def test_trivial_quote_fragment_is_not_evidence_even_when_reviewed(tmp_path, monkeypatch, quote):
+    row = _capture(tmp_path, monkeypatch)
+    result = _propose(row, 'Thanks Dana, see you Tuesday.', quote=quote)
+    assert result['resolved'] == []
+    assert len(quote) < cr.MIN_EVIDENCE_QUOTE_CHARS

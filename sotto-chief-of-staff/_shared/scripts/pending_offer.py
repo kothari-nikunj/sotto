@@ -18,13 +18,15 @@ bare "sure" calls `get`, acts on what comes back, and calls `clear`.
         --question "You're meeting Shivani in ~44 min at Sightglass — want me to pull full prep on her?"
     pending_offer.py get --offer-id ID → that offer JSON if fresh, `{}` if absent or expired
     pending_offer.py clear    → removes it
-    pending_offer.py dismiss-reply --text "no" → declines only the offer; keeps the loop
+    pending_offer.py dismiss-reply --text "no" [get selectors] → declines only the offer; keeps the loop
 
 Negative/completion replies use dismiss-reply so their meaning is enforced by code. Legacy mute
 offers are no longer returned by get: their input conflated unused drafts with user feedback.
 
-Detached runs stage the exact question until provider acceptance. Multiple fresh delivered offers
-return an explicit ambiguous result; a bare reply must clarify which question the user means.
+Detached runs stage the exact question until provider acceptance. Explicit reply IDs select their
+exact question. A transport-scoped --latest lookup selects the last delivered question before the
+reply. With another question pending, one accepted after or within ACCEPT_SKEW_SECONDS of the reply
+makes it ambiguous, as do unscoped lookups and multiple questions in one message. dismiss-reply takes the same selectors.
 Legacy direct interactive callers still write a single visible offer.
 
 Expiry is checked at READ (`expires_at`, default 180 min): nothing daemonic, no sweeper, and a
@@ -50,6 +52,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import secrets
 import sys
@@ -68,6 +71,9 @@ DISMISS_DROPPED = ("let it go", "drop it", "stop tracking this", "drop this loop
 DECLINE_OFFER = ("no", "nah", "nope", "no thanks", "no thank you", "not now", "not yet",
                  "skip", "skip it", "leave it", "forget it")
 LOOP_KINDS = frozenset(("chase", "commitment", "handoff"))
+# accepted_at is the receiver's clock after `hermes send` returns; the reply timestamp is the
+# provider's. A question accepted within this window of the reply may be what it answers.
+ACCEPT_SKEW_SECONDS = 5
 
 
 def _path() -> str:
@@ -122,6 +128,8 @@ def set_offer(kind: str, question: str, person: str = "", detail: str = "",
         # The reply gateway must never discover an offer whose question failed to send.
         offer['offer_id'] = payload_hash((ident + json.dumps({k: offer[k] for k in
             ('kind', 'question', 'anchor_key', 'payload_sha256', 'action')}, sort_keys=True)).encode())
+        if os.environ.get('SOTTO_CRON_DELIVER') == 'photon':
+            offer['chat_id'] = os.environ.get('PHOTON_HOME_CHANNEL', '')
         delivery_effects.stage([{'kind': 'pending_offer', 'offer': offer}])
     else:
         path = _path()
@@ -131,19 +139,21 @@ def set_offer(kind: str, question: str, person: str = "", detail: str = "",
 
 
 def activate_offer(offer, receipt):
-    """Idempotent ACK effect. Two unanswered delivered questions require clarification."""
+    """Idempotent ACK effect retaining delivery order and destination for short replies."""
     if not _fresh_offer(offer):
         return
     with jsonstore.lock(_path()):
         state = jsonstore.read(_path(), {})
-        offers = _fresh_offers(state)
+        offers = _retained_offers(state)
         accepted = {key: expiry for key, expiry in state.get('accepted', {}).items()
                     if (_parse(expiry) or _now()) > _now()}
         if offer['offer_id'] in accepted:
             return
         accepted[offer['offer_id']] = offer['expires_at']
         offers.append({**offer, 'message_id': receipt.get('message_id', ''),
-                       'target': receipt.get('target'), 'accepted_at': receipt['accepted_at']})
+                       'target': receipt.get('target'),
+                       'chat_id': receipt.get('chat_id') or offer.get('chat_id', ''),
+                       'accepted_at': receipt['accepted_at']})
         jsonstore.write_atomic(_path(), {'offers': offers, 'accepted': accepted})
 
 
@@ -152,19 +162,75 @@ def _fresh_offers(data):
     return [item for item in items if _fresh_offer(item)]
 
 
-def get_offer(offer_id='', message_id='') -> dict:
+def _accepted_at(offer):
+    value = offer.get('accepted_at')
+    if type(value) in (int, float):
+        return float(value) if math.isfinite(value) and value > 0 else 0
+    stamp = _parse(value) if isinstance(value, str) else None
+    return stamp.timestamp() if stamp else 0
+
+
+def _delivery_anchor(offer):
+    """Content-free barrier: an answered/expired latest question cannot select an older one."""
+    return {key: offer.get(key) for key in
+            ('offer_id', 'message_id', 'target', 'chat_id', 'accepted_at', 'expires_at')}
+
+
+def _retained_offers(data):
+    fresh = _fresh_offers(data)
+    items = data.get('offers', [data]) if isinstance(data, dict) else []
+    # Keep a barrier only while its chat still has an actionable older offer. Otherwise there
+    # is nothing it could accidentally authorize. Ordinary activations prune obsolete barriers.
+    scopes = {(o.get('target'), o.get('chat_id')) for o in fresh
+              if o.get('target') and o.get('chat_id')}
+    for scope in scopes:
+        candidates = [o for o in items if isinstance(o, dict)
+                      and (o.get('target'), o.get('chat_id')) == scope and _accepted_at(o)]
+        if not candidates:
+            continue
+        newest = max(_accepted_at(o) for o in candidates)
+        last_ids = {o.get('message_id') for o in candidates if _accepted_at(o) == newest}
+        for offer in candidates:
+            if ((_accepted_at(offer) == newest or offer.get('message_id') in last_ids)
+                    and offer not in fresh):
+                fresh.append(_delivery_anchor(offer))
+    return fresh
+
+
+def get_offer(offer_id='', message_id='', *, latest=False, target='', chat_id='', before=None) -> dict:
     """The fresh offer, or `{}` — absent, unparseable, or past `expires_at`. Never partial: a
     caller gets a whole question it can act on, or nothing it could mistake for one."""
     path = _path()
     with jsonstore.lock(path):
         data = jsonstore.read(path, {})
-    offers = _fresh_offers(data)
+    offers = _retained_offers(data) if latest and not (offer_id or message_id) else _fresh_offers(data)
+    if target:
+        offers = [o for o in offers if o.get('target') == target]
+    if chat_id:
+        offers = [o for o in offers if o.get('chat_id') == chat_id]
     if offer_id or message_id:
-        offers = [o for o in offers if (offer_id and o.get('offer_id') == offer_id)
-                  or (message_id and o.get('message_id') == message_id)]
+        # Explicit anchors never fall through to another, newer question.
+        offers = [o for o in offers if (not offer_id or o.get('offer_id') == offer_id)
+                  and (not message_id or o.get('message_id') == message_id)]
+    elif latest:
+        # Only a transport-bound conversation can opt into recency. Legacy/unbound records
+        # cannot authorize an action in another chat. Same-message multiple offers stay ambiguous.
+        if not target or not chat_id:
+            return {'ambiguous': True, 'offers': offers} if offers else {}
+        offers = [o for o in offers if _accepted_at(o)]
+        if before is not None:
+            # A reply may answer a question that settled after it; never pick an older one instead.
+            if len(offers) > 1 and any(_accepted_at(o) > before - ACCEPT_SKEW_SECONDS for o in offers):
+                return {'ambiguous': True, 'offers': offers}
+            offers = [o for o in offers if _accepted_at(o) <= before + ACCEPT_SKEW_SECONDS]
+        if offers:
+            newest = max(_accepted_at(o) for o in offers)
+            last_ids = {o.get('message_id') for o in offers if _accepted_at(o) == newest}
+            offers = [o for o in offers if _accepted_at(o) == newest or
+                      (o.get('message_id') and o.get('message_id') in last_ids)]
     if len(offers) > 1:
         return {'ambiguous': True, 'offers': offers}
-    return offers[0] if offers else {}
+    return _fresh_offer(offers[0]) if offers else {}
 
 
 def claim_offer(offer_id: str, action: str, payload_sha256: str) -> tuple[dict, str]:
@@ -190,7 +256,7 @@ def claim_offer(offer_id: str, action: str, payload_sha256: str) -> tuple[dict, 
         if offer['payload_sha256'] != payload_sha256:
             return {}, 'payload does not match what the user approved — the action changed after the offer'
         if isinstance(state, dict) and 'offers' in state:
-            jsonstore.write_atomic(path, {**state, 'offers': [o for o in state['offers'] if o != offer]})
+            jsonstore.write_atomic(path, {**state, 'offers': [_delivery_anchor(o) if o == offer else o for o in state['offers']]})
         else:
             os.remove(path)
         return offer, ''
@@ -208,14 +274,14 @@ def _fresh_offer(data) -> dict:
     return data
 
 
-def dismiss_reply(reply: str) -> dict:
+def dismiss_reply(reply: str, **selectors) -> dict:
     """Act on a snapshot; never hold the offer lock while waiting for the ledger.
 
     Only clear the same snapshot afterwards, so a newly delivered question survives a slow
     ledger write. This command takes the user's actual words, not an agent paraphrase.
     """
     text = " ".join(reply.lower().rstrip(" .!…\t\r\n").split())
-    offer = get_offer()
+    offer = get_offer(**selectors)
     if not offer:
         return {"action": "no_offer", "reason": "no fresh offer", "loop_changed": False}
     if offer.get('ambiguous'):
@@ -259,7 +325,7 @@ def clear_offer(expected: dict | None = None) -> bool:
             offers = state.get('offers', []) if isinstance(state, dict) else []
             if expected not in offers:
                 return False
-            jsonstore.write_atomic(path, {**state, 'offers': [o for o in offers if o != expected]})
+            jsonstore.write_atomic(path, {**state, 'offers': [_delivery_anchor(o) if o == expected else o for o in offers]})
             return True
         if isinstance(state, dict) and 'accepted' in state:
             jsonstore.write_atomic(path, {**state, 'offers': []})
@@ -293,11 +359,19 @@ def main() -> None:
     get = sub.add_parser("get", help="print the fresh offer, ambiguity, or {}")
     get.add_argument('--offer-id', default='')
     get.add_argument('--message-id', default='')
+    get.add_argument('--latest', action='store_true')
+    get.add_argument('--target', default='')
+    get.add_argument('--chat-id', default='')
+    get.add_argument('--before', type=float)
     clear = sub.add_parser('clear', help='remove the offer acted on')
     clear.add_argument('--offer-id', default='')
     clear.add_argument('--message-id', default='')
     reply = sub.add_parser("dismiss-reply", help="handle the user's exact negative/completion reply")
     reply.add_argument("--text", required=True, help="the user's actual words, never a paraphrase")
+    for arg in ('--message-id', '--target', '--chat-id'):
+        reply.add_argument(arg, default='')
+    reply.add_argument('--latest', action='store_true')
+    reply.add_argument('--before', type=float)
 
     a = ap.parse_args()
     if a.cmd == "set":
@@ -308,9 +382,11 @@ def main() -> None:
         print(json.dumps(set_offer(a.kind, a.question, a.person, a.detail, a.ttl_min, digest,
                                    a.anchor_key, a.action)))
     elif a.cmd == "get":
-        print(json.dumps(get_offer(a.offer_id, a.message_id)))
+        print(json.dumps(get_offer(a.offer_id, a.message_id, latest=a.latest,
+                                   target=a.target, chat_id=a.chat_id, before=a.before)))
     elif a.cmd == "dismiss-reply":
-        print(json.dumps(dismiss_reply(a.text)))
+        print(json.dumps(dismiss_reply(a.text, message_id=a.message_id, latest=a.latest,
+                                       target=a.target, chat_id=a.chat_id, before=a.before)))
     else:
         expected = get_offer(a.offer_id, a.message_id) if a.offer_id or a.message_id else None
         print('cleared' if (expected is None or expected) and clear_offer(expected=expected) else 'none')

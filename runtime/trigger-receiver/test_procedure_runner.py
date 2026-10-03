@@ -147,6 +147,21 @@ def test_digest_child_budget_exit_is_typed_and_other_child_exit_is_not(tmp_path,
     assert not isinstance(error.value, procedure_runner.ProcedureModelBudgetError)
 
 
+def test_digest_child_busy_exit_is_typed_and_uncharged(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    from work_queue import MODEL_ADMISSION_BUSY_EXIT
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', lambda *a, **k:
+                        SimpleNamespace(returncode=MODEL_ADMISSION_BUSY_EXIT,
+                                        stdout='', stderr='private provider response'))
+    with pytest.raises(procedure_runner.ProcedureModelAdmissionBusyError):
+        procedure_runner.run({'pack': str(PACK), 'kind': 'digest'})
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({'pack': str(PACK), 'kind': 'digest'})])
+    assert procedure_runner.main() == MODEL_ADMISSION_BUSY_EXIT
+    with pytest.raises(RuntimeError, match='gather_google.py exit 78'):
+        procedure_runner.run({'pack': str(PACK), 'kind': 'proactive'})
+
+
 def test_procedure_cli_emits_budget_exit_only_for_typed_denial(monkeypatch):
     monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
     from gemini_transport import ModelBudgetUnavailableError

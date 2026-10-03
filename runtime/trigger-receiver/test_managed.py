@@ -83,6 +83,25 @@ def test_google_consent_opens_only_granted_sources_and_preserves_bridge(tmp_path
     assert sources['imessage']['connected'] is True
 
 
+@pytest.mark.parametrize('source, revoke', [
+    ('imessage', lambda root: managed.record_bridge_consent(root, [], [])),
+    ('gmail', lambda root: managed.record_google_consent(root, [])),
+    ('granola', lambda root: managed.record_connector_consent(root, 'granola', False)),
+])
+def test_managed_source_revocation_erases_finished_legacy_diagnostics(
+        tmp_path, monkeypatch, source, revoke):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json', sources={
+        source: {'consented': True, 'connected': True}})
+    path = tmp_path / 'events/learning-diagnostics/brief-old.json'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'schema': 1, 'rejected': [
+        {'evidence_snippets': ['private from ' + source]}]}))
+    revoke(tmp_path)
+    assert not path.exists()
+
+
 def test_connector_consent_lifecycle_is_tenant_bound_and_self_host_is_unchanged(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
     monkeypatch.setenv('SOTTO_TENANT_ID', 'test')

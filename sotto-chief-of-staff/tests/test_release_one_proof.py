@@ -189,3 +189,27 @@ def test_unknown_timezone_is_a_usage_error_not_a_traceback(tmp_path, capsys):
         proof.main(['--data-root', str(tmp_path), '--days', '1', '--complete-days', '--timezone', 'Mars/Olympus'])
     assert stop.value.code == 2
     assert 'IANA zone' in capsys.readouterr().err
+
+
+def test_learn_step_receipts_with_rejections_still_count(tmp_path, monkeypatch):
+    """learn_step marks a continuity pass with rejections "partial"; the report must still count
+    its proposals, or the rejection rate silently reads zero."""
+    import types
+    import learn_step as ls
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    continuity = tmp_path / "cont.json"
+    continuity.write_text("{}")
+    for day, (accepted, rejected) in (("2026-09-15", (1, 0)), ("2026-09-16", (1, 2))):
+        summary = {"accepted": accepted, "rejected": rejected, "total": accepted + rejected,
+                   "rejected_by_reason": {"stale_revision": rejected} if rejected else {}}
+        stderr = "[continuity_resolve] loop update outcomes: " + json.dumps(summary) + "\n"
+        run = lambda argv, stderr=stderr, **kw: types.SimpleNamespace(
+            returncode=0, stdout="", stderr=stderr)
+        args = types.SimpleNamespace(type="morning", local="", gmail="", granola="",
+                                     knowledge_out="", continuity=str(continuity), day=day)
+        receipt = ls.learn(args, run=run, now=datetime.fromisoformat(day + "T13:30:00+00:00"))
+    assert receipt["steps"]["continuity"]["status"] == "partial"
+    learn = proof.build_report(str(tmp_path), days=30, now=NOW)["learn_receipts"]
+    assert learn["continuity_ok"] == learn["with_exact_proposal_outcomes"] == 2
+    assert learn["proposal_outcomes"]["status"] == "available"
+    assert (learn["proposal_outcomes"]["proposed"], learn["proposal_outcomes"]["rejected"]) == (4, 2)

@@ -141,7 +141,7 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 
 | Verb | Removes |
 |---|---|
-| `--snapshot` | `knowledge/last_local_snapshot.json` — the raw payload described above |
+| `--snapshot` | `knowledge/last_local_snapshot.json`, staged `briefs/*.payload.json`, and resumable `events/work-inputs/brief-*` JSON inputs and artifacts |
 | `--caches` | `cache/research_*.json`, `cache/calendar_today.json`, `cache/visual-briefs/*/*` — rebuilt when needed |
 | `--logs` | truncates `logs/compose_brief.log` (truncated, not unlinked: a running process holds it open) |
 | `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl` |
@@ -209,7 +209,8 @@ raw history is not copied into a new archive or the live event queue. The first 
 the ordinary brief archive, with type `welcome` and the same 60-day retention.
 
 `knowledge/history-state.json` contains frozen-window bounds, cursors, lifetime counts, the page
-baseline for the current window, restart progress and sanitized failure classes;
+baseline for the current window, restart progress, sanitized failure classes and metadata-only
+receipts for provider-blocked pages excluded from learning (bounds, cursors, count, time, reason);
 `knowledge/dreamer.json` contains person IDs, hashes and review time. Neither contains raw
 message bodies. `knowledge/conflicts.json` retains reference pairs for at most 100 people. These
 small state files have no age sweep; delete them with the rest of the volume. Deleting progress
@@ -244,6 +245,26 @@ whichever of those it has.
 `events/work-inputs/brief-*/` holds resumable composition inputs and artifact manifests. Ancillary
 learning removes raw current/prepared inputs after success; the retention sweep removes old
 intermediates after seven days, matching the ancillary job deadline. The artifact carries its original source cutoff and used-source IDs. A retry does not move that cutoff forward, so later messages remain eligible for the next digest. Canonical knowledge and open loops retain their existing policy.
+
+Learning receipts distinguish completed writes from partial application. They retain the input revision
+hashes each phase's writers processed (the background phase never replaces the knowledge or task inputs the first phase applied), extracted person-fact dispositions (added, confirmed, duplicate, updated, superseded, ignored or rejected),
+and fixed rejection reasons. Per-item lists are bounded and explicitly report truncation; totals
+remain exact. Relation fallback facts and company updates retain their existing aggregate counts
+and file provenance rather than claiming per-item coverage. A process exiting successfully does not mean every proposed fact or task update was
+accepted. Legacy memories without references remain usable but are labelled as lacking a source
+reference when retrieved; the system does not fabricate provenance for them.
+
+For rejected task updates, `events/learning-diagnostics/*.json` can retain a small private diagnostic:
+at most 64 proposals and 16 KiB, with at most four 500-character evidence excerpts per proposal.
+Each source must still be permitted when the file is written. A source disable clears all retained
+diagnostics immediately, even after learning has finished; the current diagnostic format cannot
+reliably attribute every older row to a source. A later learning pass that may keep nothing also
+deletes its earlier file. These are rejected model proposals,
+not accepted facts. They expire seven days after first capture, because a rewrite keeps the original capture time. `forget.py --receipts` (or `--all`) deletes them, and both it and the retention sweep remove their content-free lock files once the diagnostic is gone.
+The directory's empty `.consent.lock` remains to serialize writes, revocation, forgetting and the
+retention sweep. Per-file lock sidecars are removed only after their lock is released under that gate.
+Ordinary raw composition inputs are still removed after the learning run finishes; the permanent
+knowledge graph is not replaced with a transcript archive.
 
 The outbox deletes sent text after acceptance but keeps the minimum delivery effects until they
 finish. Those effects carry per-source addressing — a handle, chat or group id, phone, address or

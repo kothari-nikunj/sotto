@@ -320,7 +320,9 @@ def test_schedule_omitted_by_both_models_still_delivers_one_four_photo_gallery(b
     assert presentation and len(presentation['images']) == 4
     for path in presentation['images']:
         assert Path(path).read_bytes().startswith(b'\x89PNG')
-    assert '8:00 AM: Planning 8 | Location: ' + long_location in out['brief_text']
+    assert '8:00 AM: Planning 8 | Location: 1355 Market Street, Suite 900' in out['brief_text']
+    assert long_location not in out['brief_text']
+    assert inputs['google']['events'][0]['location'] == long_location
     monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *args: calls.append(args) or
                         (True, '', {'message_id': 'accepted', 'message_ids': ['1', '2', '3', '4']}))
     monkeypatch.setattr(composer, '_user_local_date', lambda tz: '2026-09-21')

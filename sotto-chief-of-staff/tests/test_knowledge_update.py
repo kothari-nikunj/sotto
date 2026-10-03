@@ -53,6 +53,13 @@ def test_low_similarity_is_new():
     assert action == kg.NEW
 
 
+def test_legacy_unreferenced_provenance_is_classified_without_fabricating_refs():
+    legacy = kg.FactMeta(text="Synthetic legacy assertion", source="brief_extraction")
+    assert kg.provenance_state(legacy) == "reference_unavailable"
+    assert legacy.source_ref == "" and legacy.evidence_refs == []
+    assert kg.provenance_state(kg.FactMeta(source="observed_message", source_ref="gmail:one")) == "source_referenced"
+
+
 def test_only_exact_age_prunes_revive():
     fact = kg.FactMeta(text="CTO at Acme Corp", type="milestone", status="archived",
                        source="web_research", archived_reason="stale")

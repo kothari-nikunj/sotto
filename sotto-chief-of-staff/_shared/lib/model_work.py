@@ -174,7 +174,13 @@ def attempt(provider, model, prompt, system=None, schema=None):
             provider_recoveries = min(MAX_PROVIDER_RECOVERIES, db.execute(
                 "SELECT COUNT(*) FROM attempts WHERE operation=? AND status IN (" +
                 ','.join('?' for _ in codes) + ")", (value['id'], *codes)).fetchone()[0])
-        if attempts - recovered - provider_recoveries >= POLICIES[value['task']].attempts or parked:
+        # Proxy admission refusals never reached the model. The owning durable
+        # queue controls their eventual retry/deadline; do not exhaust a model
+        # operation's paid-attempt ladder while waiting for capacity.
+        admission_refusals = db.execute(
+            "SELECT COUNT(*) FROM attempts WHERE operation=? AND status='admission_busy'",
+            (value['id'],)).fetchone()[0]
+        if attempts - recovered - provider_recoveries - admission_refusals >= POLICIES[value['task']].attempts or parked:
             raise ModelWorkHeldError('unchanged model operation exhausted')
         value['attempt'] = attempts + 1
         db.execute('INSERT OR REPLACE INTO operations VALUES(?,?,?,?,?)',
@@ -189,8 +195,9 @@ def attempt(provider, model, prompt, system=None, schema=None):
     try:
         yield
     except HTTPError as error:
-        status = 'http_' + str(error.code)
-        if error.code in (400, 422):
+        from gemini_transport import proxy_admission_busy
+        status = 'admission_busy' if proxy_admission_busy(error) else 'http_' + str(error.code)
+        if error.code in (400, 413, 422):
             with _db() as db:
                 db.execute('INSERT OR REPLACE INTO parked_requests VALUES(?,?,?)',
                            (value['contract_id'], request_revision, time.time()))
@@ -235,7 +242,7 @@ def headers():
         return {}
     return {'X-Sotto-Workload': value['task'], 'X-Sotto-Operation': value['id'],
             'X-Sotto-Parent-Operation': value['parent'], 'X-Sotto-Run': value['run_id'],
-            'X-Sotto-Attempt': str(value['attempt'])}
+            'X-Sotto-Job': value['run_id'], 'X-Sotto-Attempt': str(value['attempt'])}
 
 
 def call(task, prompt, inputs, *, system=None, schema=None, llm=None, contract_revision=None):

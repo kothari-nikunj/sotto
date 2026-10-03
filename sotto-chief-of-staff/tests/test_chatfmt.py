@@ -99,6 +99,15 @@ def test_imessage_keeps_urls_and_words_and_full_handled_recap():
     plain = 'https://example.com/some_page_here?q=a_b_c\n2 * 3 = 6\nunknown_identifier'
     assert cf.to_imessage(plain) == plain
 
+
+@pytest.mark.parametrize('marker', ['*', '**'])
+def test_padded_leading_labels_do_not_leak_markdown(marker):
+    raw = f'{marker}Office drill {marker}: Tomorrow at noon.\n2 * 3 = 6\nhttps://example.com/a*b*c'
+    plain = cf.to_imessage(raw)
+    assert plain == 'Office drill: Tomorrow at noon.\n2 * 3 = 6\nhttps://example.com/a*b*c'
+    assert cf.to_imessage(plain) == plain
+    assert cf.to_chat(raw).startswith('*Office drill*:')
+
 SAMPLE = """## Needs Attention Now
 
 **Sarah Chen**<!--id:sarah@acme.com|ch:email--> - Locked in Monday at 11 AM.

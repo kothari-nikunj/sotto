@@ -30,9 +30,10 @@ messages and likely to remain useful three months from now. No public-web guesse
 forwarded statement is attributed evidence, not the author's own promise. Do not store discussions,
 decisions, commitments, advice, talking points, proposed replies, open asks, or "what to say".
 Outstanding work is owned by the live commitment ledger and must never be resurrected from history.
-Don't fill slots. Return only subjects and source refs supplied in the input. Every fact needs refs
-from that subject's messages. Owner instructions, permissions, mutes and standing priorities cannot
-be learned by this process. Writing voice is learned separately from the owner's actual sends.
+Don't fill slots. Copy subject_id exactly from the input (for example, p1); it is a page-local
+identity, never a person's name, email address, or an email subject line. Return each subject_id at
+most once. Every fact needs source refs from messages with that exact subject_id. Owner instructions,
+permissions, mutes and standing priorities cannot be learned by this process. Writing voice is learned separately from the owner's actual sends.
 Maximum {FACTS_PER_PERSON} durable facts per subject.
 Each fact must use 1–{MAX_REFS} of the most relevant source refs;
 select decisive evidence, including a later answer or resolution, instead of citing the entire
@@ -40,12 +41,12 @@ conversation. Each text must be at most {MAX_TEXT_CHARS} characters. No sensitiv
 
 SCHEMA = {'type': 'OBJECT', 'properties': {'people': {'type': 'ARRAY', 'items': {
     'type': 'OBJECT', 'properties': {
-        'subject': {'type': 'STRING'},
+        'subject_id': {'type': 'STRING'},
         'facts': {'type': 'ARRAY', 'maxItems': FACTS_PER_PERSON, 'items': {'type': 'OBJECT', 'properties': {
             'text': {'type': 'STRING'}, 'refs': {'type': 'ARRAY', 'minItems': 1,
                 'maxItems': MAX_REFS, 'items': {'type': 'STRING'}}},
             'required': ['text', 'refs']}},
-        }, 'required': ['subject', 'facts']}}},
+        }, 'required': ['subject_id', 'facts']}}},
     'required': ['people']}
 
 
@@ -120,11 +121,20 @@ def learn(records, llm=gemini.call_gemini, now=None):
         if previous is not None and previous != record:
             raise MemoryExtractionError('ambiguous_source_reference')
         by_ref[record['ref']] = record
+    # Keep canonical identities in the writer. Short page-local IDs give the model an
+    # unambiguous field to copy, without normalizing or guessing a returned identity.
+    subjects = dict.fromkeys(r['subject'] for r in records)
+    subject_ids = {subject: f'p{i}' for i, subject in enumerate(subjects, 1)}
+    by_subject_id = {value: key for key, value in subject_ids.items()}
+    model_records = [{**{k: v for k, v in r.items() if k != 'subject'},
+                      'subject_id': subject_ids[r['subject']],
+                      'name': (r['name'] if r['name'] != r['subject']
+                               else subject_ids[r['subject']])} for r in records]
     # Gemini expands nested bounded arrays when compiling its response grammar. A
     # page-sized outer maxItems plus per-page enums made valid history requests fail
     # with HTTP 400. Keep the native shape and small inner caps; the single writer
     # below validates every subject, reference and length before making any changes.
-    raw = llm(json.dumps(records, ensure_ascii=False), {}, system=SYSTEM, schema=SCHEMA)
+    raw = llm(json.dumps(model_records, ensure_ascii=False), {}, system=SYSTEM, schema=SCHEMA)
     try:
         data = json.loads(raw)
     except (ValueError, TypeError) as error:
@@ -133,20 +143,19 @@ def learn(records, llm=gemini.call_gemini, now=None):
         raise MemoryExtractionError('invalid_shape')
     # Validate each person before any graph write. A malformed result cannot invalidate an
     # unrelated person's evidence, but duplicate output subjects are ambiguous in BOTH entries.
-    subject_counts = Counter(p.get('subject') for p in data['people']
-                             if isinstance(p, dict) and isinstance(p.get('subject'), str))
+    subject_counts = Counter(p.get('subject_id') for p in data['people']
+                             if isinstance(p, dict) and isinstance(p.get('subject_id'), str))
     updates, rejected = [], Counter()
     for person in data['people']:
         try:
             if not isinstance(person, dict):
                 raise MemoryExtractionError('invalid_person')
-            subject = person.get('subject')
-            if not isinstance(subject, str):
+            subject_id = person.get('subject_id')
+            if not isinstance(subject_id, str) or subject_id not in by_subject_id:
                 raise MemoryExtractionError('unknown_subject')
+            subject = by_subject_id[subject_id]
             evidence = [r for r in records if r['subject'] == subject]
-            if not evidence:
-                raise MemoryExtractionError('unknown_subject')
-            if subject_counts[subject] > 1:
+            if subject_counts[subject_id] > 1:
                 raise MemoryExtractionError('repeated_subject')
             facts = []
             entries = person.get('facts')

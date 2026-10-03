@@ -102,6 +102,51 @@ def test_staged_payloads_go_a_week_after_the_brief_that_read_them(_volume):
     assert not os.path.exists(gone) and os.path.exists(kept)
 
 
+def test_rejected_learning_evidence_is_bounded_to_the_retry_window(_volume):
+    old = _write(_volume, "events/learning-diagnostics/brief-old.json", "{}",
+                 age_days=ret.STAGED_DAYS + 1)
+    young = _write(_volume, "events/learning-diagnostics/brief-young.json", "{}",
+                   age_days=ret.STAGED_DAYS - 1)
+    ret.sweep(now=NOW)
+    assert not os.path.exists(old) and os.path.exists(young)
+
+
+def test_diagnostic_lock_sidecars_go_after_their_diagnostic(_volume):
+    """jsonstore.lock leaves `<diagnostic>.lock`; it may not outlive the window, nor its file."""
+    orphan = _write(_volume, "events/learning-diagnostics/brief-gone.json.lock",
+                    age_days=ret.STAGED_DAYS + 1)
+    expired = _write(_volume, "events/learning-diagnostics/brief-old.json", "{}",
+                     age_days=ret.STAGED_DAYS + 1)
+    expired_lock = _write(_volume, "events/learning-diagnostics/brief-old.json.lock",
+                          age_days=ret.STAGED_DAYS + 1)
+    # A reused sidecar can be older than the young diagnostic it still guards.
+    guarded = _write(_volume, "events/learning-diagnostics/brief-young.json", "{}")
+    guarded_lock = _write(_volume, "events/learning-diagnostics/brief-young.json.lock",
+                          age_days=ret.STAGED_DAYS + 1)
+    fresh_orphan = _write(_volume, "events/learning-diagnostics/brief-new.json.lock")
+    ret.sweep(now=NOW)
+    assert not any(os.path.exists(p) for p in (orphan, expired, expired_lock))
+    assert all(os.path.exists(p) for p in (guarded, guarded_lock, fresh_orphan))
+
+
+def test_diagnostic_sweep_enumerates_after_in_flight_writer(_volume):
+    directory = _volume / "events/learning-diagnostics"
+    directory.mkdir(parents=True)
+    gate = str(directory / ".consent")
+    result = {}
+    with ret.HOOKS["jsonl_lock"](gate):
+        thread = threading.Thread(target=lambda: result.update(ret.sweep(now=NOW)))
+        thread.start()
+        time.sleep(0.05)
+        assert thread.is_alive()
+        expired = _write(_volume, "events/learning-diagnostics/brief-in-flight.json", "{}",
+                         age_days=ret.STAGED_DAYS + 1)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result["errors"] == []
+    assert not os.path.exists(expired)
+
+
 def test_a_brief_and_its_markers_outlive_the_payload(_volume):
     """The payload is a staged intermediate; the brief is the archive. Between STAGED_DAYS and
     BRIEF_ARCHIVE_DAYS exactly one of them survives."""
@@ -389,6 +434,10 @@ def test_no_table_entry_even_matches_a_memory_path():
 
 def test_digest_completion_receipt_is_explicitly_durable():
     assert isinstance(ret.accounts_for("events/digest_accepted.json"), ret.Exempt)
+
+
+def test_diagnostic_consent_gate_is_a_persistent_empty_lock():
+    assert isinstance(ret.accounts_for("events/learning-diagnostics/.consent.lock"), ret.Exempt)
 
 
 def test_the_never_guard_holds_even_if_a_rule_reaches_past_it(_volume, monkeypatch):

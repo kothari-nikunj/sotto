@@ -111,7 +111,12 @@ def test_continuity_exact_proposal_outcomes_reach_the_learn_receipt(tmp_path, mo
         if argv[1].endswith("continuity_resolve.py"):
             stderr = ('[continuity_resolve] loop update outcomes: '
                       '{"accepted": 1, "rejected": 2, "rejected_by_reason": '
-                      '{"stale_revision": 1, "unsupported_evidence": 1}, "total": 3}\n')
+                      '{"stale_revision": 1, "unsupported_evidence": 1}, "total": 3}\n'
+                      '[continuity_resolve] loop update items: '
+                      '{"accepted":[{"index":0,"digest":"aaaaaaaaaaaaaaaaaaaaaaaa"}],'
+                      '"rejected":[{"index":1,"digest":"bbbbbbbbbbbbbbbbbbbbbbbb",'
+                      '"reason":"stale_revision"},{"index":2,"digest":"cccccccccccccccccccccccc",'
+                      '"reason":"unsupported_evidence"}],"truncated":0}\n')
         return types.SimpleNamespace(returncode=0, stdout="", stderr=stderr)
 
     receipt = ls.learn(_args(tmp_path, continuity=continuity), run=fake_run)
@@ -120,7 +125,16 @@ def test_continuity_exact_proposal_outcomes_reach_the_learn_receipt(tmp_path, mo
         "loop_updates": {"accepted": 1, "rejected": 2,
                          "rejected_by_reason": {"stale_revision": 1,
                                                 "unsupported_evidence": 1}, "total": 3},
+        "loop_update_items": {"accepted": [{"index": 0, "digest": "a" * 24}],
+                              "rejected": [{"index": 1, "digest": "b" * 24,
+                                            "reason": "stale_revision"},
+                                           {"index": 2, "digest": "c" * 24,
+                                            "reason": "unsupported_evidence"}],
+                              "truncated": 0},
     }
+    assert receipt["steps"]["continuity"]["status"] == "partial"
+    assert receipt["completion"] == "partial" and receipt["ok"] is True
+    assert [row['index'] for row in receipt['steps']['continuity']['proof']['loop_update_items']['rejected']] == [1, 2]
 
 
 def test_malformed_proposal_summary_is_not_claimed_as_proof():
@@ -133,6 +147,42 @@ def test_malformed_proposal_summary_is_not_claimed_as_proof():
     result = ls._run_one("/tmp/continuity_resolve.py", [], run=fake_run)
     assert result["status"] == "ok"
     assert "proof" not in result
+
+
+def test_knowledge_apply_counts_and_input_revision_are_receipted_without_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    payload = _touch(tmp_path, "knowledge.json", json.dumps({"person_updates": [
+        {"person_name": "Synthetic", "facts": []}]}))
+
+    def fake_run(argv, **kw):
+        return types.SimpleNamespace(returncode=0,
+                                     stdout=json.dumps({"applied": {"new": 2, "confirmed": 1,
+                                           "superseded": 0, "pruned": 0, "relations": 1}}),
+                                     stderr="")
+
+    receipt = ls.learn(_args(tmp_path, knowledge_out=payload), run=fake_run)
+    assert receipt["steps"]["knowledge"]["proof"] == {
+        "coverage": "exact_apply_counts",
+        "applied": {"new": 2, "confirmed": 1, "superseded": 0, "pruned": 0, "relations": 1},
+        "input_evidence": {"accepted": 0, "rejected": 0}}
+    assert receipt["input_evidence"]["knowledge"]["records"] == 1
+    assert receipt["input_evidence"]["knowledge"]["sha256"]
+    assert "Synthetic" not in json.dumps(receipt)
+
+
+def test_rejected_fact_dispositions_make_knowledge_learning_partial(tmp_path):
+    payload = _touch(tmp_path, 'knowledge_with_disposition.json', json.dumps({
+        '_learning_evidence': {'accepted': 1, 'rejected': 0}}))
+    writer_result = {'applied': {'new': 0, 'confirmed': 0, 'superseded': 0,
+                                 'pruned': 0, 'relations': 0},
+        'fact_outcomes': {'total': 1, 'counts': {'rejected': 1}, 'truncated': False,
+            'items': [{'person_index': 0, 'fact_index': 2, 'digest': 'a' * 64,
+                       'disposition': 'rejected', 'reason': 'low_confidence'}]}}
+    result = ls._run_one('/tmp/knowledge_update.py', [payload], run=lambda *a, **k:
+        types.SimpleNamespace(returncode=0, stdout=json.dumps(writer_result), stderr=''))
+    assert result['status'] == 'partial'
+    assert result['proof']['fact_outcomes']['counts'] == {'rejected': 1}
+    assert result['proof']['fact_outcomes']['items'][0]['digest'] == 'a' * 64
 
 
 def test_the_cli_runs_the_real_writers_end_to_end(tmp_path, monkeypatch):
@@ -266,6 +316,7 @@ def test_required_and_ancillary_phases_merge_one_receipt_without_losing_required
     receipt = ls.learn(args, run=fake_run)
     assert calls == ['knowledge_update.py', 'continuity_resolve.py']
     assert receipt['ok'] and receipt['required_ok']
+    assert receipt['completion'] == 'partial'  # ancillary writers are queued for the follow-up
     assert receipt['steps']['style']['status'] == 'queued'
     calls.clear()
     args.phase = 'ancillary'
@@ -277,6 +328,24 @@ def test_required_and_ancillary_phases_merge_one_receipt_without_losing_required
     assert json.load(open(ls.receipt_path(args.day, args.type))) == receipt
 
 
+def test_partial_essential_receipt_stays_partial_after_successful_ancillary_merge(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    continuity = _touch(tmp_path, 'continuity.json')
+    def fake_run(argv, **kwargs):
+        name = os.path.basename(argv[1])
+        stderr = ('[continuity_resolve] loop update outcomes: '
+                  '{"accepted":0,"rejected":1,"rejected_by_reason":{"malformed_shape":1},"total":1}\n') \
+            if name == 'continuity_resolve.py' else ''
+        return types.SimpleNamespace(returncode=0, stdout='', stderr=stderr)
+    args = _args(tmp_path, continuity=continuity, phase='essential', run_key='partial-run')
+    essential = ls.learn(args, run=fake_run)
+    assert essential['completion'] == 'partial' and essential['required_ok']
+    args.phase = 'ancillary'
+    ancillary = ls.learn(args, run=fake_run)
+    assert ancillary['completion'] == 'partial' and ancillary['required_ok']
+    assert ancillary['steps']['continuity']['status'] == 'partial'
+
+
 def test_old_ancillary_job_does_not_replace_a_newer_briefs_receipt(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     fake_run = lambda *args, **kw: types.SimpleNamespace(returncode=0, stdout='', stderr='')
@@ -285,3 +354,37 @@ def test_old_ancillary_job_does_not_replace_a_newer_briefs_receipt(tmp_path, mon
     args.phase, args.run_key = 'ancillary', 'older-run'
     ls.learn(args, run=fake_run)
     assert json.load(open(ls.receipt_path(args.day, args.type))) == fresh
+
+
+def test_malformed_item_line_is_not_proof_and_never_drops_the_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    outcomes = '{"accepted": 0, "rejected": 0, "rejected_by_reason": {}, "total": 0}'
+    run = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout='', stderr=(
+        '[continuity_resolve] loop update outcomes: ' + outcomes + '\n'
+        '[continuity_resolve] loop update items: {}\n'))
+    result = ls._run_one('/x/continuity_resolve.py', [], run=run)
+    assert result['status'] == 'ok' and 'loop_update_items' not in result['proof']
+    # Any other unreadable writer output is a failed step on a written receipt, not a traceback.
+    monkeypatch.setattr(ls, '_run_one', lambda *a, **k: {}['status'])
+    args = _args(tmp_path, continuity=_touch(tmp_path, 'cont.json'))
+    receipt = ls.learn(args, run=run)
+    assert receipt['steps']['continuity']['status'] == 'failed' and not receipt['ok']
+    assert json.load(open(ls.receipt_path(args.day, args.type))) == receipt
+
+
+def test_ancillary_merge_keeps_the_input_revisions_the_essential_writers_applied(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ok = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout='', stderr='')
+    know = tmp_path / 'know.json'
+    know.write_text('{"person_updates": []}')
+    args = _args(tmp_path, knowledge_out=str(know), continuity=_touch(tmp_path, 'cont.json'),
+                 local=_touch(tmp_path, 'local.json'), phase='essential', run_key='r1')
+    applied = ls.learn(args, run=ok)['input_evidence']
+    # brief_runner rewrites knowledge_out (the consent stamp) before every phase.
+    know.write_text('{"person_updates": [], "_learning_evidence": {"consent_checked_at": "x"}}')
+    (tmp_path / 'local.json').write_text('{"messages": []}')
+    args.phase = 'ancillary'
+    merged = ls.learn(args, run=ok)['input_evidence']
+    assert merged['knowledge'] == applied['knowledge']
+    assert merged['continuity'] == applied['continuity']
+    assert merged['local'] != applied['local']   # the ancillary writers' own input revision

@@ -259,7 +259,12 @@ sources does not claim delivery. Welcome archives use the ordinary brief shape w
 
 `knowledge/history-state.json` is owned by `memory_cycle.py`: `sources[source]` carries initial
 and current window bounds, cursor, completion, pages/rows/reviewed counts, last success and optional
-sanitized retry/error and rejected-request revision; `next_source`, `last_run`, `receipt` govern
+sanitized retry/error and rejected-request revision. Provider-blocked pages have metadata-only
+`excluded_pages` receipts keyed by frozen window/cursor hash (bounds, cursors, row count, reason,
+time). `pending_content_block` preserves a pre-upgrade exclusion through source outages;
+`last_advanced` records traversal past an exclusion, without incrementing `reviewed` or setting
+`last_success`. Completion describes traversal; exclusions remain explicit learning gaps.
+`next_source`, `last_run`, `receipt` govern
 bounded work. Retired daily accounting fields are removed when the cycle next runs. It stores no message bodies. `knowledge/dreamer.json` is owned by `dreamer.py`:
 `reviewed` maps canonical person IDs to the exact file hash reviewed, plus `last_run`.
 

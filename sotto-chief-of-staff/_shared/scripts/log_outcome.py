@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
 import jsonstore  # noqa: E402
 
 VALID = {"draft_created", "opened", "copied", "dismissed", "executed", "viewed", "edited_and_sent",
-         "useful", "not_useful", "loop_transition", "loop_proposal"}
+         "useful", "not_useful", "loop_transition", "loop_proposal", "unknown"}
 
 
 def _path():

@@ -732,6 +732,89 @@ def test_a_group_id_counts_only_when_the_snapshot_actually_contains_it(tmp_path,
     assert not out["active"][0].get("group_id")
 
 
+def test_group_guid_survives_missing_local_read_without_becoming_a_phone(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    guid = "iMessage;+;abcdef0123456789deadbeef12345678"
+    local = {"imessage": [{**GROUP_LOCAL["imessage"][0], "chat_guid": guid}]}
+    first, = cr.resolve({"today": "2026-06-24", "local": local, "new_actions": [
+        _group_ask("FPV / Piston", "Send the introduction", identifier=guid)]}, NOW,
+        resolve_existing=False)["active"]
+    assert first["anchor_key"] == f"waiting_on:gid:{guid.lower()}"
+
+    replay = _group_ask("Another label", "Send the introduction", identifier=guid,
+                        loopId=first["anchor_key"])
+    out = cr.resolve({"today": "2026-06-24", "local": {}, "new_actions": [replay]}, NOW,
+                     resolve_existing=False)
+    assert len(out["active"]) == 1
+    assert out["active"][0]["anchor_key"] == first["anchor_key"]
+    assert cr._normalize_identifier_for_anchor(guid) == guid.lower()
+
+
+def test_unrelated_group_cannot_reuse_named_loop_when_local_read_is_empty(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    first, = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL, "new_actions": [
+        _group_ask("FPV / Piston", "Send the introduction", identifier=GROUP_GUID)]}, NOW,
+        resolve_existing=False)["active"]
+    other = "iMessage;+;abcdef0123456789deadbeef12345678"
+    out = cr.resolve({"today": "2026-06-24", "local": {}, "new_actions": [
+        _group_ask("FPV / Piston", "Confirm a different plan", identifier=other,
+                   loopId=first["anchor_key"])]}, NOW, resolve_existing=False)
+    assert len(out["active"]) == 2
+    assert next(row for row in out["active"] if row["anchor_key"] == first["anchor_key"])[
+        "summary"] == "Send the introduction"
+    assert f"waiting_on:id:{other.lower()}" in {row["anchor_key"] for row in out["active"]}
+
+
+def test_model_group_id_alone_cannot_bind_existing_group_without_source(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    first, = cr.resolve({"today": "2026-06-24", "local": GROUP_LOCAL, "new_actions": [
+        _group_ask("FPV / Piston", "Send the introduction", identifier=GROUP_GUID)]}, NOW,
+        resolve_existing=False)["active"]
+    out = cr.resolve({"today": "2026-06-24", "local": {}, "new_actions": [
+        _group_ask("FPV / Piston", "Confirm a different plan", identifier="+14155559999",
+                   groupId=GROUP_GUID, loopId=first["anchor_key"])]}, NOW,
+                     resolve_existing=False)
+    assert len(out["active"]) == 2
+    assert next(row for row in out["active"] if row["anchor_key"] == first["anchor_key"])[
+        "summary"] == "Send the introduction"
+
+
+def test_legacy_group_guid_phone_anchor_migrates_without_merging_tasks(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    guid = "iMessage;+;abcdef0123456789deadbeef12345678"
+    old_phone = re.sub(r"\D", "", guid)[-10:]
+    old_key = f"follow_up:id:{old_phone}"
+    group_key = f"follow_up:gid:{guid.lower()}"
+    _loop(tmp_path, group_key, action_type="reply", channel="imessage", group_id=guid.lower(),
+          contact_identifier=guid, contact_name="Project group", summary="Send the project plan")
+    _loop(tmp_path, old_key, action_type="reply", channel="imessage",
+          contact_identifier=guid, contact_name="Project group", summary="Confirm the meeting")
+    out = cr.resolve({"today": "2026-06-24", "local": {}}, NOW)
+    keys = {row["anchor_key"] for row in out["active"]}
+    assert group_key in keys and len(keys) == 2
+    migrated = next(row for row in out["active"] if row["summary"] == "Confirm the meeting")
+    assert migrated["group_id"] == guid.lower()
+    assert migrated["anchor_key"].startswith(group_key + ":legacy:")
+    assert old_key not in keys
+
+
+def test_legacy_group_repair_never_rewrites_phone_or_custom_task(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    guid = "iMessage;+;abcdef0123456789deadbeef12345678"
+    old_phone = re.sub(r"\D", "", guid)[-10:]
+    _loop(tmp_path, f"follow_up:gid:{guid.lower()}", action_type="reply", channel="imessage",
+          group_id=guid.lower(), contact_identifier=guid, contact_name="Project group")
+    phone_key = f"follow_up:id:{old_phone}"
+    _loop(tmp_path, phone_key, action_type="reply", channel="imessage",
+          contact_identifier=old_phone, contact_name="Phone contact")
+    custom_key = "custom:separate-group-task"
+    _loop(tmp_path, custom_key, action_type="reply", channel="imessage",
+          contact_identifier=guid, contact_name="Project group", summary="Separate obligation")
+    out = cr.resolve({"today": "2026-06-24", "local": {}}, NOW)
+    keys = {row["anchor_key"] for row in out["active"]}
+    assert phone_key in keys and custom_key in keys
+
+
 
 
 def test_a_person_ask_is_untouched_by_group_identity(tmp_path, monkeypatch):
@@ -821,6 +904,26 @@ def test_a_name_only_capture_and_an_email_capture_are_the_same_person(tmp_path, 
         {"type": "reply", "channel": "gmail", "contactIdentifier": "farid@x.com"}), {},
         cr.person_identity())
     assert cr.compute_anchor_key(a) == cr.compute_anchor_key(b) == "follow_up:cid:c_farid001"
+
+
+def test_name_only_loop_id_is_ignored_like_any_bad_loop_id(tmp_path, monkeypatch, capsys):
+    """A name cannot verify a loopId, so the ID is ignored (logged) and the debt follows the
+    counterpart default it would have used without one — never silently dropped."""
+    _env(tmp_path, monkeypatch)
+    _person_file(tmp_path, "c_farid001", "Farid Mirmohseni", ["farid@x.com"])
+    first, = cr.resolve({"today": "2026-06-24", "new_actions": [{
+        "type": "reply", "channel": "gmail", "contactName": "Farid Mirmohseni",
+        "contactIdentifier": "farid@x.com", "contextSummary": "Send the signed agreement"}]}, NOW,
+        resolve_existing=False)["active"]
+    out = cr.resolve({"today": "2026-06-24", "new_actions": [{
+        "type": "reply", "channel": "gmail", "contactName": "Sam Lee",
+        "loopId": first["anchor_key"], "contextSummary": "Send Sam the board memo"}]}, NOW,
+        resolve_existing=False)
+    assert "unknown or mismatched loopId; used counterpart base" in capsys.readouterr().err
+    by_name = {row["contact_name"]: row for row in out["active"]}
+    assert by_name["Sam Lee"]["summary"] == "Send Sam the board memo"
+    assert by_name["Sam Lee"]["anchor_key"] != first["anchor_key"]
+    assert cr._load_items()[first["anchor_key"]]["summary"] == "Send the signed agreement"
 
 
 def test_an_unresolvable_counterpart_keeps_todays_behavior(tmp_path, monkeypatch):

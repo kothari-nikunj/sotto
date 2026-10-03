@@ -9,8 +9,12 @@ tenant monetization/allowance code is separate and unchanged.
 `procedure_runner.py` gathers and admits proactive candidates, then calls
 `_shared/scripts/compose_notification.py` directly. The receiver uses that same composer for event
 bundles. These paths have no Hermes process, tool-discovery loop, delegate, or model fallback
-ladder. Quiet/empty scans make no composition calls. Intentions, meeting reminders and handoff
-questions use deterministic text. Remaining admitted copy is one structured request; there are at
+ladder. Quiet/empty scans make no composition calls. Intentions and handoff
+questions use deterministic text. A meeting reminder's identity, countdown and offer are
+deterministic; one or two sentences (60 words / 500 characters) of grounded context come from the
+same writer only when stored memory, the invitation, conversation text, cached attendee mail or
+identifier-joined open items supply evidence. Once the job's batch writer has run or failed, the
+reminder keeps its basic text rather than opening a second request. Remaining admitted copy is one structured request; there are at
 most two attempts per admitted job and evidence/model/policy revision, including worker retries
 (plus the bounded interruption recovery below). Transient provider errors wait for the existing
 queue backoff; only malformed copy gets an immediate repair attempt. Validated copy is saved before
@@ -48,7 +52,7 @@ Selected notification copy (text plus draft and decline) is limited to **1,200 c
 Operation identity hashes evidence, task policy, model and tenant. Procedures additionally include
 the stable receiver job ID, so queue retries share a budget while a later scheduled job can
 legitimately run again. Standalone procedure invocations get their own occurrence. Native client and
-route revisions release work after a repair. HTTP 400/422 parks the same request contract across job
+route revisions release work after a repair. HTTP 400/413/422 parks the same request contract across job
 occurrences, including when another fallback shape has since run. Changed request/evidence/policy
 can release it.
 
@@ -143,12 +147,56 @@ counts. An optional `--billed-total` shows the residual to known token costs; us
 billing interval/currency/ project scope and allow provider lag. Today is explicitly partial. No
 scheduled report or AI call is introduced.
 
-Interactive requests without an adapter-provided per-turn ID remain `unknown`; session totals are
-not user-turn counts. Their context components are measured, but this change does not modify Hermes
-turn limits, compression, conversation history, or auxiliary routing. Per-turn hooks,
-usefulness/outcome joins, trend diagnostics and cheaper-model quality evaluation remain follow-up
-work requiring pinned-runtime and post-rollout evidence. Do not claim account-wide invoice
-reconciliation or an exact savings percentage from these token estimates.
+Interactive requests without an adapter-provided per-turn ID have no proven turn identity; session
+totals are not user-turn counts. The managed gateway now labels requests to its exact proxy chat endpoint as
+`chat`, adds an opaque request ID, and hashes the pinned transport's session ID when available.
+Compression and other auxiliary calls can share the chat lane; a request ID is not a user-turn ID.
+Legacy rows are not retroactively attributed. Usefulness/outcome joins and cheaper-model quality
+evaluation still require post-rollout evidence. Do not claim account-wide invoice reconciliation
+or an exact savings percentage from these token estimates.
+
+## Shared provider admission and managed chat context
+
+The proxy checks admission atomically in its existing SQLite ledger for both the tenant and the
+shared upstream-key pool. In a rolling minute it allows at most 60 requests and 12 million input
+characters; background work is limited to 48 requests and 6 million characters. At most eight
+calls may be active, with five available to background work. Due brief stages, meeting prep and
+chat receive the foreground reserve. Unlabelled native requests use the background lane. One tenant
+may use at most three quarters of each shared limit (45 requests, six active calls, and nine
+million input characters; background input is capped at 4.5 million). This includes the first
+request, so one tenant cannot consume the entire pool. Multiple tenants can still fill it. A single
+request larger than its tenant lane's input limit is refused
+with HTTP 413, since waiting cannot admit it. These are local backpressure limits, not claims about
+a provider quota or exact token counts.
+
+Workload headers are scheduling hints from the authenticated runtime, not an authorization
+boundary. A modified runtime can label work as foreground, but cannot change its authenticated
+tenant, allowance, or tenant-wide limits. Header labels do not grant permission to read sources
+or send messages.
+
+A temporary capacity refusal never reaches the provider and consumes no model-attempt allowance.
+It returns a typed HTTP 429 response and jittered Retry-After; native callers leave recovery to their
+existing durable work owner instead of immediately trying another model. Original job deadlines
+and source cursors still apply; jobs admitted without a deadline get a one-hour maximum age for
+this deferral. Triage refused before judgment remains explicitly unreviewed and qualifies for digest
+review even as a single item. Scheduled attendee research also defers on typed capacity refusal;
+successful research batches are reused. If prep has not finished when a brief is due, composition
+uses available context and explicitly marks attendee research pending instead of reporting an
+empty research pass as complete. A bounded digest review cannot advance its coverage timestamp past
+unreviewed overflow; the queue and accepted-item IDs retain the remainder. Active slots release after completion or client failure, with a
+six-minute lease for crash recovery. Startup preserves active leases because another process may
+still own an in-flight call. An ambiguous provider call keeps its metering reservation.
+
+Managed chat uses the pinned Hermes compressor with a 120,000-token threshold cap, proactive
+tool-result pruning at 48,000 tokens, a lean tail retaining at least two user messages, and
+abort-on-summary-failure enabled. Hermes owns the structured summary and original session archive;
+the gateway does not rewrite transcripts itself. Archived detail remains available through the
+pinned session retrieval tools. These settings reduce repeated tool payloads, but do not guarantee
+a hard request-token ceiling or a particular savings percentage. Protected recent messages,
+compression cooldowns and a failed summary can still leave a large request. A generated summary
+can omit a useful detail; retained original rows and retrieval are the recovery path. This does
+not replace quality checks on real conversations. Self-host owners'
+independent Hermes configuration is not rewritten by managed reconciliation.
 
 ## Deployment ownership and rollout
 
@@ -175,5 +223,21 @@ applications retain their own caller inventory; they are not forced through Sott
 After merge and an intentional rollout, compare a complete day, then seven complete days by admitted
 bundles, changed memory pages and delivered briefs. Check timely delivery, unresolved choices, draft
 approval and memory backlog alongside input, attempts and cost. Review billing residuals after
-settlement. Cheaper routing and interactive context changes need quality evidence before a separate
-release; low-activity days should be cheap without cutting off useful busy days.
+settlement. Cheaper routing needs quality evidence before a separate release; evaluate the managed
+compression changes against retained source context after rollout. Low-activity days should be cheap
+without cutting off useful busy days.
+
+## Provider-blocked history pages
+
+An explicit `PROHIBITED_CONTENT`, `SAFETY`, or `BLOCKLIST` response excludes that
+history page from model learning. No alternate prompt, model, or safety setting retries its
+contents. Traversal advances to the validated next cursor, while `reviewed` and `last_success`
+do not advance for the excluded page. `history-state.json` retains a metadata-only
+`excluded_pages` receipt (window, cursors, row count, time and fixed reason), never message bodies.
+The brief distinguishes current message access from paused learning and discloses historical gaps.
+
+A page parked by the earlier retry policy with one of those explicit reasons is migrated using
+its frozen window and cursor: an ordinary source read obtains the continuation, without a model
+resubmission. Source availability backoff and permission checks still apply. An invalid continuation
+is held for repair, not treated as permission to skip a different page. Other malformed, empty,
+truncated or failed model responses retain the existing bounded retry policy; they are not exclusions.

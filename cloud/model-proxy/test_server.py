@@ -518,7 +518,7 @@ def test_settlement_backfill_is_a_one_time_startup_migration(tmp_path, monkeypat
 def test_rate_limit_is_atomic_persistent_and_separate_from_spend(proxy, monkeypatch):
     http, calls = proxy
     http.tenants[0]['budget_cents'] = None
-    monkeypatch.setattr(server, 'REQUESTS_PER_WINDOW', 2)
+    monkeypatch.setattr(server, 'REQUESTS_PER_WINDOW', 3)  # one tenant may use two of three
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
         statuses = list(pool.map(lambda _: post(http)[0], range(4)))
     assert sorted(statuses) == [200, 200, 429, 429]
@@ -553,3 +553,166 @@ def test_internal_workload_headers_stay_at_the_proxy(proxy):
     with http.ledger.connect() as db:
         metadata = json.loads(db.execute('SELECT metadata_json FROM calls').fetchone()[0])
     assert metadata['workload'] == 'notification' and metadata['operation_id'] == 'a' * 64
+
+
+def test_shared_active_admission_protects_foreground(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'MAX_ACTIVE_CALLS', 3)
+    monkeypatch.setattr(server, 'MAX_ACTIVE_BACKGROUND_CALLS', 2)
+    ledger = server.Ledger(tmp_path / 'shared.sqlite3')
+    background = {'workload': 'triage', 'input_chars': 10}
+    foreground = {'workload': 'brief_extract', 'input_chars': 10}
+    first = ledger.reserve('a', None, 'native', 'gemini-3.8-flash', metadata=background)
+    second = ledger.reserve('b', None, 'native', 'gemini-3.8-flash', metadata=background)
+    with pytest.raises(server.RateLimitError, match='shared provider concurrent') as denied:
+        ledger.reserve('c', None, 'native', 'gemini-3.8-flash', metadata=background)
+    assert 3 <= denied.value.retry_after <= 7
+    ledger.reserve('c', None, 'native', 'gemini-3.8-flash', metadata=foreground)
+    with pytest.raises(server.RateLimitError, match='concurrent'):
+        ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata={'workload': 'chat'})
+    ledger.finish(first, 502, {})
+    assert ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata={'workload': 'chat'})
+    with pytest.raises(server.RateLimitError, match='concurrent'):
+        ledger.reserve('a', None, 'native', 'gemini-3.8-flash', metadata=background)
+    assert second
+
+
+def test_opening_another_ledger_handle_preserves_live_active_slots(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'MAX_ACTIVE_CALLS', 1)
+    ledger = server.Ledger(tmp_path / 'shared.sqlite3')
+    active = ledger.reserve('a', None, 'native', 'gemini-3.8-flash',
+                            metadata={'workload': 'chat', 'input_chars': 1})
+    # A rolling replacement or second process can open the shared ledger while this request lives.
+    replacement = server.Ledger(ledger.path)
+    with pytest.raises(server.RateLimitError, match='shared provider concurrent'):
+        replacement.reserve('b', None, 'native', 'gemini-3.8-flash',
+                            metadata={'workload': 'chat', 'input_chars': 1})
+    ledger.release(active)
+    assert replacement.reserve('b', None, 'native', 'gemini-3.8-flash',
+                               metadata={'workload': 'chat', 'input_chars': 1})
+
+
+def test_one_tenant_leaves_shared_room_for_another_tenant(tmp_path):
+    ledger = server.Ledger(tmp_path / 'shared.sqlite3')
+    chat = {'workload': 'chat', 'input_chars': 10}
+    held = [ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata=chat)
+            for _ in range(server.MAX_ACTIVE_CALLS * server.TENANT_SHARE_PERCENT // 100)]
+    with pytest.raises(server.RateLimitError, match='tenant concurrent'):
+        ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata=chat)
+    assert ledger.reserve('b', None, 'chat', 'gemini-3.8-flash', metadata=chat)
+    for call in held:
+        ledger.release(call)
+    with ledger.connect() as db:
+        db.execute('UPDATE calls SET active_until=NULL')
+    for _ in range(server.REQUESTS_PER_WINDOW * server.TENANT_SHARE_PERCENT // 100 - len(held)):
+        ledger.release(ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata=chat))
+    with pytest.raises(server.RateLimitError, match='tenant request rate'):
+        ledger.reserve('a', None, 'chat', 'gemini-3.8-flash', metadata=chat)
+    assert ledger.reserve('b', None, 'chat', 'gemini-3.8-flash', metadata=chat)
+
+
+def test_request_larger_than_a_window_is_refused_permanently(proxy, tmp_path):
+    ledger = server.Ledger(tmp_path / 'size.sqlite3')
+    with pytest.raises(server.RequestTooLargeError):
+        ledger.reserve('a', None, 'native', 'gemini-3.8-flash',
+                       metadata={'workload': 'triage', 'input_chars': server.BACKGROUND_INPUT_CHARS_PER_WINDOW * server.TENANT_SHARE_PERCENT // 100 + 1})
+    # The tenant share applies to the first request too; its boundary remains admissible.
+    assert ledger.reserve('a', None, 'native', 'gemini-3.8-flash',
+                          metadata={'workload': 'triage', 'input_chars': server.BACKGROUND_INPUT_CHARS_PER_WINDOW * server.TENANT_SHARE_PERCENT // 100})
+    http, calls = proxy
+    status = post(http, body={'contents': [{'parts': [{'text': 'x' * (server.BACKGROUND_INPUT_CHARS_PER_WINDOW + 1)}]}]})[0]
+    assert status == 413 and not calls
+
+
+def test_first_tenant_volume_request_leaves_shared_room(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'INPUT_CHARS_PER_WINDOW', 100)
+    monkeypatch.setattr(server, 'BACKGROUND_INPUT_CHARS_PER_WINDOW', 100)
+    ledger = server.Ledger(tmp_path / 'shared.sqlite3')
+    background = {'workload': 'triage', 'input_chars': 75}
+    ledger.reserve('a', None, 'native', 'gemini-3.8-flash', metadata=background)
+    ledger.reserve('b', None, 'native', 'gemini-3.8-flash',
+                   metadata={'workload': 'triage', 'input_chars': 25})
+    with pytest.raises(server.RateLimitError, match='shared provider input volume'):
+        ledger.reserve('b', None, 'native', 'gemini-3.8-flash',
+                       metadata={'workload': 'triage', 'input_chars': 1})
+
+
+def test_tenant_volume_413_ceiling_covers_foreground_and_background(tmp_path):
+    cases = [
+        ('brief_extract', server.INPUT_CHARS_PER_WINDOW),
+        ('triage', server.BACKGROUND_INPUT_CHARS_PER_WINDOW),
+    ]
+    for index, (workload, shared_limit) in enumerate(cases):
+        ceiling = shared_limit * server.TENANT_SHARE_PERCENT // 100
+        ledger = server.Ledger(tmp_path / f'volume-{index}.sqlite3')
+        with pytest.raises(server.RequestTooLargeError):
+            ledger.reserve('a', None, 'native', 'gemini-3.8-flash',
+                           metadata={'workload': workload, 'input_chars': ceiling + 1})
+        assert ledger.reserve('a', None, 'native', 'gemini-3.8-flash',
+                              metadata={'workload': workload, 'input_chars': ceiling})
+
+
+def test_shared_rate_and_input_volume_leave_foreground_headroom(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'REQUESTS_PER_WINDOW', 5)
+    monkeypatch.setattr(server, 'BACKGROUND_REQUESTS_PER_WINDOW', 3)
+    monkeypatch.setattr(server, 'MAX_ACTIVE_CALLS', 10)
+    monkeypatch.setattr(server, 'MAX_ACTIVE_BACKGROUND_CALLS', 10)
+    monkeypatch.setattr(server, 'BACKGROUND_INPUT_CHARS_PER_WINDOW', 100)
+    monkeypatch.setattr(server, 'INPUT_CHARS_PER_WINDOW', 200)
+    ledger = server.Ledger(tmp_path / 'shared.sqlite3')
+    for tenant in ('a', 'b'):
+        ledger.reserve(tenant, None, 'native', 'gemini-3.8-flash',
+                       metadata={'workload': 'triage', 'input_chars': 45})
+    with pytest.raises(server.RateLimitError, match='shared provider input volume') as denied:
+        ledger.reserve('b', None, 'native', 'gemini-3.8-flash',
+                       metadata={'workload': 'triage', 'input_chars': 20})
+    assert 45 <= denied.value.retry_after <= 60
+    ledger.reserve('b', None, 'chat', 'gemini-3.8-flash',
+                   metadata={'workload': 'chat', 'input_chars': 100})
+    with pytest.raises(server.RateLimitError, match='shared provider input volume'):
+        ledger.reserve('a', None, 'chat', 'gemini-3.8-flash',
+                       metadata={'workload': 'chat', 'input_chars': 11})
+
+
+def test_known_chat_route_is_attributed_without_optional_headers(proxy):
+    http, _ = proxy
+    assert post(http, path='/openai/v1/chat/completions',
+                body={'model': 'gemini-3.8-flash', 'messages': [{'role': 'user', 'content': 'hello'}]})[0] == 200
+    with http.ledger.connect() as db:
+        metadata = json.loads(db.execute('SELECT metadata_json FROM calls').fetchone()[0])
+    assert metadata['workload'] == 'chat'
+    assert metadata['input_chars'] >= sum(metadata['context_chars'].values())
+
+
+@pytest.mark.parametrize('lane,payload', [
+    ('chat', {'messages': [{'role': 'assistant', 'content': None,
+                           'tool_calls': [{'function': {'arguments': 'x' * 1000}}]}]}),
+    ('native', {'contents': [], 'tools': [{'functionDeclarations': [{'description': 'x' * 1000}]}]}),
+])
+def test_admission_input_size_covers_tool_calls_and_native_tools(lane, payload):
+    metadata = server.request_metadata({}, payload, lane)
+    assert metadata['input_chars'] > 1000
+    assert metadata['input_chars'] > sum(metadata['context_chars'].values())
+
+
+def test_failed_upstream_releases_shared_concurrency_slot(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'MAX_ACTIVE_CALLS', 1)
+    calls = []
+    def upstream(req, **kwargs):
+        calls.append(req)
+        if len(calls) == 1:
+            raise OSError('offline injected failure')
+        return Response(b'{"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}')
+    tenants = [{'id': 'a', 'token_sha256': hashlib.sha256(b'a-token').hexdigest(),
+                'budget_cents': None, 'enabled': True, 'expires_at': time.time() + 3600}]
+    http = server.serve(('127.0.0.1', 0), tenants, 'upstream-only', tmp_path / 'ledger.sqlite3', upstream)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert post(http)[0] == 502
+        assert post(http)[0] == 200
+        with http.ledger.connect() as db:
+            assert db.execute('SELECT COUNT(*) FROM calls WHERE active_until IS NOT NULL').fetchone()[0] == 0
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join()

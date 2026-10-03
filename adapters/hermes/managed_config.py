@@ -64,7 +64,16 @@ def reconcile(home, env):
                  'compression', 'title_generation', 'approval', 'skills_hub', 'mcp', 'triage_specifier'):
         cfg.setdefault('auxiliary', {})[task] = {'provider': 'main', 'model': ''}
     cfg.setdefault('compression', {}).update({'provider': 'main', 'model': '',
-                                            'base_url': model['base_url'], 'api_key': token})
+                                            'base_url': model['base_url'], 'api_key': token,
+                                            # Pinned Hermes archives original rows before compaction.
+                                            # Keep decisions, artifacts and active obligations in its
+                                            # structured summary; abort if the summary fails.
+                                            'enabled': True, 'threshold_tokens': 120_000,
+                                            'tail_mode': 'lean', 'min_tail_user_messages': 2,
+                                            'proactive_prune_tokens': 48_000,
+                                            'proactive_prune_min_result_chars': 8_000,
+                                            'proactive_prune_min_reclaim_tokens': 4_096,
+                                            'abort_on_summary_failure': True})
     cfg.setdefault('delegation', {}).update({'model': model['default'], 'provider': 'custom',
                                            'base_url': model['base_url'], 'api_key': token})
     # The execute_code kernel scrubs undeclared variables. Pass the tenant-scoped

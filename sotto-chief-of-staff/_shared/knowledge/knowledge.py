@@ -153,6 +153,9 @@ class FactMeta:
     text: str = ""
     archived_text: Optional[str] = None
     archived_reason: Optional[str] = None
+    # Set only on a curation-folded duplicate: the fact it was folded into, so later evidence
+    # for this wording reaches the copy that is still kept (knowledge_update._apply_fact).
+    duplicate_of: Optional[str] = None
     type: str = ""
     status: str = "active"
     seen: int = 1
@@ -170,6 +173,8 @@ class FactMeta:
             d["archived_text"] = self.archived_text
         if self.archived_reason is not None:
             d["archived_reason"] = self.archived_reason
+        if self.duplicate_of is not None:
+            d["duplicate_of"] = self.duplicate_of
         d["type"] = self.type
         d["status"] = self.status
         d["seen"] = self.seen
@@ -188,6 +193,7 @@ class FactMeta:
             text=d.get("text", ""),
             archived_text=d.get("archived_text"),
             archived_reason=d.get("archived_reason"),
+            duplicate_of=d.get("duplicate_of"),
             type=d.get("type", ""),
             status=d.get("status", "active"),
             seen=int(d.get("seen", 1)),
@@ -198,6 +204,17 @@ class FactMeta:
             first=d.get("first", ""),
             last=d.get("last", ""),
         )
+
+
+def provenance_state(fact: FactMeta) -> str:
+    """Classify the evidence actually present without upgrading legacy records or fabricating refs."""
+    if fact.evidence_refs:
+        return "evidence_referenced"
+    if fact.source_ref:
+        return "source_referenced"
+    if fact.source == "brief_extraction" or not str(fact.source or "").strip():
+        return "reference_unavailable"
+    return "unreferenced"
 
 
 @dataclass

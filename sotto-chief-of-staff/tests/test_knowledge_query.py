@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 
 import knowledge as kg
+import knowledge_query as kq
 import knowledge_update as ku
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -52,6 +53,26 @@ def _age_people(days=21):
     old = time.time() - days * 86400
     for name in os.listdir(kg.people_dir()):
         os.utime(os.path.join(kg.people_dir(), name), (old, old))
+
+
+def test_retrieval_marks_legacy_fact_source_reference_unavailable():
+    fact = kg.FactMeta(text="Synthetic legacy assertion", source="brief_extraction", conf=0.95)
+    packed = kq._fact_text(fact, datetime(2026, 10, 1))
+    assert packed == "Synthetic legacy assertion (source reference unavailable)"
+
+
+
+def test_retrieval_labels_missing_origin_without_relabelling_user_edits():
+    for source in ('', ' ', None):
+        fact = kg.FactMeta(text="Synthetic legacy assertion", source=source, conf=0.95)
+        assert kq._fact_text(fact, datetime(2026, 10, 1)).endswith("(source reference unavailable)")
+        fact.source_ref = "synthetic-message"
+        assert "unavailable" not in kq._fact_text(fact, datetime(2026, 10, 1))
+    uncertain = kg.FactMeta(text="Legacy guess", source="", conf=0.55)
+    rendered = kq._fact_text(uncertain, datetime(2026, 10, 1))
+    assert "(unverified)" in rendered and "(source reference unavailable)" in rendered
+    authored = kg.FactMeta(text="Owner correction", source="user_edit", conf=1.0)
+    assert "unavailable" not in kq._fact_text(authored, datetime(2026, 10, 1))
 
 
 def test_empty_person_graph_keeps_historical_coverage_and_consent_distinct(tmp_path, monkeypatch):

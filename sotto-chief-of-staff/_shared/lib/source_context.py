@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import glob
 import hashlib
 import hmac
 import json
@@ -21,6 +22,14 @@ from source_catalog import SOURCE_FIELDS, SOURCE_LABELS, LOCAL_SNAPSHOT_TTL_HOUR
 SOURCE_STATUSES = frozenset({'ok', 'partial', 'unavailable', 'disabled', 'skipped'})
 BRIDGE_STATUSES = frozenset({'ok', 'disabled', 'unavailable', 'degraded', 'needs_fda', 'partial'})
 CONTEXT_SOURCES = tuple(SOURCE_FIELDS) + ('gmail', 'calendar', 'granola', 'x', 'x_bookmarks')
+
+
+class BridgeReadError(RuntimeError):
+    """Fixed metadata only; tool bodies may contain private source content."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
 
 
 class HistoryProtocolError(ValueError):
@@ -47,23 +56,116 @@ def permission_fingerprint():
     return hashlib.sha256(json.dumps(permissions, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def used_sources(local=None, gmail=None, calendar=None, granola=None, x_context=None):
-    """Minimal source IDs for a delivery-time permission check; never copies source content."""
-    local = project_local(local or {})
+def used_sources(local=None, gmail=None, calendar=None, granola=None, x_context=None,
+                 *, already_projected=False):
+    """Minimal source IDs for a delivery-time permission check; never copies source content.
+
+    `already_projected` preserves the sources in a consent-filtered input after a concurrent
+    revocation. Reprojecting them while composing would erase evidence that the model saw them.
+    """
+    local = (local if isinstance(local, dict) else {}) if already_projected else project_local(local or {})
     sources = {source for source, fields in SOURCE_FIELDS.items()
                if any(local.get(field) for field in fields)}
     for source, rows, key in (('gmail', gmail, 'emails'), ('calendar', calendar, 'events'),
                               ('granola', granola, 'meetings')):
         if isinstance(rows, dict):
             rows = (rows.get(key) or rows.get('stale_threads') or rows.get('staleThreads') or [])
-        if rows and allowed(source):
+        if rows and (already_projected or allowed(source)):
             sources.add(source)
-    x_rows = project_x(x_context).get('attendees', [])
+    x_rows = ((x_context or {}).get('attendees', []) if isinstance(x_context, dict)
+              else (x_context or [])) if already_projected else project_x(x_context).get('attendees', [])
+    x_rows = [row for row in x_rows if isinstance(row, dict)] if isinstance(x_rows, list) else []
     if x_rows:
         sources.add('x')
         if any(row.get('bookmarks') for row in x_rows):
             sources.add('x_bookmarks')
     return sorted(sources)
+
+
+_LOOP_EXCERPT = ('_loop_context', '_loop_context_body', '_loop_context_body_sources')
+
+
+def _dependencies_allowed(deps):
+    return (isinstance(deps, list) and bool(deps) and
+            all(isinstance(source, str) and source in CONTEXT_SOURCES and allowed(source)
+                for source in deps))
+
+
+def email_dependency_sources(payload):
+    """Source grants used to choose supplemental Gmail rows or excerpts for open obligations."""
+    rows = payload if isinstance(payload, list) else (
+        payload.get('emails', payload.get('messages', [])) if isinstance(payload, dict) else [])
+    return sorted({source for row in rows if isinstance(row, dict)
+                   for key in ('_loop_context_sources', '_loop_context_body_sources')
+                   for source in (row.get(key) or [])
+                   if isinstance(source, str) and source in CONTEXT_SOURCES})
+
+
+def project_emails(payload):
+    """Apply current Gmail and derived-context grants before any brief or Learn consumer.
+
+    A row a revoked source chose is dropped; an inbox row loses only the excerpt that source chose.
+    """
+    if not allowed('gmail'):
+        return []
+    result = dict(payload) if isinstance(payload, dict) else payload
+    rows = result.get('emails', result.get('messages', [])) if isinstance(result, dict) else result
+    if not isinstance(rows, list):
+        return result
+    filtered = []
+    for row in rows:
+        if not isinstance(row, dict):
+            filtered.append(row)
+            continue
+        if '_loop_context_sources' in row and not _dependencies_allowed(row['_loop_context_sources']):
+            continue
+        if ('_loop_context_body_sources' in row
+                and not _dependencies_allowed(row['_loop_context_body_sources'])):
+            row = {key: value for key, value in row.items() if key not in _LOOP_EXCERPT}
+        filtered.append(row)
+    if isinstance(result, dict):
+        key = 'emails' if 'emails' in result else 'messages'
+        result[key] = filtered
+        return result
+    return filtered
+
+
+EVIDENCE_EXCERPT_LABEL = '\n\n[Additional excerpt from the same email]\n'
+
+
+def email_evidence_parts(row):
+    """The consent-filtered texts of one message, each verbatim from the email.
+
+    The ordinary body and a supplemental loop excerpt are separate reads of the same message.
+    A verbatim-quote check must match inside one part: a quote that spans the code-made label
+    joining them in `email_evidence_text` is not text anyone wrote.
+    """
+    rows = project_emails([row])
+    if not rows or not isinstance(rows[0], dict):
+        return []
+    row = rows[0]
+    base = str(row.get('body') or row.get('text') or row.get('snippet') or '')
+    extra = str(row.get('_loop_context_body') or '')
+    if not extra or extra in base:
+        return [base] if base else []
+    if base in extra:
+        return [extra]
+    return [base, extra]
+
+
+def email_evidence_text(row):
+    """One consent-filtered view of a message for the writer and critic prompts.
+
+    Supplemental excerpts stay separate in storage so revoking their selecting source leaves
+    the ordinary Gmail read intact. Never replace surrounding words with just a proposed quote.
+    Quote matching uses `email_evidence_parts`, never this joined rendering.
+    """
+    return EVIDENCE_EXCERPT_LABEL.join(email_evidence_parts(row))
+
+
+def email_quote_found(row, quote):
+    """Whether a whitespace-normalized quote appears verbatim inside one part of the email."""
+    return any(quote in ' '.join(part.split()) for part in email_evidence_parts(row))
 
 
 def project_x(payload):
@@ -267,6 +369,7 @@ def record_bridge_status(payload, data_root=None):
         return stamp.timestamp() > epoch(row) if strict else stamp.timestamp() >= epoch(row)
 
     is_read = 'source_status' in payload
+    revoked = False
     with _source_transaction(_state_path(data_root)) as state:
         sources = _source_rows(state)
         for source, status in values.items():
@@ -284,6 +387,7 @@ def record_bridge_status(payload, data_root=None):
             if applied:
                 current.update(status=status, observed_at=received_stamp.isoformat(),
                                observed_epoch=received_stamp.timestamp(), order_epoch=stamp.timestamp())
+                revoked |= status == 'disabled' and previous.get('status') != 'disabled'
                 if previous.get('status') == 'disabled' and status != 'disabled':
                     # Only a new read begun after this consent restoration can open a fresh
                     # first brief. Fence at server acceptance, not probe start: a read may
@@ -339,6 +443,24 @@ def record_bridge_status(payload, data_root=None):
                     current['last_available_at'] = received_stamp.isoformat()
             if current:  # never save an empty row the validator would refuse
                 sources[source] = current
+    if revoked:
+        purge_learning_diagnostics(data_root)
+
+
+def purge_learning_diagnostics(data_root=None):
+    """Erase retained private evidence when any source is disabled.
+
+    Schema 1 diagnostics do not identify every contributing source, so revocation clears the
+    whole bounded directory. Coordinate with the writer's per-file lock: a writer that checked
+    consent before the disable cannot restore its old snippets after this function returns.
+    """
+    directory = Path(data_root or os.environ.get('SOTTO_DATA', '/data')) / 'events/learning-diagnostics'
+    if not directory.exists():
+        return
+    with jsonstore.lock(str(directory / '.consent')):
+        for name in glob.glob(str(directory / 'brief-*.json')):
+            with jsonstore.lock(name):
+                Path(name).unlink(missing_ok=True)
 
 
 def source_health(data_root=None, now=None):
@@ -461,7 +583,7 @@ def allowed(source):
 def bridge_call(name, arguments=None):
     key = os.environ.get('BRIDGE_TOKEN') or os.environ.get('SOTTO_MCP_TOKEN') or os.environ.get('SOTTO_TRIGGER_TOKEN')
     if not key:
-        raise RuntimeError('Bridge is not configured')
+        raise BridgeReadError('bridge_not_configured')
     token = hmac.new(key.encode(), b'sotto-mcp', hashlib.sha256).hexdigest()
     rpc = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
            'params': {'name': name, 'arguments': arguments or {}}}
@@ -471,8 +593,16 @@ def bridge_call(name, arguments=None):
     with urllib.request.urlopen(req, timeout=100) as response:
         reply = json.load(response)
     result = reply.get('result', {})
-    if reply.get('error') or result.get('isError'):
-        raise RuntimeError('Bridge read unavailable')
+    if reply.get('error'):
+        error = reply['error']
+        code = error.get('code') if isinstance(error, dict) else None
+        code = code if type(code) is int else None
+        raise BridgeReadError({-32000: 'bridge_offline', -32001: 'bridge_timeout',
+                               -32002: 'bridge_not_permitted'}.get(code, 'bridge_rpc_error'))
+    if result.get('isError'):
+        detail = result.get('structuredContent')
+        code = detail.get('error_code') if isinstance(detail, dict) else None
+        raise BridgeReadError('bridge_offline' if code == 'bridge_offline' else 'bridge_tool_error')
     payload = unwrap_tool_result(result)
     if name in ('read_local', 'health'):
         record_bridge_status(payload)
@@ -482,8 +612,19 @@ def bridge_call(name, arguments=None):
 def read_local(hours=24):
     try:
         return project_local(bridge_call('read_local', {'since_hours': hours}))
-    except (OSError, ValueError, RuntimeError, jsonstore.Unreadable):
-        return {}  # The brief owns the last-snapshot fallback and freshness disclosure.
+    except (OSError, ValueError, RuntimeError, jsonstore.Unreadable) as error:
+        # Keep a content-free explanation of the gap; an empty payload must not erase whether
+        # this was an offline Bridge, a timeout, or another read failure. Never log tool bodies.
+        code = getattr(error, 'code', '')
+        if code not in {'bridge_offline', 'bridge_timeout', 'bridge_not_permitted',
+                        'bridge_not_configured', 'bridge_rpc_error', 'bridge_tool_error'}:
+            code = 'bridge_read_failed'
+        try:
+            from sotto_log import diag
+            diag('[read_local] ' + code + '; using permitted snapshot fallback')
+        except (OSError, ValueError):
+            pass
+        return {}  # The shared snapshot resolver owns fallback and freshness disclosure.
 
 
 def history_page(source, since, until, before=0, limit=500):
@@ -492,7 +633,7 @@ def history_page(source, since, until, before=0, limit=500):
     result = bridge_call('read_history', {'source': source, 'since': since, 'until': until,
                                         'before': before, 'limit': limit})
     if not allowed(source):
-        raise RuntimeError('source consent changed during history read')
+        raise BridgeReadError('source_consent_changed')
     if (not isinstance(result, dict) or result.get('source') != source
             or result.get('status') != 'ok' or not isinstance(result.get('rows'), list)):
         raise HistoryProtocolError('invalid_history_page')

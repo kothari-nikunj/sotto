@@ -13,7 +13,8 @@ spec.loader.exec_module(cr)
 from delivery_effects import loop_version
 
 
-@pytest.mark.parametrize("reason", ["unknown_loop", "stale_revision", "unsupported_evidence"])
+@pytest.mark.parametrize("reason", ["unknown_loop", "stale_revision", "missing_source",
+                                    "unreviewed_resolution"])
 def test_rejected_proposal_has_content_free_reason(tmp_path, monkeypatch, capsys, reason):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_TIMEZONE", "UTC")
@@ -27,6 +28,8 @@ def test_rejected_proposal_has_content_free_reason(tmp_path, monkeypatch, capsys
         proposal["loopId"] = "missing"
     elif reason == "stale_revision":
         proposal["loopVersion"] = "stale"
+    if reason != "unreviewed_resolution":
+        proposal["criticReceipt"] = cr.record_critic_approval(proposal)
     out = cr.resolve({"today": "2026-09-18", "loopUpdates": [proposal]},
                      datetime(2026, 9, 18, 18), resolve_existing=False)
     assert not out["resolved"] and len(out["active"]) == 1
@@ -46,6 +49,6 @@ def test_rejection_counts_survive_real_continuity_subprocess_in_learn_receipt(tm
     ]}))
     step = learn_step._run_one(str(ROOT / 'morning-brief/scripts/continuity_resolve.py'),
                                ['--merge-only', str(payload)])
-    assert step['status'] == 'ok'
-    assert '"unknown_loop": 2' in step['detail']
+    assert step['status'] == 'partial'
+    assert '2 of 2 proposed updates were rejected' in step['detail']
     assert 'private' not in step['detail'] and 'missing-' not in step['detail']

@@ -41,8 +41,18 @@ def message(**extra):
 
 
 def proposal(row, msg, **extra):
-    return {'loopId': row['anchor_key'], 'loopVersion': loop_version(row), 'status': 'resolved',
-            'evidence': [{'sourceType': 'imessage', 'sourceId': str(msg['rowid']), 'snippet': msg['text']}], **extra}
+    update = {'loopId': row['anchor_key'], 'loopVersion': loop_version(row), 'status': 'resolved',
+              'evidence': [{'sourceType': 'imessage', 'sourceId': str(msg['rowid']),
+                            'snippet': msg['text']}], **extra}
+    return reviewed(update)
+
+
+def reviewed(update):
+    """The receipt compose_brief stamps once a completed critic pass reviewed this closure."""
+    update = {k: v for k, v in update.items() if k != 'criticReceipt'}
+    if update.get('status') == 'resolved':
+        update['criticReceipt'] = cr.record_critic_approval(update)
+    return update
 
 
 def resolve(**payload):
@@ -171,6 +181,26 @@ def test_mismatched_loop_id_never_mutates_the_other_person():
     assert next(row for row in current if row['contact_name'] == 'Noah Kim')['summary'] == 'Confirm the budget'
 
 
+def test_model_claimed_canonical_id_cannot_redirect_a_different_identifier():
+    resolve(new_actions=[action('Send the signed contract')])
+    maya = rows()[0]
+    resolve(new_actions=[action('Confirm the budget', contactName='Noah Kim',
+                                contactIdentifier='+14155559999',
+                                canonical_id='claimed-maya', loopId=maya['anchor_key'])])
+    assert len(rows()) == 2
+    assert cr._load_items()[maya['anchor_key']]['summary'] == 'Send the signed contract'
+
+
+def test_name_only_loop_id_cannot_rewrite_another_task_or_lose_the_debt():
+    resolve(new_actions=[action('Send the signed contract')])
+    maya = rows()[0]
+    resolve(new_actions=[action('Confirm the travel plan', contactIdentifier='',
+                                contactName='Alex Kim', loopId=maya['anchor_key'])])
+    current = {row['contact_name']: row for row in rows()}
+    assert current['Maya Chen']['summary'] == 'Send the signed contract'
+    assert current['Alex Kim']['summary'] == 'Confirm the travel plan'
+
+
 def test_named_completion_closes_only_one_obligation():
     proof = [{'sourceType': 'imessage', 'sourceId': '2', 'snippet': 'contract and lunch'}]
     source = message(rowid=2, is_from_me=False, text='Please handle contract and lunch.',
@@ -208,7 +238,8 @@ def test_unsupported_completion_stays_open(mutation):
     else:
         msg['is_group_chat'] = True
         msg['chat_guid'] = 'iMessage;+;group'
-    out = resolve(loop_updates=[update], local={'imessage': [msg]})
+    # Restamp so each mutation is rejected by its own integrity check, not by a stale receipt.
+    out = resolve(loop_updates=[reviewed(update)], local={'imessage': [msg]})
     assert not out['resolved'] and len(out['active']) == 1
 
 

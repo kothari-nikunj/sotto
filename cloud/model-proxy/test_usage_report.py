@@ -17,7 +17,8 @@ def test_metadata_is_content_free_and_unknown_is_explicit(monkeypatch):
                             {'role': 'tool', 'tool_call_id': 'missing', 'content': 'legacy result'}],
                'tools': [{'type': 'function', 'function': {'name': 'knowledge_search'}}]}
     metadata = server.request_metadata({'X-Sotto-Workload': 'interactive\nforged'}, payload, 'chat')
-    assert metadata['workload'] == 'unknown'
+    assert metadata['workload'] == 'chat'  # Route is known even when the optional label is invalid.
+    assert server.request_metadata({}, {}, 'native')['workload'] == 'unknown'
     assert metadata['proxy_deployment'] == 'deploy-a'
     assert metadata['deployment'] == 'unknown'
     assert 'secret' not in json.dumps(metadata)

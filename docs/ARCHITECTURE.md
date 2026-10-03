@@ -38,7 +38,7 @@ the midday digest have their own procedures and share the source, relevance and 
 | Stage | Owner | In one sentence |
 |---|---|---|
 | **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. Two facts it reads that nothing read before (Sep 2026): the stale-sent lane (`gather_stale_sent` — one `in:sent` search plus one `threads.get` per candidate: is the last word on the thread still yours?) and your own answer to each invite (`normalize_event.my_response`). |
-| **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass — and the debts code can see are minted by code beside them (`_stale_debt_actions`, `_rsvp_actions`): an email you sent that nobody answered, an invite you haven't answered that is nearly here. The model's own row for the same thread or event wins. After revision, a deterministic source-backed calendar preview precedes optional loop expansion; the model cannot delete its schedule. |
+| **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass — unanswered sent threads are candidate evidence for the model, never automatically minted debts. `_rsvp_actions` reflects explicit unanswered invitations that are nearly here. The model's own row for the same thread or event wins. After revision, a deterministic source-backed calendar preview precedes optional loop expansion; the model cannot delete its schedule. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Checks structure, identifiers and deterministic obligations; findings guide the critic/revision pass. These checks cannot prove every model judgment correct. |
 | **commit essential memory** | [`_shared/scripts/learn_step.py`](../sotto-chief-of-staff/_shared/scripts/learn_step.py) `--phase essential` | Applies extracted knowledge and merges actions into continuity before returning the brief for delivery. Failure retries these writes against the saved artifact. |
 | **deliver** | `receiver.py` → `outbox.py` → `adapters/hermes/runtime_api.py` | The outbox persists the artifact, checks its due time and current eligibility, then claims the brief marker at the send seam. A missing composed archive cannot claim the day. Structured provider acceptance completes delivery; retrying a known result does not recompose it. |
@@ -62,10 +62,44 @@ text under its email; one it can't is named, never guessed.* Conversion is in-pr
 no hosted OCR, no API key, no env var (see [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md) §
 *Attachments*).
 
+### Meeting reminders use the same stored context
+
+`compose_notification.py` enriches the attendee from the existing person-memory query and
+permitted cached conversation, then uses its existing bounded notification writer. The reminder
+selects one or two useful sentences: where the relationship left off, relevant shared context,
+or a supported commitment. Introductions and meeting purpose are useful when known, not required.
+An old topic is not today's agenda and a stored task is not proof it remains unfinished; the
+writer checks current evidence instead of appending the scanner's task summary verbatim.
+
+The context remains capped at 60 words / 500 characters, followed by the named prep offer. Cached
+mail contributes at most five excerpts; no new source fetch, web research or model stage is added.
+Existing artifact reuse and admission limits remain in place. With insufficient evidence or a
+held/failed writer, the basic identity/time reminder still goes out without an unreviewed task.
+
 ### The open-loop path — input to outcome
 
-This is the complete path for a Granola commitment. It deliberately has one model judgment and
-small deterministic guards around it, rather than a second workflow engine:
+There is one continuity ledger, one shared evidence view, and one existing model pass that can
+propose changes. A loop is a particular obligation with an owner, counterpart, original source and
+revision; a person or conversation can have several. Stored open status is prior bookkeeping,
+not proof that later work never happened.
+
+```text
+Current permitted evidence + prior obligations
+  → bounded gather: retain source IDs, original dates, direction and incomplete coverage
+  → existing brief model: propose a new task or an update to one exact task
+  → existing optional critic: check meaning against bounded original source context
+  → continuity writer: validate task revision, identity, source, time, direction and quote
+  → same ledger: persist accepted changes; preserve unresolved tasks on missing evidence
+  → brief / Loops page / proactive watcher; delivery receipts count actual nudges separately
+```
+
+The model reasons about fulfillment, acknowledgments, promises and changed responsibility; code
+does not look for completion keywords. A new follow-up is separate from the task just completed.
+No reply, elapsed time, or archived email is itself a closure. Explicit user locks remain manual.
+The writer is local, not another model agent; a rejected update leaves a bounded rejection reason
+in the existing learning receipt. Retrying a saved valid brief reuses its artifact and inputs.
+
+Granola commitments enter that same ledger through their existing revision-aware capture path:
 
 ```text
 Granola notes / summary / transcript
@@ -91,15 +125,67 @@ against the gathered meeting: its id exists, the supporting quote was copied, th
 claimed owner, and it contains the obligation's action/deliverable words. Ambiguity drops the
 item instead of opening a loop. Exact occurrence identity handles reruns; the model may suggest at
 most one semantic merge, and code accepts it only if that anchor is live and points in the same
-direction. There is no fuzzy-matching subsystem. New source-backed Granola commitments can close
-only through the existing task-specific, source-message evidence checks; an explicit user lock
-remains manual. An ordinary reply, an old creation date, or the user's own chase cannot silently
-erase either.
+direction. There is no fuzzy-matching subsystem. New source-backed Granola commitments close like
+every other obligation: through a `resolved` loop update that passes the code checks below and that
+the brief's critic reviewed. An explicit user lock remains manual. An ordinary reply, an old
+creation date, or the user's own chase cannot silently erase either.
 
 The same ledger owns every obligation. Separate asks remain separate rows and the brief groups them
-once per person only when rendering. Optional model `loopUpdates` name one ledger ID and revision
+once per person only when rendering.
+Stored open status means the last reconciliation has not closed the task; it is not evidence that
+later work never happened. The brief model evaluates the particular obligation against the
+conversation timeline and may provide a concise `reason` with its evidence-bound update. Code
+checks identity, direction, time and a verbatim quote of at least 12 characters
+(`MIN_EVIDENCE_QUOTE_CHARS`); it keeps no English completion-verb or task-word whitelist. Meaning is
+judged by the critic: a `resolved` update applies only when it carries the `criticReceipt` that
+`compose_brief` stamps after a completed critic pass reviewed that exact update (loop, revision,
+status and evidence), backed by a persisted positive verdict in `events/loop-reviews.json`.
+The public proposal digest alone cannot claim a review. This is application provenance, not a
+security boundary against a process with write access to the volume. A closure the critic skipped, could not run, held, or could not fit in its
+review stays open for the next brief; `waiting` updates do not need the receipt. The brief
+projection and Learn's resolver share this check, so the brief never shows a closure Learn would
+refuse. If a rejected closure remains open, unmarked Already Handled claims are omitted rather
+than guessed by name; independently verified, task-marked completions remain. A reply may fulfill, acknowledge, or defer work; one message can fulfill one task and
+create another. These semantic distinctions belong to contextual reasoning, not keyword-triggered
+closures.
+
+`local_snapshot.resolve_effective_local` resolves live/cached local inputs once before the runner's
+knowledge query and continuity pass. Composition and Learn share that consent-filtered view,
+including original per-source observation times; cached messages are never re-stamped as live.
+Source grants and derived-email dependencies are checked again at consumption and delivery.
+The native daily runner also requests `gather_google --loop-local <effective-local.json>`: a bounded
+sample of active obligations refreshes exact Gmail threads or exact verified counterpart addresses.
+No name search, per-loop model call, or new polling job is used. Group addresses rotate within the
+same target allowance. Snooze, due and rotation days use the ledger's configured local day.
+A messaging handle such as a WhatsApp JID is never a mail address, and drafts, trash and spam are
+never evidence. An obligation whose channel or named origin (Granola, Calendar, Calls, iMessage
+for SMS) is turned off drives no read. Each target records the sources that chose it; revoking one
+drops the rows that target added, while an existing inbox row loses only its loop excerpt. Complete native message bodies can be reused when this gather's thread
+inventory proves every selected message is present; a snippet or one message does not prove a
+whole thread was read. This is in-memory reuse only. Archived targeted replies retain a bounded
+body excerpt and message ID in the prompt, so fetched evidence is usable without treating archive
+status as completion. Any Gmail lane hitting quota stops supplemental loop reads; failures preserve
+earlier successful rows. Its source receipt remains partial: a bounded read never proves absence
+of completion. Hosts using MCP dumps retain supplied evidence without this native refresh.
+
+| Loop reconciliation cost | Bound / reuse |
+|---|---|
+| Added model stages | None. Proposals share extraction and are reviewed inside the existing critic call. In `SOTTO_CRITIC=auto`, a brief proposing any closure of an open task always runs the critic (one call, plus a revision only when it finds issues), so a quiet brief that would have skipped review now costs that call. |
+| Supplemental Gmail | Six targets, ten API requests per fresh composition; no additional lookup on saved-artifact learning or delivery retry. Fresh recomposition uses a new bounded gather. |
+| Added source bodies | At most 24 messages, 2,000 characters each, 48,000 total; these are character limits, not exact token limits. Duplicate message IDs render once. |
+| Critic evidence | At most eight proposed updates (closures first) × two original excerpts, sharing one 16,000-character budget (2,000 per excerpt at most), plus bounded task/quote metadata, inside the existing critic call. A closure past these caps is held for the next brief, not applied. |
+| Time | Stop admitting supplemental reads after 20 seconds; one in-flight HTTP request can run to its normal 30-second timeout. |
+| Storage | Existing temporary brief inputs and ledger/learning receipts only; no new persistent raw-message cache, completion service or state machine. |
+
+Group conversation IDs remain opaque across the ledger, and an email can pay a group obligation
+only when it is addressed to the whole roster: every participant the group's own messages list, each
+through a verified alias. Name similarity cannot join people. Bridge reads and watcher events retain sent group messages without a per-message handle;
+`is_from_me` identifies the author and the chat GUID identifies the conversation. Excluded group
+participants suppress the whole group rather than exposing their message context.
+
+Optional model `loopUpdates` name one ledger ID and revision
 plus a source message ID and verbatim quote; the writer verifies counterpart, direction, original
-timestamp and quote against the snapshot. Generic replies, links, calls, calendar contact, age,
+timestamp and quote against the snapshot, and applies a closure only with its critic review receipt. Generic replies, links, calls, calendar contact, age,
 passed deadlines and unreachable counterparts cannot close or expire an obligation. Something you
 owe that nothing has touched for 14 days may park (`status: parked`, `parked_at`; the clock is
 `ledger_io.last_touch_day`). The composer attaches exact `parking_notice` effects to its warning;
@@ -168,7 +254,11 @@ consumes the attempt. Exhausted jobs are closed while the same claim continues t
 before handoff, so a crash there does not buy another composition. Duplicate queue items retain
 ownership even if a later valve batch groups them differently. Retrying terminal input releases
 only that input's alias; unrelated failed work retains ownership. Raw inputs/results are removed
-from terminal work rows; diagnostic metadata lasts seven days.
+from terminal work rows; diagnostic metadata lasts seven days. Explicit owner brief requests
+retain only their route and label alongside the job until outcome feedback is handed to the
+existing outbox (or is no longer needed), at most the same seven-day retention. The five-second
+work dispatcher reconciles failures, including expiry before a worker starts. It does not run a
+model to report a failure or create a second delivery ledger.
 
 The receiver runs at most two jobs concurrently, with at most one background job. Interactive
 Hermes is a separate supervised process. Due work normally has priority; background work waiting
@@ -429,15 +519,18 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `briefs/<date>.<kind>.payload.json` | receiver | skills (`compose_brief.py`) |
 | `briefs/<date>_<kind>.json` | skills | dashboard; consent-aware item feedback |
 | `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
-| `briefs/<date>.<kind>.learned.json` | skills (`learn_step.py`, phases `essential`, `ancillary`, or legacy `all`) | Receiver diagnostics: per-writer `ok`, `skipped`, `queued` or `failed`; essential and ancillary durable background work may finish after a valid brief is delivered |
+| `briefs/<date>.<kind>.learned.json` | skills (`learn_step.py`, phases `essential`, `ancillary`, or legacy `all`) | Receiver diagnostics: per-writer `ok`, `partial`, `skipped`, `queued` or `failed`, bounded per-item dispositions and input hashes; queued work or rejected proposals cannot masquerade as complete learning |
 | `events/model-work.sqlite3` | shared model_work.py | opaque attempt claims and usage; 90-day pruning on use |
 | `events/notification-artifacts/` | `compose_notification.py`, `capture_commitments.py` | validated notification copy plus persisted per-meeting extraction/apply results and bounded lock shards; seven-day output retention |
 | `events/research-artifacts/` | research_attendees.py | coalesced batch results and bounded lock shards; seven-day output retention |
 | `events/triage-artifacts/` | relevance.py | validated event classifications and bounded lock shards; seven-day output retention |
 | `events/seen.json` | receiver | receiver (idempotency ring — Bridge events, keyed `(source,rowid)`) |
 | `events/gmail_seen.json` | receiver, through `poll_gmail.py --ack` after accepted ingest | skills (`poll_gmail.py`) — version 2 keeps separate inbox/sent fixed query bounds, page cursors and pending page IDs; fetch or receiver failure advances neither lane |
+| `events/loop-reviews.json` | `compose_brief.py` after an explicit positive critic verdict | Shared continuity projection/resolver; at most 512 proposal digests and timestamps, valid for 14 days, pruned on write. No source text; persistent empty lock sidecar |
 | `events/work.sqlite3` | shared `work_queue.py` | receiver workers lease bounded accepted work and retain terminal results |
 | `events/work-inputs/brief-<run>/` | receiver `brief_runner.py` | resumable brief and background learning procedures |
+| `events/learning-diagnostics/brief-<hash>.json` | receiver `brief_runner.py` | bounded rejected-proposal evidence from consented sources only; deleted when its sources are revoked, seven days after first capture, or by `forget.py --receipts`; lock sidecars follow the same window |
+| `events/learning-diagnostics/.consent.lock` | Content-free lock coordinating diagnostic writes, source revocation and forgetting | Retained; contains no source data |
 | `events/usage-<job>.json` | shared model metrics writer | receiver attaches content-free usage to delivery receipts |
 | `events/last.stamp` | receiver | receiver (`/setup` liveness line) |
 | `events/bundle-<random>.json` | receiver | skills (the `sotto-event` one-shot); atomically staged with thread/process-unique names and seven-day cleanup |
@@ -467,13 +560,13 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `knowledge/last_local_snapshot.json` | skills (`compose_brief.py`) | skills — the RAW Bridge payload, overwritten each brief and never deleted; its 24h TTL stops reuse, not storage ([DATA-FLOW.md](DATA-FLOW.md)) |
 | `knowledge/snapshots/<date>.json` | skills (`compose_brief.py` — dated archive copy, last write of the day wins, pruned after 60 days) | `tools/build_golden_corpus.py` — the corpus's message history; one live snapshot only holds ~a day |
 | `corpus/<version>/` | `tools/build_golden_corpus.py` (`--out`; refuses to write on a leak), maintainer Labels route (`/app#labels`, absent from main navigation) (`labels.yaml` only — the owner's judgments) | `evals/run_golden.py` (scoring), maintainer Labels route (`/app#labels`, absent from main navigation). CONFIDENTIAL REGARDLESS — never leaves the volume |
-| `knowledge/relationship_state.json` | skills (`relationship_pulse.py`; accepted candidate-offer stamps through `review_candidates.py`, same JSON lock) | skills (`compose_brief.py`, `triage_event.py`'s Tier-1 sender one-liner — a relationship signal, never the VIP gate, which is the stated list or a typed `family_of` relation), dashboard (the attention queue) |
+| `knowledge/relationship_state.json` | skills (`relationship_pulse.py`; accepted candidate-offer stamps through `review_candidates.py`, same JSON lock) | skills (`compose_brief.py`, `triage_event.py`'s Tier-1 sender one-liner — a relationship signal, never the VIP gate, which is the stated list or a typed `family_of` relation), dashboard (the attention queue; the person page's automatic importance) |
 | `knowledge/<kind>/*.md` · `style.json` · `outcomes.jsonl` | skills | dashboard (read), skills |
 | `logs/compose_brief.log` | skills | receiver (`/debug/brief-log`) |
 | `proactive/<date>.json` | skills (`proactive_scan.py`) | skills (`proactive_scan.py`) — the once-per-day nudge dedup; a read-modify-write, so both producers take `triage_event._locked` on it |
 | `proactive/wake_run.last` | receiver (`handle_proactive_wake`) | receiver — its *mtime* is the sleep→wake throttle, nothing is read from inside it |
 | `proactive/mute_offers.json` | legacy file; no current writer | no current reader — automatic mute offers and their no-op call seam are removed |
-| `proactive/pending_offer.json` | `pending_offer.py`: staged questions become active through post-acceptance `delivery_effects` | Gateway reply resolution uses the delivered question, provider receipt and target. An unmatched reply leaves the offer unchanged; multiple unanswered questions require clarification. An action-bearing offer retains `payload_sha256`, which `google_action.py --offer-bound` must match before acting. |
+| `proactive/pending_offer.json` | `pending_offer.py`: staged questions become active through post-acceptance `delivery_effects` | Gateway reply resolution uses the delivered question, provider receipt and target. An unmatched reply leaves the offer unchanged; transport-scoped short replies select the latest delivered question before the incoming timestamp (a second question accepted near or after the reply makes it ambiguous), exact reply anchors select their message, and ambiguous multi-question messages require clarification. Content-free delivery anchors prevent an expired or consumed latest question from falling back to an older pending offer; anchors are retained only while older actionable offers remain in that chat and pruned on ordinary activation. An action-bearing offer retains `payload_sha256`, which `google_action.py --offer-bound` must match before acting. |
 | `intentions.jsonl` | skills (`schedule_wakeup.py`) | skills (`proactive_scan.py`), dashboard (`/api/cadence`) — append-only one-shot recipes, folded by id; an optional loop anchor cancels the recipe when the loop closes |
 | `hermes/platforms/whatsapp/session/creds.json` | the Hermes gateway (**not** Sotto) | receiver (`_whatsapp_status`) — the positive "this account is linked" probe; `start.sh` (the same file decides whether a redeploy keeps WhatsApp as the channel) |
 | `whatsapp-pairing.txt` · `google-auth-url.txt` | `wa_pair.py` / `start.sh` | receiver |
@@ -997,7 +1090,11 @@ uses row-id keyset cursors and stable source IDs, separate from live watcher cur
 excluded-message page can advance. Gmail uses its actual API page token and the existing token
 builder, with no attachments or writes. Failed reads and wholly invalid extractions keep the old checkpoint; partially valid extractions advance with explicit rejection counts.
 
-`context_learning.py` binds durable facts to supplied message references. Discussions, decisions,
+`context_learning.py` binds durable facts to supplied message references. Model inputs use short,
+page-local `subject_id` values; the writer resolves only exact returned IDs to the original canonical
+identities and checks that every cited reference belongs to that identity. Names, addresses and
+email subject lines are never accepted as substitute IDs. Unknown IDs retain the existing bounded
+retry/parking behavior; a changed extraction contract resumes the unfinished page on an ordinary run. Discussions, decisions,
 commitments and historical asks are not stored; actionable work remains owned by the live ledger. It reviews
 up to 160 direct-message records per page (Gmail pages have up to 100), with at most 1,400 text
 characters per record. Group history contributes to the existing activity/voice readers where
@@ -1203,7 +1300,8 @@ best-effort diagnostics swallow a timeout instead of hanging a brief.
 
 `_shared/scripts/release_one_proof.py` is a read-only operator report over retained files. It owns
 no persistence and makes no model calls. `learn_step.py` stores exact resolver proposal outcomes
-inside the existing `briefs/<date>.<kind>.learned.json` receipt. Unsupported historical correlations
+inside the existing `briefs/<date>.<kind>.learned.json` receipt; the report counts a continuity
+pass marked partial for rejected proposals alongside clean passes. Unsupported historical correlations
 remain unavailable. `compose_brief.py` reads consented history checkpoints for a plain health line.
 
 `relationship_pulse.py` remains the relationship evidence writer. Shared
@@ -1261,3 +1359,27 @@ artifact ID and recipient hash after payload deletion. Render records the permis
 and current owner-channel hash, so a default-channel receipt cannot follow a change of owner.
 No additional store or daemon is introduced. Existing cache retention and forget still own deletion.
 Learn preserves content-free extraction failures; the proof reader adds completed-local-day coverage.
+
+### Evidence review and reply targeting
+
+The existing brief critic returns explicit verdicts keyed by exact loop-proposal digests. Only a
+unique positive verdict for a fully presented proposal can authorize a closure; revision does not
+approve a rejected or changed proposal. `source_context.email_evidence_text` projects Gmail and
+supplemental-source grants for the writer, critic and resolver together.
+
+Dreamer selects bounded groups of equivalent existing IDs in its existing curation call. The graph
+writer retains original archived assertions and independent provenance and leaves human corrections
+active. Confidence and observation counts do not rise during curation. No additional cadence or
+model call is introduced. A group keeps a user correction if present, otherwise its most
+corroborated copy (observation count, then effective confidence), and the model's order only breaks
+ties. Each archived copy records `duplicate_of`, so new evidence for its wording refreshes the kept fact.
+
+Pending offers record their accepted delivery destination and order. The shared lookup supports an
+exact message anchor or a latest-question lookup scoped to transport, chat and incoming timestamp.
+With two questions pending, one accepted within `ACCEPT_SKEW_SECONDS` of the reply or later is ambiguous.
+The Photon adapter keys owner DMs by the owner handle the offer recorded. It carries the metadata
+in the turn's ephemeral `channel_prompt`, so gateway intercepts see the user's exact text. Offer-bound
+actions still claim an exact offer and payload once. The person dashboard reads the shared automatic
+importance classifier locally, without a subprocess, and leaves manual VIP permissions separate.
+Person frontmatter is read with the image's PyYAML safe loader (timestamps stay strings), so wrapped,
+quoted and escaped fact text displays exactly as stored; malformed frontmatter falls back to the tolerant parser.

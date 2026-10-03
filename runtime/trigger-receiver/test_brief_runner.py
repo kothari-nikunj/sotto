@@ -53,6 +53,7 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
             assert json.loads(path('--continuity').read_text())['new_actions'] == [{'summary': 'fixture debt'}]
             assert json.loads(path('--continuity').read_text())['loop_updates'] == [{'loopId': 'fixture', 'status': 'resolved'}]
             assert json.loads(path('--knowledge-out').read_text()) == {'person_updates': []}
+            out = json.dumps({'completion': 'complete', 'ok': True, 'steps': {}})
         return SimpleNamespace(returncode=0, stdout=out, stderr='')
 
     monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
@@ -76,6 +77,7 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
 
 @pytest.fixture
 def procedure(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(PACK / '_shared' / 'lib'))
     import gemini_transport
     monkeypatch.setattr(gemini_transport, 'brief_model_preflight', lambda: None)
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
@@ -109,6 +111,8 @@ def procedure(tmp_path, monkeypatch):
             output('--out', {'attendees': []})
         if name == 'compose_brief.py':
             result = {'brief_text': 'A useful brief', 'actions': [], 'extracted_knowledge': {}}
+        if name == 'learn_step.py':
+            result = {'completion': 'complete', 'ok': True, 'steps': {}}
         if name == 'select_attendees.py':
             result = []
         return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr='')
@@ -116,6 +120,182 @@ def procedure(tmp_path, monkeypatch):
     request = {'pack': str(PACK), 'payload_path': str(payload), 'kind': 'morning',
                'day': '2026-09-08', 'work_key': 'synthetic-brief-generation'}
     return request, state
+
+
+def test_effective_local_handoff_reaches_continuity_and_learning(procedure, monkeypatch):
+    request, _ = procedure
+    original = brief_runner.subprocess.run
+    observed = []
+
+    def invoke(argv, **kwargs):
+        name = Path(argv[1]).name
+        def path(flag):
+            return Path(argv[argv.index(flag) + 1])
+        if name == 'compose_brief.py':
+            assert path('--effective-local-out') == path('--local')
+            local = json.loads(path('--local').read_text())
+            local['contacts'] = [{'name': 'Sarah', 'phones': ['+15551234567']}]
+            local['_source_availability'] = {'contacts': 'unavailable'}
+            local['_source_observed_at'] = {'contacts': '2026-09-07T12:00:00+00:00'}
+            path('--effective-local-out').write_text(json.dumps(local))
+        if name == 'learn_step.py':
+            local = json.loads(path('--local').read_text())
+            continuity = json.loads(path('--continuity').read_text())
+            observed.append((local, continuity['local']))
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert observed
+    assert observed[0][0] == observed[0][1]
+    assert observed[0][0]['contacts'][0]['name'] == 'Sarah'
+    assert observed[0][0]['_source_availability']['contacts'] == 'unavailable'
+
+
+def test_cached_local_is_resolved_before_query_and_loop_resolution(procedure, monkeypatch):
+    request, _ = procedure
+    from datetime import datetime, timedelta, timezone
+    from local_snapshot import _save_local_snapshot
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _save_local_snapshot({'generated_at': old, 'source_status': {'imessage': 'ok'},
+                          'imessage': [{'text': 'cached message', 'handle': '+15551234567'}]})
+    Path(request['payload_path']).write_text('{}')
+    original = brief_runner.subprocess.run
+    seen = []
+
+    def invoke(argv, **kwargs):
+        name = Path(argv[1]).name
+        if name == 'gather_google.py':
+            assert '--loop-local' in argv
+            local = json.loads(Path(argv[argv.index('--loop-local') + 1]).read_text())
+            seen.append(('gather', local))
+        if name == 'knowledge_query.py':
+            local = json.loads(Path(argv[argv.index('--local') + 1]).read_text())
+            seen.append(('query', local))
+        if name == 'continuity_resolve.py' and '--resolve-only' in argv:
+            local = json.loads(Path(argv[-1]).read_text())['local']
+            seen.append(('resolve', local))
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert [name for name, _ in seen] == ['gather', 'query', 'resolve']
+    for _, local in seen:
+        assert local['imessage'][0]['text'] == 'cached message'
+        assert local['_source_availability']['imessage'] == 'unavailable'
+        assert local['_source_observed_at']['imessage'] == old
+
+
+def test_revoked_gmail_is_removed_before_query_and_continuity(procedure, monkeypatch):
+    request, _ = procedure
+    import source_context
+    original_allowed = source_context.allowed
+    revoked = {'gmail': True}
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: revoked['gmail'] if source == 'gmail' else original_allowed(source))
+    original = brief_runner.subprocess.run
+    seen = []
+
+    def invoke(argv, **kwargs):
+        name = Path(argv[1]).name
+        result = original(argv, **kwargs)
+        if name == 'gather_google.py':
+            gmail = Path(argv[argv.index('--gmail-out') + 1])
+            gmail.write_text(json.dumps([{'id': 'older-email', 'body': 'private'}]))
+            # The grant changes after the gather wrote its input but before any model consumer.
+            revoked['gmail'] = False
+        if name == 'knowledge_query.py':
+            seen.append(json.loads(Path(argv[argv.index('--gmail') + 1]).read_text()))
+        if name == 'continuity_resolve.py' and '--resolve-only' in argv:
+            seen.append(json.loads(Path(argv[-1]).read_text())['emails'])
+        if name == 'compose_brief.py':
+            seen.append(json.loads(Path(argv[argv.index('--gmail') + 1]).read_text()))
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert seen == [[], [], []]
+
+
+def test_grant_revocation_during_compose_keeps_consumed_source_for_delivery_gate(procedure, monkeypatch):
+    request, _ = procedure
+    import source_context
+    original_allowed = source_context.allowed
+    revoked = {'calendar': True}
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: revoked['calendar'] if source == 'calendar' else original_allowed(source))
+    original = brief_runner.subprocess.run
+
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if Path(argv[1]).name == 'compose_brief.py':
+            revoked['calendar'] = False
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(RuntimeError, match='source permission changed'):
+        brief_runner.run(request)
+
+
+def test_derived_email_dependency_revocation_blocks_delivery(procedure, monkeypatch):
+    request, _ = procedure
+    Path(request['payload_path']).write_text('{}')
+    import source_context
+    original_allowed = source_context.allowed
+    granted = {'imessage': True}
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: granted['imessage'] if source == 'imessage' else original_allowed(source))
+    original = brief_runner.subprocess.run
+
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'gather_google.py':
+            path = Path(argv[argv.index('--gmail-out') + 1])
+            path.write_text(json.dumps([{'id': 'derived', 'body': 'older context',
+                                         '_loop_context_sources': ['gmail', 'imessage']}]))
+        if name == 'compose_brief.py':
+            granted['imessage'] = False
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(RuntimeError, match='source permission changed'):
+        brief_runner.run(request)
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_calendar_revocation_discards_derived_attendee_research(
+        procedure, tmp_path, monkeypatch, prepared):
+    request, _ = procedure
+    import source_context
+    original_allowed = source_context.allowed
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: False if source == 'calendar' else original_allowed(source))
+    research = {'attendees': [{'name': 'Private Calendar Attendee'}]}
+    if prepared:
+        import time
+        run_key = hashlib.sha256(request['work_key'].encode()).hexdigest()[:24]
+        scratch = tmp_path / 'events/work-inputs' / ('brief-' + run_key)
+        (scratch / 'prepared').mkdir(parents=True)
+        (scratch / 'prepared.json').write_text(json.dumps({'complete': True, 'observed_at': time.time()}))
+        (scratch / 'prepared/research.json').write_text(json.dumps(research))
+        (scratch / 'prepared/x.json').write_text(json.dumps({'attendees': [{'name': 'Private'}]}))
+    else:
+        cache = tmp_path / 'cache'
+        cache.mkdir()
+        (cache / 'research_2026-09-08.json').write_text(json.dumps(research))
+    original = brief_runner.subprocess.run
+    seen = []
+
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == 'compose_brief.py':
+            path = Path(argv[argv.index('--attendee-research') + 1])
+            seen.append(json.loads(path.read_text()))
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert seen == [{'attendees': []}]
 
 
 def test_welcome_read_allowance_leaves_quota_headroom_without_dropping_sent_or_week(procedure):
@@ -159,7 +339,10 @@ def test_budget_denial_precedes_all_fresh_source_access(procedure, monkeypatch, 
 def test_saved_brief_delivery_does_not_need_another_model_allowance(procedure, monkeypatch):
     import gemini_transport
     request, state = procedure
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
     assert brief_runner.run(request) == 'A useful brief'
+    artifacts = list(Path(__import__('os').environ['SOTTO_DATA']).rglob('artifact.json'))
+    assert json.loads(artifacts[0].read_text())['_delivery_run_ids'] == ['a' * 32]
     before = list(state['calls'])
     monkeypatch.setattr(gemini_transport, 'brief_model_preflight',
                         lambda: pytest.fail('saved artifact must remain deliverable'))
@@ -178,6 +361,25 @@ def test_typed_denial_mid_run_only_comes_from_composer(procedure, monkeypatch, f
     def invoke(argv, **kwargs):
         if Path(argv[1]).name == failing_script:
             return SimpleNamespace(returncode=work_queue.MODEL_BUDGET_EXIT, stdout='', stderr='private fixture')
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(expected) as caught:
+        brief_runner.run(request)
+    assert 'private fixture' not in str(caught.value)
+
+
+@pytest.mark.parametrize('failing_script,expected', [
+    ('compose_brief.py', brief_runner.BriefModelAdmissionBusyError),
+    ('gather_google.py', RuntimeError),
+])
+def test_typed_admission_busy_only_comes_from_composer(procedure, monkeypatch, failing_script, expected):
+    import work_queue
+    request, _ = procedure
+    original = brief_runner.subprocess.run
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == failing_script:
+            return SimpleNamespace(returncode=work_queue.MODEL_ADMISSION_BUSY_EXIT,
+                                   stdout='', stderr='private fixture')
         return original(argv, **kwargs)
     monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
     with pytest.raises(expected) as caught:
@@ -288,6 +490,44 @@ def test_preparation_does_optional_work_once_then_current_sources_are_gathered_a
     assert names.index('research_attendees.py') < names.index('compose_brief.py')
 
 
+def test_busy_research_preparation_retries_and_discloses_gap_to_due_brief(
+        procedure, tmp_path, monkeypatch):
+    import work_queue
+    request, state = procedure
+    original = brief_runner.subprocess.run
+    busy = [True]
+    expected_pending = [True]
+    def invoke(argv, **kwargs):
+        name = Path(argv[1]).name
+        if name == 'research_attendees.py' and busy[0]:
+            return SimpleNamespace(returncode=work_queue.MODEL_ADMISSION_BUSY_EXIT,
+                                   stdout='', stderr='private provider response')
+        if name == 'compose_brief.py':
+            research = json.loads(Path(argv[argv.index('--attendee-research') + 1]).read_text())
+            assert (research.get('status') == 'capacity_pending') is expected_pending[0]
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(brief_runner.BriefModelAdmissionBusyError):
+        brief_runner.run({**request, 'prepare': True})
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    assert not (scratch / 'prepared.json').exists()
+    assert json.loads((scratch / 'research-status.json').read_text()) == {'status': 'admission_busy'}
+    assert brief_runner.run(request) == 'A useful brief'
+    assert any(name == 'compose_brief.py' for name, _, _ in state['calls'])
+
+    second = {**request, 'work_key': 'fresh-preparation'}
+    with pytest.raises(brief_runner.BriefModelAdmissionBusyError):
+        brief_runner.run({**second, 'prepare': True})
+    busy[0] = False
+    assert brief_runner.run({**second, 'prepare': True}) == 'NO_NUDGES'
+    fresh_scratch = tmp_path / 'events/work-inputs' / (
+        'brief-' + hashlib.sha256(second['work_key'].encode()).hexdigest()[:24])
+    assert not (fresh_scratch / 'research-status.json').exists()
+    assert json.loads((fresh_scratch / 'prepared.json').read_text())['complete']
+    expected_pending[0] = False
+    assert brief_runner.run(second) == 'A useful brief'
+
+
 def test_managed_granola_capability_allows_scheduled_preparation_gather(
         procedure, tmp_path, monkeypatch):
     request, state = procedure
@@ -306,6 +546,12 @@ def test_managed_granola_capability_allows_scheduled_preparation_gather(
 def test_prepared_x_reaches_brief_and_permission_manifest(procedure, tmp_path, monkeypatch, mode, revoke):
     request, state = procedure
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
+    if mode == 'managed':
+        monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+        (tmp_path / 'config').mkdir(exist_ok=True)
+        (tmp_path / 'config/managed-capabilities.json').write_text(json.dumps({
+            'tenant_id': 'test', 'sources': {
+                'calendar': {'consented': True, 'connected': True}}}))
     monkeypatch.setenv('X_BEARER_TOKEN', 'fixture')
     monkeypatch.delenv('SOTTO_X_STUB', raising=False)
     original = brief_runner.subprocess.run
@@ -623,3 +869,140 @@ def test_generation_body_timeout_is_not_classified_as_contention(tmp_path):
     with pytest.raises(TimeoutError, match='operation timed out'):
         with brief_runner._generation_lock(tmp_path):
             raise TimeoutError('operation timed out')
+
+
+@pytest.mark.parametrize('evidence_source, permission_source, revoke', [
+    ('imessage', 'imessage', False), ('email', 'gmail', False), ('email', 'gmail', True)])
+def test_partial_learning_keeps_only_consent_gated_rejected_evidence_briefly(
+        procedure, tmp_path, monkeypatch, evidence_source, permission_source, revoke):
+    import hashlib
+    request, _state = procedure
+    original = brief_runner.subprocess.run
+    import source_context
+    original_allowed = source_context.allowed
+    revoked = set()
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: source not in revoked and original_allowed(source))
+    proposal = {'loopId': 'synthetic-loop', 'status': 'resolved',
+                'evidence': [{'sourceType': evidence_source, 'sourceId': 'synthetic-1',
+                              'snippet': 'Synthetic evidence snippet'}]}
+
+    def with_partial_learning(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'gather_google.py':
+            Path(argv[argv.index('--gmail-out') + 1]).write_text('[{"id":"synthetic-1"}]')
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            composed = json.loads(result.stdout)
+            composed['loop_updates'] = [proposal]
+            composed['learning_evidence'] = {'accepted': 2, 'rejected': 1}
+            result.stdout = json.dumps(composed)
+        elif name == 'learn_step.py':
+            if revoke:
+                revoked.add(permission_source)
+            continuity = Path(argv[argv.index('--continuity') + 1])
+            staged = json.loads(continuity.read_text())['loop_updates'][0]
+            digest = hashlib.sha256(json.dumps(staged, sort_keys=True, default=str,
+                                  separators=(',', ':')).encode()).hexdigest()[:24]
+            result.stdout = json.dumps({'completion': 'partial', 'ok': True, 'steps': {
+                'continuity': {'status': 'partial', 'proof': {'loop_update_items': {
+                    'accepted': [], 'rejected': [{'index': 0, 'digest': digest,
+                                                  'reason': 'unsupported_evidence'}],
+                    'truncated': 0}}}}})
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', with_partial_learning)
+    assert brief_runner.run({**request, 'work_key': 'synthetic-partial-learning'}) == 'A useful brief'
+    if revoke:
+        assert not list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
+        return
+    path, = list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
+    diagnostic = json.loads(path.read_text())
+    row, = diagnostic['rejected']
+    assert row == {'index': 0, 'digest': row['digest'], 'reason': 'unsupported_evidence',
+                   'source_refs': ['synthetic-1'],
+                   'evidence_snippets': ['Synthetic evidence snippet']}
+    assert path.stat().st_size <= brief_runner.LEARNING_DIAGNOSTIC_MAX_BYTES
+    assert 'Synthetic local context' not in path.read_text()
+    knowledge, = list((tmp_path / 'events/work-inputs').glob('brief-*/current/knowledge_out.json'))
+    learning_evidence = json.loads(knowledge.read_text())['_learning_evidence']
+    assert {key: learning_evidence[key] for key in ('accepted', 'rejected')} == {
+        'accepted': 2, 'rejected': 1}
+    assert learning_evidence['consent'][permission_source] is True
+    assert learning_evidence['consent_checked_at']
+
+
+def _stage_rejected_imessage_proposal(monkeypatch):
+    """Every Learn pass rejects one staged iMessage-evidenced proposal; returns the revoked set."""
+    import source_context
+    original_allowed = source_context.allowed
+    revoked = set()
+    monkeypatch.setattr(source_context, 'allowed',
+                        lambda source: source not in revoked and original_allowed(source))
+    original = brief_runner.subprocess.run
+    proposal = {'loopId': 'synthetic-loop', 'status': 'resolved',
+                'evidence': [{'sourceType': 'imessage', 'sourceId': 'synthetic-1',
+                              'snippet': 'Synthetic evidence snippet'}]}
+
+    def with_partial_learning(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            composed = json.loads(result.stdout)
+            composed['loop_updates'] = [proposal]
+            result.stdout = json.dumps(composed)
+        elif name == 'learn_step.py':
+            continuity = Path(argv[argv.index('--continuity') + 1])
+            staged = json.loads(continuity.read_text())['loop_updates'][0]
+            digest = hashlib.sha256(json.dumps(staged, sort_keys=True, default=str,
+                                  separators=(',', ':')).encode()).hexdigest()[:24]
+            # The merged ancillary receipt carries the essential continuity proof too.
+            result.stdout = json.dumps({'completion': 'partial', 'ok': True, 'steps': {
+                'continuity': {'status': 'partial', 'proof': {'loop_update_items': {
+                    'accepted': [], 'rejected': [{'index': 0, 'digest': digest,
+                                                  'reason': 'unsupported_evidence'}],
+                    'truncated': 0}}}}})
+        return result
+
+    monkeypatch.setattr(brief_runner.subprocess, 'run', with_partial_learning)
+    return revoked
+
+
+def _queued_learning_followup(tmp_path, work_key):
+    import work_queue
+    scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
+    artifact = json.loads((scratch / 'artifact.json').read_text())
+    run_key = hashlib.sha256(work_key.encode()).hexdigest()[:24]
+    job = work_queue.get(str(tmp_path), work_queue.job_id_for(
+        'run', 'brief-learn:' + run_key + ':' + artifact['learning_revision']))
+    return json.loads(job['payload']['prompt'])
+
+
+def test_revoking_the_only_evidence_source_erases_the_earlier_diagnostic(
+        procedure, tmp_path, monkeypatch):
+    request, _state = procedure
+    revoked = _stage_rejected_imessage_proposal(monkeypatch)
+    work_key = 'synthetic-partial-learning'
+    assert brief_runner.run({**request, 'work_key': work_key}) == 'A useful brief'
+    assert list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
+    revoked.add('imessage')   # the user turns iMessage off before the background follow-up
+    assert brief_runner.run(_queued_learning_followup(tmp_path, work_key)) == 'NO_NUDGES'
+    assert not list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
+
+
+def test_followup_rewrite_keeps_the_diagnostics_capture_time(procedure, tmp_path, monkeypatch):
+    import time
+    import retention
+    request, _state = procedure
+    _stage_rejected_imessage_proposal(monkeypatch)
+    work_key = 'synthetic-partial-learning'
+    assert brief_runner.run({**request, 'work_key': work_key}) == 'A useful brief'
+    path, = list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
+    captured = time.time() - 6 * 86400   # evidence captured six days ago
+    path.write_text(json.dumps({**json.loads(path.read_text()), 'created_at': captured}))
+    os.utime(path, (captured, captured))
+    assert brief_runner.run(_queued_learning_followup(tmp_path, work_key)) == 'NO_NUDGES'
+    assert json.loads(path.read_text())['created_at'] == captured
+    assert path.stat().st_mtime == pytest.approx(captured)
+    retention.sweep(now=captured + 8 * 86400)   # day eight after capture
+    assert not path.exists()

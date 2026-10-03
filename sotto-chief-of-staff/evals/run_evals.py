@@ -201,7 +201,9 @@ def run_pipeline(name: str) -> dict:
             also observe whether the critic/revise pass fired (the auto-critic invariant)."""
             if in_.get("_critic"):
                 calls["critic"] = True
-                return json.dumps({"patches": [], "score": 88, "summary": "ok"})
+                return json.dumps({"patches": [], "score": 88, "summary": "ok",
+                    "loop_verdicts": [{"proposal_id": cr.critic_review_receipt(update), "verdict": "approve"}
+                                      for update in stub.get("loop_updates", [])]})
             if in_.get("_revise"):
                 return json.dumps({"brief_markdown": stub.get("brief_markdown", ""),
                                    "actions": stub.get("actions", []),

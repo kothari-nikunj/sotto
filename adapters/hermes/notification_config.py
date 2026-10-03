@@ -6,7 +6,8 @@ import yaml
 
 
 def quiet_display(settings):
-    settings.update(show_reasoning=False, memory_notifications='off')
+    settings.update(show_reasoning=False, memory_notifications='off',
+                    long_running_notifications='generic')
     # Preserve footer field choices, but do not display model/context/path metadata.
     footer = settings.get('runtime_footer')
     settings['runtime_footer'] = {**(footer if isinstance(footer, dict) else {}), 'enabled': False}

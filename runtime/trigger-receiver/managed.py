@@ -69,6 +69,24 @@ def connection_status(data):
             'first_brief': phase}
 
 
+def _newly_disabled(sources, source):
+    """Treat an absent legacy consent row as unknown, so the first deny clears old evidence."""
+    previous = sources.get(source)
+    return not isinstance(previous, dict) or previous.get('consented') is not False
+
+
+def _purge_learning_diagnostics(data):
+    """Receiver-side half of the shared diagnostic consent lock protocol."""
+    from connectors import file_lock
+    directory = Path(data) / 'events/learning-diagnostics'
+    if not directory.exists():
+        return
+    with file_lock(str(directory / '.consent')):
+        for path in directory.glob('brief-*.json'):
+            with file_lock(str(path)):
+                path.unlink(missing_ok=True)
+
+
 def record_google_consent(data, scopes):
     """Called only after the setup-authenticated receiver completes Google OAuth.
 
@@ -81,6 +99,7 @@ def record_google_consent(data, scopes):
     if isinstance(scopes, str):
         scopes = scopes.split()
     path = str(Path(data) / 'config/managed-capabilities.json')
+    revoked = False
     with json_transaction(path, default={}) as state:
         tenant = os.environ['SOTTO_TENANT_ID']
         if state.get('tenant_id') != tenant:
@@ -94,7 +113,10 @@ def record_google_consent(data, scopes):
         }
         for source, accepted in grants.items():
             granted = any('https://www.googleapis.com/auth/' + scope in scopes for scope in accepted)
+            revoked |= not granted and _newly_disabled(sources, source)
             sources[source] = {'consented': granted, 'connected': granted}
+    if revoked:
+        _purge_learning_diagnostics(data)
 
 
 MANAGED_CONNECTOR_SOURCES = frozenset({'granola'})
@@ -113,13 +135,18 @@ def record_connector_consent(data, service, connected):
     if service not in MANAGED_CONNECTOR_SOURCES or not isinstance(connected, bool):
         raise ValueError('Invalid managed connector source')
     path = str(Path(data) / 'config/managed-capabilities.json')
+    revoked = False
     with json_transaction(path, default={}) as state:
         tenant = os.environ['SOTTO_TENANT_ID']
         if state.get('tenant_id') != tenant:
             state.clear()
         state['tenant_id'] = tenant
-        state.setdefault('sources', {})[service] = {
+        sources = state.setdefault('sources', {})
+        revoked = not connected and _newly_disabled(sources, service)
+        sources[service] = {
             'consented': connected, 'connected': connected}
+    if revoked:
+        _purge_learning_diagnostics(data)
 
 
 def reconcile_connector_capabilities(data, statuses):
@@ -180,6 +207,7 @@ def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=F
             or not all(isinstance(s, str) for s in enabled_sources + connected_sources)
             or set(enabled_sources) - allowed or set(connected_sources) - set(enabled_sources)):
         raise ValueError('Invalid local source consent')
+    revoked = False
     with json_transaction(str(Path(data) / 'config/managed-capabilities.json'), default={}) as state:
         if state.get('tenant_id') != os.environ['SOTTO_TENANT_ID']:
             state.clear()
@@ -190,8 +218,11 @@ def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=F
         sources = state.setdefault('sources', {})
         for source in allowed:
             consented = source in enabled_sources
+            revoked |= not consented and _newly_disabled(sources, source)
             connected = consented and (source in connected_sources or sources.get(source, {}).get('connected') is True)
             sources[source] = {'consented': consented, 'connected': connected}
+    if revoked:
+        _purge_learning_diagnostics(data)
 
 
 def notice_pending(data):

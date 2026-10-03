@@ -47,15 +47,51 @@ def test_attempts_survive_reload_and_changed_evidence_can_run(tmp_path, monkeypa
     assert b'private' not in (tmp_path / 'events/model-work.sqlite3').read_bytes()
 
 
-def test_invalid_request_parks_immediately(tmp_path, monkeypatch):
+@pytest.mark.parametrize('status', [400, 413, 422])
+def test_invalid_request_parks_immediately(tmp_path, monkeypatch, status):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     def reject(*a, **kw):
-        raise HTTPError('https://provider', 400, 'bad shape', {}, io.BytesIO())
+        raise HTTPError('https://provider', status, 'bad shape', {}, io.BytesIO())
     monkeypatch.setattr(gemini, '_gemini_once', reject)
     with model_work.scope('memory_extract', 'page'), pytest.raises(HTTPError):
         gemini.model_once('gemini', 'gemini-3.8-flash', 'key', 'prompt')
     with model_work.scope('memory_extract', 'page'), pytest.raises(model_work.ModelWorkHeldError):
         gemini.model_once('gemini', 'gemini-3.8-flash', 'key', 'prompt')
+
+
+def test_proxy_admission_refusals_do_not_spend_model_attempts(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    url = 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent'
+    for _ in range(3):
+        with model_work.scope('memory_extract', 'same evidence'), pytest.raises(HTTPError):
+            with model_work.attempt('gemini', 'gemini-3.8-flash', 'prompt'):
+                raise HTTPError(url, 429, 'busy', {'X-Sotto-Admission': 'busy'}, io.BytesIO())
+    with model_work.scope('memory_extract', 'same evidence'):
+        with model_work.attempt('gemini', 'gemini-3.8-flash', 'prompt'):
+            pass
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert [row[0] for row in db.execute('SELECT status FROM attempts ORDER BY attempt')] == [
+            'admission_busy', 'admission_busy', 'admission_busy', 'succeeded']
+
+
+def test_ordinary_upstream_429_still_spends_brief_attempt_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    url = 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent'
+    attempts = model_work.POLICIES['brief_extract'].attempts
+    for _ in range(attempts):
+        with model_work.scope('brief_extract', 'same evidence'), pytest.raises(HTTPError):
+            with model_work.attempt('gemini', 'gemini-3.8-flash', 'prompt'):
+                raise HTTPError(url, 429, 'quota', {}, io.BytesIO(b'private body'))
+    with model_work.scope('brief_extract', 'same evidence'), pytest.raises(model_work.ModelWorkHeldError):
+        with model_work.attempt('gemini', 'gemini-3.8-flash', 'prompt'):
+            pytest.fail('provider 429 was improperly refunded')
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert [row[0] for row in db.execute('SELECT status FROM attempts ORDER BY attempt')] == [
+            'http_429'] * attempts
 
 
 def test_model_request_policy_and_metadata(tmp_path, monkeypatch):

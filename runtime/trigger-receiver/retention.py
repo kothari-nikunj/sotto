@@ -19,7 +19,8 @@ path, not per rule, so a typo'd glob cannot reach the memory either.
 Three policies, because three cover every family:
 
   * `DELETE_OLDER` — the file goes when it is older than N days. A filename carrying a
-    `YYYY-MM-DD` is read as the file's own age claim; everything else falls back to mtime.
+    `YYYY-MM-DD` is read as the file's own age claim; everything else falls back to mtime. A
+    `<file>.lock` sidecar is kept while the file it guards still exists.
   * `DROP_LINES_OLDER` — a JSONL ledger is rewritten without the lines whose `ts` is older than N
     days, atomically (tmp → `os.replace`, through `connectors.write_text`).
   * `TRUNCATE_TAIL` — a log is cut to its last N bytes IN PLACE. In place, not unlinked: a brief
@@ -183,6 +184,10 @@ SWEEP = (
          "validated notification copy survives retries for seven days"),
     Rule("events/research-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
          "research batch results coalesce retries; canonical profiles keep their existing freshness"),
+    Rule("events/learning-diagnostics/*.json", DELETE_OLDER, STAGED_DAYS,
+         "bounded rejected-learning evidence is kept only for the seven-day retry and diagnosis window"),
+    Rule("events/learning-diagnostics/*.json.lock", DELETE_OLDER, STAGED_DAYS,
+         "a diagnostic's content-free lock sidecar goes after its diagnostic, once the window has passed"),
     Rule("events/delivery.jsonl", DROP_LINES_OLDER, DELIVERY_RECEIPT_DAYS,
          f"a delivery receipt older than {DELIVERY_RECEIPT_DAYS} days has outlived every question "
          "it answers"),
@@ -237,6 +242,8 @@ SWEEP = (
 )
 
 EXEMPT = (
+    Exempt("events/learning-diagnostics/.consent.lock",
+           "empty persistent gate; deleting it could split revocation and writer lock owners"),
     Exempt("events/triage-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
     Exempt("events/model-work.sqlite3*", "model_work prunes opaque attempt records after 90 days on use"),
     Exempt("events/notification-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
@@ -391,6 +398,8 @@ def _line_is_young(line: str, cutoff: str) -> bool:
 def _apply_delete(path: str, days: int, now: float) -> int:
     if _age_days(path, now) <= days:
         return 0
+    if path.endswith(".lock") and os.path.exists(path[:-len(".lock")]):
+        return 0   # a `<file>.lock` sidecar goes only after the file it guards
     os.remove(path)
     return 1
 
@@ -463,19 +472,31 @@ def sweep(now: float | None = None) -> dict:
     root = _root()
     now = time.time() if now is None else now
     swept, errors = [], []
+    diagnostic_dir = os.path.join(root, "events", "learning-diagnostics")
     for rule in SWEEP:
-        for path in sorted(_glob.glob(os.path.join(root, *rule.pattern.split("/")))):
-            if not os.path.isfile(path):
-                continue
-            rel = os.path.relpath(path, root).replace(os.sep, "/")
-            if protected(rel):   # unreachable by construction; the guard is the point
-                errors.append({"path": rel, "error": "protected: this is memory, not exhaust"})
-                continue
-            try:
-                n = _APPLY[rule.policy](path, rule.amount, now)
-            except (OSError, ValueError, UnicodeDecodeError) as e:
-                errors.append({"path": rel, "error": f"{type(e).__name__}: {e}"})
-                continue
-            if n:
-                swept.append({"path": rel, "policy": rule.policy, "amount": n})
+        # A diagnostic writer takes this gate before its per-file lock and final consent check.
+        # Include glob enumeration: an in-flight writer can create the file while the sweep waits.
+        diagnostic = rule.pattern.startswith("events/learning-diagnostics/")
+        gate = (HOOKS["jsonl_lock"](os.path.join(diagnostic_dir, ".consent"))
+                if diagnostic and os.path.isdir(diagnostic_dir) else _contextlib.nullcontext())
+        try:
+            with gate:
+                for path in sorted(_glob.glob(os.path.join(root, *rule.pattern.split("/")))):
+                    if not os.path.isfile(path):
+                        continue
+                    rel = os.path.relpath(path, root).replace(os.sep, "/")
+                    if protected(rel):   # unreachable by construction; the guard is the point
+                        errors.append({"path": rel, "error": "protected: this is memory, not exhaust"})
+                        continue
+                    try:
+                        n = _APPLY[rule.policy](path, rule.amount, now)
+                    except (OSError, ValueError, UnicodeDecodeError) as e:
+                        errors.append({"path": rel, "error": f"{type(e).__name__}: {e}"})
+                        continue
+                    if n:
+                        swept.append({"path": rel, "policy": rule.policy, "amount": n})
+        except OSError as e:
+            errors.append({"path": ("events/learning-diagnostics/.consent.lock"
+                                    if diagnostic else rule.pattern),
+                           "error": f"{type(e).__name__}: {e}"})
     return {"data_root": root, "swept": swept, "count": len(swept), "errors": errors}

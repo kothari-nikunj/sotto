@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
 import urllib.error
@@ -32,6 +33,18 @@ CALL_ALLOWANCE_CENTS = 200
 LEASE_SECONDS = 30 * 86400
 RATE_WINDOW_SECONDS = 60
 REQUESTS_PER_WINDOW = 60
+# Keep room for due briefs and owner chat while routine ingestion catches up.
+BACKGROUND_REQUESTS_PER_WINDOW = 48
+MAX_ACTIVE_CALLS = 8
+MAX_ACTIVE_BACKGROUND_CALLS = 5
+ACTIVE_LEASE_SECONDS = 360  # longer than the upstream request ceiling
+INPUT_CHARS_PER_WINDOW = 12_000_000
+BACKGROUND_INPUT_CHARS_PER_WINDOW = 6_000_000
+# One tenant may use at most three quarters of a shared request or concurrency limit, so another
+# tenant's chat and due brief always keep room on the single provider key.
+TENANT_SHARE_PERCENT = 75
+FOREGROUND_WORKLOADS = frozenset({'brief', 'brief_extract', 'brief_critic',
+                                  'brief_revise', 'chat', 'meeting_prep'})
 # Verified 2026-09-06: https://ai.google.dev/gemini-api/docs/latest-model?hl=en
 # Introductory standard API prices through 2026-12-31; no future-price assumption.
 PRICING_START = 1788307200  # 2026-09-02 UTC
@@ -175,11 +188,13 @@ def request_metadata(headers, payload, lane, tenant=None):
         ('parent_operation_id', 'X-Sotto-Parent-Operation', r'[a-f0-9]{64}'),
         ('run_id', 'X-Sotto-Run', r'[a-f0-9]{32}'),
         ('attempt', 'X-Sotto-Attempt', r'[1-9][0-9]{0,3}'),
+        ('session_id', 'X-Sotto-Session', r'[A-Za-z0-9._-]{1,96}'),
+        ('job_id', 'X-Sotto-Job', r'[A-Za-z0-9._-]{1,96}'),
     ):
         value = headers.get(header, '')
         if re.fullmatch(pattern, value):
             result[name] = value
-    result.setdefault('workload', 'unknown')
+    result.setdefault('workload', 'chat' if lane == 'chat' else 'unknown')
     tenant = tenant or {}
     result['application'] = tenant.get('application', 'sotto')
     result['deployment'] = tenant.get('deployment', 'unknown')
@@ -198,15 +213,26 @@ def request_metadata(headers, payload, lane, tenant=None):
         result['context_chars'] = {'instructions': len(json.dumps(payload.get('systemInstruction') or {})),
                                    'evidence': len(json.dumps(payload.get('contents') or [])),
                                    'schema': len(json.dumps((payload.get('generationConfig') or {}).get('responseSchema') or {}))}
+    # Admission must include tool-call arguments, native tool definitions, and any future
+    # request fields as well as the diagnostic component breakdown. Over-counting a small
+    # amount of envelope/configuration is safer than leaving unmeasured model input.
+    result['input_chars'] = len(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
     return result
 
 
 class RateLimitError(RuntimeError):
-    pass
+    def __init__(self, reason, retry_after=60):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
 
 
 class AuthenticationError(RuntimeError):
     pass
+
+
+class RequestTooLargeError(ValueError):
+    """No ledger state could ever admit this request; waiting cannot help."""
 
 
 def unique_object(pairs):
@@ -226,14 +252,16 @@ class Ledger:
             db.execute('CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, route TEXT, '
                        'model TEXT, created REAL, allowance INTEGER NOT NULL, status INTEGER, input_tokens INTEGER, output_tokens INTEGER)')
             columns = {row[1] for row in db.execute('PRAGMA table_info(calls)')}
-            for column in ('usage_json', 'metadata_json'):
+            for column in ('usage_json', 'metadata_json', 'active_until'):
                 if column not in columns:
-                    db.execute(f'ALTER TABLE calls ADD COLUMN {column} TEXT')
+                    db.execute(f'ALTER TABLE calls ADD COLUMN {column} {"REAL" if column == "active_until" else "TEXT"}')
             db.execute('CREATE INDEX IF NOT EXISTS calls_tenant_created ON calls(tenant,created)')
+            db.execute('CREATE INDEX IF NOT EXISTS calls_created ON calls(created)')
+            db.execute('CREATE INDEX IF NOT EXISTS calls_active_until ON calls(active_until) '
+                       'WHERE active_until IS NOT NULL')
             db.execute('CREATE TABLE IF NOT EXISTS model_leases (tenant TEXT NOT NULL, token_hash TEXT NOT NULL, '
                        'expires REAL NOT NULL, PRIMARY KEY(tenant,token_hash))')
             db.execute('CREATE TABLE IF NOT EXISTS proxy_migrations (name TEXT PRIMARY KEY, applied REAL NOT NULL)')
-
             # Backfill only receipted chat attempts, idempotently. Failed, interrupted,
             # unknown-usage and legacy native calls keep the original reservation. Record the
             # migration so a growing metering ledger is not scanned on every process restart.
@@ -282,18 +310,67 @@ class Ledger:
                         or not hmac.compare_digest(grant['token_sha256'], digest)
                         or self._expiry(db, grant) <= now):
                     raise AuthenticationError('tenant credential expired or revoked')
-            recent = db.execute('SELECT COUNT(*) FROM calls WHERE tenant=? AND created>?',
-                                (tenant, now - RATE_WINDOW_SECONDS)).fetchone()[0]
-            if recent >= REQUESTS_PER_WINDOW:
-                raise RateLimitError('tenant request rate exceeded')
+            metadata = metadata or {}
+            foreground = metadata.get('workload') in FOREGROUND_WORKLOADS or (
+                route == 'chat' and metadata.get('workload') in (None, 'unknown'))
+            def background(item):
+                lane, labels = item
+                return (labels.get('workload') not in FOREGROUND_WORKLOADS
+                        and not (lane == 'chat' and labels.get('workload') in (None, 'unknown')))
+            input_chars = metadata.get('input_chars', 0)
+            if type(input_chars) is not int or input_chars < 0:
+                input_chars = 0
+            def cap(limit, scoped):
+                return limit if not scoped else max(1, limit * TENANT_SHARE_PERCENT // 100)
+            tenant_input_limit = cap(INPUT_CHARS_PER_WINDOW if foreground
+                                     else BACKGROUND_INPUT_CHARS_PER_WINDOW, True)
+            if input_chars > tenant_input_limit:
+                raise RequestTooLargeError('request input exceeds the per-window volume limit')
+            # Check both the owner and the shared upstream credential pool. Every
+            # configured tenant uses this proxy process's single provider key.
+            for scope in (tenant, None):
+                where = 'tenant=? AND ' if scope is not None else ''
+                params = (scope, now - RATE_WINDOW_SECONDS, now) if scope is not None else (
+                    now - RATE_WINDOW_SECONDS, now)
+                rows = db.execute('SELECT route,created,metadata_json,active_until FROM calls WHERE ' + where +
+                                  '(created>? OR active_until>?)', params).fetchall()
+                window = [(row[0], json.loads(row[2] or '{}')) for row in rows
+                          if row[1] > now - RATE_WINDOW_SECONDS]
+                active = [(row[0], json.loads(row[2] or '{}')) for row in rows
+                          if row[3] is not None and row[3] > now]
+                label = 'tenant' if scope is not None else 'shared provider'
+                scoped = scope is not None
+                if len(window) >= cap(REQUESTS_PER_WINDOW, scoped) or (
+                        not foreground and sum(background(item) for item in window) >= cap(BACKGROUND_REQUESTS_PER_WINDOW, scoped)):
+                    raise RateLimitError(f'{label} request rate exceeded', 45 + secrets.randbelow(16))
+                if len(active) >= cap(MAX_ACTIVE_CALLS, scoped) or (
+                        not foreground and sum(background(item) for item in active) >= cap(MAX_ACTIVE_BACKGROUND_CALLS, scoped)):
+                    raise RateLimitError(f'{label} concurrent calls busy', 3 + secrets.randbelow(5))
+                window_chars = sum(item[1].get('input_chars', 0) for item in window)
+                background_chars = sum(item[1].get('input_chars', 0) for item in window if background(item))
+                if window_chars + input_chars > cap(INPUT_CHARS_PER_WINDOW, scoped) or (
+                        not foreground and background_chars + input_chars
+                        > cap(BACKGROUND_INPUT_CHARS_PER_WINDOW, scoped)):
+                    raise RateLimitError(f'{label} input volume busy', 45 + secrets.randbelow(16))
             used = db.execute('SELECT COALESCE(SUM(allowance),0) FROM calls WHERE tenant=?', (tenant,)).fetchone()[0]
             if budget is not None and used + CALL_ALLOWANCE_CENTS > budget:
                 raise PermissionError('tenant request budget exhausted')
             cursor = db.execute('INSERT INTO calls(tenant,route,model,created,allowance) VALUES(?,?,?,?,?)',
                                 (tenant, route, model, time.time(), CALL_ALLOWANCE_CENTS))
             db.execute('UPDATE calls SET metadata_json=? WHERE id=?',
-                       (json.dumps(metadata or {}), cursor.lastrowid))
+                       (json.dumps(metadata), cursor.lastrowid))
+            db.execute('UPDATE calls SET active_until=? WHERE id=?',
+                       (now + ACTIVE_LEASE_SECONDS, cursor.lastrowid))
             return cursor.lastrowid
+
+    def release(self, call):
+        with self.connect() as db:
+            db.execute('UPDATE calls SET active_until=NULL WHERE id=?', (call,))
+
+    def renew_active(self, call):
+        with self.connect() as db:
+            db.execute('UPDATE calls SET active_until=? WHERE id=? AND active_until IS NOT NULL',
+                       (time.time() + ACTIVE_LEASE_SECONDS, call))
 
     def finish(self, call, status, usage, *, proven_native_text=False,
                native_text_request_eligible=None, native_text_response_eligible=None):
@@ -340,6 +417,7 @@ class Ledger:
             db.execute('UPDATE calls SET usage_json=? WHERE id=?', (json.dumps(counts), call))
             if row:
                 db.execute('UPDATE calls SET allowance=? WHERE id=?', (allowance, call))
+            db.execute('UPDATE calls SET active_until=NULL WHERE id=?', (call,))
 
     def budget_capability(self, tenant, budget):
         with self.connect() as db:
@@ -389,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def respond(self, status, body):
+    def respond(self, status, body, *, retry_after=None):
         raw = json.dumps(body).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
@@ -397,7 +475,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('Connection', 'close')
         if status == 429:
-            self.send_header('Retry-After', str(RATE_WINDOW_SECONDS))
+            self.send_header('Retry-After', str(retry_after or RATE_WINDOW_SECONDS))
+            self.send_header('X-Sotto-Admission', 'busy')
         self.close_connection = True
         self.end_headers()
         self.wfile.write(raw)
@@ -452,13 +531,28 @@ class Handler(BaseHTTPRequestHandler):
                                                   {k: tenant.get(k) for k in ('application', 'deployment')}))
         except AuthenticationError:
             return self.respond(401, {'error': 'unauthorized'})
-        except RateLimitError:
-            return self.respond(429, {'error': {'code': 'sotto_rate_limited', 'message': 'Tenant model requests are busy; retry shortly.'}})
+        except RateLimitError as error:
+            return self.respond(429, {'error': {'code': 'sotto_rate_limited', 'message': 'Tenant model requests are busy; retry shortly.',
+                                               'reason': error.reason}}, retry_after=error.retry_after)
+        except RequestTooLargeError:
+            return self.respond(413, {'error': {'code': 'sotto_request_too_large',
+                                                'message': 'This model request is larger than one window allows; retrying will not help.'}})
         except PermissionError:
             return self.respond(402, {'error': {'code': 'sotto_budget_exhausted', 'type': 'budget_exhausted',
                                               'message': 'Sotto pilot model allowance reached; waiting will not reset it.'}})
         except (ValueError, TypeError, AttributeError):
             return self.respond(400, {'error': 'invalid model request'})
+        try:
+            return self._forward(call, lane, endpoint, raw, text_request)
+        finally:
+            # Also covers a disconnected client or an unexpected response parser error.
+            # The metering row remains reserved; only the concurrency slot is released.
+            try:
+                self.server.ledger.release(call)
+            except sqlite3.Error:
+                pass
+
+    def _forward(self, call, lane, endpoint, raw, text_request):
         headers = {'Content-Type': 'application/json', 'Accept-Encoding': 'identity'}
         headers['x-goog-api-key' if lane == 'native' else 'Authorization'] = (
             self.server.upstream_key if lane == 'native' else 'Bearer ' + self.server.upstream_key)
@@ -492,8 +586,15 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             captured = bytearray()
             complete_capture = True
+            last_active_renewal = time.time()
             try:
                 while chunk := response.read1(65536):
+                    if time.time() - last_active_renewal >= 60:
+                        try:
+                            self.server.ledger.renew_active(call)
+                        except sqlite3.Error:
+                            pass  # metering failure must not interrupt the upstream reply
+                        last_active_renewal = time.time()
                     available = MAX_BODY - len(captured)
                     if len(chunk) > available:
                         complete_capture = False

@@ -161,20 +161,29 @@ def _remaining(deadline: float) -> int:
     return max(1, int(deadline - time.monotonic()))
 
 
+class ResearchAdmissionBusyError(RuntimeError):
+    """Unbilled research capacity contention left a batch unanswered."""
+
+
 def _first_answer(capability: str, attempt) -> tuple:
     """Walk the chain; return (answer, provider) from the first provider that produces one. A
     provider that raises or returns nothing falls through to the next — the same degrade the
     pipeline already applies to a broken source. Nothing left → (None, "")."""
+    admission_busy = False
     for name in provider_chain(capability):
         try:
             out = attempt(name)
         except Exception as e:  # noqa: BLE001 — a dead provider is a fallthrough, not a failure
+            if capability == 'deep_research' and gemini_transport.proxy_admission_busy(e):
+                admission_busy = True
             _diag(f"[web_research] {capability} via {name} failed: "
                   f"{type(e).__name__}: {str(e)[:120]}")
             continue
         if out:
             return out, name
         _diag(f"[web_research] {capability} via {name} returned nothing — trying the next provider")
+    if admission_busy:
+        raise ResearchAdmissionBusyError('research model admission busy')
     return None, ""
 
 

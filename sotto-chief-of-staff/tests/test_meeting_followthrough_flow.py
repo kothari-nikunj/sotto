@@ -16,6 +16,11 @@ import meeting_context
 from delivery_effects import loop_version
 
 
+def reviewed(update):
+    """The receipt compose_brief stamps once a completed critic pass reviewed this closure."""
+    return {**update, 'criticReceipt': resolver.record_critic_approval(update)}
+
+
 def test_notes_to_prep_to_specific_fulfillment_once(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
@@ -53,9 +58,30 @@ def test_notes_to_prep_to_specific_fulfillment_once(tmp_path, monkeypatch):
                       {'email': 'dana@acme.com', 'displayName': 'Dana'}]}]}})
     assert 'send Dana the deck' in context and '[you owe]' in context
 
+    fulfilled = {'id': 'sent-deck', 'threadId': 'dana-thread', 'isSent': True,
+                 'to': 'dana@acme.com', 'date': '2026-09-19T11:00:00Z',
+                 'body': 'Here is the deck I promised.'}
+    proof = {'loopId': anchor, 'loopVersion': loop_version(row), 'status': 'resolved',
+             'evidence': [{'sourceType': 'email', 'sourceId': fulfilled['id'],
+                           'snippet': fulfilled['body']}]}
+    revoked = resolver.resolve({'today': '2026-09-19', 'emails': [fulfilled],
+                                'loop_updates': [reviewed(proof)]},
+                               datetime(2026, 9, 19, 12), resolve_existing=False)
+    assert any(item['anchor_key'] == anchor for item in revoked['active'])
+
+    # The meeting capture needed Granola; this fulfillment phase reads sent Gmail evidence.
+    # Keep the source permitted so an unrelated message tests task fulfillment, not consent.
+    monkeypatch.setattr(capture.source_context, 'allowed',
+                        lambda source: source in ('granola', 'gmail'))
     unrelated = {'id': 'sent-unrelated', 'threadId': 'dana-thread', 'isSent': True,
                  'to': 'dana@acme.com', 'date': '2026-09-19T10:00:00Z',
                  'body': 'Thanks for lunch yesterday.'}
+    still_open = resolver.resolve({'today': '2026-09-19', 'emails': [unrelated],
+                                   'loop_updates': []},
+                                  datetime(2026, 9, 19, 12), resolve_existing=False)
+    assert any(item['anchor_key'] == anchor for item in still_open['active'])
+    # A model proposal quoting the unrelated message passes identity, direction, time and quote
+    # checks, so only the critic can judge it; with no critic review receipt it stays open.
     invalid_update = {'loopId': anchor, 'loopVersion': loop_version(row), 'status': 'resolved',
                       'evidence': [{'sourceType': 'email', 'sourceId': unrelated['id'],
                                     'snippet': unrelated['body']}]}
@@ -64,19 +90,16 @@ def test_notes_to_prep_to_specific_fulfillment_once(tmp_path, monkeypatch):
                                   datetime(2026, 9, 19, 12), resolve_existing=False)
     assert any(item['anchor_key'] == anchor for item in still_open['active'])
 
-    fulfilled = {'id': 'sent-deck', 'threadId': 'dana-thread', 'isSent': True,
-                 'to': 'dana@acme.com', 'date': '2026-09-19T11:00:00Z',
-                 'body': 'Here is the deck I promised.'}
     current = resolver._load_items()[anchor]
     update = {'loopId': anchor, 'loopVersion': loop_version(current), 'status': 'resolved',
               'evidence': [{'sourceType': 'email', 'sourceId': 'sent-deck',
                             'snippet': 'Here is the deck I promised.'}]}
     closed = resolver.resolve({'today': '2026-09-19', 'emails': [fulfilled],
-                               'loop_updates': [update]},
+                               'loop_updates': [reviewed(update)]},
                               datetime(2026, 9, 19, 12), resolve_existing=False)
     assert [item['anchor_key'] for item in closed['resolved']] == [anchor]
     replay = resolver.resolve({'today': '2026-09-19', 'emails': [fulfilled],
-                               'loop_updates': [update]},
+                               'loop_updates': [reviewed(update)]},
                               datetime(2026, 9, 19, 12), resolve_existing=False)
     assert replay['resolved'] == [] and resolver._load_items()[anchor]['status'] == 'resolved'
 

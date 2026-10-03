@@ -13,9 +13,12 @@ one on file, and a set racing a get can't hand the gateway a torn half-question.
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
+import time
+import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -477,3 +480,172 @@ def test_start_sh_still_parses():
     p = subprocess.run(["bash", "-n", os.path.join(HERMES, "adapters", "hermes", "start.sh")],
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr[-2000:]
+
+
+def test_latest_answer_is_chat_scoped_but_tapback_keeps_exact_older_question(tmp_path, monkeypatch):
+    path = _data(tmp_path, monkeypatch)
+    base = po.set_offer('meeting_prep', 'Want the prep?', person='Alex')
+    rows = [{**base, 'offer_id': 'old', 'message_id': 'm1', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 10},
+            {**base, 'offer_id': 'new', 'message_id': 'm2', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 20},
+            {**base, 'offer_id': 'other', 'message_id': 'm3', 'target': 'photon',
+             'chat_id': 'other-chat', 'accepted_at': 30}]
+    with open(path, 'w') as f:
+        json.dump({'offers': rows}, f)
+    scope = {'target': 'photon', 'chat_id': 'owner'}
+    assert po.get_offer(latest=True, **scope)['offer_id'] == 'new'
+    assert po.get_offer(latest=True, before=25, **scope)['offer_id'] == 'new'
+    # A reply stamped before `new` settled may answer it: never fall back to `old`.
+    assert po.get_offer(latest=True, before=15, **scope)['ambiguous']
+    assert po.get_offer(message_id='m1', latest=True, **scope)['offer_id'] == 'old'
+    assert po.get_offer(message_id='missing', latest=True, **scope) == {}
+    assert po.get_offer(message_id='m3', **scope) == {}
+    assert po.get_offer(latest=True)['ambiguous']
+    rows.append({**rows[1], 'offer_id': 'second-in-message', 'accepted_at': 21})
+    with open(path, 'w') as f:
+        json.dump({'offers': rows}, f)
+    assert po.get_offer(latest=True, **scope)['ambiguous']
+
+
+def test_delayed_activation_keeps_the_destination_at_offer_time(tmp_path, monkeypatch):
+    _data(tmp_path, monkeypatch)
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'original-owner')
+    offer = po.set_offer('meeting_prep', 'Want the prep?')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'different-owner')
+    po.activate_offer(offer, {'target': 'photon', 'message_id': 'm1', 'accepted_at': 10})
+    assert po.get_offer(latest=True, target='photon', chat_id='original-owner')['offer_id'] == offer['offer_id']
+    assert po.get_offer(latest=True, target='photon', chat_id='different-owner') == {}
+
+
+@pytest.mark.parametrize('before', [1004.0, 1007.0, 1010.0])
+def test_a_reply_near_a_newer_question_is_ambiguous_not_the_older_one(tmp_path, monkeypatch, before):
+    """accepted_at (receiver clock, after `hermes send` returns) and the reply timestamp (provider
+    clock) differ: a reply before, or within ACCEPT_SKEW_SECONDS after, B settled may answer B."""
+    path = _data(tmp_path, monkeypatch)
+    base = po.set_offer('meeting_prep', 'Want prep?')
+    rows = [{**base, 'offer_id': 'A', 'person': 'Alex', 'message_id': 'm1', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 1000.0},
+            {**base, 'offer_id': 'B', 'person': 'Bob', 'message_id': 'm2', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 1006.0}]
+    with open(path, 'w') as f:
+        json.dump({'offers': rows}, f)
+    scope = {'latest': True, 'target': 'photon', 'chat_id': 'owner'}
+    assert po.get_offer(before=before, **scope)['ambiguous']
+    assert po.get_offer(before=1006.0 + po.ACCEPT_SKEW_SECONDS + 1, **scope)['offer_id'] == 'B'
+    assert po.dismiss_reply('no', before=before, **scope)['action'] == 'clarify'
+    with open(path, 'w') as f:
+        json.dump({'offers': rows[1:]}, f)
+    assert po.get_offer(before=1004.0, **scope)['offer_id'] == 'B'  # the only question, just settled
+    assert po.get_offer(before=900.0, **scope) == {}  # a reply long before any question answers none
+
+
+def test_scoped_decline_clears_only_the_latest_question(tmp_path, monkeypatch):
+    path = _data(tmp_path, monkeypatch)
+    base = po.set_offer('meeting_prep', 'Want prep?')
+    rows = [{**base, 'offer_id': oid, 'person': person, 'message_id': oid, 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': at} for oid, person, at in (('A', 'Alex', 10), ('B', 'Bob', 20))]
+    with open(path, 'w') as f:
+        json.dump({'offers': rows}, f)
+    assert json.loads(_cli(tmp_path, 'dismiss-reply', '--text', 'no'))['action'] == 'clarify'
+    result = json.loads(_cli(tmp_path, 'dismiss-reply', '--text', 'no', '--latest', '--target',
+                             'photon', '--chat-id', 'owner', '--before', '100'))
+    assert result['action'] == 'declined' and result['person'] == 'Bob' and result['offer_cleared']
+    assert json.loads(_cli(tmp_path, 'get'))['person'] == 'Alex'
+
+
+def test_photon_offer_is_found_by_the_owner_dm_reply_context(tmp_path, monkeypatch):
+    """Real path: staged offer -> send.py receipt -> delivery_effects.finalize -> the Photon
+    adapter's reply_context for an upstream inbound DM, whose chat_id is the sidecar space id."""
+    owner = '+15551234567'
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
+    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
+    monkeypatch.setenv('PHOTON_HOME_CHANNEL', owner)
+    offer = po.set_offer('meeting_prep', QUESTION, person='Shivani')
+    fake = tmp_path / 'bin'
+    fake.mkdir()
+    (fake / 'hermes').write_text('#!/bin/sh\ncat >/dev/null\n'
+                                 'echo \'{"success": true, "message_id": "msg-1"}\'\n')
+    (fake / 'hermes').chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake}{os.pathsep}{os.environ["PATH"]}')
+    send = _load('sotto_send_offer_test', os.path.join(HERMES, 'adapters', 'hermes', 'send.py'))
+    photon = _load('sotto_photon_offer_test',
+                   os.path.join(HERMES, 'adapters', 'hermes', 'sotto_photon', '__init__.py'))
+    ok, _, receipt = send.send_receipt(QUESTION, 'photon')
+    assert ok
+    import delivery_effects  # noqa: PLC0415 — on sys.path once pending_offer is loaded
+    assert delivery_effects.finalize([{'kind': 'pending_offer', 'offer': offer}],
+                                     {**receipt, 'accepted_at': time.time()})
+
+    def context(text, **extra):
+        source = types.SimpleNamespace(chat_id='any;-;' + owner, user_id=owner, chat_type='dm')
+        event = types.SimpleNamespace(text=text, source=source, message_id='in-1',
+                                      timestamp=datetime.now(timezone.utc), **extra)
+        out = photon.reply_context(event)
+        assert out.text == text
+        return json.loads(re.search(r'\[Sotto transport reply context: (\{.*\})\]',
+                                    out.channel_prompt).group(1))
+
+    ctx = context('Sure')
+    assert ctx['chat_id'] == owner
+    got = po.get_offer(latest=True, target=ctx['target'], chat_id=ctx['chat_id'], before=ctx['before'])
+    assert got['offer_id'] == offer['offer_id']
+    ctx = context('reaction:added:👍', reply_to_message_id='msg-1')
+    got = po.get_offer(message_id=ctx['reply_to_message_id'], target=ctx['target'], chat_id=ctx['chat_id'])
+    assert got['offer_id'] == offer['offer_id']
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize('finished', ['expired', 'claimed', 'declined'])
+def test_latest_finished_question_never_authorizes_an_older_offer(tmp_path, monkeypatch, finished):
+    path = _data(tmp_path, monkeypatch)
+    base = po.set_offer('meeting_prep', 'Want prep?', action='send', payload_sha256='a' * 64)
+    older = {**base, 'offer_id': 'old', 'message_id': 'm-old', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 10}
+    newer = {**base, 'offer_id': 'new', 'message_id': 'm-new', 'target': 'photon',
+             'chat_id': 'owner', 'accepted_at': 20}
+    if finished == 'expired':
+        newer['expires_at'] = (po._now() - timedelta(minutes=1)).isoformat()
+    with open(path, 'w') as f:
+        json.dump({'offers': [older, newer]}, f)
+    if finished == 'claimed':
+        assert po.claim_offer('new', 'send', 'a' * 64)[0]['offer_id'] == 'new'
+    elif finished == 'declined':
+        assert po.clear_offer(expected=newer)
+    scope = {'latest': True, 'target': 'photon', 'chat_id': 'owner', 'before': 100}
+    assert po.get_offer(**scope) == {}
+    # The older question is still available through its exact reply anchor.
+    assert po.get_offer(message_id='m-old', target='photon', chat_id='owner')['offer_id'] == 'old'
+    # An unrelated chat receiving another question must not erase the barrier.
+    po.activate_offer({**base, 'offer_id': 'other'}, {'target': 'photon', 'chat_id': 'other',
+                      'message_id': 'm-other', 'accepted_at': 30})
+    assert po.get_offer(**scope) == {}
+    stored = json.load(open(path))['offers']
+    barrier = next(o for o in stored if o['offer_id'] == 'new')
+    assert not {'question', 'detail', 'person', 'payload_sha256', 'action'} & barrier.keys()
+    po.activate_offer({**base, 'offer_id': 'next'}, {'target': 'photon', 'chat_id': 'owner',
+                      'message_id': 'm-next', 'accepted_at': 40})
+    assert po.get_offer(**scope)['offer_id'] == 'next'
+
+
+def test_delivery_barriers_prune_after_older_offers_expire(tmp_path, monkeypatch):
+    path = _data(tmp_path, monkeypatch)
+    base = po.set_offer('meeting_prep', 'Want prep?')
+    expired = {**base, 'offer_id': 'old', 'message_id': 'm-old', 'target': 'photon',
+               'chat_id': 'owner', 'accepted_at': 10,
+               'expires_at': (po._now() - timedelta(minutes=1)).isoformat()}
+    barrier = po._delivery_anchor({**expired, 'offer_id': 'barrier', 'accepted_at': 20})
+    with open(path, 'w') as f:
+        json.dump({'offers': [expired, barrier]}, f)
+    po.activate_offer({**base, 'offer_id': 'next'}, {'target': 'photon', 'chat_id': 'other',
+                      'message_id': 'm-next', 'accepted_at': 40})
+    assert [o['offer_id'] for o in json.load(open(path))['offers']] == ['next']

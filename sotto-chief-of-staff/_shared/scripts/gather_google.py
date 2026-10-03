@@ -67,11 +67,11 @@ BODY_FETCH_WORKERS = 5   # concurrent full-body fetches, each with its own clien
 SENT_MAX = 15            # sent messages fetched per daily gather
 SENT_BODIES = 10         # of those, how many get a full-body fetch (snippets are too thin to learn voice from)
 
-# Stale sent lane (roadmap, Sep 2026): "you emailed them four days ago and got nothing" — an email
-# you sent that nobody answered is a debt owed to you. One `in:sent` search over a bounded window,
-# then one threads.get per candidate thread to ask the only question that matters: is the LAST
-# message on the thread still yours? Rows go to the gmail payload as `stale_threads`; compose_brief
-# filters them to people you know and mints the waiting_on debts deterministically.
+# Stale sent lane (roadmap, Sep 2026): "you emailed them four days ago and got nothing". One
+# `in:sent` search over a bounded window, then one threads.get per candidate thread to ask: is the
+# LAST message on the thread still yours? Rows go to the gmail payload as `stale_threads`. Silence
+# alone is context, not a debt: the brief model may propose a waiting_on only for a specific
+# outstanding request or deliverable, with its evidence.
 STALE_SILENT_DAYS = 3        # silent this long → stale (the same clock the chase lane uses)
 STALE_MAX_DAYS = 14          # …and no older: two weeks of silence is a dead thread, not a debt
 STALE_MAX_THREADS = 20       # threads.get calls per gather, newest first
@@ -225,6 +225,7 @@ def normalize_email(it: dict, full: dict) -> dict:
         "threadId": _pick(it, "threadId", "thread_id") or _pick(full, "threadId", "thread_id"),
         "from": _addr_str(_pick(full, "from", "sender", "from_address") or _pick(it, "from", "sender")),
         "to": _addr_str(_pick(full, "to", "recipient") or _pick(it, "to", "recipient")),
+        "cc": _addr_str(_pick(full, "cc") or _pick(it, "cc")),
         "subject": _pick(full, "subject", "title") or _pick(it, "subject", "title") or "",
         "date": _pick(full, "date", "internalDate", "received_at") or _pick(it, "date", "internalDate", "received_at") or "",
         "snippet": _pick(it, "snippet", "preview", "body_preview") or _pick(full, "snippet", "preview") or "",
@@ -480,6 +481,9 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
         if not isinstance(it, dict):
             continue
         e = normalize_email(it, full.get(it.get("id"), {}))
+        # Only a native MIME read proves this is a complete body, not a search snippet.
+        if isinstance((full.get(it.get('id')) or {}).get('payload'), dict):
+            e['_body_complete'] = True
         got = atts.get(it.get("id"))
         if got:
             e["attachments"] = got
@@ -689,6 +693,7 @@ def gather_stale_sent(api, service=None, now=None) -> list:
                 close()
     result = GmailRows(stale_from_threads(rows, threads, now))
     result.rate_limited = rate_limited
+    result.threads = threads  # current-gather inventory only; never serialized or cached on disk
     return result
 
 
@@ -951,6 +956,7 @@ def main():
     ap.add_argument("--gmail-out", default="/tmp/sotto_gmail.json")
     ap.add_argument("--cal-out", default="/tmp/sotto_cal.json")
     ap.add_argument("--source-results-out", help="write per-source status/completeness receipts beside legacy arrays")
+    ap.add_argument("--loop-local", help="effective local snapshot for bounded open-obligation evidence refresh")
     ap.add_argument("--max", type=int, default=40)
     ap.add_argument("--bodies", type=int, default=12)
     ap.add_argument("--window-days", dest="window_days", type=int, default=1,
@@ -1060,6 +1066,8 @@ def main():
 
     api = _find_google_api()
     emails, sent, events, stale, err = [], [], [], [], None
+    loop_emails, loop_receipt = [], None
+    gmail_rate_limited = False  # bound even when the inbox gate and the loop gate disagree
     if not api:
         err = ("google_api.py not found — the google-workspace CLI isn't this host's Google path. "
                "FALLBACK: fetch Gmail (newer_than:1d), sent mail (in:sent newer_than:1d) + Calendar "
@@ -1073,7 +1081,6 @@ def main():
         except Exception as e:  # noqa: BLE001 — both sources keep their "unavailable" receipt
             api, err = None, f"google token: {e}"
         if api and not a.skip_gmail and allowed('gmail'):
-            gmail_rate_limited = False
             try:
                 emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
                 capped = (getattr(emails, 'capped') if isinstance(emails, GmailRows)
@@ -1106,12 +1113,38 @@ def main():
             if not gmail_rate_limited and not a.skip_stale and a.window_days <= 1:
                 try:
                     stale = gather_stale_sent(api)
-                    if getattr(stale, 'rate_limited', False):
+                    gmail_rate_limited = getattr(stale, 'rate_limited', False)
+                    if gmail_rate_limited:
                         mark_gmail_lane_rate_limited()
                 except Exception as e:  # noqa: BLE001
                     err = (err + f"; stale: {e}") if err else f"stale: {e}"
-                    if _source_error(e) == 'rate_limited':
+                    gmail_rate_limited = _source_error(e) == 'rate_limited'
+                    if gmail_rate_limited:
                         mark_gmail_lane_rate_limited()
+        if (api and a.loop_local and not a.skip_gmail and allowed('gmail')
+                and not gmail_rate_limited):
+            # Read evidence, never infer completion here. The same merged rows go to both the
+            # brief model and its evidence validator. Nothing is persisted outside usual inputs.
+            try:
+                import ledger_io
+                import loop_context
+                from source_context import project_local
+                with open(a.loop_local, encoding='utf-8') as handle:
+                    loop_local = project_local(json.load(handle))
+                loops = ledger_io.load_active()
+                if loops:
+                    service = _gmail_service()
+                    try:
+                        loop_emails, loop_receipt = loop_context.refresh(
+                            loops, loop_local, service, normalize_email, allowed=allowed,
+                            known_messages=[*emails, *sent], known_threads=getattr(stale, 'threads', {}),
+                            classify_error=_source_error)
+                    finally:
+                        service.close()
+                    if loop_receipt.get('error') == 'rate_limited':
+                        mark_gmail_lane_rate_limited()
+            except Exception:  # optional context never costs the main gather or exposes source text
+                loop_receipt = {'status': 'unavailable', 'error': 'read_failed', 'complete': False}
         if api and not a.skip_calendar and allowed('calendar'):
             try:
                 observation = {}
@@ -1128,9 +1161,15 @@ def main():
         if not allowed(source):
             source_results[source] = source_result('disabled')
             if source == 'gmail':
-                emails, sent, stale = [], [], []
+                emails, sent, stale, loop_emails = [], [], [], []
+                loop_receipt = {"status": "disabled", "complete": False}
             else:
                 events = []
+    if loop_receipt and not all(allowed(source) for source in loop_receipt.get('sources', ['gmail'])):
+        loop_emails = []
+        loop_receipt.update(status='disabled', messages=0)
+    if loop_receipt is not None:
+        source_results['gmail']['loop_context'] = loop_receipt
     write_source_results()
 
     # Email-window honesty: any inbox search hitting its per-query cap may have more results.
@@ -1144,6 +1183,10 @@ def main():
                              (getattr(emails, 'capped') if isinstance(emails, GmailRows)
                               else len(emails) >= a.max)) else None
     emails = merge_sent(emails, sent)
+    # Prefer richer recent rows on collision; the extra lane only fills missing evidence.
+    if loop_emails:
+        from loop_context import merge_context
+        emails = merge_context(emails, loop_emails)
     n_sent = sum(1 for e in emails if e.get("isSent"))
     if truncated_at or stale:
         gmail_payload = {"emails": emails}

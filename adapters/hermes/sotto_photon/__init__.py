@@ -1,16 +1,176 @@
 """Shared Sotto Photon behavior with additional managed tenant guards."""
 import asyncio
+import copy
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
 BUDGET_NOTICE = ("This account has reached its usage allowance. "
                  "The account owner needs to review the limit before I can continue.")
 TYPING_START_DELAY_SECONDS = 2.0
+BRIEF_UNAVAILABLE = ("I couldn't confirm your brief request. It may still arrive; "
+                     "please check before asking again.")
+BRIEF_PENDING_DELIVERY = ("An earlier brief may still be on its way. "
+                          "I'll wait for its delivery status before starting another.")
+BRIEF_OTHER_NOT_PROCESSED = (" I didn't process the other request in your message. "
+                             "Please send it separately.")
+BRIEF_REPLAY_OTHER = ("I already have this brief request. I can't confirm the other "
+                      "part here; if it's still needed, send that separately.")
+
+
+def reply_context(event):
+    """Attach transport metadata for short answers as this turn's ephemeral system prompt.
+
+    Hermes matches approval words, clarify digits, slash confirmations and restart coercion on the
+    exact `event.text`, so the user's words are never changed. `channel_prompt` is applied at API
+    call time for this turn only and is never persisted to the transcript.
+    """
+    text = str(getattr(event, 'text', '') or '')
+    reply_id = getattr(event, 'reply_to_message_id', None)
+    if not text.strip() or text.startswith('/') or len(text.split()) > 5 or len(text) > 80:
+        return event
+    source = getattr(event, 'source', None)
+    chat_id = getattr(source, 'chat_id', None)
+    stamp = getattr(event, 'timestamp', None)
+    if not chat_id or not hasattr(stamp, 'timestamp'):
+        return event
+    # Detached offers record the owner's handle; the inbound DM arrives under its space id.
+    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    if owner and ((getattr(source, 'chat_type', None) == 'dm'
+                   and getattr(source, 'user_id', None) == owner) or owner_destination(chat_id)):
+        chat_id = owner
+    metadata = {'target': 'photon', 'chat_id': chat_id, 'before': min(stamp.timestamp(), time.time())}
+    if reply_id:
+        metadata['reply_to_message_id'] = reply_id
+    note = '[Sotto transport reply context: ' + json.dumps(metadata) + ']'
+    result = copy.copy(event)
+    result.channel_prompt = '\n\n'.join(p for p in (getattr(event, 'channel_prompt', None), note) if p)
+    return result
+
+
+def brief_request(event):
+    """Recognize a complete, unbound owner request."""
+    if (getattr(event, 'media_urls', None) or getattr(event, 'reply_to_message_id', None)
+            or getattr(event, 'reply_to_text', None)):
+        return None
+    text = ' '.join(str(getattr(event, 'text', '') or '').split())
+    if len(text) > 120 or re.search(r'["“”‘]|(?<!\w)[\x27’]|[\x27’](?!\w)', text):
+        return None
+    match = re.fullmatch(
+        r'(?:please\s+)?(?:(?:(?:can|could|would)\s+you|(?:can|could)\s+i)\s+)?'
+        r'(?:give|send|show|get)\s+(?:me\s+)?(?:my|the)\s+'
+        r'(?:(morning|evening)\s+)?brief(?:\s+again)?(?:,?\s+please)?[?.!]*', text, re.I)
+    if match:
+        return {'kind': (match.group(1) or 'auto').lower(), 'refresh': False}
+    match = re.fullmatch(
+        r'(?:please\s+)?(?:i\s+would|i\x27d|i’d)\s+like\s+(?:my|the)\s+'
+        r'(?:(morning|evening)\s+)?brief(?:,?\s+please)?[?.!]*', text, re.I)
+    if match:
+        return {'kind': (match.group(1) or 'auto').lower(), 'refresh': False}
+    match = re.fullmatch(
+        r'(?:please\s+)?(?:refresh|update)\s+(?:my|the)\s+'
+        r'(?:(morning|evening)\s+)?brief[?.!]*', text, re.I)
+    if match:
+        return {'kind': (match.group(1) or 'auto').lower(), 'refresh': True}
+    return None
+
+
+def brief_turn(event):
+    """Extract at most one explicit brief command and one independent chat clause.
+
+    A quoted, replied-to, attached, negated, or ambiguous request stays intact for
+    ordinary conversation. This deliberately does not infer intent from a mention
+    of the word "brief" inside a broader sentence.
+    """
+    text = ' '.join(str(getattr(event, 'text', '') or '').split())
+    if (len(text) > 400 or getattr(event, 'media_urls', None)
+            or getattr(event, 'reply_to_message_id', None) or getattr(event, 'reply_to_text', None)
+            or re.search(r'["“”‘]|(?<!\w)[\x27’]|[\x27’](?!\w)|\b(?:don[\x27’]t|do not|never|without|instead of)\b', text, re.I)):
+        return None
+    request = brief_request(event)
+    if request:
+        return request, None
+    clauses = re.split(r'\s*,?\s+and\s+', text, maxsplit=2, flags=re.I)
+    if len(clauses) != 2:
+        return None
+    matches = []
+    for clause in clauses:
+        candidate = copy.copy(event)
+        candidate.text = clause
+        matches.append(brief_request(candidate))
+    if sum(request is not None for request in matches) != 1:
+        return None
+    brief_index = 0 if matches[0] else 1
+    remainder = clauses[1 - brief_index].strip()
+    # Require an independent command or question, not a dangling object such as
+    # "and a summary" that may modify the brief request itself.
+    if not re.match(
+        r'(?:please\s+)?(?:tell|explain|text|send|draft|write|remind|schedule|'
+        r'look|find|check|summarize|show|give|update|what|when|where|who|how|why|'
+        r'can|could|would|is|are|do|does|did)\b', remainder, re.I):
+        return None
+    if re.search(r'\b(?:it|this|that|them|those|brief)\b', remainder, re.I):
+        return None
+    return matches[brief_index], remainder
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+def _brief_receiver_config():
+    """Read Hermes' process-private MCP binding, never a persisted config or arbitrary URL."""
+    try:
+        from tools.mcp_tool_config import _load_mcp_config  # noqa: PLC0415 - optional pinned runtime
+        entry = _load_mcp_config().get('sotto-local')
+        port = os.environ.get('PORT', '8787')
+        if not isinstance(entry, dict) or not port.isdecimal() or not 1 <= int(port) <= 65535:
+            return None
+        origin = f'http://127.0.0.1:{port}'
+        if entry.get('url') != origin + '/mcp':
+            return None
+        headers = entry.get('headers')
+        if (not isinstance(headers, dict) or not isinstance(headers.get('X-Sotto-Chat-Send'), str)
+                or not headers['X-Sotto-Chat-Send']):
+            return False  # Bound receiver, but private admission is unavailable.
+        return origin, headers
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return None
+
+
+def _admit_brief(config, payload):
+    """One bounded loopback attempt. An uncertain response is never retried here."""
+    origin, headers = config
+    request = urllib.request.Request(origin + '/chat/brief',
+        data=json.dumps(payload, separators=(',', ':')).encode(),
+        headers={**headers, 'Content-Type': 'application/json'}, method='POST')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(request, timeout=10) as response:
+            if response.status not in (200, 202):
+                return None
+            result = json.loads(response.read(4097))
+            if not isinstance(result, dict):
+                return None
+            if result.get('status') == 'queued' and isinstance(result.get('request_id'), str):
+                return 'queued'
+            if result.get('status') == 'needs_context':
+                return 'needs_context'
+            if result.get('status') == 'pending_delivery':
+                return 'pending_delivery'
+            if result.get('status') == 'known_request':
+                return 'known_request'
+    except (OSError, ValueError, TypeError, urllib.error.URLError):
+        pass
+    return None
 
 
 def missing_download_link(event):
@@ -261,10 +421,48 @@ def register(ctx):
                 # The public helper preselects exactly one owner. Keep the same
                 # authenticated DM receipt in self-host mode for setup status.
                 record_owner_activation(event.source)
+            parsed = brief_turn(event)
+            request, remainder = parsed if parsed else (None, None)
+            source = getattr(event, 'source', None)
+            owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+            if (request and restricted_allowlist() and os.environ.get('PHOTON_ALLOWED_USERS') == owner
+                    and permits(source, owner)
+                    and (not managed() or owner_destination(source.chat_id))):
+                config = _brief_receiver_config()
+                if config is not None:
+                    message_id = getattr(event, 'message_id', None)
+                    if not isinstance(message_id, str) or not message_id:
+                        status = None  # No stable replay identity: do not admit or improvise.
+                    else:
+                        payload = {**request, 'message_id': message_id, 'owner': owner,
+                                   'chat_id': source.chat_id}
+                        status = await asyncio.to_thread(_admit_brief, config, payload) if config else None
+                    if status == 'known_request':
+                        if remainder:
+                            return await self.send(source.chat_id, BRIEF_REPLAY_OTHER,
+                                                   reply_to=message_id)
+                        return  # Gateway redelivery: the original request already owns its outcome.
+                    if status == 'queued':
+                        kind = request['kind'] if request['kind'] != 'auto' else 'daily'
+                        notice = f"Your {kind} brief is queued."
+                    elif status == 'needs_context':
+                        notice = "I need a connected source before I can prepare your brief."
+                    elif status == 'pending_delivery':
+                        notice = BRIEF_PENDING_DELIVERY
+                    else:
+                        notice = BRIEF_UNAVAILABLE
+                    if remainder and status != 'queued':
+                        notice += BRIEF_OTHER_NOT_PROCESSED
+                    await self.send(source.chat_id, notice, reply_to=message_id)
+                    if remainder and status == 'queued':
+                        chat_event = copy.copy(event)
+                        chat_event.text = remainder
+                        return await super().handle_message(chat_event)
+                    return
             if managed() and missing_download_link(event):
                 return await self.send(event.source.chat_id, "Send me the link you want saved as a PDF.",
                                        reply_to=getattr(event, 'message_id', None))
-            return await super().handle_message(event)
+            return await super().handle_message(reply_context(event))
 
     async def owner_send(config, chat_id, message, **kwargs):
         if managed() and not owner_destination(chat_id):

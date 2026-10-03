@@ -78,9 +78,12 @@ def _fact_text(f: kg.FactMeta, now: datetime) -> str:
     the text, so they arrive pre-labeled. Any OTHER fact that is low-confidence — an LLM extraction
     scored 0.5-0.69, or one whose confidence decayed — would otherwise pack as a bare assertion;
     label it so the brief never presents an unverified fact as ground truth."""
+    text = f.text
     if kg.effective_confidence(f, now) < LOW_CONFIDENCE and not f.text.startswith("Per web search"):
-        return f.text + " (unverified)"
-    return f.text
+        text += " (unverified)"
+    if kg.provenance_state(f) == "reference_unavailable":
+        text += " (source reference unavailable)"
+    return text
 
 
 def _topic_words(value: str) -> set[str]:

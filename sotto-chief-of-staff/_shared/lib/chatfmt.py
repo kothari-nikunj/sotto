@@ -37,6 +37,13 @@ _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _HRULE_RE = re.compile(r"^\s{0,3}([-*_])\s*(?:\1\s*){2,}$", re.M)
 
 
+def _label_emphasis(text):
+    """Repair padding inside an explicit leading label, not arbitrary stars in prose/code."""
+    return re.sub(r"^([ \t]*(?:[-•][ \t]+)?)(\*{1,2})([^*\n]+?)\2"
+                  r"(?=[ \t]*(?::|[—–-][ \t]|$))",
+                  lambda m: m[1] + m[2] + m[3].strip() + m[2], text, flags=re.M)
+
+
 def _s(v) -> str:
     return v if isinstance(v, str) else ("" if v is None else str(v))
 
@@ -54,7 +61,7 @@ def to_chat(text) -> str:
     t = strip_invalid_links(prose_punctuation(_s(text)))
     t = _MARKER_RE.sub("", t)
     t = _HEADING_RE.sub(lambda m: f"*{m.group(1)}*", t)
-    t = _BOLD_RE.sub(r"*\1*", t)
+    t = _BOLD_RE.sub(r"*\1*", _label_emphasis(t))
     t = _HRULE_RE.sub("", t)
     t = re.sub(r"[ \t]+$", "", t, flags=re.M)     # trailing space the marker strip leaves
     t = re.sub(r"\n{3,}", "\n\n", t)
@@ -97,6 +104,7 @@ def to_imessage(text, *, normalize_style=True) -> str:
     t = _HRULE_RE.sub("", t)
     t = re.sub(r"^[ \t]*```[^\n]*$", "", t, flags=re.M)
     t = re.sub(r"^[ \t]*(?:>[ \t]*)+", "", t, flags=re.M)
+    t = _label_emphasis(t)
     # Boundary checks keep URLs, snake_case identifiers and arithmetic intact.
     for marker in (r"\*\*", r"__", r"\*", r"_", r"~~", r"`"):
         t = re.sub(rf"(?<![\w/]){marker}(\S(?:[^\n]*?\S)?){marker}(?!\w)", r"\1", t)

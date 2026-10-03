@@ -26,6 +26,7 @@ import action_links  # noqa: E402
 import loops_query  # noqa: E402
 import style_apply  # noqa: E402
 from source_context import allowed  # noqa: E402
+from textutil import _normalize_identifier  # noqa: E402
 from timeutil import parse_observed_time, _parse_ts  # noqa: E402
 
 MAX_CONTEXT_CHARS = 48000
@@ -62,10 +63,17 @@ For lead birthday offers suggest a gift only from supplied interests/preferences
 Do not invent a person's interests. For escalation lead with the supplied cross-channel fact.
 For calendar changes state only the evidenced change/conflict. Removal is not proof of cancellation,
 and a request to reschedule is not a new confirmed time. No headers, bullet lists or signoffs.
-For meeting_prep, text is ONLY one or two short sentences of personal context: who introduced
-the people (and each link in the introduction chain when explicit), what prompted THIS meeting,
-or a relevant last exchange. Prioritize the introduction and the reason for meeting. Use only
-the supplied memory, invitation and dated thread excerpts. Excerpts are partial; never use an
+For meeting_prep, make the reminder useful even when the owner never requests full prep.
+Write one or two short sentences selecting the most useful personal context from supplied memory,
+the invitation and dated conversation: where the relationship left off, a relevant development or
+shared interest, what prompted THIS meeting, or a commitment supported by current evidence.
+An introduction is useful when it explains the relationship, not a required opening. Established
+relationships need not have an introduction or a known agenda to have useful context. Prefer a
+concrete conversational foothold over a biography or a generic suggestion to catch up. Do not fill
+space when only a title/company is known. Use dates when supplied and useful; never invent a date,
+call an old fact recent, or imply that an earlier discussion is today's agenda. Open items are prior
+bookkeeping: check later evidence before saying something is still owed; a completed commitment
+can be useful relationship context without reopening it. Excerpts are partial; never use an
 excerpt's silence as proof that something did not happen. Only excerpts marked event_thread can
 prove the invitation or introduction chain; recent_background is background, not proof of this
 meeting's purpose. A null from_me means neither owner
@@ -73,8 +81,9 @@ nor attendee authorship is established; use sender_name if supplied, never attri
 An organizer is not necessarily an
 introducer; a previous discussion is not automatically today's agenda. Do not infer a purpose
 from someone's job, company, or a generic calendar title. Never turn tentative plans or disputed
-memory into settled facts. Do not repeat the person's role, countdown or open items: code adds
-those plus the prep offer. Do not offer research, ask questions or write replies. Leave draft
+memory into settled facts. Do not repeat the person's role or countdown: code adds those plus the
+prep offer. Include at most one relevant commitment within your context, never a separate list.
+Do not offer research, ask questions or write replies. Leave draft
 and decline empty. Return no items if there is no useful grounded context. At most 60 words and
 500 characters.
 Match the provided writing samples. Drafts are text for review, never actions to execute."""
@@ -223,10 +232,13 @@ def enrich(items, now):
         calendar = None
     for item in items:
         ident, person = item.get('identifier', ''), item.get('person', '')
-        participant_ids = {a.get('email', '').casefold() for a in (item.get('event') or {}).get('attendees', [])}
-        item['open_loops'] = [r for r in loops if (ident and r['identifier'] == ident)
-                              or (r['identifier'] and r['identifier'].casefold() in participant_ids)
-                              or (person and r['name'].casefold() == person.casefold())]
+        known = {_normalize_identifier(i) for i in (ident, *(a.get('email', '') for a in (item.get('event') or {}).get('attendees', [])))}
+        known.discard('')
+        # A shared first name is not an identity: when both sides carry an identifier they must
+        # match; the name is the join only when one side has no identifier at all.
+        item['open_loops'] = [r for r in loops if (_normalize_identifier(r['identifier']) in known
+                                                   if r['identifier'] and known else
+                                                   bool(person) and r['name'].casefold() == person.casefold())]
         if item.get('anchor_key') and not any(r['anchor_key'] == item['anchor_key'] for r in loops):
             item['resolved'] = True
         event = item.get('event') or {}
@@ -280,8 +292,6 @@ def _template(item, now, prep_context=''):
                 f"{item.get('title') or 'Your meeting'} starts in about {minutes} minutes.")
         if prep_context:
             text += ' ' + prep_context
-        if item.get('open_loop'):
-            text += ' Open with them: ' + item['open_loop'] + '.'
         return text + (f' Want the full prep on {person}?' if person else ' Want the full prep?')
     return None
 
@@ -334,23 +344,27 @@ def _prep_threads(item, now=None):
     return rows[:5]
 
 
-def _meeting_prep(item, now, llm):
-    """Optional context uses the existing bounded writer; the time-sensitive offer always survives."""
+def _meeting_prep(item, now, llm, may_write=True):
+    """Optional context uses the existing bounded writer; the time-sensitive offer always survives.
+    `may_write` is False once this job already spent its writer attempts on another candidate."""
     if item.get('name_source') == 'gmail':
         if not allowed('gmail'):
             item['person'] = ''
         else:
             delivery_effects.stage([{'kind': 'source_permissions', 'sources': ['gmail']}])
     basic = _template(item, now)
-    if not basic:
+    if not basic or not may_write:
         return basic
     try:
         threads = _prep_threads(item, now)
     except Exception as error:
         logging.getLogger(__name__).warning('Meeting reminder thread lookup unavailable: %s', type(error).__name__)
         threads = []
-    evidence = {**item, 'attendee_comms': threads}
-    if not (item.get('person_facts') or (item.get('event') or {}).get('description') or threads):
+    evidence = {**item, 'attendee_comms': threads, 'as_of_date': now.date().isoformat()}
+    # A calendar event can come back as its own empty "conversation"; only real text is evidence.
+    if not (item.get('person_facts') or (item.get('event') or {}).get('description') or threads
+            or any(str(m.get('text') or '').strip() for m in item.get('current_conversation') or [])
+            or item.get('open_loops')):
         return basic
     try:
         rows = _write([evidence], llm)
@@ -429,7 +443,11 @@ def _writer_item(item):
     """Pass human evidence, never action bindings or the continuity ledger's control fields."""
     value = {k: item[k] for k in ('id', 'kind', 'person', 'title', 'detail', 'style', 'person_facts',
                                  'slots', 'lead_days', 'importance', 'deadline', 'attendee_comms',
-                                 'source_timing') if k in item}
+                                 'source_timing', 'as_of_date') if k in item}
+    if item.get('kind') == 'meeting_prep':
+        # Scanner detail can carry an obsolete open-loop summary. The fresh ledger and current
+        # conversation below are the writer's evidence; never append that summary verbatim.
+        value.pop('detail', None)
     value['event'] = {k: v for k, v in (item.get('event') or {}).items()
                       if k in ('text', 'body', 'subject', 'summary', 'description', 'start', 'end', 'date', 'timestamp')}
     value['current_conversation'] = [{k: r[k] for k in ('ts', 'is_from_me', 'text') if k in r}
@@ -601,7 +619,9 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
             if item['kind'] == 'post_meeting':
                 rendered = _post_meeting(item)
             elif item['kind'] == 'meeting_prep':
-                rendered = _meeting_prep(item, now, llm)
+                # One writer budget per job: a reminder reached after the batch writer ran or
+                # failed keeps its basic text instead of opening a second pair of attempts.
+                rendered = _meeting_prep(item, now, llm, may_write=not written and error is None)
             else:
                 if item['id'] not in ready and item in writing and not written:
                     written = True
@@ -611,6 +631,10 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
                 if isinstance(rendered, dict):
                     rendered = _render(rendered, item)
         except Exception as exc:
+            # Shared admission applies to the whole run. Another candidate must not overwrite
+            # this unbilled refusal or start another model call while the pool is still busy.
+            if gemini.gemini_transport.proxy_admission_busy(exc):
+                raise
             error = exc
             continue
         if not rendered:
@@ -631,8 +655,12 @@ def compose(kind, bundle, *, now=None, llm=None, enrich_fn=None):
                                      'notification_id': item['id'], 'request_reference': reference}])
         if item['kind'] in ('meeting_prep', 'handoff', 'intention') and rendered.endswith('?'):
             question = rendered.rsplit('. ', 1)[-1]
+            detail = item.get('detail', '')
+            if item['kind'] == 'meeting_prep':
+                # The scanner's open-loop summary is unchecked; the "yes" session must not inherit it.
+                detail = detail.split(' · open with them:', 1)[0]
             pending_offer.set_offer(item['kind'], question, item.get('person', ''),
-                                    item.get('detail', ''), anchor_key=item.get('anchor_key', ''))
+                                    detail, anchor_key=item.get('anchor_key', ''))
         if item['kind'] == 'meeting_prep':
             delivery_effects.stage([{'kind': 'meeting_prep_delivered', 'mode': 'offer',
                                      'calendar_event_id': item.get('calendar_event_id', ''),
@@ -650,6 +678,10 @@ def main():
     try:
         text = compose(request['kind'], json.loads(Path(request['bundle_path']).read_text()))
     except Exception as error:
+        from gemini_transport import proxy_admission_busy
+        if proxy_admission_busy(error):
+            print('notification model admission busy', file=sys.stderr)
+            return work_queue.MODEL_ADMISSION_BUSY_EXIT
         if work_queue.retryable_provider_error(error):
             # Typed exit status, never provider bodies or traceback text as a retry protocol.
             print('notification provider temporarily unavailable', file=sys.stderr)

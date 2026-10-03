@@ -9,7 +9,6 @@ from statistics import median
 _KNOWLEDGE = str(Path(__file__).parents[1] / 'knowledge')
 if _KNOWLEDGE not in sys.path:
     sys.path.insert(0, _KNOWLEDGE)
-from knowledge import CONFIDENCE_DECAY_PER_WEEK, PRUNE_STALE_AFTER_DAYS  # noqa: E402
 
 WINDOW_DAYS = 42
 VIP_ACTIVE_DAYS, VIP_ACTIVE_WEEKS, VIP_EACH_DIRECTION_DAYS = 6, 3, 2
@@ -115,6 +114,7 @@ def _instant(value):
 
 def engagement_signals(person, previous, now):
     """Derive real alternating replies within one conversation; bursts count once."""
+    from knowledge import PRUNE_STALE_AFTER_DAYS
     previous = previous if isinstance(previous, dict) else {}
     cutoff = now - timedelta(days=WINDOW_DAYS - 1)
     conversations = {}
@@ -244,6 +244,7 @@ def engagement_signals(person, previous, now):
 
 def attention_tiebreak(engagement, now):
     """A recent owner reply is a small tie-break only; missing observations never subtract."""
+    from knowledge import CONFIDENCE_DECAY_PER_WEEK
     engagement = engagement if isinstance(engagement, dict) else {}
     expiry = _instant(engagement.get('attention_boost_expires'))
     observed = _instant(engagement.get('owner_reply_at'))
@@ -256,6 +257,7 @@ def attention_tiebreak(engagement, now):
 
 def learned_chase_after(default_at, engagement, now=None, obligation_at=None):
     """Return a deadline-less chase hint which can only delay the caller's default."""
+    from knowledge import CONFIDENCE_DECAY_PER_WEEK, PRUNE_STALE_AFTER_DAYS
     engagement = engagement if isinstance(engagement, dict) else {}
     default = _instant(default_at)
     obligation = _instant(obligation_at)

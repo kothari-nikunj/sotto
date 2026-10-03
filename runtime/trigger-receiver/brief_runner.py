@@ -21,6 +21,8 @@ ARTIFACT_MAX_AGE_SECONDS = 2 * 3600
 NOTES_CACHE_MAX_AGE_SECONDS = 24 * 3600
 WELCOME_SEED_BUDGET_SECONDS = 20
 FOLLOWUP_RETENTION_SECONDS = 7 * 24 * 3600
+LEARNING_DIAGNOSTIC_MAX_BYTES = 16 * 1024
+LEARNING_DIAGNOSTIC_MAX_ITEMS = 64
 
 
 class BriefBusyError(Exception):
@@ -29,6 +31,10 @@ class BriefBusyError(Exception):
 
 class BriefModelBudgetError(Exception):
     """Fresh composition needs an account allowance update, not repeated source reads."""
+
+
+class BriefModelAdmissionBusyError(Exception):
+    """The shared proxy refused an unbilled attempt; durable work retries within its deadline."""
 
 
 @contextmanager
@@ -48,7 +54,9 @@ def run(request):
     import jsonstore
     import work_queue
     from gemini_transport import brief_model_preflight, ModelBudgetUnavailableError
-    from source_context import allowed, project_local, project_x, read_local, record_bridge_status, used_sources
+    from source_context import (allowed, email_dependency_sources, project_emails, project_local,
+                                project_x, read_local, record_bridge_status, used_sources)
+    from local_snapshot import resolve_effective_local
     from textutil import unwrap_tool_result
     from timeutil import configured_tz, _user_local_date
 
@@ -64,6 +72,10 @@ def run(request):
         result = subprocess.run([sys.executable, str(pack / relative), *map(str, args)],
                                 capture_output=True, text=True, timeout=timeout)
         if result.returncode:
+            if (relative in ('_shared/scripts/compose_brief.py',
+                             '_shared/scripts/research_attendees.py')
+                    and result.returncode == work_queue.MODEL_ADMISSION_BUSY_EXIT):
+                raise BriefModelAdmissionBusyError('Model admission busy')
             if (relative == '_shared/scripts/compose_brief.py'
                     and result.returncode == work_queue.MODEL_BUDGET_EXIT):
                 raise BriefModelBudgetError('Model allowance reached')
@@ -132,10 +144,133 @@ def run(request):
                                 *([artifact['_review_candidate']] if artifact.get('_review_candidate') else [])])
 
     def learn(paths, phase):
-        command('_shared/scripts/learn_step.py', '--type', request['kind'], '--day', day,
-                '--phase', phase, '--run-key', learning_key,
-                '--local', paths['local'], '--gmail', paths['gmail'], '--granola', paths['granola'],
-                '--knowledge-out', paths['knowledge_out'], '--continuity', paths['continuity'])
+        # The composition file is already the effective local view. Reapply current consent at
+        # each learning phase, including a later background retry, and keep the resolver's copy
+        # in step with the exact file passed to style learning.
+        local = project_local(load(paths['local'], {}))
+        save(paths['local'], local)
+        continuity = load(paths['continuity'], {})
+        if isinstance(continuity, dict):
+            continuity['local'] = local
+            if not allowed('calendar'):
+                continuity['events'] = []
+        gmail = project_emails(load(paths['gmail'], []))
+        save(paths['gmail'], gmail)
+        if isinstance(continuity, dict):
+            continuity['emails'] = gmail if isinstance(gmail, list) else gmail.get('emails', [])
+            save(paths['continuity'], continuity)
+        if not allowed('granola'):
+            save(paths['granola'], {'meetings': []})
+        learning_payload = load(paths['knowledge_out'], {})
+        learning_evidence = learning_payload.get('_learning_evidence')
+        if isinstance(learning_evidence, dict):
+            sources = artifact.get('_source_permissions', [])
+            learning_evidence['consent'] = {source: bool(allowed(source)) for source in sources
+                                            if isinstance(source, str)}
+            learning_evidence['consent_checked_at'] = datetime.now(timezone.utc).isoformat()
+            save(paths['knowledge_out'], learning_payload)
+        output = command('_shared/scripts/learn_step.py', '--type', request['kind'], '--day', day,
+                         '--phase', phase, '--run-key', learning_key,
+                         '--local', paths['local'], '--gmail', paths['gmail'], '--granola', paths['granola'],
+                         '--knowledge-out', paths['knowledge_out'], '--continuity', paths['continuity'])
+        try:
+            receipt = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, TypeError, ValueError) as error:
+            raise RuntimeError('learning receipt missing or unreadable') from error
+        if not isinstance(receipt, dict) or receipt.get('completion') not in ('complete', 'partial'):
+            raise RuntimeError('learning receipt did not confirm a finished run')
+        _retain_partial_evidence(receipt, paths['continuity'], artifact)
+        return receipt
+
+    def _retain_partial_evidence(receipt, continuity_path, source_artifact):
+        """Keep only rejected proposal evidence briefly, and only while its sources remain allowed."""
+        from hashlib import sha256
+        destination = root / 'events' / 'learning-diagnostics' / (
+            'brief-' + sha256(learning_key.encode()).hexdigest()[:32] + '.json')
+        step = receipt.get('steps', {}).get('continuity', {})
+        items = (step.get('proof') or {}).get('loop_update_items') or {}
+        rejected = items.get('rejected')
+        sources = source_artifact.get('_source_permissions', [])
+        if not isinstance(rejected, list) or not isinstance(sources, list) or not sources:
+            rejected = []
+        retained = []
+        retained_source_types = set()
+        try:
+            payload = load(continuity_path, {}) if rejected else {}
+            proposals = payload.get('loop_updates') if isinstance(payload, dict) else None
+            proposals = proposals if isinstance(proposals, list) else []
+            for result in rejected[:LEARNING_DIAGNOSTIC_MAX_ITEMS]:
+                index = result.get('index') if isinstance(result, dict) else None
+                if not isinstance(index, int) or not 0 <= index < len(proposals):
+                    continue
+                proposal = proposals[index]
+                canonical = json.dumps(proposal, sort_keys=True, default=str, separators=(',', ':'))
+                digest = sha256(canonical.encode()).hexdigest()[:24]
+                if digest != result.get('digest'):
+                    continue
+                row = {'index': index, 'digest': digest, 'reason': result.get('reason', 'unknown')}
+                evidence = proposal.get('evidence') if isinstance(proposal, dict) else None
+                evidence = evidence if isinstance(evidence, list) else [evidence]
+                refs, snippets = [], []
+                for entry in evidence[:4]:
+                    if not isinstance(entry, dict):
+                        continue
+                    source_type = next((entry.get(k) for k in ('sourceType', 'source_type', 'source')
+                                        if isinstance(entry.get(k), str) and entry.get(k)), None)
+                    source_type = 'gmail' if source_type == 'email' else source_type
+                    if source_type not in sources or not allowed(source_type):
+                        continue
+                    retained_source_types.add(source_type)
+                    ref = next((entry.get(k) for k in
+                                ('sourceId', 'source_id', 'source_ref', 'ref', 'id')
+                                if isinstance(entry.get(k), str) and entry.get(k)), None)
+                    if ref:
+                        refs.append(ref[:240])
+                    snippet = next((entry.get(k) for k in ('snippet', 'quote', 'text', 'excerpt')
+                                    if isinstance(entry.get(k), str) and entry.get(k)), None)
+                    if snippet:
+                        snippets.append(snippet[:500])
+                row['source_refs'] = refs[:4]
+                row['evidence_snippets'] = snippets[:4]
+                if refs or snippets:
+                    retained.append(row)
+            if not retained and not destination.exists():
+                return  # nothing to keep and nothing kept earlier: no file, no lock sidecar
+            diagnostic = {'schema': 1, 'created_at': time.time(), 'expires_after_days': 7,
+                          'learning_revision': str(source_artifact.get('learning_revision') or '')[:80],
+                          'rejected': retained}
+            serialized = json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)
+            while len(serialized.encode()) > LEARNING_DIAGNOSTIC_MAX_BYTES and retained:
+                retained.pop()
+                diagnostic['rejected'] = retained
+                serialized = json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)
+            # The directory gate is shared with consent revocation. It covers the last permission
+            # check and file creation, including the interval when the file does not exist yet.
+            with jsonstore.lock(str(destination.parent / '.consent')), jsonstore.lock(str(destination)):
+                if not retained or any(not allowed(source) for source in retained_source_types):
+                    # This pass may keep nothing, so an earlier pass's file (whose source may since
+                    # have been revoked) goes too; a rewrite never carries an old row forward.
+                    destination.unlink(missing_ok=True)
+                    return
+                # The window runs from first capture: a later rewrite of the same run's diagnostic
+                # keeps the earlier of its recorded capture time and its mtime (which the retention
+                # sweep reads), so a rewrite never extends the seven days.
+                if destination.exists():
+                    previous = load(destination, {})
+                    recorded = previous.get('created_at') if isinstance(previous, dict) else None
+                    for captured in (recorded, destination.stat().st_mtime):
+                        if (isinstance(captured, (int, float)) and not isinstance(captured, bool)
+                                and 0 < captured < diagnostic['created_at']):
+                            diagnostic['created_at'] = captured
+                jsonstore.write_atomic(str(destination), diagnostic)
+                os.utime(destination, (diagnostic['created_at'], diagnostic['created_at']))
+        except (OSError, TypeError, ValueError, KeyError, AttributeError):
+            # The primary result receipt stays authoritative if optional diagnostic storage fails;
+            # a diagnostic this pass could not re-check is dropped rather than kept.
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def followup():
         followup_request = {'pack': str(pack), 'kind': request['kind'], 'day': day,
@@ -156,18 +291,16 @@ def run(request):
             if load(scratch / 'ancillary-done.json', {}).get('complete'):
                 return 'NO_NUDGES'
             paths = paths_at(scratch / 'current')
-            # Consent can change between the brief and this background run. Reapply it before
-            # extracting voice or observations from persisted source inputs.
-            save(paths['local'], project_local(load(paths['local'], {})))
-            if not allowed('gmail'):
-                save(paths['gmail'], [])
+            # Every learning phase reapplies consent before reading persisted inputs.
             if not load(scratch / 'essential-done.json', {}).get('complete'):
-                learn(paths, 'essential')
-                save(scratch / 'essential-done.json', {'complete': True, 'finished_at': time.time()})
+                receipt = learn(paths, 'essential')
+                save(scratch / 'essential-done.json', {'complete': True,
+                     'learning_status': receipt['completion'], 'finished_at': time.time()})
             if load(paths['granola'], {}).get('warnings'):
                 gather_notes(paths)  # retry missing optional context in the background lane
-            learn(paths, 'ancillary')
-            save(scratch / 'ancillary-done.json', {'complete': True, 'finished_at': time.time()})
+            receipt = learn(paths, 'ancillary')
+            save(scratch / 'ancillary-done.json', {'complete': True,
+                 'learning_status': receipt['completion'], 'finished_at': time.time()})
             shutil.rmtree(scratch / 'current')
             with jsonstore.lock(str(scratch / 'prepare')):
                 shutil.rmtree(scratch / 'prepared', ignore_errors=True)
@@ -194,8 +327,14 @@ def run(request):
             save(paths['inputs'], {'google': {'emails': [], 'events': load(paths['cal'], [])}, 'local': {}})
             command('morning-brief/scripts/select_attendees.py', paths['inputs'], output=paths['selection'])
             command('meeting-prep/scripts/persist_prep.py', '--filter-fresh', paths['selection'])
-            command('_shared/scripts/research_attendees.py', '--attendees', paths['selection'],
-                    '--context', paths['cal'], '--comms', paths['gmail'], '--out', paths['research'])
+            try:
+                command('_shared/scripts/research_attendees.py', '--attendees', paths['selection'],
+                        '--context', paths['cal'], '--comms', paths['gmail'], '--out', paths['research'])
+            except BriefModelAdmissionBusyError:
+                # A due brief may compose while this optional job waits for shared capacity.
+                # Keep a content-free marker so that fallback research is disclosed.
+                save(scratch / 'research-status.json', {'status': 'admission_busy'})
+                raise
             command('meeting-prep/scripts/persist_prep.py', '--research', paths['research'],
                     '--attendees', paths['selection'])
             command('_shared/scripts/x_connectivity.py', '--calendar', paths['cal'],
@@ -207,6 +346,7 @@ def run(request):
                 shutil.rmtree(scratch / 'prepared', ignore_errors=True)
                 return 'NO_NUDGES'
             save(scratch / 'prepared.json', {'complete': True, 'observed_at': time.time()})
+            (scratch / 'research-status.json').unlink(missing_ok=True)
         return 'NO_NUDGES'
 
     with _generation_lock(scratch):
@@ -236,8 +376,9 @@ def run(request):
                 local = read_local(168 if request['kind'] == 'welcome' else 24)
             local = unwrap_tool_result(local)
             record_bridge_status(local)
-            local = project_local(local)
+            local = resolve_effective_local(project_local(local))
             save(paths['local'], local)
+            consumed_sources = set(used_sources(local, already_projected=True))
             # The pinned Google search makes a metadata GET for every hit. The former two
             # 200-hit slices cost 8,000 quota units before reading a single body (new Google
             # projects allow 6,000/user/minute). Keep a seven-day starter sample, both date
@@ -246,11 +387,21 @@ def run(request):
             # below 5,000 units. Concurrent jobs can still hit quota and must report partial.
             extra = ['--window-days', '7', '--max', '50', '--bodies', '20'] if request['kind'] == 'welcome' else []
             command('_shared/scripts/gather_google.py', '--gmail-out', paths['gmail'], '--cal-out', paths['cal'],
-                    '--source-results-out', paths['source_results'], *extra)
+                    '--source-results-out', paths['source_results'], '--loop-local', paths['local'], *extra)
             # Source status is required for an honest current brief, even when legacy arrays are empty.
             source_results = load(paths['source_results'], {})
             if not source_results:
                 raise RuntimeError('gather omitted source observation receipts')
+            # A grant can change while Google is gathering. Do not let an earlier file reach
+            # seeding, knowledge query, or the pre-compose resolver under a revoked grant.
+            local = project_local(load(paths['local'], {}))
+            save(paths['local'], local)
+            gmail = project_emails(load(paths['gmail'], []))
+            save(paths['gmail'], gmail)
+            if not allowed('calendar'):
+                save(paths['cal'], [])
+            if any(not allowed(source) for source in consumed_sources):
+                raise RuntimeError('source permission changed during brief gather')
             prepared = load(scratch / 'prepared.json', {})
             usable_prep = prepared.get('complete') and 0 <= time.time() - prepared.get('observed_at', 0) < PREPARATION_MAX_AGE_SECONDS
             if usable_prep:
@@ -260,14 +411,33 @@ def run(request):
             else:
                 # Reuse durable research already prepared today. No uncached web research delays
                 # delivery; the scheduled preparation job and ordinary prep lane can complete it.
-                save(paths['research'], load(root / 'cache' / ('research_' + day + '.json'), {'attendees': []}))
+                research = load(root / 'cache' / ('research_' + day + '.json'), {'attendees': []})
+                if load(scratch / 'research-status.json', {}).get('status') == 'admission_busy':
+                    research = dict(research) if isinstance(research, dict) else {'attendees': research}
+                    research['status'] = 'capacity_pending'
+                save(paths['research'], research)
                 save(paths['x'], {})
                 save(paths['granola'], cached_notes())
             if not allowed('granola'):
                 save(paths['granola'], {'meetings': []})
-            gmail = load(paths['gmail'], [])
+            # Prepared attendee research and X context were selected from Calendar. A source
+            # toggle after preparation must not carry those names into a new composition.
+            if not allowed('calendar'):
+                save(paths['research'], {'attendees': []})
+                save(paths['x'], {})
+            gmail = project_emails(load(paths['gmail'], []))
+            save(paths['gmail'], gmail)
             emails = gmail if isinstance(gmail, list) else gmail.get('emails', [])
             events = load(paths['cal'], [])
+            consumed_sources.update(used_sources(
+                local, gmail, events, load(paths['granola'], {}), load(paths['x'], {}),
+                already_projected=True))
+            consumed_sources.update(email_dependency_sources(gmail))
+            research = load(paths['research'], {})
+            attendees = research.get('attendees') if isinstance(research, dict) else research
+            x_context = load(paths['x'], {})
+            if attendees or (isinstance(x_context, dict) and x_context.get('attendees')):
+                consumed_sources.add('calendar')
             if request['kind'] == 'welcome':
                 # Local-only seeders have ONE small combined allowance on the first reply.
                 # Slow optional learning resumes in the durable background job after delivery.
@@ -284,18 +454,28 @@ def run(request):
                         pass  # the durable ancillary job retries learning after delivery
             command('_shared/knowledge/knowledge_query.py', '--calendar', paths['cal'], '--gmail', paths['gmail'],
                     '--local', paths['local'], output=paths['knowledge'])
+            if any(not allowed(source) for source in consumed_sources):
+                raise RuntimeError('source permission changed during brief preparation')
             continuity = {'today': day, 'signals': {}, 'local': local, 'emails': emails, 'events': events}
             save(paths['continuity'], continuity)
             command('morning-brief/scripts/continuity_resolve.py', '--resolve-only', paths['continuity'])
             composed = json.loads(command('_shared/scripts/compose_brief.py', '--type', request['kind'],
-                '--local', paths['local'], '--gmail', paths['gmail'], '--calendar', paths['cal'],
+                '--local', paths['local'], '--local-resolved', '--effective-local-out', paths['local'],
+                '--gmail', paths['gmail'], '--calendar', paths['cal'],
                 '--granola', paths['granola'], '--knowledge', paths['knowledge'],
                 '--source-results', paths['source_results'],
                 '--attendee-research', paths['research'], '--x-context', paths['x']))
             if not isinstance(composed.get('brief_text'), str) or not composed['brief_text'].strip():
                 raise RuntimeError('composer produced no chat text')
-            composed.setdefault('_source_permissions', used_sources(
-                local, emails, events, load(paths['granola'], {}), load(paths['x'], {})))
+            # Compose can heal a partial Bridge read with permitted cached sources. Its preview
+            # and the later durable resolver must inspect the same rows and source provenance.
+            local = project_local(load(paths['local'], {}))
+            save(paths['local'], local)
+            continuity['local'] = local
+            # Keep every source that earlier stages actually consumed. Rechecking only the
+            # composer's currently permitted rows could erase a source revoked mid-run.
+            composed['_source_permissions'] = sorted(consumed_sources | set(
+                composed.get('_source_permissions') or []))
             composed['_source_cutoff'] = coverage_until
             composed['_calendar_eligibility'] = [
                 {'kind': 'eligibility', 'source': 'calendar',
@@ -303,7 +483,14 @@ def run(request):
                  'calendar_observed_at': source_results.get('calendar', {}).get('observed_at') or coverage_until}
                 for event in events if isinstance(event, dict) and event.get('id') and event.get('start')
                 and event.get('my_response') != 'declined']
-            save(paths['knowledge_out'], composed.get('extracted_knowledge') or {})
+            knowledge_payload = dict(composed.get('extracted_knowledge') or {})
+            if isinstance(composed.get('learning_evidence'), dict):
+                knowledge_payload['_learning_evidence'] = {
+                    key: int(composed['learning_evidence'].get(key, 0))
+                    for key in ('accepted', 'rejected')
+                    if isinstance(composed['learning_evidence'].get(key, 0), int)
+                    and composed['learning_evidence'].get(key, 0) >= 0}
+            save(paths['knowledge_out'], knowledge_payload)
             continuity['new_actions'] = composed.get('actions') or []
             continuity['loop_updates'] = composed.get('loop_updates') or []
             save(paths['continuity'], continuity)
@@ -316,8 +503,9 @@ def run(request):
         stage_artifact(artifact)
         if not load(scratch / 'essential-done.json', {}).get('complete'):
             try:
-                learn(paths, 'essential')
-                save(scratch / 'essential-done.json', {'complete': True, 'finished_at': time.time()})
+                receipt = learn(paths, 'essential')
+                save(scratch / 'essential-done.json', {'complete': True,
+                     'learning_status': receipt['completion'], 'finished_at': time.time()})
             except Exception as error:  # learning is after the source/consent delivery gate
                 # Consent/source validation and delivery effects are already staged. Preserve the
                 # composed brief for delivery; the durable follow-up completes required writes.
@@ -351,6 +539,12 @@ def run(request):
                 # background admission cannot withhold an already validated, composed brief.
                 print(f'[brief_runner] learning follow-up admission failed: {type(error).__name__}',
                       file=sys.stderr)
+        # Bind reusable content to exact delivery jobs. Only accepted outbox IDs may replay it.
+        run_id = os.environ.get('SOTTO_DELIVERY_RUN_ID', '')
+        if len(run_id) == 32 and all(c in '0123456789abcdef' for c in run_id):
+            artifact['_delivery_run_ids'] = list(dict.fromkeys([
+                *artifact.get('_delivery_run_ids', []), run_id]))[-16:]
+            save(scratch / 'artifact.json', artifact)
         return artifact['brief_text']
 
 
@@ -364,6 +558,10 @@ if __name__ == '__main__':
         from work_queue import MODEL_BUDGET_EXIT
         print('[brief_runner] Model allowance reached', file=sys.stderr)
         sys.exit(MODEL_BUDGET_EXIT)
+    except BriefModelAdmissionBusyError:
+        from work_queue import MODEL_ADMISSION_BUSY_EXIT
+        print('[brief_runner] Model admission busy', file=sys.stderr)
+        sys.exit(MODEL_ADMISSION_BUSY_EXIT)
     except Exception as error:
         print(f'[brief_runner] {type(error).__name__}: {error}', file=sys.stderr)
         sys.exit(1)

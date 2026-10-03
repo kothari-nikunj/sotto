@@ -140,7 +140,7 @@ class Relay:
                 # say "Bridge offline" gracefully rather than the whole MCP looking broken.
                 return _ok(rid, {"content": [{"type": "text",
                             "text": "Sotto Bridge offline — your Mac isn't connected right now."}],
-                            "isError": True})
+                            "structuredContent": {"error_code": "bridge_offline"}, "isError": True})
             return self._forward(req, timeout) or _err(rid, -32001, "Bridge timed out")
         # Anything else → forward if possible.
         if self.bridge_connected():

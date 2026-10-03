@@ -21,6 +21,19 @@ import urllib.request
 import gemini_transport
 
 
+class ModelResponseError(RuntimeError):
+    """Unusable provider output, with content-free diagnostics for durable retries."""
+
+    def __init__(self, code, reason=None):
+        self.code = code
+        # Provider strings are untrusted; never persist arbitrary response text.
+        reasons = {'SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'OTHER',
+                   'MAX_TOKENS', 'RECITATION', 'LANGUAGE', 'STOP',
+                   'SPII', 'MALFORMED_FUNCTION_CALL', 'IMAGE_SAFETY'}
+        self.provider_reason = reason if isinstance(reason, str) and reason in reasons else 'UNKNOWN'
+        super().__init__(f'{code} ({self.provider_reason})')
+
+
 def _diag(msg: str) -> None:
     """Diagnostics that must be VISIBLE to the operator. compose_brief runs inside Hermes' execute_code
     sandbox, which captures the script's stdout/stderr and returns it to the AGENT — it does NOT reach
@@ -94,14 +107,14 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
     candidates = data.get("candidates") or []
     if not candidates:
         block = (data.get("promptFeedback") or {}).get("blockReason") or "no candidates"
-        raise RuntimeError(f"Gemini {model} returned no candidates (blockReason: {block})")
+        raise ModelResponseError('model_no_candidates', block)
     if candidates[0].get('finishReason') == 'MAX_TOKENS':
-        raise RuntimeError('Gemini response exceeded task output limit (MAX_TOKENS)')
+        raise ModelResponseError('model_output_limit', 'MAX_TOKENS')
     parts = [p for p in ((candidates[0].get("content") or {}).get("parts") or []) if not p.get('thought')]
     text = parts[0].get("text") if parts else None
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text.strip():
         finish = candidates[0].get("finishReason") or "unknown"
-        raise RuntimeError(f"Gemini {model} returned no text (finishReason: {finish})")
+        raise ModelResponseError('model_no_text', finish)
     return text
 
 
@@ -112,6 +125,10 @@ def _is_retryable(err: Exception) -> bool:
     import socket
     import urllib.error
     if isinstance(err, urllib.error.HTTPError):
+        if gemini_transport.proxy_admission_busy(err):
+            # The queue retries this unbilled refusal after backpressure clears;
+            # a same-turn fallback would only join the same shared bottleneck.
+            return False
         return err.code == 429 or err.code >= 500
     return isinstance(err, (urllib.error.URLError, socket.timeout, TimeoutError))
 

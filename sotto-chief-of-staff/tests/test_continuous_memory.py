@@ -94,7 +94,7 @@ def records():
 
 
 def extraction():
-    return {'people': [{'subject': 'alex@example.com', 'facts': [
+    return {'people': [{'subject_id': 'p1', 'facts': [
         {'text': 'Alex builds a product design tool.', 'refs': ['gmail:a']}]}]}
 
 
@@ -119,10 +119,7 @@ def test_resolved_obligation_stays_terminal_when_history_learning_reviews_the_ex
     }]}, NOW - timedelta(days=2))
     assert len(opened['active']) == 1
     obligation = opened['active'][0]
-    closed = continuity_resolve.resolve({'today': '2026-09-07', 'emails': [{
-        'id': 'b', 'from': 'Me <me@example.com>', 'to': 'Alex <alex@example.com>',
-        'isSent': True, 'date': '2026-09-06T10:00:00Z', 'body': 'Confirmed, see you Tuesday.',
-    }], 'loop_updates': [{
+    update = {
         'loopId': obligation['anchor_key'],
         'loopVersion': delivery_effects.loop_version(obligation),
         'status': 'resolved',
@@ -130,12 +127,18 @@ def test_resolved_obligation_stays_terminal_when_history_learning_reviews_the_ex
             'sourceType': 'email', 'sourceId': 'b',
             'snippet': 'Confirmed, see you Tuesday.',
         }],
-    }]}, NOW)
+    }
+    # The receipt compose_brief stamps once its critic pass reviewed this closure.
+    update['criticReceipt'] = continuity_resolve.record_critic_approval(update)
+    closed = continuity_resolve.resolve({'today': '2026-09-07', 'emails': [{
+        'id': 'b', 'from': 'Me <me@example.com>', 'to': 'Alex <alex@example.com>',
+        'isSent': True, 'date': '2026-09-06T10:00:00Z', 'body': 'Confirmed, see you Tuesday.',
+    }], 'loop_updates': [update]}, NOW)
     assert len(closed['resolved']) == 1 and closed['active'] == []
 
     def model(prompt, config, **kwargs):
         assert 'Confirmed, see you Tuesday.' in prompt
-        return json.dumps({'people': [{'subject': 'alex@example.com', 'facts': []}]})
+        return json.dumps({'people': [{'subject_id': 'p1', 'facts': []}]})
 
     assert learning.learn(records(), model, NOW) == {'reviewed': 2, 'facts': 0}
     assert continuity_resolve.resolve({'today': '2026-09-07'}, NOW)['active'] == []
@@ -373,7 +376,8 @@ def test_transient_permission_denial_holds_cursor_and_resumes(tmp_path, monkeypa
     assert cursors == [44]
 
 
-@pytest.mark.parametrize('reason', ['background_budget_exhausted', 'background_provider_unsupported'])
+@pytest.mark.parametrize('reason', ['background_budget_exhausted', 'background_provider_unsupported',
+                                    'model_admission_busy'])
 def test_background_budget_rejection_holds_cursor_and_stops_remaining_work(tmp_path, monkeypatch, reason):
     from urllib.error import HTTPError
     monkeypatch.delenv('SOTTO_BACKGROUND_UNMETERED')
@@ -393,6 +397,9 @@ def test_background_budget_rejection_holds_cursor_and_stops_remaining_work(tmp_p
     def rejected(*args, **kwargs):
         if reason == 'background_budget_exhausted':
             raise HTTPError('https://proxy.example/native', 402, 'budget', {}, None)
+        if reason == 'model_admission_busy':
+            raise HTTPError('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                            429, 'busy', {'X-Sotto-Admission': 'busy'}, None)
         raise memory_cycle.gemini_transport.BackgroundModelHeldError(reason, 'held')
     receipt = memory_cycle.run(NOW, fetch, rejected,
                                lambda **k: curations.append(True) or {'reviewed': 0})
@@ -792,7 +799,7 @@ def test_native_history_schema_stays_constant_for_large_pages():
     assert learning.learn(observed, model, NOW)['reviewed'] == 100
 
 
-@pytest.mark.parametrize('status', [400, 422, 429, 503])
+@pytest.mark.parametrize('status', [400, 413, 422, 429, 503])
 def test_permanent_provider_rejection_waits_for_a_changed_contract(tmp_path, monkeypatch, status):
     from urllib.error import HTTPError
     monkeypatch.setattr(memory_cycle, 'allowed', lambda s: s == 'imessage')
@@ -810,7 +817,7 @@ def test_permanent_provider_rejection_waits_for_a_changed_contract(tmp_path, mon
     memory_cycle.run(NOW, fetch, learn, quiet)
     memory_cycle.run(NOW + timedelta(days=1), fetch, learn, quiet)
     state = json.loads(Path(memory_cycle.state_path()).read_text())
-    assert len(attempts) == (1 if status in (400, 422) else 2)
+    assert len(attempts) == (1 if status in (400, 413, 422) else 2)
     assert state['sources']['imessage']['cursor'] is None
     assert state['sources']['imessage']['http_status'] == status
     assert 'PRIVATE' not in json.dumps(state) and 'provider.invalid' not in json.dumps(state)
@@ -1165,7 +1172,7 @@ def test_invalid_person_cannot_poison_unrelated_memory_or_write_partial_facts(tm
                             'subject': 'other@example.com', 'name': 'Other'}]
     bad = extraction()['people'][0]
     bad['facts'].append({'text': 'Wrong attribution must never be saved.', 'refs': ['gmail:other']})
-    good = {'subject': 'other@example.com', 'facts': [
+    good = {'subject_id': 'p2', 'facts': [
         {'text': 'Other builds scheduling software.', 'refs': ['gmail:other']}]}
     people = [bad, good] if not reverse else [good, bad]
     result = learning.learn(observed, lambda *a, **k: json.dumps({'people': people}), NOW)
@@ -1181,7 +1188,7 @@ def test_duplicate_output_subjects_are_all_rejected_even_with_valid_other_person
     observed = [*records(), {**records()[0], 'ref': 'gmail:other',
                             'subject': 'other@example.com', 'name': 'Other'}]
     reply = {'people': [extraction()['people'][0],
-                       {'subject': 'other@example.com', 'facts': []},
+                       {'subject_id': 'p2', 'facts': []},
                        extraction()['people'][0]]}
     result = learning.learn(observed, lambda *a, **k: json.dumps(reply), NOW)
     assert result['rejected_people'] == {'repeated_subject': 2}
@@ -1199,7 +1206,7 @@ def test_ambiguous_input_reference_rejected_before_spending_or_writing(tmp_path)
 
 def test_partial_validity_cannot_bypass_consent_recheck(tmp_path, monkeypatch):
     reply = extraction()
-    reply['people'].append({'subject': 'invented@example.com', 'facts': []})
+    reply['people'].append({'subject_id': 'invented', 'facts': []})
     def revoked(*a, **k):
         monkeypatch.setattr(learning, 'allowed', lambda _: False)
         return json.dumps(reply)
@@ -1229,7 +1236,7 @@ def test_mixed_extraction_advances_history_and_retains_safe_rejection_counts(tmp
     def learn(rows, now):
         bad = extraction()['people'][0]
         bad['facts'][0]['refs'] = ['gmail:other']
-        people = [bad, {'subject': 'other@example.com', 'facts': []}] if len(calls) == 1 else []
+        people = [bad, {'subject_id': 'p2', 'facts': []}] if len(calls) == 1 else []
         return learning.learn(rows, lambda *a, **k: json.dumps({'people': people}), now)
     quiet = lambda **k: {'reviewed': 0}
     memory_cycle.run(NOW, fetch, learn, quiet)
@@ -1243,3 +1250,340 @@ def test_mixed_extraction_advances_history_and_retains_safe_rejection_counts(tmp
     assert window['rejected_people'] == {'cross_subject_reference': 1}
     assert 'rejected_people' not in window['last_extraction']
     assert 'example.com' not in path.read_text() and 'Wrong attribution' not in path.read_text()
+
+
+@pytest.mark.parametrize('code,reason', [('model_no_candidates', 'OTHER'),
+    ('model_no_text', 'STOP'), ('model_output_limit', 'MAX_TOKENS')])
+def test_unusable_model_response_parks_across_scheduled_runs_and_contract_change_releases(tmp_path, monkeypatch, code, reason):
+    _quiet_memory_inputs(monkeypatch)
+    calls = []
+    def unusable(*a, **k):
+        calls.append(True)
+        raise learning.gemini.ModelResponseError(code, reason)
+    fetch = lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': 80, 'complete': False}
+    for hour in range(17):
+        monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'scheduled-' + str(hour))
+        memory_cycle.run(NOW + timedelta(hours=hour), fetch, unusable, lambda **k: {'reviewed': 0})
+    state = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    assert len(calls) == 2
+    assert state['cursor'] is None and state['pages'] == 0
+    assert state['error_code'] == code and state['provider_reason'] == reason
+    monkeypatch.setattr(learning, 'request_revision', lambda: 'fixed-contract')
+    memory_cycle.run(NOW + timedelta(hours=17), fetch,
+                     lambda *a, **k: {'reviewed': 0, 'facts': 0}, lambda **k: {'reviewed': 0})
+    state = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    assert state['cursor'] == 80 and 'provider_reason' not in state
+    assert 'rejected_request_revision' not in state
+
+
+def test_dreamer_empty_provider_response_is_bounded(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    ku.apply(fact(), NOW)
+    calls = []
+    def unavailable(now=None):
+        calls.append(True)
+        raise learning.gemini.ModelResponseError('model_no_candidates', 'SAFETY')
+    for hour in range(5):
+        memory_cycle.run(NOW + timedelta(hours=hour),
+            lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': None, 'complete': True},
+            lambda *a, **k: {'reviewed': 0, 'facts': 0}, unavailable)
+    state = json.loads(Path(memory_cycle.state_path()).read_text())
+    assert len(calls) == 2 and state['receipt']['dreamer']['status'] == 'blocked'
+    assert state['dreamer_failure']['code'] == 'model_no_candidates'
+
+
+def test_bridge_timeout_retains_page_and_retries_without_extraction_latch(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    def unavailable(*a):
+        raise source_context.BridgeReadError('bridge_timeout')
+    memory_cycle.run(NOW, unavailable, lambda *a, **k: pytest.fail('no model call'), lambda **k: {'reviewed': 0})
+    state = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    assert state['error_code'] == 'bridge_timeout' and state['cursor'] is None
+    assert 'rejected_request_revision' not in state
+    memory_cycle.run(NOW + timedelta(hours=1),
+        lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': 80, 'complete': False},
+        lambda *a, **k: {'reviewed': 0, 'facts': 0}, lambda **k: {'reviewed': 0})
+    state = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    assert state['cursor'] == 80 and 'error_code' not in state
+
+
+@pytest.mark.parametrize('reason', ['PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST'])
+def test_provider_blocked_page_is_excluded_once_and_later_history_advances(tmp_path, monkeypatch, reason):
+    _quiet_memory_inputs(monkeypatch)
+    monkeypatch.setattr(learning, 'observations', lambda source, rows, now: rows)
+    calls = []
+    def fetch(source, window):
+        return {'status': 'ok', 'rows': [{'text': 'PRIVATE', 'ref': 'private-ref'}],
+                'next_cursor': 80 if window.get('cursor') is None else None,
+                'complete': window.get('cursor') == 80}
+    def learn(rows, now):
+        calls.append(True)
+        if len(calls) == 1:
+            raise learning.gemini.ModelResponseError('model_no_candidates', reason)
+        return {'reviewed': 1, 'facts': 0}
+    quiet = lambda **k: {'reviewed': 0}
+    receipt = memory_cycle.run(NOW, fetch, learn, quiet)
+    path = Path(memory_cycle.state_path())
+    state = json.loads(path.read_text())['sources']['imessage']
+    assert state['cursor'] == 80 and state['reviewed'] == 0 and 'last_success' not in state
+    assert receipt['history'][0]['status'] == 'excluded'
+    assert list(state['excluded_pages'].values())[0]['reason'] == reason
+    assert 'PRIVATE' not in path.read_text() and 'private-ref' not in path.read_text()
+    memory_cycle.run(NOW + timedelta(minutes=15), fetch, learn, quiet)
+    state = json.loads(path.read_text())['sources']['imessage']
+    assert len(calls) == 2 and state['reviewed'] == 1 and state['pages'] == 2
+    assert state['initial_complete'] and len(state['excluded_pages']) == 1
+    assert 'error' not in state and 'rejected_request_revision' not in state
+
+
+def test_preupgrade_content_block_survives_fetch_failure_without_model_resubmission(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'sources': {'imessage': {
+        'since': 10, 'until': 20, 'cursor': 40, 'pages': 597, 'rows': 15553, 'reviewed': 14443,
+        'last_success': '2026-09-30T06:31:44Z', 'error': 'ModelResponseError',
+        'error_stage': 'memory_extraction', 'provider_reason': 'PROHIBITED_CONTENT',
+        'rejected_request_revision': learning.request_revision(), 'retry_after': int(NOW.timestamp()) + 999}}}))
+    calls = []
+    def fetch(source, window):
+        calls.append(window['cursor'])
+        if len(calls) == 1:
+            raise source_context.BridgeReadError('bridge_offline')
+        return {'status': 'ok', 'rows': [{'text': 'PRIVATE'}], 'next_cursor': 80, 'complete': False}
+    learn = lambda *a, **k: pytest.fail('blocked page must not be resubmitted')
+    quiet = lambda **k: {'reviewed': 0}
+    memory_cycle.run(NOW, fetch, learn, quiet)
+    memory_cycle.run(NOW + timedelta(minutes=15), fetch, learn, quiet)
+    assert calls == [40]
+    memory_cycle.run(NOW + timedelta(hours=1), fetch, learn, quiet)
+    state = json.loads(path.read_text())['sources']['imessage']
+    assert calls == [40, 40] and state['cursor'] == 80
+    assert state['reviewed'] == 14443 and state['last_success'] == '2026-09-30T06:31:44Z'
+    assert len(state['excluded_pages']) == 1 and 'pending_content_block' not in state
+
+
+def test_content_block_does_not_advance_after_consent_is_revoked(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    def learn(*a, **k):
+        monkeypatch.setattr(memory_cycle, 'allowed', lambda source: False)
+        raise learning.gemini.ModelResponseError('model_no_candidates', 'PROHIBITED_CONTENT')
+    memory_cycle.run(NOW, lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': 80, 'complete': False},
+                     learn, lambda **k: {'reviewed': 0})
+    state = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    assert state['cursor'] is None and 'excluded_pages' not in state
+
+
+def test_excluded_history_page_is_not_resubmitted_after_continuation_restart(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
+    window = {'since': 10, 'until': 20, 'cursor': 40, 'pages': 2}
+    payload = {'status': 'ok', 'rows': [{'text': 'PRIVATE'}], 'next_cursor': 80, 'complete': False}
+    memory_cycle._exclude_blocked_page(window, payload, 'SAFETY', NOW)
+    window['cursor'] = 40  # a later continuation restart traverses this already excluded page
+    path.write_text(json.dumps({'sources': {'imessage': window}}))
+    memory_cycle.run(NOW, lambda *a: payload,
+                     lambda *a, **k: pytest.fail('excluded page must not be resubmitted'),
+                     lambda **k: {'reviewed': 0})
+    saved = json.loads(path.read_text())['sources']['imessage']
+    assert saved['cursor'] == 80 and len(saved['excluded_pages']) == 1
+    assert 'last_success' not in saved
+
+
+def test_parked_content_block_does_not_skip_on_invalid_continuation(tmp_path, monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'sources': {'imessage': {
+        'since': 10, 'until': 20, 'cursor': 40, 'pages': 3,
+        'pending_content_block': 'SAFETY'}}}))
+    def dead(*a):
+        raise source_context.HistoryContinuationError()
+    for hour in range(3):
+        memory_cycle.run(NOW + timedelta(hours=hour), dead,
+                         lambda *a, **k: pytest.fail('must not call a model'),
+                         lambda **k: {'reviewed': 0})
+    saved = json.loads(path.read_text())['sources']['imessage']
+    assert saved['cursor'] == 40 and 'excluded_pages' not in saved
+    assert saved['protocol_failure']['attempts'] == 2
+
+
+@pytest.mark.parametrize('identifier', ['Alex+long-tag@Example.com', '+14155550123', '15555550123@s.whatsapp.net', 'p2'])
+def test_page_ids_bind_to_exact_canonical_identity_without_mutating_input(monkeypatch, identifier):
+    observed = [{**records()[0], 'subject': identifier, 'name': identifier},
+                {**records()[1], 'subject': identifier, 'name': 'Alex'}]
+    original = json.loads(json.dumps(observed))
+    writes, calls = [], []
+    monkeypatch.setattr(learning.knowledge_update, 'apply', lambda data, **k: writes.append(data))
+    def model(prompt, config, **kwargs):
+        rows = json.loads(prompt)
+        calls.append(rows)
+        assert all('subject' not in row and row['subject_id'] == 'p1' for row in rows)
+        assert [row['name'] for row in rows] == ['p1', 'Alex']
+        assert [row['ref'] for row in rows] == ['gmail:a', 'gmail:b']
+        assert [row['text'] for row in rows] == [row['text'] for row in original]
+        assert 'subject_id' in kwargs['schema']['properties']['people']['items']['required']
+        return json.dumps({'people': [{'subject_id': rows[0]['subject_id'], 'facts': [
+            {'text': 'Alex builds a product design tool.', 'refs': [rows[0]['ref']]}]}]})
+    assert learning.learn(observed, model, NOW) == {'reviewed': 2, 'facts': 1}
+    assert len(calls) == len(writes) == 1
+    assert writes[0]['person_updates'][0]['identifier'] == identifier
+    assert writes[0]['person_updates'][0]['facts'][0]['evidence_refs'] == ['gmail:a']
+    assert observed == original
+
+
+@pytest.mark.parametrize('output_id', ['Alex', 'alex@example.com', 'p999', 'P1', 'p1 ', None, [], 1])
+def test_unknown_page_id_is_not_guessed_from_a_valid_reference(tmp_path, output_id):
+    reply = extraction()
+    reply['people'][0]['subject_id'] = output_id
+    calls = []
+    def model(*a, **k):
+        calls.append(True)
+        return json.dumps(reply)
+    with pytest.raises(learning.MemoryExtractionError, match='unknown_subject'):
+        learning.learn(records(), model, NOW)
+    assert len(calls) == 1
+    assert not list(tmp_path.glob('knowledge/people/*.md'))
+
+
+def test_unknown_subject_parks_same_page_then_new_contract_resumes_without_skipping(monkeypatch):
+    observed = records()
+    _quiet_memory_inputs(monkeypatch, source='gmail')
+    monkeypatch.setattr(learning, 'observations', lambda *a: observed)
+    revision = learning.request_revision()
+    monkeypatch.setattr(learning, 'request_revision', lambda: 'old-subject-contract')
+    fetched, calls = [], []
+    fixed = False
+    def fetch(source, window):
+        fetched.append(window['cursor'])
+        return {'status': 'ok', 'rows': observed, 'next_cursor': 'next-page', 'complete': False}
+    def model(prompt, config, **kwargs):
+        calls.append(True)
+        reply = extraction()
+        reply['people'][0]['subject_id'] = json.loads(prompt)[0]['subject_id'] if fixed else 'Alex'
+        return json.dumps(reply)
+    def learn(rows, now):
+        return learning.learn(rows, model, now)
+    for hour in range(4):
+        memory_cycle.run(NOW + timedelta(hours=hour), fetch, learn, lambda **k: {'reviewed': 0})
+    path = Path(memory_cycle.state_path())
+    state = json.loads(path.read_text())['sources']['gmail']
+    assert len(calls) == 2 and fetched == [None, None]
+    assert state['cursor'] is None and state['reviewed'] == 0
+    assert state['error_code'] == 'unknown_subject'
+    fixed = True
+    monkeypatch.setattr(learning, 'request_revision', lambda: revision)
+    memory_cycle.run(NOW + timedelta(hours=4), fetch, learn, lambda **k: {'reviewed': 0})
+    state = json.loads(path.read_text())['sources']['gmail']
+    assert len(calls) == 3 and fetched == [None, None, None]
+    assert state['cursor'] == 'next-page' and state['reviewed'] == 2
+    assert 'rejected_request_revision' not in state and 'error_code' not in state
+    assert len(person()[1].facts) == 1
+
+
+def test_dreamer_archives_paraphrases_without_inventing_confidence_or_losing_evidence():
+    ku.apply(fact('Has children named Ari and Bo.', ['imessage:one']), NOW)
+    ku.apply(fact('Has two children, Bo and Ari.', ['gmail:two']), NOW)
+    path, before = person()
+    ids = list(before.facts)
+    assert len(ids) == 2
+    def curate(prompt, config, **kwargs):
+        rows = json.loads(prompt)
+        return json.dumps({'people': [{'id': rows[0]['id'], 'summary_refs': ids,
+            'conflicts': [], 'equivalent_groups': [ids]}]})
+    result = dreamer.run(curate, NOW)
+    after = person()[1]
+    assert result['reviewed'] == 1
+    assert after.facts[ids[1]].status == 'archived'
+    assert after.facts[ids[1]].text == before.facts[ids[1]].text
+    assert after.facts[ids[1]].evidence_refs == before.facts[ids[1]].evidence_refs
+    assert after.facts[ids[0]] == before.facts[ids[0]]
+    assert after.summary_refs == ids[:1]
+    assert dreamer.run(lambda *a, **k: pytest.fail('no new evidence'), NOW)['reviewed'] == 0
+
+
+def _fold_children(first_refs, second_refs):
+    """Two paraphrases of one fact, folded by a curation that lists the first wording first."""
+    ku.apply(fact('Has children named Ari and Bo.', first_refs[:1]), NOW)
+    for ref in second_refs:
+        ku.apply(fact('Has two children, Bo and Ari.', [ref]), NOW)
+    ids = {f.text: fid for fid, f in person()[1].facts.items()}
+    a, b = ids['Has children named Ari and Bo.'], ids['Has two children, Bo and Ari.']
+    path, _ = person()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert ku.consolidate(person()[1].canonical_id, digest, [a], [], NOW,
+                          equivalent_groups=[[a, b]])['status'] == 'ok'
+    return a, b
+
+
+def _children_alive_after_prune(day):
+    ku.apply(fact('Alex runs a pottery studio.', ['gmail:nine'],
+                  date=(NOW + timedelta(days=day)).date().isoformat()), NOW + timedelta(days=day))
+    return [f for f in person()[1].facts.values() if f.status == 'active' and 'Ari' in f.text]
+
+
+def test_equivalence_keeps_the_corroborated_copy_over_the_models_preferred_wording():
+    """Wording order must not archive a seen-2 copy (never age-pruned) behind a seen-1 copy."""
+    a, b = _fold_children(['imessage:one'], ['gmail:two', 'gmail:three'])
+    after = person()[1]
+    assert after.facts[b].status == 'active' and after.facts[b].seen == 2
+    assert after.facts[a].archived_reason == 'duplicate' and after.facts[a].duplicate_of == b
+    assert after.summary_refs == [b]
+    assert [f.text for f in _children_alive_after_prune(61)] == ['Has two children, Bo and Ari.']
+
+
+def test_new_evidence_for_a_folded_paraphrase_refreshes_the_kept_copy():
+    a, b = _fold_children(['imessage:one'], ['imessage:two'])
+    assert person()[1].facts[b].status == 'archived'  # equal evidence: the model's order breaks the tie
+    # Replaying the folded copy's own evidence is not a new observation of the kept copy.
+    assert ku.apply(fact('Has two children, Bo and Ari.', ['imessage:two'], date='2026-10-27'),
+                    NOW + timedelta(days=50))['applied']['confirmed'] == 0
+    assert person()[1].facts[a].seen == 1
+    fresh = ku.apply(fact('Has two children, Bo and Ari.', ['imessage:fifty'], date='2026-10-27'),
+                     NOW + timedelta(days=50))
+    kept = person()[1].facts[a]
+    assert fresh['applied']['confirmed'] == 1 and kept.seen == 2 and kept.last == '2026-10-27'
+    assert 'imessage:fifty' in kept.evidence_refs and person()[1].facts[b].status == 'archived'
+    assert [f.text for f in _children_alive_after_prune(61)] == ['Has children named Ari and Bo.']
+
+
+def test_a_user_correction_stays_the_kept_copy_and_folded_evidence_cannot_touch_it():
+    ku.apply(fact('Has two children, Bo and Ari.', ['gmail:two']), NOW)
+    ku.apply(fact('Has two children, Bo and Ari.', ['gmail:three']), NOW)
+    path, p = person()
+    p.facts['f_user'] = kg.FactMeta(text='Alex has two kids, Ari and Bo.', type='context', seen=1,
+                                    conf=1.0, source='user_edit', source_ref='user-correction',
+                                    first='2026-09-01', last='2026-09-01')
+    kg.write_person_file(str(path), p, NOW)
+    observed = next(fid for fid in p.facts if fid != 'f_user')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    ku.consolidate(p.canonical_id, digest, [], [], NOW, equivalent_groups=[[observed, 'f_user']])
+    assert person()[1].facts[observed].duplicate_of == 'f_user'
+    before = person()[1].facts['f_user']
+    result = ku.apply(fact('Has two children, Bo and Ari.', ['gmail:four']), NOW)
+    assert result['applied']['confirmed'] == 0 and person()[1].facts['f_user'] == before
+
+
+@pytest.mark.parametrize('groups, conflicts', [([['a', 'b'], ['b', 'c']], []),
+    ([['a', 'missing']], []), ([['a', 'a']], []), ([['a', 'b']], [['a', 'c']])])
+def test_equivalence_plan_cannot_overlap_or_hide_conflicts(groups, conflicts):
+    with pytest.raises(ValueError):
+        ku.validate_equivalent_groups(groups, {'a': {}, 'b': {}, 'c': {}}, conflicts)
+
+
+def test_contact_note_numbers_are_not_promoted_to_facts():
+    result = ku.apply(fact('74', source='apple_contacts'), NOW)
+    assert result['applied']['new'] == 0
+
+
+def test_dreamer_does_not_checkpoint_facts_uncovered_beyond_the_batch(monkeypatch):
+    monkeypatch.setattr(dreamer, 'DREAM_FACTS', 2)
+    for i, text in enumerate(['Has two children named Ari and Bo.',
+                              'Has children, Bo and Ari.', 'Ari and Bo are their children.']):
+        ku.apply(fact(text, [f'imessage:{i}']), NOW)
+    def curate(prompt, config, **kwargs):
+        rows = json.loads(prompt)
+        return json.dumps({'people': [{'id': p['id'], 'summary_refs': list(p['facts'])[:1],
+            'conflicts': [], 'equivalent_groups': [list(p['facts'])]} for p in rows]})
+    assert dreamer.run(curate, NOW)['reviewed'] == 1
+    assert dreamer.prepare()['candidates']  # newly uncovered third fact still needs review
+    assert dreamer.run(curate, NOW)['reviewed'] == 1
+    assert not dreamer.prepare()['candidates']

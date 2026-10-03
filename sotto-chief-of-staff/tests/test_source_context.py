@@ -1,5 +1,6 @@
 """Source truth: empty is observed, failures retain age, revocation gates every cached read."""
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 import compose_brief as cb
 import gather_google as gg
 import source_context as sc
+import jsonstore
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +24,25 @@ def stamp(hours=0):
 def cached_message():
     return {'generated_at': stamp(1), 'source_status': {'imessage': 'ok'},
             'imessage': [{'text': 'cached synthetic message'}]}
+
+
+def test_derived_gmail_rows_obey_source_dependency_grants(monkeypatch):
+    original = sc.allowed
+    payload = {'emails': [
+        {'id': 'recent', 'body': 'ordinary Gmail'},
+        {'id': 'derived', 'body': 'older context',
+         '_loop_context_sources': ['gmail', 'imessage']}],
+        'truncated_at': 5}
+    assert sc.email_dependency_sources(payload) == ['gmail', 'imessage']
+    monkeypatch.setattr(sc, 'allowed', lambda source: source != 'imessage' and original(source))
+    filtered = sc.project_emails(payload)
+    assert [row['id'] for row in filtered['emails']] == ['recent']
+    assert filtered['truncated_at'] == 5
+    assert len(payload['emails']) == 2  # projection never rewrites the saved observation
+    assert sc.used_sources(gmail=payload, already_projected=True) == ['gmail']
+    monkeypatch.setattr(sc, 'allowed', lambda source: source != 'gmail' and original(source))
+    assert sc.project_emails(payload) == []
+    assert sc.used_sources(gmail=payload, already_projected=True) == ['gmail']
 
 
 @pytest.mark.parametrize('mode', ['self-host', 'managed'])
@@ -84,6 +105,51 @@ def test_self_host_status_receipt_records_source_revocation_without_storing_hist
     assert 'episodes' not in json.dumps(state)
 
 
+def test_revocation_erases_finished_learning_diagnostic_even_without_another_pass(tmp_path):
+    path = tmp_path / 'events/learning-diagnostics/brief-old.json'
+    path.parent.mkdir(parents=True)
+    # Schema 1 has no complete source manifest. Older diagnostics must be erased too.
+    path.write_text(json.dumps({'schema': 1, 'rejected': [{'evidence_snippets': ['private']}]}))
+    sc.record_bridge_status({'sources': {'imessage': 'disabled'}})
+    assert not path.exists()
+    assert not sc.allowed('imessage')
+
+    # A later status report for the already-disabled source must not erase new diagnostics
+    # about a different, still-allowed source.
+    path.write_text('{"schema": 1, "rejected": [{"evidence_snippets": ["other source"]}]}')
+    sc.record_bridge_status({'sources': {'imessage': 'disabled'}})
+    assert path.exists()
+
+
+def test_revocation_waits_for_diagnostic_creation_inside_consent_gate(tmp_path):
+    path = tmp_path / 'events/learning-diagnostics/brief-late.json'
+    path.parent.mkdir(parents=True)
+    gate = str(path.parent / '.consent')
+    errors = []
+
+    def disable():
+        try:
+            sc.record_bridge_status({'sources': {'imessage': 'disabled'}})
+        except Exception as error:
+            errors.append(error)
+
+    with jsonstore.lock(gate):
+        thread = threading.Thread(target=disable)
+        thread.start()
+        # The new consent is durable before the cleaner takes the directory gate.
+        for _ in range(100):
+            if not sc.allowed('imessage'):
+                break
+            threading.Event().wait(0.01)
+        assert not sc.allowed('imessage')
+        path.write_text('{"schema": 1, "rejected": [{"evidence_snippets": ["private"]}]}')
+        assert thread.is_alive()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors
+    assert not path.exists()
+
+
 def test_google_source_receipts_distinguish_failed_empty_from_complete_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(gg, '_find_google_api', lambda: 'synthetic-api.py')
     monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
@@ -124,3 +190,64 @@ def test_permission_fingerprint_changes_only_when_source_permission_changes():
     assert sc.permission_fingerprint() == before  # availability is not revocation
     sc.record_bridge_status({'sources': {'imessage': 'disabled'}})
     assert sc.permission_fingerprint() != before
+
+
+@pytest.mark.parametrize('reply,code', [
+    ({'error': {'code': -32000, 'message': 'PRIVATE'}}, 'bridge_offline'),
+    ({'error': {'code': -32001, 'message': 'PRIVATE'}}, 'bridge_timeout'),
+    ({'error': {'code': -32002, 'message': 'PRIVATE'}}, 'bridge_not_permitted'),
+    ({'error': {'code': -999, 'message': 'PRIVATE'}}, 'bridge_rpc_error'),
+    ({'result': {'isError': True, 'structuredContent': {'error_code': 'bridge_offline'}}}, 'bridge_offline'),
+    ({'result': {'isError': True, 'content': [{'text': 'PRIVATE'}]}}, 'bridge_tool_error'),
+])
+def test_bridge_errors_keep_only_fixed_codes(monkeypatch, reply, code):
+    import io
+    monkeypatch.setenv('BRIDGE_TOKEN', 'synthetic')
+    monkeypatch.setattr(sc.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(json.dumps(reply).encode()))
+    with pytest.raises(sc.BridgeReadError) as caught:
+        sc.bridge_call('read_history', {})
+    assert caught.value.code == code and 'PRIVATE' not in str(caught.value)
+
+
+@pytest.mark.parametrize('error,code', [
+    (sc.BridgeReadError('bridge_timeout'), 'bridge_timeout'),
+    (RuntimeError('private source body must not be printed'), 'bridge_read_failed'),
+])
+def test_local_read_failure_logs_only_bounded_reason(monkeypatch, error, code):
+    import sotto_log
+    messages = []
+    monkeypatch.setattr(sotto_log, 'diag', messages.append)
+    def fail(*args):
+        raise error
+    monkeypatch.setattr(sc, 'bridge_call', fail)
+    assert sc.read_local() == {}
+    assert messages == [f'[read_local] {code}; using permitted snapshot fallback']
+
+
+def test_revoked_excerpt_source_strips_only_the_excerpt_from_an_inbox_row(monkeypatch):
+    original = sc.allowed
+    inbox = {'id': 'm', 'body': 'ordinary Gmail', 'labelIds': ['INBOX'], '_loop_context': True,
+             '_loop_context_body': 'steered excerpt', '_loop_context_body_sources': ['gmail', 'whatsapp']}
+    assert sc.email_dependency_sources([inbox]) == ['gmail', 'whatsapp']
+    assert sc.project_emails([inbox]) == [inbox]
+    monkeypatch.setattr(sc, 'allowed', lambda source: source != 'whatsapp' and original(source))
+    assert sc.project_emails([inbox]) == [{'id': 'm', 'body': 'ordinary Gmail', 'labelIds': ['INBOX']}]
+    assert sc.email_dependency_sources(sc.project_emails([inbox])) == []
+
+
+def test_email_evidence_parts_keep_body_and_excerpt_separate_for_quote_matching(monkeypatch):
+    original = sc.allowed
+    row = {'id': 'm', 'body': 'Plain text: will do next week.', '_loop_context': True,
+           '_loop_context_body': '<div>Attached is the deck.</div>',
+           '_loop_context_body_sources': ['gmail', 'whatsapp']}
+    assert sc.email_evidence_parts(row) == [row['body'], row['_loop_context_body']]
+    # The prompt rendering still shows both, labelled; quote matching never spans the label.
+    assert '[Additional excerpt from the same email]' in sc.email_evidence_text(row)
+    assert sc.email_quote_found(row, 'Attached is the deck.')
+    assert not sc.email_quote_found(row, 'next week. [Additional excerpt from the same email] <div>')
+    # One read containing the other is a single part (no label at all).
+    assert sc.email_evidence_parts({**row, '_loop_context_body': 'will do next week'}) == [row['body']]
+    # Revoking the steering source drops only the excerpt part.
+    monkeypatch.setattr(sc, 'allowed', lambda source: source != 'whatsapp' and original(source))
+    assert sc.email_evidence_parts(row) == [row['body']]
+    assert not sc.email_quote_found(row, 'Attached is the deck.')

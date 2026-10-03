@@ -72,6 +72,7 @@ Test: SOTTO_LLM_STUB=/path/to/{"attendees":[...]}.json bypasses the network.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
 import os
 import re
@@ -632,7 +633,9 @@ def _gemini_json(prompt: str, key: str, schema: dict, timeout: int, max_tokens: 
                 raw = raw.split("```", 2)[1].lstrip("json").strip() if "```" in raw else raw
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else None
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if gemini_transport.proxy_admission_busy(error):
+                raise  # schema fallback cannot help while the shared pool is full
             if use_schema:
                 continue  # try grounding-only
             raise
@@ -651,7 +654,13 @@ def _grounded_json(prompt, key, schema, timeout, max_tokens, fallback_shape, tag
         root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'events/research-artifacts'
         root.mkdir(parents=True, exist_ok=True)
         path = str(root / (operation['id'] + '.json'))
-        with jsonstore.lock(model_work.artifact_lock_path(root, operation['id'])):
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(jsonstore.lock(model_work.artifact_lock_path(root, operation['id'])))
+            except TimeoutError as error:
+                # Another research batch owns the artifact shard. A later preparation attempt can
+                # read its completed result; never turn lock contention into an empty profile.
+                raise wr.ResearchAdmissionBusyError('research artifact busy') from error
             cached = jsonstore.read(path, default=None, strict=True)
             if cached is not None:
                 return cached
@@ -877,6 +886,7 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
         _diag(f"[research_attendees] --focus {focus!r} matched no attendee — sweep research only")
 
     profile_rows, deep_rows, focus_rows = [], [], []
+    admission_busy = False
     n_futs = len(batches) + len(deep_batches) + (1 if focus_target else 0)
     _diag(f"[research-plan] profile={len(batches)} recency={len(deep_batches)} "
           f"focus={int(focus_target is not None)} batches={n_futs} max_attempts={4 * n_futs}")
@@ -895,12 +905,20 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
             kind, batch = futs[fut]
             try:
                 rows = fut.result() or []
+            except wr.ResearchAdmissionBusyError:
+                admission_busy = True
+                rows = []
             except Exception as e:  # noqa: BLE001 — one failed batch never fails the others
                 _diag(f"[research_attendees] {kind} batch crashed "
                       f"({type(e).__name__}: {str(e)[:100]})")
                 rows = []
             {"profile": profile_rows, "deep": deep_rows, "focus": focus_rows}[kind].extend(
                 (batch, r) for r in rows if isinstance(r, dict))
+
+    if admission_busy:
+        # Successful batches already have durable artifacts. Let the scheduled preparation job
+        # retry its missing batches without recording this partial pass as complete.
+        raise wr.ResearchAdmissionBusyError('research model admission busy')
 
     # Merge: profile entries keyed by join key, in input order where possible; recency-sweep fields
     # post-filtered then attached. A sweep hit with no Pass-A profile still surfaces (thin entry).
@@ -1053,5 +1071,15 @@ def main():
     print(payload)   # stdout kept for compatibility with redirect-style invocations
 
 
+def cli():
+    try:
+        main()
+    except wr.ResearchAdmissionBusyError:
+        from work_queue import MODEL_ADMISSION_BUSY_EXIT
+        _diag('[research_attendees] model admission busy; preparation can retry')
+        return MODEL_ADMISSION_BUSY_EXIT
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(cli())

@@ -65,7 +65,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # The ids this process must compute IDENTICALLY to the skills tree (queue lines, style samples).
 # keys.py is a byte-identical vendored copy of sotto-chief-of-staff/_shared/lib/keys.py — the
@@ -95,6 +95,7 @@ HOOKS = {
     # not on this box and every write that needs it answers 503.
     "find_script": lambda *rel: None,
     "delivery_effects": lambda: None,
+    "relationship_importance": lambda contact, history, now: None,
     # THE atomic JSON write for the image — connectors.write_json, wired by the receiver
     # (tmp at `mode`, then os.replace). Unlike the degrade-quietly hooks above this one has no
     # sane default: silently dropping a session or a preference write is worse than a loud error.
@@ -300,18 +301,42 @@ def _from_iso(s):
         return None
 
 
-# ── Tolerant frontmatter parser (stdlib; no PyYAML — the receiver image doesn't carry it) ────────
-# Parses the exhaust-schema subset: `key: value` scalars, inline ["a","b"] lists, nested maps by
-# indentation (facts: → f_id: → fields), and block sequences (`relations:` → `- type: …` with the
-# item's remaining fields indented under it). Anything it can't read is skipped, never raised — the
-# skills-tree knowledge.py (which hard-imports yaml) stays the writer; this is a read-only window.
+# ── Frontmatter reader ───────────────────────────────────────────────────────────────────────
+# PyYAML ships in the image (requirements.txt), so well-formed frontmatter is read by the same
+# safe loader family that knowledge.py writes with: quoted-scalar folding, line continuations and
+# escapes all decode exactly. Timestamps stay strings, as the writer stored them. Frontmatter the
+# loader rejects (or a runtime without PyYAML) falls back to the tolerant subset parser below:
+# `key: value` scalars, inline ["a","b"] lists, nested maps by indentation (facts: → f_id: →
+# fields), and block sequences (`relations:` → `- type: …` with the item's remaining fields
+# indented under it). Anything it can't read is skipped, never raised — this is a read-only window.
+
+def _yaml_meta(block: str):
+    try:
+        import yaml  # noqa: PLC0415 — lazy, like _labels_load; absent only outside the image
+    except ImportError:
+        return None
+    base = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    loader = type("_FrontmatterLoader", (base,), {"yaml_implicit_resolvers": {
+        first: [r for r in resolvers if r[0] != "tag:yaml.org,2002:timestamp"]
+        for first, resolvers in base.yaml_implicit_resolvers.items()}})
+    try:
+        meta = yaml.load(block, Loader=loader)  # noqa: S506 — a SafeLoader subclass
+    except yaml.YAMLError:
+        return None
+    return meta if isinstance(meta, dict) else None
+
 
 def _parse_scalar(s: str):
     s = s.strip()
     if not s:
         return ""
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
-        return s[1:-1]
+        if s[0] == "'":
+            return s[1:-1].replace("''", "'")
+        try:
+            return json.loads(s)
+        except ValueError:
+            return s[1:-1]
     if s.startswith("[") and s.endswith("]"):
         try:
             return json.loads(s)
@@ -333,6 +358,29 @@ def _parse_scalar(s: str):
     return s
 
 
+def _fold_frontmatter_scalars(lines):
+    """Join safe_dump's wrapped scalar lines before interpreting nested mapping keys.
+
+    Continuations are indented beyond their scalar key; even a colon on a continuation is
+    text, not a new fact field. Structural map/list lines keep their original indentation.
+    """
+    result = []
+    scalar_indent = None
+    for raw in lines:
+        stripped = raw.strip()
+        indent = len(raw) - len(raw.lstrip(' '))
+        if scalar_indent is not None and (not stripped or indent > scalar_indent):
+            result[-1] += ('\n' if not stripped else ('' if result[-1].endswith('\n') else ' ') + stripped)
+            continue
+        result.append(raw)
+        scalar_indent = None
+        if ':' in stripped and not stripped.startswith(('#', '- ')):
+            value = stripped.partition(':')[2].strip()
+            if value and not value.startswith(('[', '{', '|', '>')):
+                scalar_indent = indent
+    return result
+
+
 def parse_frontmatter(text: str):
     """`---\\n…\\n---\\n<body>` → (meta dict, body str). Tolerant: no frontmatter → ({}, text)."""
     if not text.startswith("---"):
@@ -341,12 +389,15 @@ def parse_frontmatter(text: str):
     end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
     if end is None:
         return {}, text
+    meta = _yaml_meta("\n".join(lines[1:end]))
+    if meta is not None:
+        return meta, "\n".join(lines[end + 1:])
     root: dict = {}
     stack: list[tuple[int, object]] = [(-1, root)]
     # The last key whose value was empty — the only key a following `- ` line can belong to. It is
     # what turns `relations:` + dashed lines into a list instead of an empty map.
     pending: tuple = ()
-    for raw in lines[1:end]:
+    for raw in _fold_frontmatter_scalars(lines[1:end]):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -1404,6 +1455,19 @@ def api_person(slug: str):
                                             for v in (ex.get(key) or []) if isinstance(v, str))
             out["controls"] = {"name": _s(meta.get("name")),
                                "muted": _listed("mute_people"), "vip": _listed("vip_people")}
+            # Local shared calculation; the manual quiet-hours override remains separate.
+            state = _read_json_file("knowledge", "relationship_state.json", default={})
+            history = state.get('history', {}) if isinstance(state, dict) else {}
+            try:
+                importance = HOOKS["relationship_importance"](
+                    {"name": _s(meta.get("name")), "canonical_id": _s(meta.get("canonical_id"))},
+                    history, datetime.now(timezone.utc))
+            except (ImportError, OSError, RuntimeError, ValueError, TypeError, AttributeError):
+                importance = None
+            if isinstance(importance, dict):
+                out["importance"] = {key: importance[key] for key in
+                    ("tier", "reason", "active_days", "active_weeks", "sent_days", "received_days",
+                     "held_meetings", "window_days") if key in importance}
         return out
     return None
 

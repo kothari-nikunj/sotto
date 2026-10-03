@@ -132,7 +132,7 @@ def test_top_alignment_keeps_content_inside_header_and_footer():
         v._content_top(top, v.HEIGHT)
 
 
-@pytest.mark.parametrize('handled_count, fits', [(5, True), (7, True), (18, False)])
+@pytest.mark.parametrize('handled_count, fits', [(5, True), (7, True), (18, True), (32, False)])
 def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path, monkeypatch, handled_count, fits):
     # A normal-length brief can overflow from names, line wrapping, and paragraph gaps,
     # even with fewer than 200 words on each card. Keep fixed type and a real gap floor.
@@ -161,6 +161,9 @@ def test_dense_outcomes_tighten_gaps_without_shrinking_or_dropping_text(tmp_path
         assert (tmp_path / deck['id'] / 'manifest.json').is_file()
         assert sorted(b['line'] for c in manifest['cards'] for b in c['blocks']) == sorted(
             b['line'] for c in deck['cards'] for b in c['blocks'])
+        if handled_count == 18:
+            assert manifest['canvas_height'] == v.TALL_HEIGHT
+            assert all(Image.open(path).size == (v.WIDTH, v.TALL_HEIGHT) for path in manifest['images'])
         if handled_count == 5:
             assert manifest['cards'] == deck['cards']
         assert body_sizes <= {36, 48}
@@ -200,7 +203,7 @@ def test_agenda_locations_wrap_without_clipping_or_losing_unicode(tmp_path, monk
     assert ' '.join(location_lines) == address
     assert all(Path(path).read_bytes().startswith(b'\x89PNG') for path in manifest['images'])
 
-    too_long = v.build(source.replace(address, 'California Boulevard Entrance Plaza ' * 38))
+    too_long = v.build(source.replace(address, 'CaliforniaBoulevardEntrancePlaza ' * 80))
     assert too_long is not None
     with pytest.raises(ValueError, match='readable height'):
         v.render(too_long, tmp_path)
@@ -257,6 +260,30 @@ def test_companion_links_exclude_prose_punctuation_but_keep_balanced_parentheses
 ])
 def test_calendar_formats_keep_date_time_attendees_and_exact_address(source, expected):
     assert v._agenda_parts(source) == expected
+
+
+def test_evening_gallery_uses_neutral_schedule_heading_and_clean_labels(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    source = BRIEF.replace('Good morning', 'Good evening').replace(
+        'Jordan — Reply to the lunch invitation for Thursday.',
+        '**Office drill **: Check the building notice for tomorrow.').replace(
+        '10:00 AM — Team meeting', 'Tue Sep 15 10:00 AM — Team meeting')
+    deck = v.build(source)
+    assert 'Office drill: Check' in deck['full_text']
+    assert '**Office' not in deck['full_text']
+    rendered = []
+    original = ImageDraw.ImageDraw.text
+
+    def record(self, xy, text, *args, **kwargs):
+        rendered.append(text)
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(deck, tmp_path)
+    assert 'Coming up' in rendered
+    assert 'Your day' not in rendered
+    assert 'Tue Sep 15' in rendered
+    assert not any('*' in text for text in rendered)
 
 
 def test_real_calendar_and_followups_presentation(tmp_path, monkeypatch):

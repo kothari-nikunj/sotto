@@ -110,7 +110,7 @@ def _prep_item(**values):
 
 def test_prep_reminder_joins_intro_and_reason_without_losing_offer(isolated, monkeypatch):
     calls = []
-    context = 'Alex connected you through Priya. Sam suggested this coffee to discuss the robotics fund.'
+    context = 'Alex connected you through Priya for a robotics-fund discussion. You also promised Sam the deck.'
     monkeypatch.setattr(notification, '_prep_threads', lambda item, now=None: [
         {'date': '2026-09-16', 'subject': 'Coffee', 'snippet': 'Sam suggested coffee to discuss the robotics fund.', 'from_me': False}])
 
@@ -125,7 +125,8 @@ def test_prep_reminder_joins_intro_and_reason_without_losing_offer(isolated, mon
     assert notification.compose('proactive', [item], now=now) == text
     assert len(calls) == 1  # the existing composition cache owns retries
     assert context in text and '30 minutes' in text and 'Partner at Example' in text
-    assert 'the deck you promised' in text and text.endswith('Want the full prep on Sam?')
+    assert text.count('promised Sam the deck') == 1 and text.endswith('Want the full prep on Sam?')
+    assert 'Open with them:' not in text
     assert 'sam@example.com' not in text and text.count('?') == 1
     supplied = calls[0][0]
     assert supplied['event']['description'] == 'Discuss robotics fund'
@@ -516,6 +517,55 @@ def real_enrichment(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_reminder_uses_stored_relationship_memory_without_mail_or_another_model_stage(real_enrichment, monkeypatch):
+    calls, lookups = [], []
+    memory = 'On September 10, Sam shared the new fund plans after your last walk.'
+    def knowledge(*args):
+        lookups.append(args)
+        return {'sam': memory}
+    monkeypatch.setattr(notification, '_read_json_script', knowledge)
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    monkeypatch.setattr(notification.subprocess, 'run', lambda *a, **k: pytest.fail('unexpected source fetch'))
+    monkeypatch.setattr(gemini, 'provider_key', lambda _: 'test')
+    def writer(provider, model, key, prompt, **kwargs):
+        calls.append(json.loads(prompt)[0])
+        return json.dumps({'items': [{'id': 'prep-1', 'text': memory, 'draft': '', 'decline': ''}]})
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    item = _prep_item(event={'summary': 'Walk'})
+    text = notification.compose('proactive', [item], now=now, llm=writer)
+    assert notification.compose('proactive', [item], now=now, llm=writer) == text
+    assert len(calls) == 1 and memory in text
+    assert all(args[1:3] == ('--person', 'sam@example.com') for args in lookups)
+    assert calls[0]['person_facts']['sam'] == memory and calls[0]['as_of_date'] == '2026-09-17'
+    assert text.endswith('Want the full prep on Sam?') and text.count('?') == 1
+
+
+def test_conversation_alone_reaches_reminder_writer_and_stale_scanner_task_does_not(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    calls = []
+    def writer(provider, model, key, prompt, **kwargs):
+        calls.append(json.loads(prompt)[0])
+        return json.dumps({'items': [{'id': 'prep-1', 'text': 'Sam thanked you for the introduction yesterday.',
+                                     'draft': '', 'decline': ''}]})
+    item = _prep_item(open_loop='make the old introduction', detail='open with them: make the old introduction',
+                      current_conversation=[{'ts': '2026-09-16T12:00:00Z', 'is_from_me': False,
+                                             'text': 'Thanks for the introduction.'}])
+    text = notification.compose('proactive', [item], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc), llm=writer)
+    assert len(calls) == 1 and 'Thanks for the introduction.' in json.dumps(calls)
+    assert 'make the old introduction' not in json.dumps(calls) and 'make the old introduction' not in text
+    assert 'thanked you' in text and 'Open with them:' not in text
+
+
+def test_writer_failure_does_not_append_unreviewed_commitment(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    def writer(*args, **kwargs):
+        raise notification.model_work.ModelWorkHeldError('held')
+    item = _prep_item(open_loop='send the already delivered deck',
+                      open_loops=[{'what': 'Review the new proposal', 'direction': 'you_owe'}])
+    text = notification.compose('proactive', [item], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc), llm=writer)
+    assert 'deck' not in text and 'proposal' not in text and text.endswith('Want the full prep on Sam?')
+
+
 def test_stale_scheduling_candidate_gets_current_invitation_and_thread_before_writing(real_enrichment, monkeypatch):
     import personal_context
     now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
@@ -636,3 +686,98 @@ def test_notification_cli_uses_typed_provider_retry_without_payload(isolated, mo
     else:
         with pytest.raises(HTTPError):
             notification.main()
+
+
+def test_notification_cli_refunds_only_typed_proxy_busy(isolated, monkeypatch, capsys):
+    from urllib.error import HTTPError
+    bundle = isolated / 'bundle.json'
+    bundle.write_text('{}')
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    monkeypatch.setattr(sys, 'argv', ['compose_notification.py', json.dumps({
+        'kind': 'event', 'bundle_path': str(bundle)})])
+    def fail(*args):
+        raise HTTPError('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                        429, 'private reason', {'X-Sotto-Admission': 'busy'}, None)
+    monkeypatch.setattr(notification, 'compose', fail)
+    assert notification.main() == notification.work_queue.MODEL_ADMISSION_BUSY_EXIT
+    assert capsys.readouterr().err == 'notification model admission busy\n'
+
+
+def test_busy_candidate_stops_before_later_error_can_hide_deferral(isolated, monkeypatch):
+    from urllib.error import HTTPError
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    busy = HTTPError('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                     429, 'private reason', {'X-Sotto-Admission': 'busy'}, None)
+    calls = []
+    def compose_prep(item, now, llm, may_write=True):
+        calls.append(item['id'])
+        if len(calls) == 1:
+            raise busy
+        raise ValueError('later malformed candidate')
+    monkeypatch.setattr(notification, '_meeting_prep', compose_prep)
+    items = [{'key': 'first', 'kind': 'meeting_prep', 'person': 'Alex'},
+             {'key': 'second', 'kind': 'meeting_prep', 'person': 'Blair'}]
+    with pytest.raises(HTTPError) as error:
+        notification.compose('proactive', items)
+    assert error.value is busy
+    assert len(calls) == 1
+
+
+def test_reminder_without_textual_evidence_makes_no_model_call(real_enrichment, monkeypatch):
+    # Self-host consent admits a sourceless calendar event, which comes back as one empty message.
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    item = _prep_item(event={'summary': 'Intro call', 'start': '2026-09-17T12:30:00Z'})
+    text = notification.compose('proactive', [item], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc),
+                                llm=lambda *a, **k: pytest.fail('no grounded evidence, no writer'))
+    assert text == "You're meeting Sam (Partner at Example) in about 30 minutes. Want the full prep on Sam?"
+
+
+def test_reminder_open_items_join_by_identifier_before_shared_first_name(real_enrichment, monkeypatch):
+    other = {'name': 'Sam', 'identifier': '+15550001111', 'what': 'Send Sam the lease addendum',
+             'direction': 'you_owe', 'anchor_key': 'imessage:reply:id:5550001111', 'deadline': None}
+    same = {'name': 'Samantha Lee', 'identifier': 'SAM@example.com', 'what': 'Send the fund memo',
+            'direction': 'you_owe', 'anchor_key': 'gmail:reply:id:memo', 'deadline': None}
+    unbound = {'name': 'Sam', 'identifier': '', 'what': 'Return the borrowed book',
+               'direction': 'you_owe', 'anchor_key': 'note:book', 'deadline': None}
+    monkeypatch.setattr(notification.loops_query, 'query',
+                        lambda: {'you_owe': [other, same, unbound], 'waiting_on_them': []})
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    calls = []
+    def writer(provider, model, key, prompt, **kwargs):
+        calls.append(json.loads(prompt)[0])
+        return json.dumps({'items': [{'id': 'prep-1', 'text': 'Sam asked for the fund memo last week.',
+                                      'draft': '', 'decline': ''}]})
+    item = _prep_item(event={'summary': 'Walk'})  # attendee sam@example.com, not the Sam on +1555…
+    text = notification.compose('proactive', [item], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc), llm=writer)
+    supplied = [row['what'] for row in calls[0]['open_items']]
+    assert supplied == ['Send the fund memo', 'Return the borrowed book']
+    assert 'lease' not in json.dumps(calls) and 'lease' not in text and 'fund memo' in text
+
+
+def test_reminder_after_failed_batch_writer_spends_no_second_attempt_pair(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    calls = []
+    def writer(provider, model, key, prompt, **kwargs):
+        calls.append(prompt)
+        return 'not json'
+    items = [{'kind': 'commitment', 'key': 'c', 'decision_id': 'c1', 'title': 'Send deck', 'person': 'Ana',
+              'deadline': '2026-09-17T00:00:00Z'},
+             _prep_item(person_facts={'sam': 'Sam shared fund plans on September 10.'})]
+    text = notification.compose('proactive', items, now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc), llm=writer)
+    assert len(calls) == 2  # the job's one writer budget, spent by the batch writer
+    assert text == "You're meeting Sam (Partner at Example) in about 30 minutes. Want the full prep on Sam?"
+
+
+def test_reminder_offer_does_not_carry_unchecked_scanner_task(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_prep_threads', lambda *a: [])
+    item = _prep_item(open_loop='send the already delivered deck',
+                      detail='starts in ~30 min · Sam · open with them: send the already delivered deck')
+    text = notification.compose('proactive', [item], now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc),
+                                llm=lambda *a, **k: pytest.fail('no writer'))
+    assert 'deck' not in text
+    doc = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    offer = next(e['offer'] for e in doc['effects'] if e['kind'] == 'pending_offer')
+    assert 'deck' not in json.dumps(offer) and offer['detail'] == 'starts in ~30 min · Sam'

@@ -76,6 +76,7 @@ def _load_tzchain():
 
 TZCHAIN = _load_tzchain()
 WORK_QUEUE = _load_shared_lib('work_queue')
+REQUESTED_BRIEF = _load_shared_lib('requested_brief')
 def _hermes_adapter(name):
     for directory in (Path(__file__).resolve().parents[2] / 'adapters' / 'hermes',
                       Path('/app/adapters/hermes')):
@@ -262,6 +263,8 @@ DASHBOARD.HOOKS.update({
     # same discovery run_triage uses (late-bound so test monkeypatches on _find_sotto_script land).
     "find_script": lambda *rel: _find_sotto_script(*rel),
     "delivery_effects": lambda: _shared_effects(),
+    "relationship_importance": lambda contact, history, now: _load_shared_lib(
+        "relationship_importance").for_contact(contact, history, [], now),
     # THE atomic JSON write (connectors.write_json). dashboard.py/calcache.py don't import
     # connectors, so it arrives the way every other cross-module call here does — a HOOKS lambda.
     "write_json": lambda p, o, mode=0o600, indent=None: CONNECTORS.write_json(p, o, mode, indent),
@@ -500,7 +503,7 @@ def _on_delivered(payload: dict) -> bool:
                 finalized = False
     label = str(payload.get("label") or "")
     kind = MARKED_BRIEF_KINDS.get(label.rsplit(":", 1)[-1].strip())
-    if kind:
+    if kind and not REQUESTED_BRIEF.LABEL.fullmatch(label):
         if kind == 'welcome':
             import onboarding
             onboarding.delivered(DATA)
@@ -541,6 +544,8 @@ def _brief_delivery_gate(label: str, day: str, run_id: str) -> str:
     kind = MARKED_BRIEF_KINDS.get((label or "").rsplit(":", 1)[-1].strip(), "")
     if not kind:
         return OUTBOX.GATE_SEND
+    if REQUESTED_BRIEF.LABEL.fullmatch(label or ""):
+        return OUTBOX.GATE_SEND  # Explicit owner request; outbox run identity still deduplicates.
     today = day or DASHBOARD._local_today()
     marker = delivered_marker(today, kind)
     try:
@@ -801,6 +806,12 @@ def _validated_invalid_brief_recovery(payload, label):
 
 
 def _delivery_valid(payload):
+    if payload.get('feedback_for'):
+        owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+        if (payload.get('feedback_owner') != owner or payload.get('target') != _deliver_target()
+                or not REQUESTED_BRIEF.owner_destination(
+                    DATA, owner, payload.get('feedback_chat_id'), os.environ.get('SOTTO_TENANT_ID'))):
+            return False
     effects = payload.get('effects') or []
     return not effects or _shared_effects().valid(effects, time.time())
 
@@ -974,6 +985,8 @@ def _brief_revision(kind=None):
 
 
 def _job_key(label, prompt):
+    if REQUESTED_BRIEF.LABEL.fullmatch(label):
+        return 'requested:' + REQUESTED_BRIEF.LABEL.fullmatch(label).group(1)
     now = _local_now()
     name = label.rsplit(':', 1)[-1].strip()
     if name in MARKED_BRIEF_KINDS and not label.startswith('run-now:'):
@@ -988,7 +1001,7 @@ def _job_key(label, prompt):
 
 def _spawn_and_deliver(runner: list, prompt: str, label: str,
                        decision_ids: list | None = None, work_not_before: float | None = None,
-                       retry_terminal: bool = False) -> str:
+                       retry_terminal: bool = False, feedback: dict | None = None) -> str:
     """Commit accepted work before returning; the bounded worker owns retries and recovery."""
     if not runner or not shutil.which(runner[0]):
         raise FileNotFoundError('skill runner not found on PATH (SOTTO_RUN_SKILL)')
@@ -1005,7 +1018,7 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
     job_id = WORK_QUEUE.enqueue(DATA, 'run',
         {'runner': runner, 'prompt': prompt, 'label': label, 'decision_ids': decision_ids or []},
         key=_job_key(label, prompt), not_before=work_not_before, valid_until=validity,
-        priority=priority, retry_terminal=retry_terminal)
+        priority=priority, retry_terminal=retry_terminal, feedback=feedback)
     _WORK_WAKE.set()
     return job_id
 
@@ -1035,6 +1048,14 @@ def _execute_work(job):
             procedure = json.loads(prompt)
         except (ValueError, TypeError):
             procedure = {}
+        if REQUESTED_BRIEF.LABEL.fullmatch(label) and not procedure.get('refresh'):
+            cached = REQUESTED_BRIEF.accepted_artifact(
+                DATA, procedure['day'], procedure['kind'], _source_context().allowed)
+            if cached:
+                return {'text': cached['brief_text'], 'label': label,
+                        'effects': [{'kind': 'source_permissions', 'sources': cached['_source_permissions']}],
+                        'valid_until': job.get('valid_until'),
+                        'coverage_until': cached.get('_source_cutoff')}
         # Adapter API owns Hermes flags; a foreign runner receives only its declared arguments.
         argv = _hermes_adapter('runtime_api').run_argv(runner, prompt, usage_path,
                                                   os.environ.get('SOTTO_SPAWN_TOOLSETS', '').strip())
@@ -1069,6 +1090,11 @@ def _execute_work(job):
         if (process.returncode == 75
                 and runner == [sys.executable, str(Path(__file__).with_name('brief_runner.py'))]):
             raise _WorkDeferredError('brief generation is busy')
+        if (process.returncode == WORK_QUEUE.MODEL_ADMISSION_BUSY_EXIT
+                and runner in ([sys.executable, str(Path(__file__).with_name('brief_runner.py'))],
+                               [sys.executable, str(Path(__file__).with_name('procedure_runner.py'))],
+                               [sys.executable, _find_sotto_script('_shared', 'scripts', 'compose_notification.py')])):
+            raise _WorkAdmissionBusyError('model admission busy')
         if process.returncode:
             error = _WorkerError(process.returncode, _stderr)
             error.model_budget_exhausted = (
@@ -1130,6 +1156,10 @@ class _WorkDeferredError(RuntimeError):
     """The deterministic runner could not acquire its input lock before doing any work."""
 
 
+class _WorkAdmissionBusyError(RuntimeError):
+    """The proxy rejected an unbilled call; the original work deadline still applies."""
+
+
 def _work_one(job):
     settled = threading.Event()
     owner = job.get('owner') or _WORK_OWNER
@@ -1157,12 +1187,22 @@ def _work_one(job):
             os.unlink(_delivery_effects_path(job['id']))
         except OSError:
             pass
-    except _WorkDeferredError:
+    except (_WorkDeferredError, _WorkAdmissionBusyError) as error:
         # Learning and recomposition share an input lock. Contention must not spend the three
-        # fault attempts; release's timestamp sets the next due time, not the hard job deadline.
-        WORK_QUEUE.release(DATA, job['id'], owner, now=time.time() + 60)
-        _record_delivery(job['payload'].get('label', job['kind']), 'skipped',
-                         f'work {job["id"]}: generation busy; retry queued', run_id=job['id'])
+        # fault attempts. A typed proxy refusal is equally unbilled. Release moves the next due
+        # time without changing the original relevance deadline or a saved delivery result.
+        admission_busy = isinstance(error, _WorkAdmissionBusyError)
+        disposition = WORK_QUEUE.defer(DATA, job['id'], owner, delay_seconds=60,
+                                       max_age_seconds=3600 if admission_busy else None)
+        if disposition is None:
+            return  # a newer lease owns the result and its receipt
+        reason = ('model admission busy' if isinstance(error, _WorkAdmissionBusyError)
+                  else 'generation busy')
+        detail = ('retry queued' if disposition in ('pending', 'ready')
+                  else 'relevance deadline reached; no retry queued')
+        _record_delivery(job['payload'].get('label', job['kind']),
+                         'skipped' if disposition in ('pending', 'ready') else 'failed',
+                         f'work {job["id"]}: {reason}; {detail}', run_id=job['id'])
     except _WorkInterruptedError:
         # A redeploy's SIGTERM, not the job's fault: the lease goes back uncharged so the next
         # instance simply resumes it. Charging it made a day's brief terminal in three pushes.
@@ -1221,11 +1261,26 @@ def _drain_work():
                 raise
 
 
+def _requested_brief_feedback():
+    """Reconcile terminal work even when expiry happened before a worker could claim it."""
+    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    for job in WORK_QUEUE.feedback_jobs(DATA):
+        meta = job['feedback']
+        if (not isinstance(meta, dict) or not REQUESTED_BRIEF.LABEL.fullmatch(meta.get('label', ''))
+                or meta.get('owner') != owner or meta.get('target') != _deliver_target()
+                or not REQUESTED_BRIEF.owner_destination(
+                    DATA, owner, meta.get('chat_id'), os.environ.get('SOTTO_TENANT_ID'))):
+            continue
+        if OUTBOX.enqueue_work_feedback(job):
+            WORK_QUEUE.clear_feedback(DATA, job['id'])
+
+
 def start_work_thread():
     def loop():
         while not _WORK_STOP.is_set():
             try:
                 _drain_work()
+                _requested_brief_feedback()
             except Exception as error:
                 print(f'[sotto] work queue: {type(error).__name__}', flush=True)
             _WORK_WAKE.wait(5)
@@ -1303,6 +1358,48 @@ def _brief_model_ready() -> bool:
         return True
     except Exception:
         return False
+
+
+def request_owner_brief(body):
+    """Called only after bearer + gateway capability authentication; never accepts a destination."""
+    if (body.get('kind') not in ('morning', 'evening', 'auto')
+            or type(body.get('refresh')) is not bool
+            or any(not isinstance(body.get(k), str) or not 0 < len(body[k]) <= 512
+                   for k in ('owner', 'chat_id', 'message_id'))):
+        return 400, {'error': 'invalid brief request'}
+    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    if body['owner'] != owner or not REQUESTED_BRIEF.owner_destination(
+            DATA, owner, body['chat_id'], os.environ.get('SOTTO_TENANT_ID')):
+        return 403, {'error': 'owner conversation required'}
+    if _deliver_target() not in ('photon', 'photon:' + owner, 'photon:' + body['chat_id']):
+        return 409, {'error': 'owner messaging is unavailable'}
+    now = _local_now()
+    kind = body['kind'] if body['kind'] != 'auto' else ('morning' if now.hour < 12 else 'evening')
+    ident = REQUESTED_BRIEF.identity(owner, body['chat_id'], body['message_id'])
+    label = f'requested:{ident}:sotto-{kind}-brief'
+    prior = WORK_QUEUE.get(DATA, WORK_QUEUE.job_id_for('run', 'requested:' + ident))
+    if prior is not None:
+        return 200, {'status': 'known_request', 'request_id': prior['id']}
+    # A prior uncertain gallery stays uncertain. A repeated request must not send a replacement.
+    with CONNECTORS.json_transaction(OUTBOX.path(), default={}) as state:
+        if any(row.get('day') == str(now.date()) and row.get('status') == 'pending'
+               and row.get('kind') == 'brief'
+               and (row.get('acceptance_uncertain') or row.get('acceptance') in ('unknown', 'in_flight'))
+               for row in state.get('rows', [])):
+            return 200, {'status': 'pending_delivery'}
+    import onboarding
+    if onboarding.scheduled_hold(DATA) or _fresh_selfhost_brief_hold():
+        return 200, {'status': 'needs_context'}
+    composer = _find_sotto_script('_shared', 'scripts', 'compose_brief.py')
+    if not composer:
+        return 503, {'error': 'brief composer unavailable'}
+    request = {'kind': kind, 'pack': str(Path(composer).parents[2]), 'day': str(now.date()),
+               'work_key': label, 'refresh': body['refresh']}
+    job_id = _spawn_and_deliver([sys.executable, str(Path(__file__).with_name('brief_runner.py'))],
+                                json.dumps(request), label, feedback={
+                                    'label': label, 'owner': owner, 'chat_id': body['chat_id'],
+                                    'target': _deliver_target()})
+    return 200, {'status': 'queued', 'request_id': job_id}
 
 
 def _managed_brief(skill: str, label: str, payload_path: str = "",
@@ -4555,9 +4652,9 @@ class Handler(BaseHTTPRequestHandler):
                     "</div></section><script>window.location.replace("
                     + json.dumps(url).replace('<', r'\u003c') + ");</script>"))
             return self._handle_setup_post(path)
-        if path not in ("/sotto/trigger", "/mcp", "/bridge/respond", "/bridge/events"):
+        if path not in ("/sotto/trigger", "/mcp", "/bridge/respond", "/bridge/events", "/chat/brief"):
             return self._send(404, {"error": "not found"})
-        token = (MCP_TOKEN if path == "/mcp"
+        token = (MCP_TOKEN if path in ("/mcp", "/chat/brief")
                  else RELAY_TOKEN if path in ("/bridge/respond", "/bridge/events") else TOKEN)
         if path in ('/bridge/respond', '/bridge/events'):
             authenticated = self._bridge_authed()
@@ -4568,6 +4665,10 @@ class Handler(BaseHTTPRequestHandler):
             authenticated = self._authed(token)
         if not authenticated:
             return self._send(401, {"error": "unauthorized"})
+        if path == '/chat/brief':
+            presented = self.headers.get('X-Sotto-Chat-Send', '')
+            if not CHAT_SEND_TOKEN or not hmac.compare_digest(presented.encode(), CHAT_SEND_TOKEN.encode()):
+                return self._send(403, {'error': 'chat capability required'})
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -4580,6 +4681,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad json"})
         if not isinstance(body, dict):
             return self._send(400, {"error": "bad json"})
+        if path == '/chat/brief':
+            code, response = request_owner_brief(body)
+            return self._send(code, response)
         if path in ("/sotto/trigger", "/bridge/events"):
             import managed
             try:

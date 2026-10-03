@@ -4,7 +4,10 @@ import importlib.util
 import os
 import sys
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 
@@ -83,7 +86,305 @@ def photon(request, monkeypatch):
     monkeypatch.setattr(plugin, 'TYPING_START_DELAY_SECONDS', 0.01)
     instance = captured['adapter_factory']()
     instance.gallery_test = gallery
+    instance.plugin_test = plugin
     return instance
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Give me my evening brief', {'kind': 'evening', 'refresh': False}),
+    ('send me the morning brief again!', {'kind': 'morning', 'refresh': False}),
+    ('Show me my brief?', {'kind': 'auto', 'refresh': False}),
+    ('Could you give me my evening brief, please?', {'kind': 'evening', 'refresh': False}),
+    ('Could you give me my evening brief please?', {'kind': 'evening', 'refresh': False}),
+    ('Can you show me the morning brief?', {'kind': 'morning', 'refresh': False}),
+    ('Refresh my evening brief', {'kind': 'evening', 'refresh': True}),
+    ('update the brief', {'kind': 'auto', 'refresh': True}),
+    ('Could I get my evening brief, please?', {'kind': 'evening', 'refresh': False}),
+    ("I'd like my morning brief", {'kind': 'morning', 'refresh': False}),
+    ('Give me my evening brief and text Sam', None),
+    ('What is in my evening brief?', None),
+])
+def test_brief_request_is_narrow(photon, text, expected):
+    event = types.SimpleNamespace(text=text)
+    assert photon.plugin_test.brief_request(event) == expected
+    event.media_urls = ['photo']
+    assert photon.plugin_test.brief_request(event) is None
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Give me my evening brief and tell me what is on my calendar',
+     ({'kind': 'evening', 'refresh': False}, 'tell me what is on my calendar')),
+    ('What is on my calendar and could I get my morning brief?',
+     ({'kind': 'morning', 'refresh': False}, 'What is on my calendar')),
+    ('Refresh my brief and remind me to call Sam',
+     ({'kind': 'auto', 'refresh': True}, 'remind me to call Sam')),
+    ('Give me my brief and a summary of the week', None),
+    ('Give me my brief and send it to Alex', None),
+    ('Give me my brief and explain that to Sam', None),
+    ('Give me my brief and tell me about it', None),
+    ('Give me my brief and send the brief to Alex', None),
+    ('Give me my brief and give me my evening brief', None),
+    ('Give me my brief and tell me a joke and text Sam', None),
+    ("Don't give me my brief and tell me about it", None),
+    ('“Give me my brief” and tell me why that phrase is odd', None),
+    ('What did I say about "give me my brief" and my calendar?', None),
+    ('What is in my evening brief and when will it arrive?', None),
+])
+def test_brief_turn_extracts_only_independent_explicit_request(photon, text, expected):
+    event = types.SimpleNamespace(text=text)
+    assert photon.plugin_test.brief_turn(event) == expected
+    event.reply_to_text = 'Give me my brief'
+    assert photon.plugin_test.brief_turn(event) is None
+    event.reply_to_text = None
+    event.media_urls = ['attachment']
+    assert photon.plugin_test.brief_turn(event) is None
+
+
+@pytest.mark.parametrize('text,remainder', [
+    ('Give me my evening brief and tell me about tomorrow', 'tell me about tomorrow'),
+    ('Tell me about tomorrow and give me my evening brief', 'Tell me about tomorrow'),
+])
+def test_compound_brief_queues_and_preserves_other_chat_clause(
+        photon, tmp_path, monkeypatch, text, remainder):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    seen = []
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief',
+                        lambda config, payload: seen.append(payload) or 'queued')
+    event = types.SimpleNamespace(text=text,
+        message_id='compound-1', source=types.SimpleNamespace(chat_id='chat', user_id='chat',
+                                                              chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert seen == [{'kind': 'evening', 'refresh': False, 'message_id': 'compound-1',
+                     'owner': 'chat', 'chat_id': 'chat'}]
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Your evening brief is queued.'}),
+                            ('/model_turn', remainder)]
+    assert event.text == text
+
+
+def test_compound_redelivery_does_not_repeat_chat_clause(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief', lambda *_: 'known_request')
+    event = types.SimpleNamespace(text='Give me my brief and tell me a joke', message_id='compound-1',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/send', {'spaceId': 'chat',
+                                      'text': photon.plugin_test.BRIEF_REPLAY_OTHER})]
+
+
+def test_compound_without_provider_id_never_admits(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief',
+                        lambda *_: pytest.fail('no stable provider identity'))
+    event = types.SimpleNamespace(text='Give me my brief and tell me a joke', message_id=None,
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/send', {'spaceId': 'chat',
+                                      'text': photon.plugin_test.BRIEF_UNAVAILABLE
+                                              + photon.plugin_test.BRIEF_OTHER_NOT_PROCESSED})]
+
+
+@pytest.mark.parametrize('status,notice', [
+    (None, 'BRIEF_UNAVAILABLE'),
+    ('needs_context', None),
+    ('pending_delivery', 'BRIEF_PENDING_DELIVERY'),
+])
+def test_compound_nonadmission_explicitly_defers_other_clause(
+        photon, tmp_path, monkeypatch, status, notice):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief', lambda *_: status)
+    event = types.SimpleNamespace(text='Give me my brief and tell me a joke', message_id='compound-3',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    prefix = (getattr(photon.plugin_test, notice) if notice else
+              'I need a connected source before I can prepare your brief.')
+    assert photon.calls == [('/send', {'spaceId': 'chat',
+                                      'text': prefix + photon.plugin_test.BRIEF_OTHER_NOT_PROCESSED})]
+
+
+def test_compound_without_receiver_keeps_complete_chat_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: None)
+    event = types.SimpleNamespace(text='Give me my brief and tell me a joke', message_id='compound-2',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/model_turn', event.text)]
+
+
+def test_brief_request_queues_without_model_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    seen = []
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief',
+                        lambda config, payload: seen.append(payload) or 'queued')
+    event = types.SimpleNamespace(text='Give me my evening brief', message_id='inbound-1',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert seen == [{'kind': 'evening', 'refresh': False, 'message_id': 'inbound-1',
+                     'owner': 'chat', 'chat_id': 'chat'}]
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': 'Your evening brief is queued.'})]
+
+
+def test_brief_unknown_admission_never_runs_model(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief', lambda *_: None)
+    event = types.SimpleNamespace(text='Refresh my morning brief', message_id='inbound-2',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/send', {'spaceId': 'chat', 'text': photon.plugin_test.BRIEF_UNAVAILABLE})]
+
+
+def test_prior_uncertain_gallery_waits_without_model_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief', lambda *_: 'pending_delivery')
+    event = types.SimpleNamespace(text='Send me my evening brief again', message_id='inbound-4',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/send', {'spaceId': 'chat',
+                                      'text': photon.plugin_test.BRIEF_PENDING_DELIVERY})]
+
+
+def test_known_inbound_redelivery_has_no_second_reply_or_model_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: ('loopback', {}))
+    monkeypatch.setattr(photon.plugin_test, '_admit_brief', lambda *_: 'known_request')
+    event = types.SimpleNamespace(text='Give me my evening brief', message_id='original-id',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == []
+
+
+def test_no_receiver_binding_leaves_existing_model_turn(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config', lambda: None)
+    event = types.SimpleNamespace(text='Give me my evening brief', message_id='inbound-3',
+        source=types.SimpleNamespace(chat_id='chat', user_id='chat', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    assert photon.calls == [('/model_turn', event.text)]
+
+
+def test_brief_request_respects_owner_boundary(photon, tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture')
+    monkeypatch.setenv('PHOTON_PROJECT_ID', 'fixture')
+    monkeypatch.setattr(photon.plugin_test, '_brief_receiver_config',
+                        lambda: pytest.fail('foreign user must not inspect receiver binding'))
+    event = types.SimpleNamespace(text='Give me my evening brief', message_id='foreign',
+        source=types.SimpleNamespace(chat_id='stranger', user_id='stranger', chat_type='dm'))
+    asyncio.run(photon.handle_message(event))
+    if os.environ['SOTTO_DEPLOYMENT_MODE'] == 'managed':
+        assert photon.calls == []
+    else:
+        assert photon.calls == [('/model_turn', event.text)]
+
+
+def test_brief_receiver_binding_requires_exact_loopback_and_private_header(photon, monkeypatch):
+    loader = types.ModuleType('tools.mcp_tool_config')
+    tools = types.ModuleType('tools')
+    monkeypatch.setitem(sys.modules, 'tools', tools)
+    monkeypatch.setitem(sys.modules, 'tools.mcp_tool_config', loader)
+    monkeypatch.setenv('PORT', '8787')
+    entry = {'url': 'http://127.0.0.1:8787/mcp',
+             'headers': {'Authorization': 'Bearer test', 'X-Sotto-Chat-Send': 'private'}}
+    loader._load_mcp_config = lambda: {'sotto-local': entry}
+    assert photon.plugin_test._brief_receiver_config() == ('http://127.0.0.1:8787', entry['headers'])
+    for url in ('https://evil.example/mcp', 'http://127.0.0.1:8788/mcp',
+                'http://localhost:8787/mcp', 'http://127.0.0.1:8787/mcp/other'):
+        entry['url'] = url
+        assert photon.plugin_test._brief_receiver_config() is None
+    entry['url'] = 'http://127.0.0.1:8787/mcp'
+    entry['headers'].pop('X-Sotto-Chat-Send')
+    assert photon.plugin_test._brief_receiver_config() is False
+
+
+def test_brief_admission_rejects_redirect_without_second_request(photon, monkeypatch):
+    calls = []
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            calls.append((request.full_url, request.get_method(), timeout,
+                          request.get_header('X-sotto-chat-send')))
+            raise urllib.error.HTTPError(request.full_url, 302, 'redirect',
+                                         {'Location': 'https://elsewhere.example'}, None)
+
+    def opener(*handlers):
+        assert any(isinstance(h, photon.plugin_test._NoRedirect) for h in handlers)
+        return RedirectingOpener()
+
+    monkeypatch.setattr(urllib.request, 'build_opener', opener)
+    status = photon.plugin_test._admit_brief(
+        ('http://127.0.0.1:8787', {'X-Sotto-Chat-Send': 'private'}),
+        {'kind': 'evening', 'refresh': False, 'message_id': 'inbound',
+         'owner': 'chat', 'chat_id': 'chat'})
+    assert status is None
+    assert calls == [('http://127.0.0.1:8787/chat/brief', 'POST', 10, 'private')]
+
+
+def test_brief_admission_reads_pending_delivery_status(photon, monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read(self, _limit):
+            return b'{"status":"pending_delivery"}'
+
+    monkeypatch.setattr(urllib.request, 'build_opener',
+                        lambda *_: types.SimpleNamespace(open=lambda *_args, **_kw: Response()))
+    assert photon.plugin_test._admit_brief(
+        ('http://127.0.0.1:8787', {'X-Sotto-Chat-Send': 'private'}),
+        {'kind': 'evening', 'refresh': False, 'message_id': 'inbound',
+         'owner': 'chat', 'chat_id': 'chat'}) == 'pending_delivery'
+
+
+def test_brief_admission_reads_known_request_status(photon, monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read(self, _limit):
+            return b'{"status":"known_request"}'
+
+    monkeypatch.setattr(urllib.request, 'build_opener',
+                        lambda *_: types.SimpleNamespace(open=lambda *_args, **_kw: Response()))
+    assert photon.plugin_test._admit_brief(
+        ('http://127.0.0.1:8787', {'X-Sotto-Chat-Send': 'private'}),
+        {'kind': 'evening', 'refresh': False, 'message_id': 'inbound',
+         'owner': 'chat', 'chat_id': 'chat'}) == 'known_request'
 
 
 def test_isolated_typing_calls_and_fast_replies_do_not_flash(photon):
@@ -323,3 +624,52 @@ def test_missing_link_cannot_bypass_sender_authorization(photon, tmp_path, monke
         assert photon.calls == []
     else:
         assert photon.calls == [('/model_turn', event.text)]  # upstream authorization, no direct reply
+
+
+@pytest.mark.parametrize("clock", [1790899100.0, 1790899200.0, 1790899300.0])
+def test_reply_context_preserves_transport_target_and_time(photon, monkeypatch, clock):
+    plugin = photon.plugin_test
+    event = types.SimpleNamespace(text='reaction:added:👍', reply_to_message_id='older-message',
+        source=types.SimpleNamespace(chat_id='owner-chat'), timestamp=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    monkeypatch.setattr(plugin.time, 'time', lambda: clock)
+    result = plugin.reply_context(event)
+    assert result is not event and result.text == event.text == 'reaction:added:👍'
+    assert 'older-message' in result.channel_prompt and 'owner-chat' in result.channel_prompt
+    assert f'"before": {min(1790899200.0, clock)}' in result.channel_prompt
+
+
+def test_reply_metadata_preserves_reaction_feedback_and_commands(photon):
+    plugin = photon.plugin_test
+    event = types.SimpleNamespace(text='Thanks!', source=types.SimpleNamespace(chat_id='chat'),
+        message_id='thanks', timestamp=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    contextual = plugin.reply_context(event)
+    asyncio.run(photon.on_processing_start(contextual))
+    assert ('/react', {'spaceId': 'chat', 'messageId': 'thanks', 'emoji': '❤️'}) in photon.calls
+    event.text = '/new'
+    assert plugin.reply_context(event) is event
+
+
+@pytest.mark.parametrize('text', ['yes', 'no', 'ok', '👍', 'approve', '2', 'restart gateway',
+                                  'reaction:added:👍'])
+def test_reply_context_never_changes_text_that_gateway_intercepts_match(photon, text):
+    # Hermes matches approval words, clarify digits, slash confirms and restart coercion on the
+    # exact event.text; the metadata rides this turn's ephemeral channel_prompt instead.
+    plugin = photon.plugin_test
+    event = types.SimpleNamespace(text=text, channel_prompt='Existing channel prompt.',
+        source=types.SimpleNamespace(chat_id='any;-;chat', user_id='chat', chat_type='dm'),
+        message_id='in-1', timestamp=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    result = plugin.reply_context(event)
+    assert result.text == text and event.channel_prompt == 'Existing channel prompt.'
+    assert result.channel_prompt.startswith('Existing channel prompt.\n\n[Sotto transport reply context: ')
+    assert '"chat_id": "chat"' in result.channel_prompt  # the owner key detached offers record
+
+
+def test_reply_context_keeps_other_conversations_and_bare_media_unchanged(photon):
+    plugin = photon.plugin_test
+    stamp = datetime(2026, 10, 2, tzinfo=timezone.utc)
+    group = types.SimpleNamespace(text='yes', timestamp=stamp,
+        source=types.SimpleNamespace(chat_id='any;+;group', user_id='chat', chat_type='group'))
+    assert '"chat_id": "any;+;group"' in plugin.reply_context(group).channel_prompt
+    media = types.SimpleNamespace(text='', media_urls=['/tmp/p.jpg'], timestamp=stamp,
+        source=types.SimpleNamespace(chat_id='any;-;chat', user_id='chat', chat_type='dm'))
+    assert plugin.reply_context(media) is media and media.text == ''
