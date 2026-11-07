@@ -1,0 +1,38 @@
+{
+  "name": "direct-lowercase-company",
+  "world": {
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Cedar Labs",
+          "domain": "cedar.example",
+          "about": "Cedar Labs builds clinic scheduling tools. Its pilot codename is Juniper-47. The pilot covers twelve pediatric clinics. Its public website is https://cedar.example/."
+        }
+      ]
+    },
+    "websites": {
+      "https://cedar.example/": "Cedar Labs official website. The new pilot is Juniper-48, expanded to eighteen pediatric clinics. Updated October 18, 2026."
+    }
+  },
+  "turns": [
+    {
+      "text": "check cedar labs website, what's new?",
+      "contains": [
+        "Juniper-48"
+      ],
+      "websiteReads": 1
+    },
+    {
+      "text": "and how many clinics now?",
+      "containsAny": [
+        [
+          "18",
+          "eighteen"
+        ]
+      ],
+      "excludes": [
+        "Which company"
+      ]
+    }
+  ]
+}

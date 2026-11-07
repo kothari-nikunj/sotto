@@ -45,6 +45,18 @@ def _parse_ts(ts: str):
         return None
 
 
+def _calendar_day(value) -> str | None:
+    """Project a real calendar day; legacy relative or invalid dates remain unknown."""
+    raw = _s(value)
+    # Legacy ledger dates can carry a display-only weekday annotation. The
+    # explicit date remains authoritative even if that annotation was mistaken.
+    legacy = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}) \((?:mon|tue|wed|thu|fri|sat|sun)\)", raw, re.I)
+    if legacy:
+        raw = legacy[1]
+    parsed = _parse_ts(raw)
+    return raw[:10] if parsed is not None and parsed.date().isoformat() == raw[:10] else None
+
+
 def parse_observed_time(value):
     """An observed ISO/Bridge timestamp, Gmail date header, or epoch time, normalized to UTC."""
     from email.utils import parsedate_to_datetime

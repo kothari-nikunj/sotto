@@ -57,6 +57,7 @@ import preferences  # noqa: E402
 from gemini_transport import ModelBudgetUnavailableError, proxy_budget_exhausted  # noqa: E402
 from work_queue import MODEL_BUDGET_EXIT  # noqa: E402
 from personal_context import conversation_key, conversation_message  # noqa: E402
+from envutil import int_env as _int_env  # noqa: E402
 
 REVIEW_CONVERSATION_CAP = 100
 REVIEW_MESSAGES_CAP = 20
@@ -73,13 +74,6 @@ COUNT_CLASSES = frozenset({"ambient", "quiet", "cooldown", "stale", "budget", "s
                            "meeting_hold", "actionable", "scheduling_ask"})
 # Of those, the deferred-agent ones sort first in items — they were judged interrupt-worthy once.
 ACTIONABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "snoozed", "meeting_hold", "actionable", "scheduling_ask"})
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
 
 
 def _events_dir() -> str:

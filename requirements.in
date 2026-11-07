@@ -11,3 +11,5 @@ cryptography==50.0.1
 # Local document conversion and card rendering; neither uses a hosted service.
 firecrawl-anydoc==0.2.4
 Pillow==12.3.0
+# Pinned native fixed-cron successor calculations for staged personal routines.
+croniter==6.0.0

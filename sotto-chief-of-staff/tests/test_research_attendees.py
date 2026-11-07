@@ -1,6 +1,7 @@
-"""research_attendees.py — batched grounded research (port of gemini-research.ts): stub, dedup/cap, batching."""
+"""research_attendees.py — batched grounded research: stub, dedup/cap, batching."""
 import importlib.util, json, os
 import pytest
+import research_contract
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -34,10 +35,10 @@ def test_dedup_cap_and_batching(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     seen_batches, deep_batches = [], []
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None: (seen_batches.append(len(batch)) or
+                        lambda batch, key: (seen_batches.append(len(batch)) or
                                                  [{"email": a["email"], "company": "C", "summary": "s"} for a in batch]))
     monkeypatch.setattr(ra, "_deep_batch",
-                        lambda batch, ctx, key, known: (deep_batches.append(len(batch)) or []))
+                        lambda batch, key: (deep_batches.append(len(batch)) or []))
     people = [{"name": f"P{i}", "email": f"p{i}@x.com"} for i in range(12)] + [{"name": "P0", "email": "P0@x.com"}]
     out = ra.research(people, "ctx")
     assert len(out["attendees"]) == 12               # dupe (case-insensitive) dropped
@@ -45,10 +46,6 @@ def test_dedup_cap_and_batching(monkeypatch):
     assert sorted(deep_batches) == [3, 3, 3, 3]       # Pass B: 12 → batches of 3
 
 
-def test_context_summary_sorted():
-    s = ra._context_summary([{"summary": "B", "start": "2026-06-29T15:00"},
-                             {"summary": "A", "start": "2026-06-29T09:00"}])
-    assert s.index('"A"') < s.index('"B"')           # soonest first
 
 
 # ── Pass A upgrades: company fallback + comms context + grounding discipline ──────────────────────
@@ -56,7 +53,7 @@ def test_context_summary_sorted():
 def test_profile_prompt_domain_hint_and_company_fallback():
     p = ra._build_prompt([{"name": "Nelson Rojas", "email": "nelson@cobalt-research.com"},
                           {"name": "sam", "email": "sam@rasyn.ai"},
-                          {"name": "Jo Free", "email": "jo@yahoo.com"}], "ctx")
+                          {"name": "Jo Free", "email": "jo@yahoo.com"}])
     assert "(corporate domain cobalt-research.com — research the company too)" in p
     assert "(use domain rasyn.ai to identify company)" in p          # no last name → identify company
     # freemail: no company hint (yahoo, because the public-repo secrets guard flags g-mail addresses)
@@ -67,57 +64,24 @@ def test_profile_prompt_domain_hint_and_company_fallback():
 
 def test_no_unsourced_numbers_rule_verbatim_in_both_prompts():
     # The ported original's citation-backed-numbers rule, restored verbatim into BOTH live prompts.
-    a = ra._build_prompt([{"name": "A B", "email": "a@x.com"}], "")
-    b = ra._build_deep_prompt([{"name": "A B", "email": "a@x.com"}], "", {}, 90)
+    a = ra._build_prompt([{"name": "A B", "email": "a@x.com"}])
+    b = ra._build_deep_prompt([{"name": "A B", "email": "a@x.com"}], 90)
     for prompt in (a, b):
         assert ra.NO_UNSOURCED_NUMBERS in prompt
     assert "a $115M exit" in ra.NO_UNSOURCED_NUMBERS and "permanent knowledge graph" in ra.NO_UNSOURCED_NUMBERS
 
 
-def test_comms_context_threads_into_profile_prompt():
-    comms = {"emails": [
-        {"headers": {"from": "Dana <dana@acme.com>", "subject": "Pricing thread", "date": "Tue"},
-         "snippet": "circling back on the pilot"},
-        {"from": "other@y.com", "to": "someone@z.com", "subject": "noise"},
-    ]}
-    by = ra._comms_by_email(comms, {"dana@acme.com"})
-    assert by["dana@acme.com"] == ['email Tue "Pricing thread": circling back on the pilot']
-    p = ra._build_prompt([{"name": "Dana Roe", "email": "dana@acme.com"}], "", comms_by_email=by)
-    assert 'Recent comms with the user: email Tue "Pricing thread"' in p
 
 
-def test_comms_by_email_caps_at_three():
-    emails = [{"from": "dana@acme.com", "subject": f"s{i}"} for i in range(5)]
-    by = ra._comms_by_email(emails, {"dana@acme.com"})
-    assert len(by["dana@acme.com"]) == 3
 
 
-def test_comms_by_email_accepts_per_attendee_shape():
-    # gather_google --attendee-comms output: already keyed per attendee, with direction —
-    # the meeting-prep path (30d per-attendee threads, not the 24h global gmail file).
-    comms = {"Dana@acme.com": [
-        {"date": "Tue", "subject": "Pricing", "snippet": "circling back on the pilot",
-         "from_me": False},
-        {"date": "Wed", "subject": "Re: Pricing", "snippet": "sent the revised SOW",
-         "from_me": True},
-    ] + [{"date": f"d{i}", "subject": f"s{i}", "snippet": "x", "from_me": False} for i in range(3)],
-        "other@x.com": [{"date": "d", "subject": "s", "snippet": "not an attendee",
-                         "from_me": False}]}
-    by = ra._comms_by_email(comms, {"dana@acme.com"})
-    assert by["dana@acme.com"][0] == 'email Tue "Pricing" (them→you): circling back on the pilot'
-    assert by["dana@acme.com"][1] == 'email Wed "Re: Pricing" (you→them): sent the revised SOW'
-    assert len(by["dana@acme.com"]) == 3                   # same ≤3 cap as the raw-gmail path
-    assert "other@x.com" not in by                         # non-attendees dropped
-    p = ra._build_prompt([{"name": "Dana Roe", "email": "dana@acme.com"}], "", comms_by_email=by)
-    assert 'Recent comms with the user: email Tue "Pricing" (them→you)' in p
 
 
 # ── Pass B: recency sweep, novelty, post-filters, knobs ───────────────────────────────────────────
 
-def test_deep_prompt_novelty_includes_known_facts_and_recency_window():
-    p = ra._build_deep_prompt([{"name": "Dana Roe", "email": "dana@acme.com"}], "ctx",
-                              {"dana@acme.com": "CEO at Acme; raised a Series A"}, 45)
-    assert "Already known (do NOT repeat any of this): CEO at Acme; raised a Series A" in p
+def test_deep_prompt_excludes_known_facts_and_keeps_recency_window():
+    p = ra._build_deep_prompt([{"name": "Dana Roe", "email": "dana@acme.com"}], 45)
+    assert "Already known (do NOT repeat any of this): CEO at Acme; raised a Series A" not in p
     assert "last ~45 days" in p
     assert '"[Name] blog"' in p and '"[Name] podcast OR talk"' in p    # multiple distinct searches
     assert "an empty list beats a stretch" in p
@@ -162,25 +126,12 @@ def test_hooks_are_gone_from_schema_prompt_and_output():
     source — schema, prompt, post-filter — not merely hidden at render time."""
     deep_props = ra.DEEP_SCHEMA["properties"]["attendees"]["items"]["properties"]
     assert "conversation_hooks" not in deep_props
-    prompt = ra._build_deep_prompt([{"name": "A", "email": "a@b.com"}], "ctx", {}, 90)
+    prompt = ra._build_deep_prompt([{"name": "A", "email": "a@b.com"}], 90)
     assert "conversation_hooks" not in prompt and "hook" not in prompt.lower()
     assert "FACTS ONLY" in prompt          # what replaced it: report, don't advise
     assert not hasattr(ra, "MAX_HOOKS")
 
 
-def test_filler_filter_still_guards_meeting_prep_talking_points():
-    """is_filler_point outlives the hook: compose_meeting_prep applies it to the talking points,
-    the one place this tree still emits "what to say"."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "cmp_prep", os.path.join(ROOT, "meeting-prep", "scripts", "compose_meeting_prep.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    # Same source file, loaded twice by two importlib specs — compare behaviour, not identity.
-    assert os.path.realpath(mod.ra.__file__) == os.path.realpath(ra.__file__)
-    assert "ra.is_filler_point" in open(spec.origin, encoding="utf-8").read()
-    assert mod.ra.is_filler_point("Build rapport before the pitch")
-    assert not mod.ra.is_filler_point("Ask about her Devcon talk on eval harnesses")
 
 
 def test_filler_points_dropped_verbatim_failure_modes():
@@ -190,12 +141,12 @@ def test_filler_points_dropped_verbatim_failure_modes():
                    "Understand what prompted the meeting",
                    "Explore potential overlaps between your funds",
                    "Build rapport before the pitch"):
-        assert ra.is_filler_point(filler), filler
+        assert research_contract.is_filler_point(filler), filler
     # Concrete, grounded points survive — even ask-shaped ones anchored to a real find.
     for real in ("He published a piece on agent memory last week — strong hook given your roadmap",
                  "Ask about her Devcon talk on eval harnesses",
                  "Their $4M seed closed in July per TechCrunch"):
-        assert not ra.is_filler_point(real), real
+        assert not research_contract.is_filler_point(real), real
     assert ra._postfilter_deep({"recent_activity": [], "personal": []}) == \
         {"recent_activity": [], "personal": []}
 
@@ -204,12 +155,12 @@ def test_two_pass_merge_and_schema_roundtrip(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         [{"email": a["email"], "title": "CEO", "company": "Acme",
                           "relevance": ["r"], "summary": "bio", "company_summary": "Acme does X."}
                          for a in batch])
     monkeypatch.setattr(ra, "_deep_batch",
-                        lambda batch, ctx, key, known:
+                        lambda batch, key:
                         [{"email": "p0@x.com",
                           "recent_activity": [{"when": "late July 2026", "what": "Wrote a post.",
                                                "source_url": "https://s.com/p"},
@@ -236,7 +187,7 @@ def test_deep_disable_knob(monkeypatch):
     monkeypatch.setenv("SOTTO_RESEARCH_DEEP", "0")
     called = []
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         [{"email": a["email"], "company": "C", "summary": "s"} for a in batch])
     monkeypatch.setattr(ra, "_deep_batch", lambda *a, **k: called.append(1) or [])
     out = ra.research([{"name": "A B", "email": "a@b.com"}], "")
@@ -248,7 +199,7 @@ def test_deep_batch_failure_never_kills_profile_results(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.delenv("SOTTO_RESEARCH_DEEP", raising=False)
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         [{"email": a["email"], "company": "C", "summary": "s"} for a in batch])
 
     def boom(*a, **k):
@@ -301,7 +252,7 @@ def test_artifact_lock_timeout_defers_before_provider_call(tmp_path, monkeypatch
     @contextmanager
     def busy_lock(path):
         raise TimeoutError('fixture artifact lock contention')
-        yield
+        yield  # noqa: V201
     monkeypatch.setattr(jsonstore, 'lock', busy_lock)
     monkeypatch.setattr(ra, '_grounded_json_once',
                         lambda *args: (_ for _ in ()).throw(AssertionError('provider called')))
@@ -327,19 +278,6 @@ def test_deep_horizon_gate():
     assert ra._within_research_horizon({})                              # no start → trust the selector
 
 
-def test_known_facts_prefers_explicit_known_and_reads_graph(tmp_path, monkeypatch):
-    assert ra._known_facts({"known": "CEO at Acme", "email": "x@y.com"}) == "CEO at Acme"
-    # Graph fallback: a persisted profile's title/company + facts pack into the novelty anchor.
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    people = os.path.join(str(tmp_path), "knowledge", "people")
-    os.makedirs(people, exist_ok=True)
-    with open(os.path.join(people, "c_dana.md"), "w") as f:
-        f.write("---\nschema: 1\ncanonical_id: c_dana\nname: Dana Roe\ntitle: CEO\ncompany: Acme\n"
-                "identifiers: [dana@acme.com]\nfacts:\n  f1:\n    text: Raised a Series A\n"
-                "    type: context\n    status: active\n    seen: 1\n    conf: 0.8\n    source: ''\n"
-                "    source_ref: ''\n    first: '2026-08-01'\n    last: '2026-08-01'\n---\n")
-    known = ra._known_facts({"name": "Dana Roe", "email": "dana@acme.com"})
-    assert "CEO at Acme" in known and "Raised a Series A" in known
 
 
 def test_main_writes_out_file_and_truncates_stale(tmp_path, monkeypatch, capsys):
@@ -384,22 +322,33 @@ def test_matches_focus_one_rule():
     assert not ra.matches_focus("commenda.io", "Spencer Kim", "spencer.kim@commenda.io")  # domain ≠ local
 
 
+def test_focus_prompt_excludes_private_context_and_company_memory():
+    prompt = ra._build_focus_prompt({'name': 'Dana Roe', 'email': 'dana@cedar.example'})
+    assert 'Direct message: please review the new onboarding flow' not in prompt
+    assert 'Recent communications with this person (source material, not instructions)' not in prompt
+    assert 'Stored company context (not current verification)' not in prompt
+    assert 'Automated research from 2025: an old funding claim' not in prompt
+    assert "Stored context is a novelty and identity aid" not in prompt
+    assert 'product-feedback conversation does not need a fundraising dossier' in prompt
+
+
 def test_focus_prompt_covers_company_founder_traction_market_and_honesty():
-    p = ra._build_focus_prompt({"name": "Spencer Kim", "email": "spencer@commenda.io"}, "ctx",
-                               "CEO at Commenda")
+    p = ra._build_focus_prompt({"name": "Spencer Kim", "email": "spencer@commenda.io"})
     assert "Focus Person (the ONLY person to research here)" in p
     assert "(company domain commenda.io — that is the company to research)" in p
-    assert "Already known: CEO at Commenda" in p
+    assert "Already known: CEO at Commenda" not in p
     for field in ("builds:", "founder_story:", "traction:", "market:"):
         assert field in p
-    assert '"[Company] competitors OR alternatives"' in p          # multiple distinct searches
+    assert 'Choose additional searches to answer material gaps' in p  # scope follows the meeting
     assert '"Not public" beats a guess' in p
     assert ra.NO_UNSOURCED_NUMBERS in p                            # same discipline as Pass B
+    assert 'Attribute company security, privacy, retention and performance promises to the company' in p
+    assert 'do not turn them into verified guarantees' in p
     assert "return company_deep with empty fields" in p            # empty beats a stretch
     # A freemail focus gets no company-domain instruction to chase.
-    q = ra._build_focus_prompt({"name": "Jo Free", "email": "jo@yahoo.com"}, "", "")
+    q = ra._build_focus_prompt({"name": "Jo Free", "email": "jo@yahoo.com"})
     assert "that is the company to research" not in q
-    assert "Already known: (nothing on file)" in q
+    assert "Already known: (nothing on file)" not in q
 
 
 def test_postfilter_focus_drops_unsourced_traction_and_empty_fields():
@@ -430,18 +379,18 @@ def _stub_passes(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         [{"email": a["email"], "title": "CEO", "company": "Commenda",
                           "relevance": [], "summary": "bio"} for a in batch])
-    monkeypatch.setattr(ra, "_deep_batch", lambda batch, ctx, key, known: [])
+    monkeypatch.setattr(ra, "_deep_batch", lambda batch, key: [])
 
 
 def test_focus_merges_company_deep_onto_that_one_attendee(monkeypatch):
     _stub_passes(monkeypatch)
     calls = []
 
-    def fake_focus(attendee, ctx, key, known, known_company=""):
-        calls.append((attendee["email"], known))
+    def fake_focus(attendee, key):
+        calls.append(attendee["email"])
         return [{"email": "WRONG@echo.com",                # model echoed a different key…
                  "company_deep": {"company": "Commenda", "builds": ["Global tax filing"],
                                   "founder_story": "Built it after a misfiled quarter.",
@@ -452,7 +401,7 @@ def test_focus_merges_company_deep_onto_that_one_attendee(monkeypatch):
     people = [{"name": "Spencer Kim", "email": "spencer@commenda.io", "known": "CEO at Commenda"},
               {"name": "Dana Roe", "email": "dana@acme.com"}]
     out = ra.research(people, "ctx", focus="spencer")["attendees"]
-    assert calls == [("spencer@commenda.io", "CEO at Commenda")]      # ONE call, for ONE person
+    assert calls == ["spencer@commenda.io"]      # ONE call, for ONE person
     spencer, dana = out
     # …but the join key is the TARGET's email, so a deep dive can never land on someone else.
     assert spencer["email"] == "spencer@commenda.io" and spencer["company"] == "Commenda"
@@ -499,7 +448,7 @@ def test_cli_focus_flag_reaches_research(tmp_path, monkeypatch, capsys):
 
 
 # ── Dashboard persistence hook: $SOTTO_DATA/cache/research_<local-date>.json ─────────────────────
-# (The Window M3 — docs/plans/web-dashboard-the-window.md. Best-effort like _archive_brief.)
+# (The Window M3 — docs/archive/plans/web-dashboard-the-window.md. Best-effort like _archive_brief.)
 
 from datetime import datetime, timedelta  # noqa: E402
 
@@ -638,7 +587,7 @@ def test_deep_by_default_never_fans_out_across_matching_people(monkeypatch):
     _stub_passes(monkeypatch)
     calls = []
     monkeypatch.setattr(ra, "_focus_batch",
-                        lambda attendee, ctx, key, known, known_company="":
+                        lambda attendee, key:
                         calls.append(attendee["email"]) or [])
     people = [{"name": "Spencer Kim", "email": "spencer@commenda.io"},
               {"name": "Spencer Ruiz", "email": "spencer@other.com"},
@@ -658,11 +607,11 @@ def test_name_only_subject_is_researched_not_silently_dropped(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     seen = []
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         seen.append([_s(a.get("email")) or a["name"] for a in batch]) or
                         [{"email": a.get("email", ""), "title": "Founder", "company": "Antimatter",
                           "summary": "bio of " + a["name"]} for a in batch])
-    monkeypatch.setattr(ra, "_deep_batch", lambda batch, ctx, key, known: [])
+    monkeypatch.setattr(ra, "_deep_batch", lambda batch, key: [])
     out = ra.research([{"name": "Antim Kabra"}, {"name": "B Person", "email": "b@c.com"}], "ctx")
     by = {a.get("name") or a["email"]: a for a in out["attendees"]}
     assert set(by) == {"Antim Kabra", "b@c.com"}
@@ -678,9 +627,9 @@ def test_email_less_people_dedupe_by_name(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     batches = []
     monkeypatch.setattr(ra, "_research_batch",
-                        lambda batch, ctx, key, comms=None, known=None:
+                        lambda batch, key:
                         batches.append(batch) or [])
-    monkeypatch.setattr(ra, "_deep_batch", lambda batch, ctx, key, known: [])
+    monkeypatch.setattr(ra, "_deep_batch", lambda batch, key: [])
     ra.research([{"name": "Antim Kabra"}, {"name": "antim kabra"}, {"name": ""}], "ctx")
     assert sum(len(b) for b in batches) == 1        # one person, once; the blank is not a person
 
@@ -691,9 +640,307 @@ def test_a_batched_sweep_hit_for_an_unasked_email_still_surfaces(monkeypatch):
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setattr(ra, "_research_batch", lambda *a, **k: [])
-    monkeypatch.setattr(ra, "_deep_batch", lambda batch, ctx, key, known:
+    monkeypatch.setattr(ra, "_deep_batch", lambda batch, key:
                         [{"email": "surprise@x.com",
                           "recent_activity": [{"what": "Launched Y.", "source_url": "https://y.com"}],
                           "personal": []}])
     out = ra.research([{"name": "Dana", "email": "dana@acme.com"}], "ctx")["attendees"]
     assert [a["email"] for a in out] == ["surprise@x.com"]
+
+
+def test_company_uses_original_grounded_batch_without_person(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "company-fixture")
+    monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
+    monkeypatch.delenv("SOTTO_RESEARCH_DEEP", raising=False)
+    monkeypatch.setattr(ra.wr, "provider_chain", lambda _: ["fixture"])
+    monkeypatch.setattr(ra.gemini_transport, "credential", lambda: "fixture")
+    novelty, calls = [], []
+    import knowledge_update as ku
+    monkeypatch.setattr(ku, "company_knowledge", lambda **kwargs: novelty.append(kwargs) or {})
+    def grounded(prompt, schema, timeout, fallback):
+        calls.append(prompt)
+        assert schema is ra.COMPANY_SCHEMA
+        assert "owner-supplied domain cedar.example" in prompt
+        assert "Owner-corrected baseline" not in prompt and ra.NO_UNSOURCED_NUMBERS in prompt
+        assert "## Focus Person" not in prompt and "email:" not in prompt
+        return {"companies": [{"identity_status": "identified", "domain": "invented.example",
+            "email": "invented@cedar.example", "company_deep": {"company": "Cedar Labs",
+            "builds": ["Scheduling tools"], "traction": ["Unsourced", "Launch (https://cedar.example/news)"]}}]}, "fixture"
+    monkeypatch.setattr(ra.wr, "deep_research", grounded)
+    expected = {"companies": [{"company_deep": {"company": "Cedar Labs", "builds": ["Scheduling tools"],
+        "traction": ["Launch (https://cedar.example/news)"]}, "domain": "cedar.example"}]}
+    assert ra.research_company("Cedar.Example") == expected
+    assert ra.research_company("Cedar.Example") == expected
+    assert len(calls) == 1
+    assert novelty == []
+    assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
+
+
+def test_company_memory_stays_out_of_both_existing_research_calls(tmp_path, monkeypatch):
+    """An owner-edited About must not turn later cached web news into owner-confirmed facts."""
+    from datetime import datetime, timezone
+    import knowledge_update as ku
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
+    monkeypatch.delenv("SOTTO_RESEARCH_DEEP", raising=False)
+    monkeypatch.setattr(ra.wr, "provider_chain", lambda _: ["fixture"])
+    monkeypatch.setattr(ra.gemini_transport, "credential", lambda: "fixture")
+    now = datetime(2025, 1, 2, tzinfo=timezone.utc)
+    ku.apply({"company_updates": [{"company_name": "Cedar Labs", "domain": "cedar.example",
+        "about": "Owner correction: Cedar builds scheduling tools, not payment tools.",
+        "updated_by": "user_edit"}]}, now)
+    ku.apply({"company_updates": [{"company_name": "Cedar Labs", "updated_by": "web_research",
+        "last_researched": "2025-01-02", "news": [{"text": "Company claimed a pilot launch",
+        "url": "https://cedar.example/news"}]}]}, now)
+    calls = []
+    def grounded(prompt, *args, **kwargs):
+        calls.append(prompt)
+        return []
+    monkeypatch.setattr(ra, "_grounded_json", grounded)
+    ra._focus_batch({"name": "Dana", "email": "dana@cedar.example"}, "fixture")
+    ra.research_company("cedar.example")
+    assert len(calls) == 2  # one existing provider operation per requested workflow
+    for prompt in calls:
+        assert "About (owner correction; preserve): Owner correction: Cedar builds scheduling tools" not in prompt
+        assert "Last research recorded: 2025-01-02 (not current verification)." not in prompt
+        assert "Saved news (stored claim; not covered by About ownership):" not in prompt
+        assert "Company claimed a pilot launch" not in prompt and "https://cedar.example/news" not in prompt
+        assert "Stored context is a novelty and identity aid" not in prompt
+        assert "Treat the block above as known" not in prompt
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("rows", [[], [{"identity_status": "ambiguous", "company_deep": {"company": "Guess", "builds": ["Wrong"]}}],
+    [{"identity_status": "not_found", "company_deep": {}}], [{"identity_status": "identified", "company_deep": {"company": "Name only"}}],
+    [{"identity_status": "identified", "company_deep": {"builds": ["No company identity"]}}],
+    [{"identity_status": "identified", "company_deep": {"company": "Cedar", "builds": "Not an array"}}],
+    [{"identity_status": "identified", "company_deep": {"company": "Cedar", "market": {"untyped": "fact"}}}], [{}, {}]])
+def test_unusable_company_results_are_explicit_and_empty(tmp_path, monkeypatch, rows):
+    stub = tmp_path / "company.json"
+    stub.write_text(json.dumps({"companies": rows}))
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setenv("SOTTO_LLM_STUB", str(stub))
+    monkeypatch.delenv("SOTTO_RESEARCH_DEEP", raising=False)
+    result = ra.research_company("Cedar")
+    assert result["companies"] == [] and result["warnings"]
+
+
+def test_company_limits_missing_provider_and_deep_disable(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
+    monkeypatch.delenv("SOTTO_RESEARCH_DEEP", raising=False)
+    monkeypatch.setattr(ra.wr, "provider_chain", lambda _: [])
+    assert ra.research_company("Cedar Labs") == {"companies": [], "warnings": [ra.wr.NO_PROVIDER]}
+    monkeypatch.setenv("SOTTO_RESEARCH_DEEP", "0")
+    assert "disabled" in ra.research_company("Cedar Labs")["warnings"][0]
+    for selector in ["", " Cedar", "Cedar\nLabs", "x" * 201, "Cedar\u0085Labs", "Cedar\u2028Labs"]:
+        with pytest.raises(ValueError):
+            ra.research_company(selector)
+    for selector in ["Cedar Labs", "https://cedar.example", "fake@cedar.example", "localhost", "127.0.0.1"]:
+        assert ra.company_domain(selector) == ""
+
+
+def test_company_cli_does_not_create_person_cards(tmp_path):
+    import subprocess, sys
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps({"companies": [{"identity_status": "identified", "company_deep": {
+        "company": "Cedar Labs", "builds": ["Scheduling tools"]}}]}))
+    output = tmp_path / "research.json"
+    env = dict(os.environ, SOTTO_DATA=str(tmp_path), SOTTO_LLM_STUB=str(stub), SOTTO_RESEARCH_DEEP="1")
+    result = subprocess.run([sys.executable, ra.__file__, "--company", "Cedar Labs", "--out", str(output)],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output.read_text())
+    assert payload == json.loads(result.stdout) and "attendees" not in payload
+    assert "domain" not in payload["companies"][0]
+    assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
+    refused = subprocess.run([sys.executable, ra.__file__, "--company", "Cedar", "--attendees", str(stub)],
+                             env=env, capture_output=True, text=True)
+    assert refused.returncode == 2
+
+
+
+
+
+
+
+@pytest.mark.parametrize("failure", ["timeout", "503", "429", "unrelated400", "truncated", "invalid_json"])
+def test_research_does_not_retry_provider_or_answer_failures(monkeypatch, failure):
+    import io
+    from urllib.error import HTTPError
+    calls = []
+    def grounded(*args, **kwargs):
+        calls.append(kwargs)
+        if failure == "invalid_json":
+            return "not JSON"
+        if failure == "timeout":
+            raise TimeoutError("read timed out")
+        if failure == "truncated":
+            raise ValueError("research output truncated")
+        code = 400 if failure == "unrelated400" else int(failure)
+        raise HTTPError("https://example.invalid", code, "rejected", {},
+                        io.BytesIO(b'{"error":{"message":"invalid request"}}'))
+    monkeypatch.setattr(ra, "_gemini_grounded", grounded)
+    with pytest.raises(Exception):
+        ra._gemini_json("prompt", "unused", {}, 90, 8192, "{}")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("elapsed,expected_calls", [(20, 2), (90, 1)])
+def test_schema_only_retry_shares_original_deadline(monkeypatch, elapsed, expected_calls):
+    import io
+    from urllib.error import HTTPError
+    clock, calls = [0], []
+    monkeypatch.setattr(ra.time, "monotonic", lambda: clock[0])
+    def grounded(prompt, key, use_schema, **kwargs):
+        calls.append((use_schema, kwargs["timeout"]))
+        if use_schema:
+            clock[0] = elapsed
+            raise HTTPError("https://example.invalid", 400, "rejected", {}, io.BytesIO(
+                b'{"error":{"message":"Tool use with a response mime type: application/json is unsupported"}}'))
+        return '{"attendees": []}'
+    monkeypatch.setattr(ra, "_gemini_grounded", grounded)
+    if elapsed >= 90:
+        with pytest.raises(TimeoutError, match="deadline"):
+            ra._gemini_json("prompt", "unused", {}, 90, 8192, "{}")
+    else:
+        assert ra._gemini_json("prompt", "unused", {}, 90, 8192, "{}") == {"attendees": []}
+        assert calls[1] == (False, 70)
+    assert len(calls) == expected_calls
+
+
+def test_all_passes_exclude_private_project_context(monkeypatch):
+    """Private project context must not be transmitted as a disambiguation hint."""
+    monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
+    monkeypatch.setenv("SOTTO_RESEARCH_DEEP", "1")
+    monkeypatch.setattr(ra.wr, "provider_chain", lambda _: ["gemini"])
+    monkeypatch.setattr(ra.gemini_transport, "credential", lambda: "test")
+    prompts = {}
+    def grounded(prompt, *args, **kwargs):
+        prompts[args[-1]] = prompt
+        return []
+    monkeypatch.setattr(ra, "_grounded_json", grounded)
+    known = "Prior background. " * 32 + "Project: https://cedar.example/dana, a personal automation notebook."
+    attendees = [
+        {"name": "Dana Roe", "email": "dana@yahoo.com", "known": known},
+        {"name": "Sam Lee", "email": "sam@yahoo.com", "known": "Unrelated private context"},
+    ]
+    comms = {
+        "dana@yahoo.com": [{"date": "2026-10-14", "from_me": False,
+            "subject": "Our call", "snippet": "Let's talk about my notebook.",
+            "thread_context": "Dana wrote: use https://cedar.example/dana, not cedar-vendor.example."}],
+        "sam@yahoo.com": [{"snippet": "Sam's unrelated confidential request"}],
+    }
+    ra.research(attendees, "Dana call", comms=comms, focus="Dana Roe")
+    assert set(prompts) == {"profile", "recency", "focus"}  # same three stages, no extra lookup
+    for stage in ("profile", "focus"):
+        assert "Project: https://cedar.example/dana, a personal automation notebook." not in prompts[stage]
+        assert "Let's talk about my notebook." not in prompts[stage]
+    # The bounded thread read is local composition context; no research stage receives it.
+    assert all("Dana wrote:" not in prompt for prompt in prompts.values())
+    assert "Sam's unrelated confidential request" not in prompts["focus"]
+    assert "Unrelated private context" not in prompts["focus"]
+
+
+def test_private_conversation_and_thread_bodies_never_reach_research_providers(monkeypatch, tmp_path):
+    """Direct messages and full Gmail thread reads are for local prep composition only; every
+    research prompt excludes even bounded email snippets and learned memory."""
+    monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(ra, "_deep_enabled", lambda: True)
+    monkeypatch.setattr(ra, "_within_research_horizon", lambda _: True)
+    monkeypatch.setattr(ra.gemini_transport, "credential", lambda: "k")
+    monkeypatch.setattr(ra.wr, "provider_chain", lambda _: ["parallel"])
+    sent = []
+    monkeypatch.setattr(ra.wr, "_parallel_task",
+                        lambda prompt, schema, timeout: sent.append(prompt) or {"attendees": []})
+    attendees = [{"email": "dana@acme.com", "name": "Dana Reed", "company": "Acme",
+                  "conversation_context": "imessage 2026-10-14 (them→you): my divorce hearing is Tuesday"}]
+    comms = {"dana@acme.com": [{"date": "2026-10-10", "subject": "Pilot", "snippet": "Pilot timing next week",
+                                "from_me": False, "thread_context":
+                                "Exact Gmail thread, bounded read:\nemail [m1] (sender x): my salary is 250k"}]}
+    ra.research(attendees, "Dana call", comms, focus="Dana Reed")
+    assert len(sent) == 3  # profile, recency and focus all ran through the provider
+    joined = "\n".join(sent)
+    assert "divorce hearing" not in joined and "salary is 250k" not in joined
+    assert "Pilot timing next week" not in joined
+
+
+def test_focus_research_is_scoped_by_actual_meeting_not_mandatory_fundraising():
+    prompt = ra._build_focus_prompt({'name': 'Taylor Reed', 'email': 'taylor@yahoo.com'})
+    assert 'supplied name and domain' in prompt and 'Product feedback' not in prompt
+    assert '[Company] funding OR raise' not in prompt
+    assert 'exact entity' in prompt
+
+
+def test_private_memory_never_reaches_any_research_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
+    monkeypatch.setattr(ra, '_deep_enabled', lambda: True)
+    monkeypatch.setattr(ra, '_within_research_horizon', lambda _: True)
+    monkeypatch.setattr(ra.gemini_transport, 'credential', lambda: 'fixture')
+    monkeypatch.setattr(ra.wr, 'provider_chain', lambda _: ['parallel', 'exa', 'gemini'])
+    import knowledge as kg
+    import knowledge_update as ku
+    monkeypatch.setattr(kg, 'find_person_file', lambda *args, **kwargs: pytest.fail('private graph read for research'))
+    monkeypatch.setattr(ku, 'company_knowledge', lambda *args, **kwargs: pytest.fail('private company read for research'))
+    sent = []
+    def failed(provider, prompt):
+        sent.append((provider, prompt))
+        return None
+    monkeypatch.setattr(ra.wr, '_parallel_task', lambda prompt, *args: failed('parallel', prompt))
+    monkeypatch.setattr(ra.wr, '_exa_deep', lambda prompt, *args: failed('exa', prompt))
+    def grounded(prompt, *args, **kwargs):
+        sent.append(('gemini', prompt))
+        return {'attendees': []}
+    monkeypatch.setattr(ra, '_gemini_json', grounded)
+    attendee = {'name': 'Dana Reed', 'email': 'dana@acme.com',
+                'known': 'PRIVATE-KNOWLEDGE', 'company': 'PRIVATE-COMPANY',
+                'conversation_context': 'PRIVATE-DM'}
+    ra.research([attendee], 'PRIVATE-MEETING', {'dana@acme.com': [
+        {'snippet': 'PRIVATE-SNIPPET', 'thread_context': 'PRIVATE-THREAD'}]}, focus='Dana Reed')
+    assert len(sent) == 9
+    assert {provider for provider, _ in sent} == {'parallel', 'exa', 'gemini'}
+    for _, prompt in sent:
+        assert 'PRIVATE-' not in prompt
+        assert 'Dana Reed' in prompt and 'dana@acme.com' in prompt
+
+
+def test_all_attendee_research_prompts_preserve_source_qualification():
+    attendee = {'name': 'Dana Reed', 'email': 'dana@sample.test'}
+    prompts = [ra._build_prompt([attendee]),
+               ra._build_deep_prompt([attendee], 90),
+               ra._build_focus_prompt(attendee)]
+    for prompt in prompts:
+        assert 'membership does not establish certification' in prompt
+        assert 'Copy source URLs exactly' in prompt
+        assert 'including in summary and company_summary' not in prompt
+        assert 'ask whether it exists before asking how it works' not in prompt
+
+
+def test_legacy_context_arguments_are_accepted_without_reading_private_files(tmp_path, monkeypatch):
+    import builtins
+    import sys
+    attendees, stub, out = (tmp_path / name for name in ('attendees.json', 'stub.json', 'out.json'))
+    attendees.write_text('[{"name":"Dana Example","email":"dana@acme.example"}]')
+    stub.write_text('{"attendees":[]}')
+    private_paths = {str(tmp_path / 'context.json'), str(tmp_path / 'comms.json')}
+    opened = []
+    original = builtins.open
+    def record(path, *args, **kwargs):
+        opened.append(str(path))
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(builtins, 'open', record)
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_LLM_STUB', str(stub))
+    monkeypatch.setattr(sys, 'argv', ['research_attendees.py', '--attendees', str(attendees),
+        '--context', str(tmp_path / 'context.json'), '--comms', str(tmp_path / 'comms.json'), '--out', str(out)])
+    ra.main()
+    assert private_paths.isdisjoint(opened)
+    assert json.loads(out.read_text()) == {'attendees': []}

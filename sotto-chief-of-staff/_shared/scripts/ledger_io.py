@@ -18,7 +18,8 @@ Exports:
                               the block is malformed (load_entries tells the two apart and flags
                               malformed entries so writers never persist over them)
   load_entries(...)         — every ledger file's frontmatter, sorted by path (deterministic)
-  load_active()             — the entries the read views surface: ACTIVE status, not snoozed
+  load_active()             — the entries the read views surface: ACTIVE status, not snoozed,
+                              excluding proven unsourced brief birthday courtesies
                               (a PARKED row is neither: hidden until something touches it)
   last_touch_day(fm) / days_untouched(fm, today) — the park rule's one clock
   CHASE_STATE_FIELDS        — everything the chase lane has spent on a loop, cleared as one
@@ -28,13 +29,16 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import sys
-from datetime import date, timezone
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from textutil import _s  # noqa: E402
-from timeutil import _now_local, _parse_ts, configured_tz  # noqa: E402  (ages match the brief)
+from timeutil import _calendar_day, _now_local, _parse_ts, configured_tz  # noqa: E402  (ages match the brief)
+import funnel_policy as _funnel_policy  # noqa: E402
+from ledger_provenance import classify_ledger_sources, UnknownProvenanceError  # noqa: E402
 
 try:
     import yaml
@@ -52,14 +56,45 @@ TERMINAL = {"resolved", "dismissed", "expired"}        # continuity.rs:230
 PARKED = {"parked"}
 PARK_AFTER_DAYS = 14
 
+
+def task_label(row: dict) -> str:
+    return (_s(row.get("ask")).strip() or _s(row.get("summary")).strip()
+            or _s(row.get("action_type")).replace("_", " ").strip())
+
+
+def contact_label(row: dict) -> str:
+    name = _s(row.get("contact_name"))
+    if name:
+        return name
+    try:
+        kind, _sources = classify_ledger_sources(row)
+    except UnknownProvenanceError:
+        return "(unknown)"
+    return "Your task" if kind == "owner" else "(unknown)"
+
+
+def completion_basis(status: str, resolution: str, *, evidence_visible: bool = False) -> str:
+    """Describe recorded fulfillment, never infer real-world non-completion from active state.
+
+    Callers must apply source consent before indicating that supporting evidence is visible.
+    """
+    if status in ACTIVE:
+        return 'not_recorded'
+    if status != 'resolved':
+        return 'ledger_state'
+    if resolution == 'user_resolved':
+        return 'user_confirmed'
+    return 'source_evidence' if evidence_visible else 'ledger_state'
+
+
 # ── Direction, defined ONCE ──────────────────────────────────────────────────────────────────────
 # One sentence: `waiting_on` is the only type where the OTHER side owes the user, so it is the only
-# one that is chased instead of age-expired — everything else (reply / follow_up / follow_up_stale /
-# call_back / …) is a debt the USER owes. `follow_up_stale` reads like "they went quiet" but its
-# semantics are "you owe them a nudge": it resolves on the user's OUTGOING message and expires on
-# the user's clock, so it lives in you_owe, here and in every read view.
+# one in waiting_on; everything else (reply / follow_up / follow_up_stale / call_back / …) is a
+# debt the USER owes. `follow_up_stale` means "you owe them a nudge", so it lives in you_owe.
+# Age and silence do not resolve ordinary obligations; source-backed completion is validated
+# by the canonical resolver, not inferred by this direction map.
 WAITING_ON_TYPES = {"waiting_on"}
-CHASE_MAX = 2                                          # then it hands off to sotto-loops
+CHASE_MAX = _funnel_policy.CHASE_MAX
 
 # ── The CLOSED family vocabulary (the anchor's middle component) ─────────────────────────────────
 # One sentence: a debt belongs to one of four families — owed-to-you, a calendar shadow, a
@@ -114,8 +149,197 @@ def normalize_action_type(t) -> str:
 
 
 def is_waiting_on(t) -> bool:
-    """True when the OTHER side owes the user — the one direction that is chased, never age-expired."""
+    """True when the other side owes the user; this classifies direction, not completion."""
     return normalize_action_type(t) in WAITING_ON_TYPES
+
+
+def is_routine_birthday_greeting(row: dict) -> bool:
+    """A suggested birthday wish, distinct from planning or a requested birthday task."""
+    text = f"{_s(row.get('summary'))} {_s(row.get('ask'))}".casefold()
+    if re.search(r'\b(?:plan\w*|party|dinner|lunch|gift|present|reserv\w*|book\w*|venue|invoice|pay\w*|organi[sz]\w*|'
+                 r'celebrat\w*|cake|invite\w*)\b', text):
+        return False                      # planning a birthday is a real task, not a courtesy wish
+    return bool(re.search(
+        r'\bhappy\s+b(?:irth)?day\b|\bb(?:irth)?day\s+(?:wish(?:es)?|greet(?:ing)?s?)\b|'
+        r'\bb(?:irth)?day\b.*\bbelated\b|\bbelated\b.*\bb(?:irth)?day\b', text))
+
+
+def deadline_context(row: dict, today: str) -> dict:
+    """Calendar deadline facts, distinct from the request's recording date and age."""
+    try:
+        deadline = date.fromisoformat(_s(row.get('deadline'))[:10])
+        current = date.fromisoformat(today[:10])
+    except (ValueError, TypeError):
+        return {'deadline': None, 'days_overdue': None}
+    return {'deadline': deadline.isoformat(), 'days_overdue': max(0, (current - deadline).days)}
+
+
+def dated_request_text(text: str, entries: list[dict], now=None) -> str:
+    """Quote relative request wording under its recording date, never infer its event date."""
+    if not re.search(r'\b(?:today|yesterday|tomorrow|tonight)\b', text, re.I):
+        return text
+    dates = {_s(e.get('created_at'))[:10] for e in entries}
+    try:
+        recorded = datetime.strptime(next(iter(dates)), '%Y-%m-%d').date() if len(dates) == 1 else None
+    except ValueError:
+        recorded = None
+    current = (now or datetime.now(timezone.utc)).date()
+    if recorded and recorded <= current:
+        label = f"{recorded.strftime('%b')} {recorded.day}"
+        if recorded.year != current.year:
+            label += f", {recorded.year}"
+        prefix = f'From {label}: '
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            if text.startswith('“') and text.endswith('”'):
+                return prefix + text
+        return f'From {label}: “{text}”'
+    return f'Earlier request (date unknown): “{text}”'
+
+
+def birthday_courtesy_identity():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'morning-brief', 'scripts'))
+    from continuity_resolve import person_identity
+    return person_identity()
+
+
+def birthday_courtesy_importance(row: dict, now, identity=None):
+    """Require a proven person and current permitted reciprocal evidence, or an explicit VIP."""
+    import jsonstore
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'knowledge'))
+    import knowledge as kg
+    from relationship_importance import for_contact
+    from source_context import allowed, _read_source_state, _source_rows, _state_path
+    if row.get('group_id') or not allowed('contacts'):
+        return None
+    if identity is None:
+        # Reuse continuity's collision-aware exact identifier index, never a display-name match.
+        identity = birthday_courtesy_identity()
+    identifier = kg.normalize_identifier(_s(row.get('contact_identifier')))
+    cid = (identity.get('unique_identifiers') or {}).get(identifier)
+    if not cid or (row.get('canonical_id') and row['canonical_id'] != cid):
+        return None
+    try:
+        people = list((identity.get('people_by_cid') or {}).values())
+        person = next(p for p in people if p.canonical_id == cid)
+        name = person.name.strip().casefold()
+        unique_name = sum(p.name.strip().casefold() == name for p in people) == 1
+        root = os.environ.get('SOTTO_DATA', '/data')
+        state = jsonstore.read(os.path.join(root, 'knowledge/relationship_state.json'), default={}, strict=True)
+        record = (state.get('history') or {}).get(cid, {})
+        channels = set(record.get('channels') or {})
+        sources = {('gmail' if ch == 'email' else ch) for ch in channels}
+        # Retained activity from before a regrant cannot re-establish importance. Dated evidence
+        # uses the same conservative common cutoff as its union of source dependencies.
+        source_rows = _source_rows(_read_source_state(_state_path()))
+        regranted = [source_rows.get(source, {}).get('consent_regrant_epoch', 0) for source in sources]
+        cutoff = max((value for value in regranted if type(value) in (int, float)), default=0)
+        if cutoff:
+            since = datetime.fromtimestamp(cutoff, timezone.utc).date().isoformat()
+            record = {**record, 'importance_evidence': {
+                key: [day for day in days if isinstance(day, str) and day > since]
+                for key, days in (record.get('importance_evidence') or {}).items()}}
+        history = {cid: record} if sources and all(allowed(source) for source in sources) else {}
+        prefs = jsonstore.read(os.path.join(root, 'preferences.json'), default={}, strict=True)
+        vips = (prefs.get('explicit') or {}).get('vip_people', []) if unique_name else []
+        importance = for_contact({'name': person.name, 'canonical_id': cid}, history, vips, now)
+        return {**importance, 'canonical_id': cid,
+                'sources': sorted(sources) if importance['reason'] != 'you marked this person VIP' else []}
+    except (OSError, ValueError, TypeError, AttributeError, StopIteration, OverflowError, jsonstore.Unreadable):
+        return None
+
+
+def birthday_courtesy_context(row: dict, local: dict, now, identity: dict):
+    """Bind an optional recent birthday greeting to a current Contacts card, never to silence."""
+    import knowledge as kg
+    from relationship_importance import WINDOW_DAYS
+    importance = birthday_courtesy_importance(row, now, identity)
+    if not importance or importance['tier'] not in {'vip', 'vvip'}:
+        return None
+    cid = importance['canonical_id']
+    dates = set()
+    for card in local.get('contacts') or []:
+        ids = card.get('phones', []) + card.get('emails', [])
+        normalized = {kg.normalize_identifier(_s(value)) for value in ids}
+        owners = {(identity.get('unique_identifiers') or {}).get(value) for value in normalized}
+        if (kg.normalize_identifier(_s(row.get('contact_identifier'))) not in normalized
+                or owners != {cid}):
+            continue
+        try:
+            month, day = map(int, _s(card.get('birthday'))[-5:].split('-'))
+            occurred = date(now.year, month, day)
+            if occurred > now.date():
+                occurred = date(now.year - 1, month, day)
+            if 0 < (now.date() - occurred).days <= WINDOW_DAYS:
+                dates.add(occurred.isoformat())
+        except (TypeError, ValueError):
+            continue
+    if len(dates) != 1:
+        return None
+    occurred = dates.pop()
+    return {'source': 'contacts', 'source_refs': [
+        {'sourceType': 'contacts', 'sourceId': f'{cid}:birthday:{occurred}'}],
+        'birthday_importance_sources': importance['sources'], 'new_obligation': False,
+        'summary': f'Optional birthday greeting (birthday {occurred})', 'ask': '',
+        'created_at': occurred + ' 00:00:00', 'deadline': None, 'resolution_mode': 'birthday_greeting'}
+
+
+def is_optional_birthday_courtesy(row: dict) -> bool:
+    """THE optional-greeting classifier, shared by the brief, `sotto-loops` and the pulse.
+
+    Only a captured Contacts-backed courtesy (`resolution_mode: birthday_greeting`) is optional.
+    A row without that mode — a legacy source-backed request, an owner reminder, or any row whose
+    provenance cannot be classified — stays an ordinary task, visible wherever tasks are.
+    """
+    if _s(row.get('resolution_mode')).strip() != 'birthday_greeting':
+        return False
+    # The same authority split as loops_query.permitted_rows: versioned content provenance
+    # classifies owner rows; a provenance-free row must prove it is a source loop.
+    from ledger_provenance import classify_ledger_sources, source_loop_sources, UnknownProvenanceError
+    try:
+        if row.get('content_provenance') is not None:
+            return classify_ledger_sources(row)[0] != 'owner'
+        return bool(source_loop_sources(row))
+    except (UnknownProvenanceError, TypeError, ValueError, KeyError):
+        return False
+
+
+def birthday_greeting_retired(row: dict, today: str) -> bool:
+    """An optional greeting outlives its offer once the birthday is beyond the capture window.
+
+    Capture admits a greeting only within relationship_importance.WINDOW_DAYS of the actual
+    Contacts birthday; past that same window the courtesy expires through the resolver's ordinary
+    expiry. Owner rows and every non-greeting row are never retired by this rule.
+    """
+    if not is_optional_birthday_courtesy(row):
+        return False
+    from relationship_importance import WINDOW_DAYS
+    dates = {_s(ref.get('sourceId'))[-10:] for ref in row.get('source_refs') or []
+             if isinstance(ref, dict) and ref.get('sourceType') == 'contacts'}
+    if len(dates) != 1:
+        dates = {_s(row.get('created_at'))[:10]}
+    try:
+        birthday = date.fromisoformat(dates.pop())
+        return (date.fromisoformat(_s(today)[:10]) - birthday).days > WINDOW_DAYS
+    except ValueError:
+        return False
+
+
+def is_unsourced_brief_birthday_courtesy(row: dict) -> bool:
+    """Legacy model-created courtesy: retain the record, omit it from active obligation views.
+
+    A positive brief origin and the absence of owner/source evidence are both required. An old
+    row with uncertain provenance remains visible; this policy never guesses that a real request
+    or an owner-added birthday reminder was a courtesy.
+    """
+    if not _s(row.get('source_brief_at')).strip() or not is_routine_birthday_greeting(row):
+        return False
+    provenance = row.get('content_provenance')
+    if isinstance(provenance, dict) and (
+            provenance.get('kind') == 'owner' or provenance.get('sources')):
+        return False
+    return not any(row.get(key) for key in (
+        'source', 'source_refs', 'source_thread_id', 'source_message_id', 'origin_key'))
 
 
 def ledger_dir() -> str:
@@ -171,7 +395,8 @@ def load_entries(with_path: bool = False, include_bare: bool = False) -> list:
 
 
 def load_active(now=None) -> list:
-    """The entries the read views surface: ACTIVE status AND not snoozed past today. Missing status
+    """The entries the read views surface: ACTIVE status, not snoozed, and real obligations.
+    Missing status
     counts as open (matching continuity_resolve's default). A parked row (PARKED) is not ACTIVE, so
     every view that reads through here — the brief's ledger, the count line, `sotto-loops`, the
     cleanup scan, the chase clock — skips it until the resolver revives it.
@@ -179,12 +404,44 @@ def load_active(now=None) -> list:
     The SNOOZE lives here, not in each caller. The brief, `sotto-loops` and the cleanup scan are
     three views of one ledger, and the brief's used to be the one that ignored `snoozed_until` — so
     a loop the user had explicitly parked was named as urgent in the brief and counted in the line
-    that says how many are open, while the dashboard the line points at showed neither. One concept,
-    one implementation: hidden is hidden, in every view."""
-    today = (now or _now_local(configured_tz() or "+00:00")).strftime("%Y-%m-%d")
-    return [fm for fm in load_entries()
+    that says how many are open, while the dashboard the line points at showed neither. Legacy
+    model-only birthday courtesies are kept on disk but hidden from these obligation views; a
+    sourced request or owner-created task still appears. One concept, one implementation: hidden
+    is hidden in every view."""
+    instant = now or _now_local(configured_tz() or "+00:00")
+    return active_entries(load_entries(), instant)
+
+
+def active_entries(rows: list[dict], now) -> list[dict]:
+    """Apply the canonical active/snooze/visibility predicate to already loaded rows.
+
+    Only an optional birthday greeting reads importance state; every other row needs no I/O."""
+    today = now.strftime("%Y-%m-%d")
+    cache: dict = {}
+    return [fm for fm in rows
             if fm.get("status", "open") in ACTIVE
-            and not (_s(fm.get("snoozed_until"))[:10] > today)]
+            and not (_s(fm.get("snoozed_until"))[:10] > today)
+            and not hidden_from_obligation_views(fm, now, cache)]
+
+
+def hidden_from_obligation_views(row: dict, now=None, cache: dict | None = None) -> bool:
+    """THE birthday visibility rule for the brief, `sotto-loops` and the pulse — one predicate.
+
+    Hidden: a provably unsourced brief-created legacy courtesy, or a captured optional greeting
+    (`resolution_mode: birthday_greeting`) whose person no longer proves VIP/VVIP importance.
+    Every other row — legacy source-backed requests, owner reminders, unclassifiable provenance —
+    stays visible.
+    """
+    if is_unsourced_brief_birthday_courtesy(row):
+        return True
+    if not is_optional_birthday_courtesy(row):
+        return False
+    cache = {} if cache is None else cache
+    instant = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    if 'identity' not in cache:
+        cache['identity'] = birthday_courtesy_identity()
+    importance = birthday_courtesy_importance(row, instant, cache['identity'])
+    return not importance or importance['tier'] not in {'vip', 'vvip'}
 
 
 def last_touch_day(fm: dict) -> str:
@@ -213,9 +470,9 @@ def park_candidate(fm: dict, today: str) -> bool:
     return (fm.get("status", "open") in ACTIVE
             and not is_waiting_on(fm.get("action_type"))
             and normalize_action_type(fm.get("action_type")) not in MEETING_TYPES
-            and _s(fm.get("resolution_mode")).strip() != "explicit"
+            and _s(fm.get("resolution_mode")).strip() not in {"explicit", "birthday_greeting"}
             and not (_s(fm.get("snoozed_until"))[:10] > today)
-            and not (_s(fm.get("deadline"))[:10] >= today)
+            and not ((_calendar_day(fm.get("deadline")) or "") >= today)
             and (days_untouched(fm, today) or 0) >= PARK_AFTER_DAYS)
 
 

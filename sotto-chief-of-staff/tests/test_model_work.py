@@ -169,7 +169,7 @@ def test_client_repair_and_route_change_release_exhausted_work(tmp_path, monkeyp
         assert changed['id'] != first
 
 
-def test_brief_preserves_large_output_and_stage_retries(tmp_path, monkeypatch):
+def test_brief_preserves_combined_output_headroom_and_stage_retries(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setenv('GOOGLE_AI_API_KEY', 'test')
     monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
@@ -186,9 +186,44 @@ def test_brief_preserves_large_output_and_stage_retries(tmp_path, monkeypatch):
             with model_work.brief_stage(stage):
                 config = model_work.generation_config('gemini-3.8-flash')
                 assert config['maxOutputTokens'] >= 9000 + 24000
-                assert config['maxOutputTokens'] == 65536 and 'thinkingConfig' not in config
+                # Historical 3.8 revision receipt, not a prediction for low thinking.
+                assert config['maxOutputTokens'] >= 1623 + 59607
+                assert config['maxOutputTokens'] == 65536
+                assert model_work.generation_config('other-model')['maxOutputTokens'] == 65536
+                assert config['thinkingConfig'] == {'thinkingLevel': 'low'}
                 assert gemini.call_gemini('evidence', {}) == '{}'
     assert len(sent) == 9
+
+
+@pytest.mark.parametrize('stage', ['extract', 'critic', 'revise'])
+def test_brief_stage_native_request_bounds_thinking_without_truncating_context(tmp_path, monkeypatch, stage):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_TOKEN', 'test')
+    seen = []
+    response = {'candidates': [{'content': {'parts': [{'text': '{}'}]}}]}
+    def respond(request, **kwargs):
+        seen.append((request, kwargs))
+        return io.BytesIO(json.dumps(response).encode())
+    monkeypatch.setattr(gemini.urllib.request, 'urlopen', respond)
+    schema = {'type': 'object', 'properties': {'markdown': {'type': 'string'}}}
+    with model_work.scope('brief', 'unchanged source evidence'):
+        with model_work.brief_stage(stage):
+            assert gemini.model_once('gemini', 'gemini-3.8-flash', 'test',
+                                     'complete source evidence', schema=schema) == '{}'
+    assert len(seen) == 1
+    request, options = seen[0]
+    body = json.loads(request.data)
+    config = body['generationConfig']
+    assert config['maxOutputTokens'] == 65536
+    assert config['responseSchema'] == schema
+    assert config['response_mime_type'] == 'application/json'
+    assert config['temperature'] == 0.4
+    assert body['contents'] == [{'parts': [{'text': 'complete source evidence'}]}]
+    assert options == {'timeout': 300}
+    assert request.get_header('X-sotto-workload') == 'brief_' + stage
+    assert config['thinkingConfig'] == {'thinkingLevel': 'low'}
 
 
 def test_new_job_can_repeat_success_but_queue_retry_keeps_identity(tmp_path, monkeypatch):
@@ -322,3 +357,74 @@ def test_nonrecoverable_errors_and_other_workloads_keep_original_budget(tmp_path
     with model_work.scope(task, 'failure'), pytest.raises(model_work.ModelWorkHeldError):
         with model_work.attempt('gemini', 'model', 'prompt'):
             pytest.fail('budget reset')
+
+
+@pytest.mark.parametrize('failure', ['proxy', 'client'])
+def test_managed_brief_uncertain_timeout_never_retries_even_after_restart(tmp_path, monkeypatch, failure):
+    import gemini_transport
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_MODEL_PROXY_URL', 'https://proxy.example')
+    monkeypatch.setattr(gemini_transport, 'managed', lambda: True)
+    monkeypatch.setattr(gemini_transport, '_proxy_base', lambda: 'https://proxy.example')
+    monkeypatch.setattr(gemini, 'provider_key', lambda *_: 'key')
+    monkeypatch.setattr(gemini_transport, 'request', lambda *_: 'request')
+    monkeypatch.setattr(gemini_transport, 'effective_compose_model', lambda: ('gemini', 'gemini-3.8-flash'))
+    calls = []
+    def upstream(*_, **kwargs):
+        calls.append(kwargs['timeout'])
+        if failure == 'client':
+            raise TimeoutError('private failure')
+        raise HTTPError('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+                        504, 'timeout', {'X-Sotto-Outcome': 'uncertain'}, io.BytesIO(b'{}'))
+    monkeypatch.setattr(gemini.urllib.request, 'urlopen', upstream)
+    for _ in range(2):
+        with model_work.scope('brief_extract', ['same-request']), pytest.raises(
+                gemini_transport.BriefModelOutcomeUncertainError):
+            gemini.call_gemini('private context', {})
+        importlib.reload(model_work)
+    assert calls == [300]  # client gives the proxy time to report; no hidden retry/fallback
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert db.execute('SELECT status FROM attempts').fetchall() == [('BriefModelOutcomeUncertainError',)]
+    with model_work.scope('brief_extract', ['new-request']), pytest.raises(
+            gemini_transport.BriefModelOutcomeUncertainError):
+        gemini.call_gemini('private context', {})
+    assert calls == [300, 300]  # a genuinely new owner occurrence is not permanently parked
+
+
+@pytest.mark.parametrize('url,headers', [
+    ('https://provider.example/native/v1beta/models/gemini-3.8-flash:generateContent', {'X-Sotto-Outcome': 'uncertain'}),
+    ('https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent', {}),
+    ('https://proxy.example/openai/v1/chat/completions', {'X-Sotto-Outcome': 'uncertain'}),
+])
+def test_provider_504_cannot_spoof_brief_uncertain_signal(monkeypatch, url, headers):
+    import gemini_transport
+    monkeypatch.setattr(gemini_transport, 'managed', lambda: True)
+    monkeypatch.setattr(gemini_transport, '_proxy_base', lambda: 'https://proxy.example')
+    assert not gemini_transport.proxy_brief_outcome_uncertain(HTTPError(url, 504, '', headers, io.BytesIO()))
+
+
+@pytest.mark.parametrize('legacy_parked', [0, 1])
+def test_legacy_operation_layout_preserves_rollback_writes_and_request_latches(tmp_path, monkeypatch, legacy_parked):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(model_work, '_LAST_PRUNE', [model_work.time.time()])
+    (tmp_path / 'events').mkdir()
+    path = tmp_path / 'events/model-work.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE operations (id TEXT PRIMARY KEY, revision TEXT, attempts INTEGER NOT NULL, '
+                   'parked INTEGER NOT NULL, updated REAL NOT NULL)')
+        db.execute('INSERT INTO operations VALUES (?,?,?,?,?)', ('op', 'rev', 2, legacy_parked, 100.0))
+        db.execute('CREATE TABLE attempts (operation TEXT, attempt INTEGER, metadata TEXT, status TEXT, '
+                   'usage TEXT, created REAL, PRIMARY KEY(operation,attempt))')
+        db.execute('INSERT INTO attempts VALUES (?,?,?,?,?,?)', ('op', 2, '{}', 'interrupted_unknown', '{"paid":true}', 100.0))
+        db.execute('CREATE TABLE parked_requests (operation TEXT, revision TEXT, created REAL, PRIMARY KEY(operation,revision))')
+        db.execute('INSERT INTO parked_requests VALUES (?,?,?)', ('op', 'rev', 100.0))
+    for _ in range(2):
+        with model_work._db() as db:
+            assert db.execute('SELECT * FROM operations').fetchall() == [('op', 'rev', 2, legacy_parked, 100.0)]
+    with sqlite3.connect(path) as db:
+        # The previous worker writes all five columns during overlap and rollback.
+        db.execute('INSERT OR REPLACE INTO operations VALUES (?,?,?,?,?)', ('op', 'rev', 3, 0, 101.0))
+    with model_work._db() as db:
+        assert db.execute('SELECT attempts FROM operations').fetchone() == (3,)
+        assert db.execute('SELECT status,usage FROM attempts').fetchall() == [('interrupted_unknown', '{"paid":true}')]
+        assert db.execute('SELECT * FROM parked_requests').fetchall() == [('op', 'rev', 100.0)]

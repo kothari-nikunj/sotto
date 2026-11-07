@@ -3,9 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
-import hashlib
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -16,6 +14,7 @@ import knowledge_update  # noqa: E402
 from source_context import allowed  # noqa: E402
 from timeutil import configured_tz  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
+from render_local import message_version_reference  # noqa: E402
 
 REVIEW_MESSAGES = 160
 MESSAGE_CHARS = 1400
@@ -60,15 +59,16 @@ class MemoryExtractionError(ValueError):
 
 def request_revision():
     """Unblock a rejected history request when its extraction contract changes."""
-    contract = [SCHEMA, SYSTEM, Path(__file__).read_text(), Path(gemini.__file__).read_text(),
-                os.environ.get('SOTTO_BRIEF_MODEL'), os.environ.get('SOTTO_GEMINI_MODEL'),
-                os.environ.get('SOTTO_FALLBACK_MODEL'), os.environ.get('SOTTO_MODEL_PROXY_URL')]
-    return hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    # The cycle checks this latch before entering model_work. Use the same client revision
+    # and policy as that lower request gate: a repaired thinking/output setting or transport
+    # must release BOTH gates, without probing an unchanged rejected request on a timer.
+    return model_work.learning_request_revision('memory_extract', SYSTEM, SCHEMA, Path(__file__).read_text())
 
 
-def observations(source, messages, now=None):
+def observations(source, messages, now=None, *, diagnostics=None):
     now = now or datetime.now(timezone.utc)
     result = []
+    truncated = 0
     for message in messages:
         identifier = str(message.get('handle') or message.get('contact_jid') or message.get('from') or '')
         if message.get('isSent'):
@@ -93,16 +93,24 @@ def observations(source, messages, now=None):
             continue
         text = str(message.get('text') or message.get('body') or message.get('snippet') or '').strip()
         key = message.get('source_id') or message.get('id')
-        if not key or not text:
+        versioned = message_version_reference(message, source)
+        if not (key or versioned) or not text:
             continue
-        result.append({'ref': source + ':' + str(key), 'source': source, 'subject': identifier,
+        truncated += len(text) > MESSAGE_CHARS
+        result.append({'ref': versioned or source + ':' + str(key), 'source': source, 'subject': identifier,
                        'name': str(message.get('resolved_name') or message.get('partner_name') or identifier),
                        'at': instant.isoformat(), 'from_me': bool(message.get('is_from_me') or message.get('isSent')),
                        'text': text[:MESSAGE_CHARS]})
     # Oldest + newest observations keep both asks and later answers in a bounded review.
     result.sort(key=lambda r: r['at'])
+    eligible = len(result)
     if len(result) > REVIEW_MESSAGES:
         result = result[:REVIEW_MESSAGES // 2] + result[-REVIEW_MESSAGES // 2:]
+    if diagnostics is not None:
+        # Counts describe the model's actual input, never the whole connected archive.
+        diagnostics.update(rows=len(messages), eligible=eligible, selected=len(result),
+                           skipped=len(messages) - eligible, omitted=eligible - len(result),
+                           truncated=truncated)
     return result
 
 

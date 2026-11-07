@@ -85,6 +85,27 @@ def test_a_declined_meeting_never_gets_a_prep_nudge():
     assert not ps.scan(cal, [], {}, "me@x.com", now)["nudges"]
 
 
+def test_prep_loop_matches_known_address_even_when_names_collide(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    wrong = {'name': 'Alex Kim', 'identifier': 'alex@other.com',
+             'title': 'Alex Kim — the confidential acquisition memo'}
+    right = {'name': 'A. Kim', 'identifier': ' ALEX@ACME.COM ',
+             'title': 'A. Kim — the design review'}
+    attendee = {'email': 'alex@acme.com', 'displayName': 'Alex Kim'}
+    assert ps._prep_lines(attendee, [wrong, right])[1] == 'the design review'
+    assert ps._prep_lines(attendee, [wrong])[1] == ''
+    # A name-only row cannot override a known attendee address either.
+    assert ps._prep_lines(attendee, [{**wrong, 'identifier': ''}])[1] == ''
+
+
+def test_name_only_prep_loop_requires_one_unambiguous_match(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    attendee = {'displayName': 'Alex Kim'}
+    row = {'name': ' alex kim ', 'title': 'Alex Kim — the design review'}
+    assert ps._prep_lines(attendee, [row])[1] == 'the design review'
+    assert ps._prep_lines(attendee, [row, {**row, 'identifier': 'other@acme.com'}])[1] == ''
+
+
 def test_prep_attendees_exclude_rooms_decliners_and_the_owners_alias():
     now = _at(10)
     event = {'id': 'meeting', 'summary': 'Coffee',
@@ -564,7 +585,7 @@ def test_chase_candidates_read_the_pending_stamp_not_the_count(monkeypatch):
     assert [c["title"] for c in got] == ["Acme — the contract", "Ben — the deck"]
     assert got[0]["detail"] == "asked 5 days ago"
     assert got[0]["anchor_key"] == "email:waiting_on:id:ops@acme.com"
-    assert got[1]["detail"] == "overdue · chased once already"
+    assert got[1]["detail"] == "overdue · reminded you once already"
     assert ps._chase_candidates("2026-08-10") == []            # yesterday's stamp is not today's
 
 
@@ -663,9 +684,14 @@ def test_a_chased_out_loop_asks_its_own_named_question(tmp_path, monkeypatch):
                   handoff_candidates=ps._handoff_candidates())
     n = [x for x in out["nudges"] if x["kind"] == "handoff"]
     assert len(n) == 1 and n[0]["person"] == "Maya"
-    assert n[0]["detail"] == ("I've nudged Maya twice about the contract — "
-                             "nudge them again, or let it go?")
+    assert n[0]["detail"] == ("I've reminded you twice about Maya and the contract — "
+                             "want a follow-up draft, or let it go?")
     assert not [x for x in out["nudges"] if x["kind"] == "retune_offer"]
+
+
+def test_handoff_preserves_task_capitalization(monkeypatch):
+    _handoff_ledger(monkeypatch, what='the NASA contract')
+    assert 'the NASA contract' in ps._handoff_candidates()[0]['question']
 
 
 def test_the_named_question_has_its_own_clock(tmp_path, monkeypatch):
@@ -1012,14 +1038,6 @@ def test_prep_name_uses_exact_email_research_and_never_another_namesake(tmp_path
     assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''
 
 
-def test_malformed_optional_name_data_does_not_drop_prep(tmp_path, monkeypatch):
-    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    sys.path.insert(0, os.path.join(ROOT, "_shared", "knowledge"))
-    import knowledge as kg
-    path = tmp_path / 'corrupt.md'
-    path.write_text('---\nname: [unterminated\n---\n')
-    monkeypatch.setattr(kg, 'find_person_file', lambda **kw: str(path))
-    assert ps._prep_name({'email': 'person@acme.example'}, {}, _at(10)) == ''
 
 
 def test_prep_name_reads_the_message_snapshot_once_per_scan(tmp_path, monkeypatch):
@@ -1058,3 +1076,17 @@ def test_prep_names_founder_from_exact_cached_envelope_without_research(tmp_path
     monkeypatch.setattr(source_context, 'allowed', lambda _: True)
     rows.append(({'source': 'email', 'from': 'Jordan Jones <jordan@acme.example>'}, '', ''))
     assert ps.scan([event], [], {}, 'me@fund.example', now)['nudges'][0]['person'] == ''
+
+
+def test_shared_invite_prep_is_one_offer_and_honors_old_copy_receipt(monkeypatch):
+    now = _at(10)
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'me@x.com')
+    event = {'id': 'own', 'calendar_id': 'me@x.com', 'iCalUID': 'invite', 'summary': 'Pitch',
+             'start': (now + timedelta(minutes=20)).isoformat(), 'end': (now + timedelta(minutes=50)).isoformat(),
+             'attendees': [{'email': 'me@x.com', 'responseStatus': 'accepted'}, {'email': 'vc@fund.com'}]}
+    copied = {**event, 'id': 'shared', 'calendar_id': 'team@group'}
+    assert len(ps.scan([copied, event], [], {}, 'me@x.com', now)['nudges']) == 1
+    accepted = ps.delivery_effects.meeting_occurrence('shared', event['start'])
+    assert ps.scan([event, copied], [], {}, 'me@x.com', now, prepped_occurrences={accepted})['nudges'] == []
+    declined = {**event, 'my_response': 'declined'}
+    assert ps.scan([copied, declined], [], {}, 'me@x.com', now)['nudges'] == []

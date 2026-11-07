@@ -308,7 +308,28 @@ def test_confirm_survives_the_next_extraction_and_reaches_the_drafter(tmp_path):
     channel = "email" if sample["bucket"] == "work_email" else "imessage"
     out = sa.apply({"channel": channel, "recipient": "nobody@example.invalid"})
     assert out["bucket"] == sample["bucket"]
-    assert "shipped before" in out["guidance"] and sample["text"][:40] in out["guidance"]
+    assert "Past shipped drafts (strong voice examples, not current facts)" in out["guidance"] and sample["text"][:40] in out["guidance"]
+
+
+def test_style_examples_quote_exact_duplicates_once_without_dropping_shared_prefixes(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    spec = importlib.util.spec_from_file_location(
+        'style_apply_dedup', os.path.join(HERE, '..', '_shared', 'scripts', 'style_apply.py'))
+    sa = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sa)
+    prefix = 'Thanks for walking me through the plans and sending the detailed proposal for our next step. '
+    original = prefix + 'I can do Friday.'
+    distinct = prefix + 'I cannot do Friday.'
+    sample = {'text': original, 'bucket': 'work_email', 'channel': 'email', 'quality': 0.9}
+    style = {'per_person': {'c_123456': {'name': 'Alex', 'samples': [sample]}},
+             'confirmed': [sample], 'canonical': {'work_email': [sample, {**sample, 'text': distinct}]},
+             'recent': [sample]}
+    (tmp_path / 'style.json').write_text(json.dumps(style))
+    result = sa.apply({'recipient': 'Alex', 'canonical_id': 'c_123456', 'channel': 'email'})
+    assert result['guidance'].count(original) == 1
+    assert distinct in result['guidance']
+    assert result['source'] == 'per_person'
+    assert json.loads((tmp_path / 'style.json').read_text()) == style
 
 
 def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, monkeypatch):
@@ -365,7 +386,7 @@ def test_the_confirmed_bucket_is_capped_newest_first_and_quoted_newest_first(tmp
     sa_spec.loader.exec_module(sa)
     channel = "email" if sample["bucket"] == "work_email" else "imessage"
     guidance = sa.apply({"channel": channel, "recipient": "nobody@example.invalid"})["guidance"]
-    shipped = guidance.split("shipped before")[1].split("###")[0]
+    shipped = guidance.split("Past shipped drafts (strong voice examples, not current facts)")[1].split("###")[0]
     quoted = [ln for ln in shipped.splitlines() if ln.startswith("> ")]
     assert len(quoted) == 4
     assert "older sample number 1 " not in shipped                     # the oldest survivors aren't quoted

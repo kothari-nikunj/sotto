@@ -63,6 +63,31 @@ def test_old_original_thread_refresh_keeps_both_directions_and_does_not_close():
     assert receipt['complete'] is False and receipt['messages'] == 2
 
 
+def test_legacy_exact_gmail_thread_anchor_refreshes_without_name_or_relay_alias():
+    current = loop(anchor_key='thread:original-thread', source_thread_id='',
+                   contact_name='Alex Stone', contact_identifier='')
+    relay = loop(anchor_key='follow_up:cid:relay', source_thread_id='',
+                 channel='imessage', contact_name='Alex Stone',
+                 contact_identifier='+15550001000')
+    service = Service([raw('owner-reply'), raw('new-request', sent=False)])
+    result, receipt = run([current, relay], service)
+    assert [call for call in service.calls if call[0] == 'get'] == [
+        ('get', {'userId': 'me', 'id': 'original-thread', 'format': 'full'})]
+    assert [m['isSent'] for m in result] == [True, False]
+    assert receipt['complete'] is False
+    assert current['status'] == relay['status'] == 'open'
+
+
+def test_legacy_thread_anchor_cannot_override_other_source_or_explicit_thread_id():
+    other_source = loop(anchor_key='thread:original-thread', source_thread_id='',
+                        channel='imessage', contact_identifier='')
+    assert lc.targets([other_source], {}, now=NOW, allowed=lambda _: True,
+                      graph_aliases=lambda _: ()) == []
+    explicit = loop(anchor_key='thread:old-thread', source_thread_id='new-thread')
+    assert lc.targets([explicit], {}, now=NOW, allowed=lambda _: True,
+                      graph_aliases=lambda _: ()) == [('thread', 'new-thread')]
+
+
 def test_no_name_based_lookup_and_no_reads_for_explicit_closed_or_snoozed():
     service = Service()
     rows = [loop(source_thread_id='', contact_name='Same Name'),

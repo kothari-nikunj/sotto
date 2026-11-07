@@ -241,7 +241,7 @@
   }
 
   function weekdayShort(value) {
-    // "2026-08-08" → "Sat". The day alone is enough for "chased x1, Sat" — a
+    // "2026-08-08" → "Sat". The day alone is enough for "reminded you x1, Sat" — a
     // full date on a folio line reads as noise.
     var d = parseWhen(/^\d{4}-\d{2}-\d{2}$/.test(String(value)) ? value + "T12:00:00" : value);
     if (!d) return "";
@@ -410,9 +410,6 @@
     });
   }
 
-  /* All writes: POST JSON + X-Sotto-CSRF. 403 → refresh session once, retry once.
-     503 → toast "editing unavailable". Network failure → toast. Everything else
-     throws for the caller's inline error text. Never optimistic. */
   function apiPost(path, body, retried) {
     return ensureCsrf().then(function (token) {
       return fetch(path, {
@@ -425,7 +422,7 @@
         },
         body: JSON.stringify(body || {})
       }).catch(function () {
-        toast("No connection — nothing was changed");
+        toast("Could not confirm the change. Check the saved state before trying again.");
         return handled("network");
       });
     }).then(function (res) {
@@ -453,6 +450,22 @@
         });
       }
       return res.json().catch(function () { return {}; });
+    });
+  }
+
+  function saveControls(controls, errEl, action) {
+    errEl.hidden = true;
+    controls = controls.filter(function (control) { return !!control; });
+    controls.forEach(function (control) { control.disabled = true; });
+    return Promise.resolve().then(action).catch(function (err) {
+      if (err && err.handled && err.message === "network" && main.querySelector(".edit-textarea, .edit-input"))
+        return showInlineError(errEl, "Save unconfirmed. Copy draft; refresh and check.");
+      controls.forEach(function (control) { control.disabled = false; });
+      if (err && err.handled && err.message === "network") {
+        setView(skeletonView(3));
+        reroute();
+      }
+      if (!err || !err.handled) showInlineError(errEl, "Could not confirm the change. Refresh and check before trying again.");
     });
   }
 
@@ -1272,8 +1285,10 @@
     // and cancellation stay conversational so the user can state the actual intent in plain words.
     var intentions = Array.isArray(data.intentions) ? data.intentions : [];
     var routines = Array.isArray(data.routines) ? data.routines : [];
+    var routinesSupported = data.routines_supported !== false;
     container.appendChild(ledgerCap("Scheduled",
-      capCount((intentions.length + routines.length) || "none")));
+      capCount(routinesSupported ? ((intentions.length + routines.length) || "none") :
+        "personal routines unavailable")));
     var scheduled = el("div", "ledger");
     for (var si = 0; si < intentions.length; si++) {
       var intention = intentions[si] || {};
@@ -1288,8 +1303,11 @@
         str(routine.schedule) || "recurring", str(routine.prompt)));
     }
     if (!intentions.length && !routines.length) {
-      scheduled.appendChild(emptyState("Nothing scheduled",
-        "Ask Sotto for a one-time reminder or a recurring routine in plain language."));
+      scheduled.appendChild(emptyState(routinesSupported ? "Nothing scheduled" :
+        "Personal routines unavailable",
+        routinesSupported ?
+          "Ask Sotto for a one-time reminder or a recurring routine in plain language." :
+          "This runtime supports its five built-in schedules; personal routines are not active."));
     }
     container.appendChild(scheduled);
   }
@@ -1521,18 +1539,16 @@
     if (typeof loop.times_surfaced === "number" && loop.times_surfaced > 1) {
       bits.push("surfaced " + loop.times_surfaced + "x");
     }
-    // What Sotto has already done about it. Without this the page proposes a
-    // first nudge for something it nudged twice — and chat can already say
-    // "chased once, Tuesday", so the dashboard has to be able to as well.
+    // These receipts prove reminders to the owner, never messages to the other person.
     var chased = typeof loop.chased_count === "number" ? loop.chased_count : 0;
     if (chased > 0) {
       var day = weekdayShort(loop.last_chased_at);
-      bits.push("chased x" + chased + (day ? ", " + day : ""));
+      bits.push("reminded you x" + chased + (day ? ", " + day : ""));
     }
     if (bits.length) folio.appendChild(el("span", null, bits.join(" · ")));
-    // Chased its two times with no answer: Sotto has stopped, and says so.
+    // The two automatic reminders have reached the owner; the next step is their choice.
     if (loop.chased_out) {
-      mainCol.appendChild(el("div", "row-detail", "No answer after two nudges — your call"));
+      mainCol.appendChild(el("div", "row-detail", "Two reminders to you — your call"));
     }
     row.appendChild(folio);
 
@@ -1551,17 +1567,11 @@
       var actions = el("div", "row-actions");
       var resolveBtn, dismissBtn, dueBtn, keepBtn;
       var post = function (op) {
-        errEl.hidden = true;
-        resolveBtn.disabled = dismissBtn.disabled = true;
-        if (keepBtn) keepBtn.disabled = true;
-        apiPost("/api/loops", { anchor_key: anchor, op: op }).then(function () {
-          // "keep" moves the row from Parked back to Waiting on you: re-render from the server.
-          if (op === "keep") return viewNow();
-          removeLoopRow(row, counter);
-        }).catch(function (err) {
-          resolveBtn.disabled = dismissBtn.disabled = false;
-          if (keepBtn) keepBtn.disabled = false;
-          if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
+        saveControls([resolveBtn, dismissBtn, keepBtn], errEl, function () {
+          return apiPost("/api/loops", { anchor_key: anchor, op: op }).then(function () {
+            if (op === "keep") return viewNow();
+            removeLoopRow(row, counter);
+          });
         });
       };
       resolveBtn = button("text-action", "✓ mark resolved", function () { post("resolve"); });
@@ -2306,15 +2316,8 @@
     errEl.hidden = true;
 
     var send = function (body, btn, others) {
-      errEl.hidden = true;
-      btn.disabled = true;
-      for (var i = 0; i < others.length; i++) others[i].disabled = true;
-      apiPost("/api/prefs", body).then(function () {
-        viewPerson(slug);
-      }).catch(function (err) {
-        btn.disabled = false;
-        for (var j = 0; j < others.length; j++) others[j].disabled = false;
-        if (!err || !err.handled) showInlineError(errEl, "That didn't save — try again");
+      saveControls([btn].concat(others), errEl, function () {
+        return apiPost("/api/prefs", body).then(function () { viewPerson(slug); });
       });
     };
 
@@ -3014,6 +3017,32 @@
 
   function paintPrefs(seq, container, prefs) {
     container.replaceChildren();
+    var calendarBox = el("div", "card");
+    calendarBox.appendChild(el("h3", "", "Google calendars"));
+    calendarBox.appendChild(el("p", "muted", "Read all calendars you can access, or choose calendar IDs from Google Calendar settings. This changes reads only."));
+    var mode = el("select", "input");
+    [ ["all", "All readable calendars"], ["selected", "Choose calendars"] ].forEach(function (pair) {
+      var option = el("option", "", pair[1]); option.value = pair[0]; mode.appendChild(option);
+    });
+    var ids = el("textarea", "input"); ids.placeholder = "One calendar ID per line; use primary for your main calendar";
+    var save = el("button", "btn", "Save calendars");
+    var status = el("p", "muted");
+    calendarBox.appendChild(mode); calendarBox.appendChild(ids); calendarBox.appendChild(save); calendarBox.appendChild(status);
+    container.appendChild(calendarBox);
+    function paintCalendarSelection(value) {
+      mode.value = value.mode; ids.value = (value.calendar_ids || []).join("\n"); ids.hidden = mode.value === "all";
+      status.textContent = value.needs_reselection ? "Google consent changed. Save your calendar choice again." : "";
+    }
+    mode.addEventListener("change", function () { ids.hidden = mode.value === "all"; });
+    save.addEventListener("click", function () {
+      save.disabled = true;
+      apiPost("/api/calendar-settings", {mode: mode.value, calendar_ids: mode.value === "all" ? [] : ids.value.split(/\r?\n/).map(function (v) { return v.trim(); }).filter(Boolean)})
+        .then(function (value) { if (seq === state.renderSeq) { paintCalendarSelection(value); status.textContent = "Calendar selection saved."; } })
+        .catch(function () { status.textContent = "Could not save. Check the calendar IDs and Google connection."; })
+        .finally(function () { save.disabled = false; });
+    });
+    api("/api/calendar-settings").then(function (value) { if (seq === state.renderSeq) paintCalendarSelection(value); })
+      .catch(function () { status.textContent = "Connect Google Calendar to change this setting."; save.disabled = true; });
     var isObj = prefs && typeof prefs === "object" && !Array.isArray(prefs);
 
     var deleteRule = function (listName, value) {
@@ -3460,7 +3489,7 @@
     // Record shows a person, so it never says "proactive", "chase" or "retune" at them.
     chase: "something you're owed", birthday: "a birthday",
     commitment: "due today", meeting_prep: "a meeting starting soon",
-    handoff: "chased twice — your call", retune_offer: "an offer to tidy up"
+    handoff: "reminded you twice — your call", retune_offer: "an offer to tidy up"
   };
 
   function triageSentence(e) {
@@ -3750,7 +3779,7 @@
         })
         .catch(function (err) {
           save.disabled = false;
-          if (!err.handled) toast("Couldn't save — nothing was changed");
+          if (!err.handled) toast("Could not confirm the change. Refresh and check before trying again.");
         });
     });
     bar.appendChild(save);

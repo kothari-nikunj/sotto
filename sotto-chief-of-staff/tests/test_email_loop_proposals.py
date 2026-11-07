@@ -37,7 +37,7 @@ def isolated(tmp_path, monkeypatch):
 
 def _loop(tmp_path, action_type: str, summary: str) -> dict:
     row = {"anchor_key": "email-loi", "status": "open", "action_type": action_type,
-           "channel": "gmail", "contact_name": "Dana", "contact_identifier": "dana@example.com",
+           "channel": "gmail", "source": "gmail", "contact_name": "Dana", "contact_identifier": "dana@example.com",
            "created_at": "2026-06-23 08:00:00", "summary": summary}
     directory = tmp_path / "knowledge/continuity"
     directory.mkdir(parents=True)

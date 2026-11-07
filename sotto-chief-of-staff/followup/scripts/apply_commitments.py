@@ -344,14 +344,28 @@ def _source_ref(raw: dict) -> dict | None:
     snippet = _s(raw.get("source_snippet")).strip()
     if not (source_id or snippet):
         return None
-    return {"source": "granola", "source_id": source_id or None, "snippet": snippet or None}
+    ref = {"source": "granola", "source_id": source_id or None, "snippet": snippet or None}
+    if raw.get('source_timestamp'):
+        ref['timestamp'] = raw['source_timestamp']
+    return ref
 
 
 def _attach_source(it: dict, ref: dict | None) -> None:
     if not ref:
         return
     refs = [r for r in (it.get("source_refs") or []) if isinstance(r, dict)]
-    if ref not in refs:
+    matched = ref in refs
+    if not matched and ref.get('source_id'):
+        for previous in refs:
+            if not all(previous.get(key) == ref.get(key) for key in ('source', 'source_id', 'snippet')):
+                continue
+            if previous.get('timestamp') and ref.get('timestamp') and previous['timestamp'] != ref['timestamp']:
+                continue  # genuinely conflicting source timestamps remain independent evidence
+            if ref.get('timestamp') and not previous.get('timestamp'):
+                previous['timestamp'] = ref['timestamp']
+            matched = True
+            break
+    if not matched:
         refs.append(ref)
     it["source_refs"] = refs[-20:]
 
@@ -368,6 +382,8 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
     grounding = None
     if source_meetings is not None:
         payload, grounding = ground_commitments(payload, source_meetings, user_email, user_name)
+    meetings = {_s(m.get('meeting_id') or m.get('id')): m for m in source_meetings or []
+                if isinstance(m, dict)}
     commitments = payload.get("commitments", []) if isinstance(payload, dict) else (payload or [])
     if not commitments:   # nothing to write — don't even load the ledger
         result = {"written": 0, "deduped": 0, "skipped_terminal": 0, "anchor_keys": [],
@@ -383,9 +399,25 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
         for c in commitments:
             if not isinstance(c, dict):
                 continue
-            raw = _action_for(c, user_email, created_at, user_name)
+            meeting = meetings.get(_s(c.get('meeting_id'))) or {}
+            observed = cr._parse_dt(meeting.get('end') or meeting.get('start') or meeting.get('date'))
+            captured = created_at
+            if observed is not None and cr._to_user_zone(observed) <= cr._to_user_zone(now):
+                # Date-only meeting records retain a conservative end-of-day cutoff.
+                stamp = _s(meeting.get('end') or meeting.get('start') or meeting.get('date'))
+                captured = (cr._inbound_cutoff(stamp) if len(stamp) <= 10
+                            else cr._to_user_zone(observed).isoformat())
+            raw = _action_for(c, user_email, captured, user_name)
             if raw is None:
                 continue
+            # Preserve the source's own precision separately from the conservative resolution
+            # cutoff above. A date-only meeting is not a promise made at 23:59:59, and capture
+            # time cannot fill an unknown source date. This is a meeting boundary, not an
+            # exact utterance timestamp. Never take this field from model output.
+            if observed is not None and cr._to_user_zone(observed) <= cr._to_user_zone(now):
+                raw['source_timestamp'] = stamp
+                raw['source_timestamp_kind'] = ('meeting_date' if len(stamp) <= 10 else
+                    'meeting_end' if meeting.get('end') else 'meeting_start' if meeting.get('start') else 'meeting_date')
             a = cr._normalize_action(raw)
             occurrence_key = cr.compute_anchor_key(a)
             suggested = _s(raw.get("existing_anchor_key")).strip()
@@ -430,6 +462,8 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
                 "source_thread_id": a.get("source_thread_id"),
                 "source": "followup_commitment",
                 "resolution_mode": "source_grounded",
+                **({key: raw[key] for key in ('source_timestamp', 'source_timestamp_kind')}
+                   if raw.get('source_timestamp') else {}),
             }
             _attach_source(it, _source_ref(raw))
             items[ak] = it

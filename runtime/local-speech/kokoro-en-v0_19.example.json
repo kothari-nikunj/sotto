@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "kokoro-int8-en-v0_19",
+  "engine": "kokoro",
+  "source": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-en-v0_19.tar.bz2",
+  "licenses": [
+    {"component": "Kokoro model and voices", "license": "Apache-2.0 (pack LICENSE; retain upstream notices)", "source": "https://huggingface.co/hexgrad/Kokoro-82M"},
+    {"component": "eSpeak NG phonemizer and language data", "license": "GPL-3.0-or-later; data includes upstream third-party notices", "source": "https://github.com/espeak-ng/espeak-ng/blob/master/COPYING"},
+    {"component": "sherpa-onnx runtime", "license": "Apache-2.0; bundled dependencies retain their own notices", "source": "https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/LICENSE"}
+  ],
+  "roles": {"model": "model.int8.onnx", "voices": "voices.bin", "tokens": "tokens.txt", "data_dir": "espeak-ng-data"},
+  "voices": {"default": 0}
+}

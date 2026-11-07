@@ -1,0 +1,180 @@
+{
+  "name": "actual-brief-email-only-yes-prep-source-return",
+  "world": {
+    "meetingPrep": true,
+    "savedSourceGrants": [
+      "calendar"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"calendar\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "calendarEvents": [
+      {
+        "id": "routinecalendar01",
+        "summary": "Routine weekly check-in with Ada",
+        "description": "Our regular status check-in. No materials requested.",
+        "start": {
+          "dateTime": "{{ISO+1h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+2h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "responseStatus": "accepted"
+          }
+        ]
+      },
+      {
+        "id": "fixturecalendar01",
+        "summary": "Cedar notebook pickup review with Ada",
+        "description": "Pick up the cedar notebook from Ada at the west entrance. This review decides whether to expand the clinic pilot; the notebook contains its results and unresolved rollout risks.",
+        "start": {
+          "dateTime": "{{ISO+54h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+55h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "responseStatus": "accepted"
+          }
+        ]
+      }
+    ],
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Birch Labs",
+          "domain": "birch.example",
+          "about": "Birch Labs makes synthetic garden planning tools."
+        }
+      ]
+    },
+    "prepGrounding": {
+      "groundingChunks": [
+        {
+          "web": {
+            "uri": "https://cedar.example/pilot",
+            "title": "Synthetic Cedar pilot"
+          }
+        }
+      ],
+      "groundingSupports": [
+        {
+          "segment": {
+            "startIndex": 0,
+            "endIndex": 40,
+            "text": "Ada coordinates the clinic notebook pilot."
+          },
+          "groundingChunkIndices": [
+            0
+          ]
+        }
+      ]
+    }
+  },
+  "turns": [
+    {
+      "text": "Yes.",
+      "contains": [
+        "notebook",
+        "west entrance"
+      ],
+      "minReplies": 2,
+      "meetingPrep": {
+        "eventId": "fixturecalendar01",
+        "newJob": true,
+        "artifactContains": [
+          "notebook",
+          "west entrance"
+        ]
+      },
+      "latencyClass": "brief",
+      "briefPrepOfferBefore": {
+        "eventId": "fixturecalendar01"
+      }
+    },
+    {
+      "text": "Make that three questions I can ask her.",
+      "contains": [
+        "clinic",
+        "pilot"
+      ],
+      "meetingPrep": {
+        "eventId": "fixturecalendar01",
+        "newJob": false,
+        "artifactContains": [
+          "notebook",
+          "west entrance"
+        ]
+      },
+      "canonicalUnchanged": true,
+      "googleReads": 0,
+      "publicReads": 0,
+      "maxCharacters": 1000,
+      "latencyClass": "ordinary"
+    },
+    {
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 2400,
+      "latencyClass": "ordinary",
+      "text": "What supports the claim that Ada coordinates the clinic notebook pilot? Separately, did you verify that Cedar is backed by VentureCo? Please distinguish what the invitation says, what the provider research reported, and anything unsupported.",
+      "contains": [
+        "VentureCo"
+      ],
+      "briefDetailReads": 1,
+      "returnedBriefDetailContains": [
+        "research_evidence",
+        "groundingChunks",
+        "cedar.example/pilot",
+        "provider"
+      ],
+      "containsAny": [
+        [
+          "provider",
+          "gemini"
+        ],
+        [
+          "unsupported",
+          "not verified",
+          "cannot verify",
+          "can't verify",
+          "no evidence",
+          "not supported",
+          "unverified",
+          "not establish",
+          "don't have",
+          "no support"
+        ],
+        [
+          "invitation",
+          "invite",
+          "calendar"
+        ]
+      ]
+    }
+  ]
+}

@@ -24,9 +24,9 @@ _spec.loader.exec_module(ku)
 NOW = datetime(2026, 6, 23, 7, 0, 0)
 
 
-def _setup(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
-    return tmp_path
+@pytest.fixture(autouse=True)
+def isolated_data_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
 
 
 # ── dedup ────────────────────────────────────────────────────────────────────
@@ -84,7 +84,6 @@ def test_fuzzy_match_against_an_archived_fact_still_skips():
 def test_research_preamble_words_are_not_content(tmp_path):
     """Every research fact starts "Per web search", so counting those three words as content put a
     short recency item in the 0.3-0.5 band against the bio and SUPERSEDED it in the same apply()."""
-    _setup(tmp_path)
     ext = {"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
         "updated_by": "web_research", "facts": [
             {"fact": "Per web search: CEO at Acme — Leads Acme's platform org.",
@@ -102,7 +101,6 @@ def test_three_meetings_stay_three_milestones(tmp_path):
     """granola_graph types every "Met on <date>: <title>" fact `milestone`; while `milestone` was
     mutable, two date-only meeting facts shared {met, <year>} and superseded each other, so a
     person's whole meeting history collapsed into one fact carrying the first date."""
-    _setup(tmp_path)
     ext = {"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
         "updated_by": "granola_graph", "facts": [
             {"fact": f"Met on 2026-09-{day}: {title}", "memory_type": "milestone",
@@ -133,7 +131,8 @@ def test_an_archived_twin_listed_first_does_not_shadow_the_active_fact():
                              archived_text="CTO at Acme Corporation", archived_reason="duplicate",
                              source="brief_extraction", first="2026-06-01", last="2026-06-01"),
         "f_live": kg.FactMeta(text="CTO at Acme Corporation", type="context", status="active",
-                              source="brief_extraction", first="2026-07-01", last="2026-07-01"),
+                              source="brief_extraction", source_ref="email:original", evidence_refs=["email:original"],
+                              first="2026-07-01", last="2026-07-01"),
     }
     assert kg.find_similar_fact(facts, "CTO at Acme Corporation", "context", False) == (kg.BUMP, "f_live")
     # History ingestion has its own exact-text path. Exercise the writer, not only similarity.
@@ -152,7 +151,6 @@ def test_an_archived_twin_listed_first_does_not_shadow_the_active_fact():
 def test_pruned_fact_is_relearned_when_it_is_observed_again(tmp_path):
     """The 61-day prune archives a one-off. Re-observing it must re-learn it in place, not leave a
     permanent tombstone that makes the assertion unlearnable."""
-    _setup(tmp_path)
     ku.apply(_dana_fact("Runs the platform org at Acme", "gmail:one"), NOW)
     later = datetime(2026, 9, 16, 7, 0, 0)   # >60 days on, so the one-off is pruned
     ku.apply(_dana_fact("Enjoys sea kayaking", "gmail:two"), later)
@@ -166,7 +164,6 @@ def test_pruned_fact_is_relearned_when_it_is_observed_again(tmp_path):
 
 
 def test_a_fact_the_user_archived_is_never_revived_by_research(tmp_path):
-    _setup(tmp_path)
     ku.apply(_dana_fact("Runs the platform org at Acme", "user-correction", "user_edit"), NOW)
     path = kg.find_person_file(identifier="dana@acme.com")
     p = kg.parse_person_file(open(path).read())
@@ -222,6 +219,16 @@ def test_repeated_one_off_uses_same_clock_for_decay_and_archive():
     assert fact.status == "archived" and fact.archived_reason == "stale"
 
 
+def test_prune_never_expires_a_contacts_card_note():
+    """A Contacts note is the owner's own typing; re-seeding brings no new evidence, so seen stays 1."""
+    facts = {"f_1": kg.FactMeta(text="Met at the Lisbon offsite", seen=1, status="active",
+                                first="2025-01-01", last="2025-01-01", source="apple_contacts"),
+             "f_2": kg.FactMeta(text="x", seen=1, status="active", last="2025-01-01",
+                                source="brief_extraction")}
+    kg.prune_stale_facts(facts, NOW)
+    assert facts["f_1"].status == "active" and facts["f_2"].status == "archived"
+
+
 def test_prune_never_expires_a_user_correction():
     """A hand-made correction is never restated by a pipeline (seen stays 1) — the old prune
     archived it at day 60 while the wrong fact it corrected kept getting re-BUMPed by research.
@@ -247,10 +254,10 @@ def test_fact_id_is_stable_sha_prefix():
 
 # ── apply pipeline ─────────────────────────────────────────────────────────────
 def test_apply_new_then_bump_increments_seen_and_conf(tmp_path):
-    _setup(tmp_path)
     ext = {"person_updates": [{
         "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
-        "facts": [{"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.9}],
+        "facts": [{"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.9,
+                   "source_ref": "email:original-observation"}],
     }]}
     r1 = ku.apply(ext, NOW)
     assert r1["applied"]["new"] == 1
@@ -266,7 +273,6 @@ def test_apply_new_then_bump_increments_seen_and_conf(tmp_path):
 
 
 def test_full_evidence_window_rolls_for_a_new_reference_without_recounting_it(tmp_path):
-    _setup(tmp_path)
     refs = [f"gmail:{i:02d}" for i in range(64)]
     update = {"person_updates": [{
         "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
@@ -291,7 +297,6 @@ def test_full_evidence_window_rolls_for_a_new_reference_without_recounting_it(tm
 
 
 def test_saturated_window_does_not_reboost_evicted_old_evidence(tmp_path):
-    _setup(tmp_path)
     first = [f"gmail:a:{i:02d}" for i in range(64)]
     fact = {"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.6,
             "observed_date": "2026-06-23", "evidence_refs": first}
@@ -313,7 +318,6 @@ def test_saturated_window_does_not_reboost_evicted_old_evidence(tmp_path):
 
 
 def test_saturated_window_needs_observed_chronology_not_a_later_processing_day(tmp_path):
-    _setup(tmp_path)
     fact = {"fact": "CTO at Acme Corp", "memory_type": "milestone", "confidence": 0.6,
             "evidence_refs": [f"gmail:a:{i:02d}" for i in range(64)]}
     update = {"person_updates": [{"person_name": "Sarah Chen",
@@ -331,7 +335,6 @@ def test_saturated_window_needs_observed_chronology_not_a_later_processing_day(t
 
 
 def test_replaying_one_oversized_evidence_page_never_confirms_itself(tmp_path):
-    _setup(tmp_path)
     update = {"person_updates": [{"person_name": "Sarah Chen", "identifier": "sarah@acme.com",
         "facts": [{"fact": "CTO at Acme Corp", "memory_type": "milestone",
                    "evidence_refs": [f"gmail:{i:03d}" for i in range(100)]}]}]}
@@ -340,7 +343,6 @@ def test_replaying_one_oversized_evidence_page_never_confirms_itself(tmp_path):
         assert ku.apply(update, NOW)["applied"]["confirmed"] == 0
 
 def test_apply_low_confidence_fact_skipped(tmp_path):
-    _setup(tmp_path)
     ext = {"person_updates": [{"person_name": "Bob", "facts": [
         {"fact": "maybe likes tea", "memory_type": "interest", "confidence": 0.3}]}]}
     r = ku.apply(ext, NOW)
@@ -348,7 +350,6 @@ def test_apply_low_confidence_fact_skipped(tmp_path):
 
 
 def test_md_round_trip_preserves_facts(tmp_path):
-    _setup(tmp_path)
     ext = {"person_updates": [{"person_name": "Sarah Chen", "identifier": "sarah@acme.com",
         "profile_patch": {"title": "CTO", "company": "Acme Corp"},
         "facts": [{"fact": "Working on Series B", "memory_type": "milestone", "confidence": 0.85}]}]}
@@ -361,7 +362,6 @@ def test_md_round_trip_preserves_facts(tmp_path):
 
 
 def test_rejects_path_traversal_in_company_slug(tmp_path):
-    _setup(tmp_path)
     ext = {"company_updates": [{"company_slug": "../../../etc/cron.d/evil", "company_name": "Evil",
                                 "news": [{"text": "x"}]}]}
     r = ku.apply(ext, NOW)
@@ -374,7 +374,6 @@ def test_rejects_path_traversal_in_company_slug(tmp_path):
 
 
 def test_rejects_traversal_person_name(tmp_path):
-    _setup(tmp_path)
     # a name that slugifies to empty (only separators) must not fall back to a raw path
     ext = {"person_updates": [{"person_name": "../..", "facts": [
         {"fact": "x", "memory_type": "context", "confidence": 0.9}]}]}
@@ -390,7 +389,6 @@ def test_safe_slug_helpers():
 
 
 def test_company_news_dedup_by_url(tmp_path):
-    _setup(tmp_path)
     ext = {"company_updates": [{"company_name": "Acme Corp", "news": [
         {"text": "Raised Series B", "url": "https://x.com/1", "date": "2026-06"}]}]}
     ku.apply(ext, NOW)
@@ -400,7 +398,6 @@ def test_company_news_dedup_by_url(tmp_path):
 
 
 def test_company_preserves_domain_and_sets_last_news_update(tmp_path):
-    _setup(tmp_path)
     import yaml
     path = os.path.join(kg.companies_dir(), "acme.md")
     os.makedirs(kg.companies_dir(), exist_ok=True)
@@ -417,7 +414,6 @@ def test_company_preserves_domain_and_sets_last_news_update(tmp_path):
 
 
 def test_company_context_capped(tmp_path):
-    _setup(tmp_path)
     big = "x" * 1500
     ku.apply({"company_updates": [{"company_name": "Beta", "context_updates": [big]}]}, NOW)
     content = open(os.path.join(kg.companies_dir(), "beta.md")).read()
@@ -433,7 +429,6 @@ def test_canonical_id_is_12_hex(tmp_path):
 
 # ── packed-context labeling (knowledge_query.py) ─────────────────────────────
 def test_pack_person_labels_low_confidence_facts(tmp_path):
-    _setup(tmp_path)
     _kq_spec = importlib.util.spec_from_file_location(
         "knowledge_query", os.path.join(SCRIPTS, "knowledge_query.py"))
     kq = importlib.util.module_from_spec(_kq_spec)
@@ -460,7 +455,6 @@ def test_pack_person_labels_low_confidence_facts(tmp_path):
 def test_news_item_missing_text_is_skipped(tmp_path):
     # Extraction sometimes emits a news item without text — indexing item['text'] raw killed the
     # whole knowledge update. The bad item is skipped; its siblings still apply.
-    _setup(tmp_path)
     out = ku.apply({"company_updates": [{"company_name": "Acme", "news": [
         {"url": "https://x.com/no-text"},
         {"text": "Acme raised a Series B", "url": "https://x.com/b"},
@@ -478,7 +472,6 @@ def test_now_iso_labels_utc_truthfully():
 
 def test_apply_default_now_is_utc(tmp_path, monkeypatch):
     # apply() used to default to server-LOCAL datetime.now() and stamp it with a 'Z' suffix.
-    _setup(tmp_path)
     from datetime import timezone
     seen = {}
     real_dt = ku.datetime
@@ -502,7 +495,6 @@ def test_correction_supersedes_at_high_overlap_never_bumps(tmp_path):
     # THE inverted-correction bug: "Peyton is NOT the founder…" shares >0.5 of its words with the
     # wrong fact, so the old code BUMPed it (+0.1 conf, decay reset, seen>1 immortality) and threw
     # the correction away. change_type="correction" must SUPERSEDE at ANY overlap ratio.
-    _setup(tmp_path)
     ku.apply({"person_updates": [{
         "person_name": "Peyton Lee", "identifier": "peyton@alive.inc",
         "facts": [{"fact": "Peyton is the founder of Alive Ventures",
@@ -525,11 +517,11 @@ def test_correction_supersedes_at_high_overlap_never_bumps(tmp_path):
 def test_plain_reobservation_still_bumps_after_fix(tmp_path):
     # Without change_type=correction, a re-observed fact still bumps (seen+1) — the fix must not
     # turn ordinary dedup into supersession.
-    _setup(tmp_path)
     ext = {"person_updates": [{
         "person_name": "Sarah Chen", "identifier": "sarah@acme.com",
         "facts": [{"fact": "Sarah leads the platform team at Acme",
-                   "memory_type": "context", "confidence": 0.7}],
+                   "memory_type": "context", "confidence": 0.7,
+                   "source_ref": "email:original-observation"}],
     }]}
     ku.apply(ext, NOW)
     ext["person_updates"][0]["facts"][0]["source_ref"] = "email:new-observation"
@@ -568,7 +560,6 @@ def _suggestions():
 
 def test_exact_identifier_collision_auto_merges_into_one_file(tmp_path):
     """Two files, one email — one human. Facts are unioned, nothing is dropped, one file remains."""
-    _setup(tmp_path)
     _write_person("c_aaaaaaaaaaaa", "Ben", ["+1 (415) 555-0000", "ben@northstar.io"],
                   {"f_a": "Ben runs ops at Northstar"})
     _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["BEN@northstar.io"],
@@ -586,7 +577,6 @@ def test_exact_identifier_collision_auto_merges_into_one_file(tmp_path):
 
 def test_phone_identifier_collision_normalizes_before_matching(tmp_path):
     """Same rule as the graph's: phone-ish identifiers match on their last 10 digits."""
-    _setup(tmp_path)
     _write_person("c_cccccccccccc", "Dhruv", ["+1 415-555-0123"], {"f_a": "Dhruv texts about pricing"})
     _write_person("c_dddddddddddd", "Dhruv Patel", ["4155550123"], {"f_b": "Dhruv Patel is at Acme"})
     ku.apply({}, NOW)
@@ -595,7 +585,6 @@ def test_phone_identifier_collision_normalizes_before_matching(tmp_path):
 
 def test_similar_names_are_suggested_never_merged(tmp_path):
     """Slug containment with non-conflicting identifiers: a suggestion, and BOTH files survive."""
-    _setup(tmp_path)
     _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"], {"f_a": "Ben runs ops"})
     _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"],
                   {"f_b": "Ben Butler is closing the Series A", "f_c": "based in SF"})
@@ -613,7 +602,6 @@ def test_two_john_smiths_with_distinct_identifiers_are_never_merged_or_suggested
     """The audit's failure mode, in both directions: identical names, contradicting emails. Neither
     auto-merged (names never auto-merge at all) NOR suggested — a confirmed merge here would be the
     identity bug the canonical_id keying exists to prevent."""
-    _setup(tmp_path)
     _write_person("c_111111111111", "John Smith", ["john@acme.com"], {"f_a": "John Smith at Acme"})
     _write_person("c_222222222222", "John Smith", ["john@globex.com"], {"f_b": "John Smith at Globex"})
     out = ku.apply({}, NOW)
@@ -625,7 +613,6 @@ def test_two_john_smiths_with_distinct_identifiers_are_never_merged_or_suggested
 
 def test_suggestion_survives_reruns_and_is_capped(tmp_path):
     """first_seen is preserved across passes (the dashboard ages the card), and the list is capped."""
-    _setup(tmp_path)
     _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
     _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
     ku.apply({}, NOW)
@@ -639,7 +626,6 @@ def test_suggestion_survives_reruns_and_is_capped(tmp_path):
 def test_a_dismissed_pair_never_comes_back(tmp_path):
     """The suggestions are recomputed from the files on disk on every apply, so "these really are
     two people" has to be written down — as a tombstone the refresh obeys."""
-    _setup(tmp_path)
     _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
     _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
     ku.apply({}, NOW)
@@ -655,7 +641,6 @@ def test_a_dismissed_pair_never_comes_back(tmp_path):
 def test_a_dismissal_matches_the_pair_in_either_order(tmp_path):
     """A merge pair names two people, not a direction — the tombstone is order-insensitive, and the
     suggester picks the direction itself (sparser file → richer one)."""
-    _setup(tmp_path)
     _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
     _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
     ku.dismiss_merge_suggestion("c_ffffffffffff", "c_eeeeeeeeeeee", NOW)   # reversed
@@ -664,7 +649,6 @@ def test_a_dismissal_matches_the_pair_in_either_order(tmp_path):
 
 
 def test_dismissals_are_capped_at_the_newest(tmp_path):
-    _setup(tmp_path)
     for i in range(ku.MERGE_DISMISSED_MAX + 5):
         ku.dismiss_merge_suggestion(f"c_from{i:08d}", f"c_into{i:08d}", NOW)
     tombs = ku.load_merge_dismissed()
@@ -679,7 +663,6 @@ def test_dismissals_are_capped_at_the_newest(tmp_path):
 def test_identifiers_conflict_only_within_a_kind(tmp_path):
     """A phone-only file and an email-only file do not contradict each other — that IS the dupe
     shape the audit found (the non-Contacts path). Two different emails DO contradict."""
-    _setup(tmp_path)
     phone_only = kg.PersonFile(name="Ben", identifiers=["+14155550000"])
     email_only = kg.PersonFile(name="Ben Butler", identifiers=["ben@northstar.io"])
     other_email = kg.PersonFile(name="Ben Butler", identifiers=["ben@other.com"])
@@ -690,7 +673,6 @@ def test_identifiers_conflict_only_within_a_kind(tmp_path):
 
 def test_auto_merge_runs_before_the_updates_land(tmp_path):
     """The Learn step merges first, so the day's facts land in the SURVIVING file, not a third one."""
-    _setup(tmp_path)
     _write_person("c_aaaaaaaaaaaa", "Ben", ["ben@northstar.io"], {"f_a": "Ben runs ops"})
     _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
     ku.apply({"person_updates": [{"person_name": "Ben Butler", "identifier": "ben@northstar.io",
@@ -707,7 +689,6 @@ def test_auto_merge_runs_before_the_updates_land(tmp_path):
 def test_company_alias_resolves_to_the_existing_file(tmp_path):
     """"YC" must land in the stored "Y Combinator" file — aliases have been written since the Rust
     port and were never consulted, which is exactly how one company became two memories."""
-    _setup(tmp_path)
     os.makedirs(kg.companies_dir(), exist_ok=True)
     with open(os.path.join(kg.companies_dir(), "y-combinator.md"), "w", encoding="utf-8") as f:
         f.write("---\nschema: 1\nnormalized: y-combinator\naliases:\n- Y Combinator\n- YC\n"
@@ -728,7 +709,6 @@ def test_company_alias_resolves_to_the_existing_file(tmp_path):
 def test_a_resolved_name_form_is_recorded_as_an_alias_for_next_time(tmp_path):
     """The prevention loop closes itself: a spelling that resolved through the domain lookup today
     is a direct alias hit tomorrow, without re-deriving anything."""
-    _setup(tmp_path)
     os.makedirs(kg.companies_dir(), exist_ok=True)
     with open(os.path.join(kg.companies_dir(), "northstar.md"), "w", encoding="utf-8") as f:
         f.write("---\nschema: 1\nnormalized: northstar\naliases:\n- Northstar Labs\n"
@@ -747,7 +727,6 @@ def test_a_resolved_name_form_is_recorded_as_an_alias_for_next_time(tmp_path):
 
 def test_company_domain_resolves_to_the_existing_file(tmp_path):
     """A domain-shaped name resolves through the stored `domain`, not a second file."""
-    _setup(tmp_path)
     os.makedirs(kg.companies_dir(), exist_ok=True)
     with open(os.path.join(kg.companies_dir(), "northstar.md"), "w", encoding="utf-8") as f:
         f.write("---\nschema: 1\nnormalized: northstar\naliases:\n- Northstar Labs\n"
@@ -763,7 +742,6 @@ def test_company_domain_resolves_to_the_existing_file(tmp_path):
 
 def test_genuinely_new_company_still_gets_its_own_file(tmp_path):
     """Prevention must not become collapsing: an unrelated name is a new file."""
-    _setup(tmp_path)
     ku.apply({"company_updates": [{"company_name": "Y Combinator"}]}, NOW)
     ku.apply({"company_updates": [{"company_name": "Signal House"}]}, NOW)
     import glob
@@ -790,7 +768,6 @@ def _intro(subject="Priya Patel", other="Vishnu Sharma", rtype="introduced_by", 
 
 
 def test_relation_writes_both_ends_with_the_inverse_type(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma", "identifier": "v@x.com"},
                                  {"person_name": "Priya Patel", "identifier": "p@y.com"}]}, NOW)
     out = ku.apply(_intro(date="2026-05-14"), NOW)
@@ -808,7 +785,6 @@ def test_relation_writes_both_ends_with_the_inverse_type(tmp_path):
 
 
 def test_relation_vocabulary_is_closed_unknown_types_are_dropped(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     out = ku.apply(_intro(rtype="nemesis_of"), NOW)
@@ -822,7 +798,6 @@ def test_relation_vocabulary_is_closed_unknown_types_are_dropped(tmp_path):
 
 
 def test_relation_below_the_confidence_bar_is_dropped(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     out = ku.apply(_intro(confidence=0.6), NOW)
@@ -830,7 +805,6 @@ def test_relation_below_the_confidence_bar_is_dropped(tmp_path):
 
 
 def test_writing_the_same_edge_twice_is_a_no_op(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     ku.apply(_intro(date="2026-05-14"), NOW)
@@ -844,7 +818,6 @@ def test_writing_the_same_edge_twice_is_a_no_op(tmp_path):
 def test_an_identified_stranger_gets_the_same_stub_prewarm_creates(tmp_path):
     """An edge to someone with no file yet mints the identity stub — name + identifier, no invented
     facts — so the relation never points at a slug with nothing behind it."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Priya Patel"}]}, NOW)
     out = ku.apply(_intro(other_identifier="vishnu@example.com"), NOW)
     assert out["applied"]["relations"] == 1
@@ -856,7 +829,6 @@ def test_an_identified_stranger_gets_the_same_stub_prewarm_creates(tmp_path):
 
 
 def test_an_unresolvable_name_becomes_a_fact_never_a_guessed_slug(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Priya Patel"}]}, NOW)
     out = ku.apply(_intro(other="Someone Unknown"), NOW)
     assert out["applied"]["relations"] == 0
@@ -869,7 +841,6 @@ def test_an_unresolvable_name_becomes_a_fact_never_a_guessed_slug(tmp_path):
 
 def test_a_partial_name_resolves_through_the_dedup_lite_match(tmp_path):
     """"Vishnu" ⊂ "Vishnu Sharma" is the containment rule the merge suggestions already use."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     out = ku.apply(_intro(other="Vishnu"), NOW)
@@ -879,7 +850,6 @@ def test_a_partial_name_resolves_through_the_dedup_lite_match(tmp_path):
 
 def test_an_ambiguous_name_is_never_guessed(tmp_path):
     """Two candidates is not a resolution. The edge falls back to a fact rather than pick one."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma", "identifier": "a@x.com"},
                                  {"person_name": "Vishnu Sharman", "identifier": "b@x.com"},
                                  {"person_name": "Priya Patel"}]}, NOW)
@@ -889,7 +859,6 @@ def test_an_ambiguous_name_is_never_guessed(tmp_path):
 
 
 def test_relations_round_trip_through_the_person_file(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     ku.apply(_intro(date="2026-05-14"), NOW)
@@ -908,7 +877,6 @@ def test_relations_round_trip_through_the_person_file(tmp_path):
 def test_a_junk_relation_type_on_disk_is_dropped_on_read(tmp_path):
     """The closed vocabulary is enforced on the way IN too — a hand-edited file can't smuggle a
     type nobody defined into a reader or a rewrite."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Priya Patel"}]}, NOW)
     path = kg.find_person_file(name="Priya Patel")
     raw = open(path, encoding="utf-8").read()
@@ -924,7 +892,6 @@ def test_merge_repoints_back_references_to_the_surviving_slug(tmp_path):
     """THE integrity piece. Two files for one person, each holding half the graph's edges: after
     the merge every OTHER file points at the survivor, nobody points at the file that's gone, and
     the survivor holds no edge to itself."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [
         {"person_name": "Ben Butler", "identifier": "ben@acme.com"},
         {"person_name": "Ben", "identifier": "+15551230000"},
@@ -959,7 +926,6 @@ def test_merge_repoints_back_references_to_the_surviving_slug(tmp_path):
 
 def test_merge_dedupes_an_edge_both_halves_carried(tmp_path):
     """Dana knew both duplicates. After the merge she has ONE edge, not two identical ones."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Ben Butler", "identifier": "ben@acme.com"},
                                  {"person_name": "Ben", "identifier": "+15551230000"},
                                  {"person_name": "Dana Reed"}]}, NOW)
@@ -974,7 +940,6 @@ def test_merge_dedupes_an_edge_both_halves_carried(tmp_path):
 
 
 def test_unlink_removes_both_ends(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Vishnu Sharma"},
                                  {"person_name": "Priya Patel"}]}, NOW)
     ku.apply(_intro(), NOW)
@@ -986,7 +951,6 @@ def test_unlink_removes_both_ends(tmp_path):
 
 
 def test_link_refuses_a_self_edge_and_an_unknown_type(tmp_path):
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Priya Patel"},
                                  {"person_name": "Vishnu Sharma"}]}, NOW)
     p, v = _people_by_name("Priya Patel")[0], _people_by_name("Vishnu Sharma")[0]
@@ -999,7 +963,6 @@ def test_link_refuses_a_self_edge_and_an_unknown_type(tmp_path):
 def test_pack_person_renders_relations_as_sentences(tmp_path):
     """The chat surface: briefs, prep, Ask and the event funnel all read the packed person block,
     so rendering the edge here is the only wiring any of them need."""
-    _setup(tmp_path)
     _kq_spec = importlib.util.spec_from_file_location(
         "knowledge_query", os.path.join(SCRIPTS, "knowledge_query.py"))
     kq = importlib.util.module_from_spec(_kq_spec)
@@ -1022,7 +985,6 @@ def test_migration_repoints_edges_when_a_file_is_re_keyed(tmp_path):
     """A person file changes identity in two ways — a merge, and the migration re-keying a legacy
     name-slug file to {canonical_id}.md. Both must repoint back-references, or an edge names a
     filename that no longer exists. Same helper, both paths."""
-    _setup(tmp_path)
     os.makedirs(kg.people_dir(), exist_ok=True)
     ku.apply({"person_updates": [{"person_name": "Priya Patel", "identifier": "p@y.com"}]}, NOW)
     priya_slug = _people_by_name("Priya Patel")[0]
@@ -1052,7 +1014,6 @@ def test_migration_repoints_edges_when_a_file_is_re_keyed(tmp_path):
 
 def test_extracted_fact_keeps_its_source_ref(tmp_path):
     """A fact you can't trace is a fact the user can't check — source_ref survives the write."""
-    _setup(tmp_path)
     ku.apply({"person_updates": [{"person_name": "Morgan Lee", "identifier": "morgan@northstar.io",
               "facts": [{"fact": "Founder of Northstar Labs", "memory_type": "context",
                          "confidence": 0.9, "source_ref": "thr_5510cd"}]}]}, NOW)
@@ -1063,7 +1024,6 @@ def test_extracted_fact_keeps_its_source_ref(tmp_path):
 
 
 def test_company_domain_lands_once_and_never_overwrites(tmp_path):
-    _setup(tmp_path)
     ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.io"}]}, NOW)
     path = os.path.join(kg.companies_dir(), "northstar.md")
     assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.io"
@@ -1073,7 +1033,6 @@ def test_company_domain_lands_once_and_never_overwrites(tmp_path):
 
 
 def test_company_about_is_written_and_a_user_edit_is_never_overwritten(tmp_path):
-    _setup(tmp_path)
     ku.apply({"company_updates": [{"company_name": "Acme Corp", "about": "Builds dev tools."}]}, NOW)
     path = os.path.join(kg.companies_dir(), "acme.md")
     assert "Builds dev tools." in open(path).read()
@@ -1121,7 +1080,6 @@ def test_the_cli_run_as_a_script_writes_relations(tmp_path):
 
 def test_real_archive_and_correction_survive_research_and_history_replay(tmp_path):
     import knowledge_edit as ke
-    _setup(tmp_path)
     text = "Runs the platform org at Acme"
     ku.apply(_dana_fact(text, "https://example.test/team"), NOW)
     path = kg.find_person_file(identifier="dana@acme.com")
@@ -1142,7 +1100,6 @@ def test_real_archive_and_correction_survive_research_and_history_replay(tmp_pat
 
 def test_history_revives_an_exact_age_prune_but_not_a_user_archive(tmp_path):
     import knowledge_edit as ke
-    _setup(tmp_path)
     text = "Runs the platform org at Acme"
     ku.apply(_dana_fact(text, "gmail:one", "observed_message"), NOW)
     later = datetime(2026, 9, 16, 7)

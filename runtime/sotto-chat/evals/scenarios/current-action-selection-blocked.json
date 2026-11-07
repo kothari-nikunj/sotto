@@ -1,0 +1,238 @@
+{
+  "name": "synthetic-current-reply-no-ready-ask",
+  "world": {
+    "gmailTriage": true,
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "gmailMessages": {
+      "ellis-ask": {
+        "id": "ellis-ask",
+        "threadId": "ellis",
+        "internalDate": "1793692800000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Would your team like to join the Cedar pilot? Please let me know after you have discussed it with them.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Ellis Cole <ellis@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar pilot decision"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 08:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "V291bGQgeW91ciB0ZWFtIGxpa2UgdG8gam9pbiB0aGUgQ2VkYXIgcGlsb3Q_IFBsZWFzZSBsZXQgbWUga25vdyBhZnRlciB5b3UgaGF2ZSBkaXNjdXNzZWQgaXQgd2l0aCB0aGVtLg=="
+          }
+        }
+      },
+      "ellis-promise": {
+        "id": "ellis-promise",
+        "threadId": "ellis",
+        "internalDate": "1793696400000",
+        "labelIds": [
+          "SENT"
+        ],
+        "snippet": "I need to consult the team before deciding. I will discuss it with them and get back to you.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "To",
+              "value": "ellis@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Re: Cedar pilot decision"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 09:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SSBuZWVkIHRvIGNvbnN1bHQgdGhlIHRlYW0gYmVmb3JlIGRlY2lkaW5nLiBJIHdpbGwgZGlzY3VzcyBpdCB3aXRoIHRoZW0gYW5kIGdldCBiYWNrIHRvIHlvdS4="
+          }
+        }
+      },
+      "ellis-ack": {
+        "id": "ellis-ack",
+        "threadId": "ellis",
+        "internalDate": "1793721600000",
+        "labelIds": [
+          "INBOX",
+          "IMPORTANT",
+          "UNREAD"
+        ],
+        "snippet": "Thanks, sounds good. I look forward to hearing what the team thinks.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Ellis Cole <ellis@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Re: Cedar pilot decision"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 16:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "VGhhbmtzLCBzb3VuZHMgZ29vZC4gSSBsb29rIGZvcndhcmQgdG8gaGVhcmluZyB3aGF0IHRoZSB0ZWFtIHRoaW5rcy4="
+          }
+        }
+      },
+      "mira-ask": {
+        "id": "mira-ask",
+        "threadId": "mira",
+        "internalDate": "1793692800000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Please send the workshop slides.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Solis <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Workshop slides"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 08:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "UGxlYXNlIHNlbmQgdGhlIHdvcmtzaG9wIHNsaWRlcy4="
+          }
+        }
+      },
+      "mira-sent": {
+        "id": "mira-sent",
+        "threadId": "mira",
+        "internalDate": "1793700000000",
+        "labelIds": [
+          "SENT"
+        ],
+        "snippet": "Here are the workshop slides: https://slides.example.test/workshop.pdf",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "To",
+              "value": "mira@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Re: Workshop slides"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 10:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SGVyZSBhcmUgdGhlIHdvcmtzaG9wIHNsaWRlczogaHR0cHM6Ly9zbGlkZXMuZXhhbXBsZS50ZXN0L3dvcmtzaG9wLnBkZg=="
+          }
+        }
+      },
+      "mira-ack": {
+        "id": "mira-ack",
+        "threadId": "mira",
+        "internalDate": "1793718000000",
+        "labelIds": [
+          "INBOX",
+          "UNREAD"
+        ],
+        "snippet": "Received the slides. Everything I needed is here, thank you.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Solis <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Re: Workshop slides"
+            },
+            {
+              "name": "Date",
+              "value": "Tue, 03 Nov 2026 15:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "UmVjZWl2ZWQgdGhlIHNsaWRlcy4gRXZlcnl0aGluZyBJIG5lZWRlZCBpcyBoZXJlLCB0aGFuayB5b3Uu"
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "What should I reply to next? Check whether I already replied. Don\u2019t change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    },
+    {
+      "text": "What is the next meaningful step on Ellis\u2019s pilot decision? Don\u2019t change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "contains": [
+        "team"
+      ]
+    },
+    {
+      "text": "Does the acknowledgement establish that I consulted the team or decided to join? Don\u2019t change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    }
+  ]
+}

@@ -81,6 +81,35 @@ def test_commitment_with_email_becomes_follow_up_ledger_item(tmp_path, monkeypat
     assert "send the deck" in it["summary"] and "Acme sync" in it["summary"]
 
 
+@pytest.mark.parametrize('stamp,kind', [('2026-06-02T09:30:00Z', 'meeting_end'),
+                                        ('2026-06-02', 'meeting_date'), ('', '')])
+def test_source_meeting_time_survives_capture_restart_and_evidence_read(tmp_path, monkeypatch, stamp, kind):
+    from datetime import timezone
+    import loops_query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE', '+00:00')
+    source = {'meeting_id': 'old-meeting', 'end': stamp,
+              'transcript': "Dana: I'll send the deck. Dana: I'll send the contract.",
+              'attendee_emails': [USER, 'dana@example.com'],
+              'attendees': [{'email': USER}, {'email': 'dana@example.com', 'name': 'Dana'}]}
+    payload = {'commitments': [{'meeting_id': 'old-meeting', 'owner': 'Dana', 'owner_is_user': False,
+        'what': 'send the ' + deliverable, 'source_snippet': "Dana: I'll send the " + deliverable + '.'}
+        for deliverable in ('deck', 'contract')]}
+    result = ac.apply(payload, USER, NOW, source_meetings=[source])
+    assert result['written'] == 2
+    # A new module/process reader uses only persisted rows, not this capture's meeting cache.
+    history = loops_query.person_history(str(tmp_path), ['granola'], identifiers=['dana@example.com'],
+                                         now=NOW.replace(tzinfo=timezone.utc))
+    assert {row['ask'] for row in history['items']} == {'send the deck', 'send the contract'}
+    for row in history['items']:
+        assert row['source_timestamp'] == stamp
+        assert row['source_timestamp_kind'] == kind
+        assert row['source_timestamp_state'] == ('recorded' if stamp else 'unavailable')
+        assert row['source_refs'][0].get('timestamp', '') == stamp
+        assert row['status'] == 'open' and row['completion_basis'] == 'not_recorded'
+    assert loops_query.person_history(str(tmp_path), [], identifiers=['dana@example.com'])['items'] == []
+
+
 def test_rerun_dedupes_by_anchor_key(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     payload = {"commitments": [{"meeting": "Sync", "meeting_id": "m-sync", "owner": "you",
@@ -475,3 +504,53 @@ def test_obligation_identity_preserves_temporal_deliverable_qualifiers(tmp_path,
         for qualifier in ('Monday', 'Tuesday', 'next', 'this')]}, USER, NOW)
     assert result['written'] == 4 and result['deduped'] == 0
     assert len(set(result['anchor_keys'])) == 4
+
+
+def test_late_meeting_capture_uses_observed_meeting_time(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
+    source = {'meeting_id': 'late-meeting', 'end': '2026-07-01T17:00:00Z',
+              'transcript': "Dana: I'll send the deck.",
+              'attendees': [{'email': USER, 'name': 'Owner'},
+                            {'email': 'dana@example.com', 'name': 'Dana Smith'}],
+              'attendee_emails': [USER, 'dana@example.com']}
+    payload = {'commitments': [{'meeting_id': 'late-meeting', 'owner': 'Dana Smith',
+        'owner_is_user': False, 'what': 'send the deck',
+        'source_snippet': "Dana: I'll send the deck.", 'created_at': '2001-01-01'}]}
+    result = ac.apply(payload, USER, NOW, source_meetings=[source])
+    assert result['written'] == 1
+    row, = _ledger_items(tmp_path).values()
+    assert row['created_at'] == '2026-07-01T17:00:00+00:00'
+    assert cr._message_is_after('2026-07-01T18:00:00Z', cr._inbound_cutoff(row['created_at']))
+
+
+def test_same_meeting_reference_gains_timestamp_without_duplicate():
+    old = {'source': 'granola', 'source_id': 'meeting-one', 'snippet': "Dana: I'll send the deck."}
+    stamped = {**old, 'timestamp': '2026-07-02T09:00:00Z'}
+    row = {'source_refs': [dict(old)]}
+    ac._attach_source(row, stamped)
+    ac._attach_source(row, stamped)
+    assert row['source_refs'] == [stamped]
+    changed = {**stamped, 'timestamp': '2026-07-02T10:00:00Z'}
+    ac._attach_source(row, changed)
+    assert row['source_refs'] == [stamped, changed]  # conflicting source evidence stays visible
+
+
+def test_same_meeting_reference_preserves_metadata_and_does_not_lose_timestamp():
+    old = {'source': 'granola', 'source_id': 'meeting-one', 'snippet': "Dana: I'll send the deck."}
+    stamped = {**old, 'timestamp': '2026-07-02T09:00:00Z'}
+    row = {'source_refs': [{**old, 'retained_metadata': 'original'}]}
+    ac._attach_source(row, stamped)
+    ac._attach_source(row, old)
+    ac._attach_source(row, stamped)
+    assert row['source_refs'] == [{**stamped, 'retained_metadata': 'original'}]
+    ac._attach_source(row, {**stamped, 'timestamp': '2026-07-02T10:00:00Z'})
+    assert len(row['source_refs']) == 2  # conflicting timestamps remain independent evidence
+
+
+def test_recaptured_exact_reference_does_not_enrich_a_legacy_duplicate():
+    old = {'source': 'granola', 'source_id': 'meeting-one', 'snippet': "Dana: I'll send the deck."}
+    stamped = {**old, 'timestamp': '2026-07-02T09:00:00Z'}
+    row = {'source_refs': [dict(old), dict(stamped)]}
+    ac._attach_source(row, stamped)
+    assert row['source_refs'] == [old, stamped]

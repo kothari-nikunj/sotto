@@ -113,15 +113,15 @@ def test_people_index_is_shared_within_run_and_refreshed_next_run(monkeypatch):
     rp.compute(local, NOW)
     assert len(snapshots) == 2
     assert all(index is snapshots[1] for index in lookups[2:])
-    # A paginated history read includes only a few people. Every absent prior contact must
-    # share the same index too, or each page scans the entire graph hundreds of times.
+    # This synthetic complete window includes only a few current people. Every absent prior
+    # contact must share the same index, without rescanning the graph for each contact.
     before = len(lookups)
     history = {f'Past contact {i}': {'name': f'Past contact {i}', 'interactions': 20,
                                   'last_contact': (NOW-timedelta(days=50)).date().isoformat(),
                                   'importance_evidence': {'sent_days': ['2026-08-01', '2026-08-02'],
                                                           'received_days': ['2026-08-03', '2026-08-04']}}
                for i in range(20)}
-    out = rp.compute(local, NOW, history)
+    out = rp.compute(local, NOW, history, absence_complete=True)
     assert out['lapsed']
     assert len(snapshots) == 3 and len(lookups) == before + 22
     assert all(index is snapshots[2] for index in lookups[before:])

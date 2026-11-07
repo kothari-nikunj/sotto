@@ -6,8 +6,8 @@ Both playgrounds render every numeric rule from ONE embedded data island:
 
 This file is the other half of that design. It loads the island out of each HTML file, imports the
 real constants from the tree, and compares them field by field. It also asserts that
-`docs/HOW-SOTTO-DECIDES.md` still states each of those numbers in plain text — the pages and the
-prose doc are two renderings of the same claims, so they drift the same way.
+`docs/HOW-SOTTO-DECIDES.md` and the retention owner `docs/DATA-FLOW.md` still state their
+numbers in plain text — the pages and owning prose docs render the same claims.
 
 CLAUDE.md's docs-stay-true rule names this file as the enforcement layer: a behaviour change
 **updates the playground's rules island in the same commit**, or this suite goes red.
@@ -42,8 +42,8 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.abspath(os.path.join(HERE, ".."))          # sotto-chief-of-staff/
-HERMES = os.path.abspath(os.path.join(PACK, ".."))        # sotto-hermes/
-DOCS = os.path.join(HERMES, "docs")
+AGENT_ROOT = os.path.abspath(os.path.join(PACK, ".."))        # sotto-agent/
+DOCS = os.path.join(AGENT_ROOT, "docs")
 
 RULE = ("CLAUDE.md § the docs-stay-true rule: every behaviour change ships with its documentation "
         "in the same commit — update the playground's rules island in the same commit as the code.")
@@ -64,16 +64,16 @@ cr = _load("dd_continuity", PACK, "morning-brief", "scripts", "continuity_resolv
 ps = _load("dd_proactive", PACK, "proactive", "scripts", "proactive_scan.py")
 prefs = _load("dd_preferences", PACK, "_shared", "scripts", "preferences.py")
 sx = _load("dd_style_extract", PACK, "_shared", "scripts", "style_extract.py")
-rec = _load("dd_receiver", HERMES, "runtime", "trigger-receiver", "receiver.py")
-cal = _load("dd_calcache", HERMES, "runtime", "trigger-receiver", "calcache.py")
-ob = _load("dd_outbox", HERMES, "runtime", "trigger-receiver", "outbox.py")
-rt = _load("dd_retention", HERMES, "runtime", "trigger-receiver", "retention.py")
+rec = _load("dd_receiver", AGENT_ROOT, "runtime", "trigger-receiver", "receiver.py")
+cal = _load("dd_calcache", AGENT_ROOT, "runtime", "trigger-receiver", "calcache.py")
+ob = _load("dd_outbox", AGENT_ROOT, "runtime", "trigger-receiver", "outbox.py")
+rt = _load("dd_retention", AGENT_ROOT, "runtime", "trigger-receiver", "retention.py")
 fg = _load("dd_forget", PACK, "tools", "forget.py")
-dsh = _load("dd_dashboard", HERMES, "runtime", "trigger-receiver", "dashboard.py")
+dsh = _load("dd_dashboard", AGENT_ROOT, "runtime", "trigger-receiver", "dashboard.py")
 att = _load("dd_attachments", PACK, "_shared", "lib", "attachments.py")
 bv = _load("dd_brief_validate", PACK, "_shared", "lib", "brief_validate.py")
-on = _load("dd_onboarding", HERMES, "runtime", "trigger-receiver", "onboarding.py")
-br = _load("dd_brief_runner", HERMES, "runtime", "trigger-receiver", "brief_runner.py")
+on = _load("dd_onboarding", AGENT_ROOT, "runtime", "trigger-receiver", "onboarding.py")
+br = _load("dd_brief_runner", AGENT_ROOT, "runtime", "trigger-receiver", "brief_runner.py")
 mc = _load("dd_memory_cycle", PACK, "_shared", "scripts", "memory_cycle.py")
 pc = _load("dd_personal_context", PACK, "_shared", "lib", "personal_context.py")
 de = _load("dd_delivery_effects", PACK, "_shared", "lib", "delivery_effects.py")
@@ -111,6 +111,8 @@ def test_readback_limits_match_both_rules_islands():
 
 with open(os.path.join(DOCS, "HOW-SOTTO-DECIDES.md"), encoding="utf-8") as _f:
     DECIDES = re.sub(r"\s+", " ", _f.read())
+with open(os.path.join(DOCS, "DATA-FLOW.md"), encoding="utf-8") as _f:
+    DATA_FLOW = re.sub(r"\s+", " ", _f.read())
 
 
 # ── env-default extraction ──────────────────────────────────────────────────────────────────────
@@ -158,9 +160,9 @@ def _literal_constant(path, name):
     return values[0]
 
 
-def _anchor(text):
-    assert text in DECIDES, (
-        f"docs drift — docs/HOW-SOTTO-DECIDES.md no longer states {text!r}.\n{RULE}")
+def _anchor(text, owner=DECIDES, filename="HOW-SOTTO-DECIDES.md"):
+    assert text in owner, (
+        f"docs drift — docs/{filename} no longer states {text!r}.\n{RULE}")
 
 
 # ── the island itself ───────────────────────────────────────────────────────────────────────────
@@ -270,6 +272,12 @@ def test_release_valve():
     _anchor("the affected meeting's start")
 
 
+def test_explicit_timer_grace_matches_rules_and_prose():
+    _same('outbox.owner_reminder_grace_min', R['outbox']['owner_reminder_grace_min'] * 60,
+          rec.OWNER_REMINDER_GRACE_SECS)
+    assert f"{R['outbox']['owner_reminder_grace_min']} minutes after its requested due time" in DECIDES
+
+
 def test_delivery_outbox():
     """The outbox's retry numbers, and the one it is not allowed to invent.
 
@@ -336,6 +344,8 @@ def test_onboarding_brief_and_learning_caps():
     _same('brief.followup_retention_days', R['brief']['followup_retention_days'],
           br.FOLLOWUP_RETENTION_SECONDS // 86400)
     _same('learning.source_retry_seconds', R['learning']['source_retry_seconds'], mc.SOURCE_RETRY_SECONDS)
+    _same('learning.prune_interval_days', R['learning']['prune_interval_days'], mc.PRUNE_INTERVAL_SECONDS // 86400)
+    _anchor(f'at most once every {mc.PRUNE_INTERVAL_SECONDS // 86400} days')
     _same('learning.unchanged_extraction_attempts', R['learning']['unchanged_extraction_attempts'],
           mc.UNCHANGED_EXTRACTION_ATTEMPTS)
     _same('learning.conversation_messages', R['learning']['conversation_messages'], pc.CONVERSATION_MESSAGES)
@@ -350,7 +360,7 @@ def test_background_cadences_are_stated_in_prose():
     interval, the two delivery-eligibility windows, and the managed model-lease timings. Each is
     built FROM its constant so a moved knob breaks the doc, not just the page."""
     de = _load("dd_delivery_effects", PACK, "_shared", "lib", "delivery_effects.py")
-    ml = _load("dd_model_lease", HERMES, "adapters", "hermes", "model_lease.py")
+    ml = _load("dd_model_lease", AGENT_ROOT, "adapters", "sotto", "model_lease.py")
     _anchor(f"at most once every {rec.MEMORY_INTERVAL_SECONDS // 60} minutes "
             "(`receiver.MEMORY_INTERVAL_SECONDS`)")
     _anchor(f"at most {mc.PAGES_PER_RUN} rotating history pages")
@@ -362,7 +372,7 @@ def test_background_cadences_are_stated_in_prose():
 
 
 def test_proxy_capacity_guards():
-    model_proxy = os.path.join(HERMES, 'cloud', 'model-proxy', 'server.py')
+    model_proxy = os.path.join(AGENT_ROOT, 'cloud', 'model-proxy', 'server.py')
     _same('proxy.requests_per_window', R['proxy']['requests_per_window'],
           _literal_constant(model_proxy, 'REQUESTS_PER_WINDOW'))
     _same('proxy.rate_window_seconds', R['proxy']['rate_window_seconds'],
@@ -376,7 +386,7 @@ def test_proxy_capacity_guards():
 def test_account_broker_capacity_guards():
     # The broker never ships in the public distribution, and neither do the HOW-SOTTO-DECIDES
     # sentences about it (hosted-only passages are stripped) — so this half skips there.
-    accounts = os.path.join(HERMES, 'cloud', 'accounts', 'server.py')
+    accounts = os.path.join(AGENT_ROOT, 'cloud', 'accounts', 'server.py')
     if not os.path.isfile(accounts):
         pytest.skip('cloud/accounts is not part of this tree (public distribution)')
     _same('accounts.pending_signins', R['accounts']['pending_signins'],
@@ -444,11 +454,11 @@ def test_bridge_event_tick():
     """The Bridge half is Rust, and it does not ship in the public tree — so assert against the
     engine when we have it, and against the env table (which always ships) either way."""
     row = re.search(r"`SOTTO_EVENTS_TICK_SECS`.*?\(default `(\d+)`\)",
-                    open(os.path.join(HERMES, "RAILWAY.md"), encoding="utf-8").read())
+                    open(os.path.join(AGENT_ROOT, "RAILWAY.md"), encoding="utf-8").read())
     assert row, "RAILWAY.md no longer documents SOTTO_EVENTS_TICK_SECS's default"
     _same("intervals.events_tick_secs (RAILWAY env table)",
           R["intervals"]["events_tick_secs"], int(row.group(1)))
-    watcher = os.path.join(HERMES, "sotto-bridge", "core", "src", "watcher.rs")
+    watcher = os.path.join(AGENT_ROOT, "sotto-bridge", "core", "src", "watcher.rs")
     if not os.path.exists(watcher):
         pytest.skip("sotto-bridge/ is excluded from the distribution tree")
     with open(watcher, encoding="utf-8") as f:
@@ -525,7 +535,7 @@ def test_x_reads_a_bounded_page_of_posts():
 def test_the_bridge_daily_contacts_subset():
     """The Bridge half is Rust and does not ship in the public tree — assert against the engine
     when we have it (same posture as test_bridge_event_tick)."""
-    readers = os.path.join(HERMES, "sotto-bridge", "core", "src", "readers.rs")
+    readers = os.path.join(AGENT_ROOT, "sotto-bridge", "core", "src", "readers.rs")
     if not os.path.exists(readers):
         pytest.skip("sotto-bridge/ is excluded from the distribution tree")
     with open(readers, encoding="utf-8") as f:
@@ -547,6 +557,16 @@ def test_continuity_resolution_windows():
     _same("continuity.park_after_days", R["continuity"]["park_after_days"], cr.PARK_AFTER_DAYS)
     _anchor("two-day deadline grace is compatibility for legacy meeting shadows")
     _anchor(f"nothing has touched for **{cr.PARK_AFTER_DAYS} days** parks")
+
+
+def test_protected_ledger_read_bounds_and_bookkeeping_fields_are_stated():
+    """The protected reader's whole-read bounds and the provenance-carrying bookkeeping set are
+    claims HOW-SOTTO-DECIDES makes in numbers and names (PR #817 review)."""
+    pl = _load("dd_protected_ledger_io", PACK, "_shared", "lib", "protected_ledger_io.py")
+    _anchor(f"accepts up to {pl.MAX_FILES} rows and {pl.MAX_TOTAL_BYTES // (1024 * 1024)} MiB")
+    _anchor("`continuity_resolve._BOOKKEEPING_FIELDS`")
+    assert {"delivery_surface", "chase_pending", "parked_at", "snoozed_until"} <= cr._BOOKKEEPING_FIELDS
+    assert not {"summary", "contact_name", "canonical_id", "source_refs", "resolution", "deadline"} & cr._BOOKKEEPING_FIELDS, RULE
 
 
 def test_chase_and_birthday_cadence():
@@ -646,9 +666,9 @@ def test_retention_ttls():
     for rule in rt.SWEEP:
         if rule.policy == rt.DROP_LINES_OLDER:
             assert rule.amount in stated, f"{rule.pattern}: a line-age rule the island does not state.\n{RULE}"
-    _anchor(f"**{rt.SEND_RECEIPT_DAYS} days**")
-    _anchor(f"**{rt.DRAFT_LEDGER_DAYS} days**")
-    _anchor(f"daily sweep at {rt.SWEEP_LOCAL[0]}:{rt.SWEEP_LOCAL[1]:02d} AM local")
+    _anchor(f"**{rt.SEND_RECEIPT_DAYS} days**", DATA_FLOW, "DATA-FLOW.md")
+    _anchor(f"**{rt.DRAFT_LEDGER_DAYS} days**", DATA_FLOW, "DATA-FLOW.md")
+    _anchor(f"daily sweep at {rt.SWEEP_LOCAL[0]}:{rt.SWEEP_LOCAL[1]:02d} AM local", DATA_FLOW, "DATA-FLOW.md")
 
 
 def test_the_families_the_sweep_leaves_alone_are_the_ones_it_may_never_delete():
@@ -726,9 +746,9 @@ def test_what_forget_refuses_to_touch_the_sweep_refuses_too():
 # ── the schedule ────────────────────────────────────────────────────────────────────────────────
 
 def test_cron_line_matches_crons_json():
-    """`adapters/hermes/crons.json` IS the schedule (CLAUDE.md). The architecture page states it in
+    """`adapters/sotto/crons.json` IS the schedule (CLAUDE.md). The architecture page states it in
     prose; the prose reads its times from the island, and the island answers to the file."""
-    with open(os.path.join(HERMES, "adapters", "hermes", "crons.json"), encoding="utf-8") as f:
+    with open(os.path.join(AGENT_ROOT, "adapters", "sotto", "crons.json"), encoding="utf-8") as f:
         crons = {c["name"]: c["schedule"] for c in json.load(f)}
 
     def hhmm(schedule):
@@ -801,7 +821,7 @@ def test_the_key_module_is_vendored_byte_for_byte():
     the copy is byte-identical, so nobody hand-maintains two copies of a hash algorithm again.
     Change one, copy it across, in the same commit."""
     canonical = os.path.join(PACK, "_shared", "lib", "keys.py")
-    vendored = os.path.join(HERMES, "runtime", "trigger-receiver", "keys.py")
+    vendored = os.path.join(AGENT_ROOT, "runtime", "trigger-receiver", "keys.py")
     with open(canonical, "rb") as f:
         a = f.read()
     with open(vendored, "rb") as f:
@@ -971,10 +991,13 @@ def _documented_matchers():
 def _scan_data_paths():
     """{normalized path: {source files}} for every literal `$SOTTO_DATA/…` path in the tree.
 
-    `test_*.py` is skipped: a test builds paths under its own tmp_path, and a fixture tree is not
-    the volume."""
+    `test_*.py` and the runtime/sotto-chat/test fixture subtree are skipped: their synthetic
+    provider files live under disposable test directories, not the production volume."""
     found = {}
-    for dirpath, dirnames, filenames in os.walk(HERMES):
+    for dirpath, dirnames, filenames in os.walk(AGENT_ROOT):
+        if os.path.relpath(dirpath, AGENT_ROOT) == os.path.join("runtime", "sotto-chat", "test"):
+            dirnames[:] = []
+            continue
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
         for filename in filenames:
             if not filename.endswith(".py") or filename.startswith("test_"):
@@ -986,11 +1009,28 @@ def _scan_data_paths():
                 parts = _literal_parts(m.group(1))
                 if parts:
                     found.setdefault(_code_path(parts), set()).add(
-                        os.path.relpath(path, HERMES))
+                        os.path.relpath(path, AGENT_ROOT))
             for rel_path in _pathlib_data_paths(src):
-                found.setdefault(rel_path, set()).add(os.path.relpath(path, HERMES))
+                found.setdefault(rel_path, set()).add(os.path.relpath(path, AGENT_ROOT))
     return found
 
+
+
+def test_shared_file_scan_excludes_only_disposable_runtime_fixtures(tmp_path, monkeypatch):
+    monkeypatch.setattr(__import__(__name__, fromlist=['AGENT_ROOT']), 'AGENT_ROOT', str(tmp_path))
+    fixture = tmp_path / 'runtime' / 'sotto-chat' / 'test' / 'provider_fixture.py'
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text('os.path.join(DATA, "synthetic-provider.json")')
+    production = fixture.parent.parent / 'provider.py'
+    production.write_text('os.path.join(DATA, "real-provider.json")')
+    # An identically named fixture outside the exact synthetic subtree is still guarded.
+    outside = tmp_path / 'other' / 'provider_fixture.py'
+    outside.parent.mkdir()
+    outside.write_text('os.path.join(DATA, "other-provider.json")')
+    assert _scan_data_paths() == {
+        'real-provider.json': {'runtime/sotto-chat/provider.py'},
+        'other-provider.json': {'other/provider_fixture.py'},
+    }
 
 def _pathlib_data_paths(src):
     """Literal descendants of `Path(DATA|data|_root()|SOTTO_DATA)`, including chained `/` joins.
@@ -999,7 +1039,7 @@ def _pathlib_data_paths(src):
     one (`root = Path(os.environ.get('SOTTO_DATA', …))`, `root = Path(data)`, `root = _root()`), or
     to a literal descendant of one (`root = Path(…) / "config"`, whose prefix is then carried into
     every `root / "x"` below it). A `root` that is a function parameter, `Path(__file__)…` or
-    `HERMES_HOME` names some other tree, and guessing would flag files that are not on the volume.
+    `SOTTO_HOME` names some other tree, and guessing would flag files that are not on the volume.
     Every base binding in a module must agree on the prefix; a module that binds `root` two ways
     is not scanned through that name at all."""
     root_prefix = [None]          # closed over by parts(); set once the module's bindings are read
@@ -1134,7 +1174,7 @@ def test_the_completeness_scan_actually_finds_paths():
     for expected in ("events/gmail_seen.json", "events/sends.jsonl", "proactive/wake_run.last",
                      "knowledge/relationship_state.json", "config/settings.json",
                      "events/outbox.json",        # onboarding.py, through a volume-bound `root`
-                     "config/photon-activation.json"):   # sotto_photon, through `root = … / "config"`
+                     "config/photon-activation.json"):   # photon_owner, through `root = … / "config"`
         assert expected in found, (
             f"the $SOTTO_DATA path scan no longer finds {expected!r} — the scan regex has drifted "
             f"from how the tree builds paths, and the completeness guard is now vacuous.\n{RULE}")
@@ -1227,10 +1267,13 @@ def test_bounded_model_work_policies_and_recovery_numbers_do_not_drift():
     for task, policy in model_work.POLICIES.items():
         row = f"| `{task}` | {policy.attempts} | {policy.output:,} | {policy.thinking or 'unchanged'} |"
         assert row in contract and row in DECIDES, RULE
-    for number in (model_work.RETENTION_DAYS, model_work.ATTEMPT_LEASE_SECONDS,
-                   model_work.MAX_INTERRUPTION_RECOVERIES, model_work.ARTIFACT_LOCK_SHARDS,
-                   compose_notification.MAX_CONTEXT_CHARS, compose_notification.MAX_COPY_CHARS):
-        assert f'**{number:,}' in contract and f'**{number:,}' in DECIDES, RULE
+    for number, owner in ((model_work.RETENTION_DAYS, DATA_FLOW),
+                          (model_work.ATTEMPT_LEASE_SECONDS, DECIDES),
+                          (model_work.MAX_INTERRUPTION_RECOVERIES, DECIDES),
+                          (model_work.ARTIFACT_LOCK_SHARDS, DECIDES),
+                          (compose_notification.MAX_CONTEXT_CHARS, DECIDES),
+                          (compose_notification.MAX_COPY_CHARS, DECIDES)):
+        assert f'**{number:,}' in contract and f'**{number:,}' in owner, RULE
     research = _load('drift_research', PACK, '_shared', 'scripts', 'research_attendees.py')
     assert research.MAX_OUTPUT_TOKENS == research.DEEP_MAX_OUTPUT_TOKENS == research.FOCUS_MAX_OUTPUT_TOKENS == model_work.POLICIES['research'].output
 
@@ -1312,3 +1355,139 @@ def test_the_relationship_state_row_names_every_dashboard_reader():
         page = next(line for line in f if '["knowledge/relationship_state.json"' in line)
     for row in (arch, page):
         assert "person page" in row and "automatic importance" in row, f"{row}\n{RULE}"
+
+
+# The supervised Sotto runtime's variables: who sets each one decides its env-table group.
+SUPERVISED_RUNTIME_VARS = {
+    "operator": ("SOTTO_SELFHOST_LAUNCH", "SOTTO_MANAGED_LAUNCH"),
+    "do not set — the supervisor injects": ("SOTTO_RUNTIME_PROFILE", "SOTTO_ROUTINE_EPOCH", "SOTTO_HOME",
+                                            "SOTTO_CHAT_RUNTIME_URL", "SOTTO_CHAT_RUNTIME_TOKEN"),
+    "internal — do not set": ("SOTTO_CAPTURED_SOURCES", "SOTTO_PROACTIVE_CAPTURED_SOURCES",
+                              "SOTTO_SKILL_COMPOSITION_PROOF", "SOTTO_READ_ONLY"),
+}
+
+
+def test_supervised_runtime_variables_are_in_the_env_table_in_their_group():
+    with open(os.path.join(AGENT_ROOT, "RAILWAY.md"), encoding="utf-8") as f:
+        rows = [line for line in f if line.startswith("| ")]
+    code = ""
+    for directory in ("runtime", "adapters", "sotto-chief-of-staff/_shared", "tools"):
+        for dirpath, dirnames, filenames in os.walk(os.path.join(AGENT_ROOT, directory)):
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", "dist", "__pycache__", "test", "tests")]
+            for name in filenames:
+                if name.endswith((".py", ".ts")) and not name.startswith("test_"):
+                    with open(os.path.join(dirpath, name), encoding="utf-8", errors="ignore") as f:
+                        code += f.read()
+    for group, names in SUPERVISED_RUNTIME_VARS.items():
+        for name in names:
+            assert re.search(r"\b%s\b" % name, code), f"{name} is documented but no code reads it"
+            row = [line for line in rows if f"`{name}`" in line.split("|")[1]]
+            assert len(row) == 1, f"RAILWAY.md env table needs exactly one row naming {name}"
+            first = row[0].split("|")[1]
+            if group == "operator":
+                assert "do not set" not in first, name
+            else:
+                assert group in first, f"{name} belongs in the '{group}' group"
+    with open(os.path.join(AGENT_ROOT, "adapters", "sotto", ".env.template"), encoding="utf-8") as f:
+        template = f.read()
+    # The template keeps operator-settable names only, with a pointer for the rest.
+    assert all(name in template for name in SUPERVISED_RUNTIME_VARS["operator"])
+    assert 'marked "do not set"' in template
+    # Sotto is the only runtime: no runtime selector may be documented as a setting again.
+    for retired in ("SOTTO_RUNTIME", "SOTTO_RUN_SKILL", "SOTTO_SPAWN_TOOLSETS"):
+        assert not [line for line in rows if f"`{retired}`" in line.split("|")[1]], retired
+        assert not re.search(r"\b%s\b" % retired, template), retired
+
+
+def test_pack_readme_layout_names_every_shared_lib_and_script():
+    with open(os.path.join(PACK, "README.md"), encoding="utf-8") as f:
+        layout = f.read()
+    missing = []
+    for kind in ("lib", "scripts"):
+        for name in sorted(os.listdir(os.path.join(PACK, "_shared", kind))):
+            # A tree row (`  lib/x.py  # purpose`) or a prose mention (`_shared/lib/x.py`) both count.
+            if name.endswith(".py") and f"{kind}/{name}" not in layout:
+                missing.append(f"{kind}/{name}")
+    assert not missing, f"sotto-chief-of-staff/README.md layout tree is missing: {missing}"
+
+
+# A deliberately small behavior inventory: exact local test anchors and explicit evidence status.
+# This checks claims against named tests, not against a live provider or an unbuilt capability.
+_DEFERRED_BEHAVIORS = {
+    "telegram_full_attended_route_profile", "telegram_meeting_prep",
+    "telegram_owner_skill_requests", "telegram_requested_briefs",
+    "telegram_offered_replies", "telegram_brief_detail",
+    "telegram_chat_entity_chunking", "telegram_scheduled_entity_chunking",
+}
+
+
+def _check_behavior_inventory(inventory, selfhost_text, onboarding_text):
+    assert inventory["version"] == 1
+    rows = inventory["behaviors"]
+    assert isinstance(rows, list) and rows
+    by_id = {row["id"]: row for row in rows}
+    assert len(by_id) == len(rows), "duplicate behavior inventory id"
+    assert _DEFERRED_BEHAVIORS <= by_id.keys(), "missing deferred behavior inventory row"
+    for row in rows:
+        assert row["surface"] in {"current_photon", "self_host_telegram_limited", "shared_future"}
+        assert row["implementation"] in {"present", "deferred"}, row["id"]
+        expected_evidence = ("contract_test" if row["implementation"] == "present"
+                             else "current_boundary_only")
+        assert row["local_evidence"] == expected_evidence, row["id"]
+        assert row["live_evidence"] == "not_recorded_here", row["id"]
+        assert isinstance(row["claim"], str) and row["claim"].strip(), row["id"]
+        test = row["test"]
+        relative = test["file"]
+        assert relative.startswith(("runtime/", "sotto-chief-of-staff/tests/"))
+        assert ".." not in relative.split("/"), relative
+        path = os.path.join(AGENT_ROOT, relative)
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        name = test["name"]
+        if path.endswith(".py"):
+            names = {node.name for node in ast.walk(ast.parse(source))
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and node.name.startswith("test_")}
+        else:
+            assert path.endswith(".ts"), relative
+            names = set(re.findall(r"\btest\(\s*['\"]([^'\"]+)['\"]", source))
+        assert name in names, f"{row['id']}: stale test reference {relative}::{name}"
+    for marker in ("limited self-host Telegram profile", "Photon-only attended meeting prep",
+                   "full attended route profile", "entity-aware long-message chunking"):
+        assert marker in selfhost_text, f"SELFHOST.md missing limitation: {marker}"
+    for marker in ("limited profile", "Photon-only", "BEHAVIOR-INVENTORY.json"):
+        assert marker in onboarding_text, f"ONBOARDING.md missing limitation: {marker}"
+
+
+def test_behavior_inventory_has_live_test_anchors_and_setup_limits():
+    with open(os.path.join(DOCS, "BEHAVIOR-INVENTORY.json"), encoding="utf-8") as f:
+        inventory = json.load(f)
+    with open(os.path.join(AGENT_ROOT, "adapters", "sotto", "SELFHOST.md"), encoding="utf-8") as f:
+        selfhost = f.read()
+    with open(os.path.join(AGENT_ROOT, "ONBOARDING.md"), encoding="utf-8") as f:
+        onboarding = f.read()
+    _check_behavior_inventory(inventory, selfhost, onboarding)
+
+
+def test_behavior_inventory_guard_rejects_stale_or_omitted_claims():
+    with open(os.path.join(DOCS, "BEHAVIOR-INVENTORY.json"), encoding="utf-8") as f:
+        original = json.load(f)
+    with open(os.path.join(AGENT_ROOT, "adapters", "sotto", "SELFHOST.md"), encoding="utf-8") as f:
+        selfhost = f.read()
+    with open(os.path.join(AGENT_ROOT, "ONBOARDING.md"), encoding="utf-8") as f:
+        onboarding = f.read()
+    stale = json.loads(json.dumps(original))
+    stale["behaviors"][0]["test"]["name"] = "renamed test no longer exists"
+    with pytest.raises(AssertionError, match="stale test reference"):
+        _check_behavior_inventory(stale, selfhost, onboarding)
+    missing = json.loads(json.dumps(original))
+    missing["behaviors"] = [row for row in missing["behaviors"]
+                            if row["id"] != "telegram_meeting_prep"]
+    with pytest.raises(AssertionError, match="missing deferred"):
+        _check_behavior_inventory(missing, selfhost, onboarding)
+    invalid = json.loads(json.dumps(original))
+    invalid["behaviors"][0]["implementation"] = "done"
+    with pytest.raises(AssertionError):
+        _check_behavior_inventory(invalid, selfhost, onboarding)
+    with pytest.raises(AssertionError, match="SELFHOST.md missing limitation"):
+        _check_behavior_inventory(original, "", onboarding)

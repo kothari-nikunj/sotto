@@ -251,3 +251,155 @@ def test_email_evidence_parts_keep_body_and_excerpt_separate_for_quote_matching(
     monkeypatch.setattr(sc, 'allowed', lambda source: source != 'whatsapp' and original(source))
     assert sc.email_evidence_parts(row) == [row['body']]
     assert not sc.email_quote_found(row, 'Attached is the deck.')
+
+
+def test_revoked_source_loses_coverage_as_well_as_content(monkeypatch):
+    monkeypatch.setattr(sc, 'allowed', lambda source: source == 'imessage')
+    original = {'source_coverage': {'imessage': {'rows_scanned': 3},
+                                   'whatsapp': {'rows_scanned': 4},
+                                   'deferred_unread_whatsapp': {'rows_scanned': 5}}}
+    assert sc.project_local(original)['source_coverage'] == {'imessage': {'rows_scanned': 3}}
+    assert len(original['source_coverage']) == 3
+
+
+def test_successful_empty_google_read_does_not_request_reconnection():
+    receipts = {source: sc.source_result('ok', complete=True) for source in ('gmail', 'calendar')}
+    inputs = {'first_run': True, 'google': {'emails': [], 'events': []}, 'source_results': receipts}
+    local = cb._normalize_local(inputs)
+    assert local['_source_availability']['gmail'] == 'available'
+    assert local['_source_availability']['calendar'] == 'available'
+    note = cb._coverage_line(local, local['_source_availability'], [], [])
+    assert 'Gmail + Calendar' not in note
+    assert 'your email and calendar' in note
+
+
+def test_real_read_retains_coverage_separate_from_health_and_failures():
+    read_at = stamp(1)
+    detail = {'status': 'ok', 'observed_at': read_at, 'rows_scanned': 0,
+              'scan_observed': True, 'limit_reached': False, 'content_partial': False, 'bounded': True}
+    sc.record_bridge_status({'generated_at': read_at, 'source_status': {'imessage': 'ok'},
+                            'imessage': [], 'deferred_unread_imessage': [],
+                            'source_coverage': {'imessage': detail}})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['status'] == 'empty'
+    assert item['coverage'] == detail
+    assert item['last_successful_read_at'] == read_at
+    sc.record_bridge_status({'generated_at': stamp(.5), 'sources': {'imessage': 'ok'}})
+    sc.record_bridge_status({'generated_at': stamp(), 'source_status': {'imessage': 'unavailable'},
+                            'imessage': [], 'deferred_unread_imessage': []})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['status'] == 'unavailable'
+    assert item['last_successful_read_at'] == read_at
+
+
+def test_unread_receipt_is_not_summarized_as_successful_empty():
+    sc.record_bridge_status({'generated_at': stamp(), 'source_status': {'imessage': 'ok'},
+        'imessage': [], 'deferred_unread_imessage': [], 'source_coverage': {'imessage': {
+            'status': 'unread', 'last_successful_read_at': None, 'rows_returned': 0}}})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['status'] == 'unverified'
+    assert item['coverage']['status'] == 'unread'
+    assert item['last_successful_read_at'] is None
+
+
+def rich_coverage(at, *, status='partial'):
+    return {'status': status, 'observed_at': at, 'rows_scanned': 100, 'scan_observed': True,
+            'limit_reached': True, 'content_partial': False, 'bounded': True,
+            'requested_window': {'since': stamp(24), 'until': at},
+            'effective_window': {'since': stamp(24), 'until': at, 'basis': 'sent'},
+            'last_successful_read_at': at, 'rows_returned': 1, 'query_row_caps': [100],
+            'omitted_rows': None, 'failure_category': None,
+            'components': {'deferred_unread': {'status': 'failed', 'failure_category': 'query'}},
+            'attachments': {'metadata': 'available', 'body': 'not_read'}}
+
+
+def test_partial_primary_and_failed_companion_keep_independent_coverage_and_success(tmp_path):
+    at = stamp(1)
+    primary = rich_coverage(at)
+    companion = {'status': 'failed', 'failure_category': 'query', 'last_successful_read_at': None}
+    sc.record_bridge_status({'generated_at': at, 'source_status': {
+        'imessage': 'ok', 'deferred_unread_imessage': 'degraded'},
+        'imessage': [{'text': 'usable primary result'}], 'deferred_unread_imessage': [],
+        'source_coverage': {'imessage': primary, 'deferred_unread_imessage': companion}})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['status'] == 'partial' and item['field_counts']['imessage'] == 1
+    assert item['coverage'] == primary and item['deferred_unread_coverage'] == companion
+    assert item['last_successful_read_at'] == at
+    # A late older read and a later health probe cannot overwrite extraction evidence.
+    sc.record_bridge_status({'generated_at': stamp(2), 'source_status': {'imessage': 'ok'},
+        'imessage': [], 'deferred_unread_imessage': [], 'source_coverage': {'imessage': {'status': 'empty'}}})
+    sc.record_bridge_status({'generated_at': stamp(), 'sources': {'imessage': 'ok'}})
+    again = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert again['coverage'] == primary and again['last_successful_read_at'] == at
+    stored = json.loads((tmp_path / 'config/source-state.json').read_text())
+    assert 'usable primary result' not in json.dumps(stored)
+    sc.record_bridge_status({'sources': {'imessage': 'disabled'}})
+    disabled = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert 'coverage' not in disabled and 'last_successful_read_at' not in disabled
+
+
+def test_rich_coverage_reaches_prompt_as_bounded_read_evidence():
+    detail = rich_coverage(stamp())
+    text = cb._collection_limits({'source_coverage': {'imessage': detail}})
+    assert 'read status: partial' in text and 'requested window:' in text and 'effective window:' in text
+    assert 'last successful read:' in text and '1 records returned' in text and 'per-query row caps: 100' in text
+    assert 'omitted records: unknown' in text and 'deferred_unread: failed (query)' in text
+    assert 'attachment bodies not read' in text and 'do not infer absence' in text
+    malicious = {**detail, 'failure_category': 'private provider body'}
+    assert cb._collection_limits({'source_coverage': {'imessage': malicious}}) == ''
+
+
+def test_component_measurements_reach_prompt_without_becoming_parent_coverage():
+    detail = rich_coverage(stamp())
+    component = detail['components']['deferred_unread']
+    component.update(requested_window={'since': stamp(720), 'until': stamp(24)},
+                     effective_window={'since': stamp(480), 'until': stamp(24), 'basis': 'sent'},
+                     last_successful_read_at=stamp(25), query_row_caps=[12], rows_returned=2, omitted_rows=7)
+    text = cb._collection_limits({'source_coverage': {'imessage': detail}})
+    assert component['requested_window']['since'] in text
+    assert component['effective_window']['since'] in text
+    assert component['last_successful_read_at'] in text
+    assert 'per-query row caps: 12' in text and 'omitted records: 7' in text
+    assert '2 records returned' in text and '1 records returned' in text
+
+
+def test_healthy_measured_reads_are_not_presented_as_collection_gaps():
+    detail = rich_coverage(stamp())
+    detail.update(status='ok', omitted_rows=0, limit_reached=False, content_partial=False,
+                  failure_category=None, components={}, attachments={'metadata': 'available', 'body': 'not_read'})
+    assert cb._collection_limits({'source_coverage': {'imessage': detail}}) == ''
+    detail.update(status='empty', rows_returned=0)
+    assert cb._collection_limits({'source_coverage': {'imessage': detail}}) == ''
+    detail['omitted_rows'] = None
+    assert 'omitted records: unknown' in cb._collection_limits({'source_coverage': {'imessage': detail}})
+    detail['omitted_rows'] = 0
+    detail['components'] = {'deferred_unread': {'status': 'failed', 'failure_category': 'query',
+                                               'last_successful_read_at': None}}
+    assert 'deferred_unread: failed' in cb._collection_limits({'source_coverage': {'imessage': detail}})
+
+
+@pytest.mark.parametrize('detail', [None, 'invalid', {'status': 'failed', 'private': 'do not retain'}])
+def test_invalid_present_coverage_cannot_refresh_success(detail):
+    prior = stamp(1)
+    sc.record_bridge_status({'generated_at': prior, 'source_status': {'imessage': 'ok'},
+                            'imessage': [], 'deferred_unread_imessage': []})
+    sc.record_bridge_status({'generated_at': stamp(), 'source_status': {'imessage': 'ok'},
+                            'imessage': [], 'deferred_unread_imessage': [],
+                            'source_coverage': {'imessage': detail}})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['last_successful_read_at'] == prior
+    assert item['status'] == 'partial'
+    assert 'do not retain' not in json.dumps(item)
+
+
+@pytest.mark.parametrize('coverage', [None, [], 'invalid'])
+def test_malformed_coverage_container_cannot_refresh_success(coverage):
+    prior = stamp(1)
+    sc.record_bridge_status({'generated_at': prior, 'source_status': {'imessage': 'ok'},
+                            'imessage': [], 'deferred_unread_imessage': []})
+    sc.record_bridge_status({'generated_at': stamp(), 'source_status': {'imessage': 'ok'},
+                            'imessage': [], 'deferred_unread_imessage': [],
+                            'source_coverage': coverage})
+    item = next(row for row in sc.source_health()['sources'] if row['source'] == 'imessage')
+    assert item['last_successful_read_at'] == prior
+    assert item['status'] == 'partial'

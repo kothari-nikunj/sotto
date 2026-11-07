@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
 """
-Telegram link engine — "paste your bot's token, text it once, and Sotto tells you exactly what to
-set". No user-id hunting via @userinfobot, no guessing which variable names to fill in.
+Telegram link engine — validate a bot token, then capture the owner's chat id from the first
+private message that carries the pairing phrase.
 
-One command, three steps:
-  1. getMe      — is this a real bot token? Prints the @username, so you know WHICH bot you pasted.
+Three steps, one owner:
+  1. getMe      — is this a real bot token? Returns the @username, so the caller knows WHICH bot.
   2. getUpdates — long-poll until the first PRIVATE message from a human CARRYING THE PAIRING PHRASE
                   arrives. That sender IS the owner: their numeric id is CAPTURED, never looked up
                   in a second bot.
-  3. write+print— $SOTTO_DATA/telegram-link.json (0600), then the exact Railway variable block.
+  3. persist    — $SOTTO_DATA/telegram-link.json (0600): the bot token and the owner together.
 
 THE PAIRING PHRASE IS THE WHOLE OWNERSHIP CHECK. A bot's @username is discoverable, so "the first
 human who messages the bot" would hand the deploy — and every brief after it — to whoever guessed
-the name first. The caller passes `--phrase`; start.sh passes this deploy's SETUP CODE, the same
-per-deploy secret that gates /setup, so nothing new is invented and nothing here has to import the
-receiver. The phrase reaches its owner in the deploy log, which only the operator can read: the same
-trust context as the setup link boot already prints beside it. No phrase, no capture.
+the name first. The caller passes the phrase (adapters/sotto/selfhost_setup.py passes the one-time
+setup phrase only the operator can read). No phrase, no capture.
 
-WHO READS telegram-link.json: boot and the wizard. `start.sh` runs this file's `--boot` mode when a
-TELEGRAM_BOT_TOKEN is set and no chat id is configured yet — it reuses the captured id when the file
-already holds one for THAT token, else captures it — and forwards the id into `~/.hermes/.env` as
-TELEGRAM_ALLOWED_USERS + TELEGRAM_HOME_CHANNEL; the `/setup` wizard's tile 3 reads the same file to
-say "linked" or "waiting for your first message". So the deployer sets ONE variable and texts the
-bot once. This module is the ONE owner of the Telegram handshake: nothing re-implements a Bot API
-call, a capture rule or this file's shape elsewhere.
+WHO READS telegram-link.json: the self-host setup (ensure_link), the Sotto runtime adapter's
+private reader (adapters/sotto/runtime_api.py) and the `/setup` wizard's channel tile. This module
+is the ONE owner of the Telegram handshake: nothing re-implements a Bot API call, a capture rule or
+this file's shape elsewhere.
 
 SECRETS: the bot token is a credential. This module writes to no log — it deliberately does not use
 the tree's `sotto_log`/diag helpers — and `_redact` scrubs the token out of any transport detail
-that reaches an error string (the API URL carries the token in its path). It IS printed once, in
-the settings block, on the terminal of the person who just typed it: that is the deliverable.
+that reaches an error string (the API URL carries the token in its path).
 
 Stdlib only (urllib/json/time), like the rest of the receiver tree.
 """
 from __future__ import annotations
 
-import argparse
 import json
+import hashlib
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -45,8 +40,8 @@ import urllib.request
 
 # The receiver image's ONE atomic-write helper (docs/ARCHITECTURE.md names it as such). Reused
 # rather than re-implemented: a second tmp+os.replace in this tree would be a second writer of the
-# same concept. The bootstrap makes `python3 /app/trigger-receiver/telegram_link.py` work from any
-# cwd — the same sys.path bootstrap the skills scripts use.
+# same concept. The bootstrap makes this module importable from any cwd — the same sys.path
+# bootstrap the skills scripts use.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from connectors import write_json  # noqa: E402 — must follow the bootstrap above
 
@@ -68,14 +63,82 @@ HTTP_TIMEOUT_SECS = POLL_SECS + 10
 # Refused identically at both entry points, because either one alone would link a stranger.
 NO_PHRASE = "no pairing phrase — without one the first person to find the bot would own this deploy"
 
-# The variable names this prints. Source of truth: CHANNELS.md § Telegram setup — the token and
-# allow/home-channel variables belong to Hermes (start.sh forwards every TELEGRAM_* into
-# ~/.hermes/.env by prefix), and SOTTO_CRON_DELIVER is the one lever that moves the briefs.
-TOKEN_VAR = "TELEGRAM_BOT_TOKEN"
-ALLOWED_USERS_VAR = "TELEGRAM_ALLOWED_USERS"
-HOME_CHANNEL_VAR = "TELEGRAM_HOME_CHANNEL"
-DELIVER_VAR = "SOTTO_CRON_DELIVER"
 
+def validate_native_capture(token: str, provision_request: str, evidence: dict) -> dict:
+    """Validate authenticated native Bot API evidence before starting a fresh runtime.
+
+    The trusted native provisioning owner obtains these responses over TLS and keeps
+    them in its protected setup record. This is a pure contract check, not a public
+    proof verifier: arbitrary JSON cannot prove that Telegram produced a response.
+    Only the canonical private link projection leaves this setup boundary.
+    """
+    def refuse():
+        raise ValueError('native Telegram capture unavailable')
+
+    def safe_id(value, minimum=1):
+        return type(value) is int and minimum <= value <= 9007199254740991
+
+    try:
+        encoded = json.dumps(evidence, ensure_ascii=False, allow_nan=False).encode()
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        refuse()
+    keys = {'version', 'provisionRequest', 'phrase', 'bot', 'webhook', 'updates', 'update',
+            'acknowledgedOffset', 'acknowledgement', 'requestDigest'}
+    if (len(encoded) > 64 * 1024 or not isinstance(evidence, dict) or set(evidence) != keys
+            or type(evidence['version']) is not int or evidence['version'] != 1
+            or not isinstance(provision_request, str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{24,128}', provision_request)
+            or evidence['provisionRequest'] != provision_request
+            or not isinstance(token, str)
+            or not re.fullmatch(r'[1-9][0-9]{0,15}:[A-Za-z0-9_-]{20,256}', token)):
+        refuse()
+    phrase = evidence['phrase']
+    if not isinstance(phrase, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,64}', phrase):
+        refuse()
+    digest = hashlib.sha256(('sotto-native-telegram-pair-v1\0' + provision_request
+                             + '\0' + token + '\0' + phrase).encode()).hexdigest()
+    if evidence['requestDigest'] != digest:
+        refuse()
+    bot, webhook = evidence['bot'], evidence['webhook']
+    if (not isinstance(bot, dict) or not safe_id(bot.get('id'))
+            or bot['id'] != int(token.split(':', 1)[0]) or bot.get('is_bot') is not True
+            or not isinstance(bot.get('username'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_]{5,32}', bot['username'])
+            or not isinstance(webhook, dict) or webhook.get('url') != ''):
+        refuse()
+    updates, update = evidence['updates'], evidence['update']
+    ack, offset = evidence['acknowledgement'], evidence['acknowledgedOffset']
+    for batch in (updates, ack):
+        if (not isinstance(batch, list) or len(batch) > 100
+                or any(not isinstance(item, dict) or not safe_id(item.get('update_id'), 0)
+                       for item in batch)
+                or any(left['update_id'] >= right['update_id']
+                       for left, right in zip(batch, batch[1:]))):
+            refuse()
+
+    def owner(item):
+        message = item.get('message')
+        if not isinstance(message, dict):
+            return None
+        sender, chat = message.get('from'), message.get('chat')
+        if (not isinstance(sender, dict) or not isinstance(chat, dict)
+                or sender.get('is_bot') is not False or not safe_id(sender.get('id'))
+                or type(chat.get('id')) is not int or chat['id'] != sender['id']
+                or message.get('text') not in (phrase, '/start ' + phrase)):
+            return None
+        # One private-human ownership predicate serves both native and operator setup.
+        captured = _first_human_private_message(item, phrase)
+        return captured['user_id'] if captured else None
+
+    # Anyone else's update in the batch is ignored, so it cannot block pairing. The capture is
+    # the first exact owner Start; the phrase arriving from two accounts is refused.
+    # Existing version 1 captures may acknowledge the whole batch; new captures stop at Start.
+    matches = [(item, found) for item in updates if (found := owner(item)) is not None]
+    if (len({found for _, found in matches}) != 1 or update != matches[0][0]
+            or not safe_id(offset) or offset not in (update['update_id'] + 1, updates[-1]['update_id'] + 1)
+            or any(item['update_id'] < offset for item in ack)):
+        refuse()
+    return {'bot_token': token, 'allowed_user': matches[0][1]}
 
 def link_path() -> str:
     """The handoff file for the future wizard tile. Read at call time so $SOTTO_DATA can move."""
@@ -209,14 +272,19 @@ def capture_first_sender(token: str, phrase: str, timeout_secs: int = LINK_TIMEO
                 # minutes later received "/start <setup code>" as the user's first message and the
                 # per-deploy secret went into an LLM transcript. One zero-wait call consumes it.
                 if offset is not None:
-                    _call(token, "getUpdates", {"offset": offset, "timeout": 0})
+                    _confirmed, acknowledge_error = _call(
+                        token, "getUpdates", {"offset": offset, "timeout": 0})
+                    if acknowledge_error or not isinstance(_confirmed, list):
+                        return {"ok": False, "error": "pairing update acknowledgement unavailable"}
+                else:
+                    return {"ok": False, "error": "pairing update acknowledgement unavailable"}
                 return hit
         if time.monotonic() >= deadline:
             return {"ok": False, "error": "nobody sent the pairing link in time"}
 
 
 def persist(token: str, user_id: int, path: str | None = None, bot_username: str = "") -> None:
-    """Write the link file boot and the wizard read: atomic (tmp + os.replace) and 0600, because it
+    """Write the link file setup and the wizard read: atomic (tmp + os.replace) and 0600, because it
     holds the bot token. `bot_username` is carried so the wizard tile can name the bot without a
     second getMe from the browser."""
     record = {
@@ -247,10 +315,9 @@ def linked_user(token: str, path: str | None = None) -> int | None:
 
 def ensure_link(token: str, phrase: str, timeout_secs: int = LINK_TIMEOUT_SECS,
                 path: str | None = None, announce=None) -> dict:
-    """Boot's one-shot: the id already on the volume, else validate the token and capture one.
+    """Setup's one-shot: the id already on the volume, else validate the token and capture one.
 
     {"ok": True, "user_id": int, "reused": bool, ...} or {"ok": False, "error": one short line}.
-    A failure is never fatal to the caller — boot carries on and the brief still composes.
 
     `announce` is handed the one-tap deep link once the bot is known and before the wait begins, so
     the operator sees what to tap while there is still time to tap it; this module still writes to
@@ -273,97 +340,3 @@ def ensure_link(token: str, phrase: str, timeout_secs: int = LINK_TIMEOUT_SECS,
     persist(token, who["user_id"], path, bot["username"])
     return {"ok": True, "user_id": who["user_id"], "name": who["name"],
             "username": bot["username"], "reused": False}
-
-
-def settings_block(token: str, user_id: int) -> list[str]:
-    """The exact lines to paste into Railway → Variables, one `NAME=value` per line and nothing
-    else, so the whole block can be copied into Railway's raw editor unedited."""
-    return [
-        f"{TOKEN_VAR}={token}",
-        f"{ALLOWED_USERS_VAR}={user_id}",
-        f"{HOME_CHANNEL_VAR}={user_id}",
-        f"{DELIVER_VAR}=telegram",
-    ]
-
-
-def _boot(token: str, phrase: str, timeout_secs: int) -> int:
-    """`--boot`: the chat id on stdout and nothing else, progress on stderr — so start.sh can read
-    the id out of a command substitution while the deploy log still shows what happened."""
-    def say(line: str) -> None:
-        print(f"[sotto] telegram: {line}", file=sys.stderr, flush=True)
-
-    out = ensure_link(token, phrase, timeout_secs,
-                      announce=lambda link: say(f"➜ TAP THIS TO LINK YOUR CHAT:  {link}"))
-    if not out["ok"]:
-        say(out["error"])
-        if out.get("username"):
-            say(f"tap {deep_link(out['username'], phrase)} then restart this deploy to capture it")
-        return 1
-    if out.get("reused"):
-        print(f"[sotto] telegram: already linked to chat {out['user_id']} on this volume",
-              file=sys.stderr, flush=True)
-    else:
-        print(f"[sotto] telegram: linked @{out.get('username', '')} to {out.get('name', '')} "
-              f"(chat {out['user_id']})", file=sys.stderr, flush=True)
-    print(out["user_id"], flush=True)
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="telegram_link.py",
-        description="Link a Telegram bot to this deploy: validate the token, capture your user id "
-                    "from the first message carrying the pairing phrase, and print the variables "
-                    "to set.")
-    ap.add_argument("--token", required=True, help="the bot token @BotFather gave you")
-    ap.add_argument("--phrase", default="",
-                    help="the one-time pairing phrase the linking message must carry (start.sh "
-                         "passes this deploy's setup code)")
-    ap.add_argument("--timeout", type=int, default=LINK_TIMEOUT_SECS,
-                    help=f"seconds to wait for your message (default {LINK_TIMEOUT_SECS})")
-    ap.add_argument("--boot", action="store_true",
-                    help="non-interactive: reuse the captured id or capture one, print just the "
-                         "chat id on stdout (what start.sh runs)")
-    args = ap.parse_args(argv)
-    token = args.token.strip()
-    phrase = args.phrase.strip()
-    if args.boot:
-        return _boot(token, phrase, args.timeout)
-    if not phrase:
-        print(f"      x {NO_PHRASE}")
-        return 1
-
-    print("[1/3] Checking the token with Telegram...")
-    bot = validate_token(token)
-    if not bot["ok"]:
-        print(f"      x {bot['error']}")
-        return 1
-    print(f"      ok - this is @{bot['username']}")
-
-    minutes = max(1, round(args.timeout / 60))
-    print(f"[2/3] Open this on your phone - waiting up to {minutes} min...")
-    print(f"      {deep_link(bot['username'], phrase)}")
-    print(f'      (or send @{bot["username"]} the message "/start {phrase}" yourself)')
-    who = capture_first_sender(token, phrase, args.timeout)
-    if not who["ok"]:
-        print(f"      x {who['error']}")
-        return 1
-    print(f"      ok - Linked to {who['name']} (id {who['user_id']})")
-    if who["text"]:
-        print(f'           it said: "{who["text"]}"')
-
-    path = link_path()
-    persist(token, who["user_id"], path, bot["username"])
-    print(f"[3/3] Saved {path} (0600) — boot reads it and forwards the id to Hermes.")
-
-    print("")
-    print("Already set TELEGRAM_BOT_TOKEN in Railway? You are done - the next boot reads the file")
-    print("above. Otherwise paste these into Railway -> your service -> Variables, then Redeploy:")
-    print("")
-    for line in settings_block(token, who["user_id"]):
-        print(line)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

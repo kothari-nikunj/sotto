@@ -34,10 +34,64 @@ class ModelResponseError(RuntimeError):
         super().__init__(f'{code} ({self.provider_reason})')
 
 
+def request_failure(error):
+    """Classify a terminal HTTP failure without retaining provider prose or source text.
+
+    A generic INVALID_ARGUMENT cannot identify its cause. Inspect only a bounded JSON
+    error, recognize explicit settings/size/syntax signals, and leave ambiguity visible.
+    This is diagnostic only: it does not change admission, fallback or retry decisions.
+    """
+    import urllib.error
+    if not isinstance(error, urllib.error.HTTPError):
+        return None
+    if error.code == 401:
+        return 'authentication_failed'
+    if error.code == 403:
+        return 'authorization_denied'
+    if error.code == 402:
+        return 'allowance_exhausted'
+    if error.code == 413:
+        return 'input_too_large'
+    if error.code in (408, 504):
+        return 'timeout'
+    if 500 <= error.code <= 599:
+        return 'service_unavailable'
+    category = 'rate_limited' if error.code == 429 else 'provider_rejected'
+    # QuotaFailure also represents RPM/TPM limits; it does not establish exhausted
+    # account allowance. Only the explicit 402 hold above carries that conclusion.
+    if error.code not in (400, 422):
+        return category
+    try:
+        raw = error.read(16385)
+        if len(raw) > 16384:
+            return category
+        data = json.loads(raw)
+        detail = data.get('error') if isinstance(data, dict) else None
+        if not isinstance(detail, dict):
+            return category
+        message = detail.get('message')
+        message = message.lower() if isinstance(message, str) else ''
+        if ('input token count' in message or 'request payload size' in message) and any(
+                word in message for word in ('exceed', 'too large', 'maximum')):
+            return 'input_too_large'
+        if any(word in message for word in ('thinking', 'temperature', 'maxoutputtokens',
+                                           'max_output_tokens', 'responseschema', 'response_schema')) and any(
+                word in message for word in ('not supported', 'unsupported')):
+            return 'unsupported_model_settings'
+        if 'invalid json payload' in message or 'malformed json' in message:
+            return 'malformed_request'
+    except Exception:
+        # Error-body streams can fail with HTTPException/IncompleteRead as well as
+        # OSError. Diagnostics must never replace the original provider failure or
+        # prevent the caller from saving its rejection/backoff checkpoint.
+        pass
+    return category
+
+
 def _diag(msg: str) -> None:
-    """Diagnostics that must be VISIBLE to the operator. compose_brief runs inside Hermes' execute_code
-    sandbox, which captures the script's stdout/stderr and returns it to the AGENT — it does NOT reach
-    Railway's container logs — so sotto_log.diag also appends to the /data log the receiver serves at
+    """Diagnostics that must be VISIBLE to the operator. compose_brief runs as a spawned procedure
+    whose stderr the receiver's worker does not forward to the container logs, so sotto_log.diag also
+    appends to the /data log the receiver serves at
     GET /debug/brief-log. Delegated, not copied: this function used to carry its own unbounded
     `open(..., "a")` beside sotto_log's rotating one, and that second writer was the reason the log
     could grow past every bound (found in the Aug 2026 retention survey)."""
@@ -87,8 +141,20 @@ def _gemini_once(model: str, key: str, prompt: str, label: str = "",
     body["systemInstruction"] = {"parts": [{"text": gemini_transport.writing_system(system)}]}
     req = gemini_transport.request(model, body, key)
     t0 = _time.monotonic()
-    with urllib.request.urlopen(req, timeout=300) as resp:  # 5-min ceiling
-        data = json.loads(resp.read())
+    try:
+        # Managed brief proxy waits are shorter; retain client headroom to receive its verdict.
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read())
+    except Exception as error:
+        scoped_brief = (model_work.current() or {}).get('task') in {
+            'brief_extract', 'brief_critic', 'brief_revise'}
+        if scoped_brief and gemini_transport.managed() and (
+                gemini_transport.proxy_brief_outcome_uncertain(error)
+                or isinstance(error, TimeoutError)
+                or isinstance(getattr(error, 'reason', None), TimeoutError)):
+            raise gemini_transport.BriefModelOutcomeUncertainError(
+                'brief model outcome uncertain; no automatic retry') from error
+        raise
     wall = _time.monotonic() - t0
     sys_note = f" (+{len(system)} sys)" if system else ""
     _diag(f"[compose_brief] gemini {model}{label}: {len(prompt)} char prompt{sys_note} → {wall:.1f}s")
@@ -133,7 +199,7 @@ def _is_retryable(err: Exception) -> bool:
     return isinstance(err, (urllib.error.URLError, socket.timeout, TimeoutError))
 
 
-# ── The provider seam (docs/plans/model-agnostic-pipeline.md) ─────────────────────────────────────
+# ── The provider seam (docs/archive/plans/model-agnostic-pipeline.md) ─────────────────────────────────────
 # One sentence: a model is named "provider/model" and every compose call dispatches on the
 # provider, so people bring the family they already pay for — while Gemini stays the opinionated
 # default and the gemini-only capabilities (search grounding, url_context, DocSend vision) keep

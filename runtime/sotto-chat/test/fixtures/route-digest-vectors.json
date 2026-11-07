@@ -1,0 +1,390 @@
+{
+  "version": 1,
+  "description": "Shared route-digest test vectors for Node route-proof.ts routeDigest and the Python receiver mirrors (runtime_channel_proof._route_digest, telegram_channel_proof._route_digest). Transcript: ASCII \"sotto-dispatch-route-v1\\u0000\" + u32be field count (7) + seven u32be length-prefixed UTF-8 fields [channel, tenantId, projectFingerprint, ownerId, accountId, lineKey, providerThreadId]; digest is lowercase hex SHA-256. Each field must be at most 512 UTF-16 code units and 4096 UTF-8 bytes, with no U+0000-U+001F or U+007F and no lone surrogates.",
+  "fields": [
+    "channel",
+    "tenantId",
+    "projectFingerprint",
+    "ownerId",
+    "accountId",
+    "lineKey",
+    "providerThreadId"
+  ],
+  "valid": [
+    {
+      "name": "photon fixed thread with non-ASCII owner",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-1",
+        "projectFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerId": "owner-\u00e9",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:iMessage;-;+15555550123~+15555550999"
+      },
+      "digest": "5d1bb3f8b0ddb0a2b32969f08aaebaf488c9f0125390d44cea7d0cccd2c6d609"
+    },
+    {
+      "name": "photon SMS chat on the same physical line",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "ownerId": "+15550001111",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "imessage:SMS;-;+15550001111~+15550002222"
+      },
+      "digest": "4396d84aa62a1ffb2f9a63506da628d5c4fa5125517676079c4091d54315a40e"
+    },
+    {
+      "name": "photon shared-project route",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "ownerId": "+15555550100",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "imessage:any;-;+15555550100~shared"
+      },
+      "digest": "23dd802b6950704648f25165497dde30507d627a6f3d8daf251e9287a9482f55"
+    },
+    {
+      "name": "telegram with empty tenant and project fields",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "42",
+        "accountId": "fixture-bot",
+        "lineKey": "primary",
+        "providerThreadId": "telegram:42"
+      },
+      "digest": "3f5aa0bd2296156e2b897292cfaf6e551dfe9fd714b4703ac2e656b7c9105759"
+    },
+    {
+      "name": "astral and combining characters are UTF-8 length-prefixed",
+      "input": {
+        "channel": "photon",
+        "tenantId": "ten\u00e4nt \ud83c\udf32",
+        "projectFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "ownerId": "owner \u6771\u4eac e\u0301",
+        "accountId": "acct-\ud83e\udded",
+        "lineKey": "line \u2713",
+        "providerThreadId": "imessage:iMessage;-;owner@example.com"
+      },
+      "digest": "1159aa3f41b27a643762ac7fe7bc444cb501f3b9a418164ab6d0caf411fb486e"
+    },
+    {
+      "name": "field at the 512 UTF-16 unit bound (1536 UTF-8 bytes)",
+      "input": {
+        "channel": "photon",
+        "tenantId": "t",
+        "projectFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "ownerId": "o",
+        "accountId": "a",
+        "lineKey": "l",
+        "providerThreadId": "\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c\u754c"
+      },
+      "digest": "f16f5479f861eae24cc1794047ee4ea83532dca5560f14d67c1faf2697e3468d"
+    },
+    {
+      "name": "astral field at the 512 UTF-16 unit bound",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "tenant",
+        "projectFingerprint": "",
+        "ownerId": "7",
+        "accountId": "bot",
+        "lineKey": "primary",
+        "providerThreadId": "\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32"
+      },
+      "digest": "4315ea709f3bcb4bac77388bec901d5ae9cebe1907777c6211d9df0efbbbbdac"
+    },
+    {
+      "name": "managed photon fixed route",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550123",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:iMessage;-;+15555550123~+15555550999"
+      },
+      "digest": "106a0c6d64ed042e774f73825e65edba3ed516a9ef08b5a16cfdbdbb876813eb"
+    },
+    {
+      "name": "self-host photon, empty tenant",
+      "input": {
+        "channel": "photon",
+        "tenantId": "",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550124",
+        "accountId": "account-2",
+        "lineKey": "+15555550100",
+        "providerThreadId": "imessage:any;-;+15555550124~+15555550100"
+      },
+      "digest": "d6a7f92a7b2765195112c660343c6529dd15d1738ff34c01751519029d9c34a8"
+    },
+    {
+      "name": "first-contact shared project",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-b",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550125",
+        "accountId": "account-3",
+        "lineKey": "shared",
+        "providerThreadId": "imessage:iMessage;-;+15555550125~shared"
+      },
+      "digest": "050904c4facfa41083fff8c3b8206a570430c0ced00fd7995b1ad9ee3dc6edc2"
+    },
+    {
+      "name": "telegram, empty tenant and project",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "8675309",
+        "accountId": "bot-account",
+        "lineKey": "telegram-line",
+        "providerThreadId": "telegram:8675309"
+      },
+      "digest": "3ee678fc1517620580d3be322bbed1a332616ddcb867943904539eb5f708c98f"
+    },
+    {
+      "name": "non-ASCII fields hash as UTF-8",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "tenant-\u00e9",
+        "projectFingerprint": "",
+        "ownerId": "owner-\ud83d\ude42",
+        "accountId": "account-\u00fc",
+        "lineKey": "line-\u00df",
+        "providerThreadId": "telegram:\u65e5\u672c"
+      },
+      "digest": "a88b37e1986756c6dcd03d3def859ce3905cee6deba44f574443a36ac0a28cb0"
+    },
+    {
+      "name": "512 UTF-16 code units is the field bound",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      },
+      "digest": "7f6385716f55ee94f9df005cdc1127d3fe1a6ef125c6b70e20e9092b3a126b25"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "control character in a field",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerId": "owner\nnext",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "thread"
+      }
+    },
+    {
+      "name": "DEL character in a field",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "42",
+        "accountId": "bot\u007f",
+        "lineKey": "primary",
+        "providerThreadId": "telegram:42"
+      }
+    },
+    {
+      "name": "field above 512 UTF-16 units",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerId": "owner",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+    {
+      "name": "astral field above 512 UTF-16 units",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerId": "owner",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32\ud83c\udf32"
+      }
+    },
+    {
+      "name": "lone surrogate is not UTF-8 encodable",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant",
+        "projectFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerId": "owner",
+        "accountId": "account",
+        "lineKey": "line",
+        "providerThreadId": "thread\ud800"
+      }
+    },
+    {
+      "name": "empty owner",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "empty account",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550123",
+        "accountId": "",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "empty line",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "8675309",
+        "accountId": "bot-account",
+        "lineKey": "",
+        "providerThreadId": "telegram:8675309"
+      }
+    },
+    {
+      "name": "empty provider thread",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "8675309",
+        "accountId": "bot-account",
+        "lineKey": "line",
+        "providerThreadId": ""
+      }
+    },
+    {
+      "name": "short project fingerprint",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "abc123",
+        "ownerId": "+15555550123",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "uppercase project fingerprint",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07C455F62EC519BDD14A35F62E453FE3A4BF38B1F061D7250F772F97DDB70E59",
+        "ownerId": "+15555550123",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "unknown channel",
+      "input": {
+        "channel": "sms",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550123",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "sms:+15555550123"
+      }
+    },
+    {
+      "name": "control character",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550123",
+        "accountId": "account-1",
+        "lineKey": "line\n1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "DEL character",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "+15555550123",
+        "accountId": "account\u007f1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "513 UTF-16 code units",
+      "input": {
+        "channel": "photon",
+        "tenantId": "tenant-a",
+        "projectFingerprint": "07c455f62ec519bdd14a35f62e453fe3a4bf38b1f061d7250f772f97ddb70e59",
+        "ownerId": "ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo",
+        "accountId": "account-1",
+        "lineKey": "line-1",
+        "providerThreadId": "imessage:x;-;y~line-1"
+      }
+    },
+    {
+      "name": "astral character counts as two UTF-16 units",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42\ud83d\ude42",
+        "accountId": "bot-account",
+        "lineKey": "line",
+        "providerThreadId": "telegram:1"
+      }
+    },
+    {
+      "name": "lone surrogate",
+      "input": {
+        "channel": "telegram",
+        "tenantId": "",
+        "projectFingerprint": "",
+        "ownerId": "8675309",
+        "accountId": "bot-\ud800",
+        "lineKey": "line",
+        "providerThreadId": "telegram:8675309"
+      }
+    }
+  ]
+}

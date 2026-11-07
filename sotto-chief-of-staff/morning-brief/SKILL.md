@@ -2,146 +2,116 @@
 name: sotto-morning-brief
 description: Use when the user says "good morning", asks for their morning brief / daily brief / "what's on today" / "what needs my attention", when it's morning-brief time, or when the Bridge pushes a morning_ready trigger — produce the user's morning briefing. This is THE way to produce any morning brief — never hand-write a calendar/email summary instead of running this skill.
 metadata:
-  hermes:
-    tags: [brief, chief-of-staff, sotto]
-    category: productivity
-    requires_toolsets: [sotto-local, google-workspace]
-    requires_tools: [execute_code, terminal]
-required_environment_variables:
-  - name: GOOGLE_AI_API_KEY
-    prompt: Gemini API key (for the brief extraction)
-    help: https://aistudio.google.com/apikey
-    required_for: brief extraction
-  - name: SOTTO_DATA
-    prompt: Path to the Sotto exhaust volume (e.g. /data)
-    required_for: knowledge graph + continuity
+  tags: [brief, chief-of-staff, sotto]
+  category: productivity
 ---
 
 # Sotto — Morning Brief
 
 Produce the user's morning brief: what needs attention, what you've already handled, who's in their world today, and the actions they can take.
 
-> **CRITICAL — do not improvise the brief.** The brief's quality IS the product. Gather the inputs,
-> run `compose_brief.py` over them (step 3), and deliver **its** output verbatim. Do NOT write your
-> own "Your Day at a Glance" calendar/email summary — a brief that is *mostly* a calendar/email recap
-> is a failure. The real brief leads with communications (Needs Attention Now / Should Handle Today /
-> Already Handled / Filtered), weaves each person's signals across channels, carries tap-to-act
-> items, and includes one **short Coming Up** schedule section (≤5 lines: time + title + key
-> attendees). Deliver as **Sotto**, in Sotto's voice — never as "Hermes Agent".
+> **CRITICAL — do not improvise the brief.** The brief's quality IS the product. On Sotto the brief
+> is **receiver-owned**: the receiver gathers the inputs, runs the composer over them and delivers
+> **its** output verbatim. Do NOT write your own "Your Day at a Glance" calendar/email summary — a
+> brief that is *mostly* a calendar/email recap is a failure. The real brief leads with
+> communications (Needs Attention Now / Should Handle Today / Already Handled / Filtered), weaves
+> each person's signals across channels, carries tap-to-act items, and includes one **short Coming
+> Up** schedule section (≤5 lines: time + title + key attendees). Deliver as **Sotto**, in Sotto's
+> voice.
 
-## Procedure
+## How this runs on Sotto
 
-> **Script paths:** every script this skill runs lives under `$HOME/.hermes/skills/sotto/`. Use the
-> **absolute** path when invoking them (relative paths won't resolve from your working dir), e.g.
-> `python3 "$HOME/.hermes/skills/sotto/morning-brief/scripts/select_attendees.py"` and
-> `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/compose_brief.py"`.
+- **Scheduled briefs** run on the receiver's morning schedule (and the Mac wake-push), through the
+  pipeline below. Nothing in chat starts them.
+- **A request in chat** uses `owner_brief_request` with kind morning/evening/auto. Set refresh
+  only when the owner requests a fresh or updated brief; otherwise the receiver may reuse a current
+  accepted brief. Natural wording is fine. Call the tool, then stop after its receipt: the runtime
+  acknowledges the real admission and the existing pipeline delivers the result separately.
+  Never claim a brief is queued just because you loaded this guide. If the tool is unavailable,
+  say you cannot start it here. Answer ordinary calendar questions with calendar reads instead.
+- **Expanding a delivered brief** ("more on Dana in this morning's brief") is `sotto-ask`'s
+  `accepted_brief_detail` read — not a new brief.
 
-1. **Gather ALL inputs — Google AND local. The brief's value is *marrying* the two; a local-only brief is a failure when Google is connected.**
-   - **Gmail (24h) + Calendar (3d)** — REQUIRED, and **deterministic — run ONE command, don't hand-fetch:**
-     `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py"`
-     It calls the host's google-workspace `google_api.py` CLI and writes `/tmp/sotto_gmail.json` + `/tmp/sotto_cal.json` in the shape `compose_brief` expects. It prints `[gather_google] N emails (K sent), M events …`. Doing the gather by hand was the #1 cause of 0-email briefs; use the script. (The gather runs a **small `in:sent newer_than:1d` lane** — default 15, `--skip-sent`/`--sent-max` to tune — merged into the same file and flagged `isSent`. That's what step 4.4's `style_extract.py --gmail` learns the user's email voice from; don't skip it.)
-     - **Host-agnostic fallback (the CLI isn't the only way to reach Google).** If the output says the CLI **isn't this host's Google path** (`google_api.py not found … FALLBACK …`), Google may still be connected here as a **Gmail/Calendar MCP** (common on OpenClaw and some Hermes setups). Then: call the host's Gmail tool for `newer_than:1d` (≤40, matching the CLI lane's default), again for `in:sent newer_than:1d` (≤15), and the Calendar tool for the next 3 days, **dump the raw tool results** to `/tmp/sotto_gmail_raw.json` + `/tmp/sotto_sent_raw.json` + `/tmp/sotto_cal_raw.json`, and normalize them deterministically (don't hand-map fields):
-       `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_google.py" --from-mcp-gmail /tmp/sotto_gmail_raw.json --from-mcp-sent /tmp/sotto_sent_raw.json --from-mcp-calendar /tmp/sotto_cal_raw.json`
-       (`--from-mcp-sent` is optional — omit it if the host has no sent search; you just lose the email-voice lane.)
-     - **Only if NEITHER the CLI nor a Google MCP exists** is Google genuinely unavailable — then proceed local-only and say so honestly (don't fabricate email/calendar). A non-zero `N`/`M` from either path means Google is wired; carry on.
-   - **Local** — the staged `local_data`, or `read_local(since_hours=24)` → `/tmp/sotto_local.json`. If the Bridge is unreachable, still run — the script falls back to the **last cached snapshot** (flagged stale), so you degrade to yesterday's messages rather than dropping local entirely.
-   - **Granola** — deterministic, same one-command pattern as Gmail (don't hand-fetch via MCP tools):
-     `execute_code` → `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/gather_granola.py"`
-     It reads the Granola connector token (`$SOTTO_DATA/connectors/granola.json`, written when the user connects Granola on `/setup` — falls back to `GRANOLA_API_KEY` REST if set), lists the last ~14 days of meetings with `ai_summary`/`your_notes` (+ transcripts for meetings that ended in the last ~36h), and writes `/tmp/sotto_granola.json` as `{"meetings":[…]}` — exactly the file step 3 passes as `--granola`. It prints `[gather_granola] N meetings (T with transcripts, K with notes) …`. This powers "when you met last week you discussed X" next to that person's entry. If it warns Granola isn't connected, it writes an empty file and the brief proceeds without meeting notes — don't try to fetch Granola any other way.
-   - **Prior knowledge** — `python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_query.py" --calendar /tmp/sotto_cal.json --gmail /tmp/sotto_gmail.json --local /tmp/sotto_local.json` → `/tmp/sotto_know.json`, run AFTER the Gmail + calendar gather: **everyone in today's inputs** — on the calendar, in current iMessage/WhatsApp threads, in an email you got or sent, or attached to an active commitment — packs their graph knowledge, no matter how long since their file was touched (only when neither file yields anyone does it fall back to the `--relevant-days 7` file-mtime cohort). Plus the contact_index identity map, plus the **company knowledge** for today's attendee domains and the packed people's employers — the company files the Learn step writes, read back into the brief.
-   - **Attendee research** — step 2.
-2. **Research attendees — ONE batched, grounded command** (ported from the Mac's `gemini-research.ts`). `execute_code` → pipe the gathered `{google, local}` inputs into `python3 "$HOME/.hermes/skills/sotto/morning-brief/scripts/select_attendees.py"` (a file path as argv[1], or stdin) to get the external attendees worth researching (excludes you, same-domain colleagues, known contacts; capped at 25). Write that list to `/tmp/sotto_research_in.json`, then **skip anyone the graph already knows fresh** (researched < 30 days ago — the same filter `sotto-meeting-prep` runs, so the two skills share one cache instead of each paying daily):
-   `python3 "$HOME/.hermes/skills/sotto/meeting-prep/scripts/persist_prep.py" --filter-fresh /tmp/sotto_research_in.json`
-   (rewrites the file in place, dropping only people whose graph profile carries a `last_researched` stamp < 30 days old. Prints `{kept, skipped_fresh}` — skipped people still reach the brief through the knowledge graph.) Then research whoever's left:
-   `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/research_attendees.py" --attendees /tmp/sotto_research_in.json --context /tmp/sotto_cal.json --comms /tmp/sotto_gmail.json --out /tmp/sotto_research.json` (the script writes `--out` itself — no shell redirect; `--comms` feeds the already-gathered emails in as per-attendee relationship context — disambiguation + sharper relevance; the script tolerates a missing file.)
-   **Run it even when `kept` is 0** — with an empty list it writes a fresh `{"attendees":[]}`, which is what stops this brief from reusing an EARLIER run's research file as stale bios.
-   It **batches 5 attendees per grounded research call** (25 people → ~5 calls, run concurrently — far cheaper than one agent/search per person), dedupes, caps at 25, and returns `{attendees:[{email,title,company,relevance,summary}]}` grounded in real web results. The provider is whichever research key is set — Parallel, then Exa, then Gemini grounding on the Google key you already have — so no extra key is needed and no sub-agents are involved. If the list is empty or it returns none, pass `attendee_research: []`. Research only — never draft/schedule/send here. (The research rules are inlined in the script; `references/research-prompt.md` documents the original ported prompt. For a throwaway lookup — a venue's hours — use `_shared/scripts/web_research.py`; for ad-hoc research on a PERSON or a COMPANY use `sotto-ask`'s research lane, which runs this same script and persists what it finds.)
-   Then **persist what you just researched, so the next run (brief or prep) doesn't re-pay for it:**
-   ```bash
-   python3 "$HOME/.hermes/skills/sotto/meeting-prep/scripts/persist_prep.py" \
-     --research /tmp/sotto_research.json --attendees /tmp/sotto_research_in.json
-   ```
-   (writes each researched attendee's title/company/summary into the graph as clearly-sourced, LOW-confidence "Per web search: …" facts plus the `last_researched` stamp the filter above reads — grounded in the research output only, never invented. Idempotent; a no-op when research was empty.) **One rule, now global: an external attendee is researched at most once per 30 days, and every research run feeds the graph.**
-   Finally run the bounded X attendee lane:
-   `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/x_connectivity.py" --calendar /tmp/sotto_cal.json --research /tmp/sotto_research.json --out /tmp/sotto_x_context.json`
-   It is read-only, exact-lookup-only, capped at the same 25 attendees, and degrades to an empty
-   payload when X is not connected. WRITING an X identity down needs their full name plus the
-   profile agreeing about their company/domain — nothing weaker is ever remembered. A handle the web
-   pass says a page published for them rides ONE prep marked UNCONFIRMED (a page nobody fetched is a
-   claim, not proof), and everything else is a confirmation suggestion. Public Post/bookmark text remains temporary; only verified X
-   identity and sourced profile facts enter the person graph.
-3. **Extract — this step IS the brief. Run ONE command; do not write the brief yourself.**
-   **First, close what's already closed** (one command, before composing — so the brief reasons about
-   today's open loops, not last night's). Write `{ "today": "<YYYY-MM-DD>", "signals": {}, "local": <the read_local JSON from /tmp/sotto_local.json>, "emails": <emails from /tmp/sotto_gmail.json>, "events": <calendar events from /tmp/sotto_cal.json> }` to `/tmp/sotto_cont.json`, then:
-   `execute_code` → `python3 "$HOME/.hermes/skills/sotto/morning-brief/scripts/continuity_resolve.py" --resolve-only /tmp/sotto_cont.json`
-   (`--resolve-only` closes what today's data shows was delivered or answered and drops what has
-   aged out — it does NOT record anything new, so it is safe to run before the brief exists. The
-   Learn step below adds the brief's own items with `--merge-only`. Without this split, a loop that
-   today's messages already closed is still presented to the model as open.)
-   The brief MUST come from the extraction script — running the full extraction prompt by hand drifts into a generic agenda recap (calendar listing, no markers, Google-only). The script is easy: **save each source you gathered to its own file, then run one command.** No hand-assembled JSON.
-   1. Write each gathered source to a temp file (skip any you don't have — only `--local` is required):
-      - `read_local` result → `/tmp/sotto_local.json`  ← **REQUIRED** (your iMessage/WhatsApp/calls/notes/etc.; omitting it = a Google-only brief, the exact failure). **Write the tool result AS-IS** — `compose_brief` unwraps the MCP wrapper itself, so do NOT reshape it with an inline `python3 -c` (that trips the dangerous-command gate and silently kills headless/cron runs).
-      - Gmail (last 24h) → `/tmp/sotto_gmail.json`  ·  Calendar (next 3d) → `/tmp/sotto_cal.json`
-      - Granola → `/tmp/sotto_granola.json` (already written by `gather_granola.py` in step 1 — pass it as-is)  ·  `knowledge_query.py --calendar /tmp/sotto_cal.json --gmail /tmp/sotto_gmail.json --local /tmp/sotto_local.json` output → `/tmp/sotto_know.json`  ·  attendee research (step 2) → `/tmp/sotto_research.json`  ·  X attendee context → `/tmp/sotto_x_context.json`
-   2. Run the script via `execute_code` (use the **absolute path** — relative paths won't resolve):
-      ```bash
-      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/compose_brief.py" --type morning \
-        --local /tmp/sotto_local.json --gmail /tmp/sotto_gmail.json --calendar /tmp/sotto_cal.json \
-        --granola /tmp/sotto_granola.json --knowledge /tmp/sotto_know.json \
-        --attendee-research /tmp/sotto_research.json --x-context /tmp/sotto_x_context.json
-      ```
-      (Interactive runs need `execute_code` approved once — `/approve always`. **Cron/scheduled runs
-      hard-block `execute_code`** (no user present; upstream hermes-agent#38585) — there, run the
-      IDENTICAL command through the **`terminal` tool** instead: same script, same file args. The
-      boot config raises `terminal.timeout` to 600s so the 2–4 min composition isn't killed mid-run.)
-      It prints JSON: `brief_markdown`, `brief_text` (the chat-ready version — markers stripped,
-      WhatsApp-safe bold), `actions[]`, `loop_updates[]`, `meetings_needing_prep[]`, `extracted_knowledge`, `_critic`.
-      The script runs a **second-pass critic** (a port of the Mac's brief-critic) gated by `SOTTO_CRITIC=auto|always|off` (default `auto` — a quiet-day brief below the size/action thresholds in `compose_brief.py` skips the critic+revise pass): it checks the draft against a data manifest for missed threads, attribution errors, mis-prioritization, wrong "Already Handled", action coverage, and weak cross-channel synthesis, then **revises** the brief to fix any critical/moderate issues. `brief_markdown` is always the final result; `_critic` is `{score, summary, patches, actionable}` when the critic ran, or `{skipped, reason}` when it was skipped. In `auto` the critic always runs when the draft proposes closing an open task, and only a completed review stamps the `criticReceipt` that lets a closure apply. (Pass `--no-critic` to force-skip for a fast draft.)
-   3. Deliver **`brief_text` verbatim** on chat channels (WhatsApp/Telegram/SMS) — it's the chat-ready rendering: markers stripped, `*bold*` WhatsApp syntax. Do not rewrite, re-summarize, or re-format it. `brief_markdown` is the same brief WITH the `<!--…-->` markers — records and continuity only, never a chat channel (the markers show as literal clutter).
-   - **HARD GATE — if you did not run `compose_brief.py` this run, you have not produced a valid brief.** Don't hand-write one. Tells that you improvised, all failures, stop and run the script: the WHOLE brief reading as a "Your Day"/calendar agenda (a *short* Coming Up is fine, a meeting-by-meeting agenda is not); deep links like `sms:arnav_sahu` or `sms:group_…` (the script emits `sms:+<digits>`, `https://wa.me/…`, `mailto:`, `tel:` — and **never** a link for a group chat); WhatsApp contacts shown with `sms:` links; the user's own name listed as someone to reply to; names or attributions you inferred rather than read from the data.
-   - **If you genuinely cannot run `compose_brief.py` by EITHER transport** (`execute_code` blocked AND the `terminal` fallback also failed): do NOT fabricate a brief. Deliver a one-line honest status instead — "I couldn't run the brief composer (code execution unavailable); ask me to retry once it's approved." A hand-written brief is worse than no brief.
-   - *Native fallback (ONLY if `execute_code` is truly unavailable AND you can `read_file`):* run `"$HOME/.hermes/skills/sotto/morning-brief/references/extraction-prompt.md"` with your model over the same inputs — this still runs the real extraction prompt (with its guardrails), unlike free-handing. The script is strongly preferred. **Key mapping:** the raw prompt emits the FLEX camelCase keys — treat `markdown` as `brief_markdown`, `actionItems` as `actions`, `loopUpdates` as `loop_updates`, and `extractedKnowledge` (with `person_updates`/`company_updates`) as `extracted_knowledge` in every later step (the script's normalizer does this rename for you; on the fallback you must do it yourself). There is no critic pass and no `brief_text` on this path — strip any `<!--…-->` markers before sending to a chat channel. Without a critic review, `resolved` loop updates carry no `criticReceipt`, so those tasks stay open until a reviewed brief closes them; never add a receipt yourself.
-4. **Learn — ONE command runs all six memory writers (knowledge, continuity, draft outcomes, style, meeting attendance, contacts) and leaves a receipt.** Write the two payload files first, then run the step. A brief that delivers without this receipt is logged as a brief that did not learn — the receiver checks for it when the send is acknowledged.
-   1. Write the extraction's `extracted_knowledge` (the `{person_updates:[…], company_updates:[…]}` from step 3) to `/tmp/sotto_know_out.json` — a **distinct** file; do NOT reuse `/tmp/sotto_know.json`, which holds the `knowledge_query.py` output and is re-read as prior knowledge by later runs/skills.
-   2. Write `{ "today": "<YYYY-MM-DD>", "signals": {}, "new_actions": <the brief's `actions[]` verbatim>, "loop_updates": <the brief's `loop_updates[]` verbatim>, "local": <the read_local JSON from /tmp/sotto_local.json>, "emails": <emails from /tmp/sotto_gmail.json>, "events": <calendar events from /tmp/sotto_cal.json> }` to `/tmp/sotto_cont.json` (pass the brief's `actions[]` **as-is** — the script reads the FLEX camelCase fields directly).
-   3. `execute_code` →
-      ```bash
-      python3 "$HOME/.hermes/skills/sotto/_shared/scripts/learn_step.py" --type morning \
-        --local /tmp/sotto_local.json --gmail /tmp/sotto_gmail.json --granola /tmp/sotto_granola.json \
-        --knowledge-out /tmp/sotto_know_out.json --continuity /tmp/sotto_cont.json
-      ```
-      (evening brief: `--type evening`. Skip any `--flag` whose file you don't have — that step is recorded `skipped`, never `failed`. It prints the receipt as JSON and writes it to `$SOTTO_DATA/briefs/<day>.<kind>.learned.json`; a non-zero exit means one writer failed and the receipt says which — report that in one line, do not retry by hand.)
-   What the step runs, in order — for your understanding, not for you to run separately:
-   - **Knowledge** — `knowledge_update.py /tmp/sotto_know_out.json` writes/updates `$SOTTO_DATA/knowledge/people/*.md` + `companies/*.md`. **The same run does the memory's own housekeeping — deterministically, no judgment from you:** person files that share an exact identifier (the same email or phone) are one human and are merged automatically; person files that merely have *similar names* are never merged, only written to `$SOTTO_DATA/knowledge/merge_suggestions.json` for a human to confirm; and a company that matches an existing file's alias or domain resolves INTO that file instead of forking a second one. If the brief mentions a possible duplicate and the user says "yes, merge them", that confirmation is one command — `python3 "$HOME/.hermes/skills/sotto/_shared/knowledge/knowledge_edit.py" --op merge --from <slug> --into <slug>` (it refuses when the two files carry conflicting identifiers). **Never merge person files by hand**, and never merge two people because their names look alike.
-   - **Continuity**: `continuity_resolve.py --merge-only /tmp/sotto_cont.json` records distinct obligations and applies the brief's `loop_updates`. Each update must name its exact `loopId` and `loopVersion`, explain the specific obligation change in `reason`, cite a completion or promise message's source ID and verbatim snippet, and match the counterpart, direction and original timestamp. The pre-compose `--resolve-only` pass handles identity maintenance, legacy calendar shadows and the chase clock. A generic reply, Already Handled name, unrelated meeting, or old deadline cannot close an obligation. Keep `local`, `emails` and `events` in both payloads for source validation. Ambiguous evidence leaves work open; explicit-resolution commitments require the user's correction. Presentation groups one person in prose while the ledger keeps each ask separate. Unsupported/no-counterpart/no-reply actions and calendar shadows are refused with a logged reason.
-   - **Draft outcomes** — `draft_outcomes.py` matches offered drafts against observable sends, logs outcomes, and confirms verbatim voice samples. The Learn runner calls it directly; it does not infer permission or rewrite preferences. Historical `dismissed` means unmatched in an active lane, not explicit rejection.
-   - **Writing voice (style accumulation)** — `style_extract.py /tmp/sotto_local.json --gmail /tmp/sotto_gmail.json` accumulates the user's style fingerprint from today's sent messages into `$SOTTO_DATA/style.json` — caps/TTL make repeat runs safe. `--gmail` feeds the SENT emails from the gather into the work_email bucket so drafts learn the user's email voice, not just their texting voice. This is also the safety net for setups that skipped the voice seed: without it, style.json never exists and drafts can't sound like the user.
-   - **Meeting attendance (who you actually sat with)** — `granola_graph.py --granola /tmp/sotto_granola.json` writes one dated, sourced `Met on <date>: <title>` fact onto each attendee of every meeting with 8 or fewer attendees — a bigger event is not a relationship — and fills a blank `company` from a corporate email domain. Re-running the same meeting bumps the fact instead of duplicating it.
-   - **Contacts (identity, notes, birthdays)** — `prewarm_graph.py --sync-contacts` re-syncs from the snapshot the brief already saved — no live Contacts read: every email AND phone on a card becomes an identifier on that person's file, and the card's `notes` and `birthday` become sourced facts. Only cards Sotto already knows or that carry a note/birthday sync; an address book is a directory, not a graph.
-5. **Voice** (optional, **Hermes-native TTS** — no Inworld/Parallel key). Generate the spoken version when EITHER the user just asked for audio ("read me my brief") OR their standing preference says so — check `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/preferences.py" show` for `brief_audio` being `both` or matching this brief's type (`morning`/`evening`); the sotto-feedback skill sets it from "send my briefs as voice notes". When it applies: generate a tight spoken version via `"$HOME/.hermes/skills/sotto/_shared/references/audio-script-prompt.md"` (shorter + conversational — start from `brief_text`, which already has the `<!--…-->` markers stripped; also drop tap-link URLs, which don't read aloud) and let Hermes voice it. Voice output uses the configured `tts.provider` (default `edge`, free); delivery shape is per-platform (WhatsApp gets an audio file). Deliver the **text** brief regardless — voice is in addition, so the user can both read and listen. Hermes also transcribes voice notes the user sends, so they can reply to Sotto by voice.
-6. **Deliver** — **claim the deliver-once gate FIRST, then send** as **Sotto** (never "Hermes Agent").
-   - **Deliver-once (cron ↔ wake-push coordination):** right before sending, run `execute_code` →
-     `python3 "$HOME/.hermes/skills/sotto/_shared/scripts/brief_marker.py" --claim morning` (evening brief:
-     `--claim evening`). If it prints **`already`**, STOP — today's brief was already delivered by the
-     other path (the schedule and the Mac wake-push both run this skill; the gate ensures exactly one
-     delivers). Only when it prints `claimed` do you send. (Wake-push is ON by default —
-     `SOTTO_WAKE_PUSH=0` disables it — so this gate is what keeps the two paths from double-delivering.)
-     **This step is still yours to run.** Wherever the receiver started the run — the schedule, the
-     wake-push, the dashboard's button; on the cloud that is every lane — it enforces the same gate in
-     machinery at the send seam (it claims the marker itself before the message leaves the box), so a
-     run that forgets this step can no longer double-deliver: its copy is receipted `superseded` and
-     never sent. A local install whose own scheduler runs this skill from inside the agent sends past
-     every gate the receiver owns, and there this claim is the only one there is. Claim anyway: a run
-     that skips it is throwing away a composed brief on a coin flip.
-   - Send **`brief_text`** (step 3.3), never `brief_markdown`, never your own re-formatting of either.
-   - **Tap-to-act DOES work on chat.** Each action in `actions[]` carries a **`tap_link`** — a real tappable URL (`https://wa.me/…`, `mailto:…`, `tel:…`, `sms:…`, or the meeting link). WhatsApp/Telegram/iMessage render these as one-tap links. For the top 2–3 actions, attach the link to the person's name or add a short tappable line — e.g. "→ [Message Dhruv](https://wa.me/15551234567)". Use the `tap_link` **verbatim**; don't invent URLs.
-     - **Email is the exception, and it is the same rule as everywhere else: email asks, every other channel links.** Don't paste an action's `mailto:` into the brief — a percent-encoded URL is most of the line, and on a phone it opens whatever mail app the OS picks. Name the action and let the offer line carry it ("say *draft Dhruv*"): a yes runs `sotto-draft-reply`, which puts the real thing in the user's Gmail drafts.
-   - Pair the links with a one-line **conversational offer** for anything that needs drafting — "say *draft Dhruv* and I'll write the LOI reply, or *prep Berkeley* for the pitch." Mark the day delivered.
-   - **The offer line is the ONLY thing you add.** Do not append extra sections, recaps, separators, or your own accountability/status blocks after the brief — the brief already contains everything (the evening's accountability lives INSIDE it as Already Handled / Still Pending, and `compose_brief.py` appends the evening-only **What moved today** receipts itself, plus — at most once per published version, morning or evening — a single housekeeping line saying a newer Sotto is available). One brief + at most one short offer line = the whole message.
-   - If the brief came out **thin or the user pushes back on it**, append ONE recovery sentence so it carries its own next move: "If anything here looks off: say *that's wrong about X* and I'll fix my memory, *stop surfacing newsletters* to mute a source, or *clean up stale loops*."
+## The pipeline (receiver-owned — for your understanding, not for you to run)
+
+1. **Gather ALL inputs — Google AND local.** The brief's value is *marrying* the two; a local-only
+   brief is a failure when Google is connected. Gmail (24h, plus a small sent lane that teaches the
+   user's email voice) and Calendar (3 days) are read deterministically; local messages come from
+   the Bridge (`read_local`, 24h), falling back to the **last cached snapshot** (flagged stale) when
+   the Bridge is unreachable; Granola contributes ~14 days of notes plus transcripts for meetings
+   that ended in the last ~36h ("when you met last week you discussed X"). Prior knowledge packs
+   **everyone in today's inputs** — on the calendar, in current threads, in an email you got or
+   sent, or attached to an active commitment — plus the identity map and the **company knowledge**
+   for today's attendee domains and the packed people's employers.
+2. **Research attendees — ONE batched, grounded pass** (ported from the Mac's `gemini-research.ts`):
+   external attendees worth researching (excludes you, same-domain colleagues, known contacts;
+   capped at 25), skipping anyone the graph researched in the last 30 days (the same filter
+   `sotto-meeting-prep` uses, so the two share one cache). It batches 5 attendees per grounded call,
+   grounded in real web results (`references/research-prompt.md` documents the original ported
+   prompt), and persists what it found as clearly-sourced, LOW-confidence "Per web search: …"
+   facts. **One rule, global: an external attendee is researched at most once per 30 days, and
+   every research run feeds the graph.** A bounded, read-only X lane adds exact-lookup identity
+   only: WRITING an X identity down needs their full name plus the profile agreeing about their
+   company/domain; a handle a page published for them rides ONE prep marked UNCONFIRMED; public
+   Post/bookmark text stays temporary.
+3. **Extract — this step IS the brief.** First the resolver closes what's already closed (what
+   today's data shows was delivered or answered, and what aged out — it records nothing new), so
+   the brief reasons about today's open loops, not last night's. Then the composer runs the real
+   extraction prompt (`references/extraction-prompt.md`) over the gathered sources and a
+   **second-pass critic** (a port of the Mac's brief-critic, `SOTTO_CRITIC=auto|always|off`; quiet
+   days below the size/action thresholds skip it) that checks the draft against a data manifest for
+   missed threads, attribution errors, mis-prioritization, wrong "Already Handled", action coverage
+   and weak cross-channel synthesis, then **revises** the brief. Only a completed review stamps the
+   `criticReceipt` that lets a proposed closure apply. It produces `brief_markdown` (records and
+   continuity only — it carries `<!--…-->` markers), `brief_text` (the chat-ready version — markers
+   stripped), `actions[]`, `loop_updates[]`, `meetings_needing_prep[]` and `extracted_knowledge`.
+   - **Tells that a brief was improvised — all failures:** the WHOLE brief reading as a
+     "Your Day"/calendar agenda (a *short* Coming Up is fine, a meeting-by-meeting agenda is not);
+     deep links like `sms:arnav_sahu` or `sms:group_…` (the composer emits `sms:+<digits>`,
+     `https://wa.me/…`, `mailto:`, `tel:` — and **never** a link for a group chat); WhatsApp
+     contacts shown with `sms:` links; the user's own name listed as someone to reply to; names or
+     attributions inferred rather than read from the data. A hand-written brief is worse than no
+     brief.
+4. **Learn — ONE step runs all seven memory writers** (knowledge, continuity, draft outcomes, style,
+   meeting commitments, meeting attendance, contacts) and leaves a receipt; a brief that delivers without it is logged as
+   a brief that did not learn.
+   - **Knowledge** — writes/updates the people and company files. Person files that share an exact
+     identifier (the same email or phone) are one human and merge automatically; files that merely
+     have *similar names* are never merged, only suggested for a human to confirm; a company that
+     matches an existing file's alias or domain resolves INTO that file. **Never merge person files
+     by hand**, and never merge two people because their names look alike.
+   - **Continuity** — records distinct obligations and applies the brief's `loop_updates`. Each
+     update must name its exact `loopId` and `loopVersion`, explain the specific obligation change
+     in `reason`, cite a completion or promise message's source ID and verbatim snippet, and match
+     the counterpart, direction and original timestamp. A generic reply, Already Handled name,
+     unrelated meeting, or old deadline cannot close an obligation. Ambiguous evidence leaves work
+     open; explicit-resolution commitments require the user's correction. Presentation groups one
+     person in prose while the ledger keeps each ask separate. Unsupported/no-counterpart/no-reply
+     actions and calendar shadows are refused with a logged reason.
+   - **Draft outcomes** — matches offered drafts against observable sends, logs outcomes, and
+     confirms verbatim voice samples. It does not infer permission or rewrite preferences.
+     Historical `dismissed` means unmatched in an active lane, not explicit rejection.
+   - **Writing voice** — accumulates the user's style fingerprint from today's sent messages and
+     sent email into `style.json` (caps/TTL make repeat runs safe), so drafts sound like the user.
+   - **Meeting attendance** — one dated, sourced `Met on <date>: <title>` fact on each attendee of
+     every meeting with 8 or fewer attendees (a bigger event is not a relationship); a blank
+     `company` fills from a corporate email domain.
+   - **Contacts** — re-syncs identity, notes and birthdays from the snapshot the brief already
+     saved; only cards Sotto already knows or that carry a note/birthday sync.
+5. **Deliver — deliver-once, then send** as **Sotto**.
+   - **Deliver-once (schedule ↔ wake-push coordination):** the receiver claims the day's brief
+     marker at its send seam, so the schedule, the wake-push and the dashboard's button deliver
+     exactly one brief; a second copy is receipted `superseded` and never sent.
+   - It sends **`brief_text`**, never `brief_markdown`, never a re-formatting of either.
+   - **Tap-to-act DOES work on chat.** Each action carries a **`tap_link`** — a real tappable URL (`https://wa.me/…`, `mailto:…`, `tel:…`, `sms:…`, or the meeting link). For the top 2–3 actions the link rides the person's name or a short tappable line — e.g. "→ [Message Dhruv](https://wa.me/15551234567)". The `tap_link` is used **verbatim**; no URL is invented.
+     - **Email is the exception: offer wording rather than a `mailto:` link.** A percent-encoded URL is most of the line, and on a phone it opens whatever mail app the OS picks. The brief can say "I can draft a reply" beside a grounded email item. If the owner asks, show the wording in chat; saving it in Gmail requires a separate explicit request and full draft review, followed by the owner's approval.
+   - The composer pairs up to three grounded items with an inline **conversational offer** for drafting, research or prep. A draft offer belongs to an actual message the owner could review, not an owner-only task such as coding expenses. The offer sits beside its item in both text and photos; do not add another offer list. Thin context is not a reason to invent a third task. Drafts remain for owner review.
+   - A valid model-selected calendar prep is the brief’s **single help offer**, phrased as one question beside its exact meeting. Other tasks remain visible without competing draft/research offers, so a bare yes can use the existing accepted-delivery receipt. Unsupported prep leaves ordinary grounded offers available; it never hides a task or invents preparation.
+   - **Do not append another offer line.** No extra sections, recaps, separators, or accountability/status blocks after the brief — the brief already contains everything (the evening's accountability lives INSIDE it as Already Handled / Still Pending, and the composer appends the evening-only **What moved today** receipts itself, plus — at most once per published version, morning or evening — a single housekeeping line saying a newer Sotto is available). One brief, with its assistance offers inline, is the whole message.
+   - If the brief came out **thin or the user pushes back on it**, ONE recovery sentence carries its own next move: "If anything here looks off: say *that's wrong about X* and I'll fix my memory, *stop surfacing newsletters* to mute a source, or *clean up stale loops*."
 
 ## Notes
-- First brief (empty graph): widen the local window to 7 days — the ONE lever is `read_local(since_hours=168)` in step 1 (everything else identical; the Google gathers need no flag, and `compose_brief.py` takes no window — it composes whatever was gathered). Day 2+: the default (24h) is the delta.
+- First brief (empty graph): the local window widens to 7 days (`read_local(since_hours=168)`); everything else is identical — the composer takes no window, it composes whatever was gathered. Day 2+: the default (24h) is the delta.
 - **The open-items contract:** an open loop earns its own line ONLY when it is **overdue, due within
   24 hours, or already chased without an answer** (`brief_validate.is_urgent` — deterministic, read
   off the ledger row, never model-judged). Every urgent one appears exactly once — as an ask carrying
@@ -160,9 +130,8 @@ are two obligations involving the same person. The model judges that distinction
 evidence. Code validates identity, direction, time, quotation and the exact ledger revision; it
 does not decide fulfillment with an English keyword checklist.
 
-The native runner shares one effective local snapshot across composition and Learn, preserving
-cached observation times and current source consent. Its bounded Gmail loop-context refresh reads
-original threads or verified counterpart addresses without another model pass. A partial refresh
-is not proof of absence. Manual/script callers can use `--effective-local-out /tmp/sotto_local.json`
-on `compose_brief.py` and pass that resulting view to Learn so cited fallback evidence is available
-to the writer too. Never replace cached timestamps with the time you read the cache.
+The receiver's runner shares one effective local snapshot across composition and Learn, preserving
+cached observation times and current source consent, so cited fallback evidence is available to the
+writer too. Its bounded Gmail loop-context refresh reads original threads or verified counterpart
+addresses without another model pass. A partial refresh is not proof of absence. Cached timestamps
+are never replaced with the time the cache was read.

@@ -19,7 +19,7 @@ people whose graph profile carries a `last_researched` stamp < 30 days old
 
 ### Pass A — profile (batch of 5, 60s/batch)
 Who they are: `email` (join key, verbatim), `title` (null if unfound), `company`, `relevance`
-(1–2 bullets keyed to the meeting context), `summary` (3–4 sentence professional bio), and
+(always `[]`: meeting relevance is composed locally), `summary` (3–4 sentence professional bio), and
 `company_summary` (1–2 sentences on what their company does).
 
 **Degradation ladder — person → company → nothing.** Every corporate email domain gets a company
@@ -28,11 +28,10 @@ search even when the person has no public profile: the entry comes back as
 say "Cobalt Research does X; their role isn't public" instead of "No background found". A truly
 empty entry is reserved for freemail addresses (gmail/outlook/…) with unsearchable names.
 
-**Comms + graph context in.** Each attendee line can carry what the user already knows (packed
-graph facts) and recent comms with the user (subjects/snippets from the already-gathered gmail
-file, passed via `--comms /tmp/sotto_gmail.json`). The prompt uses them ONLY to disambiguate which
-person to research and to sharpen `relevance` — never as facts to restate, never to invent an
-interaction that isn't there.
+**Public identity only.** Provider calls receive the selected name and email/domain. Private
+messages, meeting titles, company memory and saved person facts stay out of every research
+provider and fallback. The final prep combines public research with authorized local context.
+Legacy context arguments remain accepted for callers but are not included in research prompts.
 
 ### Pass B — recency & texture sweep (batch of 3, 90s/batch, its own token budget)
 The quality upgrade: a separate grounded call that hunts the last `DEFAULT_RECENCY_DAYS`
@@ -52,10 +51,9 @@ Facts only: the sweep is never asked what to SAY. Openers, angles and talking po
 — they cost output tokens to invent, they restate the fact they point at, and they could never be
 persisted. The prep prompt writes them fresh from these facts each time.
 
-**Novelty relative to the graph.** Each person's existing packed facts (their `known` string from
-the knowledge graph / `knowledge_query.py --person`) are injected with *"do NOT repeat any of
-this — return only what is new relative to it"*, so the sweep surfaces beyond-the-resume material
-instead of re-finding what the user already knows.
+**Recency without exporting memory.** The public sweep asks for dated recent evidence. It does
+not send saved graph facts as a novelty baseline. Local persistence and prep reuse the existing
+knowledge readers and deduplication after research returns.
 
 Env knobs: `SOTTO_RESEARCH_DEEP=0` disables Pass B entirely. The window itself is the named
 constant `DEFAULT_RECENCY_DAYS` in `research_attendees.py`, not an env var.

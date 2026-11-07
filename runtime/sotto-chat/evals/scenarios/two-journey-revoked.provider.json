@@ -1,0 +1,98 @@
+{
+  "instructions": "Synthetic revoked-source machinery contract, no writes.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The permitted saved evidence does not establish whether the pricing promise was fulfilled or remains outstanding.",
+      "toolResultExcludes": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "launch checklist"
+      ]
+    },
+    {
+      "text": "The permitted saved evidence does not establish whether the original promise existed."
+    },
+    {
+      "text": "4."
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The permitted saved evidence does not establish whether the pricing promise was fulfilled or remains outstanding.",
+      "toolResultExcludes": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "launch checklist"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The permitted saved evidence does not establish whether the pricing promise was fulfilled or remains outstanding.",
+      "toolResultExcludes": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "launch checklist"
+      ]
+    }
+  ]
+}

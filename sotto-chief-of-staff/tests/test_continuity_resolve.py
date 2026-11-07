@@ -5,6 +5,7 @@ UTC-offset cases (the strptime(...[:19]) off-by-one this suite pins the fix for)
 import importlib.util
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 
@@ -1132,11 +1133,12 @@ def test_user_closure_does_not_mute_new_requests_but_replays_stay_closed(tmp_pat
                "body": "Can you confirm the address for our lunch tomorrow?", "date": "2026-06-24T08:00:00Z"}
     # Old evidence, a sent mail, or another person's message cannot overturn the user's closure.
     for bad in ({**message, "date": "2026-06-22T08:00:00Z"}, {**message, "isSent": True},
+                *({**message, "isSent": value} for value in ("true", "false", 1, 0, None)),
                 {**message, "from": "other@acme.com"}):
         assert cr.resolve({"today": "2026-06-24", "new_actions": [new], "emails": [bad]}, NOW, resolve_existing=False)["active"] == []
     row, = cr.resolve({"today": "2026-06-24", "new_actions": [new], "emails": [message]}, NOW, resolve_existing=False)["active"]
     assert row["summary"] == new["contextSummary"] and row["source_thread_id"] == "lunch-thread"
-    assert row["source_message_id"] == "new-mail" and row["created_at"] == "2026-06-24 08:00:00"
+    assert row["source_message_id"] == "new-mail" and row["created_at"] == "2026-06-24T08:00:00+00:00"
     assert "closed_at" not in row and "resolution" not in row
 
 
@@ -1203,7 +1205,7 @@ def test_real_bridge_message_reaches_prompt_and_reopens_only_a_new_request(tmp_p
                           resolve_existing=False)["active"] == []
     opened, = cr.resolve(payload, NOW, resolve_existing=False)["active"]
     assert opened["summary"] == "Confirm the lunch address"
-    assert opened["created_at"] == "2026-06-24 08:00:00"
+    assert opened["created_at"] == "2026-06-24T08:00:00+00:00"
     # Closing again must not turn the same extracted ask into another request.
     ke.op_loop(opened["anchor_key"], "dismissed", "2026-06-24T08:30:00Z")
     assert cr.resolve(payload, NOW, resolve_existing=False)["active"] == []
@@ -1266,3 +1268,179 @@ def test_group_evidence_cannot_reopen_a_persons_one_to_one_request(tmp_path, mon
     message = {"rowid": 12, "handle": "+14155550000", "timestamp": "2026-06-24 08:00:00",
                "text": "Can someone send that doc?", "chat_guid": GROUP_GUID, "is_group_chat": True}
     assert cr.resolve({"today": "2026-06-24", "new_actions": [action], "local": {"imessage": [message]}}, NOW, resolve_existing=False)["active"] == []
+
+
+def test_canonical_persist_fsyncs_replacement_and_new_directory_ancestry_before_outcome(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    trace = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        trace.append("directory_fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_fsync")
+        return real_fsync(fd)
+
+    def replace(source, destination):
+        trace.append("replace")
+        return real_replace(source, destination)
+
+    with monkeypatch.context() as changes:
+        changes.setattr(os, "fsync", fsync)
+        changes.setattr(os, "replace", replace)
+        changes.setattr(cr.log_outcome, "record_loop_event", lambda event: trace.append("outcome"))
+        cr._persist({"anchor_key": "manual:durability", "status": "open", "summary": "Durable ask"})
+    assert trace == ["file_fsync", "replace", "directory_fsync", "directory_fsync",
+                     "directory_fsync", "outcome"]
+    assert len(_all_fm(tmp_path)) == 1
+
+
+def test_canonical_persist_dirsync_failure_cannot_return_or_record_outcome(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    trace = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        trace.append("directory_fsync" if is_directory else "file_fsync")
+        if is_directory:
+            raise OSError("synthetic directory sync failure")
+        return real_fsync(fd)
+
+    def replace(source, destination):
+        trace.append("replace")
+        return real_replace(source, destination)
+
+    with monkeypatch.context() as changes:
+        changes.setattr(os, "fsync", fsync)
+        changes.setattr(os, "replace", replace)
+        changes.setattr(cr.log_outcome, "record_loop_event", lambda event: trace.append("outcome"))
+        with pytest.raises(OSError, match="directory sync failure"):
+            cr._persist({"anchor_key": "manual:uncertain", "status": "open", "summary": "Uncertain ask"})
+    assert trace == ["file_fsync", "replace", "directory_fsync"]
+    # The file can appear after rename; visibility is not a durable success receipt.
+    assert len(_all_fm(tmp_path)) == 1
+
+
+def _gmail_reply_rows(count):
+    for i in range(count):
+        cr._persist({"anchor_key": f"gmail:reply:{i}", "status": "open", "source": "gmail",
+                     "source_message_id": f"m{i}", "source_thread_id": f"t{i}",
+                     "source_refs": [{"sourceType": "gmail", "sourceId": f"m{i}"}],
+                     "action_type": "reply", "summary": "Reply about the deck", "created_at": "2026-06-23",
+                     "contact_name": "Sam", "contact_identifier": f"sam{i}@example.com"})
+
+
+def test_a_resolve_pass_syncs_the_directory_once_before_it_returns(tmp_path, monkeypatch):
+    """PR #817 review: three directory fsyncs per row made a 50-loop pass 200 fsyncs (main: 50).
+    Each replaced file is still fsynced; the directory names are synced once, before the result."""
+    _env(tmp_path, monkeypatch)
+    _gmail_reply_rows(50)
+    trace = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        trace.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        return real_fsync(fd)
+
+    with monkeypatch.context() as changes:
+        changes.setattr(os, "fsync", fsync)
+        changes.setattr(cr.log_outcome, "record_loop_event", lambda event: trace.append("outcome"))
+        out = cr.resolve({"today": "2026-06-24"}, NOW)
+    assert len(out["active"]) == 50
+    assert trace.count("file") == 50 and trace.count("directory") == 3
+    first_directory = trace.index("directory")
+    assert "file" not in trace[first_directory:] and "outcome" not in trace[:first_directory]
+    # Outside a pass every write is durable on return, row by row, as before.
+    trace.clear()
+    with monkeypatch.context() as changes:
+        changes.setattr(os, "fsync", fsync)
+        _gmail_reply_rows(2)
+    assert trace == ["file", "directory", "directory", "directory"] * 2
+
+
+def test_a_failed_pass_still_syncs_what_it_replaced_and_raises_its_own_error(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _gmail_reply_rows(3)
+    synced, written = [], []
+    real_persist = cr._persist
+
+    def persist(it, **kwargs):
+        if len(written) == 2:
+            raise RuntimeError("synthetic failure mid-pass")
+        written.append(it["anchor_key"])
+        return real_persist(it, **kwargs)
+
+    monkeypatch.setattr(cr, "_persist", persist)
+    monkeypatch.setattr(cr, "_fsync_ledger_directory_tree", lambda: synced.append(len(written)))
+    with pytest.raises(RuntimeError, match="mid-pass"):
+        cr.resolve({"today": "2026-06-24"}, NOW)
+    assert synced == [2]
+
+
+def test_a_directory_sync_failure_fails_the_pass(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _gmail_reply_rows(2)
+
+    def fail():
+        raise OSError("synthetic directory sync failure")
+
+    monkeypatch.setattr(cr, "_fsync_ledger_directory_tree", fail)
+    with pytest.raises(OSError, match="directory sync failure"):
+        cr.resolve({"today": "2026-06-24"}, NOW)
+
+
+def test_generic_persist_preserves_configured_data_root_symlink(tmp_path, monkeypatch):
+    target = tmp_path / "real-data"
+    target.mkdir()
+    configured = tmp_path / "configured-data"
+    configured.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("SOTTO_DATA", str(configured))
+    cr._persist({"anchor_key": "manual:linked-root", "status": "open", "summary": "Saved ask"})
+    assert (target / "knowledge" / "continuity").is_dir()
+
+
+def _nigel(identifier="+44 7911 123456"):
+    return {"action_type": "reply", "channel": "whatsapp", "contact_name": "Nigel Shaw",
+            "contact_identifier": identifier, "summary": "Nigel asked for the deck",
+            "ask": "Send Nigel the deck"}
+
+
+def test_an_international_phone_row_keyed_on_its_last_ten_digits_is_not_duplicated(tmp_path, monkeypatch):
+    # Before full-number phone anchors, +44 7911 123456 was keyed on its last ten digits.
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "follow_up:id:7911123456", **_nigel(), created_at="2026-06-22")
+    out = cr.resolve({"today": "2026-06-24", "new_actions": [_nigel()]}, NOW)
+    rows = [row for row in _all_fm(tmp_path) if row["status"] == "open"]
+    assert [row["anchor_key"] for row in rows] == ["follow_up:id:447911123456"]
+    assert len(out["active"]) == 1
+
+
+def test_a_shared_last_ten_digits_never_merges_two_different_numbers(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    _loop(tmp_path, "follow_up:id:7911123456", **{**_nigel("+33 7911 123456"), "contact_name": "Odile"},
+          created_at="2026-06-22")
+    cr.resolve({"today": "2026-06-24", "new_actions": [_nigel()]}, NOW)
+    rows = {row["anchor_key"]: row for row in _all_fm(tmp_path) if row["status"] == "open"}
+    assert set(rows) == {"follow_up:id:337911123456", "follow_up:id:447911123456"}
+    assert rows["follow_up:id:337911123456"]["contact_name"] == "Odile"
+
+
+@pytest.mark.parametrize('keeper_at,loser_at,expected_at,expected_ask', [
+    ('2026-10-18 18:00:00','2026-10-18T09:00:00-07:00','2026-10-18T09:00:00-07:00','newer task'),
+    ('2026-10-18T18:00:00-07:00','2026-10-18 09:00:00','2026-10-18 09:00:00','newer task'),
+    ('2026-10-18T18:00:00+00:00','2026-10-18T12:00:00-07:00','2026-10-18T18:00:00+00:00','older task'),
+    ('2026-10-18','2026-10-18T09:00:00-07:00','2026-10-18','older task'),
+])
+def test_duplicate_fold_orders_legacy_and_offset_instants(
+        tmp_path,monkeypatch,keeper_at,loser_at,expected_at,expected_ask):
+    _env(tmp_path,monkeypatch)
+    monkeypatch.setenv('SOTTO_TIMEZONE','America/Los_Angeles')
+    _loop(tmp_path,'keeper',created_at=keeper_at,summary='newer summary',ask='newer task')
+    _loop(tmp_path,'loser',created_at=loser_at,summary='older summary',ask='older task')
+    items=cr._load_items()
+    cr._fold_duplicate(items['keeper'],items['loser'],'2026-10-19')
+    merged=cr._load_items()
+    assert merged['keeper']['created_at']==expected_at
+    assert merged['keeper']['ask']==expected_ask
+    assert merged['loser']['resolution']=='merged_duplicate'
+    if len(expected_at)==10:
+        assert cr._inbound_cutoff(merged['keeper']['created_at'])=='2026-10-18 23:59:59'

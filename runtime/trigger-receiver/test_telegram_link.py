@@ -1,5 +1,4 @@
-"""Telegram link engine: token validation, first-sender capture, the 0600 handoff file, and the
-settings block the CLI prints.
+"""Telegram link engine: token validation, first-sender capture and the 0600 handoff file.
 
 NO NETWORK, ever: `telegram_link._get` is the single wire seam (same shape as connectors._http —
 (status, body)) and every test replaces it with `FakeGet`, which routes by Bot API method name and
@@ -14,6 +13,8 @@ import os
 import re
 import urllib.parse
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 
 
@@ -27,7 +28,7 @@ def _load(name, filename):
 tg = _load("telegram_link_t", "telegram_link.py")
 
 TOKEN = "123456789:FAKE-not-a-real-bot-token-AAbbCC"
-# Shaped like what start.sh passes: this deploy's setup code, which only the operator can read.
+# Shaped like the one-time setup phrase selfhost_setup passes, which only the operator can read.
 PHRASE = "Xk2p-9fQzR7t"
 
 
@@ -156,6 +157,24 @@ def test_capture_advances_the_offset_past_ignored_updates(monkeypatch):
     assert fake.offsets() == [None, 72, 73]                 # unoffset, then 71 + 1, then the ack
 
 
+@pytest.mark.parametrize('ack', [
+    (0, b'synthetic acknowledgement failure'),
+    (200, b'{"ok":true,"result":null}'),
+    (200, b'{"ok":true,"result":{}}'),
+])
+def test_lost_pairing_ack_refuses_capture_and_persists_nothing(tmp_path, monkeypatch, ack):
+    fake = _use(monkeypatch, FakeGet({
+        'getMe': _ok({'id': 123456789, 'is_bot': True,
+                      'first_name': 'Sotto', 'username': 'sotto_brief_bot'}),
+        'getUpdates': [_updates(_private_msg(40, 8675309)), ack],
+    }), tmp_path)
+    out = tg.ensure_link(TOKEN, PHRASE, timeout_secs=5)
+    assert out == {'ok': False, 'error': 'pairing update acknowledgement unavailable',
+                   'username': 'sotto_brief_bot'}
+    assert fake.offsets() == [None, 41]
+    assert not (tmp_path / 'telegram-link.json').exists()
+
+
 def test_capture_falls_back_to_username_then_id_for_the_display_name(monkeypatch):
     u = _private_msg(1, 77)
     u["message"]["from"] = {"id": 77, "is_bot": False, "username": "handle_only"}
@@ -218,8 +237,6 @@ def test_no_phrase_fails_closed_instead_of_linking_whoever_messages_first(tmp_pa
     assert tg.capture_first_sender(TOKEN, "", timeout_secs=5) == {"ok": False, "error": tg.NO_PHRASE}
     assert tg.capture_first_sender(TOKEN, "   ", timeout_secs=5)["error"] == tg.NO_PHRASE
     assert tg.ensure_link(TOKEN, "", timeout_secs=5) == {"ok": False, "error": tg.NO_PHRASE}
-    assert tg.main(["--token", TOKEN, "--boot"]) == 1
-    assert tg.main(["--token", TOKEN]) == 1
     assert fake.urls == [] and os.listdir(str(tmp_path)) == []
 
 
@@ -257,31 +274,6 @@ def test_persist_overwrites_a_previous_link_in_place(tmp_path):
     assert os.listdir(str(tmp_path)) == ["telegram-link.json"]
 
 
-# ── the settings block + the CLI ─────────────────────────────────────────────────────────────────
-
-# Pinned as literals ON PURPOSE. Source of truth: CHANNELS.md § Telegram setup (the token and
-# allow/home-channel variables that start.sh forwards by TELEGRAM_* prefix into ~/.hermes/.env, and
-# SOTTO_CRON_DELIVER, the one lever that moves the briefs). If CHANNELS.md renames one of these,
-# this test is the thing that must be updated with it — that is the point.
-DOCUMENTED_VARS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "SOTTO_CRON_DELIVER"]
-NAME_EQ_VALUE = re.compile(r"\A[A-Z][A-Z0-9_]*=[^\s][^\n]*\Z")
-
-
-def test_settings_block_uses_exactly_the_documented_names():
-    lines = tg.settings_block(TOKEN, 8675309)
-    names = [ln.split("=", 1)[0] for ln in lines]
-    for var in DOCUMENTED_VARS:
-        assert var in names, f"{var} (CHANNELS.md § Telegram setup) missing from the settings block"
-    assert dict(ln.split("=", 1) for ln in lines) == {
-        "TELEGRAM_BOT_TOKEN": TOKEN,
-        "TELEGRAM_ALLOWED_USERS": "8675309",
-        "TELEGRAM_HOME_CHANNEL": "8675309",      # where proactive delivery lands, same chat id
-        "SOTTO_CRON_DELIVER": "telegram",
-    }
-    for ln in lines:
-        assert NAME_EQ_VALUE.match(ln), f"not pasteable into Railway's raw editor: {ln!r}"
-
-
 def _happy_fake():
     return FakeGet({
         "getMe": _ok({"id": 123456789, "is_bot": True, "first_name": "Sotto",
@@ -290,44 +282,7 @@ def _happy_fake():
     })
 
 
-def test_cli_happy_path_prints_the_block_and_persists(tmp_path, monkeypatch, capsys):
-    _use(monkeypatch, _happy_fake(), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE, "--timeout", "5"]) == 0
-    out = capsys.readouterr().out
-    lines = out.splitlines()
-
-    assert "@sotto_brief_bot" in out                       # WHICH bot you pasted
-    assert "Nikunj Kothari" in out and "8675309" in out    # who it linked, no id hunting
-    for expected in tg.settings_block(TOKEN, 8675309):
-        assert expected in lines                           # each on its own line, unindented
-    for var in DOCUMENTED_VARS:
-        assert any(ln.startswith(var + "=") and NAME_EQ_VALUE.match(ln) for ln in lines)
-
-    rec = json.loads(open(str(tmp_path / "telegram-link.json"), encoding="utf-8").read())
-    assert rec["allowed_user"] == 8675309
-    # the CLI writes ONE file and no log: the token must not land anywhere the tree logs to
-    assert os.listdir(str(tmp_path)) == ["telegram-link.json"]
-
-
-def test_cli_bad_token_exits_1_and_writes_nothing(tmp_path, monkeypatch, capsys):
-    _use(monkeypatch, FakeGet({"getMe": (401, b'{"ok":false,"description":"Unauthorized"}')}), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE]) == 1
-    out = capsys.readouterr().out
-    assert TOKEN not in out                                # nothing to paste, nothing leaked
-    assert os.listdir(str(tmp_path)) == []
-
-
-def test_cli_timeout_exits_1_and_writes_nothing(tmp_path, monkeypatch, capsys):
-    _use(monkeypatch, FakeGet({
-        "getMe": _ok({"id": 1, "is_bot": True, "first_name": "Sotto", "username": "sotto_brief_bot"}),
-        "getUpdates": _updates(),
-    }), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE, "--timeout", "0"]) == 1
-    assert "nobody sent the pairing link in time" in capsys.readouterr().out
-    assert os.listdir(str(tmp_path)) == []
-
-
-# ── the boot handshake (what start.sh runs) ──────────────────────────────────────────────────────
+# ── the setup handshake (what selfhost_setup runs) ──────────────────────────────────────────────────────
 
 def test_ensure_link_captures_and_persists_when_nothing_is_linked_yet(tmp_path, monkeypatch):
     fake = _use(monkeypatch, _happy_fake(), tmp_path)
@@ -363,43 +318,6 @@ def test_ensure_link_reports_a_timeout_and_writes_nothing(tmp_path, monkeypatch)
     out = tg.ensure_link(TOKEN, PHRASE, timeout_secs=0)
     assert out["ok"] is False and out["error"] == "nobody sent the pairing link in time"
     assert os.listdir(str(tmp_path)) == []
-
-
-def test_boot_mode_prints_only_the_id_on_stdout(tmp_path, monkeypatch, capsys):
-    """start.sh reads stdout in a command substitution and the deploy log reads stderr, so the id
-    must be the ONLY thing on stdout — and the token must never appear on either."""
-    _use(monkeypatch, _happy_fake(), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE, "--timeout", "5", "--boot"]) == 0
-    captured = capsys.readouterr()
-    assert captured.out.strip() == "8675309"
-    assert "sotto_brief_bot" in captured.err
-    assert TOKEN not in captured.out and TOKEN not in captured.err
-
-
-def test_boot_mode_exits_1_with_an_empty_stdout_when_nobody_texts(tmp_path, monkeypatch, capsys):
-    """The failure start.sh treats as "not linked yet": no id to forward, boot continues."""
-    _use(monkeypatch, FakeGet({
-        "getMe": _ok({"id": 1, "is_bot": True, "first_name": "Sotto", "username": "sotto_brief_bot"}),
-        "getUpdates": _updates(),
-    }), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE, "--timeout", "0", "--boot"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out.strip() == ""
-    assert "nobody sent the pairing link in time" in captured.err
-    # the recovery instruction is the link itself — "message your bot" would be untappable and,
-    # since the gateway stays down, the message it asked for would sit unread anyway
-    assert f"https://t.me/sotto_brief_bot?start={PHRASE}" in captured.err
-    assert "restart this deploy" in captured.err
-
-
-def test_boot_mode_prints_the_deep_link_before_it_starts_waiting(tmp_path, monkeypatch, capsys):
-    """A link printed after the five-minute wait is a link nobody could tap: the deploy log must
-    carry it while there is still time."""
-    _use(monkeypatch, _happy_fake(), tmp_path)
-    assert tg.main(["--token", TOKEN, "--phrase", PHRASE, "--timeout", "5", "--boot"]) == 0
-    err = capsys.readouterr().err
-    assert f"TAP THIS TO LINK YOUR CHAT:  https://t.me/sotto_brief_bot?start={PHRASE}" in err
-    assert err.index("TAP THIS") < err.index("linked @sotto_brief_bot")
 
 
 def test_capture_confirms_the_pairing_message_so_the_gateway_never_sees_it(monkeypatch):

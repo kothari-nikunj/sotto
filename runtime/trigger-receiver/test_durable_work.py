@@ -1,5 +1,6 @@
 """Crash/clock contracts; all providers and sources are synthetic."""
 import importlib.util
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,149 @@ spec = importlib.util.spec_from_file_location('durable_receiver', HERE / 'receiv
 rec = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rec)
 q = rec.WORK_QUEUE
+
+
+@pytest.fixture
+def inline_runner(monkeypatch):
+    """Worker mechanics below run tiny inline Python runners; the declared-procedure fence that
+    refuses them in production is covered by the admission tests above."""
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_args: None)
+
+
+def test_sotto_job_admission_keeps_fixed_python_procedure_and_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    runner = [sys.executable, str(HERE / 'procedure_runner.py')]
+    prompt = json.dumps({'kind': 'digest', 'pack': '/app/sotto-skills'})
+    monkeypatch.setattr(rec.shutil, 'which', lambda executable: executable if executable == sys.executable else None)
+    identity = rec._spawn_and_deliver(runner, prompt, 'cron:sotto-midday-digest')
+    assert rec._spawn_and_deliver(runner, prompt, 'cron:sotto-midday-digest') == identity
+    saved = q.get(tmp_path, identity)
+    assert saved['payload']['runner'] == runner
+    assert saved['payload']['prompt'] == prompt
+    assert saved['attempts'] == 0
+    rec._WORK_WAKE.clear()
+
+
+def test_sotto_hermes_one_shot_fallback_is_refused_before_queue_admission(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_runtime_adapter', lambda: pytest.fail('one-shot translated to /v1/run'))
+    monkeypatch.setattr(rec.shutil, 'which', lambda executable: pytest.fail('one-shot executable probed'))
+    for runner in (['hermes', '-z'], ['/usr/local/bin/hermes', '-z']):
+        with pytest.raises(RuntimeError, match='unattended skill procedure is unsupported'):
+            rec._spawn_and_deliver(runner, 'Run the skill', 'cron:sotto-morning-brief')
+    assert not (tmp_path / 'events' / 'work.sqlite3').exists()
+
+
+def test_selected_sotto_wake_cannot_improvise_when_fixed_brief_is_not_selected(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_managed_brief', lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match='unattended skill procedure is unsupported'):
+        rec.run_skill('sotto-morning-brief', '/data/staged.json')
+    assert not (tmp_path / 'events' / 'work.sqlite3').exists()
+
+
+def test_selected_sotto_rejects_foreign_script_and_stale_one_shot_at_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec.shutil, 'which', lambda executable: executable)
+    for runner in ([sys.executable, str(HERE / 'other.py')], [sys.executable, '-c', 'print(1)']):
+        with pytest.raises(RuntimeError, match='unattended skill procedure is unsupported'):
+            rec._spawn_and_deliver(runner, '{}', 'background:fixture')
+    assert not (tmp_path / 'events' / 'work.sqlite3').exists()
+    legacy_id = q.enqueue(tmp_path, 'run', {
+        'runner': ['hermes', '-z'], 'prompt': 'Run the skill', 'label': 'cron:sotto-morning-brief'},
+        key='legacy-morning', valid_until=time.time() + 3600)
+    stale = q.claim(tmp_path, 'recovered-worker')
+    assert stale['id'] == legacy_id
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: pytest.fail('stale run reached receipt'))
+    monkeypatch.setattr(rec.subprocess, 'Popen', lambda *a, **k: pytest.fail('stale run spawned'))
+    with pytest.raises(RuntimeError, match='unattended skill procedure is unsupported'):
+        rec._execute_work(stale)
+    assert q.get(tmp_path, legacy_id)['result'] is None
+    assert q.get(tmp_path, legacy_id)['status'] == 'leased'
+    receipts = []
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: receipts.append(a))
+    monkeypatch.setattr(rec, '_deliver_text', lambda *a, **k: pytest.fail('stale run delivered'))
+    rec._work_one(stale)
+    retained = q.get(tmp_path, legacy_id)
+    assert retained['status'] == 'pending'
+    assert retained['result'] is None and retained['attempts'] == 1
+    assert receipts and receipts[-1][1] == 'failed'
+
+
+def test_selected_sotto_event_and_background_have_exact_fixed_scripts(monkeypatch):
+    memory = rec._find_sotto_script('_shared', 'scripts', 'memory_cycle.py')
+    event = rec._find_sotto_script('_shared', 'scripts', 'compose_notification.py')
+    assert memory and event
+    rec._require_sotto_procedure([sys.executable, memory], 'run')
+    rec._require_sotto_procedure([sys.executable, event], 'event')
+    for runner, kind in (([sys.executable, event], 'run'),
+                         ([sys.executable, memory], 'event'),
+                         ([sys.executable, memory, '--extra'], 'run'),
+                         ([sys.executable, event], 'unknown')):
+        with pytest.raises(RuntimeError, match='unattended skill procedure is unsupported'):
+            rec._require_sotto_procedure(runner, kind)
+
+
+def test_selected_sotto_preserves_saved_result_handoff_without_rerunning(tmp_path, monkeypatch):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    identity = q.enqueue(tmp_path, 'run', {
+        'runner': ['hermes', '-z'], 'prompt': 'former runtime request',
+        'label': 'cron:sotto-morning-brief'}, key='saved-former-result')
+    claimed = q.claim(tmp_path, 'recovered-worker')
+    assert claimed['id'] == identity
+    q.save_result(tmp_path, identity, 'recovered-worker', {
+        'text': 'Saved final text', 'label': 'cron:sotto-morning-brief'})
+    assert q.get(tmp_path, identity)['result']['text'] == 'Saved final text'
+    monkeypatch.setattr(rec, '_execute_work', lambda job: pytest.fail('saved result reran'))
+    handed_off = []
+    monkeypatch.setattr(rec, '_deliver_text', lambda text, label, **kwargs:
+                        handed_off.append((text, label, kwargs['run_id'])))
+    rec._work_one(q.get(tmp_path, identity))
+    assert handed_off == [('Saved final text', 'cron:sotto-morning-brief', identity)]
+    assert q.get(tmp_path, identity)['status'] == 'done'
+
+
+@pytest.mark.parametrize('name,kind,runner_name', [
+    ('sotto-morning-brief', 'morning', 'brief_runner.py'),
+    ('sotto-evening-brief', 'evening', 'brief_runner.py'),
+    ('sotto-proactive', 'proactive', 'procedure_runner.py'),
+    ('sotto-midday-digest', 'digest', 'procedure_runner.py'),
+    ('sotto-relationship-pulse', 'pulse', 'procedure_runner.py'),
+])
+def test_selected_sotto_system_job_admits_only_its_packaged_procedure(
+        tmp_path, monkeypatch, name, kind, runner_name):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_delivery_channel_ready', lambda label: True)
+    monkeypatch.setattr(rec, '_sotto_cron_jobs', lambda: [(name, '0 9 * * *', 'Run it',
+                                                        'sotto-event' if kind == 'digest' else name)])
+    seen = []
+
+    adapter = rec._runtime_adapter()
+    original_argv = adapter.run_argv
+
+    def argv(runner, prompt, *_args):
+        assert Path(runner[-1]).name == runner_name
+        seen.append(runner)
+        return original_argv(runner, prompt, *_args)
+
+    monkeypatch.setattr(adapter, 'run_argv', argv)
+    admitted = []
+    original = rec._spawn_and_deliver
+
+    def capture(*args, **kwargs):
+        identity = original(*args, **kwargs)
+        admitted.append(identity)
+        return identity
+
+    monkeypatch.setattr(rec, '_spawn_and_deliver', capture)
+    assert rec._fire_cron_job(name, f'run-now:{name}')['ok']
+    assert len(admitted) == 1 and len(seen) == 1
+    saved = q.get(tmp_path, admitted[0])
+    assert Path(saved['payload']['runner'][-1]).name == runner_name
+    request = json.loads(saved['payload']['prompt'])
+    assert request['kind'] == kind
+    assert Path(request['pack']).resolve() == (HERE.parents[1] / 'sotto-chief-of-staff').resolve()
+    rec._WORK_WAKE.clear()
 
 
 def test_synthetic_event_uses_the_job_already_committed_by_triage(tmp_path, monkeypatch):
@@ -67,7 +212,7 @@ def test_worker_recovers_saved_result_into_outbox_once(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, '_deliver_target', lambda: 'test:owner')
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
     sent = []
-    monkeypatch.setattr(rec, '_send_via_channel', lambda body, target: (sent.append(body) is None, '', {'message_id': 'provider-1'}))
+    monkeypatch.setattr(rec, '_send_with_identity', lambda body, target, *_identity: (sent.append(body) is None, '', {'message_id': 'provider-1'}))
     monkeypatch.setattr(rec, '_on_delivered', lambda payload: True)
     identity = q.enqueue(tmp_path, 'run', {}, key='prepared')
     first = q.claim(tmp_path, 'old')
@@ -358,7 +503,7 @@ def test_provider_accepted_effects_failure_retries_without_resending(tmp_path, m
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
     box = rec.OUTBOX
     sent, effects = [], []
-    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target: (sent.append(body) is None, '', {'message_id': 'accepted-1'}))
+    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target, *_identity: (sent.append(body) is None, '', {'message_id': 'accepted-1'}))
     monkeypatch.setitem(box.HOOKS, 'record', lambda *a, **k: None)
     monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: True)
     monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: effects.append(payload) or False)
@@ -440,7 +585,7 @@ def test_a_row_whose_validity_check_raises_holds_without_stalling_the_rows_behin
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
     box = rec.OUTBOX
     sent = []
-    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target: sent.append(body) or (True, '', {'message_id': 'm'}))
+    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target, *_identity: sent.append(body) or (True, '', {'message_id': 'm'}))
     monkeypatch.setitem(box.HOOKS, 'record', lambda *a, **k: None)
 
     def valid(payload):
@@ -461,7 +606,7 @@ def test_a_row_whose_validity_check_raises_holds_without_stalling_the_rows_behin
     assert poison['attempts'] == 2, 'each raising check still spends an attempt — the budget bounds it'
 
 
-def test_a_graceful_stop_hands_the_lease_back_without_charging_an_attempt(tmp_path, monkeypatch):
+def test_a_graceful_stop_hands_the_lease_back_without_charging_an_attempt(tmp_path, monkeypatch, inline_runner):
     """A redeploy's SIGTERM mid-composition is not the job failing. Charging it made a day's
     brief terminal in three pushes on a platform that redeploys on every push."""
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
@@ -484,7 +629,7 @@ def test_a_graceful_stop_hands_the_lease_back_without_charging_an_attempt(tmp_pa
     assert resumed['id'] == identity and resumed['attempts'] == 1
 
 
-def test_signal_handler_waits_for_real_worker_to_refund_lease(tmp_path, monkeypatch):
+def test_signal_handler_waits_for_real_worker_to_refund_lease(tmp_path, monkeypatch, inline_runner):
     """The production handler raises SystemExit on the main thread; its daemon worker must finish
     the interruption path before that exit is allowed to end the process."""
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
@@ -569,7 +714,7 @@ def test_shutdown_refunds_a_lease_stranded_in_the_delivery_handoff(tmp_path, mon
     assert q.get(tmp_path, identity)['owner'] == resumed['owner']
 
 
-def test_shutdown_kills_a_child_that_ignores_its_termination_signal(tmp_path, monkeypatch):
+def test_shutdown_kills_a_child_that_ignores_its_termination_signal(tmp_path, monkeypatch, inline_runner):
     """The grace is a chance to unwind, not permission to stay. An orphan keeps running against the
     same volume and would execute alongside the next instance's reclaim of the very same job."""
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
@@ -594,6 +739,20 @@ def test_shutdown_kills_a_child_that_ignores_its_termination_signal(tmp_path, mo
         with pytest.raises(SystemExit, match=str(128 + signal.SIGTERM)):
             rec._stop_work(signal.SIGTERM, None)
     finally:
+        # Production exits after _stop_work. This test keeps the interpreter alive:
+        # join the worker before clearing the stop flag or restoring DATA via monkeypatch.
+        # Otherwise it can report the killed child against the next test's /data root.
+        try:
+            child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(10)
+            raise  # Cleanup must not turn a missing production SIGKILL into a passing test.
+        with rec._WORK_LOCK:
+            workers = list(rec._WORK_THREADS)
+        for worker in workers:
+            worker.join(10)
+            assert not worker.is_alive(), 'shutdown fixture left a background worker running'
         rec._WORK_STOP.clear()
     assert child.wait(10) == -signal.SIGKILL
     row = q.get(tmp_path, identity)
@@ -615,7 +774,7 @@ def test_control_credential_never_reaches_detached_worker(monkeypatch):
     assert rec._spawn_env('stable-work-id')['SOTTO_DELIVERY_RUN_ID'] == 'stable-work-id'
 
 
-def test_real_subprocess_execution_is_bounded_and_saves_output(tmp_path, monkeypatch):
+def test_real_subprocess_execution_is_bounded_and_saves_output(tmp_path, monkeypatch, inline_runner):
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
     q.enqueue(tmp_path, 'run', {'runner': [sys.executable, '-c', 'import sys; print(sys.argv[1])'],
@@ -627,7 +786,7 @@ def test_real_subprocess_execution_is_bounded_and_saves_output(tmp_path, monkeyp
 
 
 
-def test_worker_failure_retains_safe_category_without_private_stderr(tmp_path, monkeypatch):
+def test_worker_failure_retains_safe_category_without_private_stderr(tmp_path, monkeypatch, inline_runner):
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
     reports = []
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: reports.append(a))
@@ -788,7 +947,7 @@ def test_only_canonical_brief_runner_budget_exit_parks_one_attempt_and_welcome(t
     assert q.claim(tmp_path, 'again') is None
 
 
-def test_foreign_runner_exit_77_keeps_normal_retry(tmp_path, monkeypatch):
+def test_foreign_runner_exit_77_keeps_normal_retry(tmp_path, monkeypatch, inline_runner):
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
     rec._WORK_STOP.clear()
@@ -883,7 +1042,6 @@ def test_budget_flag_cannot_discard_saved_result(tmp_path, monkeypatch):
 def test_budget_terminal_key_readmits_only_after_positive_capability(tmp_path, monkeypatch):
     import onboarding
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
-    monkeypatch.delenv('SOTTO_RUN_SKILL', raising=False)
     monkeypatch.setattr(rec, '_find_sotto_script', lambda *parts: '/fixture/_shared/scripts/compose_brief.py')
     monkeypatch.setattr(rec, '_brief_revision', lambda kind: 'fixed')
     assert rec._managed_brief('sotto-welcome-brief', onboarding.LABEL)
@@ -904,7 +1062,6 @@ def test_budget_terminal_key_readmits_only_after_positive_capability(tmp_path, m
 def test_welcome_capability_race_does_not_claim_nonexistent_work(tmp_path, monkeypatch):
     import onboarding
     monkeypatch.setattr(rec, 'DATA', str(tmp_path))
-    monkeypatch.delenv('SOTTO_RUN_SKILL', raising=False)
     monkeypatch.setattr(rec, '_find_sotto_script', lambda *parts: '/fixture/_shared/scripts/compose_brief.py')
     monkeypatch.setattr(rec, '_brief_revision', lambda kind: 'fixed')
     assert onboarding.tick(tmp_path, True,
@@ -1001,7 +1158,7 @@ def test_event_recovers_after_three_503s_through_real_worker_and_model_accountin
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
     monkeypatch.setattr(rec, '_deliver_target', lambda: 'test:owner')
     sent = []
-    monkeypatch.setattr(rec, '_send_via_channel', lambda body, target:
+    monkeypatch.setattr(rec, '_send_with_identity', lambda body, target, *_identity:
                         (sent.append(body) is None, '', {'message_id': 'fixture-accepted'}))
     monkeypatch.setattr(rec, '_on_delivered', lambda payload: True)
     identity = q.enqueue(tmp_path, 'event', {'bundle': {'events': []}}, key='recover-after-503',
@@ -1019,3 +1176,112 @@ def test_event_recovers_after_three_503s_through_real_worker_and_model_accountin
         assert db.execute('SELECT status FROM attempts ORDER BY attempt').fetchall() == [
             ('http_503',), ('http_503',), ('http_503',), ('succeeded',)]
     assert q.claim(tmp_path, 'worker', now=time.time() + 2000) is None
+
+
+@pytest.mark.parametrize('label', ['cron:sotto-relationship-pulse', 'run-now:sotto-relationship-pulse'])
+@pytest.mark.parametrize('target', ['photon', 'telegram'])
+def test_scheduled_pulse_binds_current_proof_before_child_spawn(tmp_path, monkeypatch, label, target):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *a: None)
+    monkeypatch.setattr(rec, '_deliver_target', lambda: target)
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: 'b' * 64)
+    authority = {'complete': True, 'revision': 'a' * 64}
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: authority.copy())
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: None)
+    monkeypatch.setattr(rec, '_read_usage', lambda *a: None)
+    runner = [sys.executable, str(HERE / 'procedure_runner.py')]
+    job = {'id': 'c' * 32, 'kind': 'run', 'payload': {'runner': runner,
+           'prompt': json.dumps({'pack': str(HERE.parents[1] / 'sotto-chief-of-staff'), 'kind': 'pulse'}),
+           'label': label}}
+    calls = []
+    class Child:
+        returncode = 0
+        def __init__(self, argv, **kwargs):
+            calls.append(kwargs['env'])
+        def communicate(self, **kwargs):
+            return 'Your weekly relationships', ''
+        def poll(self):
+            return 0
+    monkeypatch.setattr(rec.subprocess, 'Popen', Child)
+    authority['complete'] = False
+    with pytest.raises(rec._WorkDeferredError):
+        rec._execute_work(job)
+    assert not calls
+    authority['complete'] = True
+    result = rec._execute_work(job)
+    assert json.loads(calls[0]['SOTTO_SKILL_COMPOSITION_PROOF']) == {
+        'source_revision': 'a' * 64, 'route_digest': 'b' * 64}
+    assert calls[0]['SOTTO_DELIVERY_RUN_ID'] == job['id']
+    assert result['source_revision_at_composition'] == 'a' * 64
+    assert result['route_digest_at_composition'] == 'b' * 64
+    assert rec._composition_evidence('background:sotto-relationship-pulse') is None
+
+
+@pytest.mark.parametrize('changed', ['none', 'source_generation', 'route'])
+def test_scheduled_pulse_quiet_delivery_rechecks_proof_and_restarts_once(tmp_path, monkeypatch, changed):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'telegram')
+    current = {'revision': 'a' * 64, 'route': 'b' * 64}
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {'complete': True, 'revision': current['revision']})
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: current['route'])
+    monkeypatch.setattr(rec, '_runtime_adapter', lambda: SimpleNamespace(gallery_available=lambda: False))
+    monkeypatch.setattr(rec, '_load_shared_lib', lambda name: SimpleNamespace(prepare=lambda *a, **k: None))
+    box = rec.OUTBOX
+    sent = []
+    ready = [False]
+    monkeypatch.setitem(box.HOOKS, 'valid', rec._delivery_valid)
+    monkeypatch.setitem(box.HOOKS, 'delivery_ready', lambda payload: ready[0])
+    monkeypatch.setitem(box.HOOKS, 'send', lambda body, target, *_, **_context: (sent.append((body, target)) is None, '', {'message_id': 'm'}))
+    monkeypatch.setitem(box.HOOKS, 'record', lambda *a, **k: None)
+    monkeypatch.setitem(box.HOOKS, 'on_delivered', lambda payload: True)
+    monkeypatch.setitem(box.HOOKS, 'on_invalid', lambda payload: True)
+    text, label, ident = 'Your weekly relationships', 'cron:sotto-relationship-pulse', 'd' * 32
+    kwargs = {'run_id': ident, 'source_revision_at_composition': current['revision'],
+              'route_digest_at_composition': current['route'],
+              'source_text_sha256': hashlib.sha256(text.encode()).hexdigest()}
+    assert rec._deliver_text(text, label, **kwargs) is False
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['payload']['prep_source_revision'] == 'a' * 64
+    assert row['payload']['prep_route_digest'] == 'b' * 64
+    assert row['attempts'] == 0 and not sent
+    if changed == 'source_generation':
+        current['revision'] = 'e' * 64  # disable/regrant: allowed booleans alone are insufficient
+    elif changed == 'route':
+        current['route'] = 'f' * 64
+    ready[0] = True
+    # A later process drains the durable row, without recomputing or restoring authority.
+    box.drain()
+    box.drain()
+    assert sent == ([(text, 'telegram')] if changed == 'none' else [])
+    row = json.loads(Path(box.path()).read_text())['rows'][0]
+    assert row['status'] == ('delivered' if changed == 'none' else 'superseded')
+
+
+@pytest.mark.parametrize('runner_name,terminal', [('brief_runner.py', True), ('procedure_runner.py', False)])
+def test_uncertain_brief_exit_stops_worker_retry_only_for_brief(tmp_path, monkeypatch, runner_name, terminal):
+    monkeypatch.setattr(rec, 'DATA', str(tmp_path))
+    reports = []
+    monkeypatch.setattr(rec, '_record_delivery', lambda *a, **k: reports.append(a))
+    rec._WORK_STOP.clear()
+    class Process:
+        returncode = q.MODEL_OUTCOME_UNCERTAIN_EXIT
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, **kwargs):
+            return '', 'private provider details'
+        def poll(self):
+            return self.returncode
+    monkeypatch.setattr(rec.subprocess, 'Popen', Process)
+    runner = [sys.executable, str(HERE / runner_name)]
+    identity = q.enqueue(tmp_path, 'run', {'runner': runner, 'prompt': '{}',
+                        'label': 'cron:sotto-morning-brief'}, key='uncertain-brief')
+    rec._work_one(q.claim(tmp_path, 'worker'))
+    row = q.get(tmp_path, identity)
+    assert row['status'] == ('failed' if terminal else 'pending')
+    assert row['attempts'] == 1
+    assert 'private' not in str(reports)
+    if terminal:
+        assert row['error'] == 'model_outcome_uncertain'
+        assert row['payload'] == {}
+        assert q.claim(tmp_path, 'restart', now=time.time() + 3600) is None
+        assert 'model outcome uncertain; no retry queued' in reports[-1][2]

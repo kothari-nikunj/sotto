@@ -52,3 +52,15 @@ def test_local_queue_drops_unresolved_unknown_senders():
              "whatsapp": [{"contact_jid": "123456789012345@lid", "text": "are we still on?",
                            "is_from_me": False, "timestamp": "2026-06-25T09:00"}]}
     assert tq.local_queue(local, "whatsapp") == []
+
+
+def test_email_queue_retains_exact_latest_message_id_not_thread_or_older_message():
+    rows = [
+        {"id": "older", "threadId": "thread", "from": "a@example.com", "date": "2026-06-24", "snippet": "old"},
+        {"id": "selected", "threadId": "thread", "from": "a@example.com", "date": "2026-06-25", "snippet": "new"},
+        {"threadId": "legacy", "from": "b@example.com", "date": "2026-06-25", "snippet": "legacy"},
+    ]
+    queue = {item["threadId"]: item for item in tq.email_queue(rows)}
+    assert queue["thread"]["message_id"] == "selected"
+    assert queue["thread"]["last_snippet"] == "new"
+    assert queue["legacy"]["message_id"] == ""

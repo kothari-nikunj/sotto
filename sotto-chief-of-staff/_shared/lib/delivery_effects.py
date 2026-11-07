@@ -23,6 +23,7 @@ MAX_PENDING_SECONDS = 4 * 3600
 FRESH_NUDGE_VALID_SECONDS = 30 * 60
 CALENDAR_MIN_FRESH_SECONDS = 600
 POST_MEETING_VALID_SECONDS = 30 * 60
+PREP_LOCATION_MAX_CHARS = 512
 # These classes already carry a semantic deadline at admission: missed calls use the event
 # funnel's 240-minute envelope, while calendar changes expire at the affected meeting. Applying
 # the generic message-freshness deadline here would silently shorten both contracts to 30 minutes.
@@ -52,7 +53,7 @@ def _path(ident):
     return str(_root() / 'events' / f'delivery-effects-{ident}.json')
 
 
-def stage(effects, decision_ids=None, run_id=None, result=None):
+def stage(effects, decision_ids=None, run_id=None, result=None, research_evidence=None):
     """Merge producers in one run; never replace a previously staged offer or chase receipt."""
     ident = globals()['run_id'](run_id)
     if not ident:
@@ -70,6 +71,9 @@ def stage(effects, decision_ids=None, run_id=None, result=None):
         doc['decision_ids'] = sorted(set(doc.get('decision_ids', [])) | set(decision_ids or []))
         if result is not None:
             doc['proactive_result'] = result
+        if research_evidence is not None:
+            from retained_brief_proof import validate_research_evidence
+            doc['research_evidence'] = validate_research_evidence(research_evidence)
     return True
 
 
@@ -139,6 +143,103 @@ def meeting_occurrence(event_id, start):
     return f'{event_id}@{start_at:.3f}' if event_id and start_at is not None else ''
 
 
+def prep_location(value):
+    if not isinstance(value, str):
+        return ''
+    value = ' '.join(value.split())
+    return value if len(value) <= PREP_LOCATION_MAX_CHARS and value.isprintable() else ''
+
+
+def meeting_day(start):
+    from timeutil import configured_tz, _resolve_tz
+    zone = _resolve_tz(configured_tz() or '+00:00') or timezone.utc
+    return datetime.fromtimestamp(instant(start), zone).date().isoformat()
+
+
+def prep_location_baseline(event_id, start):
+    occurrence = meeting_occurrence(event_id, start)
+    if not occurrence:
+        return None
+    state = jsonstore.read(proactive_path(meeting_day(start)), {})
+    value = state.get('prep_locations', {}).get(occurrence)
+    if (not isinstance(value, dict) or value.get('version') != 1 or not prep_location(value.get('location'))
+            or not re.fullmatch(r'[a-f0-9]{64}', str(value.get('route_digest', '')))
+            or instant(value.get('accepted_at')) is None):
+        return None
+    return value
+
+
+def prep_location_update_valid(effect, now):
+    if prep_location_baseline(effect.get('calendar_event_id'), effect.get('calendar_start')) != effect.get('baseline'):
+        return False
+    cache = jsonstore.read(str(_root() / 'cache/calendar_today.json'), {})
+    observed = instant(cache.get('generated_at'))
+    candidate = instant(effect.get('calendar_observed_at'))
+    fresh = max(CALENDAR_MIN_FRESH_SECONDS, 3 * int(cache.get('refresh_secs') or 120))
+    if (cache.get('status') != 'ok' or cache.get('complete') is not True or cache.get('projection') != 'day'
+            or cache.get('date') != meeting_day(effect['calendar_start']) or observed is None
+            or not 0 <= now - observed <= fresh or candidate is None or observed < candidate
+            or now >= instant(effect['calendar_start']) or not prep_location(effect.get('location'))):
+        return False
+    matches = [row for row in cache.get('events', []) if row.get('id') == effect['calendar_event_id']
+               and instant(row.get('start')) == instant(effect['calendar_start'])]
+    return len(matches) == 1 and matches[0].get('prep_location') == effect['location']
+
+
+def prep_location_candidate(event, now):
+    baseline = prep_location_baseline(event.get('id'), event.get('start'))
+    location = prep_location(event.get('location'))
+    if not baseline or not location or location == baseline['location']:
+        return None
+    cache = jsonstore.read(str(_root() / 'cache/calendar_today.json'), {})
+    effect = {'kind': 'prep_location_update', 'calendar_event_id': event['id'],
+              'calendar_start': event['start'], 'location': location, 'baseline': baseline,
+              'calendar_observed_at': cache.get('generated_at')}
+    return effect if prep_location_update_valid(effect, now) else None
+
+
+def stage_full_prep(meetings):
+    proof = json.loads(os.environ.get('SOTTO_SKILL_COMPOSITION_PROOF', '{}'))
+    stage([{'kind': 'meeting_prep_delivered', 'mode': 'full',
+            **({'prep_location': meeting['prep_location'], 'prep_route_digest': proof['route_digest']}
+               if meeting.get('prep_location') and proof.get('route_digest') else {}),
+            'calendar_event_id': meeting.get('event_id', ''), 'calendar_start': meeting.get('start', '')}
+           for meeting in meetings])
+
+
+def delivered_prep_occurrences(date):
+    try:
+        state = jsonstore.read(proactive_path(date), {}, strict=True)
+        return {str(value) for value in state.get('prep_deliveries', []) if str(value)}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def prep_location_evidence(calendar, date, now):
+    events = (calendar.get('events') or calendar.get('items') or []) if isinstance(calendar, dict) else calendar
+    updates, delivered = {}, delivered_prep_occurrences(date)
+    for event in events or []:
+        if not isinstance(event, dict) or instant(event.get('start')) is None:
+            continue
+        delivered |= delivered_prep_occurrences(meeting_day(event['start']))
+        update = prep_location_candidate(event, now)
+        if update:
+            updates[meeting_occurrence(event.get('id'), event['start'])] = update
+    return updates, delivered
+
+
+def prep_location_nudge(event, start, updates):
+    update = (updates or {}).get(meeting_occurrence(event.get('id'), start))
+    if not update or prep_location(event.get('location')) != update['location']:
+        return None
+    key = hashlib.sha256(json.dumps({k: v for k, v in update.items()
+                                    if k != 'calendar_observed_at'}, sort_keys=True).encode()).hexdigest()
+    return {'kind': 'meeting_prep', 'key': f'mtg-location:{key}', 'calendar_event_id': event['id'],
+            'calendar_start': start, 'calendar_observed_at': update['calendar_observed_at'],
+            'valid_until': start, 'title': str(event.get('summary') or '').strip() or 'Your meeting',
+            'location_update': update}
+
+
 def _loops():
     import ledger_io
     return {row.get('anchor_key'): row for row in ledger_io.load_entries() if row.get('anchor_key')}
@@ -147,6 +248,14 @@ def _loops():
 def loop_version(row):
     return hashlib.sha256(json.dumps({k: row.get(k) for k in LOOP_FIELDS},
                                     sort_keys=True, default=str).encode()).hexdigest()
+
+
+
+def closure_version(row):
+    """Bind a completion claim without changing existing active-task review hashes."""
+    value = [loop_version(row), row.get('resolution_loop_version'), row.get('resolution_source_refs')]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str,
+                                     separators=(',', ':')).encode()).hexdigest()
 
 
 def loop_identity(row):
@@ -283,8 +392,13 @@ def valid(effects, now=None):
     now = time.time() if now is None else now
     from source_context import allowed
     loops = None
+    sender_allowed = None
     conversation = None   # the local snapshot, parsed at most once per call (it is multi-MB)
     for effect in effects:
+        if effect.get('kind') == 'prep_location_update':
+            if not allowed('calendar') or not prep_location_update_valid(effect, now):
+                return False
+            continue
         if effect.get('kind') == 'unsolicited_nudge':
             import preferences
             if preferences.effective_nudge_budget() == 0:
@@ -312,6 +426,13 @@ def valid(effects, now=None):
         source = effect.get('source')
         if source and not allowed(source):
             return False
+        if 'notification_sender' in effect:
+            if sender_allowed is None:
+                import preferences
+                from personal_context import conversation_filter
+                sender_allowed = conversation_filter(preferences.load_explicit())
+            if not sender_allowed(effect['notification_sender']):
+                return False
         # Only the selected notification carries this reference. Inferring it from every
         # bundled event would let a closed, unselected ask suppress a fresh primary item.
         reference = effect.get('request_reference')
@@ -322,6 +443,14 @@ def valid(effects, now=None):
         until = instant(effect.get('valid_until'))
         if until is not None and now >= until:
             return False
+        closed = effect.get('closed_loop')
+        if closed:
+            loops = _loops() if loops is None else loops
+            row = loops.get(closed)
+            if (not row or row.get('status') != 'resolved'
+                    or not effect.get('closed_loop_version')
+                    or closure_version(row) != effect['closed_loop_version']):
+                return False
         anchor = effect.get('anchor_key')
         if anchor:
             import ledger_io
@@ -332,9 +461,17 @@ def valid(effects, now=None):
                 return False
         if effect.get('intention_id'):
             import schedule_wakeup
-            if not any(r.get('id') == effect['intention_id'] and r.get('status') == 'scheduled'
-                       for r in schedule_wakeup.current()):
+            intentions = [r for r in schedule_wakeup.current() if r.get('id') == effect['intention_id'] and r.get('status') == 'scheduled']
+            if len(intentions) != 1:
                 return False
+            binding = intentions[0].get('condition_binding')
+            if binding is not None:
+                try:
+                    state, _, _ = schedule_wakeup.conditional_current_state(binding, now=datetime.fromtimestamp(now, timezone.utc))
+                    if state != 'active':
+                        return False
+                except (ValueError, OSError, RuntimeError, TypeError):
+                    return False
         event_id = effect.get('calendar_event_id')
         if event_id:
             cache = jsonstore.read(str(_root() / 'cache' / 'calendar_today.json'), {})
@@ -408,22 +545,53 @@ def finalize(effects, receipt):
                 pending = state['pending'].get(effect['key'], {})
                 if pending.get('run_id') == effect.get('run_id'):
                     state['pending'].pop(effect['key'], None)
+        elif kind == 'prep_location_update':
+            occurrence = meeting_occurrence(effect['calendar_event_id'], effect['calendar_start'])
+            with proactive_state(meeting_day(effect['calendar_start'])) as state:
+                current = state.get('prep_locations', {}).get(occurrence)
+                if (current == effect['baseline'] and receipt.get('route_proof_version') == 1
+                        and receipt.get('route_digest') == current['route_digest']):
+                    state['prep_locations'][occurrence] = {**current, 'location': effect['location'],
+                                                          'notified_at': receipt['accepted_at']}
         elif kind == 'meeting_prep_delivered':
             occurrence = meeting_occurrence(effect.get('calendar_event_id'), effect.get('calendar_start'))
             if occurrence and effect.get('mode') in ('offer', 'full'):
                 date = str(effect.get('date') or '')
                 if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date):
-                    from timeutil import configured_tz, _resolve_tz
-                    zone = _resolve_tz(configured_tz() or '+00:00') or timezone.utc
-                    date = datetime.fromtimestamp(instant(effect['calendar_start']), zone).date().isoformat()
+                    date = meeting_day(effect['calendar_start'])
                 with proactive_state(date) as state:
                     state['prep_deliveries'] = sorted(set(state.get('prep_deliveries', [])) | {occurrence})
+                location = prep_location(effect.get('prep_location'))
+                route = effect.get('prep_route_digest')
+                if effect['mode'] == 'full':
+                    with proactive_state(meeting_day(effect['calendar_start'])) as state:
+                        current = state.setdefault('prep_locations', {}).get(occurrence)
+                        if not current or receipt['accepted_at'] > max(current['accepted_at'], current.get('notified_at', 0)):
+                            baseline = {'version': 0, 'accepted_at': receipt['accepted_at']}
+                            if (location and receipt.get('route_proof_version') == 1
+                                    and re.fullmatch(r'[a-f0-9]{64}', str(route or ''))
+                                    and receipt.get('route_digest') == route):
+                                baseline.update(version=1, location=location, route_digest=route)
+                            state['prep_locations'][occurrence] = baseline
+
         elif kind == 'intention':
             import schedule_wakeup
-            schedule_wakeup.transition(effect['id'], 'fired')
+            schedule_wakeup.mark_accepted(effect['id'], receipt['accepted_at'])
         elif kind == 'pending_offer':
             import pending_offer
-            pending_offer.activate_offer(effect['offer'], receipt)
+            offer = effect['offer']
+            if offer.get('kind') == 'meeting_prep' and 'meeting' not in offer:
+                occurrences = [e for e in effects if e.get('kind') == 'meeting_prep_delivered'
+                               and e.get('mode') == 'offer' and e.get('calendar_event_id')
+                               and instant(e.get('calendar_start')) is not None]
+                if len(occurrences) == 1:
+                    offer = {**offer, 'meeting': {'event_id': occurrences[0]['calendar_event_id'],
+                                                 'start': occurrences[0]['calendar_start']}}
+            pending_offer.activate_offer(offer, receipt)
+        elif kind == 'accepted_offer_clear':
+            import pending_offer
+            # Missing means already settled; exact snapshot clearing preserves any newer offer.
+            pending_offer.clear_offer(expected=effect['offer'])
         elif kind == 'parking_notice':
             sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'morning-brief/scripts'))
             import continuity_resolve

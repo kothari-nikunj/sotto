@@ -62,7 +62,8 @@ def test_partitions_actions_and_rejects_more_than_four_readable_cards(tmp_path):
 
 
 def test_prep_sections_remain_extracts_not_new_research():
-    deck = v.build('Meeting with Alex\nYour thread\nMet on Friday.\nWhat Example builds\nSoftware for clinics.\nThe founder\nWas an engineer.\nTraction & signals\nThree pilots are signed.\nAngles\nAsk how pilots convert to paid contracts.', 'prep')
+    source = 'Meeting with Alex\nYour thread\nMet on Friday.\nWhat Example builds\nSoftware for clinics.\nThe founder\nWas an engineer.\nTraction & signals\nThree pilots are signed.\nAngles\nAsk how pilots convert to paid contracts.'
+    deck = v.build(_rich_prep_source(source), 'prep')
     assert [c['title'] for c in deck['cards']] == ['Your relationship', 'The business', 'Signals & context', 'Questions to ask']
     assert 'Was an engineer' in str(deck['cards'])
 
@@ -389,6 +390,52 @@ def test_birthday_cannot_swallow_the_following_meetings_day(tmp_path, monkeypatc
     assert '12:00 PM' in drawn
 
 
+def test_clock_led_rows_in_other_formats_stay_on_the_calendar_card():
+    # Only prose moves to Other updates; a time range or 24-hour row is still an event.
+    source = BRIEF.replace('10:00 AM — Team meeting\n12:00 PM — Lunch with Alex',
+        '🎂 Ashish · birthday today\n'
+        '9:30–10:00 AM — Standup\n'
+        '14:00 — Design review\n'
+        'Sriram 4:30 call did not take place.')
+    deck = v.build(source)
+    agenda = [b['text'] for c in deck['cards'] if c['title'] == 'Your day' for b in c['blocks']]
+    updates = [b['text'] for c in deck['cards'] if c['title'] == 'Follow-ups' for b in c['blocks']
+               if b.get('section') == 'Other updates']
+    assert agenda == ['🎂 Ashish · birthday today', '9:30–10:00 AM — Standup', '14:00 — Design review']
+    assert updates == ['Sriram 4:30 call did not take place.']
+
+
+def test_unheaded_updates_after_birthday_leave_calendar_rows_intact(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    source = BRIEF.replace('10:00 AM — Team meeting\n12:00 PM — Lunch with Alex',
+        '🎂 Ashish · birthday today\n'
+        'Sriram 4:30 call did not take place.\n'
+        'Charley introduction still open.\n'
+        'Ankit plans are waiting.\n'
+        '5:00 PM — Team meeting')
+    deck = v.build(source)
+    assert deck is not None
+    agenda = [b for c in deck['cards'] if c['title'] == 'Your day' for b in c['blocks']]
+    updates = [b for c in deck['cards'] if c['title'] == 'Follow-ups' for b in c['blocks']
+               if b.get('section') == 'Other updates']
+    assert [b['text'] for b in agenda] == ['🎂 Ashish · birthday today', '5:00 PM — Team meeting']
+    assert [b['text'] for b in updates] == [
+        'Sriram 4:30 call did not take place.', 'Charley introduction still open.',
+        'Ankit plans are waiting.']
+    for text in [b['text'] for b in agenda + updates]:
+        assert sum(b['text'] == text for c in deck['cards'] for b in c['blocks']) == 1
+        assert deck['full_text'].splitlines()[next(b['line'] for b in agenda + updates
+                                                  if b['text'] == text)] == text
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+    def record(self, xy, text, *args, **kwargs):
+        drawn.append(text)
+        return original(self, xy, text, *args, **kwargs)
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(deck, tmp_path)
+    assert 'Birthdays today' in drawn and 'Other updates' in drawn and '5:00 PM' in drawn
+
+
 @pytest.mark.parametrize('birthday, label', [
     ('🎂 Alex Smith (birthday today)', 'Birthdays today'),
     ('🎂️ Alex Smith (birthday tomorrow)', 'Birthdays tomorrow'),
@@ -420,3 +467,88 @@ def test_fit_check_and_delivery_agree_on_overflow(tmp_path):
     assert not v.fits(deck)
     with pytest.raises(ValueError, match='too wide'):
         v.render(deck, tmp_path)
+
+
+@pytest.mark.parametrize('edition,greeting,heading', [
+    ('evening', 'Good morning', 'Coming up'),
+    ('morning', 'Good afternoon', 'Your day'),
+])
+def test_explicit_edition_is_independent_of_wall_clock_greeting(tmp_path, monkeypatch, edition, greeting, heading):
+    from PIL import ImageDraw
+    source = BRIEF.replace('Good morning', greeting)
+    deck = v.build(source, edition=edition)
+    assert deck['full_text'].startswith(greeting)
+    assert f"Here's your {edition} brief" in deck['summary']
+    assert deck['id'] != v.build(source, edition='morning' if edition == 'evening' else 'evening')['id']
+    rendered = []
+    original = ImageDraw.ImageDraw.text
+    def record(self, xy, text, *args, **kwargs):
+        rendered.append(text)
+        return original(self, xy, text, *args, **kwargs)
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    v.render(deck, tmp_path)
+    assert heading in rendered
+    assert any(text.startswith(edition.capitalize() + ' brief · ') for text in rendered)
+
+
+def test_prep_keeps_person_identity_and_sourced_paragraphs(tmp_path):
+    source = ("Alex (Example) — Tuesday 10:00\nYour thread\nAlex asked Monday for the pilot results.\n"
+              "What Example builds\nSoftware for clinics.\nTraction & signals\n"
+              "Example reports three pilots (October 20): https://example.com/pilots\n"
+              "Angles\nAsk which of the three pilots converted to paid contracts.")
+    source = _rich_prep_source(source)
+    deck = v.build(source, 'prep')
+    assert deck['title'] == 'Alex (Example) — Tuesday 10:00'
+    assert 'https://example.com/pilots' in str(deck['cards'])
+    assert 'https://example.com/pilots' in deck['summary']
+    assert not deck['excerpt']
+    assert len(v.render(deck, tmp_path)['images']) == 4
+
+
+def test_thin_prep_remains_text_instead_of_splitting_questions_into_pages():
+    assert v.build('Alex — Tuesday\nYour thread\nNo private context available.\nAngles\n'
+                   'Ask about the three signed pilots.\nAsk about their renewal dates.\n'
+                   'Ask which clinic owns the budget.', 'prep') is None
+
+
+def test_focused_prep_long_meeting_title_uses_person_heading(tmp_path, monkeypatch):
+    title = ('Alex Chen - Rivera · Quarterly customer implementation and security readiness '
+             'review with the regional deployment leadership team — Thursday 10:00 AM')
+    source = (title + '\nYour thread\nAlex asked Monday for the pilot results.\n'
+              'What Example builds\nSoftware for clinics.\nTraction & signals\n'
+              'Example reports three signed pilots.\nAngles\n'
+              'Ask which pilot clears the security review before rollout.')
+    source = _rich_prep_source(source)
+    deck = v.build(source, 'prep')
+    assert deck['summary'] == v._display_text(title)
+    headings = []
+    original = v._lines
+
+    def capture(draw, text, font, width):
+        if width == 870:
+            headings.append(text)
+        return original(draw, text, font, width)
+
+    monkeypatch.setattr(v, '_lines', capture)
+    assert len(v.render(deck, tmp_path)['images']) == 4
+    assert headings and set(headings) == {'Alex Chen - Rivera'}
+
+
+def _rich_prep_source(source):
+    # Enough substantive source text to need multiple cards, while each section still fits.
+    history = ('Alex described the pilot review process and asked the team to document each '
+               'clinic decision before the next implementation meeting. ') * 5
+    business = ('The clinic workflow includes intake review, staff assignment and a shared '
+                'record of outstanding implementation decisions across the pilot sites. ') * 5
+    return source.replace('Your thread\n', 'Your thread\n' + history.strip() + '\n').replace(
+        'What Example builds\n', 'What Example builds\n' + business.strip() + '\n')
+
+
+def test_complete_short_prep_with_four_sections_stays_as_text():
+    source = ('Maya Chen · Pilot pricing review — Thursday 2:00 PM\n'
+              'Your thread\nMaya asked you to compare annual and monthly costs before Thursday.\n'
+              'What Example builds\nClinic workflow tools.\n'
+              'Traction & signals\nThe vendor reports three pilot clinics.\n'
+              'Angles\nAsk whether the thirty-seat limit changes the annual versus monthly decision.')
+    assert len(source.split()) <= v.MAX_PREP_WORDS
+    assert v.build(source, 'prep') is None

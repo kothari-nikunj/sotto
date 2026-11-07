@@ -17,7 +17,6 @@ BRIEF = {
     'schedule': '30 6 * * *',
     'prompt': 'Run my morning brief',
     'skill': 'sotto-morning-brief',
-    'runner': 'receiver',
 }
 
 
@@ -26,9 +25,7 @@ def _fresh_selfhost(tmp_path, monkeypatch, at):
     monkeypatch.setattr(managed, 'enabled', lambda: False)
     monkeypatch.setattr(rec.RELAY, 'bridge_connected', lambda: False)
     monkeypatch.setattr(rec.CONNECTORS, 'service_status', lambda: [])
-    monkeypatch.setattr(rec, '_hermes_adapter', lambda name: type('Runtime', (), {
-        'home_path': staticmethod(lambda filename: str(tmp_path / filename)),
-    })())
+    monkeypatch.setenv('SOTTO_HOME', str(tmp_path))
     monkeypatch.setattr(rec, '_deliver_target', lambda: 'telegram')
     monkeypatch.setattr(rec, '_channel_status', lambda channel=None: 'unknown')
     monkeypatch.setattr(rec, '_local_now', lambda: at)
@@ -390,10 +387,10 @@ def test_bootstrap_runs_for_every_held_first_brief_status(tmp_path, monkeypatch,
 
 
 def test_setup_page_waits_for_a_real_mac_read_not_the_link(tmp_path, monkeypatch):
-    real_adapter = rec._hermes_adapter
+    real_adapter = rec._sotto_adapter
     _fresh_selfhost(tmp_path, monkeypatch, datetime(2026, 9, 28, 6, 30))
-    monkeypatch.setattr(rec, '_hermes_adapter', real_adapter)
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes'))
+    monkeypatch.setattr(rec, '_sotto_adapter', real_adapter)
+    monkeypatch.setenv('SOTTO_HOME', str(tmp_path / 'sotto-home'))
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))
     monkeypatch.setattr(rec.CONNECTORS, 'DATA', str(tmp_path))
     monkeypatch.setattr(rec.RELAY, 'bridge_connected', lambda: True)
@@ -597,18 +594,12 @@ def _selfhost_photon(tmp_path, monkeypatch):
     (tmp_path / 'config').mkdir(exist_ok=True)
 
 
-def test_established_selfhost_photon_without_owner_receipt_keeps_delivering(tmp_path, monkeypatch):
-    # Installs made before owner receipts existed never wrote photon-activation.json.
-    _selfhost_photon(tmp_path, monkeypatch)
-    (tmp_path / 'config/onboarding.json').write_text(json.dumps({'phase': 'existing'}))
-    assert rec._channel_status('photon') == 'linked'
-    assert rec._delivery_channel_ready('cron:sotto-proactive') is True
-
-
-def test_fresh_or_managed_photon_still_waits_for_the_owner_hello(tmp_path, monkeypatch):
+def test_photon_waits_for_the_owner_hello_until_its_receipt_exists(tmp_path, monkeypatch):
     _selfhost_photon(tmp_path, monkeypatch)
     assert rec._channel_status('photon') == 'pairing'  # fresh self-host: no accepted brief yet
     (tmp_path / 'config/onboarding.json').write_text(json.dumps({'phase': 'existing'}))
+    assert rec._channel_status('photon') == 'pairing'  # a delivered brief is not an owner receipt
+    assert rec._delivery_channel_ready('cron:sotto-proactive') is False
     (tmp_path / 'config/photon-activation.json').write_text('{broken')
     assert rec._channel_status('photon') == 'pairing'  # a corrupt receipt is never trusted
     (tmp_path / 'config/photon-activation.json').unlink()

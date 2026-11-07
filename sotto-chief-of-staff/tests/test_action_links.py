@@ -108,8 +108,8 @@ def test_any_other_variant_still_links(tmp_path):
 # ── The offer: email asks, every other channel links ──────────────────────────────────────────────
 #
 # The rule in one sentence: for an email action Sotto shows the draft text and ASKS ("want this in
-# your Gmail drafts?" → `google_action.py gmail-draft`); every other channel, and any host where
-# Google isn't connected, keeps the deep link. The offer itself is prose the agent speaks, so it is
+# your Gmail drafts?" → the reviewed Gmail draft tools); every other channel, and any host where
+# Google isn't connected, keeps the deep link (or, in chat, the text to send yourself). The offer itself is prose the agent speaks, so it is
 # guarded where it is written — the SKILLs — and the fallback is guarded here, in code.
 
 _SKILL_ROOT = os.path.join(HERE, "..")
@@ -126,25 +126,29 @@ def _skill_text(name: str) -> str:
 def test_the_email_offer_is_an_ask_not_a_mailto(skill):
     """An email draft is offered into Gmail, not pasted as a 300-character percent-encoded URL."""
     text = _skill_text(skill)
-    assert "gmail-draft" in text, f"{skill}/SKILL.md never names the draft verb"
+    # The Sotto runtime's reviewed Gmail draft tools: a direct reply, a yes to a nudge's offer, or a
+    # follow-up's offered draft. Each presents a full review before a separate save approval.
+    assert any(tool in text for tool in ("gmail_draft_propose", "gmail_draft_offer",
+                                         "gmail_draft_followup_review")), \
+        f"{skill}/SKILL.md never names the draft tool"
     assert "Gmail drafts" in text, f"{skill}/SKILL.md never makes the ask"
 
 
 @pytest.mark.parametrize("skill", _OFFER_SKILLS)
 def test_every_offer_surface_keeps_an_honest_fallback(skill):
     """Do not remove the only path that works when Google is absent: each surface names the
-    `fallback:deep_link` branch (or, for followup, defers to draft-reply which does) and still
-    offers the link for a non-email channel."""
+    `deep_link` fallback (or defers to draft-reply, which owns it) and still gives a non-email
+    channel a way to send — the receiver-built one-tap link, or in chat the text to send in the app."""
     text = _skill_text(skill)
     assert "deep_link" in text or "sotto-draft-reply" in text
-    assert any(s in text for s in ("wa.me", "action_links.py", "one-tap link"))
+    assert any(s in text for s in ("wa.me", "one-tap link", "in the app themselves"))
 
 
 def test_the_brief_stops_pasting_mailto_urls_too():
     """The brief is the same rule at a different altitude: it links wa.me/sms/tel actions and lets
     the offer line carry email ("say *draft Dhruv*")."""
     text = _skill_text("morning-brief")
-    assert "email asks, every other channel links" in text
+    assert "Email is the exception: offer wording rather than a `mailto:` link" in text
     assert "mailto:dhruv@acme.com" not in text     # the old worked example, deleted
 
 

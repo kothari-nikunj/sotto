@@ -1,0 +1,12 @@
+*
+!smoke
+smoke/*
+!smoke/fixed-cross
+smoke/fixed-cross/*
+!smoke/fixed-cross/Dockerfile
+!smoke/fixed-cross/Dockerfile.dockerignore
+!smoke/fixed-cross/README.md
+!smoke/fixed-cross/node-harness.mjs
+!smoke/fixed-cross/run.py
+!smoke/fixed-cross/run-lifecycle.py
+!smoke/fixed-cross/run-config-mismatch.py

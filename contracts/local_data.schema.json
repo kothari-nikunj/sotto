@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "LocalData",
-  "description": "Output of the Sotto Bridge read_local tool. Field names + per-item shapes are pinned to the Mac app's extract_local_data (app/src-tauri/src/commands/brief.rs) and to what the consumer (sotto-chief-of-staff/_shared/scripts/compose_brief.py) reads, so the brief skill needs no remap. Messages are FLAT per-message arrays (the consumer groups into threads). granola_meetings is intentionally OUT of the Bridge — Hermes owns Granola via MCP.",
+  "description": "Output of the Sotto Bridge read_local tool. Field names + per-item shapes are pinned to the Mac app's extract_local_data (app/src-tauri/src/commands/brief.rs) and to what the consumer (sotto-chief-of-staff/_shared/scripts/compose_brief.py) reads, so the brief skill needs no remap. Messages are FLAT per-message arrays (the consumer groups into threads). granola_meetings is intentionally OUT of the Bridge — the cloud side gathers Granola through its own connector (gather_granola.py).",
   "type": "object",
   "required": ["generated_at", "window_hours", "source_status"],
   "properties": {
@@ -41,6 +41,7 @@
         "handle": { "type": "string" },
         "is_from_me": { "type": "boolean" },
         "timestamp": { "type": "string" },
+        "timestamp_utc": { "type": "string", "description": "RFC3339 UTC instant of timestamp (local wall clock, no offset)." },
         "text": { "type": "string" },
         "is_group_chat": { "type": "boolean" },
         "chat_guid": {
@@ -66,6 +67,7 @@
         "partner_name": { "type": "string" },
         "is_from_me": { "type": "boolean" },
         "timestamp": { "type": "string" },
+        "timestamp_utc": { "type": "string", "description": "RFC3339 UTC instant of timestamp (local wall clock, no offset)." },
         "text": { "type": "string" },
         "is_group_chat": { "type": "boolean" },
         "chat_guid": {
@@ -135,7 +137,7 @@
         "phone": { "type": "string" },
         "timestamp": { "type": "string" },
         "is_outgoing": { "type": "boolean" },
-        "is_answered": { "type": "boolean" },
+        "is_answered": { "type": "boolean", "description": "macOS sets this only for incoming calls; an outgoing call connected if duration_seconds > 0." },
         "call_type": { "enum": ["phone", "facetime_audio", "facetime_video"] },
         "duration_seconds": { "type": "number" }
       }
@@ -146,6 +148,7 @@
       "properties": {
         "jid": { "type": "string" },
         "timestamp": { "type": "string" },
+        "timestamp_utc": { "type": "string", "description": "RFC3339 UTC instant of timestamp (local wall clock, no offset)." },
         "is_outgoing": { "type": "boolean" },
         "is_missed": { "type": "boolean" }
       }

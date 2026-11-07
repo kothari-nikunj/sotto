@@ -1,0 +1,3 @@
+# Isolated CPU inference only; do not add these to Sotto's root environment.
+sherpa-onnx==1.13.8
+numpy==2.3.4

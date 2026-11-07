@@ -1,176 +1,77 @@
-"""System cron reconciliation and the user-routine fence."""
+"""The one system schedule (adapters/sotto/crons.json), its single reader and the user-routine fence."""
+import importlib.util
 import json
 import os
 import re
-import subprocess
-import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
-HERMES = os.path.dirname(ROOT)
-START_SH = os.path.join(HERMES, "adapters", "hermes", "start.sh")
-CRONS_JSON = os.path.join(HERMES, "adapters", "hermes", "crons.json")
-RECONCILER = os.path.join(HERMES, "adapters", "hermes", "reconcile_crons.py")
-INSTALL_SH = os.path.join(HERMES, "adapters", "hermes", "install.sh")
-CONFIG_TEMPLATE = os.path.join(HERMES, "adapters", "hermes", "config.template.yaml")
-RAILWAY_MD = os.path.join(HERMES, "RAILWAY.md")
+AGENT_ROOT = os.path.dirname(ROOT)
+CRONS_JSON = os.path.join(AGENT_ROOT, "adapters", "sotto", "crons.json")
+RECEIVER = os.path.join(AGENT_ROOT, "runtime", "trigger-receiver", "receiver.py")
 
-with open(START_SH, encoding="utf-8") as f:
-    START = f.read()
-with open(INSTALL_SH, encoding="utf-8") as f:
-    INSTALL = f.read()
-with open(CONFIG_TEMPLATE, encoding="utf-8") as f:
-    CONFIG = f.read()
-with open(RAILWAY_MD, encoding="utf-8") as f:
-    RAILWAY = f.read()
+_spec = importlib.util.spec_from_file_location("cron_fence_receiver", RECEIVER)
+rec = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rec)
 
-CRON_LIST_FIXTURE = """Scheduled jobs (5):
-
-  a1b2c3d4e5f6  sotto-morning-brief
-      Prompt: Run my morning brief
-  b1b2c3d4e5f6  sotto-morning-brief
-      Prompt: Run my morning brief
-  c1b2c3d4e5f6  sotto-followup
-      Prompt: Run my followup
-  d1b2c3d4e5f6  user-open-loops-friday
-      Prompt: Summarize my open loops grouped by person.
-  e1b2c3d4e5f6  user-morning-echo
-      Prompt: Run my morning brief again on Saturday.
-"""
-ID_RE = r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{12,})\b"
-
-FAKE_HERMES = """#!/usr/bin/env python3
-import os, re, sys
-state, log = os.environ["FAKE_CRON_STATE"], os.environ["FAKE_CRON_LOG"]
-ids = re.compile(%r)
-argv = sys.argv[1:]
-if argv[:2] == ["cron", "list"]:
-    sys.stdout.write(open(state, encoding="utf-8").read())
-elif argv[:2] == ["cron", "remove"]:
-    jid = argv[2]
-    with open(log, "a", encoding="utf-8") as f:
-        f.write("remove " + jid + "\\n")
-    text = open(state, encoding="utf-8").read()
-    matches = list(ids.finditer(text))
-    head = text[:matches[0].start()] if matches else text
-    keep = [text[m.start():(matches[i + 1].start() if i + 1 < len(matches) else len(text))]
-            for i, m in enumerate(matches) if m.group(1) != jid]
-    open(state, "w", encoding="utf-8").write(head + "".join(keep))
-elif argv[:2] == ["cron", "create"]:
-    with open(log, "a", encoding="utf-8") as f:
-        f.write("create " + argv[argv.index("--name") + 1] + "\\n")
-else:
-    sys.exit(2)
-""" % ID_RE
+SYSTEM_JOBS = {"sotto-morning-brief", "sotto-evening-brief", "sotto-proactive",
+               "sotto-midday-digest", "sotto-relationship-pulse"}
 
 
-def _run_reconcile(tmp_path, listing=CRON_LIST_FIXTURE, extra_env=None):
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "hermes"
-    fake.write_text(FAKE_HERMES, encoding="utf-8")
-    fake.chmod(0o755)
-    state = tmp_path / "crons.txt"
-    state.write_text(listing, encoding="utf-8")
-    log = tmp_path / "calls.txt"
-    log.write_text("", encoding="utf-8")
-    env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
-               FAKE_CRON_STATE=str(state), FAKE_CRON_LOG=str(log))
-    env.update(extra_env or {})
-    # --deliver is required, never defaulted: the channel is resolved once by the caller (start.sh
-    # step 0.4 / receiver._deliver_target), so the reconciler has no channel name of its own.
-    proc = subprocess.run([sys.executable, RECONCILER, "--spec", CRONS_JSON, "--deliver", "telegram"],
-                          capture_output=True, text=True, env=env, timeout=60)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    return proc.stdout, log.read_text().splitlines(), state.read_text()
-
-
-def test_reconciler_leaves_user_routines_alone(tmp_path):
-    out, calls, remaining = _run_reconcile(tmp_path)
-    assert not [call for call in calls if call in {
-        "remove d1b2c3d4e5f6", "remove e1b2c3d4e5f6"}]
-    assert "user-open-loops-friday" in remaining and "user-morning-echo" in remaining
-    assert "leaving 2 user routine(s) alone" in out
-
-
-def test_reconciler_replaces_system_jobs_and_retired_jobs(tmp_path):
-    _, calls, remaining = _run_reconcile(tmp_path)
-    assert {call for call in calls if call.startswith("remove ")} == {
-        "remove a1b2c3d4e5f6", "remove b1b2c3d4e5f6", "remove c1b2c3d4e5f6"}
-    assert "sotto-morning-brief" not in remaining and "sotto-followup" not in remaining
-    created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
-    assert created == {row["name"] for row in json.load(open(CRONS_JSON))
-                       if row.get("runner") != "receiver"}
-
-
-def test_receiver_run_jobs_are_removed_from_hermes_but_never_created(tmp_path):
-    """The briefs, the proactive watcher and the midday digest are `runner: receiver` jobs: the
-    trigger receiver schedules and delivers them, so Hermes must never hold a registration for one.
-    The watcher and the digest moved here on Sep 4, 2026, the morning Hermes' scheduler delivered
-    the literal `NO_NUDGES` token — the silence seam is receiver-side, so a lane that can end with
-    nothing has to be a receiver lane. They all stay in the REMOVAL markers, which is what strips an
-    existing deployment's stale Hermes crons on the next boot — no manual step."""
-    spec = json.load(open(CRONS_JSON))
-    receiver_run = {row["name"] for row in spec if row.get("runner") == "receiver"}
-    assert receiver_run == {"sotto-morning-brief", "sotto-evening-brief",
-                            "sotto-proactive", "sotto-midday-digest", "sotto-relationship-pulse"}
-    # The receiver reads fixed daily/weekly times and */N intervals.
+def test_the_spec_is_exactly_the_five_receiver_fired_system_jobs(monkeypatch):
+    """The briefs, the proactive watcher, the midday digest and the weekly pulse all fire on the
+    receiver's own clock (the silence seam is receiver-side, so a lane that can end with nothing
+    has to be a receiver lane). No row names a second runner, and none is a personal routine."""
+    for key in ("SOTTO_PROACTIVE", "SOTTO_DIGEST", "SOTTO_PROACTIVE_CRON"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SOTTO_CRONS_JSON", CRONS_JSON)
+    spec = json.load(open(CRONS_JSON, encoding="utf-8"))
+    assert {row["name"] for row in spec} == SYSTEM_JOBS
     for row in spec:
-        if row.get("runner") == "receiver":
-            assert re.match(r"\A(\d+ \d+|\*/\d+ \*) \* \* (\*|[0-6])\Z", row["schedule"]), row
-    _, calls, remaining = _run_reconcile(tmp_path)
-    created = {call.removeprefix("create ") for call in calls if call.startswith("create ")}
-    assert not (created & receiver_run)
-    # the fixture's two stale sotto-morning-brief registrations were removed anyway
-    assert "sotto-morning-brief" not in remaining
-    assert {"remove a1b2c3d4e5f6", "remove b1b2c3d4e5f6"} <= set(calls)
+        assert set(row) <= {"name", "schedule", "prompt", "skill", "gate", "schedule_env"}, row
+        # The receiver reads fixed daily/weekly times and */N intervals.
+        assert re.match(r"\A(\d+ \d+|\*/\d+ \*) \* \* (\*|[0-6])\Z", row["schedule"]), row
+    assert {name for name, *_ in rec._sotto_cron_jobs()} == SYSTEM_JOBS
 
 
-def test_reconciler_honors_gates_and_schedule_source(monkeypatch):
-    """`gate` and `schedule_env` are honored by the ONE reader every registrar shares — the
-    receiver's tick, which now fires the gated jobs, reads exactly this list."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("cron_fence_reconciler", RECONCILER)
-    reconciler = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(reconciler)
+def test_gates_and_schedule_source_are_honored_by_the_one_reader(monkeypatch):
+    """`gate` and `schedule_env` are honored by the ONE reader every consumer shares — the
+    receiver's tick and the dashboard's run-now list read exactly this list."""
+    monkeypatch.setenv("SOTTO_CRONS_JSON", CRONS_JSON)
     monkeypatch.setenv("SOTTO_DIGEST", "0")
     monkeypatch.setenv("SOTTO_PROACTIVE_CRON", "*/30 * * * *")
-    jobs = {name: schedule for name, schedule, _p, _s
-            in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}
+    jobs = {name: schedule for name, schedule, _p, _s in rec._sotto_cron_jobs()}
     assert "sotto-midday-digest" not in jobs
     assert jobs["sotto-proactive"] == "*/30 * * * *"
-    assert [n for n, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER)] \
-        == []
 
 
-def test_start_sh_calls_the_shared_reconciler():
-    assert "runtime_python /app/adapters/hermes/reconcile_crons.py" in START
-    assert "--spec \"$CRONS_JSON\" --deliver \"$SOTTO_CRON_DELIVER\"" in START
+def test_managed_and_self_host_read_the_same_system_jobs(monkeypatch):
+    monkeypatch.setenv("SOTTO_CRONS_JSON", CRONS_JSON)
+    monkeypatch.setenv("SOTTO_DEPLOYMENT_MODE", "managed")
+    managed = rec._sotto_cron_jobs()
+    monkeypatch.delenv("SOTTO_DEPLOYMENT_MODE")
+    assert managed == rec._sotto_cron_jobs()
+    assert {name for name, *_ in managed} == SYSTEM_JOBS
 
 
+# ── the channel is resolved ONCE: no literal channel name may stand in for the answer ────────────
 
-def test_hermes_cron_delivers_sotto_copy_without_the_scheduler_envelope():
-    """Cloud boot, local install, and the copyable config template all disable Hermes' default
-    `Cronjob Response: ... (job_id: ...)` wrapper. Otherwise the native proactive fallback is the
-    one Sotto lane that reads like a scheduler notification while Bridge-fired messages read clean."""
-    assert "hermes_set_if_supported cron.wrap_response false" in START
-    assert "hermes config get cron.wrap_response" in INSTALL
-    assert "hermes config set cron.wrap_response false" in INSTALL
-    assert re.search(r"(?m)^cron:\n\s+wrap_response:\s+false(?:\s|#|$)", CONFIG)
-    assert "disables Hermes' generic `Cronjob Response` envelope" in RAILWAY
+# Every place a delivery channel used to be guessed. Each takes the resolved value from the ONE
+# decider (receiver._deliver_target) — a `whatsapp` fallback here was how a Telegram deploy could
+# be delivered onto WhatsApp.
+NO_FALLBACK = [
+    os.path.join(AGENT_ROOT, "runtime", "trigger-receiver", "receiver.py"),
+    os.path.join(AGENT_ROOT, "sotto-chief-of-staff", "setup", "SKILL.md"),
+    os.path.join(AGENT_ROOT, "sotto-chief-of-staff", "routines", "SKILL.md"),
+    os.path.join(AGENT_ROOT, "sotto-chief-of-staff", "relationship-pulse", "SKILL.md"),
+]
 
 
-def test_managed_pilot_only_enables_receiver_owned_system_jobs(monkeypatch):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('managed_cron_contract', RECONCILER)
-    reconciler = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(reconciler)
-    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
-    assert reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER) == []
-    names = {name for name, *_ in reconciler.active_jobs(CRONS_JSON)}
-    assert 'sotto-morning-brief' in names and 'sotto-evening-brief' in names
-    assert 'sotto-relationship-pulse' in names
-    assert names == {name for name, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}
-    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE')
-    assert reconciler.active_jobs(CRONS_JSON, reconciler.HERMES_RUNNER) == []
-    assert names == {name for name, *_ in reconciler.active_jobs(CRONS_JSON, reconciler.RECEIVER_RUNNER)}
+def test_no_delivery_default_is_spelled_as_a_channel_name():
+    for path in NO_FALLBACK:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        for bad in (':-whatsapp', ':-telegram',
+                    'SOTTO_CRON_DELIVER", "whatsapp"', "SOTTO_CRON_DELIVER', 'whatsapp'",
+                    'deliver: str = "whatsapp"', 'deliver="whatsapp"'):
+            assert bad not in text, f"{os.path.relpath(path, AGENT_ROOT)} still falls back to {bad!r}"

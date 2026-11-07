@@ -1,0 +1,2 @@
+# The driver only; no Browser Use agent, model clients, or MCP server.
+browser-harness==0.1.13

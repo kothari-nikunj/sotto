@@ -1,0 +1,98 @@
+{
+  "config": {
+    "allowedSkills": [],
+    "bearerToken": "runtime-bearer-only-12345678901234567890",
+    "bridge": {
+      "readBearer": "87eafef2947b7937ebc8c5b03cb7ddb4626b85aa73ba0ef819c9e37a69286040",
+      "url": "http://127.0.0.1:19982/mcp"
+    },
+    "channel": "photon",
+    "credentials": {
+      "mode": "cloud",
+      "photonProjectId": "project-fixture",
+      "photonProjectSecret": "project-secret-fixture"
+    },
+    "firstContact": {
+      "expectedProviderLine": "+15557654321",
+      "mode": "owner_dm"
+    },
+    "instructions": "Packaged offline instruction fixture.\n\nManaged Photon capabilities: use only tools offered for this turn and sources currently granted by the owner. An owner must send the literal `/loop add <text>` command to add an open loop. To close one, read `owner_open_loops` for its actual `anchor_key` and ask the owner to send `/loop close <anchor_key>`; never invent an anchor or claim a plain-language request changed a loop. The owner can schedule a one-time reminder by sending `/reminder at <ISO8601-with-offset> <text>`, see pending reminders with `/reminder list`, or cancel one with `/reminder cancel <int_id>`. For a clear one-time reminder requested in an attended owner message, use `owner_reminder_context` for the configured timezone and current time, then `owner_reminder_create` when those tools are offered. Private reminder creation needs no second approval; clarify ambiguous day or time before writing. Use an explicit offset-bearing due time and self-contained reminder text. These tools do not authorize conditional checks, recurring jobs or external actions. If unavailable, offer the literal command without claiming the reminder was created. Scheduled delivery uses the existing 15-minute heartbeat, quiet-hours, and delivery checks, so do not promise exact-minute delivery. The owner can pause nudges with `/quiet for <Nh|Nm>` (up to 24 hours) and resume them with `/quiet off`; these commands do not change briefs or ordinary quiet hours. `/stop` cancels the active turn but cannot undo an effect already contacted; `/new` starts fresh chat context but does not undo task changes or resolve uncertain sends. The receiver owns five built-in procedures on fixed schedules; eligibility and delivery checks still apply. You cannot create or change personal routines or other schedules, change other preferences, write Gmail or Calendar, or send through Bridge. You may draft text in chat, but cannot create an external draft. Claim an effect only after a confirmed receipt; otherwise say it is unavailable or uncertain.",
+    "lineKey": "line-fixed",
+    "mediaRoot": "/tmp/sotto-rendered-media",
+    "modelProxy": {
+      "bearer": "model-bearer-fixture",
+      "chatModelId": "chat-v1",
+      "nativeMediaModelId": "native-v1",
+      "origin": "https://proxy.example"
+    },
+    "owner": {
+      "accountId": "account-fixed",
+      "ownerId": "+15551234567"
+    },
+    "ownerLoop": {
+      "bearer": "582018637b51069a6264faaf604520f2f13c118391003d3749053ecfc7ed54d6",
+      "identity": {
+        "account_id": "account-fixed",
+        "channel": "photon",
+        "line_key": "line-fixed",
+        "owner_id": "+15551234567",
+        "project_fingerprint": "15004734d25d374ce182b485da8e0d15e84fd94e57b839f51b64ed1e724bcba4",
+        "route_id": "+15557654321",
+        "route_mode": "first_contact",
+        "target": "photon",
+        "tenant_id": "tenant-fixed"
+      },
+      "mode": "explicit_command"
+    },
+    "port": 19981,
+    "stateDirectory": "/tmp/sotto-rendered-state",
+    "target": "photon",
+    "tenantId": "tenant-fixed",
+    "turnPresence": false,
+    "version": 1
+  },
+  "manifest": {
+    "channel": "photon",
+    "credentials": {
+      "mode": "cloud",
+      "photonProjectId": "project-fixture",
+      "photonProjectSecret": "project-secret-fixture"
+    },
+    "deployment": "managed",
+    "firstContact": {
+      "expectedProviderLine": "+15557654321",
+      "mode": "owner_dm"
+    },
+    "instructions": "Packaged offline instruction fixture.",
+    "lineKey": "line-fixed",
+    "mediaRoot": "/tmp/sotto-rendered-media",
+    "modelProxy": {
+      "bearer": "model-bearer-fixture",
+      "chatModelId": "chat-v1",
+      "nativeMediaModelId": "native-v1",
+      "origin": "https://proxy.example"
+    },
+    "owner": {
+      "accountId": "account-fixed",
+      "ownerId": "+15551234567"
+    },
+    "photonLineNumber": "+15557654321",
+    "relay": {
+      "receiverPort": 19982,
+      "rootBearer": "root-relay-never-output-1234567890"
+    },
+    "runtime": {
+      "bearerToken": "runtime-bearer-only-12345678901234567890",
+      "port": 19981
+    },
+    "stateDirectory": "/tmp/sotto-rendered-state",
+    "target": "photon",
+    "tenantId": "tenant-fixed",
+    "version": 1
+  },
+  "receiver_projection": {
+    "SOTTO_CHAT_RUNTIME_TOKEN": "runtime-bearer-only-12345678901234567890",
+    "SOTTO_CHAT_RUNTIME_URL": "http://127.0.0.1:19981"
+  },
+  "source_revision": "3e7d5fbb"
+}

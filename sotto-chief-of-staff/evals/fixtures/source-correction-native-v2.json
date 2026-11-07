@@ -1,0 +1,11 @@
+{
+  "source_ref": "msg:v2:imessage:5c7e85fc4e4662f6833a9c53b299e3ec62433d3ee6bb981570896eb7bdff0f70",
+  "previous_content_version": "8088360cd3c3580b38bc1cddd14204bef674c0e991a4e5f01c984227428db216",
+  "content_version": "0a14dfade2cba4cfe734f0a9735c79b80a773f1ac8aa916c7854987ebf34bd39",
+  "source_revision_evidence": {
+    "kind": "edit",
+    "marker": "date_edited",
+    "value": "814000000000000001"
+  },
+  "store_generation": "a7eb826e44b26f515ac3deb1a626495aefd22daf3fbf1332032d2ef81fe073f0"
+}

@@ -71,15 +71,35 @@ def test_two_asks_same_message_and_paraphrase_carry_forward():
     first = next(row for row in rows() if row['summary'].startswith('Send'))
     second = next(row for row in rows() if row['summary'].startswith('Confirm'))
     assert second['origin_key'] and ':origin:' in second['anchor_key']
-    # Replaying the same observed action with different prose targets the persisted origin, not a
-    # third content-hash row.
+    # Replaying with different prose targets the persisted origin without redefining
+    # its original task or creating a third content-hash row.
     resolve(new_actions=[action('Lock down Tuesday lunch', evidence=proof, newObligation=True)],
             local={'imessage': [source]})
     assert len(rows()) == 2
-    assert cr._load_items()[second['anchor_key']]['summary'] == 'Lock down Tuesday lunch'
+    assert cr._load_items()[second['anchor_key']]['summary'] == second['summary']
     resolve(new_actions=[action('Send the executed agreement', loopId=first['anchor_key'])])
     assert len(rows()) == 2
-    assert cr._load_items()[first['anchor_key']]['summary'] == 'Send the executed agreement'
+    assert cr._load_items()[first['anchor_key']]['summary'] == first['summary']
+
+
+@pytest.mark.parametrize('summary', [
+    'Send Patrick a belated birthday greeting', 'Happy birthday Patrick',
+])
+def test_calendar_birthday_suggestion_does_not_create_a_ledger_debt(summary):
+    result = resolve(new_actions=[action(summary, contextAsk='Wish Patrick a happy birthday')])
+    assert not result['active']
+    assert not rows()
+
+
+def test_sourced_request_for_birthday_help_remains_a_real_obligation():
+    source = message(rowid=7, is_from_me=False,
+                     text='Please send Mom a birthday greeting for me.',
+                     timestamp='2026-09-10 08:00:00')
+    evidence = [{'sourceType': 'imessage', 'sourceId': '7',
+                 'snippet': 'Please send Mom a birthday greeting for me.'}]
+    result = resolve(new_actions=[action('Send Mom a birthday greeting for Maya',
+                                         evidence=evidence)], local={'imessage': [source]})
+    assert len(result['active']) == 1
 
 
 def test_first_flagged_action_owns_base_and_all_replays_stay_one_row():
@@ -95,7 +115,7 @@ def test_first_flagged_action_owns_base_and_all_replays_stay_one_row():
                                 newObligation=True)], local={'imessage': [source]})
     assert len(rows()) == 1
     assert rows()[0]['anchor_key'] == first['anchor_key']
-    assert rows()[0]['summary'] == 'Send the executed agreement'
+    assert rows()[0]['summary'] == first['summary']
 
 
 def test_unique_evidence_recovers_active_sibling_without_loop_id():
@@ -112,13 +132,13 @@ def test_unique_evidence_recovers_active_sibling_without_loop_id():
     current = cr._load_items()
     assert len(current) == 2
     assert current[by_summary['Send the signed contract']]['summary'] == 'Send the signed contract'
-    assert current[by_summary['Confirm lunch on Tuesday']]['summary'] == 'Lock down Tuesday lunch'
+    assert current[by_summary['Confirm lunch on Tuesday']]['summary'] == 'Confirm lunch on Tuesday'
     # A later request message can be a reminder. Disjoint evidence alone does not create a task.
     reminder = message(rowid=12, is_from_me=False, text='Any update on sending the contract?')
     resolve(new_actions=[action('Send the executed agreement', evidence=[
         {'sourceType': 'imessage', 'sourceId': '12'}])], local={'imessage': [reminder]})
     assert len(rows()) == 2
-    assert cr._load_items()[by_summary['Send the signed contract']]['summary'] == 'Send the executed agreement'
+    assert cr._load_items()[by_summary['Send the signed contract']]['summary'] == 'Send the signed contract'
 
 
 def test_shared_evidence_cannot_choose_an_active_sibling():
@@ -163,7 +183,7 @@ def test_unobserved_new_obligation_is_rejected_and_bad_loop_id_uses_counterpart_
         local={'imessage': [future]})
     assert len(rows()) == 1 and rows()[0]['summary'] == 'Send the signed contract'
     resolve(new_actions=[action('Send the final agreement', loopId='made-up')])
-    assert len(rows()) == 1 and rows()[0]['summary'] == 'Send the final agreement'
+    assert len(rows()) == 1 and rows()[0]['summary'] == base['summary']
     err = capsys.readouterr().err
     assert 'newObligation evidence not observed' in err
     assert 'unknown or mismatched loopId' in err
@@ -467,3 +487,150 @@ def test_weekly_review_survives_photo_selection():
     deck = visual_brief.build(brief)
     assert deck
     assert any('signed contract' in block['text'] for card in deck['cards'] for block in card['blocks'])
+
+
+def test_identity_growth_replay_keeps_terminal_intro_and_distinct_open_meeting():
+    import knowledge as kg
+    request = message(rowid=901, is_from_me=False, text='Introduce me to Lee and check whether we meet.',
+                      timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType':'imessage', 'sourceId':'901', 'snippet':request['text']}]
+    actions = [action('Introduce Maya to Lee', evidence=proof),
+               action('Check whether Maya and Lee meet', evidence=proof, newObligation=True)]
+    resolve(new_actions=actions, local={'imessage':[request]})
+    intro = next(row for row in rows() if row['summary'].startswith('Introduce'))
+    meeting = next(row for row in rows() if row['summary'].startswith('Check'))
+    sent = message(rowid=902, text='Maya, meet Lee. Lee, meet Maya.')
+    assert resolve(loop_updates=[proposal(intro, sent)], local={'imessage':[sent]})['resolved']
+    closed = cr._load_items()[intro['anchor_key']].copy()
+    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155551234'])
+    path = Path(kg.people_dir()) / 'c_aaaaaa.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kg.write_person_file(str(path), p)
+    resolve(new_actions=actions, local={'imessage':[request]})
+    saved = cr._load_items()
+    assert set(saved) == {intro['anchor_key'], meeting['anchor_key']}
+    assert saved[intro['anchor_key']] == closed
+    assert saved[meeting['anchor_key']]['status'] == 'open'
+
+
+def test_identity_growth_keeps_two_flagged_asks_from_one_source_separate():
+    import knowledge as kg
+    source = message(rowid=910, is_from_me=False, text='Send the contract and confirm lunch.',
+                     timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType':'imessage', 'sourceId':'910', 'snippet':source['text']}]
+    actions = [action('Send the contract', evidence=proof, newObligation=True),
+               action('Confirm lunch on Tuesday', evidence=proof, newObligation=True)]
+    resolve(new_actions=actions, local={'imessage':[source]})
+    before = {row['anchor_key']: row['origin_key'] for row in rows()}
+    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155551234'])
+    path = Path(kg.people_dir()) / 'c_aaaaaa.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kg.write_person_file(str(path), p)
+    resolve(new_actions=actions, local={'imessage':[source]})
+    resolve(new_actions=actions, local={'imessage':[source]})
+    assert {row['anchor_key']: row['origin_key'] for row in rows()} == before
+    assert len(rows()) == 2
+
+
+@pytest.mark.parametrize('boundary', ['different_person', 'unknown_identifier', 'ambiguous_identifier',
+                                     'missing_identifier', 'group', 'direction', 'shared_task_evidence'])
+def test_identity_alias_never_supplies_missing_person_or_task_authority(boundary):
+    import knowledge as kg
+    people = Path(kg.people_dir())
+    people.mkdir(parents=True, exist_ok=True)
+    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa',
+                      identifiers=['+14155551234', 'maya@example.test'])
+    kg.write_person_file(str(people / 'c_aaaaaa.md'), p)
+    other = kg.PersonFile(name='Maya Chen', canonical_id='c_bbbbbb', identifiers=['other@example.test'])
+    if boundary == 'ambiguous_identifier':
+        other.identifiers.append('+14155551234')
+    kg.write_person_file(str(people / 'c_bbbbbb.md'), other)
+    old = {'action_type':'reply', 'contact_identifier':'+14155551234', 'contact_name':'Maya Chen',
+           'channel':'imessage', 'source_refs':[['imessage','910']]}
+    old_key = cr.compute_anchor_key(old)
+    incoming = {**old, 'canonical_id':'c_aaaaaa', 'contact_identifier':'maya@example.test'}
+    if boundary == 'different_person':
+        incoming.update(canonical_id='c_bbbbbb', contact_identifier='other@example.test')
+    elif boundary == 'unknown_identifier':
+        old['contact_identifier'] = 'unknown@example.test'
+    elif boundary == 'missing_identifier':
+        old['contact_identifier'] = ''
+    elif boundary == 'group':
+        incoming['group_id'] = 'group-platform-id'
+    elif boundary == 'direction':
+        incoming['action_type'] = 'waiting_on'
+    items = {old_key:old}
+    if boundary == 'shared_task_evidence':
+        items[old_key+':task:second'] = {**old, 'summary':'A separate ask'}
+    assert cr._obligation_key(incoming, items, person_index=cr.person_identity()) not in items
+
+
+
+def test_ambiguous_retained_alias_origin_is_held_without_third_row():
+    import knowledge as kg
+    source = message(rowid=920, is_from_me=False, text='Send the signed contract please.',
+                     timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType':'imessage', 'sourceId':'920', 'snippet':source['text']}]
+    capture = action('Send the signed contract', evidence=proof, newObligation=True)
+    resolve(new_actions=[capture], local={'imessage':[source]})
+    first = rows()[0]
+    duplicate = {**first, 'anchor_key':first['anchor_key']+':origin:legacy-copy',
+                 '_path':str(Path(cr._dir()) / 'legacy-copy.md')}
+    cr._persist(duplicate)
+    before = cr._load_items()
+    people = Path(kg.people_dir())
+    people.mkdir(parents=True, exist_ok=True)
+    kg.write_person_file(str(people / 'c_aaaaaa.md'), kg.PersonFile(name='Maya Chen',
+        canonical_id='c_aaaaaa', identifiers=['+14155551234']))
+    resolve(new_actions=[capture], local={'imessage':[source]})
+    assert cr._load_items() == before and len(rows()) == 2
+
+
+
+def test_shared_request_evidence_after_identity_growth_is_held_without_new_row():
+    import knowledge as kg
+    source = message(rowid=930, is_from_me=False, text='Send the contract and confirm lunch on Tuesday.',
+                     timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType':'imessage', 'sourceId':'930', 'snippet':source['text']}]
+    resolve(new_actions=[action('Send the contract', evidence=proof, newObligation=True),
+                         action('Confirm lunch on Tuesday', evidence=proof, newObligation=True)],
+            local={'imessage':[source]})
+    before = cr._load_items()
+    assert len(before) == 2
+    people = Path(kg.people_dir())
+    people.mkdir(parents=True, exist_ok=True)
+    kg.write_person_file(str(people/'c_aaaaaa.md'), kg.PersonFile(name='Maya Chen',
+        canonical_id='c_aaaaaa', identifiers=['+14155551234']))
+    resolve(new_actions=[action('Handle the outstanding request', evidence=proof)], local={'imessage':[source]})
+    assert cr._load_items() == before
+
+
+def test_same_message_siblings_survive_reorder_and_one_sibling_closing():
+    source = message(rowid=950, is_from_me=False, text='Send the contract and confirm lunch.',
+                     timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType': 'imessage', 'sourceId': '950', 'snippet': source['text']}]
+    batch = [action('Send the contract', evidence=proof, newObligation=True),
+             action('Confirm lunch on Tuesday', evidence=proof, newObligation=True)]
+    resolve(new_actions=batch, local={'imessage': [source]})
+    initial = {r['summary']: r['anchor_key'] for r in rows()}
+    resolve(new_actions=list(reversed(batch)), local={'imessage': [source]})
+    assert {r['summary']: r['anchor_key'] for r in rows()} == initial
+    contract = next(r for r in rows() if r['summary'] == 'Send the contract')
+    delivered = message()
+    resolve(local={'imessage': [delivered]}, loop_updates=[proposal(contract, delivered)])
+    resolve(new_actions=[batch[1]], local={'imessage': [source]})
+    assert [(r['anchor_key'], r['summary']) for r in rows() if r['status'] == 'open'] == [
+        (initial['Confirm lunch on Tuesday'], 'Confirm lunch on Tuesday')]
+
+
+def test_ambiguous_paraphrase_of_same_message_siblings_cannot_select_by_order():
+    source = message(rowid=951, is_from_me=False, text='Send the contract and confirm lunch.',
+                     timestamp='2026-09-10 08:00:00')
+    proof = [{'sourceType': 'imessage', 'sourceId': '951', 'snippet': source['text']}]
+    resolve(new_actions=[action('Send the contract', evidence=proof, newObligation=True),
+                         action('Confirm lunch on Tuesday', evidence=proof, newObligation=True)],
+            local={'imessage': [source]})
+    before = cr._load_items()
+    resolve(new_actions=[action('Please confirm our lunch plans', evidence=proof, newObligation=True)],
+            local={'imessage': [source]})
+    assert cr._load_items() == before

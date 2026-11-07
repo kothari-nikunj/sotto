@@ -77,6 +77,24 @@ def test_no_prior_success_has_no_fabricated_fresh_timestamp(calendar):
     assert result['unavailable'] and not cc.refresh_once()
 
 
+@pytest.mark.parametrize('extra, taps', [({'transparency': 'transparent'}, 0), ({'eventType': 'workingLocation'}, 0)])
+def test_free_event_remains_visible_without_holding_but_only_meetings_get_followup(calendar, extra, taps):
+    cc, state, now, _ = calendar
+    state['events'][0].update(extra, calendar_id='primary',
+                              start=(now - timedelta(hours=1)).isoformat(),
+                              end=(now - timedelta(minutes=10)).isoformat())
+    # Pin the local date to the event even when this test happens to run near UTC midnight.
+    day = state['events'][0]['start'][:10]
+    cc.HOOKS['local_today'] = lambda: day
+    assert cc.refresh_once()
+    events = cc.snapshot()['events']
+    assert len(events) == 1 and events[0]['busy'] is False
+    rows = json.loads(Path(cc.cache_path()).read_text())['events']
+    assert len(rows) == 1 and rows[0]['busy'] is False
+    assert rows[0]['id'] == 'synthetic-meeting'  # presence remains available to delivery checks
+    assert len(cc.ended_meetings(events, now, today=day)) == taps
+
+
 def test_disabled_calendar_clears_cached_projection_without_emitting_cancellations(calendar):
     cc, state, now, changes = calendar
     cc.refresh_once()
@@ -325,3 +343,152 @@ def test_known_to_unknown_to_same_known_account_does_not_diff_across_identity_ga
     assert cc.change_tick(now) == 0 and changes == []
     saved = json.loads(Path(cc.change_state_path()).read_text())
     assert saved['account'] == 'owner@example.com'
+
+
+def test_calendar_selection_or_consent_revision_invalidates_cached_events(calendar):
+    cc, state, _now, _changes = calendar
+    revision = ['a'*64]
+    cc.HOOKS['source_revision'] = lambda: revision[0]
+    assert cc.snapshot()['events']
+    revision[0] = 'b'*64
+    state['events'] = []
+    state['observation']['status'] = 'partial'
+    state['observation']['complete'] = False
+    assert cc.snapshot()['events'] == []
+    revision[0] = None
+    assert cc.snapshot()['status'] == 'unavailable'
+    assert cc._LAST_RAW.get('valid') is False
+
+
+def test_shared_calendar_uid_does_not_join_distinct_calendars(calendar):
+    cc, state, now, _ = calendar
+    old = {**state['events'][0], 'calendar_id': 'primary', 'iCalUID': 'shared@example.com'}
+    new = {**old, 'id': 'shared-event', 'calendar_id': 'team@example.com',
+           'start': (now + timedelta(minutes=30)).isoformat()}
+    saved = cc._change_events([old])
+    assert saved[0]['calendar_id'] == 'primary'
+    assert all(row['kind'] != 'moved'
+               for row in cc.calendar_changes(saved, [new], now, 'owner@example.com'))
+
+
+def test_current_calendar_revision_preserves_durable_baseline_across_restart(calendar):
+    cc, state, now, changes = calendar
+    revision = ['a' * 64]
+    cc.HOOKS['source_revision'] = lambda: revision[0]
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    cc._CAL_CACHE.clear()
+    cc._CAL_CACHE.update(ts=0, value=None)
+    _restart_change_detector(cc)
+    state['events'][0]['start'] = (now + timedelta(hours=2)).isoformat()
+    assert cc.refresh_once() and cc.change_tick(now) == 1
+    assert [event['change'] for event in changes] == ['moved']
+    # A restart after a selection/consent change still starts a fresh comparison.
+    cc._CAL_CACHE.clear()
+    cc._CAL_CACHE.update(ts=0, value=None)
+    _restart_change_detector(cc)
+    revision[0] = 'b' * 64
+    state['events'][0]['start'] = (now + timedelta(hours=3)).isoformat()
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    assert len(changes) == 1
+
+
+def test_successful_partial_rows_keep_holds_and_taps_without_absence_claims(calendar):
+    cc, state, now, changes = calendar
+    event = state['events'][0]
+    # The cache projects the local day, which may differ for the future/past fixture near midnight.
+    cc.HOOKS['local_today'] = lambda: event['start'][:10]
+    event.update(calendar_id='primary', attendees=[{'email': 'owner@example.com', 'responseStatus': 'accepted'},
+                                                  {'email': 'guest@example.com'}])
+    state['observation'].update(status='partial', complete=False)
+    assert cc.refresh_once()
+    snap = cc.snapshot()
+    assert snap['status'] == 'partial' and snap['complete'] is False
+    cache = json.loads(Path(cc.cache_path()).read_text())
+    assert cache['events'][0]['attendees'] == 1 and cache['complete'] is False
+    event.update(start=(now-timedelta(minutes=30)).isoformat(), end=(now-timedelta(minutes=10)).isoformat())
+    cc._CAL_CACHE['ts'] = 0
+    sent = []
+    cc.HOOKS['meeting_tap'] = lambda row: sent.append(row) or True
+    assert cc.tap_tick(now) == 1 and len(sent) == 1
+    assert cc.change_tick(now) == 0 and changes == []
+
+
+def test_other_calendar_owners_meeting_is_context_only(calendar):
+    cc, state, now, changes = calendar
+    event = state['events'][0]
+    event.update(calendar_id='colleague@example.com', organizer={'email': 'colleague@example.com', 'self': True})
+    event['attendees'].append({'email': 'colleague@example.com', 'self': True})
+    assert cc.refresh_once()
+    assert len(cc.snapshot()['events']) == 1
+    assert json.loads(Path(cc.cache_path()).read_text())['events'] == []
+    event.update(start=(now-timedelta(minutes=30)).isoformat(), end=(now-timedelta(minutes=10)).isoformat())
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.tap_tick(now) == 0
+    assert cc.calendar_changes([], [event], now-timedelta(hours=1), 'owner@example.com') == []
+
+
+def test_removed_calendar_is_not_a_cancelled_meeting(calendar):
+    cc, state, now, changes = calendar
+    state['events'][0].update(calendar_id='shared', attendees=[{'email': 'owner@example.com'}, {'email': 'guest@example.com'}])
+    state['observation']['calendars'] = [{'calendar_id': 'shared', 'status': 'ok'}, {'calendar_id': 'primary', 'status': 'ok'}]
+    assert cc.refresh_once() and cc.change_tick(now) == 0
+    state['observation']['calendars'] = [{'calendar_id': 'primary', 'status': 'ok'}]
+    state['events'] = []
+    cc._CAL_CACHE['ts'] = 0
+    assert cc.refresh_once()
+    assert cc.change_tick(now) == 0 and changes == []
+
+
+def test_invite_copies_produce_one_move_and_do_not_create_removed_copy(calendar, monkeypatch):
+    cc, state, now, changes = calendar
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    own = {**state['events'][0], 'calendar_id': 'owner@example.com', 'iCalUID': 'invite',
+           'attendees': [{'email': 'owner@example.com'}, {'email': 'guest@example.com'}]}
+    shared = {**own, 'id': 'copy', 'calendar_id': 'team@group'}
+    moved = {**own, 'start': (now+timedelta(hours=2)).isoformat(), 'end': (now+timedelta(hours=3)).isoformat()}
+    current = [moved, {**moved, 'id': 'copy', 'calendar_id': 'team@group'}]
+    changes = cc.calendar_changes([own, shared], current, now, 'owner@example.com')
+    assert len(changes) == 1 and changes[0]['kind'] == 'moved'
+    assert cc.calendar_changes([own, shared], [shared], now, 'owner@example.com') == []
+
+
+def test_primary_copy_disappearing_leaves_same_recurring_shared_invite_silent(calendar):
+    cc, state, now, changes = calendar
+    own = {**state['events'][0], 'calendar_id': 'primary', 'iCalUID': 'invite', 'recurringEventId': 'series',
+           'originalStartTime': {'dateTime': state['events'][0]['start']},
+           'attendees': [{'email': 'owner@example.com'}, {'email': 'guest@example.com'}]}
+    shared = {**own, 'id': 'copy', 'calendar_id': 'team@group'}
+    assert cc.calendar_changes([own, shared], [shared], now, 'owner@example.com', calendar_ids=['team@group']) == []
+
+
+def test_owner_day_and_overnight_meeting_survive_calendar_projection(calendar, monkeypatch):
+    cc, _, _, _ = calendar
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'America/Los_Angeles')
+    event = {'summary': 'Late meeting', 'start': '2026-10-16T06:30:00Z',
+             'end': '2026-10-16T07:15:00Z', 'attendees': [{'email': 'guest@example.com'}]}
+    assert cc.today_rows([event], '2026-10-15')
+    assert cc.today_rows([event], '2026-10-16')
+    assert cc.ended_meetings([event], datetime(2026, 10, 16, 7, 30, tzinfo=timezone.utc), '2026-10-16')
+    all_day = {'summary': 'Conference', 'start': '2026-10-14', 'end': '2026-10-17'}
+    assert cc.today_rows([all_day], '2026-10-15')
+    assert not cc.today_rows([all_day], '2026-10-17')
+
+
+def test_equivalent_timestamp_offsets_are_not_calendar_moves(calendar):
+    cc, state, now, _ = calendar
+    old = state['events'][0]
+    shifted = {**old, 'start': datetime.fromisoformat(old['start']).astimezone(
+        timezone(timedelta(hours=2))).isoformat()}
+    assert cc.calendar_changes([old], [shifted], now, 'owner@example.com') == []
+
+
+def test_periodic_calendar_gather_requests_ended_meetings(calendar, monkeypatch):
+    cc, _, _, _ = calendar
+    original = cc.subprocess.run
+    commands = []
+    def capture(argv, **kwargs):
+        commands.append(argv)
+        return original(argv, **kwargs)
+    monkeypatch.setattr(cc.subprocess, 'run', capture)
+    cc._run_calendar_gather()
+    assert commands[0][commands[0].index('--window-days') + 1] == '2'

@@ -184,13 +184,14 @@ def test_changed_source_cannot_supersede_unknown_gallery(box, monkeypatch):
 
 def test_sidecar_operation_still_resolving_cannot_release_a_fresh_brief(box, monkeypatch):
     """The sidecar answers in_flight while its operation runs; the adapter holds it as unknown."""
-    adapter = importlib.util.spec_from_file_location(
-        'visual_test_gallery', HERE.parents[1] / 'adapters/hermes/gallery.py')
-    gallery = importlib.util.module_from_spec(adapter)
-    adapter.loader.exec_module(gallery)
-    monkeypatch.setattr(gallery, '_call', lambda endpoint, body, timeout=60: (True, 'accepted',
-                        {'found': True, 'receipt': {'dispatchId': body['dispatchId'], 'acceptance': 'in_flight'}}))
-    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', gallery.receipt)
+    api = rec._runtime_adapter()
+    client = api._client_module()
+    monkeypatch.setenv('SOTTO_CHAT_RUNTIME_URL', 'http://127.0.0.1:8789')
+    monkeypatch.setenv('SOTTO_CHAT_RUNTIME_TOKEN', 'local-test-bearer-not-a-secret-0000000')
+    monkeypatch.setattr(client.ChatClient, 'call', lambda self, path, body=None, **_: client.CallResult(
+        True, 'accepted', {'found': True, 'receipt': {'dispatch_id': body['dispatch_id'], 'acceptance': 'in_flight'}}))
+    assert api.gallery_receipt('probe') == {'acceptance': 'unknown'}
+    monkeypatch.setitem(box.HOOKS, 'gallery_receipt', api.gallery_receipt)
     monkeypatch.setitem(box.HOOKS, 'brief_gate', lambda *a: 'send')
     monkeypatch.setitem(box.HOOKS, 'send_gallery', lambda *a:
                         (False, 'gallery acceptance unconfirmed', {'acceptance': 'unknown'}))
@@ -266,7 +267,7 @@ def test_gallery_default_and_capability_fallback(monkeypatch, tmp_path, label):
     monkeypatch.delenv('SOTTO_VISUAL_BRIEFS', raising=False)
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     seen = []
-    visual = types.SimpleNamespace(build=lambda body, kind, preview: seen.append(kind) or {},
+    visual = types.SimpleNamespace(build=lambda body, kind, preview, edition: seen.append(kind) or {},
                                    render=lambda *a: pytest.fail('empty deck must fall back'))
     assert v.prepare('body', label, 'photon', lambda: visual, lambda: True) is None
     assert seen == ['prep' if 'prep' in label else 'brief']
@@ -353,13 +354,14 @@ def test_expected_gallery_fallbacks_have_content_free_reasons(monkeypatch, tmp_p
     assert 'private' not in caplog.text
 
 
-def test_crowded_brief_reflows_and_records_one_gallery_through_receiver(box, monkeypatch, tmp_path):
+@pytest.mark.parametrize('handoff', [False, True])
+def test_crowded_brief_reflows_and_records_one_gallery_through_receiver(box, monkeypatch, tmp_path, handoff):
     """Sep 22 shape: eleven wrapped follow-ups, spare space on two action cards."""
     import types
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.delenv('SOTTO_VISUAL_BRIEFS', raising=False)
     monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
-    monkeypatch.setattr(rec, '_hermes_adapter', lambda _: types.SimpleNamespace(gallery_available=lambda: True))
+    monkeypatch.setattr(rec, '_runtime_adapter', lambda: types.SimpleNamespace(gallery_available=lambda: True))
     monkeypatch.setattr(rec, '_shared_effects', lambda: None)
     pack = HERE.parents[1] / 'sotto-chief-of-staff'
     monkeypatch.syspath_prepend(str(pack / '_shared/lib'))
@@ -372,9 +374,14 @@ def test_crowded_brief_reflows_and_records_one_gallery_through_receiver(box, mon
                         for i in range(5)) + '\nAlready Handled\n'
             + '\n'.join(f'Christopher Alexander {i}: Confirmed the planning meeting and shared the revised notes with the team.'
                         for i in range(6)))
+    question = 'Keep this request, snooze it, or let it go?'
+    effects = []
+    if handoff:
+        body += '\nWeekly review\n' + question
+        effects = [{'kind': 'pending_offer', 'offer': {'kind': 'handoff', 'question': question}}]
     original = visual_brief.build(body)
     assert len(original['cards']) == 4
-    assert len(original['cards'][-1]['blocks']) == 11
+    assert len(original['cards'][-1]['blocks']) == 11 + int(handoff)
     assert sum(len(b['text'].split()) for b in original['cards'][-1]['blocks']) < 200
     with pytest.raises(visual_brief.LayoutError, match='readable height'):
         visual_brief._measure(original, original['cards'])
@@ -387,7 +394,7 @@ def test_crowded_brief_reflows_and_records_one_gallery_through_receiver(box, mon
     import compose_brief
     monkeypatch.setattr(compose_brief, '_user_local_date', lambda tz: '2026-09-22')
     compose_brief._archive_brief({'brief_text': body, 'brief_markdown': body}, 'evening')
-    assert rec._deliver_text(body, 'cron:sotto-evening-brief', run_id='evening-crowded', decision_ids=['decision-1'])
+    assert rec._deliver_text(body, 'cron:sotto-evening-brief', run_id='evening-crowded', decision_ids=['decision-1'], effects=effects)
     rec._deliver_text(body, 'cron:sotto-evening-brief', run_id='evening-crowded')
     box.drain()
     assert len(sent) == 1
@@ -437,3 +444,58 @@ def test_layout_failure_sends_canonical_text_once_and_records_reason(box, monkey
 def test_receipt_diagnostics_ignore_unrecognized_data(status):
     delivery = rec._load_shared_lib('visual_delivery')
     assert delivery.delivery_detail(status) == ''
+
+
+def test_evening_label_preserves_edition_with_morning_greeting(tmp_path, monkeypatch):
+    import visual_brief
+    import visual_delivery
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    seen = []
+    class Visual:
+        @staticmethod
+        def build(*args, **kwargs):
+            deck = visual_brief.build(*args, **kwargs)
+            seen.append(deck)
+            return deck
+        @staticmethod
+        def render(deck, root):
+            return {'summary': deck['summary'], 'images': ['1.png', '2.png', '3.png', '4.png']}
+    source = ('Good morning — Monday, September 14\nNeeds Attention Now\nAlex — Reply today.\n'
+              'Should Handle Today\nJordan — Reply to the invitation.\nComing Up\n10:00 AM — Team meeting\n'
+              'Already Handled\nSam — Replied yesterday.\nFiltered\nDonation blast.')
+    result = visual_delivery.prepare(source, 'run-now:sotto-evening-brief', 'photon',
+                                     lambda: Visual, lambda: True)
+    assert seen[0]['edition'] == 'evening'
+    assert "Good morning. Here's your evening brief" in result['summary']
+
+
+@pytest.mark.parametrize('visible', [True, False])
+def test_handoff_question_requires_visible_complete_gallery_block(monkeypatch, tmp_path, visible):
+    import types
+    delivery = rec._load_shared_lib('visual_delivery')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    question = 'Keep this request, snooze it, or let it go?'
+    deck = {'cards': [{'blocks': [{'text': question if visible else 'Another task.'}]}]}
+    calls = []
+    visual = types.SimpleNamespace(build=lambda *a, **kw: deck,
+        render=lambda *a, **kw: calls.append(1) or {'summary': 'Brief', 'images': ['one']})
+    diagnostics = {}
+    result = delivery.prepare(question, 'sotto-evening-brief', 'photon', lambda: visual,
+                              lambda: True, diagnostics=diagnostics, required_questions=(question,))
+    assert bool(result) == visible
+    assert calls == ([1] if visible else [])
+    assert diagnostics == ({'format': 'gallery'} if visible else
+                           {'format': 'text', 'reason': 'offer_not_visible', 'card_index': None})
+
+
+def test_procedure_offer_keeps_exact_text_delivery(box, monkeypatch):
+    question = 'Make this a standing rule?'
+    delivery = rec._load_shared_lib('visual_delivery')
+    monkeypatch.setattr(delivery, 'prepare', lambda *a, **kw: pytest.fail('consent offer must stay text'))
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
+    saved = []
+    monkeypatch.setattr(box, 'deliver', lambda p: saved.append(p) or True)
+    effect = {'kind': 'pending_offer', 'offer': {'kind': 'procedure', 'question': question}}
+    assert rec._deliver_text(question, 'sotto-evening-brief', effects=[effect])
+    assert saved[0]['presentation'] is None
+    assert saved[0]['effects'] == [effect]

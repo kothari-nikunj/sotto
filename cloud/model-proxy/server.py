@@ -4,14 +4,15 @@ Never log prompts, credentials, URLs with keys, images or upstream response bodi
 The pilot charges a conservative $2 allowance per attempted upstream call. This is
 an admission budget, not an invoice; provider billing remains authoritative. Holding
 the allowance across crashes/ambiguous failures avoids freeing spend already used.
-Successful 3.8 chat and proven text-only native calls settle to reported input plus
-the FULL model output ceiling, covering unreported reasoning tokens. Grounded,
-multimodal and ambiguous native calls, and any reply whose reported output (with
-thinking) is missing or above that ceiling, retain their allowance.
+Successful proven 3.8 text chat and native calls settle against complete provider
+receipts, including thinking tokens. Grounded, multimodal, ambiguous or incomplete
+responses retain their allowance. The older one-time chat ceiling migration is unchanged.
 """
+import calendar
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import math
 import os
@@ -24,10 +25,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from usage_accounting import normalize, estimate, estimate_range, PRICING_VERSION
+from usage_accounting import (normalize, normalize_google_openai, google_openai_receipt,
+                              estimate, estimate_range, PRICING_VERSION, PRICES, INTRO_END)
 
 MODELS = {'gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash-lite'}
 MAX_BODY = 8 * 1024 * 1024
+BRIEF_UPSTREAM_WAIT_SECONDS = 120
+BRIEF_WORKLOADS = frozenset({'brief_extract', 'brief_critic', 'brief_revise'})
 MAX_OUTPUT = 65536
 CALL_ALLOWANCE_CENTS = 200
 LEASE_SECONDS = 30 * 86400
@@ -51,6 +55,11 @@ PRICING_START = 1788307200  # 2026-09-02 UTC
 PRICING_END = 1798761600    # 2027-01-01 UTC
 SETTLEMENT_MIGRATION = 'settled_chat_allowance_v1'
 MAX_TOOL_RESULT_CATEGORIES = 32
+NATIVE_USAGE_KEYS = frozenset({
+    'promptTokenCount', 'candidatesTokenCount', 'totalTokenCount',
+    'thoughtsTokenCount', 'cachedContentTokenCount', 'toolUsePromptTokenCount',
+    'promptTokensDetails', 'cacheTokensDetails', 'candidatesTokensDetails',
+    'serviceTier'})
 
 
 def tool_result_sizes(payload):
@@ -108,6 +117,84 @@ def settled_text_allowance(model, created, status, input_tokens):
     return CALL_ALLOWANCE_CENTS
 
 
+def chat_receipt_allowance(model, created, status, usage):
+    """Settle only a complete Google text-chat receipt, including hidden thinking."""
+    receipt = google_openai_receipt(usage, MAX_OUTPUT)
+    if (status != 200 or model != 'gemini-3.8-flash'
+            or not PRICING_START <= created < min(PRICING_END, INTRO_END)
+            or receipt is None):
+        return None
+    prompt, cached = receipt['prompt'], receipt['cached'] or 0
+    output = receipt['total'] - prompt
+    input_rate, cached_rate, output_rate = PRICES[model]
+    return min(CALL_ALLOWANCE_CENTS, math.ceil(100 * (
+        (prompt - cached) * input_rate + cached * cached_rate + output * output_rate) / 1_000_000))
+
+
+def native_usage_features_safe(usage):
+    """Reject usage features that could add an unpriced modality or service tier."""
+    if (not isinstance(usage, dict) or not set(usage) <= NATIVE_USAGE_KEYS
+            or usage.get('serviceTier', 'standard') not in ('standard', 'unspecified')
+            or type(usage.get('toolUsePromptTokenCount', 0)) is not int
+            or usage.get('toolUsePromptTokenCount', 0) != 0):
+        return False
+    for name in ('promptTokensDetails', 'cacheTokensDetails', 'candidatesTokensDetails'):
+        if name in usage and (not isinstance(usage[name], list) or any(
+                not isinstance(item, dict) or set(item) != {'modality', 'tokenCount'}
+                or item['modality'] != 'TEXT' or type(item['tokenCount']) is not int
+                or item['tokenCount'] < 0 for item in usage[name])):
+            return False
+    return True
+
+
+def native_receipt_allowance(model, created, status, usage):
+    """Price only a complete native text receipt under the known standard tariff."""
+    if (status != 200 or model not in MODELS or model not in PRICES
+            or not PRICING_START <= created < min(PRICING_END, INTRO_END)
+            or not native_usage_features_safe(usage)):
+        return None
+    prompt = usage.get('promptTokenCount')
+    candidates = usage.get('candidatesTokenCount')
+    total = usage.get('totalTokenCount')
+    if (type(prompt) is not int or not 0 <= prompt <= 1048576
+            or type(candidates) is not int or not 0 <= candidates <= MAX_OUTPUT
+            or type(total) is not int):
+        return None
+    output = total - prompt
+    if not candidates <= output <= MAX_OUTPUT:
+        return None
+    if 'thoughtsTokenCount' in usage:
+        thoughts = usage['thoughtsTokenCount']
+        if type(thoughts) is not int or thoughts < 0 or total != prompt + candidates + thoughts:
+            return None
+    if 'cachedContentTokenCount' in usage:
+        cached = usage['cachedContentTokenCount']
+        if type(cached) is not int or not 0 <= cached <= prompt:
+            return None
+    input_rate, _, output_rate = PRICES[model]
+    return min(CALL_ALLOWANCE_CENTS, math.ceil(
+        100 * (prompt * input_rate + output * output_rate) / 1_000_000))
+
+
+def native_sparse_usage_safe(usage):
+    """The legacy ceiling policy applies only when no total receipt was supplied."""
+    if not native_usage_features_safe(usage) or 'totalTokenCount' in usage:
+        return False
+    prompt = usage.get('promptTokenCount')
+    candidates = usage.get('candidatesTokenCount')
+    if (type(prompt) is not int or not 0 <= prompt <= 1048576
+            or type(candidates) is not int or not 0 <= candidates <= MAX_OUTPUT):
+        return False
+    thoughts = usage.get('thoughtsTokenCount', 0)
+    if type(thoughts) is not int or thoughts < 0 or candidates + thoughts > MAX_OUTPUT:
+        return False
+    if 'cachedContentTokenCount' in usage:
+        cached = usage['cachedContentTokenCount']
+        if type(cached) is not int or not 0 <= cached <= prompt:
+            return False
+    return True
+
+
 def _text_parts(value):
     return (isinstance(value, dict) and set(value) <= {'parts', 'role'}
             and isinstance(value.get('parts'), list) and bool(value['parts'])
@@ -151,20 +238,106 @@ def native_text_request(payload):
             and set(config['thinkingConfig']) <= {'thinkingLevel', 'includeThoughts'})))
 
 
+def chat_function_call_supported(call):
+    """Permit only ordinary function calls and Google's opaque continuation signature."""
+    if (not isinstance(call, dict) or call.get('type') != 'function'
+            or not set(call) <= {'id', 'type', 'function', 'extra_content'}):
+        return False
+    if 'extra_content' not in call:
+        return True
+    return chat_google_signature_supported(call['extra_content'])
+
+
+def chat_google_signature_supported(extra):
+    """Accept only Google's opaque continuation metadata, without retaining its value."""
+    if not isinstance(extra, dict) or set(extra) != {'google'}:
+        return False
+    google = extra['google']
+    return (isinstance(google, dict) and set(google) == {'thought_signature'}
+            and isinstance(google['thought_signature'], str) and bool(google['thought_signature']))
+
+
+def chat_text_request(payload):
+    """Exclude unknown paid features before permitting receipt-based chat settlement."""
+    if not isinstance(payload, dict) or not set(payload) <= {
+            'model', 'messages', 'n', 'max_tokens', 'max_completion_tokens', 'temperature',
+            'top_p', 'frequency_penalty', 'presence_penalty', 'stop', 'seed',
+            'response_format', 'tools', 'tool_choice', 'parallel_tool_calls',
+            'reasoning_effort', 'stream', 'service_tier', 'modalities'}:
+        return False
+    if payload.get('stream', False) is not False:
+        return False
+    if payload.get('reasoning_effort', 'low') not in ('none', 'minimal', 'low', 'medium', 'high'):
+        return False
+    response_format = payload.get('response_format')
+    if response_format is not None and (not isinstance(response_format, dict)
+            or response_format.get('type') not in ('text', 'json_object', 'json_schema')
+            or not set(response_format) <= {'type', 'json_schema'}):
+        return False
+    tools = payload.get('tools', [])
+    if (not isinstance(tools, list) or any(
+            not isinstance(tool, dict) or set(tool) != {'type', 'function'}
+            or tool['type'] != 'function' or not isinstance(tool['function'], dict)
+            or not set(tool['function']) <= {'name', 'description', 'parameters', 'strict'}
+            for tool in tools)):
+        return False
+    messages = payload.get('messages')
+    if not isinstance(messages, list) or not messages:
+        return False
+    for message in messages:
+        if (not isinstance(message, dict) or not set(message) <= {
+                'role', 'content', 'name', 'tool_call_id', 'tool_calls', 'extra_content'}
+                or message.get('role') not in ('system', 'developer', 'user', 'assistant', 'tool')):
+            return False
+        if 'extra_content' in message and (message.get('role') != 'assistant'
+                or not chat_google_signature_supported(message['extra_content'])):
+            return False
+        content = message.get('content')
+        if not (isinstance(content, str) or content is None and message.get('role') == 'assistant'
+                or isinstance(content, list) and all(
+                    isinstance(part, dict) and set(part) == {'type', 'text'}
+                    and part['type'] == 'text' and isinstance(part['text'], str) for part in content)):
+            return False
+        if 'tool_calls' in message and (not isinstance(message['tool_calls'], list)
+                or any(not chat_function_call_supported(call) for call in message['tool_calls'])):
+            return False
+    return True
+
+
+def chat_text_response(item):
+    """Only a complete, single ordinary chat choice can support text settlement."""
+    if not isinstance(item, dict) or not set(item) <= {
+            'id', 'object', 'created', 'model', 'choices', 'usage', 'system_fingerprint', 'service_tier'}:
+        return False
+    if item.get('service_tier', 'default') not in ('default', 'standard'):
+        return False
+    choices = item.get('choices')
+    if not isinstance(choices, list) or len(choices) != 1:
+        return False
+    choice = choices[0]
+    if (not isinstance(choice, dict) or not set(choice) <= {'index', 'message', 'finish_reason', 'logprobs'}
+            or choice.get('finish_reason') not in ('stop', 'length', 'tool_calls')):
+        return False
+    message = choice.get('message')
+    return (isinstance(message, dict) and set(message) <= {'role', 'content', 'tool_calls', 'refusal', 'extra_content'}
+            and message.get('role') == 'assistant'
+            and ('extra_content' not in message
+                 or chat_google_signature_supported(message['extra_content']))
+            and (isinstance(message.get('content'), str) or message.get('content') is None)
+            and ('tool_calls' not in message or (isinstance(message['tool_calls'], list)
+                 and all(chat_function_call_supported(call) for call in message['tool_calls']))))
+
+
 def native_text_response(item):
     """A completed nonstreamed reply must prove native usage and no paid tools/media."""
     if not isinstance(item, dict) or not set(item) <= {
             'candidates', 'usageMetadata', 'modelVersion', 'responseId', 'createTime'}:
         return False
     usage = item.get('usageMetadata')
-    if not isinstance(usage, dict):
+    if not native_usage_features_safe(usage):
         return False
     prompt = usage.get('promptTokenCount')
-    if (type(prompt) is not int or not 0 <= prompt <= 1048576
-            or type(usage.get('toolUsePromptTokenCount', 0)) is not int
-            or usage.get('toolUsePromptTokenCount', 0) != 0
-            or any(any(label in key.lower() for label in ('tool', 'ground', 'search'))
-                   for key in usage if key != 'toolUsePromptTokenCount')):
+    if type(prompt) is not int or not 0 <= prompt <= 1048576:
         return False
     candidates = item.get('candidates')
     return (isinstance(candidates, list) and len(candidates) == 1
@@ -299,7 +472,21 @@ class Ledger:
                        (tenant['id'], tenant['token_sha256'], expires))
         return self.expiry(tenant)
 
-    def reserve(self, tenant, budget, route, model, *, credential=None, metadata=None):
+    @staticmethod
+    def _budget_used(db, tenant, period, started_at, now):
+        if period == 'calendar_month':
+            utc = time.gmtime(now)
+            month_start = calendar.timegm((utc.tm_year, utc.tm_mon, 1, 0, 0, 0))
+            next_month = calendar.timegm((utc.tm_year + (utc.tm_mon == 12),
+                                          utc.tm_mon % 12 + 1, 1, 0, 0, 0))
+            return db.execute('SELECT COALESCE(SUM(allowance),0) FROM calls '
+                              'WHERE tenant=? AND created>=? AND created<?',
+                              (tenant, max(started_at, month_start), next_month)).fetchone()[0]
+        return db.execute('SELECT COALESCE(SUM(allowance),0) FROM calls WHERE tenant=?',
+                          (tenant,)).fetchone()[0]
+
+    def reserve(self, tenant, budget, route, model, *, credential=None, metadata=None,
+                budget_period=None, budget_started_at=None):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             now = time.time()
@@ -352,11 +539,11 @@ class Ledger:
                         not foreground and background_chars + input_chars
                         > cap(BACKGROUND_INPUT_CHARS_PER_WINDOW, scoped)):
                     raise RateLimitError(f'{label} input volume busy', 45 + secrets.randbelow(16))
-            used = db.execute('SELECT COALESCE(SUM(allowance),0) FROM calls WHERE tenant=?', (tenant,)).fetchone()[0]
+            used = self._budget_used(db, tenant, budget_period, budget_started_at, now)
             if budget is not None and used + CALL_ALLOWANCE_CENTS > budget:
                 raise PermissionError('tenant request budget exhausted')
             cursor = db.execute('INSERT INTO calls(tenant,route,model,created,allowance) VALUES(?,?,?,?,?)',
-                                (tenant, route, model, time.time(), CALL_ALLOWANCE_CENTS))
+                                (tenant, route, model, now, CALL_ALLOWANCE_CENTS))
             db.execute('UPDATE calls SET metadata_json=? WHERE id=?',
                        (json.dumps(metadata), cursor.lastrowid))
             db.execute('UPDATE calls SET active_until=? WHERE id=?',
@@ -372,8 +559,9 @@ class Ledger:
             db.execute('UPDATE calls SET active_until=? WHERE id=? AND active_until IS NOT NULL',
                        (time.time() + ACTIVE_LEASE_SECONDS, call))
 
-    def finish(self, call, status, usage, *, proven_native_text=False,
-               native_text_request_eligible=None, native_text_response_eligible=None):
+    def finish(self, call, status, usage, *, proven_native_text=False, proven_chat_text=False,
+               native_text_request_eligible=None, native_text_response_eligible=None,
+               chat_text_request_eligible=None, chat_text_response_eligible=None):
         # Missing usage or ambiguous outcomes never release an allowance.
         usage = usage if isinstance(usage, dict) else {}
         def count(*names):
@@ -391,38 +579,66 @@ class Ledger:
         output_within_ceiling = (output is not None and output <= MAX_OUTPUT
                                  and ('thoughtsTokenCount' not in usage or thoughts is not None))
         with self.connect() as db:
+            route = db.execute('SELECT route FROM calls WHERE id=?', (call,)).fetchone()
+            chat_counts = normalize_google_openai(usage, MAX_OUTPUT) if route and route[0] == 'chat' else None
             db.execute('UPDATE calls SET status=?,input_tokens=?,output_tokens=? WHERE id=?',
-                       (status, count('promptTokenCount') if proven_native_text else
+                       (status, chat_counts['input_tokens'] if chat_counts is not None else
+                        count('promptTokenCount') if proven_native_text else
                         count('promptTokenCount', 'prompt_tokens'),
-                        output, call))
+                        chat_counts['billed_output_tokens'] if chat_counts is not None else output, call))
             row = db.execute('SELECT route,model,created,status,input_tokens FROM calls WHERE id=?', (call,)).fetchone()
-            counts = normalize(usage)
-            counts.update(estimated_token_cost=estimate(row[1], counts, row[2]) if row else None,
-                          token_cost_range=estimate_range(row[1], counts, row[2]) if row else None,
-                          pricing_version=PRICING_VERSION, provider_fee_status='not_included')
-            allowance = (settled_chat_allowance(*row) if row and output_within_ceiling
-                         else CALL_ALLOWANCE_CENTS)
-            if row and row[0] == 'native' and proven_native_text and output_within_ceiling:
+            counts = chat_counts if chat_counts is not None else normalize(usage)
+            allowance = CALL_ALLOWANCE_CENTS
+            if row and row[0] == 'chat' and proven_chat_text:
+                receipt_allowance = chat_receipt_allowance(row[1], row[2], row[3], usage)
+                if receipt_allowance is not None:
+                    allowance = receipt_allowance
+                    counts['allowance_policy'] = 'chat_text_receipt_v1'
+            if (row and row[0] == 'native' and proven_native_text and output_within_ceiling
+                    and native_sparse_usage_safe(usage)):
                 allowance = settled_text_allowance(row[1], row[2], row[3], row[4])
                 if allowance < CALL_ALLOWANCE_CENTS:
                     counts['allowance_policy'] = 'native_text_v1'
+            if row and row[0] == 'native' and proven_native_text:
+                receipt_allowance = native_receipt_allowance(row[1], row[2], row[3], usage)
+                if receipt_allowance is not None:
+                    allowance = receipt_allowance
+                    counts['allowance_policy'] = 'native_text_receipt_v2'
+                    billed_output = usage['totalTokenCount'] - usage['promptTokenCount']
+                    counts['billed_output_tokens'] = billed_output
+                    counts['reasoning_tokens'] = billed_output - usage['candidatesTokenCount']
+                    counts['visible_output_tokens'] = usage['candidatesTokenCount']
+                    counts['usage_completeness'] = 'complete'
+                    db.execute('UPDATE calls SET output_tokens=? WHERE id=?', (billed_output, call))
+            counts.update(estimated_token_cost=estimate(row[1], counts, row[2]) if row else None,
+                          token_cost_range=estimate_range(row[1], counts, row[2]) if row else None,
+                          pricing_version=PRICING_VERSION, provider_fee_status='not_included')
             if row and row[0] == 'native' and native_text_request_eligible is not None:
                 counts['native_text_request_eligible'] = native_text_request_eligible
                 counts['native_text_response_eligible'] = native_text_response_eligible is True
                 counts['native_text_settlement_reason'] = (
                     'request_ineligible' if not native_text_request_eligible else
                     'response_ineligible' if native_text_response_eligible is not True else
+                    'receipt_settled' if counts.get('allowance_policy') == 'native_text_receipt_v2' else
+                    'receipt_invalid' if 'totalTokenCount' in usage and allowance == CALL_ALLOWANCE_CENTS else
                     'output_unbounded' if not output_within_ceiling else
                     'settled' if allowance < CALL_ALLOWANCE_CENTS else 'tariff_unavailable')
+            if row and row[0] == 'chat' and chat_text_request_eligible is not None:
+                # Fixed categories only; never retain response keys, payloads, or provider text.
+                counts['chat_text_settlement_reason'] = (
+                    'upstream_failure' if status != 200 else
+                    'request_ineligible' if not chat_text_request_eligible else
+                    'response_ineligible' if chat_text_response_eligible is not True else
+                    'receipt_settled' if counts.get('allowance_policy') == 'chat_text_receipt_v1' else
+                    'receipt_unavailable')  # Existing usage/tariff gates remain unchanged.
             db.execute('UPDATE calls SET usage_json=? WHERE id=?', (json.dumps(counts), call))
             if row:
                 db.execute('UPDATE calls SET allowance=? WHERE id=?', (allowance, call))
             db.execute('UPDATE calls SET active_until=NULL WHERE id=?', (call,))
 
-    def budget_capability(self, tenant, budget):
+    def budget_capability(self, tenant, budget, *, budget_period=None, budget_started_at=None):
         with self.connect() as db:
-            used = db.execute('SELECT COALESCE(SUM(allowance),0) FROM calls WHERE tenant=?',
-                              (tenant,)).fetchone()[0]
+            used = self._budget_used(db, tenant, budget_period, budget_started_at, time.time())
         remaining = None if budget is None else max(0, budget - used)
         return {'version': 1, 'finite': budget is not None, 'remaining_cents': remaining,
                 'can_admit': remaining is not None and remaining >= CALL_ALLOWANCE_CENTS,
@@ -461,6 +677,28 @@ def route(path, payload):
     return lane, model, endpoint
 
 
+def join_leading_system_messages(payload):
+    """Give Google's chat endpoint one ordered instruction message, without moving later turns."""
+    messages = payload.get('messages')
+    if not isinstance(messages, list):
+        return payload
+    leading = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get('role') != 'system':
+            break
+        leading += 1
+    if leading < 2:
+        return payload
+    instructions = messages[:leading]
+    if any(set(message) != {'role', 'content'} or not isinstance(message['content'], str)
+           for message in instructions):
+        raise ValueError('ambiguous leading system messages')
+    return {**payload, 'messages': [
+        {'role': 'system', 'content': '\n\n'.join(message['content'] for message in instructions)},
+        *messages[leading:],
+    ]}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -477,6 +715,8 @@ class Handler(BaseHTTPRequestHandler):
         if status == 429:
             self.send_header('Retry-After', str(retry_after or RATE_WINDOW_SECONDS))
             self.send_header('X-Sotto-Admission', 'busy')
+        if status == 504 and isinstance(body.get('error'), dict) and body['error'].get('code') == 'sotto_brief_outcome_uncertain':
+            self.send_header('X-Sotto-Outcome', 'uncertain')
         self.close_connection = True
         self.end_headers()
         self.wfile.write(raw)
@@ -491,12 +731,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(401, {'error': 'unauthorized'})
         digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
         tenant = next((t for t in self.server.tenants if t.get('enabled') is True
-                       and self.server.ledger.expiry(t) > time.time()
-                       and hmac.compare_digest(t['token_sha256'], digest)), None)
+                       and hmac.compare_digest(t['token_sha256'], digest)
+                       and self.server.ledger.expiry(t) > time.time()), None)
         if not tenant:
             return self.respond(401, {'error': 'unauthorized'})
         return self.respond(200, self.server.ledger.budget_capability(
-            tenant['id'], tenant['budget_cents']))
+            tenant['id'], tenant['budget_cents'], budget_period=tenant.get('budget_period'),
+            budget_started_at=tenant.get('budget_started_at')))
 
     def do_POST(self):
         self.connection.settimeout(330)
@@ -507,8 +748,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/v1/lease/renew':
             return self.renew_lease(digest)
         tenant = next((t for t in self.server.tenants if t.get('enabled') is True
-                       and self.server.ledger.expiry(t) > time.time()
-                       and hmac.compare_digest(t['token_sha256'], digest)), None)
+                       and hmac.compare_digest(t['token_sha256'], digest)
+                       and self.server.ledger.expiry(t) > time.time()), None)
         if not tenant:
             return self.respond(401, {'error': 'unauthorized'})
         try:
@@ -519,14 +760,22 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) != size:
                 return self.respond(400, {'error': 'incomplete request'})
             payload = json.loads(raw, object_pairs_hook=unique_object)
-            raw = json.dumps(payload, allow_nan=False, separators=(',', ':')).encode()
             lane, model, endpoint = route(self.path, payload)
+            if lane == 'chat':
+                payload = join_leading_system_messages(payload)
+            raw = json.dumps(payload, allow_nan=False, separators=(',', ':')).encode()
+            if len(raw) > MAX_BODY:
+                raise RequestTooLargeError('merged request exceeds body limit')
             text_request = lane == 'native' and native_text_request(payload)
+            text_chat_request = lane == 'chat' and chat_text_request(payload)
             if (self.headers.get('X-Sotto-Require-Finite-Budget') == 'true'
                     and tenant['budget_cents'] is None):
                 raise PermissionError('finite tenant budget required')
             call = self.server.ledger.reserve(tenant['id'], tenant['budget_cents'], lane, model,
-                                              credential=(tenant, digest), metadata=request_metadata(
+                                              credential=(tenant, digest),
+                                              budget_period=tenant.get('budget_period'),
+                                              budget_started_at=tenant.get('budget_started_at'),
+                                              metadata=request_metadata(
                                                   self.headers, payload, lane,
                                                   {k: tenant.get(k) for k in ('application', 'deployment')}))
         except AuthenticationError:
@@ -539,11 +788,14 @@ class Handler(BaseHTTPRequestHandler):
                                                 'message': 'This model request is larger than one window allows; retrying will not help.'}})
         except PermissionError:
             return self.respond(402, {'error': {'code': 'sotto_budget_exhausted', 'type': 'budget_exhausted',
-                                              'message': 'Sotto pilot model allowance reached; waiting will not reset it.'}})
+                                              'period': 'calendar_month' if tenant.get('budget_period') == 'calendar_month' else 'lifetime',
+                                              'message': ('Sotto monthly model allowance reached; it resets at the start of the next UTC month.'
+                                                          if tenant.get('budget_period') == 'calendar_month' else
+                                                          'Sotto pilot model allowance reached; waiting will not reset it.')}})
         except (ValueError, TypeError, AttributeError):
             return self.respond(400, {'error': 'invalid model request'})
         try:
-            return self._forward(call, lane, endpoint, raw, text_request)
+            return self._forward(call, lane, endpoint, raw, text_request, text_chat_request)
         finally:
             # Also covers a disconnected client or an unexpected response parser error.
             # The metering row remains reserved; only the concurrency slot is released.
@@ -552,18 +804,43 @@ class Handler(BaseHTTPRequestHandler):
             except sqlite3.Error:
                 pass
 
-    def _forward(self, call, lane, endpoint, raw, text_request):
+    def _forward(self, call, lane, endpoint, raw, text_request, text_chat_request):
         headers = {'Content-Type': 'application/json', 'Accept-Encoding': 'identity'}
         headers['x-goog-api-key' if lane == 'native' else 'Authorization'] = (
             self.server.upstream_key if lane == 'native' else 'Bearer ' + self.server.upstream_key)
         req = urllib.request.Request(endpoint, data=raw, headers=headers, method='POST')
+        # These labels can only shorten a tenant-authenticated native text call's wait.
+        # They grant no permission or refund. Unlabelled/other workloads keep their old path.
+        labels = request_metadata(self.headers, {}, lane)
+        brief = (lane == 'native' and text_request
+                 and labels.get('workload') in BRIEF_WORKLOADS
+                 and all(labels.get(k) for k in ('operation_id', 'run_id', 'attempt')))
         try:
-            response = self.server.open_upstream(req, timeout=300)
+            response = self.server.open_upstream(req, timeout=BRIEF_UPSTREAM_WAIT_SECONDS if brief else 300)
+            if brief:
+                # Native generateContent is not SSE. Wait for the complete bounded response
+                # before sending 200: a body timeout must remain an explicit uncertain outcome,
+                # not a truncated success which the caller might automatically retry.
+                with response:
+                    content_type = response.headers.get('Content-Type', 'application/json')
+                    data = response.read(MAX_BODY + 1)
+                    if len(data) > MAX_BODY:
+                        raise TimeoutError('brief response could not be confirmed')
+                response = io.BytesIO(data)
+                response.headers = {'Content-Type': content_type}
+
         except urllib.error.HTTPError as error:
             self.server.ledger.finish(call, error.code, {},
                                       native_text_request_eligible=text_request if lane == 'native' else None,
-                                      native_text_response_eligible=False)
-            # Preserve the native provider error envelope/status, including retry reasons.
+                                      native_text_response_eligible=False,
+                                      chat_text_request_eligible=text_chat_request if lane == 'chat' else None,
+                                      chat_text_response_eligible=False)
+            if brief and error.code == 504:
+                # A provider gateway timeout also leaves paid work uncertain.
+                error.close()
+                return self.respond(504, {'error': {'code': 'sotto_brief_outcome_uncertain',
+                    'message': 'The brief model response could not be confirmed; do not retry this request automatically.'}})
+            # Preserve other provider error envelopes/statuses, including retry reasons.
             data = error.read(MAX_BODY)
             self.send_response(error.code)
             self.send_header('Content-Type', 'application/json')
@@ -571,10 +848,19 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        except (OSError, http.client.HTTPException):
-            self.server.ledger.finish(call, 502, {},
+        except (OSError, http.client.HTTPException) as error:
+            # urllib wraps only connect/send failures in URLError. A raw error came after the
+            # request was sent (no/partial response), so the provider may have billed it.
+            uncertain = brief and (not isinstance(error, urllib.error.URLError) or
+                                   isinstance(getattr(error, 'reason', None), TimeoutError))
+            self.server.ledger.finish(call, 504 if uncertain else 502, {},
                                       native_text_request_eligible=text_request if lane == 'native' else None,
-                                      native_text_response_eligible=False)
+                                      native_text_response_eligible=False,
+                                      chat_text_request_eligible=text_chat_request if lane == 'chat' else None,
+                                      chat_text_response_eligible=False)
+            if uncertain:
+                return self.respond(504, {'error': {'code': 'sotto_brief_outcome_uncertain',
+                    'message': 'The brief model response could not be confirmed; do not retry this request automatically.'}})
             return self.respond(502, {'error': 'upstream unavailable'})
         with response:
             content_type = response.headers.get('Content-Type', 'application/json')
@@ -605,10 +891,13 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, TimeoutError):
                 self.server.ledger.finish(call, 502, {},
                                           native_text_request_eligible=text_request if lane == 'native' else None,
-                                          native_text_response_eligible=False)
+                                          native_text_response_eligible=False,
+                                          chat_text_request_eligible=text_chat_request if lane == 'chat' else None,
+                                          chat_text_response_eligible=False)
                 return
             usage = {}
             text_response = False
+            text_chat_response = False
             try:
                 if not complete_capture:
                     pass
@@ -621,12 +910,16 @@ class Handler(BaseHTTPRequestHandler):
                     item = json.loads(captured)
                     usage = item.get('usageMetadata') or item.get('usage') or {}
                     text_response = native_text_response(item)
+                    text_chat_response = chat_text_response(item)
             except (ValueError, UnicodeError):
                 pass
             self.server.ledger.finish(call, 200, usage,
                                       proven_native_text=text_request and text_response,
+                                      proven_chat_text=text_chat_request and text_chat_response,
                                       native_text_request_eligible=text_request if lane == 'native' else None,
-                                      native_text_response_eligible=text_response)
+                                      native_text_response_eligible=text_response,
+                                      chat_text_request_eligible=text_chat_request if lane == 'chat' else None,
+                                      chat_text_response_eligible=text_chat_response)
 
     def renew_lease(self, digest):
         # No prompt, provider call, billing mutation or returned credential. A model token
@@ -672,6 +965,18 @@ def validate_tenants(tenants):
         budget = tenant.get('budget_cents', 'missing')
         if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool) or budget < 0):
             raise ValueError('tenant budget must be nonnegative cents or explicit null')
+        period = tenant.get('budget_period')
+        started_at = tenant.get('budget_started_at')
+        if period not in (None, 'calendar_month'):
+            raise ValueError('unsupported tenant budget period')
+        if period == 'calendar_month':
+            if budget is None or budget == 'missing':
+                raise ValueError('monthly tenant budget must be finite')
+            if (not isinstance(started_at, (int, float)) or isinstance(started_at, bool)
+                    or not math.isfinite(started_at) or not 0 < started_at <= time.time()):
+                raise ValueError('monthly tenant budget activation must be a past Unix timestamp')
+        elif started_at is not None:
+            raise ValueError('tenant budget activation requires a monthly period')
         if not isinstance(tenant.get('enabled'), bool):
             raise ValueError('tenant enabled flag is required')
         expiry = tenant.get('expires_at')

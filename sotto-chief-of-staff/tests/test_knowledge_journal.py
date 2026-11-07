@@ -308,7 +308,7 @@ def test_an_op_that_raises_is_kept_for_the_next_replay(data, monkeypatch, capsys
     assert any(r.slug == BEN for r in _read(ANNA).relations)
 
 
-def test_a_forever_broken_op_is_dropped_at_the_attempt_cap(data, monkeypatch, capsys):
+def test_a_forever_broken_op_is_quarantined_at_the_attempt_cap(data, monkeypatch, capsys):
     """A permanently broken op must not tax every graph write forever — at JOURNAL_MAX_ATTEMPTS it
     is dropped with a line saying so."""
     _person(ANNA, "Anna Reyes", "anna@example.com")
@@ -322,6 +322,12 @@ def test_a_forever_broken_op_is_dropped_at_the_attempt_cap(data, monkeypatch, ca
         kg.replay_journal()
     assert not os.path.exists(kg.journal_path())
     assert "gave up" in capsys.readouterr().err
+    from pathlib import Path
+    records = list((Path(kg.journal_path()).parent / '.journal-repair').glob('*.json'))
+    assert len(records) == 1
+    saved = json.loads(records[0].read_text())
+    assert saved['reason'] == 'attempt_limit'
+    assert json.loads(bytes.fromhex(saved['journal_hex']))['ops'][0]['slug'] == ANNA
 
 
 def test_a_new_batch_does_not_clobber_an_op_still_retrying(data, monkeypatch):
@@ -341,3 +347,41 @@ def test_a_new_batch_does_not_clobber_an_op_still_retrying(data, monkeypatch):
     kg.run_journaled([{"op": "unedge", "slug": ANNA, "rel_key": "nobody"}])
     assert applied == ["unedge"], "the new batch applies; the stuck op is replay's to retry"
     assert _journal()["ops"] == [stuck], "the retrying op survives with its attempts intact"
+
+
+def test_corrupt_intent_preserved_before_new_batch(data):
+    from pathlib import Path
+    raw = b'{broken intent'
+    Path(kg.journal_path()).parent.mkdir(parents=True, exist_ok=True)
+    Path(kg.journal_path()).write_bytes(raw)
+    kg.run_journaled([{'op': 'nonsense'}])
+    records = list((Path(kg.journal_path()).parent / '.journal-repair').glob('*.json'))
+    assert bytes.fromhex(json.loads(records[0].read_text())['journal_hex']) == raw
+
+
+def test_failed_quarantine_does_not_clear_original_intent(data, monkeypatch):
+    from pathlib import Path
+    raw = b'{broken intent'
+    Path(kg.journal_path()).parent.mkdir(parents=True, exist_ok=True)
+    Path(kg.journal_path()).write_bytes(raw)
+    def fail(*args):
+        raise OSError('quarantine full')
+    monkeypatch.setattr(kg, '_preserve_journal', fail)
+    with pytest.raises(OSError, match='quarantine full'):
+        kg.replay_journal()
+    assert Path(kg.journal_path()).read_bytes() == raw
+
+
+def test_full_repair_directory_retains_active_intent_and_all_prior_records(data):
+    directory = data / 'knowledge/.journal-repair'
+    directory.mkdir()
+    for index in range(kg.JOURNAL_REPAIR_MAX_RECORDS):
+        (directory / f'{index}.json').write_bytes(b'prior')
+    active = data / 'knowledge/.journal.json'
+    active.write_bytes(b'{unparseable')
+    with pytest.raises(OSError, match='operator repair required'):
+        kg.replay_journal()
+    assert active.read_bytes() == b'{unparseable'
+    records = list(directory.iterdir())
+    assert len(records) == kg.JOURNAL_REPAIR_MAX_RECORDS
+    assert all(record.read_bytes() == b'prior' for record in records)

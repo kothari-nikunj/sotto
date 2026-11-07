@@ -1,0 +1,18 @@
+{
+  "name": "@sotto/local-reader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded offline article extraction from supplied HTML; not a URL fetcher",
+  "engines": { "node": ">=22.18.0 <27" },
+  "exports": "./src/index.js",
+  "scripts": {
+    "start": "node src/cli.js",
+    "check": "node --check src/contracts.js && node --check src/index.js && node --check src/cli.js && node --check src/worker.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "linkedom": "0.18.14"
+  }
+}

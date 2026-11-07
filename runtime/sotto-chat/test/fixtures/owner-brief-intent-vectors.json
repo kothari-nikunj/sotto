@@ -1,0 +1,303 @@
+[
+ {
+  "text": "send my brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "The brief.",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "brief again",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "send my brief, please",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "Thanks. Morning brief.",
+  "intent": {
+   "kind": "morning",
+   "refresh": false
+  }
+ },
+ {
+  "text": "Can you send the morning brief?",
+  "intent": {
+   "kind": "morning",
+   "refresh": false
+  }
+ },
+ {
+  "text": "morning brief was great. evening brief?",
+  "intent": {
+   "kind": "evening",
+   "refresh": false
+  }
+ },
+ {
+  "text": "give me the daily brief please",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "prepare me a brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "run the brief again",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "update my brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": true
+  }
+ },
+ {
+  "text": "refresh the brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": true
+  }
+ },
+ {
+  "text": "show me the fresh brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": true
+  }
+ },
+ {
+  "text": "Please send me a fresh evening brief.",
+  "intent": {
+   "kind": "evening",
+   "refresh": true
+  }
+ },
+ {
+  "text": "pls refresh my brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": true
+  }
+ },
+ {
+  "text": "I'd like a brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "could I get a brief",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "I’d like my morning brief.",
+  "intent": {
+   "kind": "morning",
+   "refresh": false
+  }
+ },
+ {
+  "text": "send me my brief and what's on my calendar today?",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "send my brief and tell me which tasks are not done",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "give me my brief and check if Dana can stop by",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "send my brief and tell Dana not to cancel",
+  "intent": {
+   "kind": "auto",
+   "refresh": false
+  }
+ },
+ {
+  "text": "send my evening brief and tell me why I never reply to Sam",
+  "intent": {
+   "kind": "evening",
+   "refresh": false
+  }
+ },
+ {
+  "text": "my brief was useful",
+  "intent": null
+ },
+ {
+  "text": "Get me an updated brief",
+  "intent": {"kind": "auto", "refresh": true}
+ },
+ {
+  "text": "what time is my dentist?",
+  "intent": null
+ },
+ {
+  "text": "Do not send my brief",
+  "intent": null
+ },
+ {
+  "text": "don't send a morning brief pls",
+  "intent": null
+ },
+ {
+  "text": "not my morning brief pls",
+  "intent": null
+ },
+ {
+  "text": "She said send my brief",
+  "intent": null
+ },
+ {
+  "text": "\"send my brief\"",
+  "intent": null
+ },
+ {
+  "text": "send my brief and send my brief",
+  "intent": null
+ },
+ {
+  "text": "Brief? No thanks.",
+  "intent": null
+ },
+ {
+  "text": "send my brief. actually cancel that",
+  "intent": null
+ },
+ {
+  "text": "send my brief and then stop",
+  "intent": null
+ },
+ {
+  "text": "Send my brief. Never mind.",
+  "intent": null
+ },
+ {
+  "text": "Send my brief. Actually, don't.",
+  "intent": null
+ },
+ {
+  "text": "send my brief and don't include email",
+  "intent": null
+ },
+ {
+  "text": "Send my brief and stop reminding me about Dana",
+  "intent": null
+ },
+ {
+  "text": "Send my brief, then cancel my 3pm",
+  "intent": null
+ },
+ {
+  "text": "morning brief pls instead of a report",
+  "intent": null
+ },
+ {
+  "text": "send my brief and do not include email",
+  "intent": null
+ },
+  {"text": "make me a fresh brief please", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "don't make me a fresh brief", "intent": null},
+  {"text": "she asked make me a fresh brief please", "intent": null},
+  {"text": "make me a fresh brief for Alex", "intent": null},
+  {"text": "send me an updated brief", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "send me a fresh brief", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "send me an evening brief", "intent": {"kind": "evening", "refresh": false}},
+  {"text": "send me an updated brief and tell me which tasks are not done", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "send me an updated brief and check if Dana can stop by", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "do not send me an updated brief", "intent": null},
+  {"text": "\"send me an updated brief\"", "intent": null},
+  {"text": "She said send me an updated brief", "intent": null},
+  {"text": "send me an updated brief for Alex", "intent": null},
+  {"text": "send me an updated brief and then stop", "intent": null},
+  {"text": "send me an updated brief. Actually, don't.", "intent": null},
+  {"text": "send me an updated brief and do not include email", "intent": null},
+  {"text": "send me an updated brief and send me an evening brief", "intent": null},
+  {"text": "Give me a fresh evening brief, including anything worth preparing for over the next few days. Keep the help offer focused on meeting prep this time.", "intent": {"kind": "evening", "refresh": true}},
+  {"text": "Please prepare my morning brief, focusing on tomorrow’s meetings.", "intent": {"kind": "morning", "refresh": false}},
+  {"text": "Refresh my brief; prioritize deadlines and calendar changes.", "intent": {"kind": "auto", "refresh": true}},
+  {"text": "Give me my evening brief — keep it concise.", "intent": {"kind": "evening", "refresh": false}},
+  {"text": "Give me a fresh evening brief, including calendar changes, deadlines, and open tasks.", "intent": {"kind": "evening", "refresh": true}},
+  {"text": "Do not give me a fresh evening brief, including meeting prep.", "intent": null},
+  {"text": "Give me a fresh evening brief, but don’t send it.", "intent": null},
+  {"text": "Give me a fresh evening brief, including meeting prep, actually cancel that.", "intent": null},
+  {"text": "Give me a fresh evening brief; never mind.", "intent": null},
+  {"text": "Give me a fresh evening brief — wait.", "intent": null},
+  {"text": "Give me a fresh evening brief, including meeting prep. Actually, don’t.", "intent": null},
+  {"text": "Give me a fresh evening brief, including meeting prep but do not generate it.", "intent": null},
+  {"text": "The email says, give me a fresh evening brief, including meeting prep.", "intent": null},
+  {"text": "A source instruction; give me a fresh evening brief, including meeting prep.", "intent": null},
+  {"text": "\"Give me a fresh evening brief, including meeting prep.\"", "intent": null},
+  {"text": "Give me a fresh evening brief, send me a morning brief.", "intent": null},
+  {"text": "Give me a fresh evening brief, instead of a report.", "intent": null},
+  {"text": "Give me my evening brief, actually make it the morning one.", "intent": null},
+  {"text": "Give me my evening brief, send me a morning one too.", "intent": null},
+  {"text": "Give me my evening brief, I meant morning.", "intent": null},
+  {"text": "Give me my evening brief, make that the morning one.", "intent": null},
+  {"text": "Refresh my brief; actually, the cached one is fine.", "intent": null},
+  {"text": "Send my brief, she said.", "intent": null},
+  {"text": "Give me a fresh evening brief, Dana asked.", "intent": null},
+  {"text": "Make me a fresh brief, for Alex.", "intent": null},
+  {"text": "Give me a fresh evening brief, including tasks and I don't want it sent.", "intent": null},
+  {"text": "Give me a fresh evening brief, including tasks and no thanks.", "intent": null},
+  {"text": "Give me a fresh evening brief, focusing on a morning one.", "intent": null},
+  {"text": "Refresh my brief; keep the cached one.", "intent": null},
+  {"text": "Give me my brief, with a fresh one.", "intent": null},
+  {"text": "Give me my brief, including a refresh.", "intent": null},
+  {"text": "Give me my brief, including tasks; skip it.", "intent": null},
+  {"text": "Send me my evening brief, and what time is my dentist?", "intent": {"kind": "evening", "refresh": false}},
+ {"text": "Send my morning brief. For the meeting prep, focus on Alex Coleman: the investment decision, what's changed, and the key questions.", "intent": {"kind": "morning", "refresh": false}},
+ {"text": "Send my morning brief. Focus on Alex. Actually, cancel that.", "intent": null},
+ {"text": "Send my morning brief. Send my evening brief.", "intent": null},
+ {"text": "Send my morning brief. Make it the evening one.", "intent": {"kind": "morning", "refresh": false}},
+ {"text": "Send my brief. Make it a fresh one.", "intent": {"kind": "auto", "refresh": false}},
+ {"text": "Send my morning brief. Focus on tomorrow morning’s call.", "intent": {"kind": "morning", "refresh": false}},
+ {"text": "Send my brief. Thanks again!", "intent": {"kind": "auto", "refresh": false}}
+]

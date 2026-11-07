@@ -40,7 +40,7 @@ in the [evaluation guide](sotto-chief-of-staff/evals/README.md); it is not part 
 Two pieces:
 
 ```
-you ⇄ Telegram / WhatsApp / iMessage
+you ⇄ iMessage (your Photon line) · Telegram (private owner bot)
          │
    Sotto agent  — a container YOU deploy (Railway). Runs the brains: briefs, memory,
          │        drafts, schedules. Connects natively to Gmail + Google Calendar.
@@ -57,53 +57,39 @@ catches up quietly — old messages go to the digest, never a barrage of stale p
 
 ## Install
 
-About **35 minutes** the first time — only ~15 of it active; the rest is waiting on builds. Full
-walkthrough with screenshots-level detail: **[ONBOARDING.md](ONBOARDING.md)**. The shape:
+Start with the [Bridge setup guide](ONBOARDING.md). Sotto Cloud opens directly to Google sign-in;
+self-hosting is under **Other setup options**. Conversation stays in iMessage, with Telegram an
+optional self-host choice.
 
-Want an AI coding agent to guide setup? Open this public repository in Codex or Claude Code and use
-[`docs/AGENT-ONBOARDING.md`](docs/AGENT-ONBOARDING.md). It branches between your own Railway
-self-host and an invited Sotto Cloud account, keeps credentials out of chat, and makes consent,
-permissions, and delivery checks explicit. Invited Cloud users do not need Railway credentials.
+**Sotto Cloud:** choose Continue with Google and allow Gmail or Calendar in the same authorization.
+Grant Full Disk Access, return to choose Mac sources, then send the prepared hello in iMessage.
+There is no separate account-only sign-up, infrastructure screen or AI key to supply. Cloud is
+currently invite-only with pre-created isolated tenants and Photon lines; automatic public signup
+provisioning is not yet connected. Cloud's optional Telegram connection is not yet available.
 
-1. **Deploy the agent** on Railway from your own copy of this repo, following
-   [ONBOARDING.md § 1](ONBOARDING.md). The primary assisted self-host route uses your own Photon
-   connection and Gemini API key, a `/data` volume and a public domain. Telegram is an alternative;
-   each channel has its own setup requirements in **[Choosing your channel and model](CHANNELS.md)**.
-   **For iMessage, [follow the Photon self-host setup](CHANNELS.md#photon-imessage-and-photo-briefs)**
-   using your own provider connection. It ships in this public runtime; Railway does not allocate an
-   iMessage number. The Mac Bridge is independent of the delivery channel.
-2. **Connect your sources; add your Mac if wanted** — [download Sotto Bridge from Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
-   drag to /Applications, and open the **setup link** printed in your deploy logs — pairing is one
-   click from the `/setup` page it opens. First run asks for an **access code** — the distributed Bridge binary's first-run access is invite-only for now (self-host deployment
-   itself is not), the code is checked on your Mac and never sent anywhere, and if you don't
-   have one you can ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
-   **Already running an older Bridge?** Updating to **1.2.7 or newer** asks your existing install for
-   a code once, and it stops streaming to your cloud until you enter one — nothing else is lost
-   (pairing, Full Disk Access and your settings all survive), and the same
-   [Issues](https://github.com/kothari-nikunj/sotto/issues) link is where you ask for a code.
-   A 3-step wizard in the app covers **Connect → Choose sources → Disk access**, in that
-   order, and nothing is read or sent until you press **Save & Connect** at the end. Connect Google
-   on the same setup page — which also reports your channel's link (and shows the WhatsApp QR if
-   that's your channel).
-3. **Check the automatic first brief** once your channel and a context source are ready. Setup
-   reports preparing, waiting to send, delayed or sent; confirm it appears on your device before
-   requesting another. Progressive history learning is separate: receiver-based self-hosts need a
-   budgeted model proxy, or an explicit `SOTTO_BACKGROUND_UNMETERED=true` opt-in to direct-key
-   background spending. Without either, chat and briefs work but history learning stays held.
-   Check `knowledge/history-state.json` for actual coverage. See [RAILWAY.md](RAILWAY.md).
+**Self-hosted Railway:** Continue with Railway → choose a workspace and create a fresh project →
+enter one Google AI key → configure your Photon iMessage line (the default) or pair a dedicated
+Telegram bot → review charges and create your server. Photon credentials and line setup are manual
+for now. Bridge saves credentials and operation intent in Keychain and resumes the same setup.
+After connecting the Mac, grant Full Disk Access **before** choosing sources, then verify your
+conversation. Both hosting paths require that grant; neither offers a skip action. Selected readers
+start only after source choices are saved.
 
-**Staying updated:** your server checks once a day and, when a newer Sotto is published, says so
-three quiet ways — a line on its `/setup` page, a line on the dashboard, and one line in your next
-brief (once per version, never a separate message). Merge Railway's update PR (or hit **Sync fork**
-on GitHub) and the redeploy is the update, Hermes included. Details:
-**[RAILWAY.md § Staying updated](RAILWAY.md#staying-updated)**.
+New server creation requires a signed Bridge release with a qualified digest-pinned runtime image;
+Railway OAuth additionally needs the registered native client configuration bundled into that
+release. Source implementation is not a released installer or proof of live qualification. Without
+OAuth configuration, API-token setup remains under Advanced. Existing servers can still pair through
+their private setup link. Server upgrades remain separate from Bridge app updates.
 
-**What it costs to run:** Railway ~$5/mo, plus your own Gemini usage — typically **$1–1.5/day**
-with the default models (briefs are the bulk; real-time triage runs on a model that costs pennies).
-No subscription, no per-seat anything.
+Want an AI coding agent to guide setup? Follow
+[`ONBOARDING.md`](ONBOARDING.md#agent-guided-setup). It keeps credentials out of chat and
+separates connection checks from seeing an actual reply and brief on your device.
 
-**Don't have a Mac, or don't want the Bridge?** Sotto still works — briefs from Gmail + Calendar
-alone, no local messages. The Bridge is additive.
+**What it costs to run:** your Railway hosting and model provider usage are billed separately.
+Check their current plans and budgets before deploying. Self-hosting has no Sotto subscription.
+
+Bridge is the guided onboarding surface. Once setup is complete, server-side Gmail and Calendar
+reading continues while your Mac sleeps; selected Mac sources resume when it wakes.
 
 ## The dashboard
 
@@ -117,22 +103,21 @@ Text stays the primary interface; the dashboard is the window.
 
 ## The model
 
-Gemini is the default. The model settings are separate for each layer:
+Gemini runs everything on a supervised install, with the one direct key from your setup config:
 
-- **Briefs, meeting prep, follow-ups and triage** use the shared provider seam. Gemini uses
-  `GOOGLE_AI_API_KEY`; `SOTTO_BRIEF_MODEL=openai/<model>` or `anthropic/<model>` selects another
-  family with its credentials. `SOTTO_TRIAGE_MODEL` configures triage separately. Brief models
-  must meet the context requirement; see [docs/MODELS.md](docs/MODELS.md) for limits and
-  capabilities that still require Gemini. Changing the chat model alone does not change these calls.
-- **The chat layer** (Ask Sotto, nudge replies) — Hermes' model, so Anthropic, OpenAI, Kimi,
-  DeepSeek, xAI and OpenRouter all work with that provider's key and no Sotto code change. One
-  caveat on the cloud container, stated in [CHANNELS.md](CHANNELS.md#switching-the-chat-model).
-- **Web research** — independent of both: set `EXA_API_KEY` and/or `PARALLEL_API_KEY` and attendee
-  research stops going through Gemini at all.
-- **X attendee context** — optional and read-only: the owner's `X_BEARER_TOKEN` lets meeting prep
-  confirm exact handles and pull recent public Posts only for upcoming attendees; an OAuth2
-  `X_USER_ACCESS_TOKEN` + `X_OWNER_USER_ID` also folds in the owner's matching bookmarks. No feed
-  mirror, people-search, Chat decryption, or API sends.
+- **Chat** (Ask Sotto, nudge replies) uses the chat-model id in that config; the runtime accepts
+  only the `google` provider.
+- **Briefs, meeting prep, follow-ups and triage** use the shared provider seam. Its code can also
+  compose with OpenAI or Anthropic models; see [docs/MODELS.md](docs/MODELS.md) for those limits.
+  The supervised launch passes no key for another family, so it composes on Gemini.
+- **Web research** uses Gemini grounding. The research code prefers Exa or Parallel when their keys
+  are present, and the supervised launch does not pass them.
+- **X attendee context** is read-only and optional in the code (exact handles and recent public
+  Posts for upcoming attendees, plus matching bookmarks); it needs X credentials the supervised
+  launch does not pass, so it reports `unconfigured`.
+
+What is fixed and what can be overridden: [CHANNELS.md](CHANNELS.md#switching-the-model) and the
+[environment reference](RAILWAY.md#environment-variables--full-reference).
 
 Every call site, the measured prompt sizes and a five-model comparison: [docs/MODELS.md](docs/MODELS.md).
 
@@ -150,34 +135,56 @@ local material, and the escape hatch) plus how to add a service:
 | Doc | What |
 |---|---|
 | **[ONBOARDING.md](ONBOARDING.md)** | The setup walkthrough (start here) |
-| [docs/AGENT-ONBOARDING.md](docs/AGENT-ONBOARDING.md) | Agent-guided setup for self-hosting or invited Sotto Cloud users |
-| [adapters/hermes/RECOVERY.md](adapters/hermes/RECOVERY.md) | Managed volume migration, model lease continuity, scoped device access and offline tenant restore |
+| [Agent-guided setup](ONBOARDING.md#agent-guided-setup) | Bridge-guided Railway or invited Sotto Cloud setup |
+| [docs/MAINTAINER-RAILWAY-HELPER.md](docs/MAINTAINER-RAILWAY-HELPER.md) | Maintainer-only source-build helper and recovery reference |
+| [tools/RUNTIME-RELEASE.md](tools/RUNTIME-RELEASE.md) | Qualify and publish the immutable runtime artifact before signed Bridge promotion |
+| [docs/BEHAVIOR-INVENTORY.json](docs/BEHAVIOR-INVENTORY.json) | Current local behavior contracts, Telegram limits, deferred work, and separate live-evidence status |
+| [Source-grounded memory experiment](sotto-chief-of-staff/evals/README.md#source-grounded-memory-experiment) | Isolated Dreamer comparison, evidence-binding contracts and explicit live-model qualification |
+| [adapters/sotto/VOLUME.md](adapters/sotto/VOLUME.md) | Tenant volume operations: replacement epoch, model lease continuity and scoped device access (no restore path) |
 | [RAILWAY.md](RAILWAY.md) | Every setting, env var, and troubleshooting table for the cloud deploy |
 | [docs/DATA-FLOW.md](docs/DATA-FLOW.md) | **Where your data goes** — every destination, every file written, how long each stays, and the gaps stated plainly. Read this before installing |
-| [LICENSE](LICENSE) | MIT, for everything in this repo. The Bridge binary is proprietary and explicitly out of scope |
+| [LICENSE](LICENSE) | Sotto source is MIT; external dependencies and model packs retain their own licenses. The Bridge binary is proprietary and explicitly out of scope |
 | [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) | Why you get nudged (or don't): the triage funnel, budgets, quiet hours, and the digest — in plain rules |
 | [docs/MODELS.md](docs/MODELS.md) | What changes if you don't use Gemini: every LLM call site, the measured prompt sizes, a five-model comparison (Gemini · Sonnet · GPT-5.x · Kimi · DeepSeek), and exactly what's missing for each |
+| [History discovery handoff](docs/solutions/first-connect-observation-handoff.md) | Bounded current-work discovery, mute exclusions and synthetic acceptance limits |
+| [Research question premises](docs/solutions/research-question-premises.md) | Preserve source limits in meeting questions and talking points |
 | [docs/BOUNDED-MODEL-WORK.md](docs/BOUNDED-MODEL-WORK.md) | Direct background composition, durable attempt ownership, usage reports and deployment checks |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The runtime map: modules, daemon threads, subprocess boundaries, and shared files on the volume |
+| [Advance meeting preparation](docs/verification/early-meeting-preparation-oct26.md) | Source-backed advance work, safe named prep offers, synthetic evidence and acceptance limits |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Includes the pure calendar/prep projection helper and accepted location receipt ownership. The runtime map: modules, daemon threads, subprocess boundaries, and shared files on the volume |
+| [Shared helper ownership](docs/solutions/shared-helper-ownership.md) | Exact helper policies, canonical constants and source/image import boundaries |
+| [runtime/sotto-chat/README.md](runtime/sotto-chat/README.md) | Supervised TypeScript chat runtime: local checks, explicit credentials, current boundaries and rollout gaps |
+| [runtime/local-reader/README.md](runtime/local-reader/README.md) | Standalone offline HTML extraction foundation; no URL fetch or registered chat tool |
+| [runtime/local-speech/README.md](runtime/local-speech/README.md) | Standalone offline Kokoro synthesis foundation; explicit model provisioning, no channel delivery |
+| [runtime/hosted-speech/README.md](runtime/hosted-speech/README.md) | Gemini/OpenAI transcription and speech using an explicit existing key; awaiting runtime integration |
+| [runtime/browser-harness/README.md](runtime/browser-harness/README.md) | Pinned Browser Harness driver under Mastra; fresh profiles, no cloud key, containment gate before registration |
+| [docs/DOCSEND-COVERAGE.md](docs/DOCSEND-COVERAGE.md) | Page coverage, incomplete reads and legacy DocSend caches |
+| [adapters/sotto/README.md](adapters/sotto/README.md) | The Sotto runtime adapter: what the receiver loads, delivery receipts, fixed managed procedures and channel agreement |
+| [adapters/sotto/SELFHOST.md](adapters/sotto/SELFHOST.md) | Supervised self-host profiles (Photon Cloud, Telegram): the root-private operator file, one-shot `--prepare`, `--run`, and the Railway setup-helper mode |
+| [adapters/sotto/STARTUP-FIXTURE.md](adapters/sotto/STARTUP-FIXTURE.md) | Offline startup fixture: how a private manifest renders the strict Node config and receiver projection |
+| [Runtime capabilities](docs/RUNTIME-CAPABILITIES.md) | Code-checked mounted tools, standalone foundations, channel limits and evidence boundaries |
 | [sotto-chief-of-staff/evals/README.md](sotto-chief-of-staff/evals/README.md) | Developer verification, including the continuous tracking probe and its current gaps |
 | [docs/playground-architecture.html](docs/playground-architecture.html) | **The interactive map** — the same machine, explorable: a layered node map with saved views, a drawer per module, and every number interpolated from the drift-guarded rules island ([and the loops playground](docs/playground-feedback-loops.html)). Open the file, or visit `/static/playground-architecture.html` on your deploy |
-| [LOCAL-SETUP.md](LOCAL-SETUP.md) | Run everything on your Mac instead — no cloud, no hosting bill |
-| **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — Telegram (default) · WhatsApp · iMessage, each with what it costs to set up and how tested it is; plus which model layer needs which key |
+| **[CHANNELS.md](CHANNELS.md)** | **Choosing your channel and model** — Photon iMessage (supported) and the limited Telegram profile, what each needs and how complete it is; plus what the model choice covers |
 | [INTEGRATIONS.md](INTEGRATIONS.md) | Connecting services (Granola, …): the one-click Connect tiles + the four-lane doctrine |
-| [docs/BLUEBUBBLES.md](docs/BLUEBUBBLES.md) | Optional: give Sotto its own iMessage identity |
 | [ONBOARDING.md §If something's off](ONBOARDING.md#if-somethings-off) | Troubleshooting, and removing the Mac app cleanly |
 
 ## For developers
 
-The backend is **host-agnostic**: a portable core (skills + Python pipeline over open standards —
-MCP, agentskills) with thin per-runtime adapters. It runs today on
-[Hermes](https://hermes-agent.nousresearch.com/) and has an [OpenClaw adapter](adapters/openclaw/README.md).
+The backend has a portable core (skills + Python pipeline over MCP and agent skills) with thin
+adapters. The supervised Sotto runtime uses the TypeScript chat service, and the root Dockerfile
+builds that self-host image. No other agent runtime is supported.
 
 | Directory | What |
 |---|---|
 | `sotto-chief-of-staff/` | The shared skill pack + Python pipeline (extraction, knowledge, continuity, voice, relevance and continuous memory) over `$SOTTO_DATA` |
-| `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, first useful look, scheduled delivery, quiet memory work + live triage |
-| `adapters/` | Per-host wiring (Hermes, OpenClaw) — see [adapters/README.md](adapters/README.md) |
+| `runtime/trigger-receiver/` | HTTP receiver: Bridge pairing, first useful look, scheduled delivery, quiet memory work + live triage; `setup_markup.py` owns pure setup markup |
+| [`runtime/sotto-chat/`](runtime/sotto-chat/README.md) | Supervised TypeScript/Chat SDK runtime; the self-host helper builds it from the root Dockerfile and still needs separate live acceptance |
+| [`runtime/local-reader/`](runtime/local-reader/README.md) | Independently installed HTML extraction package; not launched by the supervisor |
+| [`runtime/local-speech/`](runtime/local-speech/README.md) | Independently installed offline speech worker; not launched by the supervisor |
+| [`runtime/hosted-speech/`](runtime/hosted-speech/README.md) | Documentation for hosted speech adapters in sotto-chat; no extra service |
+| [`runtime/browser-harness/`](runtime/browser-harness/README.md) | Independently installed browser driver; not launched by the supervisor |
+| `adapters/` | Runtime wiring: the Sotto adapter, supervisor and bootstraps under `adapters/sotto/` — see [adapters/README.md](adapters/README.md) |
+| `adapters/sotto/tenant_lifecycle.py` | Root supervisor's Linux lifecycle: tenant flock, empty-namespace proof, role launch/stop and replacement epoch; synthetic fixture: `adapters/sotto/test_fixtures/run-lifecycle.sh` |
 | `contracts/` | LocalData JSON Schema + the on-disk data layout |
 
 Cloud and receiver-based self-host use the same backend and skill procedures. The receiver admits
@@ -202,15 +209,10 @@ guards. Tests use synthetic sources and local fixtures; none call paid models or
 Some tests bind a local loopback server. Bridge compilation and macOS integration remain a separate
 platform verification step; backend test success alone does not certify the desktop app.
 
-The Docker build also runs [`check_runtime.py`](runtime/trigger-receiver/check_runtime.py) as
-the managed user in the installed filesystem layout. The same contract runs in both deployment
-modes in the receiver suite: a nonempty scheduled scan must produce a nudge receipt, and morning
-and evening briefs must deliver four photos through the real outbox and adapters. It checks
-missing provider IDs, retry recovery, duplicate suppression, completed effects and disabled nudges.
-Synthetic CLI and loopback sidecar fixtures replace only the external transport; no real messages
-or model calls occur. Regression tests deliberately restore the missing-import and rejected-nudge
-bugs and require the gate to fail. These checks prove our delivery contract, not live provider
-availability or device display. GitHub must separately enable required checks to prevent bypassing
+The root Dockerfile's build also runs the packaged runtime checks: it typechecks and builds the
+chat runtime, loads every packaged skill, validates an offline runtime config, and imports the
+receiver with the five fixed procedures and the Sotto runner fence. These checks prove the
+package, not live provider availability or device display. GitHub must separately enable required checks to prevent bypassing
 the gate at merge time.
 
 The `.in` dependency manifests hold reviewed direct pins. The generated `.txt` files include
@@ -241,16 +243,47 @@ also closes each lock against its manifest; its output states whether that exact
   guarantee. Resolver conflicts and malformed inputs fail verification; only an explicit missing-cache
   diagnostic permits the offline check to be skipped.
 
-These locks cover Sotto's Python dependencies; Hermes manages its own runtime dependencies.
+These locks cover the supervised runtime's Python dependencies; its npm dependencies come from `runtime/sotto-chat/package-lock.json`.
+
+### Local capability foundations
+
+The standalone [reader](runtime/local-reader/README.md) and [speech worker](runtime/local-speech/README.md)
+have separate pinned dependencies and installation instructions. They do not change the supervised
+runtime's model provider, web-read routing, preferences, channel delivery, or deployment image.
+The reader consumes already supplied HTML; URL fetching, Chromium, source admission and browser
+egress policy remain integration work. Speech produces a private WAV artifact from an explicitly
+provisioned model pack; audio preferences, source revocation and delivery receipts remain integration work.
+
+The recommended target is Gemini with one Google model key for chat, image understanding,
+transcription and optional spoken output. The offline worker is an advanced option.
+[Hosted speech](runtime/hosted-speech/README.md) and the
+[chat provider factory](runtime/sotto-chat/README.md#standalone-provider-adapters) are callable
+adapters; protected configuration and incoming-audio/outbox integration remain gated on the
+active owner-runtime migration. [Browser Harness](runtime/browser-harness/README.md) supplies
+browser control under Mastra, not another agent loop. Its alpha upstream package is pinned and
+fixture-tested; container/network containment and Chromium packaging remain release gates.
+
+Run their documented contract checks separately from the shared verification command. Source CI
+checks the reader on the minimum supported Node version and Node 26, and runs the speech contract
+tests on Python 3.12. The public CI runs both foundation contracts too. Contract tests do not certify
+native speech performance or successful audio delivery; the speech README provides an explicit real-model smoke check.
+
+Dependency updates are reviewed changes, never runtime installs. Source Dependabot proposes npm
+updates for the chat runtime and reader, grouping the model framework/adapters and the channel
+adapters. Keep the reader lockfile paired with its manifest. Regenerate the speech worker's own
+hashed lock using its documented command and re-run its provisioned-model smoke before changing a
+native dependency or model pack. Model assets stay outside Git, and their complete checksums and
+license inventory belong to the provisioned pack. Nothing in these foundations implements automatic
+self-host upgrades or activates a paid service.
 
 Release CI and the publisher also run `bash tools/verify-public-image.sh <distribution-tree>`.
 This requires a running Docker daemon and the Buildx plugin. It uses BuildKit with plain progress
 output and loads the verified image locally. Docker Desktop includes Buildx; with Homebrew, run
 `brew install docker-buildx` and follow the plugin setup instructions from `brew info docker-buildx`.
-The first build warms a new cache; subsequent builds reuse it. The image keeps the Node/Photon
-installation and dependency permission changes ahead of app code so routine releases do not
-reinstall dependencies or copy their entire tree into another permission-only layer.
-The build checks the exact files that users deploy, including Hermes compatibility and message delivery. It does not publish an image or start a configured Sotto instance.
+The first build warms a new cache; subsequent builds reuse it. The npm dependency installs run in
+their own build stages from the committed lock file, ahead of app code, so routine releases reuse
+them.
+The build checks the exact files that users deploy: it typechecks and builds the chat runtime, loads every packaged skill and imports the receiver. It does not export or publish an image or start a configured Sotto instance.
 
 (Working in the monorepo? `docs/ADDING-A-SOURCE.md` there covers adding a new Bridge data source —
 it edits Bridge source, so it deliberately doesn't ship in this repo.)
@@ -264,3 +297,5 @@ that keeps your Full Disk Access grant.
 Cloud and self-host use the same shared runtime and skill pack.
 
 Four-photo iMessage briefs, focused meeting backgrounds, and saved text on request: [visual briefs, privacy, and testing](docs/VISUAL-BRIEFS.md).
+
+Run `bin/check` from the repository root for the same full gate. The shared gate also checks C90 complexity at 15 and PLR rules, Vulture findings at confidence 80, and source file byte/line limits. Existing file/rule exemptions can hide new occurrences of that rule in the same file. Static size caps allow regrowth up to their recorded values after a shrink; tighten caps manually when appropriate. `bin/check --python /absolute/path/to/qualified/python` supports CI environments that installed the pinned development lock outside `.venv`.

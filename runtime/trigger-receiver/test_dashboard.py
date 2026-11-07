@@ -11,8 +11,8 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
+import sqlite3
 import sys
 import threading
 import time
@@ -42,6 +42,10 @@ def _load_receiver():
                                                   os.path.join(HERE, "receiver.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    # Fixture source rows are Gmail-backed; production still captures live authority.
+    m._runtime_source_authority = lambda: {'complete': True, 'revision': 'fixture-grants',
+        'bridge_sources': ['imessage'], 'google_sources': ['gmail'], 'connector_sources': []}
+    m._owner_continuity()  # Resolve packaged readers before write-CLI tests stub script discovery.
     return m
 
 
@@ -139,7 +143,7 @@ Opened a Lisbon office.
 
 def _loop_md(anchor, status, created, surfaced=2, meeting="", action_type="reply"):
     meet = f'meeting_time: "{meeting}"\n' if meeting else ""
-    return (f"---\nanchor_key: \"{anchor}\"\naction_type: {action_type}\nchannel: email\n"
+    return (f"---\nanchor_key: \"{anchor}\"\naction_type: {action_type}\nchannel: email\nsource: gmail\n"
             f"contact_name: Sarah Chen\nstatus: {status}\ncreated_at: {created}\n"
             f"times_surfaced: {surfaced}\nsummary: \"Reply about the deck\"\n{meet}---\n")
 
@@ -261,7 +265,7 @@ def _login(base):
     return {"Cookie": _session_cookie(hdrs)}
 
 
-API_PATHS = ("/api/session", "/api/overview", "/api/loops", "/api/briefs",
+API_PATHS = ("/api/client-mcp", "/api/session", "/api/overview", "/api/loops", "/api/briefs",
              "/api/people", "/api/people/sarah-chen", "/api/learned",
              "/api/calendar", "/api/research", "/api/ledger")
 
@@ -666,6 +670,11 @@ def test_api_overview_shape(tmp_path):
         code, body, _ = _get(base, "/api/overview", headers=cookie)
         assert code == 200
         ov = json.loads(body)
+        assert ov["knowledge_repair"] == "clear"
+        _write(str(tmp_path / "knowledge/.journal-repair/private-record.json"), "private fixture")
+        report = _get(base, "/api/overview", headers=cookie)[1]
+        assert json.loads(report)["knowledge_repair"] == "needs_repair"
+        assert "private-record" not in report and "private fixture" not in report
         assert ov["date"] == today
         assert ov["briefs_today"][0]["kind"] == "morning"
         assert ov["briefs_today"][0]["status"] == "sent"
@@ -721,6 +730,127 @@ def test_source_diagnostics_require_dashboard_auth_and_never_reach_public_health
         assert json.loads(body)["source_health"] == {"status": "unavailable", "sources": []}
     finally:
         srv.shutdown()
+
+
+def test_history_learning_is_authenticated_metadata_only_and_consent_filtered(tmp_path):
+    m, srv, base = _server(tmp_path)
+    secret = 'PRIVATE-checkpoint-content-and-token'
+    _write(os.path.join(str(tmp_path), 'knowledge', 'history-state.json'), json.dumps({
+        'last_run': secret, 'receipt': {'history': secret}, 'sources': {
+            'imessage': {'last_success': '2026-10-08T11:30:00.123-07:00', 'complete': False,
+                         'pages': 3, 'reviewed': 419, 'error': secret,
+                         'error_code': 'bridge_offline', 'error_stage': 'fetch',
+                         'cursor': secret, 'rejected_request_revision': secret},
+            'whatsapp': {'last_success': secret, 'complete': 'yes', 'pages': True,
+                         'reviewed': -1, 'error_code': secret, 'error_stage': secret},
+            'gmail': {'pages': 888, 'reviewed': 999, 'error_code': 'rate_limited'},
+            secret: {'pages': 1}}}))
+    m.DASHBOARD.HOOKS['source_allowed'] = lambda source: source in ('imessage', 'whatsapp')
+    try:
+        assert _get(base, '/api/overview')[0] == 401
+        assert 'history_learning' not in _get(base, '/health')[1]
+        cookie = _login(base)
+        code, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert code == 200
+        result = json.loads(body)['history_learning']
+        assert secret not in json.dumps(result)
+        for row in result['sources']:
+            if row['checkpoint'] == 'present':
+                assert row.pop('coverage')['review_scope'] == 'unknown'
+        assert result == {'status': 'available', 'sources': [
+            {'source': 'imessage', 'checkpoint': 'present',
+             'last_success': '2026-10-08T18:30:00.123000+00:00', 'complete': False,
+             'pages': 3, 'reviewed': 419, 'error_code': 'bridge_offline',
+             'error_stage': 'fetch', 'rejected_request': True},
+            {'source': 'whatsapp', 'checkpoint': 'present', 'last_success': None,
+             'complete': None, 'pages': None, 'reviewed': None,
+             'error_code': 'other', 'error_stage': 'other', 'rejected_request': False},
+            {'source': 'gmail', 'checkpoint': 'withheld'}]}
+        def authority_failed(source):
+            raise OSError(secret)
+        m.DASHBOARD.HOOKS['source_allowed'] = authority_failed
+        result = json.loads(_get(base, '/api/overview', headers=cookie)[1])['history_learning']
+        assert result['sources'] == [{'source': source, 'checkpoint': 'withheld'}
+                                     for source in ('imessage', 'whatsapp', 'gmail')]
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize('raw,status', [
+    (None, 'absent'), (b'{broken', 'unknown'), (b'[]', 'unknown'),
+    (b'{"sources": []}', 'unknown'), (b'\xff', 'unknown'), (b'{}', 'available'),
+])
+def test_history_learning_missing_or_malformed_checkpoint_fails_soft(tmp_path, monkeypatch, raw, status):
+    monkeypatch.setitem(_dash.HOOKS, 'data_root', lambda: str(tmp_path))
+    monkeypatch.setitem(_dash.HOOKS, 'source_allowed', lambda source: True)
+    if raw is not None:
+        path = tmp_path / 'knowledge' / 'history-state.json'
+        path.parent.mkdir()
+        path.write_bytes(raw)
+    result = _dash._history_learning()
+    assert result == {'status': status, 'sources': [
+        {'source': source, 'checkpoint': 'unknown' if status == 'unknown' else 'absent'}
+        for source in ('imessage', 'whatsapp', 'gmail')]}
+
+
+def test_history_learning_bad_source_row_and_unbounded_values_are_unknown(tmp_path, monkeypatch):
+    monkeypatch.setitem(_dash.HOOKS, 'data_root', lambda: str(tmp_path))
+    monkeypatch.setitem(_dash.HOOKS, 'source_allowed', lambda source: True)
+    path = tmp_path / 'knowledge' / 'history-state.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'sources': {'imessage': [], 'whatsapp': {
+        'last_success': '0001-01-01T00:00:00+23:00', 'pages': 10**20,
+        'reviewed': 2.5, 'error': 'private error without a code',
+        'error_stage': 'local_learning'}}}))
+    result = _dash._history_learning()
+    assert result['sources'][0] == {'source': 'imessage', 'checkpoint': 'unknown'}
+    row = result['sources'][1]
+    assert row['last_success'] is None and row['pages'] is None and row['reviewed'] is None
+    assert row['error_code'] == 'other'
+    assert row['error_stage'] == 'local_learning'
+
+
+def test_dashboard_learning_uses_shared_safe_failure_category(tmp_path, monkeypatch):
+    monkeypatch.setitem(_dash.HOOKS, 'data_root', lambda: str(tmp_path))
+    monkeypatch.setitem(_dash.HOOKS, 'source_allowed', lambda source: source == 'gmail')
+    path = tmp_path / 'knowledge/history-state.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'sources': {'gmail': {
+        'error': 'HTTPError', 'error_code': 'provider_request_rejected',
+        'error_stage': 'memory_extraction', 'http_status': 400,
+        'provider_failure': 'unsupported_model_settings',
+        'last_read_success': '2026-10-23T00:00:00Z',
+        'last_success': '2026-10-22T00:47:00Z',
+        'last_attempt': {'status': 'failed', 'stage': 'memory_extraction'},
+        'cursor': 'PRIVATE', 'provider_body': 'PRIVATE'}}}))
+    result = _dash._history_learning()
+    row = next(item for item in result['sources'] if item['source'] == 'gmail')
+    assert row['error_code'] == 'provider_request_rejected'
+    assert row['coverage']['latest_attempt']['category'] == 'unsupported_model_settings'
+    assert row['coverage']['last_extraction_success_at'] == '2026-10-22T00:47:00+00:00'
+    assert row['coverage']['last_read_success_at'] == '2026-10-23T00:00:00+00:00'
+    assert 'PRIVATE' not in json.dumps(result)
+
+
+def test_history_traversal_completion_does_not_hide_excluded_or_truncated_learning():
+    window = {'since': 1791936000, 'until': 1792022400, 'complete': True,
+              'initial_complete': True, 'pages': 3, 'window_page_base': 2,
+              'observation_totals': dict(pages=1, rows=10, eligible=10, selected=10,
+                                         skipped=0, omitted=0, truncated=0, rejected_people=0)}
+    coverage = _dash._history_window_coverage(window)
+    assert coverage['review_scope'] == 'reviewed_window'
+    assert coverage['window']['since'] == '2026-10-14T00:00:00+00:00'
+    for key in ('skipped', 'omitted', 'truncated', 'rejected_people'):
+        partial = {**window, 'observation_totals': {**window['observation_totals'], key: 1}}
+        assert _dash._history_window_coverage(partial)['review_scope'] == 'partial'
+    excluded = {**window, 'excluded_pages': {'private-cursor': {'reason': 'private text'}}}
+    result = _dash._history_window_coverage(excluded)
+    assert result['review_scope'] == 'partial' and result['excluded_pages'] == 1
+    assert 'private' not in json.dumps(result)
+    assert _dash._history_window_coverage({**window, 'pages': 5})['review_scope'] == 'unknown'
+    assert _dash._history_window_coverage({**window, 'since': None})['review_scope'] == 'unknown'
+    assert _dash._history_window_coverage({**window, 'since': window['until'] + 1})['review_scope'] == 'unknown'
+    assert _dash._history_window_coverage({**window, 'complete': False})['review_scope'] == 'in_progress'
 
 
 def test_overview_brief_state_prefers_latest_attempt_and_outbox_acceptance(tmp_path, monkeypatch):
@@ -803,13 +933,37 @@ def test_api_loops_active_only_newest_first(tmp_path):
         assert not any(l["anchor_key"].startswith("calendar:") for l in loops)
         top = loops[0]
         assert top == {"anchor_key": "email:reply:sarah", "action_type": "reply",
-                       "channel": "email", "contact_name": "Sarah Chen", "status": "waiting",
+                       "channel": "email", "contact_name": "Sarah Chen",
+                       "contact_identifier": "", "canonical_id": "", "ask": "",
+                       "status": "waiting",
                        "created_at": "2026-08-04", "times_surfaced": 0,
                        "summary": "Reply about the deck", "meeting_time": None,
-                       "deadline": None, "source": None,
+                       "deadline": None, "source": "gmail",
                        "chased_count": 0, "last_chased_at": None, "chase_after": None,
                        "chased_out": False}
         assert loops[1]["meeting_time"] == "Tomorrow 3pm"
+    finally:
+        srv.shutdown()
+
+
+def test_api_loops_owner_session_projects_existing_identity_and_ask_without_writing(tmp_path):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    path = os.path.join(str(tmp_path), 'knowledge', 'continuity', 'thread_abc.md')
+    _write(path, _loop_md('thread:abc', 'open', '2026-08-01').replace(
+        'contact_name: Sarah Chen\n',
+        'contact_name: Sarah Chen\ncontact_identifier: sarah@example.test\n'
+        'canonical_id: person-sarah\nask: Send the signed deck\n'))
+    before = open(path, 'rb').read()
+    try:
+        assert _get(base, '/api/loops')[0] == 401
+        cookie = _login(base)
+        code, body, _headers = _get(base, '/api/loops', headers=cookie)
+        assert code == 200
+        row = next(row for row in json.loads(body)['loops'] if row['anchor_key'] == 'thread:abc')
+        assert (row['contact_identifier'], row['canonical_id'], row['ask']) == (
+            'sarah@example.test', 'person-sarah', 'Send the signed deck')
+        assert open(path, 'rb').read() == before
     finally:
         srv.shutdown()
 
@@ -818,7 +972,7 @@ def test_api_loops_uses_accepted_delivery_count_not_legacy_capture_count(tmp_pat
     m, srv, base = _server(tmp_path)
     _fixtures(str(tmp_path))
     trusted = ('---\nanchor_key: "trusted"\naction_type: reply\nchannel: email\n'
-               'contact_name: Jordan\nstatus: open\ncreated_at: 2026-08-05\n'
+               'source: gmail\ncontact_name: Jordan\nstatus: open\ncreated_at: 2026-08-05\n'
                'times_surfaced: 99\nsummary: "Send the proposal"\n'
                'delivery_surface:\n  schema: 1\n  delivery_keys:\n    - receipt-a\n'
                '    - receipt-b\n    - receipt-a\n---\n')
@@ -898,7 +1052,7 @@ def test_api_loops_exposes_chase_state(tmp_path):
     m, srv, base = _server(tmp_path)
     _fixtures(str(tmp_path))
     chase = ('---\nanchor_key: "imessage:waiting_on:id:5551112222"\naction_type: waiting_on\n'
-             'channel: imessage\ncontact_name: Maya Iyer\nstatus: open\ncreated_at: 2026-08-05\n'
+             'channel: imessage\nsource: imessage\ncontact_name: Maya Iyer\nstatus: open\ncreated_at: 2026-08-05\n'
              'times_surfaced: 3\nsummary: "the signed contract"\nchased_count: 2\n'
              'last_chased_at: 2026-08-08\nchase_after: 2026-08-11\n---\n')
     _write(os.path.join(str(tmp_path), "knowledge", "continuity", "wait_maya.md"), chase)
@@ -1437,8 +1591,9 @@ ap.add_argument("--skip-gmail", action="store_true")
 ap.add_argument("--cal-out")
 ap.add_argument("--gmail-out")
 ap.add_argument("--source-results-out")
+ap.add_argument("--window-days", type=int)
 a, extra = ap.parse_known_args()
-assert a.skip_gmail and a.cal_out and not extra
+assert a.skip_gmail and a.cal_out and a.window_days == 2 and not extra
 with open({count!r}, "a") as f:
     f.write("x")
 with open({events!r}) as f:
@@ -1462,7 +1617,10 @@ def _stub_gather(m, tmp_path, events=None, source=None):
     _write(ev_path, json.dumps(events if events is not None else []))
     fake = os.path.join(str(tmp_path), "fake_gather_google.py")
     _write(fake, source if source is not None else FAKE_GATHER.format(count=count, events=ev_path))
-    m._find_sotto_script = lambda *rel: fake if rel[-1] == "gather_google.py" else None
+    # Replace only the external gather boundary. Calendar attendee joins use the canonical
+    # person projection, whose shared correction/permission helpers must remain discoverable.
+    find_script = m._find_sotto_script
+    m._find_sotto_script = lambda *rel: fake if rel[-1] == "gather_google.py" else (find_script(*rel) if rel[:2] in (('_shared', 'knowledge'), ('_shared', 'lib')) else None)
     return count
 
 
@@ -1487,7 +1645,7 @@ def _raw_cal_events(today, tomorrow, later):
          "attendees": []},
         {"id": "e2", "summary": "Coffee with Bob", "start": f"{tomorrow}T15:00:00-07:00",
          "end": "", "location": "", "description": "", "meetingLink": "", "attendees": []},
-        {"id": "e1", "summary": "Board sync", "start": f"{today}T09:00:00-07:00",
+        {"id": "e1", "iCalUID": "board@google.com", "summary": "Board sync", "start": f"{today}T09:00:00-07:00",
          "end": f"{today}T10:00:00-07:00", "location": "Zoom HQ",
          "description": "PRIVATE-agenda-notes", "meetingLink": "https://meet.google.com/abc",
          "attendees": [{"email": "sarah@acme.com", "displayName": "Sarah Chen",
@@ -1891,38 +2049,6 @@ def _cal_file(tmp_path):
     return os.path.join(str(tmp_path), "cache", "calendar_today.json")
 
 
-def test_calendar_refresh_file_rides_the_dashboard_s_fetch(tmp_path):
-    """One gather serves both consumers: a dashboard hit warms the cache, and the refresh thread's
-    work (run inline) writes calendar_today.json from THAT snapshot — no second fork inside the
-    TTL, and the file carries the belief's generated_at, not the write's."""
-    m, srv, base = _server(tmp_path)
-    _fixtures(str(tmp_path))
-    today, tomorrow, later = _cal_dates(m)
-    count = _stub_gather(m, tmp_path, _raw_cal_events(today, tomorrow, later))
-    try:
-        cookie = _login(base)
-        cal = json.loads(_get(base, "/api/calendar", headers=cookie)[1])
-        assert cal["cached"] is False and _gather_calls(count) == 1
-        assert m.CALCACHE.refresh_once() is True
-        assert _gather_calls(count) == 1                  # single flight: the SAME fetch
-        data = json.load(open(_cal_file(tmp_path)))
-        assert data["date"] == today
-        assert data["refresh_secs"] == m.CALCACHE.REFRESH_SECS_DEFAULT
-        assert data["generated_at"] == cal["generated_at"]
-        # times + a count, never people; tomorrow's event is not "today"
-        assert data["events"] == [{"summary": "Board sync",
-                                   "start": f"{today}T09:00:00-07:00",
-                                   "end": f"{today}T10:00:00-07:00",
-                                   "attendees": 2, "all_day": False, "id": "e1"}]
-        assert "sarah@acme.com" not in json.dumps(data)
-        # and the reverse direction: a thread refresh warms the endpoint
-        m.CALCACHE._CAL_CACHE.update({"ts": 0.0, "value": None})
-        assert m.CALCACHE.refresh_once() is True
-        assert _gather_calls(count) == 2
-        cal2 = json.loads(_get(base, "/api/calendar", headers=cookie)[1])
-        assert cal2["cached"] is True and _gather_calls(count) == 2
-    finally:
-        srv.shutdown()
 
 
 def test_calendar_cache_is_single_flight_under_concurrency(tmp_path):
@@ -2752,6 +2878,74 @@ def test_prefs_edit_only_stated_rules_and_preserve_history(tmp_path):
         srv.shutdown()
 
 
+def test_overview_feedback_is_authenticated_and_failure_does_not_block(tmp_path, monkeypatch):
+    m, srv, base = _server(tmp_path)
+    try:
+        assert _get(base, '/api/overview')[0] == 401
+        cookie = _login(base)
+        m.DASHBOARD.HOOKS['feedback'] = lambda: {'available': False}
+        code, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert code == 200
+        assert json.loads(body)['feedback'] == {'available': False}
+        def failed():
+            raise TimeoutError('private provider error')
+        m.DASHBOARD.HOOKS['feedback'] = failed
+        code, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert code == 200
+        assert json.loads(body)['feedback'] == {'available': False}
+        assert 'private provider error' not in body
+        assert 'feedback' not in json.loads(_get(base, '/health')[1])
+        # The real receiver hook reads both observations together, without a second probe.
+        from types import SimpleNamespace
+        calls = []
+        observation = {'feedback': {'available': False}, 'runtime_health': {
+            'status': 'observed', 'ready': True, 'provider_lifecycle': 'active',
+            'provider_connection': 'not_observed', 'feedback_status': 'no_fresh_turn'}}
+        def observe():
+            calls.append('health')
+            return observation
+        monkeypatch.setattr(m, '_runtime_adapter', lambda: SimpleNamespace(runtime_observation=observe))
+        assert _get(base, '/api/overview')[0] == 401
+        assert calls == []
+        code, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert code == 200 and calls == ['health']
+        assert json.loads(body)['feedback'] == {'available': False}
+        assert json.loads(body)['runtime_health'] == observation['runtime_health']
+        public = json.loads(_get(base, '/health')[1])
+        assert 'runtime_health' not in public and calls == ['health']
+        observation['runtime_health'] = {'status': 'read_failed'}
+        assert json.loads(_get(base, '/api/overview', headers=cookie)[1])['runtime_health'] == {'status': 'read_failed'}
+        # Real adapter sanitizer through the receiver's authenticated hook.
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location('task_diagnostic_adapter',
+            Path(__file__).resolve().parents[2] / 'adapters' / 'sotto' / 'runtime_api.py')
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        raw = {'runtime': 'sotto', 'ready': True, 'providerLifecycle': 'active',
+               'providerConnection': 'not_observed', 'feedback': {'available': False},
+               'taskToolDiagnostics': {'events': [{'tool': 'owner_task_close',
+                   'status': 'needs_selection', 'error': 'none'}], 'completedAtMs': 1791450000000}}
+        monkeypatch.setattr(adapter, '_client', lambda timeout: SimpleNamespace(
+            call=lambda *a, **kw: SimpleNamespace(ok=True, value=raw)))
+        monkeypatch.setattr(m, '_runtime_adapter', lambda: adapter)
+        projected = json.loads(_get(base, '/api/overview', headers=cookie)[1])['runtime_health']
+        assert projected['task_tool_diagnostics'] == {'events': raw['taskToolDiagnostics']['events'],
+                                                      'completed_at_ms': 1791450000000}
+        assert 'runtime_health' not in json.loads(_get(base, '/health')[1])
+        assert _get(base, '/api/overview')[0] == 401
+        raw['taskToolDiagnostics']['events'][0]['private_arg'] = 'PRIVATE'
+        body = _get(base, '/api/overview', headers=cookie)[1]
+        assert 'task_tool_diagnostics' not in json.loads(body)['runtime_health']
+        assert 'PRIVATE' not in body
+        raw['taskToolDiagnostics']['events'] = []
+        assert json.loads(_get(base, '/api/overview', headers=cookie)[1])['runtime_health']['task_tool_diagnostics']['events'] == []
+
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_person_facts_keep_wrapped_yaml_text_and_quotes():
     import yaml
     values = ['Has a career break and is evaluating roles in areas such as program management and operations.',
@@ -2819,3 +3013,175 @@ def test_person_auto_importance_is_separate_from_manual_override(tmp_path, monke
     assert result['importance']['tier'] == 'vvip'
     assert result['controls']['vip'] is False
     assert calls[0]['canonical_id'] == 'c_a8f3e2'
+
+
+def test_receiver_person_importance_uses_original_shared_classifier(tmp_path):
+    from datetime import timedelta
+    m = _load_receiver()
+    m.DATA = str(tmp_path)
+    _write(str(tmp_path / 'knowledge/people/c_a8f3e2.md'), PERSON_MD)
+    days = [(datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
+            for i in range(28)]
+    history = {'c_a8f3e2': {'name': 'Sarah Chen', 'importance_evidence': {
+        'active_days': days, 'sent_days': days, 'received_days': days}}}
+    path = tmp_path / 'knowledge/relationship_state.json'
+    path.write_text(json.dumps({'history': history}))
+    original = path.read_bytes()
+    result = m.DASHBOARD.api_person('c_a8f3e2')
+    assert result['importance']['tier'] == 'vvip'
+    assert result['importance']['active_days'] == 28
+    assert result['controls']['vip'] is False
+    assert path.read_bytes() == original
+
+
+def test_loops_and_overview_share_current_full_source_union(tmp_path):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    m._owner_continuity()  # Exercise the same validated package loader as the hook.
+    from ledger_provenance import digest_frontmatter
+    import yaml
+    directory = tmp_path / 'knowledge' / 'continuity'
+    owner = {'anchor_key': 'manual:owner', 'action_type': 'reply', 'channel': 'manual',
+             'source': 'user_added', 'source_thread_id': 'manual:owner', 'status': 'open',
+             'created_at': '2026-08-07', 'summary': 'Owner task'}
+    owner['content_provenance'] = {'version': 1, 'kind': 'owner', 'sources': [],
+                                   'digest': digest_frontmatter(owner)}
+    _write(str(directory / 'owner.md'), '---\n' + yaml.safe_dump(owner) + '---\n')
+    _write(str(directory / 'mixed.md'), _loop_md('mixed', 'parked', '2026-08-07').replace(
+        'source: gmail\n', 'source: gmail\nsource_refs: [{sourceType: granola, sourceId: meeting-1}]\n'))
+    _write(str(directory / 'unknown.md'), _loop_md('unknown', 'open', '2026-08-08').replace('source: gmail\n', ''))
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    try:
+        cookie = _login(base)
+        def read():
+            status, body, _ = _get(base, '/api/loops', headers=cookie)
+            assert status == 200
+            return json.loads(body)
+        # Gmail grant cannot authorize a row that also contains Granola content.
+        rows = read()
+        assert {r['anchor_key'] for r in rows['loops']} == {'manual:owner', 'email:reply:sarah', 'thread:abc'}
+        assert rows['parked'] == []
+        m._runtime_source_authority = lambda: {'complete': True, 'revision': 'revoked',
+            'bridge_sources': [], 'google_sources': [], 'connector_sources': []}
+        rows = read()
+        assert [r['anchor_key'] for r in rows['loops']] == ['manual:owner']
+        assert rows['parked'] == []
+        status, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert status == 200 and json.loads(body)['loops_active'] == 1
+        assert before == {p.name: p.read_bytes() for p in directory.iterdir()}
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize('failure', ['incomplete', 'changed', 'missing_hook', 'unsafe_file'])
+def test_loop_projection_uncertainty_fails_closed(tmp_path, failure):
+    m, srv, base = _server(tmp_path)
+    _fixtures(str(tmp_path))
+    calls = iter(['before', 'after'])
+    if failure == 'incomplete':
+        m._runtime_source_authority = lambda: {'complete': False, 'revision': None}
+    elif failure == 'changed':
+        m._runtime_source_authority = lambda: {'complete': True, 'revision': next(calls),
+            'bridge_sources': [], 'google_sources': ['gmail'], 'connector_sources': []}
+    elif failure == 'missing_hook':
+        del m.DASHBOARD.HOOKS['permitted_loop_rows']
+    else:
+        (tmp_path / 'knowledge' / 'continuity' / 'unsafe.md').symlink_to('/dev/null')
+    try:
+        cookie = _login(base)
+        status, body, _ = _get(base, '/api/loops', headers=cookie)
+        assert status == 503 and json.loads(body) == {'error': 'unreadable'}
+        assert 'Sarah' not in body and 'deck' not in body
+        status, body, _ = _get(base, '/api/overview', headers=cookie)
+        assert status == 200 and json.loads(body)['loops_active'] is None
+    finally:
+        srv.shutdown()
+
+
+def test_loop_projection_preserves_unquoted_yaml_dates_and_chronology(tmp_path):
+    m = _load_receiver()
+    m.DATA = str(tmp_path)
+    directory = tmp_path / 'knowledge' / 'continuity'
+    _write(str(directory / 'earlier.md'), _loop_md('earlier', 'open', '2026-08-01'))
+    _write(str(directory / 'later.md'), '''---
+anchor_key: later
+action_type: reply
+source: gmail
+channel: email
+status: open
+created_at: 2026-08-04
+deadline: 2026-08-20
+last_chased_at: 2026-08-08
+chase_after: 2026-08-11
+meeting_time: 2026-08-12T09:00:00+00:00
+---
+''')
+    rows = m.DASHBOARD.api_loops()['loops']
+    assert [row['anchor_key'] for row in rows] == ['later', 'earlier']
+    assert {field: rows[0][field] for field in (
+        'created_at', 'deadline', 'last_chased_at', 'chase_after', 'meeting_time')} == {
+            'created_at': '2026-08-04', 'deadline': '2026-08-20',
+            'last_chased_at': '2026-08-08', 'chase_after': '2026-08-11',
+            'meeting_time': '2026-08-12T09:00:00+00:00'}
+
+
+def test_calendar_settings_surface_requires_session_csrf_and_calls_existing_writer(tmp_path, monkeypatch):
+    m, srv, base = _server(tmp_path)
+    saved = {'mode':'all','calendar_ids':[], 'needs_reselection':False}
+    calls = []
+    def settings(value=None):
+        if value is not None:
+            calls.append(value)
+            saved.update(value)
+        return saved
+    monkeypatch.setattr(m, '_google_calendar_settings', settings)
+    body = {'mode':'selected','calendar_ids':['primary','team@group']}
+    try:
+        assert _get(base, '/api/calendar-settings')[0] == 401
+        assert _post_json(base, '/api/calendar-settings', body)[0] == 401
+        cookie, authed = _login_with_csrf(base)
+        assert _post_json(base, '/api/calendar-settings', body, headers=cookie)[0] == 403
+        assert calls == []
+        code, raw, _ = _post_json(base, '/api/calendar-settings', body, headers=authed)
+        assert code == 200 and json.loads(raw)['calendar_ids'] == body['calendar_ids']
+        assert calls == [body]
+        assert json.loads(_get(base, '/api/calendar-settings', headers=cookie)[1])['mode'] == 'selected'
+    finally:
+        srv.shutdown()
+
+
+def test_calendar_projection_excludes_internal_policy_and_identity_markers(monkeypatch):
+    import dashboard
+    event = {"summary": "Visible meeting", "start": "2026-10-16T12:00:00Z", "attendees": [],
+             "_active_participation": False, "_owner_participates": False,
+             "_copy_ids": ["private-copy"], "_original_start": "private-occurrence",
+             "_id": "private-id", "_uid": "private-uid"}
+    monkeypatch.setitem(dashboard.HOOKS, "calendar_snapshot", lambda: {"events": [event]})
+    monkeypatch.setattr(dashboard, "_enrich_calendar_events", lambda rows: rows)
+    assert dashboard.api_calendar()["events"] == [{k: v for k, v in event.items() if not k.startswith("_")}]
+    assert event["_active_participation"] is False
+
+
+def test_client_mcp_diagnostics_requires_owner_session(tmp_path):
+    m, srv, base = _server(tmp_path)
+    try:
+        for headers in ({}, {'Authorization': 'Bearer bearer-tok'}):
+            assert _get(base, '/api/client-mcp', headers=headers)[0] == 401
+        # Traverse the real HTTP route and receiver hook with stderr discarded.
+        token, _ = m.CLIENT_MCP.create_grant(str(tmp_path), 'test client', ['sotto_source_status'], 1)
+        m.CLIENT_MCP.print = lambda *a, **k: None
+        payload = json.dumps({'jsonrpc': '2.0', 'id': 'private-id', 'method': 'ping'}).encode()
+        code, _, _ = _post(base, '/client-mcp', payload,
+                          headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
+                                   'Accept': 'application/json, text/event-stream'})
+        assert code == 200
+        code, body, headers = _get(base, '/api/client-mcp', headers=_login(base))
+        assert code == 200 and 'no-store' in headers['Cache-Control']
+        result = json.loads(body)
+        assert result['retention'] == 'current_process'
+        assert len(result['requests']) == 1
+        assert result['requests'][0]['method'] == 'ping'
+        assert result['requests'][0]['outcome'] == 'ok'
+        assert 'private-id' not in body and token not in body
+    finally:
+        srv.shutdown()

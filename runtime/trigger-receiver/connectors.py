@@ -42,6 +42,8 @@ import fcntl
 import secrets
 import tempfile
 import time
+from pathlib import Path
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,28 +69,13 @@ SERVICES = {
 # These rows are READ-ONLY on purpose: the key lives in the host's environment (Railway's own
 # encrypted store), and nothing in this process writes one to the volume.
 #
-# This table mirrors `_shared/scripts/web_research.py`'s KEY_ENV + CAPABILITIES, which is the real
-# provider ladder. The receiver image cannot import the skills tree, so — exactly like keys.py and
-# RELATION_SENTENCE — it is duplicated ONCE and guarded: tests/test_docs_drift.py fails the suite
-# if the two ever disagree.
-KEY_PROVIDERS = {
-    "exa": {"label": "Exa", "env": "EXA_API_KEY",
-            "does": "web search, and deep research when Parallel isn't set"},
-    "parallel": {"label": "Parallel", "env": "PARALLEL_API_KEY",
-                 "does": "deep research (first choice when set)"},
-    "browseruse": {"label": "Browser Use Cloud", "env": "BROWSER_USE_API_KEY",
-                   "does": "a real hosted browser for JS-heavy link reads — their cloud sees the "
-                           "page; read-only, never your logins"},
-    "gemini": {"label": "Gemini grounding", "env": "GOOGLE_AI_API_KEY",
-               "does": "the built-in fallback for the others — already set if briefs work"},
-}
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from shared_lib import load_shared_lib  # noqa: E402
 
-# Per capability, the providers that could answer it, in precedence order. First one with a key wins.
-CAPABILITIES = {
-    "web_search": ("exa", "gemini"),
-    "deep_research": ("parallel", "exa", "gemini"),
-    "fetch_url": ("exa", "gemini", "browseruse"),
-}
+_RESEARCH_PROVIDERS = load_shared_lib('research_providers', anchor=__file__)
+KEY_PROVIDERS = _RESEARCH_PROVIDERS.KEY_PROVIDERS
+CAPABILITIES = _RESEARCH_PROVIDERS.CAPABILITIES
 
 DISCOVERY_TTL_SECS = 24 * 3600   # re-discover daily; providers move endpoints rarely but do
 PENDING_TTL_SECS = 10 * 60       # an authorize leg older than this is dead — sweep it
@@ -146,7 +133,7 @@ def _pending_dir() -> str:
     return os.path.join(_connectors_dir(), ".pending")
 
 
-def write_text(path: str, text: str, mode: int = 0o600) -> None:
+def write_text(path: str, text: str, mode: int = 0o600, *, durable: bool = False) -> None:
     """THE atomic write for the whole receiver image: tmp file at `mode`, then os.replace — a crash
     mid-write can't corrupt the destination, and the default 0600 means the volume never holds a
     world-readable file. write_json below is this plus a serializer; retention.py reaches it as
@@ -160,7 +147,16 @@ def write_text(path: str, text: str, mode: int = 0o600) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             os.fchmod(f.fileno(), mode)
             f.write(text)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
+        if durable:
+            directory = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -169,11 +165,12 @@ def write_text(path: str, text: str, mode: int = 0o600) -> None:
         raise
 
 
-def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None) -> None:
+def write_json(path: str, obj, mode: int = 0o600, indent: int | None = None,
+               *, durable: bool = False) -> None:
     """THE atomic JSON write for the whole receiver image (receiver.py, dashboard.py and calcache.py
     reach it as CONNECTORS.write_json / HOOKS["write_json"]). Callers that want a human-diffable
     file pass indent=2."""
-    write_text(path, json.dumps(obj, indent=indent), mode)
+    write_text(path, json.dumps(obj, indent=indent), mode, durable=durable)
 
 
 LOCK_SUFFIX = ".lock"   # MUST match _shared/lib/jsonstore.LOCK_SUFFIX — asserted by test_docs_drift
@@ -428,31 +425,55 @@ def start_auth(service: str, redirect_uri: str) -> str:
     svc = SERVICES.get(service)
     if not svc:
         raise ConnectorError("config", f"unknown service '{service}'")
-    disc = discover(service)
-    client_id = ensure_client(service, redirect_uri, disc)
-    state, verifier = create_pending(service)
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code_challenge": pkce_challenge(verifier),
-        "code_challenge_method": "S256",
-        "state": state,
-    }
-    if disc.get("supports_resource"):
-        params["resource"] = svc["mcp_url"]   # RFC 8707 — bind the token to the MCP resource
-    return disc["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
+    # Serialize pending creation with callback completion and disconnect. If disconnect wins
+    # after discovery starts, it must also invalidate the state this request would otherwise add.
+    with file_lock(token_path(service)):
+        disc = discover(service)
+        client_id = ensure_client(service, redirect_uri, disc)
+        state, verifier = create_pending(service)
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": pkce_challenge(verifier),
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+        if disc.get("supports_resource"):
+            params["resource"] = svc["mcp_url"]   # RFC 8707 — bind the token to the MCP resource
+        return disc["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
 
 
-def finish_auth(state: str, code: str, redirect_uri: str) -> dict:
+def _pending_service(state: str) -> str | None:
+    """Untrusted lock-key hint only; finish_auth re-reads/consumes under that service lock."""
+    if not state or not _STATE_RE.match(state):
+        return None
+    entry = _read_json(os.path.join(_pending_dir(), f"{state}.json"))
+    service = entry.get("service") if isinstance(entry, dict) else None
+    return service if service in SERVICES else None
+
+
+def cancel_auth(state: str) -> None:
+    """Burn a denied OAuth state under the same lock used by callback and disconnect."""
+    service = _pending_service(state)
+    if service:
+        with file_lock(token_path(service)):
+            if _pending_service(state) == service:
+                consume_pending(state)
+
+
+def _finish_auth_locked(state: str, code: str, redirect_uri: str,
+                        expected_service: str) -> dict:
     """Validate + consume the state, exchange the code (PKCE verifier, no client secret), and write
-    the PINNED token file. Returns the written record. Raises ConnectorError with the failing step."""
+    the PINNED token file. Caller owns file_lock(token_path(service)) throughout."""
     pending = consume_pending(state)
     if not pending:
         raise ConnectorError("state",
                              "unknown, expired, or already-used state — restart from /setup "
                              "(each Connect click is valid once, for 10 minutes)")
     service = pending["service"]
+    if service != expected_service:
+        raise ConnectorError("state", "authorization state changed; restart from /setup")
     svc = SERVICES.get(service)
     if not svc:
         raise ConnectorError("config", f"pending state names unknown service '{service}'")
@@ -501,9 +522,28 @@ def finish_auth(state: str, code: str, redirect_uri: str) -> dict:
         "resource": svc["mcp_url"],
         "mcp_url": svc["mcp_url"],
         "obtained_at": int(time.time()),
+        # Opaque grant identity, atomic with the credential. A reconnect is a new
+        # source-authority generation even if the provider returns the same scopes.
+        "sotto_source_generation": secrets.token_hex(16),
     }
-    write_json(token_path(service), record, 0o600)
+    write_json(token_path(service), record, 0o600, durable=True)
     return record
+
+
+def finish_auth(state: str, code: str, redirect_uri: str, *, on_connected=None) -> dict:
+    """Consume/exchange/write once under the service token lock. The optional callback runs before
+    releasing the lock so receiver consent and the credential have one local commit boundary."""
+    service = _pending_service(state)
+    if not service:
+        raise ConnectorError("state",
+                             "unknown, expired, or already-used state — restart from /setup "
+                             "(each Connect click is valid once, for 10 minutes)")
+    with file_lock(token_path(service)):
+        # The pending record may have been invalidated or replaced while acquiring the lock.
+        record = _finish_auth_locked(state, code, redirect_uri, service)
+        if on_connected is not None:
+            on_connected(record)
+        return record
 
 
 # ── /setup status (read-only: presence + dates; refresh belongs to connector_tokens.py) ───────────
@@ -532,18 +572,59 @@ def credential_matches(service: str) -> bool:
                 and rec.get("access_token"))
 
 
-def disconnect(service: str) -> dict:
+def _cancel_pending(service: str) -> None:
+    """Invalidate every valid state filename while its service token lock is held."""
+    directory = _pending_dir()
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    removed = False
+    for name in names:
+        if not name.endswith(".json") or not _STATE_RE.match(name[:-5]):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            entry = _read_json(path)
+            # A malformed state cannot pass callback validation; remove it as unusable. A valid
+            # state for another registered service is left alone for that service's own fence.
+            if entry is None or entry.get("service") == service:
+                os.unlink(path)
+                removed = True
+        except FileNotFoundError:
+            pass
+    if removed:
+        # A successful disconnect is a durable fence even if no token file existed to unlink/fsync.
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+def disconnect(service: str, before_disconnect=None) -> dict:
     """Forget a connected service: delete its TOKEN file (the credential) and the gather-written
     `.error` marker. The DCR client registration and discovery cache stay — they hold no user
     credential and make a later reconnect one click. Nothing to delete is a success (the forget.py
     posture): disconnecting twice is not an error."""
     removed = []
     credential = token_path(service)
-    try:
-        os.unlink(credential)
-        removed.append(os.path.basename(credential))
-    except FileNotFoundError:
-        pass
+    with file_lock(credential):
+        # The receiver uses this hook to revoke the managed capability under the same fence.
+        # A hook failure aborts without deleting the credential or pending authorization states.
+        if before_disconnect is not None:
+            before_disconnect()
+        _cancel_pending(service)
+        try:
+            os.unlink(credential)
+            directory = os.open(os.path.dirname(credential), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            removed.append(os.path.basename(credential))
+        except FileNotFoundError:
+            pass
     # Any other failure must reach the setup handler: claiming success while the bearer remains
     # on disk makes the tile immediately flip back to Connected after an explicit disconnect.
     for p in (os.path.join(_connectors_dir(), f"{service}.error"),):

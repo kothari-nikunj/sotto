@@ -1,0 +1,161 @@
+{
+  "name": "two-journey-chronological-partial",
+  "world": {
+    "savedSourceGrants": [
+      "gmail",
+      "imessage"
+    ],
+    "commitmentJourney": {},
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}"
+    }
+  },
+  "turns": [
+    {
+      "text": "What did I promise Maya Journey? Check the saved obligations.",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "request",
+          "scenario": "partial"
+        }
+      ],
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document",
+        "launch checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700
+    },
+    {
+      "text": "the checklist too?",
+      "contains": [
+        "checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "excludes": [
+        "yes, that establishes fulfillment",
+        "yes, that finishes the promise"
+      ],
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "outstanding",
+          "not yet",
+          "not sent",
+          "no fulfillment",
+          "no completion",
+          "no later",
+          "any later",
+          "no evidence",
+          "still owe",
+          "still need"
+        ]
+      ]
+    },
+    {
+      "text": "What is 2 plus 2?",
+      "contains": [
+        "4"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "knowledgeQueryReads": 0,
+      "maxCharacters": 100,
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "My later text to Maya says \u201cOnly the first pricing table is ready; the document is incomplete.\u201d Does that finish the pricing promise?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "fulfillment",
+          "scenario": "partial"
+        },
+        {
+          "journey": "commitment",
+          "stage": "resolve",
+          "scenario": "partial"
+        }
+      ],
+      "resetConversationBefore": true,
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "excludes": [
+        "yes, that finishes"
+      ],
+      "containsAny": [
+        [
+          "still open",
+          "not finished",
+          "not complete",
+          "doesn't finish",
+          "does not finish",
+          "doesn't fulfill",
+          "does not fulfill",
+          "doesn't establish",
+          "does not establish",
+          "not fulfilled",
+          "not yet",
+          "not done"
+        ]
+      ]
+    },
+    {
+      "text": "After restarting, what remains open for Maya?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "restart",
+          "scenario": "partial"
+        }
+      ],
+      "restartBefore": true,
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "launch checklist"
+      ]
+    }
+  ]
+}

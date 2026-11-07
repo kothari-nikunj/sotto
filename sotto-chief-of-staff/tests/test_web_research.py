@@ -220,7 +220,7 @@ def test_identical_url_read_in_one_run_reuses_complete_result(tmp_path, monkeypa
     monkeypatch.setenv("SOTTO_DELIVERY_RUN_ID", "d" * 32)
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "g")
     calls = []
-    response = {"candidates": [{"content": {"parts": [{"text": "Title\nBody"}]}}]}
+    response = {"candidates": [{"urlContextMetadata": {"urlMetadata": [{"retrievedUrl": "https://example.com", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}]}, "content": {"parts": [{"text": "Title\nBody"}]}}]}
     _wire(monkeypatch, {"generativelanguage": response}, calls)
     assert wr._gemini_fetch_url("https://example.com", 10) == wr._gemini_fetch_url(
         "https://example.com", 10)
@@ -392,3 +392,203 @@ def test_gemini_schema_keyword_is_stripped_for_plain_json_schema_providers():
         "type": "object", "properties": {"title": {"type": "string"},
                                          "rows": {"type": "array", "items": {"type": "string"}}}}
     assert "nullable" in json.dumps(src)      # the source constant is untouched
+
+
+@pytest.mark.parametrize(('metadata', 'category'), [
+    (None, 'metadata_absent_or_empty'),
+    ({}, 'metadata_absent_or_empty'),
+    ({'urlMetadata': []}, 'metadata_absent_or_empty'),
+    ({'urlMetadata': 'PRIVATE'}, 'metadata_absent_or_empty'),
+    ({'urlMetadata': ['PRIVATE']}, 'retrieval_status_failed'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://example.com', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_ERROR'}]}, 'retrieval_status_failed'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://example.com', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_PAYWALL'}]}, 'retrieval_status_failed'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://PRIVATE.example', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]}, 'retrieved_url_mismatch'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://example.com/', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]}, 'retrieved_url_mismatch'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://example.com?', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]}, 'retrieved_url_mismatch'),
+    ({'urlMetadata': [{'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]}, 'retrieved_url_mismatch'),
+    ({'urlMetadata': [{'retrievedUrl': 'https://example.com', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'},
+                     {'retrievedUrl': 'https://PRIVATE.example', 'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]}, 'retrieved_url_mismatch'),
+])
+def test_fluent_url_answer_without_exact_successful_retrieval_is_unreadable(monkeypatch, tmp_path, metadata, category):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    candidate = {'finishReason': 'STOP', 'content': {'parts': [{'text': 'PRIVATE invented page text'}]}}
+    if metadata is not None:
+        candidate['urlContextMetadata'] = metadata
+    calls, diagnostics = [], []
+    monkeypatch.setattr(wr, '_diag', diagnostics.append)
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [candidate]}}, calls)
+    result = wr.fetch_url('https://example.com')
+    assert result['text'] == '' and result['provider'] is None and result['error']
+    assert len(calls) == 1  # no additional model attempt to manufacture evidence
+    assert diagnostics == [f'[web_research] fetch_url via gemini failed: ValueError: Gemini URL {category}']
+    assert 'PRIVATE' not in str(diagnostics)
+
+
+def test_url_answer_accepts_exact_successful_provider_retrieval(monkeypatch, tmp_path):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://example.com',
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'Title\nRetrieved content'}]}}]}})
+    result = wr.fetch_url('https://example.com')
+    assert result['provider'] == 'gemini' and result['text'] == 'Source-derived summary (not verbatim page text):\nTitle\nRetrieved content'
+
+
+@pytest.mark.parametrize('returned_url', [None, 'https://other.example', 'https://example.com'])
+def test_exa_contents_requires_requested_url_and_requests_fresh_crawl(monkeypatch, returned_url):
+    calls = []
+    def post(url, body, headers, timeout):
+        calls.append(body)
+        return {'results': [{'url': returned_url, 'text': 'Page text', 'title': 'Title'}]}
+    monkeypatch.setattr(wr, '_post', post)
+    result = wr._exa_contents('https://example.com', 10)
+    assert calls[0]['maxAgeHours'] == 0 and calls[0]['urls'] == ['https://example.com']
+    assert bool(result) is (returned_url == 'https://example.com')
+
+
+def test_gemini_url_requests_own_words_notes_and_labels_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    requests = []
+    def post(api, body, headers, timeout):
+        requests.append(body)
+        return {'candidates': [{'finishReason': 'STOP',
+            'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://example.com',
+                'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+            'content': {'parts': [{'text': 'Example\nA short factual note.'}]}}]}
+    monkeypatch.setattr(wr, '_post', post)
+    result = wr.fetch_url('https://example.com')
+    prompt = requests[0]['contents'][0]['parts'][0]['text']
+    assert 'title on the first line' in prompt and 'in your own words' in prompt
+    assert 'do not reproduce the page or quote its text' in prompt
+    assert 'Use only facts supported by the retrieved page' in prompt
+    assert requests[0]['tools'] == [{'url_context': {}}]
+    assert len(requests) == 1 and result['title'] == 'Example'
+    assert result['text'].startswith('Source-derived summary (not verbatim page text):\n')
+
+
+@pytest.mark.parametrize(('finish_reason', 'parts', 'diagnostic'), [
+    ('RECITATION', [], 'Gemini URL recitation_blocked'),
+    ('RECITATION', [{'text': 'Unusable partial text'}], 'Gemini URL recitation_blocked'),
+    ('STOP', [], 'Gemini URL read returned no text'),
+])
+def test_gemini_url_blocked_or_empty_content_stays_failure(monkeypatch, tmp_path, finish_reason, parts, diagnostic):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    calls, diagnostics = [], []
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{'finishReason': finish_reason,
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://example.com',
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': parts}}]}}, calls)
+    monkeypatch.setattr(wr, '_diag', diagnostics.append)
+    result = wr.fetch_url('https://example.com')
+    assert result['text'] == '' and result['provider'] is None and result['error']
+    assert len(calls) == 1
+    assert diagnostics == [f'[web_research] fetch_url via gemini failed: ValueError: {diagnostic}']
+
+
+@pytest.mark.parametrize(('requested', 'retrieved'), [
+    ('https://sixsense.ai/', 'https://www.sixsense.ai/'),
+    ('https://www.example.co.uk/', 'https://example.co.uk/'),
+    ('https://example.com/', 'https://example.com/'),
+])
+def test_company_homepage_accepts_only_root_alias_and_reports_actual_url(monkeypatch, tmp_path, requested, retrieved):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    calls = []
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'finishReason': 'STOP',
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': retrieved,
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'Example\nFacts from the homepage.'}]}}]}}, calls)
+    result = wr.fetch_url(requested, company_homepage=True)
+    assert result['url'] == retrieved and result['provider'] == 'gemini'
+    assert 'Facts from the homepage.' in result['text']
+    assert len(calls) == 1  # metadata interpretation, never a second fetch or model attempt
+
+
+@pytest.mark.parametrize('retrieved', [
+    'https://example.com/about', 'https://example.com/?a=1', 'https://example.com/?',
+    'https://example.com/#section', 'https://example.com/#', 'https://example.com:443/',
+    'https://owner@example.com/', 'http://example.com/', 'https://api.example.com/',
+    'https://www.www.example.com/', 'https://example.com.evil.test/', 'https://other.test/',
+    'https://www.example.com/about', 'https://www.example.com/?a=1', None,
+])
+def test_company_homepage_does_not_widen_other_url_boundaries(monkeypatch, tmp_path, retrieved):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    calls = []
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': retrieved,
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'Unproven page facts'}]}}]}}, calls)
+    result = wr.fetch_url('https://example.com/', company_homepage=True)
+    assert result['text'] == '' and result['error'] == 'could not read the page'
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('requested', [
+    'http://example.com/', 'https://example.com/page', 'https://example.com/?',
+    'https://example.com/#', 'https://example.com:443/', 'https://owner@example.com/',
+    'https://www.www.example.com/',
+])
+def test_company_homepage_policy_requires_plain_https_root(requested):
+    assert wr._company_homepage_urls(requested) == ()
+
+
+@pytest.mark.parametrize('company_homepage', [False, True])
+@pytest.mark.parametrize('status', [None, 'URL_RETRIEVAL_STATUS_ERROR', 'URL_RETRIEVAL_STATUS_PAYWALL'])
+def test_company_homepage_still_requires_successful_retrieval(monkeypatch, tmp_path, company_homepage, status):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://www.example.com/',
+            'urlRetrievalStatus': status}]},
+        'content': {'parts': [{'text': 'Unproven page facts'}]}}]}})
+    assert wr.fetch_url('https://example.com/', company_homepage=company_homepage)['text'] == ''
+
+
+def test_literal_url_read_still_rejects_company_homepage_alias(monkeypatch, tmp_path):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://www.example.com/',
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'The homepage'}]}}]}})
+    result = wr.fetch_url('https://example.com/')
+    assert result['text'] == '' and result['url'] == 'https://example.com/'
+
+
+def test_company_homepage_result_cannot_satisfy_a_literal_url_read(monkeypatch, tmp_path):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'same-operation-fixture')
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    calls = []
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://www.example.com/',
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'The company homepage'}]}}]}}, calls)
+    assert wr.fetch_url('https://example.com/', company_homepage=True)['text']
+    assert wr.fetch_url('https://example.com/')['text'] == ''
+    assert len(calls) == 2  # different proof policy cannot reuse the cached broader result
+
+
+def test_literal_fetch_preserves_existing_operation_identity_material(monkeypatch, tmp_path):
+    import model_work
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'fixture')
+    monkeypatch.setattr(wr, '_client_revision', lambda: 'current-client-revision')
+    captured = []
+    original = model_work.scope
+    def scope(task, evidence, **kwargs):
+        captured.append((task, evidence, kwargs))
+        return original(task, evidence, **kwargs)
+    monkeypatch.setattr(model_work, 'scope', scope)
+    _wire(monkeypatch, {'generativelanguage': {'candidates': [{
+        'urlContextMetadata': {'urlMetadata': [{'retrievedUrl': 'https://example.com/',
+            'urlRetrievalStatus': 'URL_RETRIEVAL_STATUS_SUCCESS'}]},
+        'content': {'parts': [{'text': 'The exact homepage'}]}}]}})
+    assert wr.fetch_url('https://example.com/')['text']
+    assert captured == [('web_fetch', ['https://example.com/', wr.MODEL, 'current-client-revision'], {'occurrence': True})]

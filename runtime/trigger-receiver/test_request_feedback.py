@@ -54,7 +54,7 @@ def test_expiry_before_claim_gets_one_durable_notice_and_no_raw_error(rec, monke
     assert rec.WORK_QUEUE.get(rec.DATA, job_id)['status'] == 'expired'
     sent = []
     monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send',
-                        lambda body, target: sent.append((body, target)) or
+                        lambda body, target, *_identity: sent.append((body, target)) or
                         (True, '', {'message_id': 'offline-ack'}))
     rec._requested_brief_feedback()
     rows = _rows(rec)
@@ -109,7 +109,7 @@ def test_done_work_with_no_output_reports_failure_without_exposing_diagnostic(re
 
     calls = []
     monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send',
-                        lambda body, target: calls.append(body) or
+                        lambda body, target, *_identity: calls.append(body) or
                         (False, 'offline', {'acceptance': 'rejected'}))
     rec.OUTBOX.drain()
     assert len(calls) == 1 and _rows(rec)[0]['status'] == 'pending'
@@ -120,7 +120,7 @@ def test_done_work_with_no_output_reports_failure_without_exposing_diagnostic(re
     state['rows'][0]['next_at'] = 0
     path.write_text(json.dumps(state))
     monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send',
-                        lambda body, target: calls.append(body) or
+                        lambda body, target, *_identity: calls.append(body) or
                         (True, '', {'message_id': 'recovered-ack'}))
     rec.OUTBOX.drain()
     assert len(calls) == 2 and calls[0] == calls[1]
@@ -165,24 +165,27 @@ def test_unknown_gallery_gets_honest_notice_without_replaying_original(rec, monk
     monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send_gallery',
                         lambda *_: (_ for _ in ()).throw(AssertionError('original gallery replayed')))
     monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send',
-                        lambda body, target: sends.append(body) or (True, '', {'message_id': 'notice-ack'}))
+                        lambda body, target, *_identity: sends.append(body) or (True, '', {'message_id': 'notice-ack'}))
     rec.OUTBOX.drain()
     assert sends == [rows[1]['payload']['body']]
     assert _rows(rec)[0]['status'] == 'pending'
 
 
-def test_pending_text_delivery_with_unknown_acceptance_remains_silent(rec):
+def test_unknown_text_delivery_is_held_and_gets_the_same_honest_notice(rec):
+    # Ambiguous text is held for receipt reconciliation exactly like a gallery, never resent.
     job_id = rec.request_owner_brief(request())[1]['request_id']
     _finish(rec, job_id, status='done')
     _original(rec, job_id, status='pending', acceptance='unknown', created=time.time() - 601)
     path = Path(rec.OUTBOX.path())
     state = json.loads(path.read_text())
     state['rows'][0]['payload'].pop('presentation')
-    state['rows'][0]['payload']['body'] = 'still retrying original text'
+    state['rows'][0]['payload']['body'] = 'original text of unknown acceptance'
     path.write_text(json.dumps(state))
     rec._requested_brief_feedback()
-    assert len(_rows(rec)) == 1
-    assert rec.WORK_QUEUE.get(rec.DATA, job_id)['feedback'] is not None
+    rows = _rows(rec)
+    assert len(rows) == 2 and rows[0]['status'] == 'pending'
+    assert 'couldn\'t confirm' in rows[1]['payload']['body'].lower()
+    assert rec.WORK_QUEUE.get(rec.DATA, job_id)['feedback'] is None
 
 
 def test_owner_route_change_and_old_failures_do_not_generate_notifications(rec, monkeypatch):
@@ -210,3 +213,22 @@ def test_route_change_suppresses_notice_already_queued(rec, monkeypatch):
                         lambda *_: (_ for _ in ()).throw(AssertionError('old owner notified')))
     rec.OUTBOX.drain()
     assert _rows(rec)[0]['status'] == 'superseded'
+
+
+def test_uncertain_model_work_has_one_failure_notice_without_requeue(rec, monkeypatch):
+    job_id = rec.request_owner_brief(request())[1]['request_id']
+    with rec.WORK_QUEUE._db(rec.DATA) as db:
+        db.execute('UPDATE jobs SET valid_until=? WHERE id=?', (time.time() + 3600, job_id))
+    job = rec.WORK_QUEUE.claim(rec.DATA, 'brief-worker')
+    assert job['id'] == job_id
+    assert rec.WORK_QUEUE.fail(rec.DATA, job_id, 'brief-worker', 'private provider details',
+                              model_outcome_uncertain=True) == 'failed'
+    rec._requested_brief_feedback()
+    rec._requested_brief_feedback()
+    rows = _rows(rec)
+    assert len(rows) == 1
+    body = rows[0]['payload']['body']
+    assert "couldn't finish your requested evening brief" in body
+    assert "won't keep retrying" in body
+    assert 'private' not in json.dumps(rows)
+    assert rec.WORK_QUEUE.claim(rec.DATA, 'next-worker', now=time.time() + 3600) is None

@@ -17,7 +17,7 @@ The three capabilities are the three shapes this tree actually asks for — not 
   deep_research — a prompt + a JSON schema in, a grounded structured object out. That is
                   `research_attendees.py`'s `_grounded_json` (attendee profiles, the recency sweep,
                   the focus company dive) — multi-step research whose answer must land in fields.
-  fetch_url     — ONE specific URL in, that page's text out (BROWSER-USE.md §5's "the cheaper
+  fetch_url     — ONE specific URL in, page text or labeled source-derived notes out (BROWSER-USE.md §5's "the cheaper
                   80%": read the link someone actually SENT the user). Exa's /contents endpoint,
                   then Gemini's url_context tool — both crawler-class and cheap — and only when
                   BOTH fail, Browser Use Cloud (key-gated, a real hosted browser, read-only by
@@ -49,6 +49,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 from collections import OrderedDict
 
 MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
@@ -59,22 +60,7 @@ _LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
-# ── the resolver ─────────────────────────────────────────────────────────────────────────────────
-# One table, one precedence per capability, one presence check. Everything else in this file is a
-# provider implementation; nothing else decides who answers.
-KEY_ENV = {"exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY", "gemini": "GOOGLE_AI_API_KEY",
-           "browseruse": "BROWSER_USE_API_KEY"}
-CAPABILITIES = {
-    "web_search": ("exa", "gemini"),
-    "deep_research": ("parallel", "exa", "gemini"),
-    # browseruse is LAST, not a middle rung (owner, Aug 2026): Exa and Gemini's url_context are both
-    # crawler-class fetches — fast, and already paid for — so the hosted browser (real credits,
-    # 10-60s of session) is the escalation for the pages NO crawler can read: JS-rendered SPAs and
-    # bot-walled sites. READ fence (BROWSER-USE.md §4 still governs): public pages only, a
-    # read-this-one-page task, never a profile, never a credential, never an action — their cloud
-    # runs the browser and sees the page, which is exactly what the key opts into.
-    "fetch_url": ("exa", "gemini", "browseruse"),
-}
+from research_providers import KEY_ENV, CAPABILITIES  # noqa: E402
 
 HTTP_TIMEOUT = 60             # a one-off lookup's whole budget (the old grounded-call timeout)
 EXA_NUM_RESULTS = 6           # enough sources for a bio; more is noise you pay to read
@@ -240,34 +226,60 @@ def _exa_deep(prompt: str, schema: dict, timeout: float) -> dict | None:
                   "outputSchema": plain_json_schema(schema)},
                  {"x-api-key": _key("exa")}, timeout)
     content = (data.get("output") or {}).get("content")
+    original_response = content if isinstance(content, str) else None
     if isinstance(content, str):
         try:
             content = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             return None
-    return content if isinstance(content, dict) else None
+    if isinstance(content, dict):
+        content = {key: value for key, value in content.items() if key not in ('_provider_grounding', '_provider_response')}
+        grounding = (data.get('output') or {}).get('grounding')
+        return {**content, **({'_provider_grounding': grounding} if grounding else {}),
+                **({'_provider_response': original_response} if original_response is not None else {})}
+    return None
 
 
 def _exa_contents(url: str, timeout: float) -> dict | None:
     """Exa POST /contents — page text for ONE known URL (same header, same key as /search; the
     endpoint is in the same exa-labs/openapi-spec the module header cites)."""
     data = _post("https://api.exa.ai/contents",
-                 {"urls": [url], "text": {"maxCharacters": FETCH_TEXT_MAX_CHARS}},
+                 {"urls": [url], "maxAgeHours": 0, "text": {"maxCharacters": FETCH_TEXT_MAX_CHARS}},
                  {"x-api-key": _key("exa")}, timeout)
     for r in (data.get("results") or []):
-        if isinstance(r, dict) and (r.get("text") or "").strip():
+        if isinstance(r, dict) and r.get("url") == url and isinstance(r.get("text"), str) and r["text"].strip():
             return {"url": url, "title": r.get("title") or "", "text": r["text"].strip()}
     return None
 
 
-def _gemini_fetch_url(url: str, timeout: float) -> dict | None:
+def _company_homepage_urls(url: str) -> tuple[str, ...]:
+    """Trusted company-site intent allows only the HTTPS root's single www alias."""
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ''
+    if (parsed.scheme != 'https' or parsed.netloc != host or parsed.path != '/'
+            or '?' in url or '#' in url or not host or '.' not in host
+            or any(not label or not all(c.isascii() and (c.isalnum() or c == '-') for c in label)
+                   for label in host.split('.'))):
+        return ()
+    bare = host[4:] if host.startswith('www.') else host
+    if bare.startswith('www.') or '.' not in bare:
+        return ()
+    return ('https://' + bare + '/', 'https://www.' + bare + '/')
+
+
+def _gemini_fetch_url(url: str, timeout: float, *, company_homepage=False) -> dict | None:
     """Gemini's url_context tool — the model fetches the URL server-side and answers from it. The
     floor rung: works on the key every deploy already has; JS-heavy or blocked pages may come back
     empty, which falls through to the caller's honest 'could not read it'."""
-    prompt = ("Read this page and return its content as plain text — the title on the first line, "
-              f"then the substantive text, no commentary: {url}")
+    prompt = ("Read this exact page with url_context. Put the page title on the first line, then "
+              "concise faithful notes about its substantive facts in your own words. Use only "
+              "facts supported by the retrieved page; do not reproduce the page or quote its text. "
+              f"No outside knowledge or commentary: {url}")
     import model_work
-    with model_work.scope('web_fetch', [url, MODEL, _client_revision()], occurrence=True) as operation:
+    scope_evidence = [url, MODEL, _client_revision()]
+    if company_homepage:
+        scope_evidence.append('company-homepage-v1')
+    with model_work.scope('web_fetch', scope_evidence, occurrence=True) as operation:
         cache_key = _cache_key(operation['id'])
         with _cache_stripe(cache_key):
             cached = _cached(cache_key)
@@ -279,16 +291,33 @@ def _gemini_fetch_url(url: str, timeout: float) -> dict | None:
             request_contract = {"tools": body["tools"], "generationConfig": body["generationConfig"]}
             with model_work.attempt('gemini', MODEL, prompt, schema=request_contract):
                 api, headers = gemini_transport.endpoint(MODEL, _key("gemini"))
+                headers.update(gemini_transport.attribution_headers(api))
                 data = _post(api, body, headers, timeout)
                 model_work.note_usage(MODEL, data.get('usageMetadata'))
                 cand = (data.get("candidates") or [{}])[0]
                 if cand.get('finishReason') == 'MAX_TOKENS':
                     raise ValueError('Gemini URL read reached MAX_TOKENS')
+                if cand.get('finishReason') == 'RECITATION':
+                    raise ValueError('Gemini URL recitation_blocked')
+                # A tool request is not proof that the provider retrieved this page. Do not
+                # accept fluent prior knowledge, failed fetches, or an unproven redirect.
+                metadata = cand.get('urlContextMetadata')
+                urls = metadata.get('urlMetadata') if isinstance(metadata, dict) else None
+                if not isinstance(urls, list) or not urls:
+                    raise ValueError('Gemini URL metadata_absent_or_empty')
+                if any(not isinstance(item, dict) or
+                       item.get('urlRetrievalStatus') != 'URL_RETRIEVAL_STATUS_SUCCESS' for item in urls):
+                    raise ValueError('Gemini URL retrieval_status_failed')
+                allowed_urls = _company_homepage_urls(url) if company_homepage else (url,)
+                retrieved_urls = {item.get('retrievedUrl') for item in urls if isinstance(item.get('retrievedUrl'), str)}
+                if (len(retrieved_urls) != 1 or any(item.get('retrievedUrl') not in allowed_urls for item in urls)):
+                    raise ValueError('Gemini URL retrieved_url_mismatch')
                 text = "".join(p.get("text", "") for p in (cand.get("content", {}).get("parts") or [])).strip()
                 if not text:
                     raise ValueError('Gemini URL read returned no text')
-            return _remember(cache_key, {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
-                                         "text": text[:FETCH_TEXT_MAX_CHARS]})
+            return _remember(cache_key, {"url": next(iter(retrieved_urls)), "title": text.split("\n", 1)[0].strip()[:200],
+                                         "text": ("Source-derived summary (not verbatim page text):\n"
+                                                  + text)[:FETCH_TEXT_MAX_CHARS]})
 
 
 # ── Browser Use Cloud (https://api.browser-use.com/api/v2 — their CLOUD.md is the spec source) ───
@@ -307,28 +336,51 @@ _BROWSERUSE_TASK = ("Open {url} and return the page's title on the first line, t
                     "not log in, do not fill or submit anything, do not navigate anywhere else.")
 
 
-def _browseruse_stop(session_id: str, headers: dict) -> None:
+def _browseruse_stop(session_id: str, headers: dict, *, strict=False) -> None:
     """Best-effort session stop — an open session bills for up to 15 minutes."""
     if not session_id:
         return
     try:
-        _post(f"{BROWSERUSE_BASE}/sessions/{session_id}", {"action": "stop"}, headers,
+        _post(f"{BROWSERUSE_BASE}/sessions/{urllib.parse.quote(session_id, safe='')}", {"action": "stop"}, headers,
               10, method="PATCH")
     except Exception:  # noqa: BLE001
-        pass
+        if strict:
+            raise
 
 
-def _browseruse_fetch(url: str, timeout: float) -> dict | None:
+def _browseruse_fetch(url: str, timeout: float, *, lifecycle=None, cancelled=None) -> dict | None:
     headers = {"X-Browser-Use-API-Key": _key("browseruse")}
     deadline = time.monotonic() + timeout
-    run = _post(f"{BROWSERUSE_BASE}/tasks", {"task": _BROWSERUSE_TASK.format(url=url)},
-                headers, min(BROWSERUSE_CREATE_TIMEOUT, timeout))
-    task_id, session_id = run.get("id"), run.get("sessionId")
-    if not task_id:
-        return None
+    session_id = None
     try:
+        try:
+            run = _post(f"{BROWSERUSE_BASE}/tasks", {"task": _BROWSERUSE_TASK.format(url=url)},
+                        headers, min(BROWSERUSE_CREATE_TIMEOUT, timeout))
+            if not isinstance(run, dict):
+                raise ValueError('browser create response unavailable')
+            candidate = run.get('sessionId')
+            if isinstance(candidate, str) and 0 < len(candidate) <= 512 and not any(ord(c) < 33 or ord(c) == 127 for c in candidate):
+                session_id = candidate
+            task_id = run.get('id')
+            if lifecycle is not None and (not session_id or not isinstance(task_id, str) or not 0 < len(task_id) <= 512
+                    or any(ord(c) < 33 or ord(c) == 127 for c in task_id)):
+                raise ValueError('browser create binding unavailable')
+        except Exception as error:
+            if lifecycle is not None:
+                raise WebReadHeldError('browser create unconfirmed') from error
+            raise
+        if lifecycle is None:
+            task_id, session_id = run.get("id"), run.get("sessionId")
+        if lifecycle is not None:
+            if not session_id:
+                raise WebReadHeldError('browser session unconfirmed')
+            lifecycle('created', session_id)
+        if not task_id:
+            return None
         while time.monotonic() < deadline:
             time.sleep(BROWSERUSE_POLL_SECS)
+            if lifecycle is not None and (time.monotonic() >= deadline or cancelled is not None and cancelled()):
+                raise WebReadHeldError('browser continuation stopped')
             tv = _get(f"{BROWSERUSE_BASE}/tasks/{task_id}", headers,
                       max(5, min(20, deadline - time.monotonic())))
             if tv.get("status") in ("finished", "stopped"):
@@ -337,19 +389,48 @@ def _browseruse_fetch(url: str, timeout: float) -> dict | None:
                     return None
                 return {"url": url, "title": text.split("\n", 1)[0].strip()[:200],
                         "text": text[:FETCH_TEXT_MAX_CHARS]}
-        return None                       # out of budget → fall through to the Gemini floor
+        return None
     finally:
-        _browseruse_stop(session_id, headers)
+        if session_id:
+            hook_failed = False
+            if lifecycle is not None:
+                try:
+                    lifecycle('stop_started', session_id)
+                except BaseException:
+                    hook_failed = True
+            try:
+                _browseruse_stop(session_id, headers, strict=lifecycle is not None)
+            except Exception as error:
+                if lifecycle is not None:
+                    try:
+                        lifecycle('stop_unknown', session_id)
+                    except BaseException:
+                        pass
+                    raise WebReadHeldError('browser cleanup unconfirmed') from error
+                raise
+            if lifecycle is not None:
+                try:
+                    lifecycle('stop_accepted', session_id)
+                except BaseException:
+                    hook_failed = True
+                if hook_failed:
+                    raise WebReadHeldError('browser cleanup receipt unconfirmed')
 
 
 _FETCH_URL = {"exa": _exa_contents, "browseruse": _browseruse_fetch, "gemini": _gemini_fetch_url}
 
 
-def fetch_url(url: str) -> dict:
+class WebReadHeldError(BaseException):
+    """A paid attended read or known browser cleanup remains unconfirmed."""
+
+
+def fetch_url(url: str, *, lifecycle=None, cancelled=None, company_homepage=False) -> dict:
     """Read ONE specific URL — the link someone sent, the page the user asked about. Returns
     {url, title, text, provider}; with nothing able to read it, empty text plus `error`, so the
-    caller says "couldn't read the link" instead of summarizing from imagination. Same never-raise,
-    one-deadline contract as research()."""
+    caller says "couldn't read the link" instead of summarizing from imagination. Only the trusted
+    company worker sets company_homepage; literal URL reads always retain exact URL proof. Same never-raise,
+    one-deadline contract as research(). Gemini text is explicitly labeled source-derived
+    summary, not verbatim page text and not authority for quotations."""
     stub = os.environ.get("SOTTO_LLM_STUB")
     if stub:
         try:
@@ -358,8 +439,15 @@ def fetch_url(url: str) -> dict:
         except Exception:
             return {"url": url, "title": "", "text": "", "provider": "stub"}
     deadline = time.monotonic() + HTTP_TIMEOUT
-    out, provider = _first_answer("fetch_url",
-                                  lambda p: _FETCH_URL[p](url, _remaining(deadline)))
+    def attempt(provider):
+        if lifecycle is not None and (time.monotonic() >= deadline or cancelled is not None and cancelled()):
+            raise WebReadHeldError('attended read stopped before provider continuation')
+        if provider == 'browseruse' and lifecycle is not None:
+            return _browseruse_fetch(url, _remaining(deadline), lifecycle=lifecycle, cancelled=cancelled)
+        if provider == 'gemini' and company_homepage:
+            return _gemini_fetch_url(url, _remaining(deadline), company_homepage=True)
+        return _FETCH_URL[provider](url, _remaining(deadline))
+    out, provider = _first_answer("fetch_url", attempt)
     if out is None:
         return {"url": url, "title": "", "text": "", "provider": None,
                 "error": NO_PROVIDER if not provider_chain("fetch_url") else "could not read the page"}
@@ -389,7 +477,11 @@ def _parallel_task(prompt: str, schema: dict, timeout: float) -> dict | None:
     left = max(1, int(timeout - (time.monotonic() - t0)))
     res = _get(f"{PARALLEL_BASE}/v1/tasks/runs/{run_id}/result?timeout={left}", headers, left + 5)
     content = (res.get("output") or {}).get("content")
-    return content if isinstance(content, dict) else None
+    if isinstance(content, dict):
+        content = {key: value for key, value in content.items() if key not in ('_provider_grounding', '_provider_response')}
+        grounding = res.get('basis') or (res.get('output') or {}).get('basis')
+        return {**content, **({'_provider_grounding': grounding} if grounding else {})}
+    return None
 
 
 # ── Gemini Search Grounding (the floor: the key we already have) ─────────────────────────────────

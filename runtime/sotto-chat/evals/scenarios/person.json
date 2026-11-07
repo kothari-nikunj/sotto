@@ -1,0 +1,81 @@
+{
+  "name": "person-company-and-draft-continuation",
+  "world": {
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Cedar Labs",
+          "domain": "cedar.example",
+          "about": "Cedar Labs builds clinic scheduling tools. Its pilot codename is Juniper-47. The pilot covers twelve pediatric clinics. Its public website is https://cedar.example/."
+        }
+      ],
+      "person_updates": [
+        {
+          "person_name": "Dana Reed",
+          "identifier": "dana@cedar.example",
+          "updated_by": "web_research",
+          "facts": [
+            {
+              "fact": "Dana Reed founded Cedar Labs. She previously led clinic operations at Bay Pediatrics.",
+              "memory_type": "context",
+              "confidence": 0.9,
+              "source": "web_research",
+              "source_ref": "https://cedar.example/team"
+            }
+          ]
+        }
+      ]
+    },
+    "websites": {
+      "https://cedar.example/": "Cedar Labs official website. The new pilot is Juniper-48, expanded to eighteen pediatric clinics. Updated October 18, 2026."
+    }
+  },
+  "turns": [
+    {
+      "text": "what do we know about Dana Reed?",
+      "contains": [
+        "Cedar",
+        "Bay Pediatrics"
+      ]
+    },
+    {
+      "text": "what does her company do?",
+      "contains": [
+        "clinic"
+      ],
+      "excludes": [
+        "Which company"
+      ]
+    },
+    {
+      "text": "draft a short note to her asking about the pilot",
+      "contains": [
+        "Dana",
+        "pilot"
+      ],
+      "excludes": [
+        "sent the",
+        "saved the draft"
+      ]
+    },
+    {
+      "text": "less formal pls",
+      "containsAny": [
+        [
+          "pilot",
+          "Juniper"
+        ]
+      ],
+      "maxCharacters": 600,
+      "excludes": [
+        "Which draft"
+      ]
+    },
+    {
+      "text": "where did she work before?",
+      "contains": [
+        "Bay Pediatrics"
+      ]
+    }
+  ]
+}

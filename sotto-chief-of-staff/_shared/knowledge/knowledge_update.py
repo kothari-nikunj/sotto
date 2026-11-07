@@ -3,7 +3,7 @@
 knowledge_update.py — apply a brief's extracted_knowledge to the people/company graph.
 
 PORT SOURCE: app/src-tauri/src/database/knowledge_files.rs::save_knowledge_extraction (line 2453)
-Run by Hermes via execute_code after compose_brief. Reads/writes knowledge/*.md on $SOTTO_DATA.
+Run by learn_step.py (the brief's learning phase) after compose_brief. Reads/writes knowledge/*.md on $SOTTO_DATA.
 
 Usage:
     knowledge_update.py < extracted.json          # {"person_updates":[...], "company_updates":[...]}
@@ -59,12 +59,13 @@ from __future__ import annotations
 import difflib
 import glob
 import hashlib
+import heapq
 import json
 import os
 import re
 import sys
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -72,7 +73,13 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import knowledge as kg  # noqa: E402
+import knowledge_correction as correction  # noqa: E402
 import jsonstore  # noqa: E402 — THE lock for the volume (see apply)
+from source_corrections import MAX_RECEIPTS  # noqa: E402
+
+ACCEPTED_FACT_DISPOSITIONS = correction.ACCEPTED_FACT_DISPOSITIONS
+fact_establishes_research_coverage = correction.fact_establishes_research_coverage
+
 
 # Dedup-lite tuning. Kept small and boring: the suggestion list is a human's to-do list, not a
 # report, and the pairwise scan must never become the Learn step's cost centre.
@@ -82,6 +89,7 @@ MERGE_SUGGEST_MAX_FILES = 300       # above this the O(n²) name scan is skipped
 MERGE_SUGGEST_MAX_BUCKET = 40       # a name-prefix shared by more people than this is noise
 NAME_SIMILARITY_MIN = 0.9           # difflib ratio over name slugs, when neither contains the other
 MERGE_SUGGESTIONS_FILE = "merge_suggestions.json"
+SOURCE_CORRECTION_FILE_BYTES = 1024 * 1024
 
 # Relations ride the same evidence bar as facts, one notch higher: a wrong EDGE is louder than a
 # wrong fact (it renders as a sentence about how two people know each other), so an inferred one
@@ -558,9 +566,53 @@ def resolve_company_path(upd: dict, index: dict) -> tuple:
     return (path, slug)
 
 
-def company_knowledge(company_name: str = "", domain: str = "", company_slug: str = "") -> dict:
+
+class CompanyLookupError(ValueError):
+    """Closed failure for the opt-in unique saved-company read only."""
+    def __init__(self, status):
+        self.status = status
+        super().__init__(status)
+
+
+def _unique_company_path(upd):
+    """Resolve actual saved candidates without changing legacy write resolution."""
+    slug = kg.safe_slug(_s(upd.get('company_slug')) or kg.company_slug(_s(upd.get('company_name'))))
+    if not slug:
+        return None, None
+    domain = _company_domain_of(upd)
+    candidates = set()
+    try:
+        directory = kg.companies_dir()
+        try:
+            names = os.listdir(directory)
+        except FileNotFoundError:
+            names = []
+        paths = [Path(directory) / name for name in sorted(names) if name.endswith('.md')]
+        for path in paths:
+            yaml_str, _ = kg.split_frontmatter_body(path.read_text(encoding='utf-8'))
+            import yaml
+            fm = (yaml.safe_load(yaml_str) if yaml_str else {}) or {}
+            if (type(fm) is not dict or type(fm.get('aliases', [])) is not list
+                    or any(type(a) is not str for a in fm.get('aliases', []))
+                    or any(type(fm.get(k, '')) is not str for k in ('normalized', 'domain'))):
+                raise ValueError('company metadata invalid')
+            aliases = [fm.get('normalized', ''), *fm.get('aliases', [])]
+            alias_slugs = {kg.safe_slug(kg.company_slug(a)) for a in aliases if a}
+            saved_domain = fm.get('domain', '').strip().lower().lstrip('@')
+            if path.stem == slug or slug in alias_slugs or domain and domain == saved_domain:
+                candidates.add(str(path))
+    except Exception as exc:  # noqa: BLE001 -- strict read must not misreport unreadable as missing
+        raise CompanyLookupError('unavailable') from exc
+    if len(candidates) > 1:
+        raise CompanyLookupError('ambiguous')
+    if not candidates:
+        return None, None
+    path = candidates.pop()
+    return path, _stem(path)
+
+def company_knowledge(company_name: str = "", domain: str = "", company_slug: str = "", *, unique: bool = False) -> dict:
     """What is ALREADY on file about a company — the read side of the writer above, and the only
-    one. Returns {slug, name, about, news[], context, updated_by, last_researched} for the file the
+    one. Returns {slug, name, domain, about, news[], context, updated_by, last_researched} for the file the
     same resolution (slug → alias → domain) would write to, or {} when nothing is on file.
 
     Two callers, one purpose — never buy a fact twice: `research_attendees` injects it into the
@@ -569,7 +621,7 @@ def company_knowledge(company_name: str = "", domain: str = "", company_slug: st
     returns {} and the caller simply researches as if cold."""
     upd = {"company_name": company_name, "domain": domain, "company_slug": company_slug}
     try:
-        path, slug = resolve_company_path(upd, _company_index())
+        path, slug = _unique_company_path(upd) if unique else resolve_company_path(upd, _company_index())
         if not slug or not path or not os.path.exists(path):
             return {}
         with open(path, encoding="utf-8") as f:
@@ -577,12 +629,68 @@ def company_knowledge(company_name: str = "", domain: str = "", company_slug: st
         import yaml as _y
         fm = (_y.safe_load(yaml_str) if yaml_str else {}) or {}
         secs = _parse_company_body(body)
-    except Exception:  # noqa: BLE001 — reading memory must never fail a research run
+    except CompanyLookupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — reading memory must never fail a research run
+        if unique:
+            raise CompanyLookupError('unavailable') from exc
         return {}
     aliases = [_s(a) for a in (fm.get("aliases") or []) if _s(a).strip()]
     return {"slug": slug, "name": aliases[0] if aliases else _s(fm.get("normalized")) or slug,
+            "domain": _s(fm.get("domain")),
             "about": secs["about"], "news": secs["news"], "context": secs["context"],
             "updated_by": _s(fm.get("updated_by")), "last_researched": _s(fm.get("last_researched"))}
+
+
+def _duplicate_family(facts: dict, matched: str):
+    """Resolve only explicit local duplicate links; retain each record's owning provenance.
+
+    Rebuild from current records so a later proposal in the same apply sees earlier evidence.
+    No cross-person lookup or semantic merge can supply a missing endpoint.
+    """
+    reverse = {}
+    for fid, record in facts.items():
+        if record.duplicate_of:
+            reverse.setdefault(record.duplicate_of, []).append(fid)
+    keeper, visited = matched, set()
+    while True:
+        if keeper in visited or keeper not in facts:
+            return None
+        visited.add(keeper)
+        record = facts[keeper]
+        if record.archived_reason == 'duplicate' or record.duplicate_of:
+            if (record.status != 'archived' or record.archived_reason != 'duplicate'
+                    or not record.duplicate_of):
+                return None
+            keeper = record.duplicate_of
+        else:
+            break
+    family, pending = set(), [keeper]
+    while pending:
+        fid = pending.pop()
+        if fid in family:
+            return None
+        family.add(fid)
+        for child in reverse.get(fid, []):
+            record = facts[child]
+            if record.status != 'archived' or record.archived_reason != 'duplicate':
+                return None
+            pending.append(child)
+    retained, incomplete, unknown, dates = set(), False, False, []
+    for fid in family:
+        record = facts[fid]
+        refs = {value for value in [*record.evidence_refs, record.source_ref] if value}
+        retained.update(refs)
+        # No schema migration can recover references evicted by the rolling cap, or prove
+        # completeness for legacy records lacking their evidence list.
+        unknown |= not record.evidence_refs or record.seen > len(refs)
+        incomplete |= len(record.evidence_refs) >= 64
+        dates.append(record.last)
+    try:
+        latest = max(date.fromisoformat(value).isoformat() for value in dates)
+    except (ValueError, TypeError):
+        latest = None
+    return keeper, retained, incomplete or unknown, latest, unknown
 
 
 def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict) -> dict:
@@ -600,8 +708,14 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         today = observed
     force = fu.get("change_type") == "correction"
     action, existing_id = kg.find_similar_fact(
-        p.facts, fu["fact"], fu.get("memory_type", ""), force
+        p.facts, fu["fact"], fu.get("memory_type", ""), force, include_tombstone_id=True
     )
+    if fu.get('exact_new') is True and action != kg.NEW:
+        # Explicit owner teaching adds exactly this fact or nothing: word overlap never bumps,
+        # re-stamps or archives a fact the owner did not name (correction is a separate route).
+        if action != kg.SUPERSEDE:
+            return {'disposition': 'rejected', 'reason': 'similar_fact_exists', 'fact_id': existing_id}
+        action, existing_id = kg.NEW, None
     source = fu.get('source') or 'brief_extraction'
     ref = str(fu.get('source_ref') or '')[:500]
     # Keep the writer-provided order: at the cap, lexicographic slicing could discard every new
@@ -613,9 +727,18 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         v for v in [*supplied_refs, *([ref] if ref else [])]
         if isinstance(v, str) and 0 < len(v) <= 500
     ))[-64:]
-    if existing_id and p.facts[existing_id].source == 'user_edit' and source != 'user_edit':
+    if source != 'user_edit':
+        invalid = kg.source_invalidated_refs()
+        surviving = [value for value in new_refs if value not in invalid]
+        if new_refs and not surviving:
+            return {'disposition': 'rejected', 'reason': 'withdrawn_source_evidence'}
+        new_refs = surviving
+        if ref in invalid:
+            ref = new_refs[0] if new_refs else ''
+    if action != kg.SKIP and existing_id and p.facts[existing_id].source == 'user_edit' and source != 'user_edit':
         return {'disposition': 'rejected', 'reason': 'protected_owner_correction'}
-    folded_refs = set()
+    family_refs, family_incomplete, family_latest, family_unknown = set(), False, None, False
+    family_resolved = False
     if source == 'observed_message' and not force:
         # Overlapping words do not prove two historical statements agree. Keep both assertions
         # for evidence-based curation instead of strengthening or overwriting one heuristically.
@@ -623,29 +746,30 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         # live copy of the same words and turn a re-observation into a SKIP.
         exact = next((fid for fid, fact in sorted(p.facts.items(), key=lambda kv: kv[1].status == 'archived')
                       if ' '.join(fact.text.split()).casefold() == ' '.join(fu['fact'].split()).casefold()), None)
-        revivable = exact and kg.can_revive_fact(p.facts[exact], fu['fact'])
-        # Evidence for a curation-folded duplicate's wording is evidence for the copy it was folded
-        # into: follow duplicate_of to that keeper (reviving it only from an age-prune), so ongoing
-        # evidence keeps the fact alive. The folded copies' own refs are not new evidence.
-        visited = set()
-        while (exact and exact not in visited and p.facts[exact].archived_reason == 'duplicate'
-               and p.facts[exact].status == 'archived' and p.facts[exact].duplicate_of in p.facts):
-            visited.add(exact)
-            folded_refs.update([*p.facts[exact].evidence_refs, p.facts[exact].source_ref])
-            exact = p.facts[exact].duplicate_of
-            revivable = p.facts[exact].archived_reason == 'stale' and p.facts[exact].source != 'user_edit'
-        action, existing_id = ((kg.BUMP if p.facts[exact].status == 'active' or revivable else kg.SKIP, exact)
-                               if exact else (kg.NEW, None))
-        if visited and p.facts[exact].source == 'user_edit':
-            return {'disposition': 'rejected', 'reason': 'protected_owner_correction', 'fact_id': exact}
+        if exact:
+            family = _duplicate_family(p.facts, exact)
+            if family is None:
+                return {'disposition': 'rejected', 'reason': 'invalid_duplicate_lineage', 'fact_id': exact}
+            exact, family_refs, family_incomplete, family_latest, family_unknown = family
+            family_resolved = True
+            if p.facts[exact].source == 'user_edit':
+                return {'disposition': 'rejected', 'reason': 'protected_owner_correction', 'fact_id': exact}
+            revivable = p.facts[exact].archived_reason == 'stale'
+            action, existing_id = (kg.BUMP if p.facts[exact].status == 'active' or revivable else kg.SKIP, exact)
+        else:
+            action, existing_id = kg.NEW, None
     if action == kg.BUMP:
+        if source != 'user_edit' and not family_resolved:
+            family = _duplicate_family(p.facts, existing_id)
+            if family is None:
+                return {'disposition': 'rejected', 'reason': 'invalid_duplicate_lineage', 'fact_id': existing_id}
+            existing_id, family_refs, family_incomplete, family_latest, family_unknown = family
+            if p.facts[existing_id].source == 'user_edit':
+                return {'disposition': 'rejected', 'reason': 'protected_owner_correction', 'fact_id': existing_id}
         ex = p.facts[existing_id]
-        revived = ex.status == 'archived'
-        if ex.status == 'archived':
-            # Re-observed, so re-learned (kg.find_similar_fact): drop the tombstone and keep the
-            # id, then let the bookkeeping below decide whether this sighting is independent.
-            ex.status, ex.archived_text, ex.archived_reason, ex.duplicate_of = 'active', None, None, None
         if source == 'user_edit':
+            if ex.status == 'archived':
+                ex.status, ex.archived_text, ex.archived_reason, ex.duplicate_of = 'active', None, None, None
             # An explicit confirmation upgrades authority once; automatic replay never does.
             upgraded = ex.source != 'user_edit'
             if upgraded:
@@ -658,22 +782,28 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
                     'reason': 'owner_confirmation', 'fact_id': existing_id}
         refs = list(dict.fromkeys([*(ex.evidence_refs or []),
                                    *([ex.source_ref] if ex.source_ref else [])]))
-        retained = set(refs) | folded_refs
+        retained = set(refs) | family_refs
         novel = [value for value in new_refs if value not in retained]
         if not novel:
             # Re-reading the same evidence is not independent confirmation: no seen/conf bump.
             # Nor is it a fresh observation: repeated or ref-less extraction can be the model
             # proposing the same words from the same input. Only distinct source evidence (or the
             # explicit user-confirmation branch above) may refresh evidence recency.
-            return {'disposition': 'updated' if revived else 'duplicate',
-                    'reason': 'revived' if revived else 'no_new_evidence', 'fact_id': existing_id}
-        saturated = len(refs) >= 64
-        ex.evidence_refs = list(dict.fromkeys([*refs, *novel]))[-64:]
-        if saturated and not (has_observed_date and observed > (ex.last or '')):
+            return {'disposition': 'duplicate', 'reason': 'no_new_evidence', 'fact_id': existing_id}
+        saturated = len(refs) >= 64 or family_incomplete
+        # A provenance-only append must not turn a legacy incomplete list into apparent
+        # completeness on the next proposal/restart. Without new schema, retain that signal
+        # even after chronology earns corroboration; do not fabricate historical references.
+        if not family_unknown:
+            ex.evidence_refs = list(dict.fromkeys([*refs, *novel]))[-64:]
+        if saturated and not (has_observed_date and family_latest
+                              and observed > family_latest):
             # A bounded exact set cannot remember every evicted reference. Keep rolling provenance,
             # but after saturation require source-bound chronology before granting corroboration:
             # processing on a later day alone must not make replayed old evidence look new.
             return {'disposition': 'updated', 'reason': 'evidence_refs_only', 'fact_id': existing_id}
+        if ex.status == 'archived':
+            ex.status, ex.archived_text, ex.archived_reason, ex.duplicate_of = 'active', None, None, None
         ex.seen += 1
         ex.conf = min(ex.conf + 0.1, 1.0)
         ex.first = min(ex.first or today, today)
@@ -701,7 +831,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
         counts["new"] += 1
         return {'disposition': 'superseded' if action == kg.SUPERSEDE else 'added',
                 'reason': 'accepted', 'fact_id': fid}
-    return {'disposition': 'ignored', 'reason': 'archived_match', 'fact_id': existing_id}
+    return {'disposition': 'ignored', 'reason': 'archived_match', 'fact_id': existing_id,
+            'tombstone_reason': p.facts[existing_id].archived_reason if existing_id else None}
 
 
 def _apply_relations(pending: list, index: dict, counts: dict, dropped: list,
@@ -791,7 +922,7 @@ def graph_lock():
         yield
 
 
-def apply(extracted: dict, now: datetime | None = None) -> dict:
+def apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True) -> dict:
     """Apply an extraction to the graph under ONE lock — the graph's single writer, serialized.
 
     Four processes call this concurrently (the brief's Learn step, meeting-prep research, the
@@ -801,12 +932,151 @@ def apply(extracted: dict, now: datetime | None = None) -> dict:
     it. The lock is held across the WHOLE body — the migration, the auto-merge, every file write and
     the suggestion refresh — because those steps read each other's output.
 
+    Explicit target-only owner edits disable identity maintenance to avoid incidental migration,
+    merges or suggestion refresh; fact construction and persistence still use this writer.
+
     jsonstore.lock is reentrant within a process, so the locked merge/relation entry points nest here for free."""
     with graph_lock():
-        return _apply(extracted, now)
+        return _apply(extracted, now, maintain_identities=maintain_identities)
 
 
-def _apply(extracted: dict, now: datetime | None = None) -> dict:
+def prune_stale_memory(now: datetime | None = None) -> dict:
+    """Apply the existing age rule to untouched people through the same graph writer.
+
+    Archive only stale single-observation facts; owner words and corroborated facts retain
+    the existing exemption. No model, source fetch, identity migration or loop mutation.
+    A failed write leaves the caller's weekly checkpoint unadvanced; replay is idempotent.
+    """
+    now = now or datetime.now(timezone.utc)
+    counts = {'people': 0, 'pruned': 0, 'unreadable': 0}
+    with graph_lock():
+        for path in sorted(Path(kg.people_dir()).glob('*.md')):
+            try:
+                person = kg.parse_person_file(path.read_text())
+            except Exception:  # noqa: BLE001
+                # Like the index builders: one unreadable file is skipped and counted, never
+                # rewritten, and cannot hold back archival for every other person.
+                counts['unreadable'] += 1
+                continue
+            before = {fid for fid, fact in person.facts.items() if fact.status == 'archived'}
+            kg.prune_stale_facts(person.facts, now)
+            pruned = sum(fact.status == 'archived' and fid not in before
+                         for fid, fact in person.facts.items())
+            if pruned:
+                # Do not refresh evidence dates or rewrite unchanged files.
+                person.updated_at = kg.now_iso(now)
+                person.updated_by = 'memory_prune'
+                kg.write_person_file(str(path), person, now)
+                counts['people'] += 1
+                counts['pruned'] += pruned
+    return counts
+
+
+def migrate_source_reference(canonical_id, fact_id, expected_version, *, channel, legacy_ref,
+                             original_records, current_record):
+    """Apply one reviewed native-ID mapping, without asserting complete historical support.
+
+    This deliberately has no automatic scan or model tool: callers must supply retained native
+    identity/version proof and an exact fact version reviewed by the owner. Row-only originals
+    and fingerprint guesses cannot establish a mapping. Evidence dates and owner words stay put.
+    """
+    from render_local import verified_legacy_reference_mapping
+
+    if (not isinstance(canonical_id, str) or not kg.valid_canonical_id(canonical_id)
+            or not isinstance(fact_id, str) or not fact_id or len(fact_id) > 256
+            or not isinstance(expected_version, str)
+            or re.fullmatch(r'[a-f0-9]{64}', expected_version) is None
+            or not isinstance(original_records, list) or not 1 <= len(original_records) <= 64):
+        raise ValueError('invalid reviewed source migration target')
+    mapping = verified_legacy_reference_mapping(channel, legacy_ref, original_records, current_record)
+    if mapping is None:
+        return {'status': 'unsupported'}
+    with graph_lock():
+        original_path = Path(kg.people_dir()) / (canonical_id + '.md')
+        if original_path.is_symlink():
+            return {'status': 'unsupported'}
+        path = Path(kg.safe_path(kg.people_dir(), canonical_id))
+        try:
+            with path.open('rb') as handle:
+                raw = handle.read(SOURCE_CORRECTION_FILE_BYTES + 1)
+            if len(raw) > SOURCE_CORRECTION_FILE_BYTES:
+                return {'status': 'unsupported'}
+            person = kg.parse_person_file(raw.decode('utf-8'), invalid_refs=set())
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            return {'status': 'unsupported'}
+        fact = person.facts.get(fact_id)
+        if (person.canonical_id != canonical_id or fact is None
+                or kg.person_fact_version(canonical_id, fact_id, fact) != expected_version):
+            return {'status': 'changed_during_review'}
+        if fact.source == 'user_edit':
+            return {'status': 'protected'}
+        if legacy_ref not in [fact.source_ref, *fact.evidence_refs]:
+            return {'status': 'unsupported'}
+        new_ref = mapping['new_version_ref']
+        if fact.source_ref == legacy_ref:
+            fact.source_ref = new_ref
+        # Empty evidence_refs remain empty: migrating one citation does not prove that the
+        # legacy writer retained all supporting observations.
+        fact.evidence_refs = list(dict.fromkeys(new_ref if ref == legacy_ref else ref
+                                               for ref in fact.evidence_refs))
+        kg.write_person_file(str(path), person)
+        return {'status': 'migrated', 'fact_version': kg.person_fact_version(canonical_id, fact_id, fact)}
+
+
+def project_source_correction(refs, now=None, *, after='', limit=100):
+    """Bounded async projection of already admitted receipts through the canonical graph writer."""
+    if (not isinstance(refs, (list, set, tuple)) or any(not isinstance(ref, str) for ref in refs)
+            or len(refs) > MAX_RECEIPTS or not isinstance(after, str) or len(after) > 256 or '/' in after or '\\' in after
+            or type(limit) is not int or not 1 <= limit <= 100):
+        raise ValueError('invalid source correction projection bounds')
+    admitted = set(refs) & kg.source_invalidated_refs()
+    counts = {'status': 'complete', 'scanned': 0, 'changed': 0, 'archived': 0,
+              'support_removed': 0, 'restored': 0, 'unsupported': 0, 'unreadable': 0,
+              'next_cursor': '', 'complete': True}
+    if not admitted:
+        return counts
+    now = now or datetime.now(timezone.utc)
+    with graph_lock():
+        paths = heapq.nsmallest(limit + 1,
+                               (path for path in Path(kg.people_dir()).glob('*.md') if path.name > after))
+        batch = paths[:limit]
+        counts['complete'] = len(paths) <= limit
+        counts['status'] = 'complete' if counts['complete'] else 'partial'
+        for path in batch:
+            counts['scanned'] += 1
+            counts['next_cursor'] = path.name
+            try:
+                if path.is_symlink():
+                    raise ValueError('symlink is not a graph projection target')
+                with path.open('rb') as handle:
+                    raw = handle.read(SOURCE_CORRECTION_FILE_BYTES + 1)
+                if len(raw) > SOURCE_CORRECTION_FILE_BYTES:
+                    raise ValueError('oversized graph projection target')
+                person = kg.parse_person_file(raw.decode('utf-8'), invalid_refs=set())
+                changed = kg.project_invalidated_evidence(person, admitted)
+                if any(changed[key] for key in ('archived', 'support_removed', 'restored')):
+                    person.updated_at = kg.now_iso(now)
+                    if not kg.summary_protected(person):
+                        person.updated_by = 'source_correction'
+                    write_failed = False
+                    try:
+                        kg.write_person_file(str(path), person, now)
+                    except OSError:
+                        write_failed = True
+                    if write_failed:
+                        # No exception context containing writer diagnostics survives this seam.
+                        raise RuntimeError('source correction write failed')
+                    counts['changed'] += 1
+                for key, count in changed.items():
+                    counts[key] += count
+            except (OSError, ValueError, TypeError, AttributeError, RecursionError, OverflowError, yaml.YAMLError):
+                counts['unreadable'] += 1
+        if counts['complete']:
+            counts['next_cursor'] = ''
+    return counts
+
+
+def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True) -> dict:
     # UTC, not server-local: now_iso labels the timestamp with a 'Z' suffix, so feeding it local
     # time would write a lie into every updated_at in the graph.
     now = now or datetime.now(timezone.utc)
@@ -815,16 +1085,6 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     counts = {"new": 0, "confirmed": 0, "superseded": 0, "pruned": 0, "relations": 0}
     fact_outcomes = {'total': 0, 'counts': {}, 'items': [], 'truncated': False}
 
-    def record_fact(person_index, fact_index, fact, outcome):
-        fact_outcomes['total'] += 1
-        disposition = outcome['disposition']
-        fact_outcomes['counts'][disposition] = fact_outcomes['counts'].get(disposition, 0) + 1
-        if len(fact_outcomes['items']) < 256:
-            digest = hashlib.sha256(json.dumps(fact, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-            fact_outcomes['items'].append({'person_index': person_index, 'fact_index': fact_index,
-                                           'digest': digest, **outcome})
-        else:
-            fact_outcomes['truncated'] = True
     person_files: list[str] = []
     company_files: list[str] = []
     # (subject cid, subject name, [extracted relation]) — resolved AFTER every person file in this
@@ -839,12 +1099,13 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     # Files are keyed by canonical_id, with legacy name-slug files auto-migrated once (idempotent).
     # An existing person is found canonical_id → identifier → name, so "Sarah" texting and
     # "Sarah Chen" emailing land in ONE file instead of fragmenting the graph per name form.
-    kg.migrate_people_dir(now)
+    if maintain_identities:
+        kg.migrate_people_dir(now)
     # Entity-dedup lite, half one: two files sharing an exact identifier are one human. Runs HERE,
     # piggybacking the migration call, so the day's updates land in the merged file rather than
     # re-splitting it — and BEFORE the index is built, so the index can't hand back a path that
     # this pass just deleted.
-    auto_merged = auto_merge_by_identifier(now)
+    auto_merged = auto_merge_by_identifier(now) if maintain_identities else []
     index = kg.build_people_index()
 
     for person_index, upd in enumerate(extracted.get("person_updates", [])):
@@ -856,7 +1117,7 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
             cid = ""  # malformed/LLM-invented id → resolve by identifier/name instead
         if not cid and not ident and not _slug_for(name):
             for fact_index, fact in enumerate(upd.get('facts', [])):
-                record_fact(person_index, fact_index, fact,
+                correction.record_fact_outcome(fact_outcomes, person_index, fact_index, fact,
                             {'disposition': 'rejected', 'reason': 'missing_person_identity'})
             continue  # nothing usable to key this person by (garbage-name-only update)
 
@@ -893,13 +1154,6 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
             p.name = name
 
         patch = upd.get("profile_patch") or {}
-        if patch.get("title"):
-            p.title = patch["title"]
-        if patch.get("company"):
-            new_slug = kg.company_slug(patch["company"]).replace("-", "")
-            cur_slug = kg.company_slug(p.company).replace("-", "") if p.company else None
-            if cur_slug != new_slug:
-                p.company = patch["company"]
         if patch.get("linkedin"):
             p.linkedin = patch["linkedin"]
         # Deterministic connector writers only: X's immutable id is typed identity, and handles
@@ -911,15 +1165,20 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
             kg.observe_x_handle(p, patch["x_handle"], today)
         if isinstance(patch.get("x_resolution"), dict):
             p.x_resolution = dict(patch["x_resolution"])
-        # Research writers (persist_prep / prewarm_graph) stamp when they actually researched this
-        # person; persist_prep.profile_is_fresh keys ONLY off this (file mtime is bumped by every
-        # brief rewrite and says nothing about research recency).
-        if upd.get("last_researched"):
-            p.last_researched = str(upd["last_researched"])[:10]
-
+        covered = any(fu.get('source') == 'web_research' for fu in upd.get('facts', []))
         for fact_index, fu in enumerate(upd.get("facts", [])):
             outcome = _apply_fact(p, cid, fu, today, counts)
-            record_fact(person_index, fact_index, fu, outcome)
+            correction.record_fact_outcome(fact_outcomes, person_index, fact_index, fu, outcome)
+            if fu.get('source') == 'web_research':
+                covered = covered and fact_establishes_research_coverage(outcome)
+            if fact_index == upd.get("profile_support_fact_index") and outcome['disposition'] in ACCEPTED_FACT_DISPOSITIONS:
+                correction.apply_profile(p, patch, _s(upd.get('updated_by')), outcome.get('fact_id', ''))
+        if 'profile_support_fact_index' not in upd:
+            correction.apply_profile(p, patch, _s(upd.get('updated_by')), company_slug=kg.company_slug)
+
+        # Research freshness includes deliberate terminal decisions, but not invalid evidence.
+        if upd.get("last_researched") and covered:
+            p.last_researched = str(upd["last_researched"])[:10]
 
         before_archived = sum(1 for f in p.facts.values() if f.status == "archived")
         kg.prune_stale_facts(p.facts, now)
@@ -1051,7 +1310,7 @@ def _apply(extracted: dict, now: datetime | None = None) -> dict:
     # Entity-dedup lite, half two: refresh the SUGGESTIONS after today's writes (a person created
     # minutes ago is exactly the dupe worth catching). Never merges — see suggest_name_merges.
     try:
-        suggestions = suggest_name_merges(now)
+        suggestions = suggest_name_merges(now) if maintain_identities else []
     except Exception:  # noqa: BLE001 — memory hygiene must never cost the Learn step its writes
         suggestions = []
 
@@ -1168,97 +1427,175 @@ def validate_equivalent_groups(groups, facts, conflicts):
         used.update(group)
 
 
-def consolidate(slug, expected_hash, summary_refs, conflicts, now=None, *, equivalent_groups=None):
+CONFLICT_PEOPLE = 100   # people with stored contradiction pairs; the oldest record is evicted first
+from knowledge import CONFLICT_PAIRS, live_conflict_pairs  # noqa: E402, F401
+
+
+
+
+def curation_fact_version(fact: "kg.FactMeta") -> str:
+    """Semantic/authority version for bounded curation, independent of sightings and file time."""
+    payload = {
+        'text': fact.text, 'type': fact.type, 'source': fact.source,
+        'source_ref': fact.source_ref,
+        'evidence_refs': sorted(json.dumps(ref, sort_keys=True, separators=(',', ':'))
+                                for ref in fact.evidence_refs),
+        'status': fact.status, 'archived_text': fact.archived_text,
+        'archived_reason': fact.archived_reason, 'duplicate_of': fact.duplicate_of,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def _conflict_at(record) -> str:
+    value = record.get('at') if isinstance(record, dict) else None
+    return value if isinstance(value, str) else ''
+
+
+def consolidate(slug, expected_hash, summary_refs, conflicts, now=None, *, equivalent_groups=None,
+                supplied_versions=None, supplied_conflict_revision=None):
     """Apply a Dreamer selection through the graph writer, preserving evidence and human edits.
 
     The model selects existing fact IDs. It cannot supply replacement prose, confidence,
     instructions, identity, or deletion targets. Equivalents retain their original archived evidence.
     """
-    import hashlib
-    import jsonstore
     if not kg.valid_canonical_id(slug):
         raise ValueError('invalid person id')
+    if (supplied_conflict_revision is not None and
+            (not isinstance(supplied_conflict_revision, str) or len(supplied_conflict_revision) != 64
+             or any(ch not in '0123456789abcdef' for ch in supplied_conflict_revision))):
+        raise ValueError('invalid conflict revision')
     now = now or datetime.now(timezone.utc)
     with graph_lock():
         path = _person_path(slug)
-        raw = open(path, encoding='utf-8').read()
-        if hashlib.sha256(raw.encode()).hexdigest() != expected_hash:
+        raw_bytes = Path(path).read_bytes()
+        if hashlib.sha256(raw_bytes).hexdigest() != expected_hash:
             return {'status': 'changed_during_review'}
+        raw = raw_bytes.decode('utf-8')
         person = kg.parse_person_file(raw)
         active = {fid: fact for fid, fact in person.facts.items() if fact.status == 'active'}
+        if supplied_versions is not None:
+            if (not isinstance(supplied_versions, dict) or not supplied_versions
+                    or any(not isinstance(fid, str) or not isinstance(version, str)
+                           or len(version) != 64 for fid, version in supplied_versions.items())):
+                raise ValueError('invalid supplied versions')
+            if any(fid not in active or curation_fact_version(active[fid]) != version
+                   for fid, version in supplied_versions.items()):
+                return {'status': 'changed_during_review'}
+            scoped = {fid: active[fid] for fid in supplied_versions}
+        else:
+            scoped = active
         if (not isinstance(summary_refs, list) or len(summary_refs) > 4
                 or len(set(summary_refs)) != len(summary_refs)
-                or any(fid not in active for fid in summary_refs)
+                or any(fid not in scoped for fid in summary_refs)
                 or not isinstance(conflicts, list) or len(conflicts) > 3):
             raise ValueError('invalid consolidation references')
         for pair in conflicts:
-            if not isinstance(pair, list) or len(pair) != 2 or len(set(pair)) != 2 or any(fid not in active for fid in pair):
+            if not isinstance(pair, list) or len(pair) != 2 or len(set(pair)) != 2 or any(fid not in scoped for fid in pair):
                 raise ValueError('invalid contradiction references')
         groups = equivalent_groups if equivalent_groups is not None else []
-        validate_equivalent_groups(groups, active, conflicts)
-        # Never overwrite a human-maintained summary or turn uncertain facts into confident prose.
-        prior_text = ' '.join(person.facts[fid].text for fid in person.summary_refs if fid in person.facts)
-        protected_summary = (person.summary and (
-            (person.summary_refs and person.summary != prior_text)
-            or (not person.summary_refs and person.updated_by == 'user_edit')))
-        duplicates, seen, representatives = 0, {}, {}
-        protected_refs = set(person.summary_refs) if protected_summary else set()
-        # The chosen existing fact keeps its own provenance, dates, seen count and confidence.
-        # Other assertions remain in the file with their independent source/consent ownership.
-        # Never pool source refs across grants or make repeated paraphrases stronger evidence.
-        # Keeper rule: a user correction, else the most corroborated copy (seen, then effective
-        # confidence); the model's order only breaks ties. Its wording preference must not archive
-        # a corroborated copy (never age-pruned) behind a heard-once one that ages out at day 60.
-        def rank(fid):
-            fact = active[fid]
-            return (fact.source == 'user_edit', fact.seen, kg.effective_confidence(fact, now))
-
-        def fold(fid, keeper):
-            nonlocal duplicates
-            fact = active[fid]
-            fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'duplicate'
-            fact.duplicate_of = representatives[fid] = keeper
-            duplicates += 1
-
-        for group in groups:
-            keeper = max(group, key=rank)  # max() keeps the first of equals: model order breaks ties
-            for fid in group:
-                if fid != keeper and active[fid].source != 'user_edit' and fid not in protected_refs:
-                    fold(fid, keeper)
-        for fid in sorted(active, key=lambda fid: (tuple(-v for v in rank(fid)), fid)):
-            fact = active[fid]
-            if fact.status != 'active':
-                continue
-            key = (fact.type, ' '.join(fact.text.split()).casefold())
-            if key in seen and fact.source != 'user_edit' and fid not in protected_refs:
-                fold(fid, seen[key])
-            else:
-                seen[key] = fid
-        # A bare contact-note number is not an assertion. Keep the original in the archive,
-        # but stop displaying it as a learned fact. Human-authored facts are never filtered.
-        for fid, fact in active.items():
-            if (fact.status == 'active' and fact.source == 'apple_contacts'
-                    and not any(c.isalpha() for c in fact.text) and fid not in protected_refs):
-                fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'non_assertion'
-        if not protected_summary:
-            def representative(fid):
-                while fid in representatives:
-                    fid = representatives[fid]
-                return fid
-            summary_refs = list(dict.fromkeys(representative(fid) for fid in summary_refs))
-            summary_refs = [fid for fid in summary_refs if active[fid].status == 'active']
-            person.summary_refs = summary_refs
-            person.summary = ' '.join(active[fid].text for fid in summary_refs)
-        # Curation is not a new observation: preserve each fact's date/confidence and file recency.
-        kg.write_person_file(path, person, now)
-        written_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        validate_equivalent_groups(groups, scoped, conflicts)
+        # A summary from one bounded window identifies only its submitted references. Other
+        # assertions remain in storage and retrieval; a later window may replace this derived view.
+        protected_summary = kg.summary_protected(person)
         conflict_path = os.path.join(kg.data_root(), 'knowledge', 'conflicts.json')
-        with jsonstore.transaction(conflict_path, default={'people': {}}) as state:
-            state.setdefault('people', {})[slug] = {'pairs': conflicts, 'at': kg.now_iso(now)}
-            state['people'] = dict(sorted(state['people'].items(), key=lambda kv: kv[1]['at'])[-100:])
-        return {'status': 'ok', 'duplicates': duplicates, 'conflicts': len(conflicts),
-                'summary_facts': len(summary_refs), 'protected_summary': bool(protected_summary),
-                'hash': written_hash}
+        # Lock ordering is graph -> conflicts, matching the writer. Conflict storage is bounded by
+        # eviction, never by refusal: a full store must not stop curation of the next person.
+        with jsonstore.lock(conflict_path):
+            state = jsonstore.read(conflict_path, default={'people': {}}, strict=True)
+            if not isinstance(state, dict) or not isinstance(state.get('people'), dict):
+                raise ValueError('invalid conflict state')
+            people = state['people']
+            previous = people.get(slug, {})
+            if not isinstance(previous, dict):
+                return {'status': 'invalid_conflict_state'}
+            previous_pairs = previous.get('pairs', [])
+            if (not isinstance(previous_pairs, list)
+                    or any(not isinstance(pair, list) or len(pair) != 2
+                           or any(not isinstance(fid, str) for fid in pair)
+                           or len(set(pair)) != 2 for pair in previous_pairs)):
+                return {'status': 'invalid_conflict_state'}
+            current_revision = hashlib.sha256(json.dumps(previous_pairs, sort_keys=True).encode()).hexdigest()
+            if supplied_conflict_revision is not None and current_revision != supplied_conflict_revision:
+                return {'status': 'changed_during_review'}
+            scoped_ids = set(scoped)
+            # Keep an unreviewed pair only while both of its facts are still active; a pair whose
+            # side was edited or archived is already invisible to every reader and is dropped here.
+            preserved = ([pair for pair in live_conflict_pairs(person, previous_pairs)
+                          if not set(pair) <= scoped_ids]
+                         if supplied_versions is not None else [])
+            candidates, pair_keys = [], set()
+            for pair in [*conflicts, *preserved]:   # this review's findings first, then older ones
+                key = tuple(sorted(pair))
+                if key not in pair_keys:
+                    candidates.append(pair)
+                    pair_keys.add(key)
+            merged = candidates[:CONFLICT_PAIRS]
+            duplicates, seen, representatives = 0, {}, {}
+            # Every live candidate's facts stay unfolded in this write, including one evicted for room.
+            conflict_endpoints = {fid for pair in candidates for fid in pair}
+            protected_refs = (set(person.summary_refs) if protected_summary else set()) | conflict_endpoints
+            # The chosen existing fact keeps its own provenance, dates, seen count and confidence.
+            # Other assertions remain in the file with their independent source/consent ownership.
+            # Never pool source refs across grants or make repeated paraphrases stronger evidence.
+            # Keeper rule: a user correction, else the most corroborated copy (seen, then effective
+            # confidence); the model's order only breaks ties. Its wording preference must not archive
+            # a corroborated copy (never age-pruned) behind a heard-once one that ages out at day 60.
+            def rank(fid):
+                fact = active[fid]
+                return (fact.source == 'user_edit', fact.seen, kg.effective_confidence(fact, now))
+
+            def fold(fid, keeper):
+                nonlocal duplicates
+                fact = active[fid]
+                fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'duplicate'
+                fact.duplicate_of = representatives[fid] = keeper
+                duplicates += 1
+
+            for group in groups:
+                keeper = max(group, key=rank)  # max() keeps the first of equals: model order breaks ties
+                for fid in group:
+                    if fid != keeper and active[fid].source != 'user_edit' and fid not in protected_refs:
+                        fold(fid, keeper)
+            for fid in sorted(scoped, key=lambda fid: (tuple(-v for v in rank(fid)), fid)):
+                fact = scoped[fid]
+                if fact.status != 'active':
+                    continue
+                key = (fact.type, ' '.join(fact.text.split()).casefold())
+                if key in seen and fact.source != 'user_edit' and fid not in protected_refs:
+                    fold(fid, seen[key])
+                else:
+                    seen[key] = fid
+            # A bare contact-note number is not an assertion. Keep the original in the archive,
+            # but stop displaying it as a learned fact. Human-authored facts are never filtered.
+            for fid, fact in scoped.items():
+                if (fact.status == 'active' and fact.source == 'apple_contacts'
+                        and not any(c.isalpha() for c in fact.text) and fid not in protected_refs):
+                    fact.status, fact.archived_text, fact.archived_reason = 'archived', fact.text, 'non_assertion'
+            if not protected_summary:
+                def representative(fid):
+                    while fid in representatives:
+                        fid = representatives[fid]
+                    return fid
+                summary_refs = list(dict.fromkeys(representative(fid) for fid in summary_refs))
+                summary_refs = [fid for fid in summary_refs if active[fid].status == 'active']
+                person.summary_refs = summary_refs
+                person.summary = ' '.join(person.facts[fid].text for fid in person.summary_refs)
+            # Curation is not a new observation: preserve each fact's date/confidence and file recency.
+            kg.write_person_file(path, person, now)
+            written_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            if merged:
+                people.pop(slug, None)   # re-inserted as the newest record
+                at = kg.now_iso(now)
+                while len(people) >= CONFLICT_PEOPLE:
+                    people.pop(min(people, key=lambda cid: (_conflict_at(people[cid]), cid)))
+                people[slug] = {'pairs': merged, 'at': at}
+            else:
+                people.pop(slug, None)
+            jsonstore.write_atomic(conflict_path, state)
+            return {'status': 'ok', 'duplicates': duplicates, 'conflicts': len(merged),
+                    'summary_facts': len(person.summary_refs), 'protected_summary': bool(protected_summary),
+                    'hash': written_hash,
+                    'committed_versions': {fid: curation_fact_version(person.facts[fid]) for fid in scoped}}
 
 
 # The LAST lines of this file, on purpose. This guard once sat above the three locked wrappers —

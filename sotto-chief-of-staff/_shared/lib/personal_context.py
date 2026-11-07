@@ -14,7 +14,7 @@ FEEDBACK_LIMIT = 8
 FEEDBACK_EXCERPT_CHARS = 320
 
 
-def archived_output(reference):
+def archived_output(reference, *, permitted=None, snapshot=False):
     """Return an output only while its authorized archive still exists."""
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
     if str(reference).startswith('draft:'):
@@ -30,9 +30,16 @@ def archived_output(reference):
         if not isinstance(sources, list):
             return None
         from source_context import allowed
-        if any(not isinstance(source, str) or not allowed(source) for source in sources):
+        if any(not isinstance(source, str) or not allowed(source)
+               or permitted is not None and not permitted(source) for source in sources):
             return None
-        return str(value.get('brief_text') or value.get('brief_markdown') or '') or None
+        text = str(value.get('brief_text') or value.get('brief_markdown') or '') or None
+        if not text or not snapshot:
+            return text
+        marker = (root / 'briefs' / f'{match[1]}.{match[2]}.delivered').read_bytes()
+        version = hashlib.sha256(json.dumps([text, sources, marker.hex()], ensure_ascii=False,
+            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return {'text': text, 'archive_version': version}
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
@@ -53,8 +60,8 @@ def item_locator(text, excerpt):
     return f'excerpt:{start}:{len(excerpt)}:{digest}'
 
 
-def resolve_item(reference, locator):
-    text = archived_output(reference)
+def resolve_item(reference, locator, *, permitted=None):
+    text = archived_output(reference, permitted=permitted)
     if not text or not str(locator).startswith('excerpt:'):
         return None
     try:
@@ -85,7 +92,7 @@ def rows(path, limit=2000):
     return result
 
 
-def feedback(now=None):
+def feedback(now=None, *, permitted=None):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -104,9 +111,9 @@ def feedback(now=None):
         locator = row.get('item_locator') or 'output'
         key = (row.get('reference'), locator)
         recent.pop(key, None)
-        if locator == 'output' and archived_output(row.get('reference')) is None:
+        if locator == 'output' and archived_output(row.get('reference'), permitted=permitted) is None:
             continue
-        item = None if locator == 'output' else resolve_item(row.get('reference'), locator)
+        item = None if locator == 'output' else resolve_item(row.get('reference'), locator, permitted=permitted)
         if locator != 'output' and item is None:
             continue
         recent[key] = {k: str(row.get(k) or '')[:200] for k in ('outcome', 'reference')}
@@ -116,8 +123,8 @@ def feedback(now=None):
     return list(recent.values())[-FEEDBACK_LIMIT:]
 
 
-def render_feedback(now=None):
-    examples = feedback(now)
+def render_feedback(now=None, *, permitted=None):
+    examples = feedback(now, permitted=permitted)
     if not examples:
         return ''
     return ('\nUSER FEEDBACK ON SPECIFIC PAST OUTPUTS\n'
@@ -147,6 +154,95 @@ def event_source(event):
     return 'gmail' if source in ('email', 'gmail') else source
 
 
+def resolve_sender(event, lookup):
+    """Use the shared contact resolvers for a transport event, including email aliases."""
+    from render_local import resolve_imessage_name, resolve_whatsapp_name, resolve_call_name
+    from textutil import _s, _sender_addr, _extract_sender_name
+    source = event_source(event)
+    if source == 'gmail':
+        envelope = _s(event.get('from'))
+        ident = _sender_addr(envelope)
+        return (lookup.get(ident) or _extract_sender_name(envelope) or ident or 'Unknown'), ident
+    if source == 'whatsapp':
+        ident = _s(event.get('sender_jid')) or _s(event.get('contact_jid'))
+        return resolve_whatsapp_name(ident, _s(event.get('partner_name')), lookup), ident
+    if source == 'calls':
+        ident = _s(event.get('phone'))
+        return resolve_call_name(ident, lookup) or '', ident
+    ident = _s(event.get('handle'))
+    return resolve_imessage_name(ident, lookup), ident
+
+
+def graph_display_name(ident):
+    """Best-effort exact-identifier lookup; a display name never joins people."""
+    if not ident:
+        return ''
+    try:
+        import knowledge
+        from textutil import _looks_like_phone_number
+        path = knowledge.find_person_file(identifier=ident)
+        name = knowledge.parse_person_file(Path(path).read_text()).name if path else ''
+        return name if name and name != 'Unknown' and not _looks_like_phone_number(name) else ''
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+def conversation_filter(explicit, lookup=None, *, graph_name=None):
+    """One batch's current mute check, shared by triage, composition and delivery."""
+    from email.utils import getaddresses
+    import preferences
+    from render_local import build_contact_lookup
+    from source_context import allowed
+    if lookup is None:
+        lookup = {}
+        if explicit.get('mute_people') and allowed('contacts'):
+            try:
+                path = Path(os.environ.get('SOTTO_DATA', '/data')) / 'knowledge/last_local_snapshot.json'
+                lookup = build_contact_lookup(json.loads(path.read_text()).get('local', {}).get('contacts', []))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+    names = {}
+    def include(event):
+        if not isinstance(event, dict):
+            return False
+        try:
+            for name in ('', event.get('resolved_name'), event.get('sender_name')):
+                if preferences.proactively_muted(name, event, explicit):
+                    return False
+            if not explicit.get('mute_people'):
+                return True
+            if event_source(event) == 'gmail':
+                addresses = getaddresses([str(event.get('from') or '')])
+                if len(addresses) == 1 and preferences.proactively_muted(addresses[0][0], event, explicit):
+                    return False
+            name, ident = resolve_sender(event, lookup)
+            if preferences.proactively_muted(name, event, explicit):
+                return False
+            if ident and normalized_identifier(ident) not in lookup:
+                if ident not in names:
+                    names[ident] = (graph_name or graph_display_name)(ident)
+                return not preferences.proactively_muted(names[ident], event, explicit)
+            return True
+        except Exception:  # noqa: BLE001 — malformed preferences/identity hold context and delivery
+            return False
+    return include
+
+
+def notification_sender(item):
+    """Minimal selected-sender proof for current mute checks; never retain message prose."""
+    event = item.get('event') or {}
+    result = {key: event[key] for key in ('source', 'from', 'handle', 'contact_jid', 'sender_jid',
+              'phone', 'email', 'address', 'partner_name', 'resolved_name', 'sender_name') if key in event}
+    result.setdefault('source', item.get('channel', ''))
+    if item.get('person'):
+        result['resolved_name'] = item['person']
+    if item.get('identifier'):
+        result.setdefault('handle', item['identifier'])
+        if event_source(result) == 'gmail':
+            result.setdefault('from', item['identifier'])
+    return result
+
+
 def conversation_key(event):
     """Stable source/thread key; a missing identity stays independent, never name-joined."""
     import hashlib
@@ -171,18 +267,38 @@ def conversation_key(event):
     return source + ':event:' + str(stable)
 
 
-def conversation_message(event, *, timestamp='', prior_class=''):
+def _conversation_text(event):
+    return '\n'.join(str(event.get(k) or '') for k in ('subject', 'text', 'body', 'snippet')
+                     if event.get(k))
+
+
+def conversation_message(event, *, timestamp='', prior_class='', text_limit=CONVERSATION_TEXT_CHARS,
+                         preserve_ending=False):
     from timeutil import parse_observed_time
     observed = parse_observed_time(event.get('timestamp') or event.get('date')) or parse_observed_time(timestamp)
-    text = '\n'.join(str(event.get(k) or '') for k in ('subject', 'text', 'body', 'snippet') if event.get(k))
+    text = _conversation_text(event)
+    original_length = len(text)
+    clipped = original_length > text_limit
+    if clipped:
+        if preserve_ending:
+            marker = '\n[message middle omitted]\n'
+            head = (text_limit - len(marker)) // 2
+            text = text[:head] + marker + text[-(text_limit - len(marker) - head):]
+        else:
+            text = text[:text_limit]  # keep digest and meeting-prep's existing 400-char preview
     return {'source': event_source(event), 'ts': observed.isoformat() if observed else '',
             'thread': conversation_key(event), 'is_from_me': bool(event.get('is_from_me')) or prior_class == 'signal',
-            'text': text[:CONVERSATION_TEXT_CHARS], 'prior_class': prior_class}
+            'text': text, 'prior_class': prior_class, 'original_length': original_length,
+            'text_clipped': clipped}
 
 
-def conversation_snapshot():
-    """Read shared queue/snapshot sources once for an ingress batch."""
+def conversation_snapshot(events=None, *, include=None):
+    """Read retained context once, plus copies of incoming rows, with optional sender filtering."""
     from source_context import project_local
+    incoming = None if events is None else [dict(event) for event in events if isinstance(event, dict)]
+    if incoming == []:
+        return []
+    threads = None if incoming is None else {conversation_key(event) for event in incoming}
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
     candidates = [(r.get('event') or {}, r.get('ts', ''), r.get('verdict_class', ''))
                   for r in rows(root / 'events/queue.jsonl')]
@@ -194,7 +310,10 @@ def conversation_snapshot():
                               if isinstance(r, dict))
     except (OSError, ValueError, TypeError, AttributeError):
         pass
-    return candidates
+    candidates.extend((event, '', '') for event in incoming or [])
+    return [row for row in candidates if isinstance(row[0], dict)
+            and (threads is None or conversation_key(row[0]) in threads)
+            and (include is None or include(row[0]))]
 
 
 def current_conversation(event, now=None, candidates=None):
@@ -212,7 +331,8 @@ def current_conversation(event, now=None, candidates=None):
     for candidate, stamp, cls in candidates:
         if not isinstance(candidate, dict) or conversation_key(candidate) != conversation_key(event):
             continue
-        message = conversation_message(candidate, timestamp=stamp, prior_class=cls)
+        message = conversation_message(candidate, timestamp=stamp, prior_class=cls,
+                                       text_limit=CONVERSATION_TOTAL_CHARS, preserve_ending=True)
         parsed = _parse_ts(message['ts'])
         if parsed is None:
             if candidate != event:
@@ -221,11 +341,17 @@ def current_conversation(event, now=None, candidates=None):
         parsed = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
         if not now - timedelta(days=CONVERSATION_DAYS) <= parsed <= now:
             continue
-        key = (message['ts'], message['is_from_me'], message['text'])
+        # Deduplicate using the full observed text: two distinct endings must not collapse merely
+        # because their bounded display excerpts happen to match.
+        key = (message['ts'], message['is_from_me'], hashlib.sha256(
+            _conversation_text(candidate).encode()).digest())
         selected[key] = (parsed, message)
-    messages = [m for _, m in sorted(selected.values(), key=lambda pair: pair[0])[-CONVERSATION_MESSAGES:]]
+    ordered = sorted(selected.values(), key=lambda pair: pair[0])
+    messages = [m for _, m in ordered[-CONVERSATION_MESSAGES:]]
     while sum(len(m['text']) for m in messages) > CONVERSATION_TOTAL_CHARS and len(messages) > 1:
         messages.pop(0)
+    if messages and len(ordered) > len(messages):
+        messages[0]['older_observed_messages_omitted'] = len(ordered) - len(messages)
     return messages
 
 

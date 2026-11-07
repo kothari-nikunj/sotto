@@ -1,0 +1,136 @@
+{
+  "instructions": "Synthetic machinery contract. Tools are selected by a scripted external provider. Use supplied skill and source tools; no writes.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document and launch checklist remain open. An unrelated acknowledgment does not fulfill either promise.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "toolResultExcludes": [
+        "journey-pricing-text"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document and checklist remain open.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "toolResultExcludes": [
+        "journey-pricing-text"
+      ]
+    },
+    {
+      "text": "4."
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document and launch checklist remain open. An unrelated acknowledgment does not fulfill either promise.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "toolResultExcludes": [
+        "journey-pricing-text"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document and launch checklist remain open. An unrelated acknowledgment does not fulfill either promise.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "toolResultExcludes": [
+        "journey-pricing-text"
+      ]
+    }
+  ]
+}

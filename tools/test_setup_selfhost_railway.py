@@ -2,17 +2,24 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 import pytest
 
+from adapters.sotto import selfhost_bootstrap
+from adapters.sotto import process_handoff
+
 
 spec = importlib.util.spec_from_file_location('setup_selfhost_railway',
                                              Path(__file__).with_name('setup_selfhost_railway.py'))
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
+ROOT = Path(__file__).resolve().parents[1]
+REAL_HEALTH = setup._health
+MARKER = {'schema': 1, 'tenant_id': 'fixture-local-tenant', 'volume_id': 'volume-id'}
 
 
 def config(tmp_path):
@@ -20,12 +27,17 @@ def config(tmp_path):
             'environment_id': '22222222-2222-2222-2222-222222222222',
             'service_name': 'sotto-selfhost', 'source_path': str(tmp_path),
             'source_commit': 'a' * 40, 'source_manifest_sha256': 'b' * 64,
-            'owner_phone': '+15555550101', 'photon_project_id': 'project',
-            'photon_project_secret': 'private-photon-secret',
-            'gemini_api_key': 'private-gemini-key'}
+            'tenant_id': 'fixture-local-tenant', 'owner_phone': '+15551234567',
+            'photon_line_number': '+15557654321', 'photon_project_id': 'synthetic-project',
+            'photon_project_secret': 'private-photon-secret', 'gemini_api_key': 'private-gemini-key',
+            'sotto_runtime': {'account_id': 'fixture-account', 'line_key': 'physical-line-a',
+                              'instructions': 'Answer briefly.', 'chat_model_id': 'gemini-chat-fixture',
+                              'native_media_model_id': 'gemini-media-fixture', 'timezone': 'UTC'}}
 
 
 class FakeRailway:
+    """Synthetic Railway: each CLI upload becomes one deployment carrying the current start command."""
+
     def __init__(self, project, environment):
         self.service = None
         self.volume = None
@@ -33,12 +45,17 @@ class FakeRailway:
         self.volume_hidden_reads = 0
         self.domain_hidden_reads = 0
         self.vars = {}
-        self.latest = None
         self.history = {}
+        self.messages = {}
+        self.starts = {}
+        self.start = None
+        self.uploads = 0
+        self.new_status = 'SUCCESS'
         self.operations = []
-        self.upload_fails_after_accept = False
         self.settings = {'dockerfilePath': None, 'rootDirectory': None,
                          'healthcheckPath': None, 'healthcheckTimeout': 300}
+        self.marker = 'pending'
+        self.marker_reads = 0
 
     def close(self):
         self.operations.append('close')
@@ -89,7 +106,11 @@ class FakeRailway:
         return {'domain': self.domain['domain'], 'targetPort': 8080}
 
     def instance(self, service):
-        return {'startCommand': None, 'source': {}, 'latestDeployment': self.latest}
+        latest = None
+        if self.history:
+            identifier = list(self.history)[-1]
+            latest = {'id': identifier, 'status': self.history[identifier]}
+        return {'startCommand': self.start, 'source': {}, 'latestDeployment': latest}
 
     def build_settings(self, service):
         return dict(self.settings)
@@ -98,21 +119,31 @@ class FakeRailway:
         self.operations.append('set_build_settings')
         self.settings.update(settings)
 
+    def set_start(self, service, start):
+        self.operations.append('set_start:' + start)
+        self.start = start
+
     def upload(self, service, source, message):
         self.operations.append('upload')
-        self.latest = {'id': 'deployment-id', 'status': 'SUCCESS',
-                       'meta': {'cliMessage': message}}
-        self.history['deployment-id'] = 'SUCCESS'
-        if self.upload_fails_after_accept:
-            raise setup.SetupError('ambiguous upload response')
+        self.uploads += 1
+        identifier = f'deployment-{self.uploads}'
+        self.messages[identifier] = message
+        self.starts[identifier] = self.start
+        self.history[identifier] = self.new_status
 
     def deployment(self, identifier, service):
         return {'id': identifier, 'status': self.history[identifier], 'meta': {
-            'imageDigest': 'sha256:' + 'c' * 64,
-            'serviceManifest': {'deploy': {'startCommand': None}}}}
+            'cliMessage': self.messages.get(identifier), 'imageDigest': 'sha256:' + 'c' * 64,
+            'serviceManifest': {'deploy': {'startCommand': self.starts.get(identifier)}}}}
 
     def deployment_statuses(self, service):
         return dict(self.history)
+
+    def volume_marker(self, volume):
+        self.marker_reads += 1
+        if self.marker == 'pending':
+            raise setup.VolumeInspectionPendingError('file access needs a running container')
+        return self.marker
 
 
 class Healthy:
@@ -128,67 +159,75 @@ class Healthy:
         pass
 
 
-def patch_offline(monkeypatch, c):
+def offline(monkeypatch, c):
+    """Pin the synthetic source and record each health probe as (prepared, domain)."""
     monkeypatch.setattr(setup, 'source_receipt', lambda *_a, **_k: {
         'source_commit': c['source_commit'],
         'source_manifest_sha256': c['source_manifest_sha256']})
-    monkeypatch.setattr(setup.urllib.request, 'urlopen', lambda *_a, **_k: Healthy())
+    health = []
+    monkeypatch.setattr(setup, '_health', lambda domain, *, prepared: health.append((prepared, domain)))
+    return health
 
 
-def test_setup_saves_receipts_before_deploy_and_reruns_without_replacement(tmp_path, monkeypatch):
+def run_setup(c, state_path, provider, **kwargs):
+    return setup.reconcile(c, state_path, provider_factory=lambda *_: provider, **kwargs)
+
+
+def test_fresh_setup_uploads_pinned_source_twice_with_prepare_then_run(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    health = offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    state_path = tmp_path / 'state.json'
-    first = setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert first['stage'] == 'receiver_reachable'
-    assert first['model_status'] == 'unverified' and first['setup_status'] == 'pending'
+    state_path = tmp_path / 'new-state-directory' / 'state.json'
+    result = run_setup(c, state_path, provider)
+    assert result['stage'] == 'receiver_reachable'
+    assert result['model_status'] == 'unverified' and result['setup_status'] == 'pending'
+    assert result['image_digest'] == 'sha256:' + 'c' * 64
     assert state_path.stat().st_mode & 0o077 == 0
     state = setup.protected_json(state_path)
-    assert state['service_id'] == 'service-id' and state['volume_id'] == 'volume-id'
-    assert state['deployment_id'] == 'deployment-id'
-    assert state['image_digest'] == 'sha256:' + 'c' * 64
-    assert provider.vars['PHOTON_ALLOWED_USERS'] == c['owner_phone']
-    assert provider.vars['PHOTON_HOME_CHANNEL'] == c['owner_phone']
-    assert provider.vars['SOTTO_CRON_DELIVER'] == 'photon'
-    assert provider.vars['PHOTON_ALLOW_ALL_USERS'] == 'false'
-    assert provider.vars['BRIDGE_TOKEN'] == state['bridge_token']
-    assert provider.operations.index('create_volume') < provider.operations.index('upload')
-    assert provider.operations.index('create_domain') < provider.operations.index('upload')
-    assert provider.operations.index('set_variable:GOOGLE_AI_API_KEY') < provider.operations.index('upload')
-    assert provider.operations.index('set_build_settings') < provider.operations.index('upload')
-    assert 'private-photon-secret' not in json.dumps(first)
-    assert 'private-gemini-key' not in json.dumps(first)
-    setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert provider.operations.count('create_service') == 1
-    assert provider.operations.count('create_volume') == 1
-    assert provider.operations.count('upload') == 1
+    assert (state['initializer_deployment_id'], state['runtime_deployment_id']) == (
+        'deployment-1', 'deployment-2')
+    assert provider.starts == {'deployment-1': setup.SOTTO_PREPARE_START,
+                               'deployment-2': setup.SOTTO_RUNTIME_START}
+    marker = state['request_marker']
+    assert provider.messages == {
+        'deployment-1': f'sotto-selfhost {marker} initializer {c["source_commit"]}',
+        'deployment-2': f'sotto-selfhost {marker} runtime {c["source_commit"]}'}
+    assert health == [(True, 'selfhost.example.test'), (False, 'selfhost.example.test')]
+    assert set(provider.vars) == {'SOTTO_SETUP_REQUEST', 'SOTTO_SELFHOST_LAUNCH'}
+    envelope = json.loads(provider.vars['SOTTO_SELFHOST_LAUNCH'])
+    assert envelope['provider']['volumeCreationReceipt'] == {
+        'service_id': 'service-id', 'volume_id': 'volume-id'}
+    assert envelope['bundle']['manifest']['photonLineNumber'] == c['photon_line_number']
+    assert envelope['bundle']['manifest']['owner']['ownerId'] == c['owner_phone']
+    assert envelope['bundle']['publicReceiverAuthority']['serviceId'] == 'service-id'
+    assert envelope['bundle']['trustedServiceId'] == 'service-id'
+    ops = provider.operations
+    assert ops.index('create_volume') < ops.index('create_domain') < ops.index(
+        'set_variable:SOTTO_SELFHOST_LAUNCH') < ops.index('set_build_settings') < ops.index(
+        'set_start:' + setup.SOTTO_PREPARE_START) < ops.index('upload')
+    assert 'private-photon-secret' not in json.dumps(result)
+    assert 'private-gemini-key' not in json.dumps(result)
+    run_setup(c, state_path, provider)
+    for step in ('create_service', 'create_volume', 'create_domain'):
+        assert provider.operations.count(step) == 1
+    assert provider.uploads == 2
 
 
 def test_slow_build_resumes_same_deployment_without_second_upload(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    original_upload = provider.upload
-
-    def slow_upload(*args):
-        original_upload(*args)
-        provider.history['deployment-id'] = 'BUILDING'
-        provider.latest['status'] = 'BUILDING'
-
-    provider.upload = slow_upload
+    provider.new_status = 'BUILDING'
     monkeypatch.setattr(setup, 'DEPLOYMENT_POLLS', 2)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: None)
     state_path = tmp_path / 'state.json'
     with pytest.raises(setup.SetupPendingError, match='saved deployment will be reused'):
-        setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert setup.protected_json(state_path)['deployment_id'] == 'deployment-id'
-    provider.history['deployment-id'] = 'SUCCESS'
-    provider.latest['status'] = 'SUCCESS'
-    result = setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert result['stage'] == 'receiver_reachable'
-    assert provider.operations.count('upload') == 1
-    assert provider.operations.count('create_volume') == 1
+        run_setup(c, state_path, provider)
+    assert setup.protected_json(state_path)['initializer_deployment_id'] == 'deployment-1'
+    provider.history['deployment-1'] = 'SUCCESS'
+    provider.new_status = 'SUCCESS'
+    assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
+    assert provider.uploads == 2 and provider.operations.count('create_volume') == 1
 
 
 def test_pending_cli_explains_resume_without_traceback(tmp_path, monkeypatch, capsys):
@@ -206,55 +245,53 @@ def test_pending_cli_explains_resume_without_traceback(tmp_path, monkeypatch, ca
 
 def test_generated_railway_variables_allowed_but_other_app_variables_rejected(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+    run_setup(c, tmp_path / 'state.json', provider)
     assert provider.variables('service-id')['RAILWAY_PUBLIC_DOMAIN'] == 'selfhost.example.test'
     provider.vars['PHOTON_ALLOW_ALL_USERS'] = 'true'
     with pytest.raises(setup.SetupError, match='Existing service variables differ'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
-
-
-def test_lost_upload_response_resolves_exact_message_without_second_upload(tmp_path, monkeypatch):
-    c = config(tmp_path)
-    patch_offline(monkeypatch, c)
-    provider = FakeRailway(c['project_id'], c['environment_id'])
-    provider.upload_fails_after_accept = True
-    state_path = tmp_path / 'state.json'
-    with pytest.raises(setup.SetupError, match='ambiguous upload'):
-        setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert setup.protected_json(state_path)['source_upload_attempted'] is True
-    setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-    assert provider.operations.count('upload') == 1
+        run_setup(c, tmp_path / 'state.json', provider)
 
 
 def test_conflicts_fail_closed_without_touching_other_service_or_volume(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     provider.service = {'id': 'unowned', 'name': c['service_name']}
     with pytest.raises(setup.SetupError, match='not owned'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+        run_setup(c, tmp_path / 'state.json', provider)
     assert 'create_volume' not in provider.operations
     provider.service = None
     provider.volume = {'id': 'foreign-volume', 'service_id': 'service-id', 'mount_path': '/data'}
     with pytest.raises(setup.SetupError, match='ambiguous'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+        run_setup(c, tmp_path / 'state.json', provider)
     assert 'upload' not in provider.operations
 
 
 def test_rejects_changed_input_and_second_active_deployment(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     state_path = tmp_path / 'state.json'
-    setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
+    run_setup(c, state_path, provider)
     changed = {**c, 'owner_phone': '+15555550202'}
     with pytest.raises(setup.SetupError, match='differs'):
-        setup.reconcile(changed, state_path, provider_factory=lambda *_: provider)
+        run_setup(changed, state_path, provider)
     provider.history['other-active'] = 'SUCCESS'
-    with pytest.raises(setup.SetupError, match='Another runtime deployment'):
-        setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
+    with pytest.raises(setup.SetupError, match='no longer latest|Another Sotto runtime deployment'):
+        run_setup(c, state_path, provider)
+
+
+def test_changed_source_checkout_stops_before_provider_contact(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    monkeypatch.setattr(setup, 'source_receipt', lambda *_a, **_k: {
+        'source_commit': 'd' * 40, 'source_manifest_sha256': c['source_manifest_sha256']})
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    with pytest.raises(setup.SetupError, match='differs from the pinned clean checkout'):
+        run_setup(c, tmp_path / 'state.json', provider)
+    assert provider.operations == []
 
 
 def test_source_receipt_parses_actual_railway_toml_not_comment_text(tmp_path):
@@ -274,34 +311,31 @@ def test_source_receipt_parses_actual_railway_toml_not_comment_text(tmp_path):
 
 def test_created_volume_must_attach_before_source_upload(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     provider.create_volume = lambda service: 'unattached-volume-id'
     with pytest.raises(setup.SetupError, match='did not attach'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+        run_setup(c, tmp_path / 'state.json', provider)
     assert 'upload' not in provider.operations
 
 
 def test_transient_volume_and_domain_absence_resolve_without_second_creation(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: None)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     provider.volume_hidden_reads = 2
     provider.domain_hidden_reads = 2
-
-    result = setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
-
-    assert result['stage'] == 'receiver_reachable'
+    assert run_setup(c, tmp_path / 'state.json', provider)['stage'] == 'receiver_reachable'
     assert provider.operations.count('create_volume') == 1
     assert provider.operations.count('create_domain') == 1
-    assert provider.operations.count('upload') == 1
+    assert provider.uploads == 2
 
 
 def test_wrong_new_attachment_fails_immediately_without_upload(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: pytest.fail('wrong attachment was polled'))
     provider = FakeRailway(c['project_id'], c['environment_id'])
 
@@ -312,35 +346,33 @@ def test_wrong_new_attachment_fails_immediately_without_upload(tmp_path, monkeyp
 
     provider.create_volume = wrong_volume
     with pytest.raises(setup.SetupError, match='attached differently'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+        run_setup(c, tmp_path / 'state.json', provider)
     assert 'upload' not in provider.operations
 
 
 def test_saved_volume_wait_timeout_reruns_without_duplicate_mutation(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     provider.volume_hidden_reads = 100
     state_path = tmp_path / 'state.json'
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)
-
     with pytest.raises(setup.SetupError, match='did not attach'):
-        setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
+        run_setup(c, state_path, provider)
     state = setup.protected_json(state_path)
     assert state['volume_create_attempted'] and state['volume_id'] == 'volume-id'
     assert provider.operations.count('create_volume') == 1
     assert 'upload' not in provider.operations
-
     provider.volume_hidden_reads = 2
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 30)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: None)
-    assert setup.reconcile(c, state_path, provider_factory=lambda *_: provider)['stage'] == 'receiver_reachable'
+    assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
     assert provider.operations.count('create_volume') == 1
 
 
 def test_wrong_new_domain_fails_immediately_without_upload(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: pytest.fail('wrong domain was polled'))
     provider = FakeRailway(c['project_id'], c['environment_id'])
 
@@ -351,60 +383,60 @@ def test_wrong_new_domain_fails_immediately_without_upload(tmp_path, monkeypatch
 
     provider.create_domain = wrong_domain
     with pytest.raises(setup.SetupError, match='attached differently'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+        run_setup(c, tmp_path / 'state.json', provider)
     assert 'upload' not in provider.operations
 
 
 def test_saved_domain_wait_timeout_reruns_without_duplicate_mutation(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     provider.domain_hidden_reads = 100
     state_path = tmp_path / 'state.json'
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)
-
     with pytest.raises(setup.SetupError, match='did not attach'):
-        setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
+        run_setup(c, state_path, provider)
     state = setup.protected_json(state_path)
     assert state['domain_create_attempted'] and state['domain'] == 'selfhost.example.test'
     assert provider.operations.count('create_domain') == 1
     assert 'upload' not in provider.operations
-
     provider.domain_hidden_reads = 2
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 30)
     monkeypatch.setattr(setup.time, 'sleep', lambda _: None)
-    assert setup.reconcile(c, state_path, provider_factory=lambda *_: provider)['stage'] == 'receiver_reachable'
+    assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
     assert provider.operations.count('create_domain') == 1
 
 
-def test_receiver_health_cannot_be_any_http_200(tmp_path, monkeypatch):
-    c = config(tmp_path)
-    patch_offline(monkeypatch, c)
-    provider = FakeRailway(c['project_id'], c['environment_id'])
-
-    class GenericOK(Healthy):
+@pytest.mark.parametrize('prepared,body,message', [
+    (True, b'{"status": "ok"}', 'preparation health is not exact'),
+    (False, b'{"status": "ok"}', 'not the reviewed receiver'),
+    # The initializer's body is not runtime health: setup keeps waiting for the runtime.
+    (False, b'OK', 'not ready'),
+])
+def test_health_must_be_the_exact_phase_response(monkeypatch, prepared, body, message):
+    class Response(Healthy):
         def read(self, *_args):
-            return b'OK'
+            return body
 
-    monkeypatch.setattr(setup.urllib.request, 'urlopen', lambda *_a, **_k: GenericOK())
-    with pytest.raises(setup.SetupError, match='health endpoint'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+    monkeypatch.setattr(setup.urllib.request, 'urlopen', lambda *_a, **_k: Response())
+    with pytest.raises(setup.SetupError, match=message):
+        setup._health('selfhost.example.test', prepared=prepared)
 
 
-def test_runtime_manifest_start_command_must_remain_image_default(tmp_path, monkeypatch):
+def test_deployment_must_carry_the_phase_start_command(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    original = provider.deployment
+    original = provider.upload
 
-    def wrong_start(identifier, service):
-        row = original(identifier, service)
-        row['meta']['serviceManifest']['deploy']['startCommand'] = 'other-runtime'
-        return row
+    def railway_ignores_start(*args):
+        original(*args)
+        provider.starts[f'deployment-{provider.uploads}'] = None
 
-    provider.deployment = wrong_start
-    with pytest.raises(setup.SetupError, match='unexpected start'):
-        setup.reconcile(c, tmp_path / 'state.json', provider_factory=lambda *_: provider)
+    provider.upload = railway_ignores_start
+    with pytest.raises(setup.SetupError, match='unexpected start command'):
+        run_setup(c, tmp_path / 'state.json', provider)
+    assert provider.uploads == 1
 
 
 def test_railway_api_keeps_secret_out_of_argv_and_protects_temp_file(monkeypatch):
@@ -443,15 +475,15 @@ def test_target_requires_selected_single_environment(monkeypatch):
         provider.close()
 
 
-def run_setup(c, state_path, provider):
-    return setup.reconcile(c, state_path, provider_factory=lambda *_: provider)
-
-
-def fail_once(monkeypatch, provider, name, *, lands, sent=True):
-    """Railway call fails once: never sent (`sent=False`), or sent and it landed or not."""
+def fail_once(monkeypatch, provider, name, *, lands, sent=True, skip=0):
+    """Railway call fails once (after `skip` successes): never sent, or sent and it landed or not."""
     original = getattr(provider, name)
+    calls = {'n': 0}
 
     def failing(*args):
+        calls['n'] += 1
+        if calls['n'] <= skip:
+            return original(*args)
         monkeypatch.setattr(provider, name, original)
         if not sent:
             raise setup.NotSentError('Railway CLI could not start')
@@ -462,61 +494,72 @@ def fail_once(monkeypatch, provider, name, *, lands, sent=True):
     monkeypatch.setattr(provider, name, failing)
 
 
-@pytest.mark.parametrize('name', ['create_service', 'create_volume', 'create_domain', 'upload'])
+STEPS = [('create_service', 0), ('create_volume', 0), ('create_domain', 0),
+         ('upload', 0), ('upload', 1), ('set_start', 0), ('set_start', 1)]
+
+
+@pytest.mark.parametrize('name,skip', STEPS)
 @pytest.mark.parametrize('lands', [False, True])
-def test_failed_railway_step_resumes_from_observed_state(tmp_path, monkeypatch, name, lands):
+def test_failed_railway_step_resumes_from_observed_state(tmp_path, monkeypatch, name, skip, lands):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    fail_once(monkeypatch, provider, name, lands=lands, sent=lands)
+    fail_once(monkeypatch, provider, name, lands=lands, sent=lands, skip=skip)
     state_path = tmp_path / 'state.json'
     with pytest.raises(setup.SetupError, match='failed or timed out|could not start'):
         run_setup(c, state_path, provider)
     assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
-    # A call that never landed is retried once; one that landed is adopted, never repeated.
-    for step in ('create_service', 'create_volume', 'create_domain', 'upload'):
+    # A call that never left this machine is retried once; one that landed is adopted, never repeated.
+    for step in ('create_service', 'create_volume', 'create_domain'):
         assert provider.operations.count(step) == 1
+    assert provider.uploads == 2
     state = setup.protected_json(state_path)
-    assert (state['service_id'], state['volume_id'], state['domain'], state['deployment_id']) == (
-        'service-id', 'volume-id', 'selfhost.example.test', 'deployment-id')
+    assert (state['service_id'], state['volume_id'], state['domain'], state['runtime_deployment_id']) == (
+        'service-id', 'volume-id', 'selfhost.example.test', 'deployment-2')
 
 
-@pytest.mark.parametrize('name', ['create_service', 'create_volume', 'create_domain', 'upload'])
-def test_unconfirmed_mutation_is_observed_not_repeated(tmp_path, monkeypatch, capsys, name):
+@pytest.mark.parametrize('name,skip', STEPS)
+def test_unconfirmed_mutation_is_observed_not_repeated(tmp_path, monkeypatch, capsys, name, skip):
     """A sent request whose outcome is unknown stays pending until Railway shows it or the operator confirms."""
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)  # the observation window expires empty
     provider = FakeRailway(c['project_id'], c['environment_id'])
-    fail_once(monkeypatch, provider, name, lands=False)
+    fail_once(monkeypatch, provider, name, lands=False, skip=skip)
     state_path = tmp_path / 'state.json'
     with pytest.raises(setup.SetupError, match='failed or timed out'):
         run_setup(c, state_path, provider)
+    sent = provider.operations.count('upload') + sum(
+        op.startswith('set_start') for op in provider.operations)
     for _ in range(2):
         with pytest.raises(setup.UnconfirmedCreateError, match='--retry-unconfirmed'):
             run_setup(c, state_path, provider)
-    assert provider.operations.count(name) == 0
+    assert provider.operations.count('upload') + sum(
+        op.startswith('set_start') for op in provider.operations) == sent
     # The CLI reports it as resumable, not as a failure.
     reconcile = setup.reconcile
     monkeypatch.setattr(setup, 'reconcile', lambda *a, **k: reconcile(
         *a, **{'provider_factory': lambda *_: provider, **k}))
     config_path = tmp_path / 'config.json'
-    config_path.write_text(json.dumps(c))
-    config_path.chmod(0o600)
+    setup.save_state(config_path, c)
     assert setup.main(['--config', str(config_path), '--state', str(state_path)]) == 2
     assert json.loads(capsys.readouterr().out)['stage'] == 'create_unconfirmed'
     # After checking Railway, the operator's explicit retry sends it exactly once more.
-    assert setup.reconcile(c, state_path, provider_factory=lambda *_: provider,
-                           retry_unconfirmed=True)['stage'] == 'receiver_reachable'
-    assert provider.operations.count(name) == 1
+    assert reconcile(c, state_path, provider_factory=lambda *_: provider,
+                     retry_unconfirmed=True)['stage'] == 'receiver_reachable'
+    assert provider.uploads == 2
+    for step in ('create_service', 'create_volume', 'create_domain'):
+        assert provider.operations.count(step) == 1
+    assert [op for op in provider.operations if op.startswith('set_start')] == [
+        'set_start:' + setup.SOTTO_PREPARE_START, 'set_start:' + setup.SOTTO_RUNTIME_START]
 
 
 def test_lost_create_waits_for_late_visibility_instead_of_duplicating(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     fail_once(monkeypatch, provider, 'create_volume', lands=True)
@@ -530,7 +573,7 @@ def test_lost_create_waits_for_late_visibility_instead_of_duplicating(tmp_path, 
 
 def test_ambiguous_state_after_lost_create_stays_stopped(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
     monkeypatch.setattr(setup, 'ATTACHMENT_WAIT_SECONDS', 0)
     state_path = tmp_path / 'state.json'
@@ -557,23 +600,23 @@ def test_ambiguous_state_after_lost_create_stays_stopped(tmp_path, monkeypatch):
         run_setup(c, state_path, provider)
     assert provider.operations.count('create_volume') == 1 and setup.protected_json(state_path)['volume_id'] is None
 
-    # A deployment that does not carry our source identity is neither adopted nor re-uploaded.
-    for meta in ({}, {'cliMessage': 'someone else'}):
+    # A deployment that does not carry this phase's source identity is neither adopted nor re-uploaded.
+    for message in (None, 'someone else'):
         state_path.unlink()
         provider = FakeRailway(c['project_id'], c['environment_id'])
         fail_once(monkeypatch, provider, 'upload', lands=False)
         with pytest.raises(setup.SetupError):
             run_setup(c, state_path, provider)
-        provider.latest = {'id': 'foreign', 'status': 'SUCCESS', 'meta': meta}
         provider.history['foreign'] = 'SUCCESS'
+        provider.messages['foreign'] = message
         with pytest.raises(setup.SetupError, match='unrelated deployment|upload unresolved'):
             run_setup(c, state_path, provider)
-        assert provider.operations.count('upload') == 0
+        assert provider.uploads == 0
 
 
 def test_saved_service_missing_is_not_recreated(tmp_path, monkeypatch):
     c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+    offline(monkeypatch, c)
     provider = FakeRailway(c['project_id'], c['environment_id'])
     state_path = tmp_path / 'state.json'
     run_setup(c, state_path, provider)
@@ -583,7 +626,288 @@ def test_saved_service_missing_is_not_recreated(tmp_path, monkeypatch):
     assert provider.operations.count('create_service') == 1
 
 
-def git_source(root, *, extra_ignored=()):
+def test_two_new_deployments_stop_instead_of_pending_forever(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    original = provider.upload
+
+    def double(*args):
+        original(*args)
+        original(*args)
+
+    provider.upload = double
+    with pytest.raises(setup.SetupError, match='More than one new Sotto deployment') as raised:
+        run_setup(c, tmp_path / 'state.json', provider, retry_unconfirmed=True)
+    assert not isinstance(raised.value, setup.SetupPendingError)
+
+
+def test_prepared_health_polls_through_fresh_domain_lag(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    monkeypatch.setattr(setup, '_health', REAL_HEALTH)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
+    calls = []
+
+    def urlopen(*_a, **_k):
+        calls.append(1)
+        if len(calls) <= 3:
+            raise OSError('fresh domain DNS/TLS lag')
+        response = Healthy()
+        if len(calls) == 4:
+            response.read = lambda *_: b'OK'  # the initializer's exact preparation body
+        return response
+
+    monkeypatch.setattr(setup.urllib.request, 'urlopen', urlopen)
+    state_path = tmp_path / 'state.json'
+    assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
+    assert len(calls) == 5
+    state = setup.protected_json(state_path)
+    assert state['prepared_proof'] == 'health' and state['prepared_health_observed']
+    assert provider.marker_reads == 0 and provider.uploads == 2
+
+
+def unready_prepare(monkeypatch, *, now=1000.0):
+    """The preparation listener is never reachable; the clock is controlled by the test."""
+    clock = {'now': now}
+    monkeypatch.setattr(setup.time, 'sleep', lambda *_: None)
+    monkeypatch.setattr(setup.time, 'time', lambda: clock['now'])
+    monkeypatch.setattr(setup, 'HEALTH_WAIT_SECONDS', 0)
+
+    def health(_domain, *, prepared):
+        if prepared:
+            raise setup.SetupPendingError('Sotto health endpoint is not ready; resume exact deployment')
+
+    monkeypatch.setattr(setup, '_health', health)
+    return clock
+
+
+def test_unseen_preparation_resumes_from_exact_volume_marker(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    unready_prepare(monkeypatch)
+    state_path = tmp_path / 'state.json'
+    with pytest.raises(setup.SetupPendingError, match='within 15 minutes') as raised:
+        run_setup(c, state_path, provider, retry_unconfirmed=True)
+    # Inside the listener window the operator flag changes nothing.
+    assert not isinstance(raised.value, setup.PreparationUnconfirmedError)
+    provider.marker = MARKER
+    assert run_setup(c, state_path, provider)['stage'] == 'receiver_reachable'
+    assert setup.protected_json(state_path)['prepared_proof'] == 'volume_marker'
+    assert provider.uploads == 2
+
+
+def test_wrong_marker_or_failed_initializer_stops(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    unready_prepare(monkeypatch)
+    provider.marker = {**MARKER, 'tenant_id': 'another-tenant'}
+    with pytest.raises(setup.SetupError, match='marker differs'):
+        run_setup(c, tmp_path / 'state.json', provider)
+    provider.marker = 'pending'
+    provider.history['deployment-1'] = 'CRASHED'
+    with pytest.raises(setup.SetupError, match='did not succeed|stopped before preparation') as raised:
+        run_setup(c, tmp_path / 'state.json', provider, retry_unconfirmed=True)
+    assert not isinstance(raised.value, setup.SetupPendingError)
+    assert provider.uploads == 1
+
+
+def test_closed_listener_needs_operator_and_runtime_marker(tmp_path, monkeypatch, capsys):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    clock = unready_prepare(monkeypatch)
+    state_path = tmp_path / 'state.json'  # the listener exited, so no container serves file access
+    with pytest.raises(setup.SetupPendingError, match='within 15 minutes'):
+        run_setup(c, state_path, provider)
+    clock['now'] += setup.PREPARED_LISTENER_SECONDS + setup.PREPARED_LISTENER_MARGIN_SECONDS
+    with pytest.raises(setup.PreparationUnconfirmedError, match='--retry-unconfirmed'):
+        run_setup(c, state_path, provider)
+    config_path = tmp_path / 'config.json'
+    setup.save_state(config_path, c)
+    reconcile = setup.reconcile
+    monkeypatch.setattr(setup, 'reconcile', lambda *a, **k: reconcile(
+        *a, **{'provider_factory': lambda *_: provider, **k}))
+    assert setup.main(['--config', str(config_path), '--state', str(state_path)]) == 2
+    assert json.loads(capsys.readouterr().out)['stage'] == 'preparation_unconfirmed'
+    assert provider.uploads == 1
+    # Confirmed: the runtime replaces the closed initializer, which is never redeployed,
+    # and setup succeeds only once the running runtime shows the exact marker.
+    with pytest.raises(setup.SetupPendingError, match='marker is not readable yet'):
+        reconcile(c, state_path, provider_factory=lambda *_: provider, retry_unconfirmed=True)
+    assert provider.uploads == 2
+    provider.marker = None
+    with pytest.raises(setup.SetupError, match='no preparation marker'):
+        reconcile(c, state_path, provider_factory=lambda *_: provider)
+    provider.marker = MARKER
+    assert reconcile(c, state_path, provider_factory=lambda *_: provider)['stage'] == 'receiver_reachable'
+    state = setup.protected_json(state_path)
+    assert state['prepared_proof'] == 'listener_closed' and state['prepared_marker_verified']
+    assert not state.get('prepared_health_observed') and provider.uploads == 2
+
+
+def test_closed_listener_with_definitely_missing_marker_stops(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    offline(monkeypatch, c)
+    provider = FakeRailway(c['project_id'], c['environment_id'])
+    clock = unready_prepare(monkeypatch)
+    provider.marker = None
+    state_path = tmp_path / 'state.json'
+    with pytest.raises(setup.SetupPendingError):
+        run_setup(c, state_path, provider)
+    clock['now'] += setup.PREPARED_LISTENER_SECONDS + setup.PREPARED_LISTENER_MARGIN_SECONDS
+    with pytest.raises(setup.SetupError, match='did not write its /data volume marker'):
+        run_setup(c, state_path, provider, retry_unconfirmed=True)
+    assert provider.uploads == 1
+
+
+@pytest.mark.parametrize('code,diagnostic,expected', [
+    (1, 'Service has no active deployment in environment x. Deploy or restart the service '
+        'before using file commands', 'pending'),
+    (1, 'Failed to initialize SFTP session: timeout', 'pending'),
+    (1, 'Error: failed to stat remote path /.sotto-volume.json\nCaused by: No such file or directory', None),
+    (1, 'permission denied private-gemini-key', 'error'),
+    (0, '', 'marker'),
+])
+def test_railway_volume_marker_classifies_without_forwarding_output(monkeypatch, code, diagnostic, expected):
+    provider = setup.Railway('project', 'environment')
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        if not code:
+            Path(argv[argv.index('download') + 2]).write_text('{"schema": 1}')
+        return subprocess.CompletedProcess(argv, code, '', diagnostic)
+
+    monkeypatch.setattr(setup.subprocess, 'run', run)
+    try:
+        if expected == 'pending':
+            with pytest.raises(setup.VolumeInspectionPendingError):
+                provider.volume_marker('volume')
+        elif expected == 'error':
+            with pytest.raises(setup.SetupError) as raised:
+                provider.volume_marker('volume')
+            assert 'private-gemini-key' not in str(raised.value)
+        elif expected is None:
+            assert provider.volume_marker('volume') is None
+        else:
+            assert provider.volume_marker('volume') == {'schema': 1}
+    finally:
+        provider.close()
+    assert seen[0][:7] == ['railway', 'volume', '--project', 'project', '--environment', 'environment', 'files']
+    assert seen[0][7:11] == ['--volume', 'volume', 'download', '/.sotto-volume.json']
+
+
+def test_config_is_exact_and_does_not_accept_other_state(tmp_path, monkeypatch):
+    c = config(tmp_path)
+    assert setup.validate(c) is None
+    for changed, message in (
+            ({**c, 'runtime_image': 'example.invalid/sotto@sha256:' + 'c' * 64}, 'missing or unexpected'),
+            ({key: value for key, value in c.items() if key != 'source_commit'}, 'missing or unexpected'),
+            ({**c, 'source_commit': 'HEAD'}, 'Source pin'),
+            ({**c, 'source_path': 'relative/checkout'}, 'absolute'),
+            ({**c, 'photon_line_number': '5557654321'}, 'E.164'),
+            ({**c, 'sotto_runtime': {**c['sotto_runtime'], 'chat_model_id': 'bad model'}}, 'manifest is invalid')):
+        with pytest.raises(setup.SetupError, match=message):
+            setup.validate(changed)
+    offline(monkeypatch, c)
+    for schema in (1, 2):
+        state_path = tmp_path / f'state-{schema}.json'
+        setup.save_state(state_path, {'schema': schema, 'identity': setup.identity(c)})
+        with pytest.raises(setup.SetupError, match='Saved setup state differs'):
+            setup.reconcile(c, state_path, provider_factory=FakeRailway)
+
+
+def test_envelope_matches_public_bootstrap_contract(tmp_path):
+    c = config(tmp_path)
+    state = {'service_id': '33333333-3333-3333-3333-333333333333',
+             'volume_id': '44444444-4444-4444-4444-444444444444',
+             'domain': 'selfhost.example.test', 'request_marker': 'request-marker-0123456789',
+             'runtime_bearer': 'r' * 48, 'bridge_token': 'b' * 48, 'control_token': 'c' * 48}
+    envelope = setup.launch_envelope(c, state)
+    env = {'SOTTO_SELFHOST_LAUNCH': json.dumps(envelope),
+           'RAILWAY_PROJECT_ID': c['project_id'], 'RAILWAY_ENVIRONMENT_ID': c['environment_id'],
+           'RAILWAY_SERVICE_ID': state['service_id'], 'RAILWAY_PUBLIC_DOMAIN': state['domain'],
+           'SOTTO_SETUP_REQUEST': state['request_marker'], 'RAILWAY_VOLUME_MOUNT_PATH': '/data',
+           'RAILWAY_VOLUME_NAME': 'sotto-data', 'PORT': '8080'}
+    assert selfhost_bootstrap._railway_envelope(env) == envelope
+    with pytest.raises(selfhost_bootstrap.SelfHostBootstrapUnavailableError):
+        selfhost_bootstrap._railway_envelope({**env, 'RAILWAY_SERVICE_ID': c['project_id']})
+
+
+@pytest.mark.parametrize('choice', [None, False, True])
+def test_protected_background_choice_reaches_real_guard_only_when_opted_in(tmp_path, monkeypatch, choice):
+    c = config(tmp_path)
+    c['gemini_api_key'] = 'g' * 48
+    c['photon_project_secret'] = 'p' * 48
+    if choice is not None:
+        c['sotto_runtime']['background_unmetered'] = choice
+    setup.validate(c)
+    state = {'service_id': 'fixture-service', 'volume_id': 'fixture-volume',
+             'domain': 'selfhost.example.test', 'request_marker': 'request-marker-0123456789',
+             'runtime_bearer': 'r' * 48, 'bridge_token': 'b' * 48, 'control_token': 'c' * 48}
+    bundle = setup.launch_envelope(c, state)['bundle']
+    monkeypatch.setenv('SOTTO_BACKGROUND_UNMETERED', 'true')  # ambient spending is not authority
+    handoff = process_handoff.build_child_handoff(
+        bundle['manifest'], bundle['receiverAuthority'], stable_identity=bundle['stableIdentity'],
+        node_config_path='/data/node-config/config/runtime-config.json', data_directory='/data',
+        skills_root='/app/sotto-skills', receiver_overrides=bundle['receiverOverrides'],
+        limited_profile='self-host-photon-fixed-five-v1')
+    assert handoff.receiver_env['SOTTO_BACKGROUND_UNMETERED'] == ('true' if choice is True else 'false')
+    assert 'SOTTO_BACKGROUND_UNMETERED' not in handoff.node_env
+    transport_spec = importlib.util.spec_from_file_location(
+        'setup_guard_transport', ROOT / 'sotto-chief-of-staff/_shared/lib/gemini_transport.py')
+    transport = importlib.util.module_from_spec(transport_spec)
+    transport_spec.loader.exec_module(transport)
+    monkeypatch.setattr(transport.urllib.request, 'urlopen',
+                        lambda *a, **kw: pytest.fail('background guard contacted network'))
+    for key in list(os.environ):
+        monkeypatch.delenv(key)
+    for key, value in handoff.receiver_env.items():
+        monkeypatch.setenv(key, value)
+    if choice is True:
+        with transport.background_learning():
+            assert transport.credential() == c['gemini_api_key']
+    else:
+        with pytest.raises(transport.BackgroundModelHeldError) as error:
+            with transport.background_learning():
+                pytest.fail('unapproved background spending admitted')
+        assert error.value.reason == 'background_budget_not_configured'
+
+
+@pytest.mark.parametrize('choice', ['true', 'false', 0, 1, None, {}, []])
+def test_background_choice_requires_json_boolean(tmp_path, choice):
+    c = config(tmp_path)
+    c['sotto_runtime']['background_unmetered'] = choice
+    with pytest.raises(setup.SetupError, match='runtime settings'):
+        setup.validate(c)
+
+
+def test_same_state_second_process_refused_before_provider_contact(tmp_path):
+    state_path = tmp_path / 'state.json'
+    script = (
+        'import importlib.util, pathlib, sys\n'
+        'spec=importlib.util.spec_from_file_location("helper", sys.argv[1])\n'
+        'helper=importlib.util.module_from_spec(spec)\n'
+        'spec.loader.exec_module(helper)\n'
+        'with helper._state_lock(pathlib.Path(sys.argv[2])):\n'
+        '    print("unexpected-lock")\n'
+    )
+    with setup._state_lock(state_path):
+        result = subprocess.run([sys.executable, '-c', script,
+                                 str(Path(setup.__file__).resolve()), str(state_path)],
+                                text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert 'Another Sotto setup owns' in result.stderr
+    assert 'unexpected-lock' not in result.stdout
+    with setup._state_lock(state_path):
+        pass
+
+
+def git_source(root):
     (root / 'Dockerfile').write_text('FROM scratch\n')
     (root / 'VERSION').write_text('test\n')
     (root / 'railway.toml').write_text('[build]\nbuilder = "DOCKERFILE"\ndockerfilePath = "Dockerfile"\n'
@@ -629,27 +953,30 @@ def test_cli_setup_error_is_one_line_without_traceback(tmp_path):
     assert 'private-gemini-key' not in result.stderr
 
 
-def test_helper_matches_photon_preset_contract(tmp_path, monkeypatch):
-    preset = json.loads((Path(__file__).resolve().parents[1] / 'deploy' / 'railway-photon-preset.json').read_text())
-    variables = setup.desired_variables(config(tmp_path), {'request_marker': 'm', 'bridge_token': 't'})
-    assert not set(variables) & set(preset['mustNotSet'])
-    assert set(preset['variables']) <= set(variables)
-    assert preset['service']['port'].startswith('8080')
-    sent = []
-    provider = setup.Railway('project', 'environment')
-    monkeypatch.setattr(provider, 'api', lambda query, values: sent.append(values) or {
-        'serviceDomainCreate': {'domain': 'd', 'targetPort': 8080}})
-    try:
-        provider.create_domain('service')
-    finally:
-        provider.close()
-    assert sent[0]['input']['targetPort'] == 8080
-
-
-def test_health_probe_uses_honest_user_agent(tmp_path, monkeypatch):
-    c = config(tmp_path)
-    patch_offline(monkeypatch, c)
+def test_health_probe_uses_honest_user_agent(monkeypatch):
     seen = []
     monkeypatch.setattr(setup.urllib.request, 'urlopen', lambda request, **_k: seen.append(request) or Healthy())
-    run_setup(c, tmp_path / 'state.json', FakeRailway(c['project_id'], c['environment_id']))
+    setup._health('selfhost.example.test', prepared=False)
+    assert seen[0].full_url == 'https://selfhost.example.test/health'
     assert seen[0].get_header('User-agent') == 'sotto-selfhost-setup'
+
+
+def test_start_commands_are_the_root_image_command_with_tini_at_the_platform_boundary():
+    provider = object.__new__(setup.Railway)
+    provider.environment, provider.project = 'environment', 'project'
+    emitted = []
+    provider.api = lambda query, variables: emitted.append(variables)
+    provider.set_start('service', setup.SOTTO_PREPARE_START)
+    provider.set_start('service', setup.SOTTO_RUNTIME_START)
+    assert [row['i'] for row in emitted] == [
+        {'startCommand': '/usr/bin/tini -- python3 -I -B /app/adapters/sotto/selfhost_bootstrap.py --prepare'},
+        {'startCommand': '/usr/bin/tini -- python3 -I -B /app/adapters/sotto/selfhost_bootstrap.py --run'}]
+    # Railway's custom start command replaces the image ENTRYPOINT; the runtime command is the
+    # root image's own ENTRYPOINT + CMD, and the repository's railway.toml passes the source check.
+    lines = (ROOT / 'Dockerfile').read_text().splitlines()
+    entrypoint = json.loads(next(line for line in lines if line.startswith('ENTRYPOINT '))[11:])
+    command = json.loads([line for line in lines if line.startswith('CMD ')][-1][4:])
+    assert ' '.join(entrypoint + command) == setup.SOTTO_RUNTIME_START
+    railway = setup.tomllib.loads((ROOT / 'railway.toml').read_text())
+    assert railway['build'] == {'builder': 'DOCKERFILE', 'dockerfilePath': 'Dockerfile'}
+    assert railway['deploy']['healthcheckPath'] == '/health' and 'startCommand' not in railway['deploy']

@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import prep_selection as selection
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -324,6 +325,24 @@ def _taylor_inputs(**extra):
     return base
 
 
+@pytest.mark.parametrize("focus", ["Taylor Reed", None])
+def test_company_summary_is_only_a_fallback_when_the_person_has_a_profile(monkeypatch, focus):
+    monkeypatch.setattr(mp, "_active_loops", lambda: [])
+    inputs = _taylor_inputs(attendee_research=[
+        {"email": "taylor@startup.com", "title": "CEO", "company": "Startup Inc",
+         "relevance": ["Asked for product feedback on the automation notebook."],
+         "summary": "CEO of Startup Inc, building a personal automation notebook.",
+         "company_summary": "Startup Inc raised a $40M Series B and sells payroll software."}])
+    if focus:
+        inputs["focus"] = focus
+    ctx, meetings = mp.build_context(inputs)
+    assert "Taylor Reed <taylor@startup.com> — CEO at Startup Inc" in ctx
+    assert "research: CEO of Startup Inc, building a personal automation notebook." in ctx
+    assert "Asked for product feedback on the automation notebook." in ctx
+    assert meetings[0]["attendees"][0]["company"] == "Startup Inc"
+    assert "Series B" not in ctx and "    company:" not in ctx
+
+
 def test_thread_lines_from_attendee_comms_with_direction_and_cap(monkeypatch):
     monkeypatch.setattr(mp, "_active_loops", lambda: [])
     rows = [{"date": "Tue, 04 Aug", "subject": "Deck feedback",
@@ -463,7 +482,7 @@ def test_focus_by_email_and_unambiguous_match_says_nothing_extra(monkeypatch):
     assert "matches" not in ctx                                          # only one meeting matched
 
 
-def test_focus_no_match_falls_back_to_the_sweep(monkeypatch):
+def test_focus_no_match_never_composes_a_sweep(monkeypatch):
     monkeypatch.setattr(mp, "_active_loops", lambda: [])
     inputs = _two_meetings(focus="nobody")
     ctx, meetings = mp.build_context(inputs)
@@ -471,6 +490,8 @@ def test_focus_no_match_falls_back_to_the_sweep(monkeypatch):
     assert ctx == sweep_ctx and meetings == sweep_meetings               # byte-identical to sweep
     assert "(FOCUS:" not in ctx
     assert not mp.focus_mode(inputs)
+    with pytest.raises(ValueError, match="focused meeting unavailable"):
+        mp.compose(inputs, llm=lambda *_: pytest.fail("unmatched focus must not call the model"))
 
 
 def test_focus_ignores_people_outside_the_window(monkeypatch):
@@ -533,26 +554,26 @@ def test_prompt_variant_markers_never_reach_the_model():
     for text in (mp._load_prompt(), mp._load_prompt(focus=True)):
         for marker in (mp.SWEEP_BEGIN, mp.SWEEP_END, mp.FOCUS_BEGIN, mp.FOCUS_END):
             assert marker not in text
-    # Both variants keep the shared hard rules + private-context documentation.
     for text in (mp._load_prompt(), mp._load_prompt(focus=True)):
         assert "**Never invent facts.**" in text and "`granola:`" in text
 
 
-# ── Focused prompt contract: thread first, angles last, empty sections omitted ─────────────────
+# ── Focused prompt contract: decision and questions before optional background ───────────────
 
 with open(os.path.join(ROOT, "meeting-prep", "references", "meeting-prep-prompt.md"),
           encoding="utf-8") as _f2:
     FOCUSED = _f2.read().split("<!-- FOCUSED PREP — the --focus variant -->", 1)[1]
 
 
-def test_focused_prompt_mandates_thread_first_and_angles_last():
+def test_focused_prompt_leads_with_decision_evidence_unknowns_and_questions():
     assert "**Your thread** — ALWAYS FIRST, ALWAYS PRESENT" in FOCUSED
-    assert "**Angles** — ALWAYS LAST" in FOCUSED
+    assert "name the decision or unresolved issue first" in FOCUSED
     assert FOCUSED.index("**Your thread**") < FOCUSED.index("**What <company> builds**")
-    assert FOCUSED.index("**What <company> builds**") < FOCUSED.index("**Angles**")
+    assert (FOCUSED.index("**Your thread**") < FOCUSED.index("**Unknowns**")
+            < FOCUSED.index("**Angles**") < FOCUSED.index("**What <company> builds**"))
     # The private half never contains web research — that is why it leads.
     assert "no web research belongs in it" in FOCUSED
-    assert "the half no search can produce" in FOCUSED
+    assert "Build private history only from" in FOCUSED
 
 
 def test_focused_prompt_documents_company_deep_lines_and_no_line_no_section():
@@ -563,9 +584,10 @@ def test_focused_prompt_documents_company_deep_lines_and_no_line_no_section():
     assert "a casual coffee does not get a forced market thesis" in FOCUSED   # scale to the meeting
 
 
-def test_focused_prompt_angle_fusion_rule():
-    assert "Every angle fuses a private fact with a researched fact where both exist" in FOCUSED
-    assert "never fabricate the missing half" in FOCUSED
+def test_focused_prompt_keeps_suggestions_distinct_from_stated_intent():
+    assert "Keep an\ninformed suggestion distinct from what the person said" in FOCUSED
+    assert "Never add\na private premise" in FOCUSED
+    assert "a model or search-provider name is not a source citation" in FOCUSED.lower()
     assert "never restate a fact as an angle" in FOCUSED
     assert "never ask a generic process question" in FOCUSED
     assert "`meetings[0].talking_points`" in FOCUSED
@@ -601,11 +623,12 @@ with open(PROMPT_PATH, encoding="utf-8") as _f:
     PROMPT = _f.read()
 
 
-def test_prompt_documents_private_context_lines_as_authoritative():
+def test_prompt_documents_private_context_as_dated_evidence():
     for marker in ("`thread:`", "`text:`", "`loop:`", "`granola:`"):
         assert marker in PROMPT, f"prompt no longer documents {marker} context lines"
-    assert "pre-computed" in PROMPT and "authoritative" in PROMPT
-    assert "do not re-verify, second-guess, or re-derive" in PROMPT
+    assert "show what was said and when" in PROMPT
+    assert "do not make an old statement current or prove a sender's claim" in PROMPT
+    assert "exact identity, direction and recorded date" in PROMPT
 
 
 def test_prompt_requires_your_thread_and_recently_when_present():
@@ -620,8 +643,9 @@ def test_prompt_requires_your_thread_and_recently_when_present():
 def test_prompt_thread_direction_and_grounding_rules():
     # gemini-flex.ts threadSnippet rule: never present the user's own outbound as needing response.
     assert "NEVER present the user's own outbound words" in PROMPT
-    # Talking points grounded in research ∪ thread ∪ graph; thread context must be built on.
-    assert "research ∪ thread ∪ graph" in PROMPT
+    # Calendar agenda can ground a point without becoming verified fact or private history.
+    assert "explicitly stated calendar agenda" in PROMPT
+    assert "verified conclusions or private conversation history" in PROMPT
     assert "at least one talking point must build on it" in PROMPT
 
 
@@ -665,22 +689,23 @@ def test_filler_talking_points_stripped_and_empty_list_respected(tmp_path):
 def _real_research_envelope(monkeypatch):
     """What `research_attendees.py --focus … --out /tmp/sotto_research.json` actually writes —
     produced by research() itself, not hand-shaped, so this test tracks the real contract."""
+    import research_attendees as research
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
-    monkeypatch.setattr(mp.ra, "_research_batch", lambda batch, ctx, key, comms=None, known=None: [
+    monkeypatch.setattr(research, "_research_batch", lambda batch, key: [
         {"email": a["email"], "title": "CEO", "company": "Commenda",
          "relevance": ["Raising a Series A"],
          "summary": "Founder and CEO of Commenda, a global tax-filing company."} for a in batch])
-    monkeypatch.setattr(mp.ra, "_deep_batch", lambda *a, **k: [])
-    monkeypatch.setattr(mp.ra, "_focus_batch",
-                        lambda attendee, ctx, key, known, known_company="": [
+    monkeypatch.setattr(research, "_deep_batch", lambda *a, **k: [])
+    monkeypatch.setattr(research, "_focus_batch",
+                        lambda attendee, key: [
         {"email": attendee["email"],
          "company_deep": {"company": "Commenda",
                           "builds": ["Global tax filing tied to each payment"],
                           "founder_story": "Built it after a misfiled quarter.",
                           "traction": ["Series A led by Ridgeline, June 2026 (https://tc.com/a)"],
                           "market": "Displaces the EOR incumbents."}}])
-    env = mp.ra.research([{"name": "Spencer Kim", "email": "spencer@commenda.io"}],
+    env = research.research([{"name": "Spencer Kim", "email": "spencer@commenda.io"}],
                          "ctx", focus="spencer")
     assert isinstance(env, dict) and "attendees" in env      # the envelope, not a bare list
     return env
@@ -701,7 +726,6 @@ def test_research_envelope_renders_into_the_prep_context(monkeypatch):
     assert "founder: Built it after a misfiled quarter." in ctx
     assert "market: Displaces the EOR incumbents." in ctx
     assert meetings[0]["attendees"][0]["role"] == "CEO"
-    # The documented bare list keeps working, and garbage still degrades to "nothing known".
     bare, _ = mp.build_context(_two_meetings(focus="spencer",
                                              attendee_research=envelope["attendees"]))
     assert bare == ctx
@@ -780,10 +804,11 @@ def test_skill_states_deep_by_default_for_one_meeting():
     assert "is a deep dive on that meeting alone" in desc
 
 
-def test_skill_resolves_a_bare_yes_to_focus_mode():
-    assert '"yes" / "sure" / "do it" means `--focus "Spencer Kim"`' in SKILL
-    assert "A yes to a prep offer is NEVER the sweep" in SKILL
-    assert "SOONEST one with outside" in SKILL          # the no-name fallback, not a question
+def test_skill_binds_a_bare_yes_to_the_accepted_offer():
+    flat = " ".join(SKILL.split())
+    assert "A yes continues the exact accepted offer." in flat
+    assert "Do not run another `--focus` job for that yes or select a different attendee." in flat
+    assert "never guess the soonest meeting or broaden to the sweep" in flat
 
 
 def test_proactive_offer_names_the_person_so_the_yes_is_answerable():
@@ -795,3 +820,371 @@ def test_proactive_offer_names_the_person_so_the_yes_is_answerable():
     assert "with no list of other meetings" in line
     for jargon in ("--focus", "focus mode", "sweep"):    # the DELIVERED text stays plain English
         assert jargon not in line.split('"')[1]
+
+
+def test_exact_occurrence_refuses_missing_focus_or_model_coverage_before_sweep(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'c'*32)
+    start = _soon()
+    event = _event('Offered', start, [{'email': 'dana@outside.com', 'displayName': 'Dana'}])
+    inputs = {'google': {'userEmail': 'me@myco.com', 'events': [event]},
+              'focus': 'Dana', 'exact_meeting': {'event_id': 'offered', 'start': start}}
+    calls = []
+    def model(*args):
+        calls.append(True)
+        return json.dumps({'prep_markdown': 'Specific prep', 'meetings': [
+            {'event_id': 'offered', 'start': start,
+             'talking_points': ['Discuss their September launch and updated enterprise pricing.']}]})
+    assert mp.compose(inputs, llm=model)['prep_markdown']
+    for changed in ({'event_id': 'different', 'start': start},
+                    {'event_id': 'offered', 'start': _soon(8)}):
+        with pytest.raises(ValueError, match='occurrence unavailable'):
+            mp.compose({**inputs, 'exact_meeting': changed}, llm=model)
+    with pytest.raises(ValueError, match='occurrence unavailable'):
+        mp.compose({**inputs, 'focus': 'Unrelated'}, llm=model)
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match='exact occurrence coverage'):
+        mp.compose(inputs, llm=lambda *args: json.dumps({'prep_markdown': 'Generic prep'}))
+
+
+def test_exact_prompt_supplies_occurrence_and_focused_schema_to_model(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'd'*32)
+    start = _soon()
+    event = _event('Offered', start, [{'email': 'dana@outside.com', 'displayName': 'Dana'}])
+    event['id'] = 'canonical_occurrence_20261006'
+    event['description'] = 'Review revised September enterprise pricing; bring the annotated rate sheet.'
+    inputs = {'google': {'userEmail': 'me@myco.com', 'events': [event]}, 'focus': 'Dana',
+              'exact_meeting': {'event_id': event['id'], 'start': start}}
+    def prompt_reader(prompt, _inputs, wrong=False):
+        prefix = 'calendar occurrence (copy these exact identity fields into meetings): '
+        line = next(line for line in prompt.splitlines() if line.startswith(prefix))
+        occurrence = json.loads(line[len(prefix):])
+        assert occurrence == inputs['exact_meeting']
+        assert 'an array containing exactly the ONE meeting covered' in prompt
+        assert '"attendees":' in prompt and '"talking_points":' in prompt
+        assert 'Copy `event_id` and `start` verbatim' in prompt
+        assert 'calendar description (stated meeting purpose, if present): '+event['description'] in prompt
+        assert 'Use that attributed context for prep and questions' in prompt
+        assert "I don't have private conversation context available for this prep." in prompt
+        assert 'Missing or partial context does not establish first contact or no prior exchange.' in prompt
+        return json.dumps({'prep_markdown': 'Discuss the revised September enterprise pricing.',
+            'meetings': [{**occurrence, 'event_id': 'different' if wrong else occurrence['event_id'],
+                'talking_points': ['Discuss the revised September enterprise pricing.']}]})
+    assert mp.compose(inputs, llm=prompt_reader)['meetings'][0]['event_id'] == event['id']
+    with pytest.raises(ValueError, match='exact occurrence coverage'):
+        mp.compose(inputs, llm=lambda prompt, data: prompt_reader(prompt, data, wrong=True))
+    sweep, meetings = mp.build_prompt(mp._load_prompt(), {k:v for k,v in inputs.items() if k not in ('focus', 'exact_meeting')})
+    assert len(meetings) == 1 and meetings[0]['event_id'] == event['id']
+    assert '## Output — FOCUSED PREP' not in sweep
+    assert 'array, one per meeting you covered' in sweep
+    assert 'calendar description (stated meeting purpose, if present): '+event['description'] in sweep
+    assert 'Use that attributed context for prep and questions' in sweep
+    assert 'canonical_occurrence_20261006' in sweep
+
+
+@pytest.mark.parametrize('focus', [False, True])
+@pytest.mark.parametrize('now,start,today,local_time', [
+    ('2026-10-14T00:05:00+00:00', '2026-10-14T22:30:00+00:00', '2026-10-13',
+     '2026-10-14 Wednesday 15:30 PDT'),
+    ('2026-11-01T07:30:00+00:00', '2026-11-01T09:30:00+00:00', '2026-11-01',
+     '2026-11-01 Sunday 01:30 PST'),
+])
+def test_prep_prompt_distinguishes_current_day_calendar_time_and_dated_source_claims(
+        monkeypatch, tmp_path, focus, now, start, today, local_time):
+    import timeutil
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(now).astimezone(tz)
+    monkeypatch.setattr(selection, 'datetime', Clock)
+    monkeypatch.setattr(timeutil, 'datetime', Clock)
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    inputs = {'google': {'userEmail': 'owner@fund.example', 'userTimezone': 'America/Los_Angeles',
+        'events': [{'id': 'exact-meeting', 'summary': 'Dana meeting', 'start': start,
+                    'location': 'Current calendar room', 'attendees': [
+                        {'email': 'dana@outside.example', 'displayName': 'Dana Example'}]}]},
+        'attendee_comms': {'dana@outside.example': [{'date': '2026-10-10T16:00:00-07:00',
+            'from_me': False, 'snippet': 'We can change the location today.'}]},
+        'attendee_research': {'attendees': [{'email': 'dana@outside.example',
+            'company_summary': 'The company says its service is designed for zero data retention.'}]}}
+    if focus:
+        inputs['focus'] = 'Dana Example'
+    prompt, meetings = mp.build_prompt(mp._load_prompt(focus=focus), inputs)
+    assert 'today: ' + today in prompt
+    assert 'calendar local time: ' + local_time + ' (America/Los_Angeles)' in prompt
+    assert meetings[0]['start'] == start  # provider occurrence identity remains unchanged
+    assert '2026-10-10T16:00:00-07:00' in prompt and 'change the location today' in prompt
+    assert 'Current calendar room' in prompt
+    assert 'source' in prompt and 'Never silently rebase it' in prompt
+    assert 'not independently verified guarantees' in prompt
+    assert 'designed for zero data retention' in prompt  # source qualification preserved
+
+
+def test_focused_prep_keeps_direct_request_beyond_preview_and_email_cap(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    now = datetime.now(timezone.utc)
+    request = 'Background. ' * 60 + 'Please try my profile and send product feedback at https://example.test/project.'
+    inputs = _taylor_inputs(focus='Taylor Reed',
+        prior_knowledge={'contact_index': [{'display_name': 'Taylor Reed',
+            'identifiers': ['taylor@startup.com', '+14155551234']}]},
+        attendee_comms={'taylor@startup.com': [{'subject': f'Calendar invitation {i}'} for i in range(3)]},
+        local={'imessage': [
+            {'handle': '+14155551234', 'timestamp': (now-timedelta(hours=2)).isoformat(), 'text': request},
+            {'handle': '+14155551234', 'timestamp': (now-timedelta(hours=1)).isoformat(), 'text': 'Tomorrow works', 'is_from_me': True},
+            {'handle': '+14155551234', 'timestamp': now.isoformat(), 'text': 'See you then'},
+            {'handle': '+14155551234', 'timestamp': now.isoformat(), 'text': 'GROUP SECRET', 'chat_guid': 'group'},
+            {'handle': '+19998887777', 'timestamp': now.isoformat(), 'text': 'OTHER PERSON'}]})
+    context, _ = mp.build_context(inputs)
+    assert request in context and '(you→them): Tomorrow works' in context
+    assert 'GROUP SECRET' not in context and 'OTHER PERSON' not in context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source != 'imessage')
+    context, _ = mp.build_context(inputs)
+    assert request not in context
+
+
+def test_direct_prep_context_requires_exact_link_not_a_unique_display_name(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    rows = [{'display_name': 'Taylor Reed', 'identifiers': ['+14155551234']}]
+    inputs = {'prior_knowledge': {'contact_index': rows}, 'local': {'imessage': [
+        {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(),
+         'text': 'UNLINKED PRIVATE THREAD'}]}}
+    # A same-named contact whose identifiers never include this attendee is another person.
+    assert mp.attendee_text_context(inputs, 'taylor@unrelated.example', 'Taylor Reed') == ''
+    rows[0]['identifiers'].append('taylor@unrelated.example')
+    assert 'UNLINKED PRIVATE THREAD' in mp.attendee_text_context(
+        inputs, 'taylor@unrelated.example', 'Taylor Reed')
+
+
+def test_direct_prep_context_is_bounded_and_ambiguous_names_do_not_join(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    rows = [{'display_name': 'Taylor Reed', 'identifiers': [phone]} for phone in ['+14155551234', '+14155554321']]
+    inputs = {'prior_knowledge': {'contact_index': rows}, 'local': {'imessage': [
+        {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'start ' + 'x'*20000 + ' final request'}]}}
+    assert mp.attendee_text_context(inputs, 'unlinked@example.test', 'Taylor Reed') == ''
+    rows[0]['identifiers'].append('linked@example.test')
+    text = mp.attendee_text_context(inputs, 'linked@example.test', 'Taylor Reed')
+    assert len(text) <= 8000 and 'start' in text and 'final request' in text and 'omitted' in text
+
+
+def _shared_calendar_event(*, owner_invited=False):
+    attendees = [{'email': 'spouse@family.example', 'self': True, 'responseStatus': 'accepted'},
+                 {'email': 'tanya@acme.com', 'displayName': 'Tanya Roe', 'responseStatus': 'accepted'}]
+    if owner_invited:
+        attendees.append({'email': 'owner@corp.com', 'responseStatus': 'accepted'})
+    return {'id': 'gcal_shared', 'calendar_id': 'spouse@family.example', 'summary': 'Tanya / Pat coffee',
+            'start': _soon(5), 'end': _soon(6), 'organizer': {'email': 'spouse@family.example', 'self': True},
+            'attendees': attendees}
+
+
+def test_meeting_only_visible_on_shared_calendar_is_never_selected_for_prep():
+    """Sweep, name focus and clock focus share one participation rule: an event on a shared
+    calendar the owner is not invited to is context, not the owner's meeting."""
+    event = _shared_calendar_event()
+    local_time = datetime.fromisoformat(event['start']).strftime('%H:%M')
+    inputs = {'google': {'events': [event], 'userEmail': 'owner@corp.com', 'userTimezone': 'UTC'}}
+    assert selection.upcoming(inputs) == []
+    assert selection.focus_hits({**inputs, 'focus': 'Tanya'}) == []
+    assert mp.focus_mode({**inputs, 'focus': 'Tanya'}) is False
+    assert selection.time_focus_hits({**inputs, 'focus': local_time}) == []
+    assert mp.build_context(inputs) == ("", [])
+
+
+def test_shared_calendar_holder_is_not_an_external_attendee():
+    """Google `self` on a non-owner calendar is that calendar's holder, not an outside guest."""
+    inputs = {'google': {'events': [_shared_calendar_event(owner_invited=True)],
+                         'userEmail': 'owner@corp.com', 'userTimezone': 'UTC'}, 'focus': 'Tanya'}
+    hits = selection.focus_hits(inputs)
+    assert len(hits) == 1
+    assert [a['email'] for a in hits[0][4]] == ['tanya@acme.com']
+
+
+@pytest.mark.parametrize('inactive', [
+    {'status': 'cancelled'}, {'status': 'canceled'}, {'my_response': 'declined'},
+    {'_owner_participates': False},
+])
+def test_named_prep_skips_inactive_earlier_meeting_and_selects_active_occurrence(inactive, monkeypatch):
+    monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
+    attendees = [{'email': 'owner@inside.test', 'self': True},
+                 {'email': 'dana@cedar.test', 'displayName': 'Dana Rivers'}]
+    earlier = _event('Earlier review', _soon(1), attendees, **inactive)
+    later = _event('Decision review', _soon(54), attendees)
+    inputs = {'google': {'userEmail': 'owner@inside.test', 'events': [earlier, later]},
+              'focus': 'Dana Rivers'}
+    assert [row[1]['id'] for row in selection.upcoming(inputs)] == ['decision-review']
+    context, meetings = mp.build_context(inputs)
+    assert [meeting['event_id'] for meeting in meetings] == ['decision-review']
+    assert 'Decision review' in context and 'Earlier review' not in context
+
+
+def test_explicit_prep_preserves_free_owner_organized_meeting(monkeypatch):
+    monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
+    event = _event('Free decision review', _soon(2), [
+        {'email': 'owner@inside.test', 'self': True},
+        {'email': 'dana@cedar.test', 'displayName': 'Dana Rivers'}],
+        calendar_id='primary', transparency='transparent', busy=False,
+        organizer={'self': True, 'email': 'owner@inside.test'})
+    inputs = {'google': {'userEmail': 'owner@inside.test', 'events': [event]}}
+    assert len(selection.upcoming(inputs)) == 1
+    exact = {**inputs, 'focus': 'Dana Rivers',
+             'exact_meeting': {'event_id': event['id'], 'start': event['start']}}
+    assert mp.require_exact_meeting(exact) == [{'name': 'Dana Rivers', 'email': 'dana@cedar.test'}]
+    assert mp.build_context(exact)[1][0]['event_id'] == event['id']
+
+
+def test_prep_passes_private_source_limitations_to_writer():
+    inputs = {'google': {'userEmail': 'me@example.com',
+              '_source_availability': {'gmail': 'partial'},
+              'events': [_event('Coffee', _soon(), [{'email': 'alex@acme.com', 'displayName': 'Alex'}])]},
+              'local': {'_source_availability': {'imessage': 'unavailable'}}}
+    context, _ = mp.build_context(inputs)
+    assert 'Data Source Availability' in context
+    assert 'iMessage' in context and 'Gmail' in context
+    assert 'partial' in context.lower()
+
+
+@pytest.mark.parametrize('focus', [None, 'Taylor Reed'])
+@pytest.mark.parametrize('wrong_identifier', ['other@unrelated.example', '+14155551234', '', 'name-only'])
+def test_production_prep_context_never_joins_same_name_with_contradictory_identity(
+        tmp_path, monkeypatch, focus, wrong_identifier):
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    wrong = {'canonical_id': 'c_wrong', 'display_name': 'Taylor Reed',
+             'identifiers': ['other@unrelated.example', '+14155551234']}
+    monkeypatch.setattr(mp, '_active_loops', lambda: [{
+        'contact_identifier': '' if wrong_identifier == 'name-only' else wrong_identifier,
+        'canonical_id': '' if wrong_identifier == 'name-only' else 'c_wrong', 'contact_name': 'Taylor Reed',
+        'status': 'open', 'summary': 'OTHER_PERSON_OBLIGATION'}])
+    inputs = _taylor_inputs(prior_knowledge={
+        'person_knowledge': {'c_wrong': 'Taylor Reed (c_wrong) | CTO | other@unrelated.example\nOTHER_PERSON_KNOWLEDGE'},
+        'contact_index': [wrong]}, local={'imessage': [{
+            'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(),
+            'text': 'OTHER_PERSON_PRIVATE_TEXT'}]})
+    if focus:
+        inputs['focus'] = focus
+    context, meetings = mp.build_context(inputs)
+    assert meetings and 'Taylor Reed <taylor@startup.com>' in context
+    assert all(marker not in context for marker in (
+        'OTHER_PERSON_PRIVATE_TEXT', 'OTHER_PERSON_KNOWLEDGE', 'OTHER_PERSON_OBLIGATION'))
+
+
+@pytest.mark.parametrize('focus', [None, 'Taylor Reed'])
+@pytest.mark.parametrize('loop_identifier', ['taylor@startup.com', '+14155554321', ''])
+def test_production_prep_preserves_exact_linked_texts_canonical_knowledge_and_obligations(
+        tmp_path, monkeypatch, focus, loop_identifier):
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    monkeypatch.setattr(mp, '_active_loops', lambda: [{
+        'contact_identifier': loop_identifier, 'canonical_id': 'c_right', 'contact_name': 'Taylor Reed',
+        'status': 'open', 'summary': 'LINKED_PERSON_OBLIGATION'}])
+    inputs = _taylor_inputs(prior_knowledge={
+        'person_knowledge': {
+            'c_wrong': 'Taylor Reed (c_wrong) | CTO | other@unrelated.example\nOTHER_PERSON_KNOWLEDGE',
+            # The canonical identity already linked to the attendee email is sufficient even
+            # when the packed display header contains no email of its own.
+            'c_right': 'Taylor Reed (c_right) | CEO\nLINKED_PERSON_KNOWLEDGE'},
+        'contact_index': [
+            {'canonical_id': 'c_wrong', 'display_name': 'Taylor Reed',
+             'identifiers': ['other@unrelated.example', '+14155551234']},
+            {'canonical_id': 'c_right', 'display_name': 'Taylor Reed',
+             'identifiers': ['taylor@startup.com', '+14155554321']}]},
+        local={'imessage': [
+            {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'OTHER_PERSON_PRIVATE_TEXT'},
+            {'handle': '+14155554321', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'LINKED_PERSON_PRIVATE_TEXT'}]})
+    if focus:
+        inputs['focus'] = focus
+    context, meetings = mp.build_context(inputs)
+    assert meetings
+    assert all(marker in context for marker in (
+        'LINKED_PERSON_PRIVATE_TEXT', 'LINKED_PERSON_KNOWLEDGE', 'LINKED_PERSON_OBLIGATION'))
+    assert 'OTHER_PERSON_PRIVATE_TEXT' not in context and 'OTHER_PERSON_KNOWLEDGE' not in context
+
+
+def test_production_prep_keeps_knowledge_with_exact_email_without_contact_bridge(monkeypatch):
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    inputs = _taylor_inputs(prior_knowledge={'person_knowledge': {
+        'c_right': 'Taylor Reed (c_right) | CEO | taylor@startup.com\nEXACT_EMAIL_KNOWLEDGE'}})
+    context, _ = mp.build_context(inputs)
+    assert 'EXACT_EMAIL_KNOWLEDGE' in context
+
+
+@pytest.mark.parametrize('map_key', ['c_ddeeff', 'legacy-slug'])
+def test_prep_knowledge_never_uses_parentheses_in_display_name_as_canonical_identity(monkeypatch, map_key):
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    inputs = _taylor_inputs(prior_knowledge={
+        'contact_index': [{'canonical_id': 'c_aabbcc', 'display_name': 'Taylor Reed',
+                           'identifiers': ['taylor@startup.com']}],
+        'person_knowledge': {map_key:
+            'Taylor (c_aabbcc) Reed (c_ddeeff) | CEO\nFOREIGN_PARENTHESIS_KNOWLEDGE'}})
+    context, _ = mp.build_context(inputs)
+    assert 'FOREIGN_PARENTHESIS_KNOWLEDGE' not in context
+
+
+def test_prep_knowledge_uses_production_canonical_map_key_before_display_header(monkeypatch):
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    inputs = _taylor_inputs(prior_knowledge={
+        'contact_index': [{'canonical_id': 'c_aabbcc', 'display_name': 'Taylor Reed',
+                           'identifiers': ['taylor@startup.com']}],
+        'person_knowledge': {'c_aabbcc': 'Taylor (nickname) Reed (legacy-display) | CEO\nCANONICAL_MAP_KNOWLEDGE'}})
+    context, _ = mp.build_context(inputs)
+    assert 'CANONICAL_MAP_KNOWLEDGE' in context
+
+
+def test_prep_knowledge_rejects_duplicate_canonical_candidates(monkeypatch):
+    monkeypatch.setattr(mp, '_active_loops', lambda: [])
+    inputs = _taylor_inputs(prior_knowledge={
+        'contact_index': [{'canonical_id': 'c_aabbcc', 'display_name': 'Taylor Reed',
+                           'identifiers': ['taylor@startup.com']}],
+        'person_knowledge': {
+            'c_aabbcc': 'Taylor Reed (c_aabbcc) | CEO\nFIRST_DUPLICATE_KNOWLEDGE',
+            'legacy-copy': 'Other Taylor (c_aabbcc) | CTO\nSECOND_DUPLICATE_KNOWLEDGE'}})
+    context, _ = mp.build_context(inputs)
+    assert 'FIRST_DUPLICATE_KNOWLEDGE' not in context and 'SECOND_DUPLICATE_KNOWLEDGE' not in context
+
+
+def test_prep_keeps_multiple_exact_and_canonical_obligations_despite_nicknames_with_existing_cap(monkeypatch):
+    rows = [{'canonical_id': 'c_aabbcc', 'contact_identifier': 'taylor@startup.com',
+             'contact_name': 'Taylor Reed', 'summary': 'EXACT_EMAIL_ASK', 'deadline': '2026-10-28'}]
+    rows += [{'canonical_id': 'c_aabbcc', 'contact_identifier': '', 'contact_name': nickname,
+              'summary': f'CANONICAL_ASK_{i}', 'deadline': f'2026-10-{29+i}'}
+             for i, nickname in enumerate(['Tay', '', 'Different display alias'])]
+    rows += [{'canonical_id': 'c_aabbcc', 'contact_identifier': 'other@unrelated.example',
+              'summary': 'FOREIGN_IDENTIFIER_ASK', 'deadline': '2026-10-01'},
+             {'canonical_id': 'c_ddeeff', 'contact_identifier': '', 'contact_name': 'Taylor Reed',
+              'summary': 'FOREIGN_CANONICAL_ASK', 'deadline': '2026-10-01'}]
+    monkeypatch.setattr(mp, '_active_loops', lambda: rows)
+    inputs = _taylor_inputs(prior_knowledge={'contact_index': [{
+        'canonical_id': 'c_aabbcc', 'display_name': 'Taylor Reed', 'identifiers': ['taylor@startup.com']}]})
+    context, _ = mp.build_context(inputs)
+    assert all(marker in context for marker in ['EXACT_EMAIL_ASK', 'CANONICAL_ASK_0', 'CANONICAL_ASK_1'])
+    assert context.count('loop:') == mp.MAX_RELEVANT_LOOPS_PER_ATTENDEE
+    assert all(marker not in context for marker in ['CANONICAL_ASK_2', 'FOREIGN_IDENTIFIER_ASK', 'FOREIGN_CANONICAL_ASK'])
+
+
+def test_research_source_qualification_reaches_both_prep_modes(monkeypatch):
+    monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
+    for focus in (False, True):
+        prompt, _ = mp.build_prompt(mp._load_prompt(focus=focus), {})
+        assert 'membership does not establish certification' in prompt
+        assert 'Copy source URLs exactly' in prompt
+        assert 'ask whether it exists before asking how it works' in prompt
+
+
+def test_qualified_membership_and_literal_source_survive_local_context(monkeypatch):
+    monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
+    url = 'https://directory.example.test/contributing-members/sample/?ref=public#member'
+    claim = 'Sample is listed as a contributing member; certification is not established. ' + url
+    inputs = {'google': {'userEmail': 'owner@example.com', 'events': [
+        _event('Sample discussion', _soon(), [{'email': 'dana@sample.test', 'displayName': 'Dana Reed'}])]},
+        'attendee_research': {'attendees': [{'email': 'dana@sample.test', 'summary': claim,
+            'company_deep': {'builds': [claim], 'traction': [claim]}}]}}
+    prompt, meetings = mp.build_prompt(mp._load_prompt(focus=True), inputs)
+    assert len(meetings) == 1
+    assert prompt.count(claim) == 3

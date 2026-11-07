@@ -28,6 +28,25 @@ def _load(name, filename):
 con = _load("connectors_t", "connectors.py")
 rec = _load("receiver_conn", "receiver.py")
 
+
+def test_durable_credential_write_syncs_before_and_after_replace(tmp_path, monkeypatch):
+    calls = []
+    original_sync = con.os.fsync
+    original_replace = con.os.replace
+
+    def sync(fd):
+        calls.append('sync')
+        return original_sync(fd)
+
+    def replace(before, after):
+        calls.append('replace')
+        return original_replace(before, after)
+
+    monkeypatch.setattr(con.os, 'fsync', sync)
+    monkeypatch.setattr(con.os, 'replace', replace)
+    con.write_json(str(tmp_path / 'granola.json'), {'fixture': True}, durable=True)
+    assert calls == ['sync', 'replace', 'sync']
+
 MCP_ORIGIN = "https://mcp.granola.ai"
 AUTH_FALLBACK = "https://mcp-auth.granola.ai"
 REDIRECT = "https://myapp.up.railway.app/connect/oauth/callback"
@@ -276,7 +295,9 @@ def test_finish_auth_happy_path_writes_pinned_schema(tmp_path, monkeypatch):
     on_disk = json.load(open(path))
     assert on_disk == record
     assert set(on_disk) == {"service", "access_token", "refresh_token", "expires_at",
-                            "token_endpoint", "client_id", "resource", "mcp_url", "obtained_at"}
+                            "token_endpoint", "client_id", "resource", "mcp_url", "obtained_at",
+                            "sotto_source_generation"}
+    assert len(on_disk['sotto_source_generation']) == 32
     assert on_disk["service"] == "granola" and on_disk["access_token"] == "at-1"
     assert on_disk["refresh_token"] == "rt-1"
     assert before + 3600 <= on_disk["expires_at"] <= before + 3610
@@ -312,6 +333,161 @@ def test_disconnect_surfaces_credential_unlink_failure(tmp_path, monkeypatch):
     with pytest.raises(OSError, match='fixture permission'):
         con.disconnect('granola')
     assert os.path.exists(path)
+
+
+def test_disconnect_fences_inflight_callback_and_revokes_after_its_consent(tmp_path, monkeypatch):
+    _use(monkeypatch, con, tmp_path, _flow_http(
+        (200, json.dumps({"access_token": "at-fence", "refresh_token": "rt-fence"}).encode())))
+    url = con.start_auth("granola", REDIRECT)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    entered_exchange = threading.Event()
+    release_exchange = threading.Event()
+    consent_events = []
+    original_http = con._http
+
+    def paused_http(url, method="GET", headers=None, body=None):
+        if "/oauth2/token" in url:
+            entered_exchange.set()
+            assert release_exchange.wait(timeout=5)
+        return original_http(url, method, headers, body)
+
+    monkeypatch.setattr(con, "_http", paused_http)
+
+    def callback():
+        return con.finish_auth(state, "code", REDIRECT,
+                               on_connected=lambda _record: consent_events.append(True))
+
+    def disconnect():
+        return con.disconnect("granola",
+                              before_disconnect=lambda: consent_events.append(False))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback)
+        assert entered_exchange.wait(timeout=3)
+        disconnect_started = threading.Event()
+
+        def start_disconnect():
+            disconnect_started.set()
+            return disconnect()
+
+        disconnect_future = pool.submit(start_disconnect)
+        assert disconnect_started.wait(timeout=3)
+        # The exchange owns the shared sidecar lock, so disconnect cannot report success yet.
+        assert not disconnect_future.done()
+        release_exchange.set()
+        callback_future.result(timeout=5)
+        disconnect_future.result(timeout=5)
+
+    assert consent_events == [True, False]
+    assert not os.path.exists(con.token_path("granola"))
+    assert not os.path.exists(os.path.join(con._pending_dir(), f"{state}.json"))
+
+
+def test_disconnect_invalidates_pending_and_old_callback_cannot_exchange(tmp_path, monkeypatch):
+    http = _use(monkeypatch, con, tmp_path, _flow_http(
+        (200, json.dumps({"access_token": "must-not-write"}).encode())))
+    url = con.start_auth("granola", REDIRECT)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    pending_path = os.path.join(con._pending_dir(), f"{state}.json")
+    con.disconnect("granola", before_disconnect=lambda: None)
+    assert not os.path.exists(pending_path)
+    with pytest.raises(con.ConnectorError) as exc:
+        con.finish_auth(state, "old-code", REDIRECT)
+    assert exc.value.step == "state"
+    assert not [call for call in http.calls if "/oauth2/token" in call[0]]
+    assert not os.path.exists(con.token_path("granola"))
+
+
+def test_duplicate_callbacks_consume_state_once_under_lock(tmp_path, monkeypatch):
+    http = _use(monkeypatch, con, tmp_path, _flow_http(
+        (200, json.dumps({"access_token": "single-writer"}).encode())))
+    url = con.start_auth("granola", REDIRECT)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    hints_ready = threading.Barrier(2)
+    original_hint = con._pending_service
+
+    def synchronized_hint(value):
+        service = original_hint(value)
+        hints_ready.wait(timeout=3)
+        return service
+
+    monkeypatch.setattr(con, "_pending_service", synchronized_hint)
+
+    def finish():
+        try:
+            return con.finish_auth(state, "duplicate-code", REDIRECT)
+        except con.ConnectorError as exc:
+            return exc.step
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result(timeout=5) for future in
+                   (pool.submit(finish), pool.submit(finish))]
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert results.count("state") == 1
+    assert len([call for call in http.calls if "/oauth2/token" in call[0]]) == 1
+
+
+def test_start_pending_creation_is_serialized_with_disconnect(tmp_path, monkeypatch):
+    _use(monkeypatch, con, tmp_path, _flow_http((200, b'{"access_token":"unused"}')))
+    entered_registration = threading.Event()
+    release_registration = threading.Event()
+    original_ensure = con.ensure_client
+
+    def paused_ensure(*args, **kwargs):
+        entered_registration.set()
+        assert release_registration.wait(timeout=5)
+        return original_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(con, "ensure_client", paused_ensure)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        start_future = pool.submit(con.start_auth, "granola", REDIRECT)
+        assert entered_registration.wait(timeout=3)
+        disconnect_future = pool.submit(con.disconnect, "granola")
+        assert not disconnect_future.done()
+        release_registration.set()
+        url = start_future.result(timeout=5)
+        disconnect_future.result(timeout=5)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    assert not os.path.exists(os.path.join(con._pending_dir(), f"{state}.json"))
+
+
+def test_failed_consent_revocation_retains_token_and_pending(tmp_path, monkeypatch):
+    _use(monkeypatch, con, tmp_path, _flow_http((200, b'{"access_token":"at"}')))
+    url = con.start_auth("granola", REDIRECT)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    token_path = con.token_path("granola")
+    con.write_json(token_path, {"service": "granola", "access_token": "existing"})
+    with pytest.raises(RuntimeError, match="consent store unavailable"):
+        con.disconnect("granola", before_disconnect=lambda: (_ for _ in ()).throw(
+            RuntimeError("consent store unavailable")))
+    assert os.path.exists(token_path)
+    assert os.path.exists(os.path.join(con._pending_dir(), f"{state}.json"))
+
+
+def test_disconnect_fsyncs_pending_directory_even_without_token(tmp_path, monkeypatch):
+    _use(monkeypatch, con, tmp_path, _flow_http((200, b'{"access_token":"unused"}')))
+    url = con.start_auth("granola", REDIRECT)
+    state = urllib.parse.parse_qs(url.split("?", 1)[1])["state"][0]
+    pending_dir = con._pending_dir()
+    malformed = os.path.join(pending_dir, "malformed-state-1234.json")
+    with open(malformed, "w", encoding="utf-8") as f:
+        f.write("[]")
+    expected = os.stat(pending_dir)
+    synced = []
+    real_fsync = con.os.fsync
+
+    def observe_fsync(fd):
+        actual = os.fstat(fd)
+        if actual.st_dev == expected.st_dev and actual.st_ino == expected.st_ino:
+            synced.append(True)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(con.os, "fsync", observe_fsync)
+    con.disconnect("granola")
+    assert not os.path.exists(os.path.join(pending_dir, f"{state}.json"))
+    assert not os.path.exists(malformed)
+    assert synced
+    assert not os.path.exists(con.token_path("granola"))
 
 
 def test_finish_auth_no_expiry_or_refresh_becomes_null(tmp_path, monkeypatch):
@@ -481,6 +657,18 @@ def _get(base, path, headers=None):
         return e.code, e.read().decode(), dict(e.headers)
 
 
+def _post_json(base, path, value, headers=None):
+    import urllib.error as _ue
+    import urllib.request as _u
+    req = _u.Request(base + path, data=json.dumps(value).encode(), method="POST",
+                     headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with _u.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read().decode()
+    except _ue.HTTPError as e:
+        return e.code, e.read().decode()
+
+
 def test_connect_endpoints_over_http(tmp_path, monkeypatch):
     """The full matrix: /connect/<svc>/start is setup-code-gated and 302s with the S256 shape;
     /connect/oauth/callback is public, 400s a bogus state with a step-named body, and completes the
@@ -537,6 +725,59 @@ def test_connect_endpoints_over_http(tmp_path, monkeypatch):
         code, body, _ = _get(base, f"/connect/oauth/callback?code=bad&state={st3}")
         assert code == 502 and "exchange" in body and "invalid_grant" in body
     finally:
+        srv.shutdown()
+
+
+def test_receiver_disconnect_waits_for_oauth_callback_and_leaves_revoked_state(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    os.makedirs(tmp_path / 'config')
+    json.dump({'tenant_id': 'test', 'sources': {}},
+              open(tmp_path / 'config/managed-capabilities.json', 'w'))
+    r2, srv, base = _serve(tmp_path)
+    original_http = _flow_http(
+        (200, json.dumps({"access_token": "at-race", "refresh_token": "rt-race"}).encode()))
+    entered_exchange = threading.Event()
+    release_exchange = threading.Event()
+
+    def paused_http(url, method="GET", headers=None, body=None):
+        if "/oauth2/token" in url:
+            entered_exchange.set()
+            assert release_exchange.wait(timeout=5)
+        return original_http(url, method, headers, body)
+
+    r2.CONNECTORS._http = paused_http
+    try:
+        code, _, headers = _get(base, "/connect/granola/start?code=sekrit-code-123")
+        assert code == 302
+        state = urllib.parse.parse_qs(headers["Location"].split("?", 1)[1])["state"][0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            callback = pool.submit(_get, base,
+                                   f"/connect/oauth/callback?code=fixture&state={state}")
+            assert entered_exchange.wait(timeout=3)
+            disconnected = threading.Event()
+
+            def post_disconnect():
+                disconnected.set()
+                return _post_json(base, "/setup/disconnect?code=sekrit-code-123",
+                                  {"service": "granola"})
+
+            disconnect = pool.submit(post_disconnect)
+            assert disconnected.wait(timeout=3)
+            assert not disconnect.done()
+            release_exchange.set()
+            assert callback.result(timeout=5)[0] == 200
+            status, body = disconnect.result(timeout=5)
+            assert status == 200 and json.loads(body)["ok"] is True
+
+        capabilities = json.load(open(tmp_path / 'config/managed-capabilities.json'))
+        assert capabilities['sources']['granola'] == {'consented': False, 'connected': False}
+        assert not os.path.exists(os.path.join(str(tmp_path), 'connectors', 'granola.json'))
+        assert not os.listdir(os.path.join(str(tmp_path), 'connectors', '.pending'))
+    finally:
+        release_exchange.set()
         srv.shutdown()
 
 

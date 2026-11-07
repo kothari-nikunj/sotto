@@ -63,10 +63,10 @@ def read() -> str:
         return ""
 
 
-def render_for_prompt() -> str:
+def render_for_prompt(text: str | None = None) -> str:
     """The prompt-facing form: the file under a header that tells the model what it is. Empty file
     (or none) renders '' so callers can drop the block entirely."""
-    text = read().strip()
+    text = (read() if text is None else text).strip()
     if not text:
         return ""
     return ("## MASTER CONTEXT (the user's own standing file — who they are, who is around them, "
@@ -74,6 +74,22 @@ def render_for_prompt() -> str:
             "Every line below was stated by the user themselves — treat it as ground truth and "
             "resolve names/roles against it first. The Procedures section is standing "
             "instructions: apply them.\n\n" + text)
+
+
+def render_for_chat_prompt(text: str | None = None) -> str:
+    """Fresh chat clock plus standing context, using the shared owner timezone chain."""
+    import tzchain
+    now = tzchain.local_now()
+    if tzchain.resolve(tzchain.configured_tz_name()) is None:
+        clock = (f"Current UTC instant: {now.isoformat(timespec='seconds')}. "
+                 "The owner's local timezone is unavailable. Do not assume UTC is their local date "
+                 "or state a local today/tomorrow/weekday without clarifying their timezone.")
+    else:
+        clock = (f"Current local date and time: {now.strftime('%A')}, {now.isoformat(timespec='seconds')} "
+                 f"({now.tzinfo}). Use this local date for today/tomorrow, not dates in old messages. "
+                 "Historical timestamps describe their own events, not the current day.")
+    standing = render_for_prompt(text)
+    return clock + ('\n\n' + standing if standing else '')
 
 
 def priorities() -> dict:

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "tenantRoot": "/data",
+  "manifest": {
+    "version": 1,
+    "deployment": "self_host",
+    "channel": "photon",
+    "tenantId": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "owner": {"accountId": "REPLACE_WITH_ACCOUNT_ID", "ownerId": "+15551234567"},
+    "lineKey": "REPLACE_WITH_STABLE_PHOTON_LINE_KEY",
+    "target": "photon",
+    "firstContact": {"mode": "owner_dm", "expectedProviderLine": "+15557654321"},
+    "photonLineNumber": "+15557654321",
+    "stateDirectory": "/data/node-state",
+    "mediaRoot": "/data/node-media",
+    "instructions": "REPLACE_WITH_OWNER_INSTRUCTIONS",
+    "runtime": {"port": 19981, "bearerToken": "REPLACE_WITH_UNIQUE_RUNTIME_SECRET_AT_LEAST_32_CHARS"},
+    "relay": {"receiverPort": 19982, "rootBearer": "REPLACE_WITH_UNIQUE_RELAY_SECRET_AT_LEAST_32_CHARS"},
+    "modelDirect": {
+      "provider": "google",
+      "apiKey": "REPLACE_WITH_DIRECT_GOOGLE_API_KEY",
+      "chatModelId": "gemini-3.8-flash",
+      "nativeMediaModelId": "gemini-3.8-flash"
+    },
+    "credentials": {
+      "mode": "cloud",
+      "photonProjectId": "REPLACE_WITH_PHOTON_SPECTRUM_CLOUD_PROJECT_ID",
+      "photonProjectSecret": "REPLACE_WITH_PHOTON_SPECTRUM_CLOUD_PROJECT_SECRET"
+    }
+  },
+  "receiverAuthority": {
+    "SOTTO_MCP_TOKEN": "REPLACE_WITH_SAME_RELAY_ROOT_BEARER",
+    "SOTTO_CONTROL_TOKEN": "REPLACE_WITH_UNIQUE_CONTROL_SECRET_AT_LEAST_32_CHARS",
+    "SOTTO_TENANT_ID": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "SOTTO_DATA": "/data",
+    "SOTTO_HOME": "/data/sotto-home",
+    "SOTTO_VOLUME_ID": "REPLACE_WITH_STABLE_LOCAL_VOLUME_ID"
+  },
+  "stableIdentity": {
+    "channel": "photon",
+    "target": "photon",
+    "tenantId": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "accountId": "REPLACE_WITH_ACCOUNT_ID",
+    "ownerId": "+15551234567",
+    "lineKey": "REPLACE_WITH_STABLE_PHOTON_LINE_KEY",
+    "providerThreadId": null,
+    "expectedProviderLine": "+15557654321",
+    "projectFingerprint": "REPLACE_WITH_SHA256_OF_sotto-photon-project-v1_COLON_PROJECT_ID"
+  },
+  "publicReceiverAuthority": null,
+  "trustedServiceId": "",
+  "receiverOverrides": {"SOTTO_TIMEZONE": "UTC"}
+}

@@ -9,6 +9,52 @@ gg = importlib.util.module_from_spec(spec); spec.loader.exec_module(gg)
 _real_refresh = gg._refresh_google_token
 
 
+def test_google_cli_discovery_uses_only_the_packaged_sotto_path(tmp_path, monkeypatch):
+    # An installed upstream google-workspace skill under SOTTO_HOME is never discovered.
+    stray = tmp_path / 'skills' / 'google-workspace' / 'scripts' / 'google_api.py'
+    stray.parent.mkdir(parents=True)
+    stray.write_text('')
+    monkeypatch.setenv('SOTTO_HOME', str(tmp_path))
+    path = gg._find_google_api()
+    assert path.endswith('/adapters/sotto/google_api.py')
+    monkeypatch.setattr(gg.os.path, 'isfile', lambda _path: False)
+    assert gg._find_google_api() is None
+
+
+def test_sotto_locked_refresh_uses_only_sotto_setup_path(tmp_path, monkeypatch):
+    root = tmp_path / 'repo'
+    here = root / 'sotto-chief-of-staff' / '_shared' / 'scripts'
+    here.mkdir(parents=True)
+    (root / 'adapters' / 'sotto').mkdir(parents=True)
+    (root / 'adapters' / 'sotto' / 'google_setup.py').write_text('# neutral setup fixture')
+    (root / 'adapters' / 'other').mkdir(parents=True)
+    (root / 'adapters' / 'other' / 'google_setup.py').write_text('# other adapter trap')
+    monkeypatch.setattr(gg, '__file__', str(here / 'gather_google.py'))
+    calls = []
+    monkeypatch.setattr(gg.subprocess, 'run', lambda argv, **kwargs:
+                        calls.append((argv, kwargs)) or type('Result', (), {'returncode': 0})())
+
+    _real_refresh()
+
+    assert len(calls) == 1
+    assert calls[0][0] == [gg.sys.executable, str(root / 'adapters' / 'sotto' / 'google_setup.py'), '--check']
+
+
+def test_sotto_locked_refresh_fails_closed_without_sotto_setup_even_if_another_adapter_has_one(monkeypatch, tmp_path):
+    root = tmp_path / 'repo'
+    here = root / 'sotto-chief-of-staff' / '_shared' / 'scripts'
+    here.mkdir(parents=True)
+    other = root / 'adapters' / 'other' / 'google_setup.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other adapter trap')
+    monkeypatch.setattr(gg, '__file__', str(here / 'gather_google.py'))
+    monkeypatch.setattr(gg.os.path, 'isfile', lambda path: path == str(other))
+    monkeypatch.setattr(gg.subprocess, 'run', lambda *_a, **_k: pytest.fail("must not use another adapter's setup"))
+
+    with pytest.raises(gg.GoogleCLIError, match='Sotto Google setup implementation is missing'):
+        _real_refresh()
+
+
 @pytest.fixture(autouse=True)
 def _no_token_refresh(monkeypatch):
     monkeypatch.setattr(gg, '_refresh_google_token', lambda: None)
@@ -46,6 +92,12 @@ def test_event_normalization_preserves_cancellation_and_recurring_identity():
     assert all(ev[key] == raw[key] for key in ('status', 'recurringEventId', 'originalStartTime'))
 
 
+def test_event_normalization_preserves_provider_availability():
+    raw = {'id': 'location', 'transparency': 'transparent', 'eventType': 'workingLocation'}
+    ev = gg.normalize_event(raw)
+    assert ev['transparency'] == 'transparent' and ev['eventType'] == 'workingLocation'
+
+
 def test_as_list_unwraps_common_envelopes():
     assert gg._as_list([1, 2]) == [1, 2]
     assert gg._as_list({"messages": [1]}) == [1]
@@ -72,22 +124,6 @@ def test_event_normalization_tolerates_mcp_field_names():
     assert ev["attendees"] == [{"email": "x@y.com"}]
 
 
-def test_normalize_mcp_path_writes_canonical_files(tmp_path, monkeypatch):
-    # The MCP fallback: agent dumps raw MCP results, --from-mcp normalizes to canonical shape, no CLI.
-    graw = tmp_path / "graw.json"; craw = tmp_path / "craw.json"
-    json.dump({"messages": [{"message_id": "1", "sender": "a@b.com", "title": "Hi"}]}, open(graw, "w"))
-    json.dump([{"event_id": "e", "title": "Sync", "start": {"dateTime": "2026-06-29T10:00:00Z"}}], open(craw, "w"))
-    g, c = tmp_path / "g.json", tmp_path / "c.json"
-    # _find_google_api should NOT be consulted on the MCP path.
-    monkeypatch.setattr(gg, "_find_google_api", lambda: (_ for _ in ()).throw(AssertionError("CLI used")))
-    monkeypatch.setattr("sys.argv", ["gather_google.py", "--from-mcp-gmail", str(graw),
-                                     "--from-mcp-calendar", str(craw), "--gmail-out", str(g), "--cal-out", str(c)])
-    gg.main()
-    emails, events = json.load(open(g)), json.load(open(c))
-    assert emails[0]["id"] == "1" and emails[0]["subject"] == "Hi"
-    assert events[0]["summary"] == "Sync" and events[0]["start"] == "2026-06-29T10:00:00Z"
-
-
 def test_main_writes_empty_files_when_api_missing(tmp_path, monkeypatch):
     # No google_api.py found → write empty files + WARNING, exit 0 (the brief still runs).
     monkeypatch.setattr(gg, "_find_google_api", lambda: None)
@@ -105,7 +141,7 @@ def test_locked_refresh_runs_before_upstream_cli_and_failure_reads_unavailable(t
     monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
 
     def run(argv, **kw):
-        assert argv[1].endswith(os.path.join('adapters', 'hermes', 'google_setup.py')) and argv[2:] == ['--check']
+        assert argv[1].endswith(os.path.join('adapters', 'sotto', 'google_setup.py')) and argv[2:] == ['--check']
         assert os.path.isfile(argv[1])
         calls.append('check')
         return type('R', (), {'returncode': check_rc})()
@@ -122,7 +158,8 @@ def test_locked_refresh_runs_before_upstream_cli_and_failure_reads_unavailable(t
         assert calls == ['check']
         assert results['gmail']['status'] == results['calendar']['status'] == 'unavailable'
     else:
-        assert calls == ['check', 'inbox', 'calendar']
+        assert calls.count('calendar') == 1
+        assert [call for call in calls if call != 'calendar'] == ['check', 'inbox']
 
 
 @pytest.mark.parametrize('message,expected', [
@@ -133,6 +170,14 @@ def test_locked_refresh_runs_before_upstream_cli_and_failure_reads_unavailable(t
     ('<HttpError 429: Too many requests>', 'rate_limited'),
     ('<HttpError 403: insufficientPermissions>', 'GoogleCLIError'),
     ('<HttpError 403: forbidden>', 'GoogleCLIError'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=403 provider_reason=rateLimitExceeded', 'rate_limited'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=403 provider_reason=userRateLimitExceeded', 'rate_limited'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=403 provider_reason=quotaExceeded', 'rate_limited'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=403 provider_reason=insufficientPermissions', 'GoogleCLIError'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=403', 'GoogleCLIError'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=429', 'rate_limited'),
+    ('Google operation unavailable or refused. diagnostic=provider_http http_status=500 provider_reason=rateLimitExceeded', 'GoogleCLIError'),
+    ('Google operation unavailable or refused. diagnostic=permission provider_reason=rateLimitExceeded', 'GoogleCLIError'),
     ('local error: quota exceeded', 'GoogleCLIError'),
 ])
 def test_google_cli_error_classification_requires_typed_status_and_quota_signal(message, expected):
@@ -148,30 +193,6 @@ def test_typed_provider_http_error_classification():
     assert gg._source_error(ProviderError(429, 'Too many requests')) == 'rate_limited'
     assert gg._source_error(ProviderError(403, 'quotaExceeded')) == 'rate_limited'
     assert gg._source_error(ProviderError(403, 'insufficientPermissions')) == 'ProviderError'
-
-
-def test_quota_denial_skips_extra_gmail_reads_but_keeps_calendar(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
-    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: True)
-
-    def inbox(*args, **kwargs):
-        calls.append('inbox')
-        raise gg.GoogleCLIError('<HttpError 403: Quota exceeded for quota metric Queries and limit Total Query Cost Units per minute per user>')
-
-    monkeypatch.setattr(gg, 'gather_gmail', inbox)
-    monkeypatch.setattr(gg, 'gather_sent', lambda *a, **k: calls.append('sent'))
-    monkeypatch.setattr(gg, 'gather_stale_sent', lambda *a, **k: calls.append('stale'))
-    monkeypatch.setattr(gg, 'gather_calendar', lambda *a, **k: calls.append('calendar') or [])
-    gmail, cal, receipt = (tmp_path / name for name in ('gmail.json', 'cal.json', 'source-results.json'))
-    monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
-                                    '--source-results-out', str(receipt)])
-    gg.main()
-    assert calls == ['inbox', 'calendar']
-    assert json.loads(gmail.read_text()) == [] and json.loads(cal.read_text()) == []
-    results = json.loads(receipt.read_text())
-    assert results['gmail']['status'] == 'unavailable' and results['gmail']['error'] == 'rate_limited'
-    assert results['calendar']['status'] == 'partial'
 
 
 def test_sent_quota_denial_keeps_inbox_and_skips_stale(tmp_path, monkeypatch):
@@ -191,7 +212,8 @@ def test_sent_quota_denial_keeps_inbox_and_skips_stale(tmp_path, monkeypatch):
     monkeypatch.setattr('sys.argv', ['gather_google.py', '--gmail-out', str(gmail), '--cal-out', str(cal),
                                     '--source-results-out', str(receipt)])
     gg.main()
-    assert calls == ['inbox', 'sent', 'calendar']
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['inbox', 'sent']
     assert json.loads(gmail.read_text()) == [{'id': 'message'}]
     assert json.loads(receipt.read_text())['gmail']['error'] == 'rate_limited'
 
@@ -267,7 +289,8 @@ def test_body_quota_keeps_search_snippet_and_marks_partial(tmp_path, monkeypatch
                                     '--gmail-out', str(gmail), '--cal-out', str(cal),
                                     '--source-results-out', str(receipt)])
     gg.main()
-    assert calls == ['search', 'get', 'calendar']  # no second date slice after quota
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['search', 'get']  # no second date slice after quota
     assert json.loads(gmail.read_text())[0]['snippet'] == 'usable snippet'
     result = json.loads(receipt.read_text())
     assert result['gmail']['status'] == 'partial'
@@ -312,7 +335,8 @@ def test_later_slice_search_quota_keeps_earlier_rows(tmp_path, monkeypatch):
                                     '--gmail-out', str(gmail), '--cal-out', str(cal),
                                     '--source-results-out', str(receipt)])
     gg.main()
-    assert calls == ['search', 'search', 'calendar']
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['search', 'search']
     assert json.loads(gmail.read_text()) == [{'id': 'first', 'threadId': None, 'from': '',
         'to': '', 'cc': '', 'subject': '', 'date': '', 'snippet': 'earlier slice survived', 'body': '',
         'labelIds': [], 'isSent': False}]
@@ -355,7 +379,8 @@ def test_nonquota_body_failure_remains_snippet_fallback_with_healthy_search(tmp_
                                     '--source-results-out', str(receipt)])
     gg.main()
     assert json.loads(gmail.read_text())[0]['snippet'] == 'usable snippet'
-    assert calls == ['sent', 'stale', 'calendar']
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['sent', 'stale']
     result = json.loads(receipt.read_text())
     assert result['gmail']['status'] == 'ok' and result['gmail']['complete'] is True
 
@@ -747,7 +772,8 @@ def test_stale_thread_quota_keeps_prior_evidence_and_marks_partial(tmp_path, mon
                                     '--gmail-out', str(gmail), '--cal-out', str(cal),
                                     '--source-results-out', str(receipt)])
     gg.main()
-    assert calls == ['inbox-search', 'stale-search', 't1', 't2', 'closed', 'calendar']
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['inbox-search', 'stale-search', 't1', 't2', 'closed']
     payload = json.loads(gmail.read_text())
     assert [row['threadId'] for row in payload['stale_threads']] == ['t1']
     result = json.loads(receipt.read_text())
@@ -862,18 +888,6 @@ def test_sent_lane_shape_is_what_style_extract_consumes():
     assert se.bucket_for_sample(samples[0]) == "work_email"
     # the file-shaped envelope compose_brief writes on a truncated window works too
     assert len(se._adapt_gmail({"emails": rows, "truncated_at": 40})) == 2
-
-
-def test_normalize_mcp_merges_a_sent_dump(tmp_path):
-    (tmp_path / "gm.json").write_text(json.dumps([{"id": "a", "from": "x@y.com"}]))
-    (tmp_path / "sent.json").write_text(json.dumps([_sent_row("s1")]))
-    emails, events = gg.normalize_mcp(str(tmp_path / "gm.json"), None, str(tmp_path / "sent.json"))
-    assert [e["id"] for e in emails] == ["a", "s1"]
-    assert emails[1]["isSent"] is True and "SENT" in emails[1]["labelIds"]
-    assert events == []
-    # no sent dump → the CLI-parity path still works (the documented MCP gap)
-    emails2, _ = gg.normalize_mcp(str(tmp_path / "gm.json"), None)
-    assert [e["isSent"] for e in emails2] == [False]
 
 
 def test_gather_sent_uses_the_in_sent_query(monkeypatch):
@@ -1159,7 +1173,8 @@ def test_attachment_quota_marks_partial_and_stops_later_downloads(tmp_path, monk
     payload = json.loads(gmail.read_text())
     assert payload[0]['subject'] == 'Q3 numbers'
     assert [a['filename'] for a in payload[0]['attachments']] == ['first.csv', 'second.csv']
-    assert calls == ['first.csv', 'calendar']
+    assert calls.count('calendar') == 1
+    assert [call for call in calls if call != 'calendar'] == ['first.csv']
     result = json.loads(receipt.read_text())
     assert result['gmail']['status'] == 'partial'
     assert result['gmail']['complete'] is False and result['gmail']['error'] == 'rate_limited'
@@ -1218,6 +1233,8 @@ def test_calendar_native_pages_preserve_identity_rsvp_and_all_day(monkeypatch):
                     'end': {'date': '2026-09-08'}},
                    {'id': 'cancelled', 'status': 'cancelled'}, {'id': '0', 'summary': 'Event'}]}]
     class Service:
+        def calendarList(self):
+            return SimpleNamespace(list=lambda **kwargs: SimpleNamespace(execute=lambda: {'items': [{'id': 'primary', 'accessRole': 'owner'}]}))
         def events(self): return self
         def list(self, **kwargs):
             calls.append(kwargs)
@@ -1225,10 +1242,10 @@ def test_calendar_native_pages_preserve_identity_rsvp_and_all_day(monkeypatch):
     events = gg.gather_calendar('unused.py', service=Service())
     assert len(events) == 27
     assert calls[0]['maxResults'] == 250 and calls[1]['pageToken'] == 'second'
-    meeting = next(e for e in events if e['id'] == 'meeting')
+    meeting = next(e for e in events if e['provider_event_id'] == 'meeting')
     assert meeting['attendees'][0]['displayName'] == 'Alex Example'
     assert meeting['my_response'] == 'accepted'
-    assert next(e for e in events if e['id'] == 'ooo')['start'] == '2026-09-07'
+    assert next(e for e in events if e['provider_event_id'] == 'ooo')['start'] == '2026-09-07'
 
 
 def test_calendar_native_fails_on_repeated_page_and_closes_owned_client(monkeypatch):
@@ -1236,6 +1253,8 @@ def test_calendar_native_fails_on_repeated_page_and_closes_owned_client(monkeypa
     from types import SimpleNamespace
     closed = []
     class Service:
+        def calendarList(self):
+            return SimpleNamespace(list=lambda **kwargs: SimpleNamespace(execute=lambda: {'items': [{'id': 'primary', 'accessRole': 'owner'}]}))
         def events(self): return self
         def list(self, **kwargs):
             return SimpleNamespace(execute=lambda: {'items': [], 'nextPageToken': 'same'})
@@ -1268,3 +1287,468 @@ def test_gmail_grant_restored_between_inbox_and_loop_gates_does_not_fail_the_gat
     assert json.loads(gmail.read_text()) == []
     assert len(gmail_checks) >= 2 and json.loads(cal.read_text()) == []
     assert json.loads(receipt.read_text())['gmail']['status'] == 'unavailable'
+
+
+@pytest.mark.parametrize('count,status', [(0, 'ok'), (2, 'ok'), (gg.PULSE_REFRESH_MAX_MESSAGES, 'partial')])
+def test_attended_pulse_is_one_bounded_both_direction_metadata_query(tmp_path, monkeypatch, count, status):
+    import source_context
+    now = gg.datetime.datetime.now(gg.datetime.timezone.utc)
+    since = int(now.timestamp()) - 3600
+    out, receipt = tmp_path / 'gmail.json', tmp_path / 'sources.json'
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg, '_ensure_google_deps', lambda: pytest.fail('foreground dependency install'))
+    monkeypatch.setattr(gg, '_refresh_google_token', lambda: pytest.fail('extra foreground token-check process'))
+    calls = []
+    def read(api, args, timeout):
+        calls.append((api, args, timeout))
+        assert args[:2] == ['gmail', 'search'] and args[-2:] == ['--max', str(gg.PULSE_REFRESH_MAX_MESSAGES)]
+        assert args[2].startswith(f'after:{since} before:')
+        assert 'in:inbox' not in args[2] and 'in:sent' not in args[2] and timeout == 12
+        return [{'id': f'm{i}', 'from': 'a@example.com', 'date': now.isoformat(), 'labels': ['SENT']}
+                for i in range(count)]
+    monkeypatch.setattr(gg, '_run', read)
+    monkeypatch.setattr(gg.sys, 'argv', ['gather_google.py', '--pulse-since-epoch', str(since),
+        '--gmail-out', str(out), '--cal-out', str(tmp_path / 'cal.json'), '--source-results-out', str(receipt)])
+    gg.main()
+    result = json.loads(receipt.read_text())['gmail']
+    assert len(calls) == 1 and len(json.loads(out.read_text())) == count
+    assert result['status'] == status and result['complete'] is (status == 'ok')
+    assert result['coverage']['since'] == gg.datetime.datetime.fromtimestamp(since, gg.datetime.timezone.utc).isoformat()
+
+
+def test_attended_pulse_timeout_or_revoke_never_returns_complete_coverage(tmp_path, monkeypatch):
+    import source_context
+    now = gg.datetime.datetime.now(gg.datetime.timezone.utc)
+    since = int(now.timestamp()) - 60
+    out, receipt = tmp_path / 'gmail.json', tmp_path / 'sources.json'
+    permission = {'allowed': True}
+    monkeypatch.setattr(source_context, 'allowed', lambda source: permission['allowed'])
+    monkeypatch.setattr(gg, '_find_google_api', lambda: '/fake/api.py')
+    monkeypatch.setattr(gg.sys, 'argv', ['gather_google.py', '--pulse-since-epoch', str(since),
+        '--gmail-out', str(out), '--cal-out', str(tmp_path / 'cal.json'), '--source-results-out', str(receipt)])
+    def timeout(*args, **kwargs):
+        assert kwargs['timeout'] == 12
+        raise gg.subprocess.TimeoutExpired('private provider request', 12)
+    monkeypatch.setattr(gg, '_run', timeout)
+    gg.main()
+    result = json.loads(receipt.read_text())['gmail']
+    assert result['status'] == 'unavailable' and result['complete'] is False
+    assert json.loads(out.read_text()) == [] and 'private' not in receipt.read_text()
+    def revoked(*args, **kwargs):
+        permission['allowed'] = False
+        return [{'id': 'private', 'from': 'a@example.com'}]
+    monkeypatch.setattr(gg, '_run', revoked)
+    gg.main()
+    assert json.loads(receipt.read_text())['gmail']['status'] == 'disabled'
+    assert json.loads(out.read_text()) == []
+
+
+def test_attended_refresh_interrupts_a_real_slow_child_and_returns_unavailable(tmp_path, monkeypatch):
+    import time
+    import source_context
+    now = gg.datetime.datetime.now(gg.datetime.timezone.utc)
+    slow = tmp_path / 'slow_google.py'
+    slow.write_text('import time\ntime.sleep(5)\n')
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    monkeypatch.setattr(gg, '_find_google_api', lambda: str(slow))
+    monkeypatch.setattr(gg, 'PULSE_REFRESH_TIMEOUT_SECONDS', 0.05)
+    out, receipt = tmp_path / 'gmail.json', tmp_path / 'sources.json'
+    monkeypatch.setattr(gg.sys, 'argv', ['gather_google.py', '--pulse-since-epoch', str(int(now.timestamp()) - 60),
+        '--gmail-out', str(out), '--cal-out', str(tmp_path / 'cal.json'), '--source-results-out', str(receipt)])
+    started = time.monotonic()
+    gg.main()
+    elapsed = time.monotonic() - started
+    assert elapsed < 2  # shortened test-only deadline kills the five-second fake reader
+    result = json.loads(receipt.read_text())['gmail']
+    assert result['status'] == 'unavailable' and result['complete'] is False
+    assert result['error'] == 'TimeoutExpired' and json.loads(out.read_text()) == []
+
+
+def test_calendar_response_uses_connected_email_not_shared_self(monkeypatch):
+    monkeypatch.setattr(gg, 'configured_user_email', lambda: 'owner@example.com')
+    event = {'calendar_id': 'shared', 'attendees': [
+        {'email': 'colleague@example.com', 'self': True, 'responseStatus': 'accepted'},
+        {'email': 'owner@example.com', 'responseStatus': 'declined'}]}
+    assert gg.normalize_event(event)['my_response'] == 'declined'
+    event['attendees'].pop()
+    assert gg.normalize_event(event)['my_response'] == ''
+
+
+@pytest.mark.parametrize('mode', ['complete', 'fallback-in-thread', 'fallback-read', 'partial-candidate', 'empty-thread'])
+def test_stale_id_candidates_keep_exact_original_evidence_and_thread_inventory(monkeypatch, mode):
+    import datetime as dt
+    now=dt.datetime(2026,10,13,12,tzinfo=dt.timezone.utc)
+    old=int((now-dt.timedelta(days=5)).timestamp()*1000)
+    def message(mid, headers, snippet):
+        return {'id':mid,'threadId':'t','internalDate':str(old),'labelIds':['SENT'],
+                'payload':{'headers':[{'name':k,'value':v} for k,v in headers.items()]},'snippet':snippet}
+    candidate=message('candidate',{'To':'Original <original@example.com>','Subject':'Original subject'},'original snippet')
+    last=message('last',{'To':'Current <current@example.com>','Subject':'Current subject','Cc':'copy@example.com'},'latest snippet')
+    last['internalDate']=str(old+1000)
+    if mode!='complete':
+        last['payload']['headers']=[{'name':'Cc','value':'copy@example.com'}]
+        last['snippet']=''
+    thread={'id':'t','messages':([candidate] if mode!='fallback-read' else [])+[last]}
+    if mode=='partial-candidate':
+        thread['messages'][0]={'id':'candidate','internalDate':str(old),'payload':{'headers':[]},'snippet':''}
+    if mode=='empty-thread':
+        thread['messages']=None
+    original=[gg.normalize_email({'id':'candidate','threadId':'t','to':'Original <original@example.com>',
+                                  'subject':'Original subject','snippet':'original snippet'}, {})]
+    expected=gg.stale_from_threads(original, {'t':thread}, now)
+    def search(api,args,timeout=60):
+        assert args==['gmail','search','in:sent older_than:3d newer_than:14d -in:chats','--max','40','--ids-only']
+        assert timeout==60
+        return [{'id':'candidate','threadId':'t'}]
+    monkeypatch.setattr(gg,'_run',search)
+    calls=[]
+    class Service:
+        kind=''
+        def users(self):return self
+        def threads(self):self.kind='thread';return self
+        def messages(self):self.kind='message';return self
+        def get(self,**kwargs):
+            calls.append((self.kind,kwargs))
+            value=thread if self.kind=='thread' else candidate
+            return type('Call',(),{'execute':lambda _:value})()
+    actual=gg.gather_stale_sent('/fake',service=Service(),now=now)
+    assert list(actual)==expected
+    assert actual.threads=={'t':thread}
+    assert not actual.rate_limited
+    assert [kind for kind,_ in calls]==(['thread','message'] if mode in ('fallback-read','partial-candidate') else ['thread'])
+    if mode in ('fallback-read','partial-candidate'):
+        assert calls[-1][1]=={'userId':'me','id':'candidate','format':'metadata','metadataHeaders':['From','To','Subject','Date']}
+
+
+def test_stale_fallback_quota_preserves_completed_threads_and_stops_reads(monkeypatch):
+    import datetime as dt
+    now=dt.datetime(2026,10,13,12,tzinfo=dt.timezone.utc)
+    old=now-dt.timedelta(days=5)
+    monkeypatch.setattr(gg,'_run',lambda *a,**k:[{'id':f'm{i}','threadId':f't{i}'} for i in range(3)])
+    calls=[]
+    class QuotaError(Exception):
+        resp=type('Response',(),{'status':429})()
+    class Service:
+        kind=''
+        def users(self):return self
+        def threads(self):self.kind='thread';return self
+        def messages(self):self.kind='message';return self
+        def get(self,**kwargs):
+            calls.append((self.kind,kwargs['id']))
+            if self.kind=='message':
+                return type('Call',(),{'execute':lambda _:(_ for _ in ()).throw(QuotaError())})()
+            thread=_thread(kwargs['id'],[(old,True,'person@example.com','Subject','Complete context')])
+            if kwargs['id']=='t1':
+                thread['messages'][0]['snippet']=''
+            return type('Call',(),{'execute':lambda _:thread})()
+    result=gg.gather_stale_sent('/fake',service=Service(),now=now)
+    assert calls==[('thread','t0'),('thread','t1'),('message','m1')]
+    assert result.rate_limited and set(result.threads)=={'t0'}
+    assert [row['threadId'] for row in result]==['t0']
+
+
+@pytest.fixture
+def attendee_thread(monkeypatch):
+    import base64
+    import datetime
+    import source_context
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def message(index, body, sender='Dana <dana@acme.com>'):
+        stamp = now - datetime.timedelta(days=16-index)
+        return {'id': f'm{index}', 'threadId': 'thread-1', 'internalDate': str(int(stamp.timestamp()*1000)),
+                'labelIds': ['INBOX'], 'snippet': body[:20],
+                'payload': {'mimeType': 'text/plain', 'headers': [
+                    {'name': 'From', 'value': sender}, {'name': 'To', 'value': 'owner@example.com'},
+                    {'name': 'Cc', 'value': 'dana@acme.com'}, {'name': 'Date', 'value': stamp.isoformat()},
+                    {'name': 'Subject', 'value': 'Intro then scheduling'}],
+                    'body': {'data': base64.urlsafe_b64encode(body.encode()).decode()}}}
+    messages = [message(0, 'Happy to connect you both. Discuss the new infrastructure.', 'Introducer <intro@other.com>')]
+    messages += [message(i, f'Scheduling reply {i}') for i in range(1, 7)]
+    messages.append(message(8, 'Correction: 10 on the 14th is easiest.'))
+    search = [{'id': row['id'], 'threadId': 'thread-1', 'from': 'Dana <dana@acme.com>',
+               'subject': 'Intro then scheduling', 'snippet': row['snippet'], 'date': row['internalDate']} for row in reversed(messages[3:])]
+    calls=[]; grants={'gmail'}; response={'id': 'thread-1', 'messages': messages}; fail=[]
+    class Service:
+        def users(self): return self
+        def threads(self): return self
+        def get(self, **kwargs):
+            calls.append(kwargs)
+            return self
+        def execute(self):
+            if fail:
+                raise fail[0]
+            return response
+        def close(self): pass
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source in grants)
+    monkeypatch.setattr(gg, '_gmail_service', Service)
+    def run(api,args,**kwargs):
+        assert 'cc:dana@acme.com' in args[2]
+        return search
+    monkeypatch.setattr(gg, '_run', run)
+    return response, messages, search, calls, grants, fail, message
+
+
+def test_focused_attendee_threads_keep_intro_and_latest_correction_for_local_prep_only(attendee_thread, monkeypatch, tmp_path):
+    import compose_meeting_prep as prep
+    import research_attendees as research
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    email, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    assert len(calls) == 1 and calls[0] == {'userId': 'me', 'id': 'thread-1', 'format': 'full'}
+    assert len(rows) == 1  # full thread replaces duplicate current search snippets
+    assert 'Happy to connect you both' in rows[0]['thread_context']
+    assert 'Correction: 10 on the 14th' in rows[0]['thread_context']
+    prompt = '\n'.join(prep._thread_lines(rows))
+    assert 'Introducer <intro@other.com>' in prompt
+    assert 'Happy to connect you both' in prompt
+    assert 'Correction: 10 on the 14th' in prompt
+    sent = []
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
+    monkeypatch.setattr(research.wr, 'provider_chain', lambda _: ['parallel'])
+    monkeypatch.setattr(research.wr, '_parallel_task',
+                        lambda prompt, *args: sent.append(prompt) or {'attendees': []})
+    research.research([{'name': 'Dana Example', 'email': email}], 'PRIVATE-MEETING',
+                      {email: rows}, focus='Dana Example')
+    assert sent
+    assert all('Happy to connect you both' not in prompt and 'Introducer <intro@other.com>' not in prompt
+               and rows[0]['snippet'] not in prompt and 'PRIVATE-MEETING' not in prompt for prompt in sent)
+
+
+def test_muted_sender_text_never_enters_thread_background(attendee_thread, monkeypatch):
+    """Compose drops a muted sender's own rows; their words in a shared thread are dropped by the
+    one bounded thread reader, for both focused prep and the brief cohort, before rendering."""
+    import preferences
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    owner_reply = message(5, 'Owner reply: Tuesday works.', 'Owner <owner@example.com>')
+    owner_reply['labelIds'] = ['SENT']
+    messages[5] = owner_reply
+    monkeypatch.setattr(preferences, 'load_explicit', lambda: {'mute_senders': ['@other.com', 'owner@example.com']})
+    email, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    context = rows[0]['thread_context']
+    assert 'Happy to connect you both' not in context and 'intro@other.com' not in context
+    assert 'Correction: 10 on the 14th' in context and 'partial' in context
+    assert 'Owner reply: Tuesday works.' in context  # the owner's own SENT words are never muted
+    monkeypatch.setattr(gg, '_token_path', lambda: 'connected')
+    monkeypatch.setattr(gg, '_run', lambda *a, **k: [
+        {'id': 'm8', 'threadId': 'thread-1', 'labelIds': ['INBOX'], 'snippet': 'Thin excerpt'}])
+    brief = gg.gather_gmail('fake', 2, 2, attachments=False)
+    assert brief and 'Correction: 10 on the 14th' in brief[0]['body']
+    assert 'Happy to connect you both' not in json.dumps(brief)
+
+
+@pytest.mark.parametrize('case', ['denied', 'revoked', 'rate_limit', 'wrong_thread', 'missing_payload'])
+def test_focused_thread_failure_keeps_only_permitted_partial_search(attendee_thread, monkeypatch, case):
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    if case == 'denied':
+        grants.clear()
+    elif case == 'revoked':
+        class Response(dict):
+            def get(self, key, default=None):
+                grants.clear()
+                return super().get(key, default)
+        response['messages'] = Response()  # malformed after the read and revoke
+    elif case == 'rate_limit':
+        error = RuntimeError('provider body must stay out of context')
+        error.resp = type('Response', (), {'status': 429})()
+        fail.append(error)
+        search[1] = {**search[0], 'id': 'other', 'threadId': 'thread-2'}
+    elif case == 'wrong_thread':
+        response['id'] = 'unrelated'
+    else:
+        messages[0].pop('payload')
+    if case == 'revoked':
+        original = gg._gmail_service
+        def service():
+            client = original()
+            execute = client.execute
+            def revoke():
+                result = execute(); grants.clear(); return result
+            client.execute = revoke
+            return client
+        monkeypatch.setattr(gg, '_gmail_service', service)
+    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    if case in ('denied', 'revoked'):
+        assert rows == []
+        if case == 'denied':
+            assert calls == []
+    else:
+        assert len(calls) == 1
+        assert rows and all('Happy to connect' not in row.get('thread_context', '') for row in rows)
+        assert 'unavailable' in rows[0]['thread_context']
+        assert all('provider body' not in row.get('thread_context', '') for row in rows)
+
+
+def test_focused_thread_caps_preserve_opening_latest_and_exclude_non_evidence(attendee_thread):
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    response['messages'] = [message(i, ('opening ' if i==0 else 'latest ' if i==15 else 'middle ') + 'x'*5000) for i in range(16)]
+    response['messages'].append({**message(16, 'DRAFT DO NOT INCLUDE'), 'labelIds': ['DRAFT']})
+    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    context = rows[0]['thread_context']
+    assert len(context) <= gg.ATTENDEE_THREAD_CHARS
+    assert 'opening ' in context and 'latest ' in context and 'DRAFT DO NOT INCLUDE' not in context
+    assert 'partial' in context
+    assert context.count('[message middle omitted]') == gg.ATTENDEE_THREAD_MESSAGES
+
+
+
+def test_focused_thread_read_cap_and_shared_quota_stop(attendee_thread):
+    import threading
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    search[1] = {**search[0], 'id': 'other', 'threadId': 'thread-2'}
+    search[2] = {**search[0], 'id': 'third', 'threadId': 'thread-3'}
+    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    assert len(calls) == gg.ATTENDEE_THREAD_CAP
+    stop = threading.Event(); stop.set()
+    assert gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True, quota_stop=stop) == ('dana@acme.com', [])
+    assert len(calls) == gg.ATTENDEE_THREAD_CAP
+
+
+
+def test_focused_thread_long_latest_ending_survives(attendee_thread):
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    messages[-1] = message(8, 'Initial proposal. ' + 'x'*12000 + ' Final correction: do not meet on Friday.')
+    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    text = rows[0]['thread_context']
+    assert 'Initial proposal.' in text
+    assert 'Final correction: do not meet on Friday.' in text
+    assert '[message middle omitted]' in text and 'partial' in text
+
+
+
+def test_focused_thread_context_has_one_run_budget_across_fifteen_attendees(tmp_path, monkeypatch):
+    import base64
+    import datetime
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda _: True)
+    now = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp()*1000)-1000)
+    class Service:
+        def users(self): return self
+        def threads(self): return self
+        def get(self, **kwargs): self.tid=kwargs['id']; return self
+        def execute(self):
+            return {'id': self.tid, 'messages': [{'id': f'm{i}', 'threadId': self.tid,
+                'internalDate': now, 'labelIds': ['INBOX'], 'payload': {'mimeType': 'text/plain',
+                'headers': [{'name': 'From', 'value': 'Person <person@example.test>'}],
+                'body': {'data': base64.urlsafe_b64encode((f'opening{i} '+'x'*12000+f' ending{i}').encode()).decode()}}}
+                for i in range(10)]}
+        def close(self): pass
+    monkeypatch.setattr(gg, '_gmail_service', Service)
+    monkeypatch.setattr(gg, '_run', lambda *a, **k: [{'id': 'a', 'threadId': 'one'}, {'id': 'b', 'threadId': 'two'}])
+    path=tmp_path/'attendees.json';path.write_text(json.dumps([{'email': f'person{i}@example.test'} for i in range(15)]))
+    result = gg.gather_attendee_comms('fake', str(path), expand_threads=True)
+    assert len(result) == 15
+    assert sum(len(row.get('thread_context', '')) for rows in result.values() for row in rows) <= gg.ATTENDEE_THREADS_TOTAL_CHARS
+    for rows in result.values():
+        for row in rows:
+            assert 'opening0' in row['thread_context'] and 'ending9' in row['thread_context']
+            assert 'partial' in row['thread_context']
+
+
+
+def test_partial_thread_inventory_does_not_discard_current_search_snippets(attendee_thread):
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    response['messages'] = messages[:1]
+    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    assert len(rows) == len(search)
+    assert {row['message_id'] for row in rows} == {row['id'] for row in search}
+    assert 'partial' in rows[0]['thread_context']
+    assert 'Happy to connect you both' in rows[0]['thread_context']
+    assert rows[-1]['snippet'] == search[-1]['snippet']
+
+
+def test_brief_reads_one_exact_thread_for_current_messages_and_keeps_background_separate(attendee_thread, monkeypatch):
+    import compose_brief as compose
+    import render_local
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    opening = message(0, 'Loved your article.')
+    proposal = message(1, 'How about 11 am at the park on October 21?', 'Owner <owner@example.com>')
+    proposal['labelIds'] = ['SENT']
+    correction = message(7, 'Can we do 12:30 instead on that day?')
+    latest = message(8, 'My earlier meeting that day was cancelled. 11 am works again.')
+    draft = {**message(9, 'Unsent proposal: October 30.'), 'labelIds': ['DRAFT']}
+    response['messages'] = [opening, proposal, correction, latest, draft]
+    monkeypatch.setattr(gg, '_token_path', lambda: 'connected')
+    monkeypatch.setattr(gg, '_run', lambda *a, **k: [
+        {'id': m['id'], 'threadId': 'thread-1', 'labelIds': ['INBOX'], 'snippet': 'Thin excerpt'}
+        for m in (latest, correction)])
+    rows = gg.gather_gmail('fake', 2, 2, attachments=False)
+    assert calls == [{'userId': 'me', 'id': 'thread-1', 'format': 'full'}]
+    assert rows[0]['id'] == latest['id']
+    assert rows[0]['body'] == 'My earlier meeting that day was cancelled. 11 am works again.'
+    assert 'October 21' not in rows[0]['body']  # older evidence must not inherit the latest message ID
+    assert sum(bool(row.get('thread_context')) for row in rows) == 1
+    assert 'October 21' in rows[0]['thread_context'] and 'owner sent' in rows[0]['thread_context']
+    assert 'October 30' not in rows[0]['thread_context']
+    rendered = render_local._format_emails([render_local._trim_email(row) for row in rows])
+    assert 'October 21' in rendered and "not part of the current MessageId's body" in rendered
+    manifest = compose.build_data_manifest({'google': {'emails': rows}})
+    assert 'October 21' in json.dumps(manifest) and 'October 30' not in json.dumps(manifest)
+
+
+@pytest.mark.parametrize('case', ['wrong_thread', 'missing_target', 'revoked', 'quota'])
+def test_brief_thread_failure_does_not_retry_or_leak_background(attendee_thread, monkeypatch, case):
+    import threading
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    if case == 'wrong_thread':
+        response['id'] = 'other-thread'
+    elif case == 'missing_target':
+        response['messages'] = messages[:-1]
+    elif case == 'quota':
+        error = RuntimeError('private provider text')
+        error.resp = type('Response', (), {'status': 429})()
+        fail.append(error)
+    else:
+        original = gg._gmail_service
+        def service():
+            client = original(); execute = client.execute
+            def revoke():
+                value = execute(); grants.clear(); return value
+            client.execute = revoke
+            return client
+        monkeypatch.setattr(gg, '_gmail_service', service)
+    stop = threading.Event()
+    assert gg._fetch_thread_bodies('thread-1', ['m8'], stop) == {}
+    assert len(calls) == 1
+    assert stop.is_set() is (case == 'quota')
+
+
+def test_brief_background_retains_middle_agreement_without_repeating_current_messages(attendee_thread, monkeypatch):
+    response, messages, search, calls, grants, fail, message = attendee_thread
+    response['messages'] = [message(i, f'Historical message {i}.') for i in range(8)]
+    response['messages'][3] = message(3, 'Coffee is October 21 at 11 AM.', 'Owner <owner@example.com>')
+    response['messages'][3]['labelIds'] = ['SENT']
+    response['messages'][-1] = message(7, 'The earlier conflict cleared; that time works.')
+    monkeypatch.setattr(gg, '_token_path', lambda: 'connected')
+    # Use the fixture's actual opaque message ID rather than inventing a selector.
+    current = response['messages'][-1]
+    monkeypatch.setattr(gg, '_run', lambda *a, **k: [
+        {'id': current['id'], 'threadId': 'thread-1', 'labelIds': ['INBOX'], 'snippet': 'Thin excerpt'}])
+    rows = gg.gather_gmail('fake', 2, 2, attachments=False)
+    assert len(calls) == 1
+    assert 'October 21 at 11 AM' in rows[0]['thread_context']
+    assert 'The earlier conflict cleared' not in rows[0]['thread_context']
+    assert 'The earlier conflict cleared' in rows[0]['body']
+    assert len(rows[0]['thread_context']) <= gg.BRIEF_THREAD_CHARS
+
+
+def test_sent_body_cohort_preserves_native_bcc(monkeypatch):
+    import base64
+    from gmail_read import message_fields
+    raw = {'id': 's1', 'threadId': 't1', 'labelIds': ['SENT'], 'internalDate': '1780000000000',
+           'payload': {'mimeType': 'text/plain', 'headers': [
+               {'name': 'From', 'value': 'owner@example.test'},
+               {'name': 'To', 'value': 'recipient@example.test'},
+               {'name': 'Bcc', 'value': 'introducer@example.test'}],
+               'body': {'data': base64.urlsafe_b64encode(b'Thanks for the introduction.').decode()}}}
+    calls = []
+    def read(_api, args, timeout=60):
+        calls.append(args)
+        return [_sent_row('s1')] if args[:2] == ['gmail', 'search'] else message_fields(raw)
+    monkeypatch.setattr(gg, '_token_path', lambda: None)
+    monkeypatch.setattr(gg, '_run', read)
+    rows = gg.gather_sent('fixture-api', max_n=1, bodies=1)
+    assert ['gmail', 'get', 's1'] in calls
+    assert rows[0]['bcc'] == 'introducer@example.test'
+    assert rows[0]['isSent'] is True
+    assert rows[0]['body'] == 'Thanks for the introduction.'

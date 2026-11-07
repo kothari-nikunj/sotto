@@ -8,7 +8,7 @@ tenant monetization/allowance code is separate and unchanged.
 
 `procedure_runner.py` gathers and admits proactive candidates, then calls
 `_shared/scripts/compose_notification.py` directly. The receiver uses that same composer for event
-bundles. These paths have no Hermes process, tool-discovery loop, delegate, or model fallback
+bundles. These paths have no chat-engine turn, tool-discovery loop, delegate, or model fallback
 ladder. Quiet/empty scans make no composition calls. Intentions and handoff
 questions use deterministic text. A meeting reminder's identity, countdown and offer are
 deterministic; one or two sentences (60 words / 500 characters) of grounded context come from the
@@ -29,8 +29,8 @@ executable action, or introduce candidate IDs. The writer has a 48,000-character
 models. Oversized or invalid work stays undelivered for existing retry/brief coverage.
 
 Context reads are fixed: live open items, matching person facts, writing style, and calendar only
-when required. The current Google gatherer reads only the primary calendar. Even a complete primary
-read cannot establish availability: scheduling stays a grounded question with no acceptance draft.
+when required. The Google gatherer reads the selected readable calendars and reports partial failures.
+A selected subset or failed inventory cannot establish all-calendar availability: scheduling stays a grounded question with no acceptance draft.
 The slot calculator requires explicit all-calendar coverage before offering times, plus an explicit
 day and duration within the covered interval. Unknown constraints remain an open question.
 Calendar-dependent text retains the existing permission and freshness checks. Post-meeting events
@@ -71,10 +71,10 @@ held, never as passed: a quality stage may not cost the user the day's brief.
 | `digest` | 2 | 4,096 | low |
 | `memory_extract` | 2 | 16,384 | low |
 | `memory_curate` | 2 | 8,192 | low |
-| `brief` | 12 | 65,536 | unchanged |
-| `brief_extract` | 6 | 65,536 | unchanged |
-| `brief_critic` | 3 | 65,536 | unchanged |
-| `brief_revise` | 3 | 65,536 | unchanged |
+| `brief` | 12 | 65,536 | low |
+| `brief_extract` | 6 | 65,536 | low |
+| `brief_critic` | 3 | 65,536 | low |
+| `brief_revise` | 3 | 65,536 | low |
 | `followup` | 3 | 8,192 | low |
 | `meeting_prep` | 3 | 65,536 | unchanged |
 | `research` | 4 | 8,192 | low |
@@ -82,19 +82,22 @@ held, never as passed: a quality stage may not cost the user the day's brief.
 | `web_fetch` | 2 | 8,192 | unchanged |
 | `deck_read` | 2 | 32,768 | unchanged |
 
+Gemini 3.8 Flash uses the existing **65,536-token combined thinking and answer ceiling** for every brief stage, with `thinkingLevel: low`. Visible brief size alone cannot set a safe ceiling: a recorded revision used 1,623 visible tokens plus 59,607 thinking tokens. That historical receipt does not establish usage under the current low-thinking setting. A truncated extraction uses its existing second semantic attempt immediately with identical source context, without a queue delay or another gathering pass. Safety refusals are not retried as truncation. The receiver retains its 600-second composition subprocess timeout; token headroom does not guarantee completion before that deadline.
+
 The `brief` row is the parent envelope: extraction owns six requests (two semantic extraction
 attempts, each with the existing three-request provider ladder), critic owns three and revision owns
 three. These stages cannot consume each other's allowance. Follow-up allows three calls so its
 primary, one transient retry and same-family fallback ladder is reachable; the optional evening
-follow-up uses that separate child allowance. Core brief output retains the proxy's previous 65,536-token
-ceiling and provider-default thinking. OpenAI-compatible and Anthropic output parameters retain
-their pre-change behavior; these native Gemini ceilings do not silently alter those providers.
-Meeting prep, grounded web search/fetch, and deck reading now use the same durable operation ledger.
-Each invocation retains its existing model and thinking behavior; successful grounded research still
-persists facts through its existing path. A retry is a new attempt under the same operation identity,
-while a fresh delivery run receives a fresh identity. Repeated identical URL/search work in one run
-reuses its complete in-memory result within the same data root; failures are never cached. A fixed
-set of process locks makes concurrent identical requests share that result instead of paying twice.
+follow-up uses that separate child allowance. The full source context, structured output, critic and
+closure-review checks remain unchanged; low thinking is a latency preference, not a hard token or
+time limit. OpenAI-compatible and Anthropic output parameters retain their pre-change behavior;
+these native Gemini ceilings do not silently alter those providers. Meeting prep, grounded web
+search/fetch, and deck reading now use the same durable operation ledger. Each invocation retains
+its existing model and thinking behavior; successful grounded research still persists facts through
+its existing path. A retry is a new attempt under the same operation identity, while a fresh
+delivery run receives a fresh identity. Repeated identical URL/search work in one run reuses its
+complete in-memory result within the same data root; failures are never cached. A fixed set of
+process locks makes concurrent identical requests share that result instead of paying twice.
 Low-thinking overrides are limited to tested request contracts; a priced model is not automatically
 considered compatible.
 
@@ -109,22 +112,36 @@ Attempt receipts contain opaque IDs, request-shape hashes, component sizes and n
 prompts. Model-work receipts retain **90 days**. An unknown worker claim has a **900-second** lease,
 with at most **2** interruption replacements per operation. Artifact families use **256** lock
 shards. Notification context is capped at **48,000 characters**, including instructions and schema.
-The database prunes when opened. Validated notification/triage/research artifacts contain private
-output, live in the tenant volume with mode 0600, expire through the existing seven-day retention
-sweep, and are removed by `forget.py --caches`. There are at most 256 content-free lock files per
-artifact family.
+The database prunes on open at most once an hour per process. Validated notification/triage/research
+artifacts contain private output, live in the tenant volume with mode 0600, expire through the
+existing seven-day retention sweep, and are removed by `forget.py --caches`. There are at most 256
+content-free lock files per lock kind; research artifacts have five kinds plus one DocSend lock, at
+most 1,281 in all.
 
 ## Accounting and reports
 
 `usage_accounting.py` is canonical in the shared library; `tools/sync-usage.py` packages an
 identical copy into the independently built model proxy. Verification rejects drift. Native Gemini
-output is candidates plus thoughts; compatible-chat completion totals already include reasoning.
+output is candidates plus thoughts. Google's OpenAI-compatible `completion_tokens` excludes thinking;
+the proxy uses a validated `total_tokens - prompt_tokens` receipt for future text-chat settlement and
+keeps older rows or incomplete receipts held. The provider-specific normalizer preserves these
+reported counts without changing the generic adapter's assumptions.
 Cached input is priced separately. Chat responses missing cache details retain an unknown exact cost
 but also show token-cost lower/upper bounds (all input cached versus uncached); never label the
 upper bound an invoice amount. Native blocked responses with a usable total retain their billed
 usage. Missing usage, unknown prices and expired introductory prices produce unknown cost, never
 zero. Estimates exclude paid search/image/audio categories and other provider fees. The proxy's
 allowance is not used as an invoice estimate.
+
+For an explicitly authorized temporary cap increase, record the original `budget_cents`,
+`budget_period`, `budget_started_at`, and cumulative allowance used in that period before changing
+the cap. Restore the original configured cap afterward without deleting call rows or changing the
+period start. Usage incurred under the temporary cap remains counted: if cumulative usage plus
+the next 200-cent reservation exceeds the restored cap, admission remains exhausted. Report that
+state accurately; restoring a cap does not restore spendable allowance. A lifetime budget does
+not reset by waiting; a calendar-month budget follows its existing UTC month boundary. Any further
+increase needs its own explicit authorization. These are configuration steps for the authorized
+operator, not a reason to reset accounting or treat held reservations as proven provider charges.
 
 Proxy metadata records application and caller deployment from trusted tenant configuration (optional
 `application` and `deployment` fields), the separate proxy deployment, authenticated tenant/owner,
@@ -187,16 +204,12 @@ unreviewed overflow; the queue and accepted-item IDs retain the remainder. Activ
 six-minute lease for crash recovery. Startup preserves active leases because another process may
 still own an in-flight call. An ambiguous provider call keeps its metering reservation.
 
-Managed chat uses the pinned Hermes compressor with a 120,000-token threshold cap, proactive
-tool-result pruning at 48,000 tokens, a lean tail retaining at least two user messages, and
-abort-on-summary-failure enabled. Hermes owns the structured summary and original session archive;
-the gateway does not rewrite transcripts itself. Archived detail remains available through the
-pinned session retrieval tools. These settings reduce repeated tool payloads, but do not guarantee
-a hard request-token ceiling or a particular savings percentage. Protected recent messages,
-compression cooldowns and a failed summary can still leave a large request. A generated summary
-can omit a useful detail; retained original rows and retrieval are the recovery path. This does
-not replace quality checks on real conversations. Self-host owners'
-independent Hermes configuration is not rewritten by managed reconciliation.
+Chat history is the Node runtime's Mastra conversation memory (`runtime/sotto-chat/src/agent/runtime.ts`):
+each turn sees the last 20 messages (`lastMessages: 20`, no token limiter), with semantic recall,
+working memory and observational memory off, and completed tool traces are reduced to their text
+before they are stored. No summarizer runs over the history; the receiver rotates sessions nightly
+and `/new` rotates on request. This bounds repeated tool payloads, but it is not a hard
+request-token ceiling: instructions, skills and the current turn's tool results also count.
 
 ## Deployment ownership and rollout
 

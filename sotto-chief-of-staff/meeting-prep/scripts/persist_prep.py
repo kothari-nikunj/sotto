@@ -10,12 +10,13 @@ Two jobs, both deterministic:
      facts applied through knowledge_update.apply() (dedupe/bump/supersede + decay all included).
      Three kinds, all labeled source="web_research" (they came from grounded search, NOT from the
      brief's email/message extraction):
-       • the profile bio (title/company/summary) — LOW confidence (0.55) that decays
+       • the profile bio (title/company/summary) — LOW confidence (0.55) that decays; a later run
+         whose bio reads differently supersedes it, the same words corroborate it
        • recent_activity items (Pass B) — dated + source-URLed, confidence 0.6,
          source_ref = the item's source_url
        • personal items (Pass B) — public texture carrying its own source URL, confidence 0.6
-     Facts are never written as authoritative identity fields; the brief's Learn step promotes
-     them as confirmed.
+     Typed title/company retain their supporting fact id; correcting that fact withdraws the
+     typed projection until the owner supplies structured identity.
 
      WHAT WE LEARNED ABOUT A COMPANY GOES TO THE COMPANY. The same apply() call carries
      `company_updates`, because the focus pass's `company_deep` (what it builds, the founder story,
@@ -53,6 +54,7 @@ Prints JSON either way. Degrades to a no-op (exit 0) on missing/empty inputs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -66,7 +68,8 @@ sys.path.insert(0, os.path.join(_HERE, "..", "..", "_shared", "knowledge"))
 from textutil import _s  # noqa: E402  (the shared string coercion, not a private copy)
 import knowledge as kg  # noqa: E402
 import knowledge_update as ku  # noqa: E402
-import research_attendees as ra  # noqa: E402  (matches_focus — the one focus/keep matching rule)
+from textutil import FREEMAIL_DOMAINS  # noqa: E402
+import research_contract as ra  # noqa: E402
 
 FRESH_DAYS = 30                 # matches the Mac attendee-cache TTL
 RESEARCH_CONFIDENCE = 0.55      # prewarm_graph.py — low-confidence research facts that decay
@@ -74,9 +77,9 @@ RECENT_CONFIDENCE = 0.6         # dated + source-URLed recency-sweep items (Pass
 SOURCE_PREFIX = "meeting-prep-research"
 FACT_SOURCE = "web_research"    # provenance label for ALL research writes (grounded web search —
                                 # NOT knowledge_update's default "brief_extraction" label)
-MAX_RECENT_PERSISTED = 4        # mirror research_attendees.py's post-filter caps, defensively
-MAX_PERSONAL_PERSISTED = 2
-MAX_TRACTION_PERSISTED = 4      # company_deep's own cap (research_attendees.MAX_TRACTION)
+MAX_RECENT_PERSISTED = ra.MAX_RECENT_ACTIVITY
+MAX_PERSONAL_PERSISTED = ra.MAX_PERSONAL
+MAX_TRACTION_PERSISTED = ra.MAX_TRACTION
 
 
 def _find_profile(name: str, email: str):
@@ -136,7 +139,7 @@ def _domain_of(email: str) -> str:
     is what stops "Commenda" and "Commenda Inc." forking two files."""
     email = _s(email).strip().lower()
     dom = email.split("@")[1] if "@" in email else ""
-    return "" if not dom or dom in ra.FREEMAIL_DOMAINS else dom
+    return "" if not dom or dom in FREEMAIL_DOMAINS else dom
 
 
 def _about_from_deep(cd: dict) -> str:
@@ -177,7 +180,7 @@ def _news_from_traction(cd: dict) -> list:
     return out
 
 
-def _company_updates(research: dict, today: str) -> list:
+def company_updates(research: dict, today: str, *, companies_only: bool = False) -> list:
     """The `company_updates` half of the research write: what we learned about ORGANIZATIONS,
     keyed to the company rather than to whichever human we happened to research.
 
@@ -185,14 +188,14 @@ def _company_updates(research: dict, today: str) -> list:
     only ever written when it is an UPGRADE on what is on file — a deep dive beats a sweep
     one-liner, and a `user_edit` About beats everything."""
     by_key: dict = {}
-    for a in (research or {}).get("attendees", []):
+    for a in (research or {}).get("companies" if companies_only else "attendees", []):
         if not isinstance(a, dict):
             continue
         cd = a.get("company_deep") if isinstance(a.get("company_deep"), dict) else {}
         name = _s(cd.get("company")).strip() or _s(a.get("company")).strip()
         if not name:
             continue    # no company identified — nothing to key a file by, and none is invented
-        domain = _domain_of(a.get("email"))
+        domain = ra.company_domain(_s(a.get("domain"))) if companies_only else _domain_of(a.get("email"))
         key = kg.company_slug(name) or domain
         if not key:
             continue
@@ -229,7 +232,48 @@ def _company_updates(research: dict, today: str) -> list:
     return out
 
 
-def persist(research: dict, attendees_in: list | None = None, now: datetime | None = None) -> dict:
+def research_bio(a: dict) -> str:
+    """The attendee's ONE combined "Per web search: <title> at <company> — <summary>" bio, or "".
+    One fact, because the shared prefix would make separate title/summary facts dedupe-collide
+    inside knowledge_update; prewarm_graph writes the same bio through here. The sentinel summary
+    is a research MISS, and company_summary describes the employer: it seeds the company's About
+    in company_updates, so it never resurfaces in a later prep as something about this person."""
+    bits = []
+    title, company = _s(a.get("title")).strip(), _s(a.get("company")).strip()
+    if title or company:
+        bits.append(" at ".join(x for x in (title, company) if x))
+    summary = _profile_summary(a)
+    if summary:
+        bits.append(summary)
+    return "Per web search: " + " — ".join(bits) if bits else ""
+
+
+def _profile_summary(a: dict) -> str:
+    summary = _s(a.get("summary")).strip()
+    return "" if summary.lower() == "no public profile found." else summary
+
+
+def _replaces_earlier_bio(name: str, email: str, bio: str) -> bool:
+    """True when `bio` would BUMP an earlier research bio that reads differently. A bump keeps the
+    old words and strengthens them — including the company summary earlier runs folded in — so
+    the new bio replaces it through knowledge_update's correction path instead. Same words still
+    corroborate."""
+    path = _find_profile(name, email)
+    if not path:
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            facts = kg.parse_person_file(f.read()).facts
+    except Exception:  # noqa: BLE001 — an unreadable profile just keeps the plain bump
+        return False
+    action, fid = kg.find_similar_fact(facts, bio, "context", False)
+    old = facts[fid] if action == kg.BUMP else None
+    return bool(old and old.source == FACT_SOURCE and old.type == "context"
+                and old.text.startswith("Per web search: ") and old.text != bio)
+
+
+def persist(research: dict, attendees_in: list | None = None, now: datetime | None = None,
+            *, previous_receipt: dict | None = None) -> dict:
     """Write the research output's grounded bits into the graph via knowledge_update. Attendees with
     NO grounded content (no title/company/summary) are skipped entirely — nothing is invented."""
     now = now or datetime.now(timezone.utc)
@@ -248,24 +292,18 @@ def persist(research: dict, attendees_in: list | None = None, now: datetime | No
             or (email.split("@")[0] if email else "")
         if not name and not email:
             continue
-        # Grounded bits ONLY — from the research output, clearly sourced (prewarm_graph pattern).
-        # ONE combined bio fact per attendee: the shared "Per web search" prefix would otherwise
-        # make separate title/summary facts dedupe-collide inside knowledge_update.
+        # Grounded bits ONLY — from the research output, clearly sourced.
         facts = []
-        bits = []
         title, company = _s(a.get("title")).strip(), _s(a.get("company")).strip()
-        if title or company:
-            bits.append(" at ".join(x for x in (title, company) if x))
-        summary = _s(a.get("summary")).strip()
-        if summary and summary.lower() != "no public profile found.":
-            bits.append(summary)   # the sentinel is a research MISS, not a fact about the person
-        company_summary = _s(a.get("company_summary")).strip()
-        if company_summary:        # person → company fallback: the company profile still persists
-            bits.append(company_summary)
-        if bits:
-            facts.append({"fact": "Per web search: " + " — ".join(bits),
-                          "confidence": RESEARCH_CONFIDENCE, "memory_type": "context",
-                          "source": FACT_SOURCE, "source_ref": f"{SOURCE_PREFIX}:{today}"})
+        bio = research_bio(a)
+        if bio:
+            fact = {"fact": bio, "confidence": RESEARCH_CONFIDENCE, "memory_type": "context",
+                    "source": FACT_SOURCE, "source_ref": f"{SOURCE_PREFIX}:{today}"}
+            # Only a run that found the person retires the earlier bio; a miss must not thin it
+            # down to "title at company".
+            if _profile_summary(a) and _replaces_earlier_bio(name, email, bio):
+                fact["change_type"] = "correction"
+            facts.append(fact)
         # Recency-sweep items (Pass B) — persisted ONLY when dated + source-URLed (the research
         # script post-filters, but re-check here: this is the graph's last line of defense).
         # source_ref = the actual page, so every graph fact can be traced to its source.
@@ -303,28 +341,96 @@ def persist(research: dict, attendees_in: list | None = None, now: datetime | No
         # typed pair; without this, a fully-researched person still looked blank there.
         if title or company:
             update["profile_patch"] = {k: v for k, v in (("title", title), ("company", company)) if v}
+            update["profile_support_fact_index"] = 0
         updates.append(update)
 
+    return _persist_updates(research, today, updates, previous_receipt=previous_receipt)
+
+
+def _persist_updates(research: dict, today: str, updates: list, *, companies_only=False,
+                     previous_receipt: dict | None = None) -> dict:
+    digest = hashlib.sha256(json.dumps({'research': research,
+        'people': [(u['person_name'], u.get('identifier', '')) for u in updates]},
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    out = {"persisted": 0, "people": [], "companies": [], "complete": True,
+           "input_digest": digest, "outcomes": {"people": [], "companies": []}}
+    errors = []
+    previous = ((previous_receipt or {}).get('outcomes', {})
+                if (previous_receipt or {}).get('input_digest') == digest else {})
+    prior_companies = {item.get('name'): item for item in previous.get('companies', [])
+                       if item.get('status') == 'applied'}
+    prior_people = {(item.get('identifier') or item.get('name')): item
+                    for item in previous.get('people', [])
+                    if item.get('fresh') or (item.get('status') == 'rejected'
+                        and not all(ku.fact_establishes_research_coverage(outcome)
+                                    for outcome in item.get('fact_outcomes', {}).get('items', [])))}
     try:
-        companies = _company_updates(research, today)
-    except Exception:  # noqa: BLE001 — reading the company graph must never cost the person writes
+        companies = company_updates(research, today, companies_only=companies_only)
+    except Exception as error:
         companies = []
-    out = {"persisted": len(updates), "people": [u["person_name"] for u in updates],
-           "companies": [c["company_name"] for c in companies]}
-    if not (updates or companies):
-        return out
-    try:
-        # ONE apply() for the whole research run: people and companies land together, so a person
-        # and their employer can never disagree about when they were last researched, and the run
-        # can't half-write.
-        ku.apply({"person_updates": updates, "company_updates": companies})
-    except Exception as e:  # noqa: BLE001
-        # FAIL TOWARD SILENCE (CLAUDE.md): persistence is memory, not the deliverable. An
-        # unwritable volume loses one run's learning; it must never cost the prep or the brief the
-        # research was gathered for. Said out loud in the output, never swallowed.
-        out.update({"persisted": 0, "people": [], "companies": [],
-                    "error": f"{type(e).__name__}: {str(e)[:200]}"})
+        errors.append(f"{type(error).__name__}: {str(error)[:200]}")
+        out['outcomes']['companies'].append({'status': 'failed', 'error': errors[-1]})
+    for company in companies:
+        item = {'name': company['company_name']}
+        if company['company_name'] in prior_companies:
+            out['companies'].append(company['company_name'])
+            out['outcomes']['companies'].append(prior_companies[company['company_name']])
+            continue
+        try:
+            result = ku.apply({'person_updates': [], 'company_updates': [company]})
+            item.update(status='applied' if result['company_files'] else 'rejected')
+            if result['company_files']:
+                out['companies'].append(company['company_name'])
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {str(error)[:200]}")
+            item.update(status='failed', error=errors[-1])
+        out['outcomes']['companies'].append(item)
+    for update in updates:
+        if errors:
+            update.pop('last_researched', None)
+        item = {'name': update['person_name'], 'identifier': update.get('identifier', '')}
+        prior = prior_people.get(update.get('identifier') or update['person_name'])
+        if prior:
+            out['outcomes']['people'].append(prior)
+            if prior['status'] == 'applied':
+                out['persisted'] += 1
+                out['people'].append(update['person_name'])
+            continue
+        try:
+            result = ku.apply({'person_updates': [update], 'company_updates': []})
+            facts = result['fact_outcomes']
+            accepted = any(key in ku.ACCEPTED_FACT_DISPOSITIONS and count
+                           for key, count in facts['counts'].items())
+            item.update(status='applied' if accepted else 'rejected', fact_outcomes=facts,
+                        fresh=bool(update.get('last_researched') and facts['total'] and not facts['truncated']
+                                   and all(ku.fact_establishes_research_coverage(outcome)
+                                           for outcome in facts['items'])))
+            if accepted:
+                out['persisted'] += 1
+                out['people'].append(update['person_name'])
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {str(error)[:200]}")
+            item.update(status='failed', error=errors[-1])
+        out['outcomes']['people'].append(item)
+    if errors:
+        out.update(complete=False, error='; '.join(errors)[:600])
     return out
+
+
+def persist_company(research: dict, now: datetime | None = None, *,
+                    previous_receipt: dict | None = None) -> dict:
+    """Persist only original grounded company fields; never generate a person update."""
+    out = {"persisted": 0, "people": [], "companies": []}
+    rows = research.get("companies", []) if isinstance(research, dict) else []
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return out
+    filtered = ra.postfilter_company(rows[0])
+    if not filtered or not _s(filtered["company_deep"].get("company")).strip():
+        return out
+    row = {**filtered, "domain": ra.company_domain(_s(rows[0].get("domain")))}
+    return _persist_updates({"companies": [row]},
+                            (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
+                            [], companies_only=True, previous_receipt=previous_receipt)
 
 
 def _load(path):
@@ -338,6 +444,8 @@ def _load(path):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--company-only", action="store_true", help="persist companies only, never people")
+    ap.add_argument("--previous-receipt", help="receipt for retrying the same retained research")
     ap.add_argument("--research", help="research_attendees.py output ({attendees:[…]})")
     ap.add_argument("--attendees", help="select_attendees.py output (email → name mapping)")
     ap.add_argument("--filter-fresh", dest="filter_fresh",
@@ -347,6 +455,8 @@ def main():
                          "email) — the focused person, whose deep dive freshness must not block")
     a = ap.parse_args()
 
+    if a.company_only and (a.attendees or a.filter_fresh or a.keep):
+        ap.error("--company-only cannot be combined with person selection")
     if a.filter_fresh:
         data = _load(a.filter_fresh)
         attendees = data if isinstance(data, list) else []
@@ -360,10 +470,15 @@ def main():
     research = _load(a.research) if a.research else None
     if not isinstance(research, dict):
         research = {"attendees": research} if isinstance(research, list) else {"attendees": []}
+    if a.company_only:
+        print(json.dumps(persist_company(research, previous_receipt=_load(a.previous_receipt)
+                                         if a.previous_receipt else None)))
+        return
     attendees_in = _load(a.attendees) if a.attendees else None
     if not isinstance(attendees_in, list):
         attendees_in = []
-    print(json.dumps(persist(research, attendees_in)))
+    print(json.dumps(persist(research, attendees_in, previous_receipt=_load(a.previous_receipt)
+                             if a.previous_receipt else None)))
 
 
 if __name__ == "__main__":

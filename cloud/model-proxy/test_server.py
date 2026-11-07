@@ -1,9 +1,13 @@
 import concurrent.futures
+import calendar
 import hashlib
+import http.client
 import io
 import json
+import math
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -81,6 +85,43 @@ def test_expired_credential_rejected(proxy):
     http,calls=proxy
     http.tenants[0]['expires_at']=0
     assert post(http)[0]==401 and not calls
+
+
+@pytest.mark.parametrize('method', ['POST', 'GET'])
+@pytest.mark.parametrize('credential', ['valid', 'expired', 'disabled', 'unknown'])
+def test_authentication_reads_expiry_only_for_matching_enabled_tenant(proxy, monkeypatch, method, credential):
+    http, calls = proxy
+    matching = http.tenants[0]
+    http.tenants[:0] = [
+        {'id': f'unrelated-{index}',
+         'token_sha256': hashlib.sha256(f'unrelated-token-{index}'.encode()).hexdigest(),
+         'budget_cents': 200, 'enabled': True, 'expires_at': time.time() + 3600}
+        for index in range(100)
+    ]
+    if credential == 'expired':
+        matching['expires_at'] = 0
+    elif credential == 'disabled':
+        matching['enabled'] = False
+    token = 'unknown-token' if credential == 'unknown' else 'a-token'
+    expiry = http.ledger.expiry
+    checked = []
+
+    def record_expiry(tenant):
+        checked.append(tenant['id'])
+        return expiry(tenant)
+
+    monkeypatch.setattr(http.ledger, 'expiry', record_expiry)
+    if method == 'POST':
+        status, _ = post(http, token=token)
+    else:
+        status, _ = get(http, '/v1/capabilities/background-budget', token=token)
+
+    accepted = credential == 'valid'
+    assert status == (200 if accepted else 401)
+    assert checked == (['a'] if credential in ('valid', 'expired') else [])
+    assert len(calls) == (1 if accepted and method == 'POST' else 0)
+    with http.ledger.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM calls').fetchone()[0] == len(calls)
 
 
 def test_credential_expiring_during_body_read_is_rejected_before_reservation(tmp_path):
@@ -199,6 +240,54 @@ def test_chat_uses_separate_fixed_surface(proxy):
     assert calls[0].get_header('Authorization')=='Bearer upstream-only'
 
 
+def test_chat_joins_only_contiguous_leading_system_text_before_upstream(proxy):
+    http, calls = proxy
+    messages = [
+        {'role': 'system', 'content': 'Owner voice rule.'},
+        {'role': 'system', 'content': 'Skill index and boundaries.'},
+        {'role': 'system', 'content': 'Current context is unavailable.'},
+        {'role': 'user', 'content': 'Just the wording.'},
+        {'role': 'assistant', 'content': 'A draft.'},
+        {'role': 'system', 'content': 'Later system content is not leading.'},
+    ]
+    tools = [{'type': 'function', 'function': {
+        'name': 'skill', 'description': 'Activate a skill',
+        'parameters': {'type': 'object', 'properties': {}}}}]
+    body = {'model': 'gemini-3.8-flash', 'messages': messages,
+            'tools': tools, 'tool_choice': 'auto'}
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 200
+    upstream = json.loads(calls[0].data)
+    assert upstream == {**body, 'messages': [
+        {'role': 'system', 'content': 'Owner voice rule.\n\nSkill index and boundaries.\n\nCurrent context is unavailable.'},
+        *messages[3:],
+    ]}
+    assert body['messages'] == messages
+
+
+def test_chat_one_leading_system_message_is_unchanged(proxy):
+    http, calls = proxy
+    body = {'model': 'gemini-3.8-flash', 'messages': [
+        {'role': 'system', 'content': 'Owner voice rule.'},
+        {'role': 'user', 'content': 'Just the wording.'},
+    ]}
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 200
+    assert json.loads(calls[0].data) == body
+
+
+@pytest.mark.parametrize('leading', [
+    [{'role': 'system', 'content': 'Voice'}, {'role': 'system', 'content': None}],
+    [{'role': 'system', 'content': 'Voice'}, {'role': 'system', 'content': [{'type': 'text', 'text': 'More'}]}],
+    [{'role': 'system', 'content': 'Voice'}, {'role': 'system', 'content': 'More', 'name': 'other'}],
+])
+def test_chat_rejects_ambiguous_leading_system_merge_before_contact(proxy, leading):
+    http, calls = proxy
+    body = {'model': 'gemini-3.8-flash', 'messages': [*leading, {'role': 'user', 'content': 'Hello'}]}
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 400
+    assert calls == []
+    with http.ledger.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM calls').fetchone()[0] == 0
+
+
 def test_shared_cache_and_multiple_candidates_cannot_bypass_tenant_budget(proxy):
     http, calls = proxy
     assert post(http, body={'cachedContent': 'cachedContents/foreign-tenant'})[0] == 400
@@ -216,8 +305,136 @@ def test_native_thinking_tokens_are_included_in_output_usage(tmp_path):
         assert db.execute('SELECT input_tokens,output_tokens FROM calls').fetchone() == (10, 25)
 
 
+@pytest.mark.parametrize('model', sorted(server.MODELS))
+def test_complete_native_receipt_uses_model_tariff_and_all_prompt_tokens(model):
+    usage = {'promptTokenCount': 20000, 'cachedContentTokenCount': 19000,
+             'candidatesTokenCount': 500, 'thoughtsTokenCount': 500,
+             'totalTokenCount': 21000, 'serviceTier': 'standard',
+             'promptTokensDetails': [{'modality': 'TEXT', 'tokenCount': 20000}]}
+    allowance = server.native_receipt_allowance(model, server.PRICING_START + 1, 200, usage)
+    rates = server.PRICES[model]
+    assert allowance == min(200, math.ceil(100 * (20000 * rates[0] + 1000 * rates[2]) / 1_000_000))
+    assert allowance < 200
+    without_thoughts = {key: value for key, value in usage.items() if key != 'thoughtsTokenCount'}
+    assert server.native_receipt_allowance(model, server.PRICING_START + 1, 200, without_thoughts) == allowance
+
+
+@pytest.mark.parametrize('change', [
+    {'promptTokenCount': None}, {'promptTokenCount': True}, {'promptTokenCount': -1},
+    {'promptTokenCount': 1048577}, {'candidatesTokenCount': None},
+    {'candidatesTokenCount': False}, {'candidatesTokenCount': -1},
+    {'candidatesTokenCount': server.MAX_OUTPUT + 1}, {'totalTokenCount': None},
+    {'totalTokenCount': 999}, {'totalTokenCount': 1001},
+    {'totalTokenCount': 1000 + server.MAX_OUTPUT + 1},
+    {'thoughtsTokenCount': -1}, {'thoughtsTokenCount': True},
+    {'thoughtsTokenCount': 2}, {'cachedContentTokenCount': 1001},
+    {'cachedContentTokenCount': False}, {'serviceTier': 'priority'},
+    {'groundingTokenCount': 1}, {'toolUsePromptTokenCount': 1},
+    {'toolUsePromptTokensDetails': []},
+    {'promptTokensDetails': [{'modality': 'AUDIO', 'tokenCount': 1}]},
+    {'candidatesTokensDetails': [{'modality': 'TEXT', 'tokenCount': True}]},
+    {'cacheTokensDetails': [{'modality': 'TEXT', 'tokenCount': -1}]},
+])
+def test_native_receipt_rejects_missing_inconsistent_or_unpriced_usage(change):
+    usage = {'promptTokenCount': 1000, 'candidatesTokenCount': 10,
+             'thoughtsTokenCount': 10, 'totalTokenCount': 1020}
+    usage.update(change)
+    assert server.native_receipt_allowance('gemini-3.8-flash', server.PRICING_START + 1, 200, usage) is None
+
+
+def test_native_receipt_respects_tariff_and_status_bounds():
+    usage = {'promptTokenCount': 1000, 'candidatesTokenCount': 10, 'totalTokenCount': 1020}
+    assert server.native_receipt_allowance('gemini-3.8-flash', server.PRICING_START - 1, 200, usage) is None
+    assert server.native_receipt_allowance('gemini-3.8-flash', server.PRICING_END, 200, usage) is None
+    assert server.native_receipt_allowance('gemini-3.8-flash', server.PRICING_START + 1, 502, usage) is None
+    assert server.native_receipt_allowance('unknown', server.PRICING_START + 1, 200, usage) is None
+
+
+def test_native_receipt_settles_prospectively_and_monthly_rollover_uses_admission_time(tmp_path, monkeypatch):
+    def utc(year, month, day):
+        return calendar.timegm((year, month, day, 0, 0, 0))
+    now = [utc(2026, 10, 31) + 86390]
+    monkeypatch.setattr(server, 'time', types.SimpleNamespace(time=lambda: now[0], gmtime=time.gmtime))
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    policy = {'budget_period': 'calendar_month', 'budget_started_at': utc(2026, 10, 15)}
+    usage = {'promptTokenCount': 1000, 'candidatesTokenCount': 10, 'totalTokenCount': 1020}
+    call = ledger.reserve('a', 200, 'native', 'gemini-3.5-flash-lite', **policy)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 0
+    now[0] = utc(2026, 11, 1)
+    ledger.finish(call, 200, usage, proven_native_text=True,
+                  native_text_request_eligible=True, native_text_response_eligible=True)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 200
+    with ledger.connect() as db:
+        allowance, output_tokens, usage_json = db.execute(
+            'SELECT allowance,output_tokens,usage_json FROM calls').fetchone()
+    assert allowance == 1
+    assert output_tokens == 20
+    stored_usage = json.loads(usage_json)
+    assert stored_usage['allowance_policy'] == 'native_text_receipt_v2'
+    assert stored_usage['native_text_settlement_reason'] == 'receipt_settled'
+    assert stored_usage['reasoning_tokens'] == 10
+    assert stored_usage['billed_output_tokens'] == 20
+    assert stored_usage['estimated_token_cost'] == pytest.approx((1000 * .30 + 20 * 2.50) / 1_000_000)
+    assert ledger.reserve('a', 200, 'native', 'gemini-3.5-flash-lite', **policy)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 0
+
+
+@pytest.mark.parametrize('usage', [
+    {'promptTokenCount': 20000, 'candidatesTokenCount': 2, 'totalTokenCount': False},
+    {'promptTokenCount': 20000, 'candidatesTokenCount': 2, 'totalTokenCount': 9999999},
+    {'promptTokenCount': 20000, 'candidatesTokenCount': 2,
+     'totalTokenCount': 20002, 'cachedContentTokenCount': 20001},
+    {'promptTokenCount': 20000, 'candidatesTokenCount': 2,
+     'cachedContentTokenCount': 20001},
+])
+def test_malformed_native_receipt_keeps_full_reservation(tmp_path, monkeypatch, usage):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 1)
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    call = ledger.reserve('a', 200, 'native', 'gemini-3.8-flash')
+    ledger.finish(call, 200, usage, proven_native_text=True,
+                  native_text_request_eligible=True, native_text_response_eligible=True)
+    with ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert 'allowance_policy' not in json.loads(usage_json)
+
+
+def test_sparse_native_usage_keeps_prior_conservative_ceiling_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 1)
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    call = ledger.reserve('a', 200, 'native', 'gemini-3.8-flash')
+    ledger.finish(call, 200, {'promptTokenCount': 20000, 'candidatesTokenCount': 2},
+                  proven_native_text=True, native_text_request_eligible=True,
+                  native_text_response_eligible=True)
+    with ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == server.settled_text_allowance('gemini-3.8-flash', server.PRICING_START + 1, 200, 20000)
+    assert json.loads(usage_json)['allowance_policy'] == 'native_text_v1'
+
+
+@pytest.mark.parametrize('extra,expected', [
+    ({}, 1),
+    ({'serviceTier': 'priority'}, 200),
+    ({'unexpectedCount': 1}, 200),
+    ({'promptTokensDetails': [{'modality': 'IMAGE', 'tokenCount': 1}]}, 200),
+    ({'toolUsePromptTokensDetails': []}, 200),
+])
+def test_native_http_receipt_requires_safe_usage_features(proxy, extra, expected):
+    http, _ = proxy
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'candidates': [{'content': {'parts': [{'text': 'hello'}]}, 'finishReason': 'STOP'}],
+        'usageMetadata': {'promptTokenCount': 1000, 'candidatesTokenCount': 10,
+                          'totalTokenCount': 1020, **extra}}).encode())
+    assert post(http)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == expected
+    assert ('allowance_policy' in json.loads(usage_json)) == (expected < 200)
+
+
 @pytest.mark.parametrize('finish_reason', ['STOP', 'MAX_TOKENS'])
-def test_proven_text_native_settles_prospectively_and_admits_again(proxy, finish_reason):
+@pytest.mark.parametrize('brief', [False, True])
+def test_proven_text_native_settles_prospectively_and_admits_again(proxy, finish_reason, brief):
     http, calls = proxy
     http.tenants[0]['budget_cents'] = 227  # the next admission still reserves its full 200c
     http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
@@ -231,14 +448,16 @@ def test_proven_text_native_settles_prospectively_and_admits_again(proxy, finish
                                  'response_mime_type': 'application/json',
                                  'thinkingConfig': {'thinkingLevel': 'low'},
                                  'responseSchema': {'type': 'OBJECT'}}}
-    assert post(http, body=body)[0] == 200
+    headers = ({'X-Sotto-Workload': 'brief_extract', 'X-Sotto-Operation': 'a' * 64,
+                'X-Sotto-Run': 'b' * 32, 'X-Sotto-Attempt': '1'} if brief else {})
+    assert post(http, body=body, headers=headers)[0] == 200
     with http.ledger.connect() as db:
         allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
     assert allowance == server.settled_text_allowance('gemini-3.8-flash', time.time(), 200, 20000)
     assert allowance == 27
     assert json.loads(usage_json)['allowance_policy'] == 'native_text_v1'
     assert json.loads(usage_json)['native_text_settlement_reason'] == 'settled'
-    assert post(http, body=body)[0] == 200
+    assert post(http, body=body, headers=headers)[0] == 200
     assert len(calls) == 0  # the replacement upstream is the only provider used
     reopened = server.Ledger(http.ledger.path)
     with reopened.connect() as db:
@@ -295,7 +514,100 @@ def test_chat_output_missing_or_above_ceiling_keeps_full_allowance(tmp_path, mon
                   {'prompt_tokens': 20000, 'completion_tokens': server.MAX_OUTPUT}):
         ledger.finish(ledger.reserve('a', None, 'chat', 'gemini-3.8-flash'), 200, usage)
     with ledger.connect() as db:
-        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(200,), (200,), (27,)]
+        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(200,), (200,), (200,)]
+
+
+def test_google_chat_receipt_settles_reported_total_including_thinking_and_keeps_counts(proxy):
+    http, calls = proxy
+    http.tenants[0]['budget_cents'] = 201
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps({
+        'id': 'response-fixture', 'object': 'chat.completion', 'model': 'gemini-3.8-flash',
+        'choices': [{'index': 0, 'finish_reason': 'stop',
+                     'message': {'role': 'assistant', 'content': 'Done.'}}],
+        'usage': {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9120,
+                  'completion_tokens_details': {'reasoning_tokens': 100}},
+    }).encode())
+    body = {'model': 'gemini-3.8-flash', 'messages': [{'role': 'user', 'content': 'hello'}],
+            'max_completion_tokens': 512}
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, output, usage_json = db.execute(
+            'SELECT allowance,output_tokens,usage_json FROM calls').fetchone()
+    usage = json.loads(usage_json)
+    assert allowance == 1
+    assert output == 120
+    assert usage['allowance_policy'] == 'chat_text_receipt_v1'
+    assert usage['chat_text_settlement_reason'] == 'receipt_settled'
+    assert usage['reported_total_tokens'] == 9120
+    assert usage['visible_output_tokens'] == 20
+    assert usage['reasoning_tokens'] == 100
+    assert usage['billed_output_tokens'] == 120
+    assert usage['usage_completeness'] == 'partial'  # cache details were not reported
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 200
+    assert len(calls) == 0  # the replacement upstream is the only provider used
+
+
+def test_google_chat_receipt_prices_reported_cache_without_erasing_thinking(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 86400)
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    call = ledger.reserve('a', None, 'chat', 'gemini-3.8-flash')
+    ledger.finish(call, 200, {'prompt_tokens': 100000, 'completion_tokens': 100,
+                              'total_tokens': 101000,
+                              'prompt_tokens_details': {'cached_tokens': 90000},
+                              'completion_tokens_details': {'reasoning_tokens': 900}},
+                  proven_chat_text=True)
+    with ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    usage = json.loads(usage_json)
+    assert allowance == 2
+    assert usage['estimated_token_cost'] == pytest.approx(.018)
+    assert usage['reported_cached_tokens'] == 90000
+    assert usage['reported_reasoning_tokens'] == 900
+    assert usage['usage_completeness'] == 'complete'
+
+
+@pytest.mark.parametrize('usage', [
+    {'prompt_tokens': 9000, 'completion_tokens': 20},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9019},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9100,
+     'completion_tokens_details': {'reasoning_tokens': 79}},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9000 + server.MAX_OUTPUT + 1},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': True},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9100,
+     'prompt_tokens_details': {'cached_tokens': 9001}},
+    {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9100,
+     'completion_tokens_details': {'audio_tokens': 1}},
+])
+def test_google_chat_bad_or_unpriced_receipt_keeps_full_allowance(tmp_path, monkeypatch, usage):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 86400)
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    call = ledger.reserve('a', None, 'chat', 'gemini-3.8-flash')
+    ledger.finish(call, 200, usage, proven_chat_text=True)
+    with ledger.connect() as db:
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert 'allowance_policy' not in json.loads(usage_json)
+
+
+def test_google_chat_receipt_rejects_unknown_request_or_response_shape(proxy):
+    http, _ = proxy
+    http.tenants[0]['budget_cents'] = 600
+    reply = {
+        'choices': [{'index': 0, 'finish_reason': 'stop',
+                     'message': {'role': 'assistant', 'content': 'Done.'}}],
+        'usage': {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9100},
+        'unknown_paid_feature': {},
+    }
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps(reply).encode())
+    base = {'model': 'gemini-3.8-flash', 'messages': [{'role': 'user', 'content': 'hello'}]}
+    assert post(http, path='/openai/v1/chat/completions', body=base)[0] == 200
+    del reply['unknown_paid_feature']
+    assert post(http, path='/openai/v1/chat/completions', body={**base, 'extra_body': {}})[0] == 200
+    with http.ledger.connect() as db:
+        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(200,), (200,)]
+        stored=[json.loads(row[0]) for row in db.execute('SELECT usage_json FROM calls ORDER BY id')]
+        assert [row['chat_text_settlement_reason'] for row in stored]==['response_ineligible','request_ineligible']
+        assert 'unknown_paid_feature' not in json.dumps(stored)
 
 
 @pytest.mark.parametrize('extra', [
@@ -417,7 +729,7 @@ def test_settlement_keeps_ambiguous_and_native_calls_reserved(tmp_path, monkeypa
     ledger.finish(missing, 200, {})
     reopened = server.Ledger(ledger.path)
     with reopened.connect() as db:
-        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(27,), (200,), (200,), (200,)]
+        assert db.execute('SELECT allowance FROM calls ORDER BY id').fetchall() == [(200,)] * 4
     assert server.settled_chat_allowance('chat', 'gemini-3.8-flash', server.PRICING_END, 200, 1) == 200
 
 
@@ -440,6 +752,7 @@ def test_unlimited_tenant_keeps_metering_and_authentication(proxy):
     status, body = post(http)
     assert status == 402
     assert json.loads(body)['error']['code'] == 'sotto_budget_exhausted'
+    assert json.loads(body)['error']['period'] == 'lifetime'
     assert len(calls) == 2
 
 
@@ -472,9 +785,73 @@ def test_background_budget_capability_is_authenticated_content_free_and_tracks_s
         'supported_native_models': sorted(server.MODELS)}
 
 
+def test_monthly_allowance_uses_activation_then_utc_calendar_months(tmp_path, monkeypatch):
+    def utc(year, month, day):
+        return calendar.timegm((year, month, day, 0, 0, 0))
+
+    now = [utc(2026, 10, 20)]
+    monkeypatch.setattr(server, 'time', types.SimpleNamespace(time=lambda: now[0], gmtime=time.gmtime))
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    activation = utc(2026, 10, 15)
+    with ledger.connect() as db:
+        db.executemany('INSERT INTO calls(tenant,route,model,created,allowance) VALUES(?,?,?,?,?)', [
+            ('a', 'native', 'gemini-3.8-flash', utc(2026, 9, 20), 200),
+            ('a', 'native', 'gemini-3.8-flash', utc(2026, 10, 10), 200),
+            ('b', 'native', 'gemini-3.8-flash', utc(2026, 10, 16), 200),
+        ])
+    policy = {'budget_period': 'calendar_month', 'budget_started_at': activation}
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 200
+    assert ledger.reserve('a', 200, 'native', 'gemini-3.8-flash', **policy)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 0
+    with pytest.raises(PermissionError):
+        ledger.reserve('a', 200, 'native', 'gemini-3.8-flash', **policy)
+    assert ledger.budget_capability('b', 200)['remaining_cents'] == 0
+
+    now[0] = utc(2026, 11, 1)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 200
+    assert ledger.reserve('a', 200, 'native', 'gemini-3.8-flash', **policy)
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 0
+    assert ledger.budget_capability('a', 1000)['remaining_cents'] == 200
+    with ledger.connect() as db:
+        assert db.execute('SELECT COUNT(*),SUM(allowance) FROM calls WHERE tenant=?', ('a',)).fetchone() == (4, 800)
+
+
+def test_monthly_allowance_serializes_concurrent_admission(tmp_path):
+    ledger = server.Ledger(tmp_path / 'ledger.sqlite3')
+    policy = {'budget_period': 'calendar_month', 'budget_started_at': time.time() - 1}
+    def attempt(_):
+        try:
+            ledger.reserve('a', 200, 'native', 'gemini-3.8-flash', **policy)
+            return 'admitted'
+        except PermissionError:
+            return 'exhausted'
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        assert sorted(pool.map(attempt, range(2))) == ['admitted', 'exhausted']
+    assert ledger.budget_capability('a', 200, **policy)['remaining_cents'] == 0
+
+
+def test_monthly_capability_and_denial_keep_authentication(proxy):
+    http, calls = proxy
+    http.tenants[0].update(budget_period='calendar_month', budget_started_at=time.time() - 1)
+    assert get(http, '/v1/capabilities/background-budget', token='wrong')[0] == 401
+    assert get(http, '/v1/capabilities/background-budget')[1]['remaining_cents'] == 200
+    assert post(http)[0] == 200
+    status, body = post(http)
+    assert status == 402
+    assert 'next UTC month' in json.loads(body)['error']['message']
+    assert json.loads(body)['error']['period'] == 'calendar_month'
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize('change', [
     {'budget_cents': '200'}, {'budget_cents': True}, {'budget_cents': -1},
     {'enabled': 1}, {'expires_at': None}, {'expires_at': float('nan')}, {'expires_at': float('inf')}, {'token_sha256': 'not-a-hash'},
+    {'budget_period': 'weekly'}, {'budget_started_at': time.time() - 100},
+    {'budget_period': 'calendar_month'},
+    {'budget_period': 'calendar_month', 'budget_started_at': 0},
+    {'budget_period': 'calendar_month', 'budget_started_at': float('nan')},
+    {'budget_period': 'calendar_month', 'budget_started_at': time.time() + 3600},
+    {'budget_period': 'calendar_month', 'budget_started_at': time.time() - 100, 'budget_cents': None},
 ])
 def test_invalid_tenant_policy_cannot_become_an_implicit_bypass(tmp_path, change):
     tenant = {'id': 'a', 'token_sha256': hashlib.sha256(b'a-token').hexdigest(),
@@ -716,3 +1093,271 @@ def test_failed_upstream_releases_shared_concurrency_slot(tmp_path, monkeypatch)
         http.shutdown()
         http.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize('status,request_ok,response_ok,proven,valid_usage,reason,expected', [
+    (502, True, False, False, False, 'upstream_failure', 200),
+    (200, False, True, False, True, 'request_ineligible', 200),
+    (200, True, False, False, True, 'response_ineligible', 200),
+    (200, True, True, True, False, 'receipt_unavailable', 200),
+    (200, True, True, True, True, 'receipt_settled', 1),
+])
+def test_chat_settlement_diagnostic_is_fixed_and_does_not_change_accounting(tmp_path, monkeypatch,
+        status, request_ok, response_ok, proven, valid_usage, reason, expected):
+    monkeypatch.setattr(server.time, 'time', lambda: server.PRICING_START + 86400)
+    ledger=server.Ledger(tmp_path/'ledger.sqlite3')
+    call=ledger.reserve('a', None, 'chat', 'gemini-3.8-flash')
+    usage={'prompt_tokens':9000,'completion_tokens':20,'total_tokens':9120,
+           'completion_tokens_details':{'reasoning_tokens':100}} if valid_usage else {}
+    ledger.finish(call,status,usage,proven_chat_text=proven,
+        chat_text_request_eligible=request_ok,chat_text_response_eligible=response_ok)
+    with ledger.connect() as db:
+        allowance,raw=db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    counts=json.loads(raw)
+    assert allowance==expected
+    assert counts['chat_text_settlement_reason']==reason
+    assert set(k for k in counts if k.startswith('chat_text_'))=={'chat_text_settlement_reason'}
+
+
+def signed_chat_call():
+    return {'id':'fixture-call','type':'function','function':{'name':'fixture_read','arguments':'{}'},
+            'extra_content':{'google':{'thought_signature':'opaque-fixture-signature'}}}
+
+
+@pytest.mark.parametrize('extra', [None, {}, {'google':None}, {'google':{}},
+    {'google':{'thought_signature':''}}, {'google':{'thought_signature':1}},
+    {'google':{'thought_signature':False}}, {'google':{'thought_signature':['opaque']}},
+    {'google':{'thought_signature':'opaque','paid_feature':True}},
+    {'google':{'thought_signature':'opaque'},'other_provider':{}},
+    {'thought_signature':'opaque'}, {'google':{'other':'opaque'}}])
+def test_chat_signature_metadata_rejects_every_unsupported_nested_shape(extra):
+    call={**signed_chat_call(),'extra_content':extra}
+    message={'role':'assistant','content':None,'tool_calls':[call]}
+    request={'model':'gemini-3.8-flash','messages':[message]}
+    response={'choices':[{'index':0,'finish_reason':'tool_calls','message':message}]}
+    assert not server.chat_text_request(request)
+    assert not server.chat_text_response(response)
+
+
+def test_chat_signature_support_does_not_relax_other_keys_or_roles():
+    for call in [{**signed_chat_call(),'unpriced':True},{**signed_chat_call(),'type':'other'}]:
+        assert not server.chat_function_call_supported(call)
+    message={'role':'model','content':None,'tool_calls':[signed_chat_call()]}
+    assert not server.chat_text_request({'model':'gemini-3.8-flash','messages':[message]})
+    assert not server.chat_text_response({'choices':[{'finish_reason':'tool_calls','message':message}]})
+    # Existing assistant content/refusal/logprobs null are allowed, while null tool_calls are not.
+    message={'role':'assistant','content':None,'refusal':None,'tool_calls':[signed_chat_call()]}
+    assert server.chat_text_response({'choices':[{'finish_reason':'tool_calls','logprobs':None,'message':message}]})
+    message['tool_calls']=None
+    assert not server.chat_text_response({'choices':[{'finish_reason':'stop','message':message}]})
+
+
+def test_documented_chat_signatures_settle_and_forward_unchanged_without_refunding_old_holds(proxy):
+    http,_=proxy
+    http.tenants[0]['budget_cents']=1000
+    historical=http.ledger.reserve('a',None,'chat','gemini-3.8-flash')
+    http.ledger.finish(historical,200,{})
+    signed=signed_chat_call()
+    message={'role':'assistant','content':None,'tool_calls':[signed]}
+    reply={'choices':[{'index':0,'finish_reason':'tool_calls','message':message}],
+        'usage':{'prompt_tokens':9000,'completion_tokens':20,'total_tokens':9120,
+                 'completion_tokens_details':{'reasoning_tokens':100}}}
+    contacted=[]
+    def upstream(req,**_kwargs):
+        contacted.append(json.loads(req.data))
+        return Response(json.dumps(reply).encode())
+    http.open_upstream=upstream
+    first={'model':'gemini-3.8-flash','messages':[{'role':'user','content':'fixture'}]}
+    status,raw=post(http,path='/openai/v1/chat/completions',body=first)
+    assert status==200 and json.loads(raw)==reply
+    continuation={**first,'messages':[*first['messages'],message,
+        {'role':'tool','tool_call_id':'fixture-call','content':'fixture result'}]}
+    status,raw=post(http,path='/openai/v1/chat/completions',body=continuation)
+    assert status==200 and json.loads(raw)==reply
+    assert contacted==[first,continuation]
+    with http.ledger.connect() as db:
+        rows=db.execute('SELECT allowance,usage_json FROM calls ORDER BY id').fetchall()
+    assert [row[0] for row in rows]==[200,1,1]
+    for _,raw in rows[1:]:
+        counts=json.loads(raw)
+        assert counts['billed_output_tokens']==120
+        assert counts['allowance_policy']=='chat_text_receipt_v1'
+        assert counts['chat_text_settlement_reason']=='receipt_settled'
+        assert 'opaque-fixture-signature' not in raw
+
+
+def test_final_message_signatures_settle_and_continue_without_refunding_old_holds(proxy):
+    http,_=proxy
+    http.tenants[0]['budget_cents']=1000
+    historical=http.ledger.reserve('a',None,'chat','gemini-3.8-flash')
+    http.ledger.finish(historical,200,{})
+    message={'role':'assistant','content':'Hello.',
+             'extra_content':{'google':{'thought_signature':'opaque-fixture-signature'}}}
+    reply={'choices':[{'index':0,'finish_reason':'stop','message':message}],
+        'usage':{'prompt_tokens':9000,'completion_tokens':20,'total_tokens':9120,
+                 'completion_tokens_details':{'reasoning_tokens':100}}}
+    contacted=[]
+    def upstream(req,**_kwargs):
+        contacted.append(json.loads(req.data))
+        return Response(json.dumps(reply).encode())
+    http.open_upstream=upstream
+    first={'model':'gemini-3.8-flash','messages':[{'role':'user','content':'fixture'}]}
+    status,raw=post(http,path='/openai/v1/chat/completions',body=first)
+    assert status==200 and json.loads(raw)==reply
+    continuation={**first,'messages':[*first['messages'],message,
+        {'role':'user','content':'fixture follow-up'}]}
+    status,raw=post(http,path='/openai/v1/chat/completions',body=continuation)
+    assert status==200 and json.loads(raw)==reply
+    assert contacted==[first,continuation]
+    with http.ledger.connect() as db:
+        rows=db.execute('SELECT allowance,usage_json FROM calls ORDER BY id').fetchall()
+    assert [row[0] for row in rows]==[200,1,1]
+    for _,raw in rows[1:]:
+        counts=json.loads(raw)
+        assert counts['billed_output_tokens']==120
+        assert counts['allowance_policy']=='chat_text_receipt_v1'
+        assert counts['chat_text_settlement_reason']=='receipt_settled'
+        assert 'opaque-fixture-signature' not in raw
+
+
+@pytest.mark.parametrize('extra', [None, {}, {'google': {}},
+    {'google': {'thought_signature': ''}}, {'google': {'thought_signature': 1}},
+    {'google': {'thought_signature': 'opaque', 'paid_feature': True}},
+    {'google': {'thought_signature': 'opaque'}, 'other': {}},
+    {'google': {'thought_signature': ['opaque']}}])
+def test_final_message_invalid_signature_metadata_keeps_reservation(proxy, extra):
+    http, _ = proxy
+    message = {'role': 'assistant', 'content': 'Hello.', 'extra_content': extra}
+    reply = {'choices': [{'finish_reason': 'stop', 'message': message}],
+             'usage': {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9120}}
+    http.open_upstream = lambda *_args, **_kwargs: Response(json.dumps(reply).encode())
+    body = {'model': 'gemini-3.8-flash', 'messages': [{'role': 'user', 'content': 'fixture'}]}
+    assert not server.chat_text_request({**body, 'messages': [message]})
+    assert post(http, path='/openai/v1/chat/completions', body=body)[0] == 200
+    with http.ledger.connect() as db:
+        allowance, raw = db.execute('SELECT allowance,usage_json FROM calls').fetchone()
+    assert allowance == 200
+    assert json.loads(raw)['chat_text_settlement_reason'] == 'response_ineligible'
+    assert 'opaque' not in raw and 'paid_feature' not in raw
+
+
+def test_message_signature_does_not_allow_other_fields_or_user_metadata():
+    message = {'role': 'assistant', 'content': 'Hello.',
+               'extra_content': {'google': {'thought_signature': 'opaque'}}}
+    body = {'model': 'gemini-3.8-flash', 'messages': [message]}
+    assert server.chat_text_request(body)
+    assert not server.chat_text_request({**body, 'messages': [{**message, 'role': 'user'}]})
+    reply = {'choices': [{'finish_reason': 'stop', 'message': {**message, 'unknown': True}}]}
+    assert not server.chat_text_response(reply)
+
+
+@pytest.mark.parametrize('workload,proof,timeout', [
+    ('brief_extract', True, 120), ('brief_critic', True, 120), ('brief_revise', True, 120),
+    ('brief_extract', False, 300), ('research', True, 300), ('chat', True, 300),
+])
+@pytest.mark.parametrize('failure', [None, 'opening', 'body', 'gateway'])
+def test_brief_wait_is_scoped_and_uncertain_hold_is_preserved(tmp_path, workload, proof, timeout, failure):
+    calls = []
+    body = b'{"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}'
+    class BodyTimeout(Response):
+        def read(self, *_):
+            raise TimeoutError('private provider details')
+        def read1(self, *_):
+            raise TimeoutError('private provider details')
+    def upstream(req, **kwargs):
+        calls.append(kwargs['timeout'])
+        if failure == 'opening':
+            raise urllib.error.URLError(TimeoutError('private provider details'))
+        if failure == 'gateway':
+            raise urllib.error.HTTPError(req.full_url, 504, 'timeout', {}, io.BytesIO(b'provider timeout'))
+        return BodyTimeout(body) if failure == 'body' else Response(body)
+    tenants = [{'id': 'a', 'token_sha256': hashlib.sha256(b'a-token').hexdigest(),
+                'budget_cents': 200, 'enabled': True, 'expires_at': time.time() + 3600}]
+    http = server.serve(('127.0.0.1', 0), tenants, 'upstream-only', tmp_path / 'ledger.sqlite3', upstream)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        headers = {'X-Sotto-Workload': workload}
+        if proof:
+            headers.update({'X-Sotto-Operation': 'a' * 64, 'X-Sotto-Run': 'b' * 32,
+                            'X-Sotto-Attempt': '1'})
+        status, result = post(http, headers=headers)
+        assert calls == [timeout]
+        if timeout == 120 and failure:
+            assert status == 504
+            assert json.loads(result)['error']['code'] == 'sotto_brief_outcome_uncertain'
+            assert b'private' not in result
+        elif failure == 'gateway':
+            assert status == 504 and result == b'provider timeout'
+        elif failure == 'opening':
+            assert status == 502
+        else:
+            assert status == 200
+            if not failure:
+                assert result == body
+        if failure:
+            with http.ledger.connect() as db:
+                assert db.execute('SELECT allowance FROM calls').fetchone()[0] == 200
+        assert post(http, headers=headers)[0] == 402  # unknown usage is not refunded
+        assert len(calls) == 1
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('remote_disconnected', 504), ('incomplete_body', 504), ('reset_body', 504),
+    ('refused', 502),
+])
+def test_brief_loss_after_send_is_uncertain_but_connect_refusal_still_retries(tmp_path, failure, expected):
+    class Broken(Response):
+        def read(self, *_):
+            if failure == 'incomplete_body':
+                raise http.client.IncompleteRead(b'{"cand', 100)
+            raise ConnectionResetError('private provider details')
+    def upstream(req, **_kwargs):
+        if failure == 'remote_disconnected':
+            raise http.client.RemoteDisconnected('private provider details')
+        if failure == 'refused':
+            raise urllib.error.URLError(ConnectionRefusedError('private provider details'))
+        return Broken(b'{"candidates":[]}')
+    tenants = [{'id': 'a', 'token_sha256': hashlib.sha256(b'a-token').hexdigest(),
+                'budget_cents': 200, 'enabled': True, 'expires_at': time.time() + 3600}]
+    proxy_http = server.serve(('127.0.0.1', 0), tenants, 'upstream-only', tmp_path / 'ledger.sqlite3', upstream)
+    thread = threading.Thread(target=proxy_http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, result = post(proxy_http, headers={'X-Sotto-Workload': 'brief_extract', 'X-Sotto-Operation': 'a' * 64,
+                                             'X-Sotto-Run': 'b' * 32, 'X-Sotto-Attempt': '1'})
+        assert status == expected
+        assert b'private' not in result
+        if expected == 504:
+            assert json.loads(result)['error']['code'] == 'sotto_brief_outcome_uncertain'
+    finally:
+        proxy_http.shutdown()
+        proxy_http.server_close()
+        thread.join()
+
+
+def test_unsupported_sdk_field_keeps_hold_on_otherwise_valid_tool_continuation(proxy):
+    http, _ = proxy
+    http.tenants[0]['budget_cents'] = 1000
+    reply = {'choices': [{'index': 0, 'finish_reason': 'stop',
+                         'message': {'role': 'assistant', 'content': 'Done.'}}],
+             'usage': {'prompt_tokens': 9000, 'completion_tokens': 20, 'total_tokens': 9120,
+                       'completion_tokens_details': {'reasoning_tokens': 100}}}
+    http.open_upstream = lambda *args, **kwargs: Response(json.dumps(reply).encode())
+    body = {'model': 'gemini-3.8-flash', 'messages': [
+        {'role': 'user', 'content': 'Read my item'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [signed_chat_call()]},
+        {'role': 'tool', 'tool_call_id': 'fixture-call', 'content': 'fixture item'}]}
+    assert server.chat_text_request(body)
+    assert not server.chat_text_request({**body, 'unsupported_paid_feature': True})
+    for request in (body, {**body, 'unsupported_paid_feature': True}):
+        assert post(http, path='/openai/v1/chat/completions', body=request)[0] == 200
+    with http.ledger.connect() as db:
+        rows = db.execute('SELECT allowance,usage_json FROM calls ORDER BY id').fetchall()
+    assert [row[0] for row in rows] == [1, 200]
+    assert [json.loads(row[1])['chat_text_settlement_reason'] for row in rows] == [
+        'receipt_settled', 'request_ineligible']

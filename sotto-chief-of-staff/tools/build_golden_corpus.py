@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 build_golden_corpus.py — turn the owner's real $SOTTO_DATA into a PII-scrubbed, referentially
-intact eval corpus (docs/plans/golden-corpus.md).
+intact eval corpus (docs/archive/plans/golden-corpus.md).
 
 Runs WHERE THE DATA LIVES (the container / the machine holding the volume), stdlib + PyYAML only —
 the same deps the image already carries. Nothing here calls out to the network unless you ask for
@@ -881,22 +881,24 @@ def split_days(raw: dict, days: int, end: datetime) -> list:
     return out
 
 
-def day_fixture(day: dict, raw: dict, im: IdentityMap, user_email: str, tz: str) -> dict:
+def day_fixture(day: dict, raw: dict, im: IdentityMap, user_email: str, tz: str,
+                *, chronological: bool = False) -> dict:
     """A corpus day in the EXACT shape evals/fixtures/*.json use — so the existing harness loads it
     with no new format and no new loader."""
-    b, base = day["sections"], datetime.combine(day["date"], datetime.min.time()).replace(hour=12)
+    b, base = day["sections"], datetime.combine(day["date"], datetime.min.time()).replace(
+        hour=23 if chronological else 12, minute=59 if chronological else 0)
     local = {
-        "generated_at": (base + timedelta(hours=11, minutes=59)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": (base if chronological else base + timedelta(hours=11, minutes=59)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "window_hours": 24,
-        "source_status": (raw["local"].get("source_status") or {}),
-        "contacts": day["contacts"],
+        "source_status": {} if chronological else (raw["local"].get("source_status") or {}),
+        "contacts": [] if chronological else day["contacts"],
         "imessage": b.get("imessage", []),
         "whatsapp": b.get("whatsapp", []),
         "calls": b.get("calls", []),
-        "reminders": _arr(raw["local"], "reminders"),
+        "reminders": [] if chronological else _arr(raw["local"], "reminders"),
     }
     inputs = {
-        "type": "morning", "first_run": False, "window_hours": 24,
+        "type": "evening" if chronological else "morning", "first_run": False, "window_hours": 24,
         "google": {"userEmail": user_email, "userTimezone": tz,
                    "events": b.get("events", []), "emails": b.get("emails", [])},
         "granola": {"meetings": b.get("granola", [])},
@@ -907,6 +909,7 @@ def day_fixture(day: dict, raw: dict, im: IdentityMap, user_email: str, tz: str)
     n = day["offset_days"]
     return {
         "name": f"day-{n:02d}",
+        **({"replay_clock": "day_end"} if chronological else {}),
         "description": (f"corpus day T-{n}: {len(local['imessage'])} iMessage, "
                         f"{len(local['whatsapp'])} WhatsApp, {len(inputs['google']['emails'])} emails, "
                         f"{len(inputs['google']['events'])} calendar events"),
@@ -1112,7 +1115,9 @@ def build(args) -> int:
     if not days_raw:
         print("ERROR: no dated activity found in the window — nothing to build.")
         return 2
-    days = [stamp_gids(day_fixture(d, raw, im, user_email, args.timezone)) for d in days_raw]
+    chronological = getattr(args, 'chronological', False)
+    days = [stamp_gids(day_fixture(d, raw, im, user_email, args.timezone,
+                                  chronological=chronological)) for d in days_raw]
 
     llm = None
     if args.draft_labels_llm:
@@ -1129,7 +1134,7 @@ def build(args) -> int:
     oldest = datetime.combine(min(d["date"] for d in days_raw), datetime.min.time()).replace(hour=12)
     ledger = [{"filename": f"loop-{hashlib.sha256(json.dumps(e, sort_keys=True, default=str).encode()).hexdigest()[:8]}.md",
                "frontmatter": tokenize(scrub(e, im), oldest)}
-              for e in raw["ledger"]]
+              for e in ([] if chronological else raw["ledger"])]
     manifest = {
         "schema": CORPUS_SCHEMA,
         "version": args.version,
@@ -1142,9 +1147,15 @@ def build(args) -> int:
                    "emails": sum(len(d["inputs"]["google"]["emails"]) for d in days),
                    "messages": sum(len(d["inputs"]["local"]["imessage"])
                                    + len(d["inputs"]["local"]["whatsapp"]) for d in days)},
-        "preferences": scrub(raw["preferences"], im),
+        "preferences": {} if chronological else scrub(raw["preferences"], im),
         "seed_ledger": ledger,
-        "note": "CONFIDENTIAL REGARDLESS — scrubbed is not shareable. See docs/plans/golden-corpus.md.",
+        "replay_policy": {
+            "mode": "chronological" if chronological else "current_snapshot",
+            "unversioned_state_seeded": not chronological,
+            "identity_map": "current identifiers for pseudonymization only",
+            "limitation": "Retained message versions are not a historical edit/unsend archive.",
+        },
+        "note": "CONFIDENTIAL REGARDLESS — scrubbed is not shareable. See docs/archive/plans/golden-corpus.md.",
     }
 
     payload = {"manifest": manifest, "days": days}
@@ -1200,6 +1211,8 @@ def main() -> int:
     ap.add_argument("--out", help="corpus output dir (default evals/corpus/<version>)")
     ap.add_argument("--map", help="identity-map path (default $SOTTO_DATA/corpus-keys/<version>.map.json)")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"window in days (default {DEFAULT_DAYS})")
+    ap.add_argument("--chronological", action="store_true",
+                    help="replay dated evidence at day end without today's ledger, preferences, contacts or reminders")
     ap.add_argument("--end", help="last day of the window, YYYY-MM-DD (default: today)")
     ap.add_argument("--local", help="read_local snapshot (default $SOTTO_DATA/knowledge/last_local_snapshot.json)")
     ap.add_argument("--gmail", default="/tmp/sotto_gmail.json", help="gather_google --gmail-out")

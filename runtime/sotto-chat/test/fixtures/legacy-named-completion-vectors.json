@@ -1,0 +1,4 @@
+[
+  {"text":"alpha and beta are done!!","names":["alpha","beta"],"expected":false},
+  {"text":"alpha and beta are done.\n","names":["alpha","beta"],"expected":true}
+]

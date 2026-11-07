@@ -15,7 +15,7 @@ import tempfile
 # What the gate imports before it can say anything useful, and where to get it. Checked up front so
 # a Mac whose Homebrew Python has none of it reads one line — not a CalledProcessError traceback out
 # of the first subprocess (ship.sh, Sep 13).
-TOOLING = (('pytest', 'pytest'), ('ruff', 'ruff'), ('yaml', 'pyyaml'))
+TOOLING = (('pytest', 'pytest'), ('ruff', 'ruff'), ('yaml', 'pyyaml'), ('vulture', 'vulture'))
 
 
 def _normalize(name):
@@ -147,22 +147,60 @@ def preflight(python=None):
             "  python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt")
 
 
+def smoke_suites(root):
+    """Hermetic fixture-model/transport unit suites beside the packaged smokes (no Docker, no network).
+
+    The packaged smoke runners themselves need built images and stay explicit release steps; only
+    their offline `test_*.py` contracts run here, wherever a smoke directory carries them.
+    """
+    smoke = root / 'smoke'
+    if not smoke.is_dir():
+        return []
+    return [str(path.relative_to(root)) for path in sorted(smoke.iterdir())
+            if path.is_dir() and any(path.glob('test_*.py'))]
+
+
+def verify_unique_test_basenames(root):
+    """A bare `pytest` from the root imports test modules by basename (no packages here), so two
+    test files with one name make collection error before any test runs."""
+    seen = {}
+    for path in sorted(root.rglob('test_*.py')):
+        relative = path.relative_to(root)
+        if any(part in ('node_modules', '__pycache__', 'sotto-bridge') for part in relative.parts):
+            continue
+        if (path.parent / '__init__.py').exists():
+            continue
+        if path.name in seen:
+            raise SystemExit(f'verify: {seen[path.name]} and {relative} share a test module name; '
+                             'rename one so a root pytest run can collect both')
+        seen[path.name] = relative
+
+
 def commands(root):
     python = sys.executable
     pack = root / 'sotto-chief-of-staff'
-    suites = ['runtime/trigger-receiver', 'adapters/hermes', 'cloud/model-proxy', 'cloud/accounts']
+    suites = ['runtime/trigger-receiver', 'adapters/sotto', 'cloud/model-proxy', 'cloud/accounts',
+              *smoke_suites(root)]
     return [
         (root, [python, '-m', 'ruff', 'check', '.']),
+        (root, [python, '-m', 'vulture', '.', 'sotto-chief-of-staff/tools/vulture_whitelist.py',
+                '--min-confidence', '80', '--exclude',
+                '*/.venv/*,*/node_modules/*,*/__pycache__/*,*/target/*,*/.pytest_cache/*,*/.ruff_cache/*,*/runtime/sotto-chat/dist/*']),
+        (root, ['node', 'tools/check-file-size.mjs']),
         *([(root, [python, 'tools/sync-usage.py', '--check'])] if (root / 'cloud/model-proxy').is_dir() else []),
         (pack, [python, '-m', 'pytest', 'tests', '-q']),
         (pack, [python, 'tools/validate_skills.py']),
-        (root, [python, 'tools/verify_railway_photon_preset.py']),
-        (root, [python, '-m', 'pytest', 'tools/test_setup_selfhost_railway.py', '-q']),
+        (root, [python, '-m', 'pytest', 'tools/test_setup_selfhost_railway.py',
+                        'tools/test_bundle_runtime_descriptor.py',
+                        'tools/test_bundle_railway_oauth.py',
+                        *(['tools/test_runtime_release_artifact.py'] if (root / 'tools/test_runtime_release_artifact.py').is_file() else []), '-q']),
         # One contract, two trees: the public distribution has no cloud/accounts (the hosted broker
         # never ships), so a suite runs where its directory is and is simply absent otherwise.
         *((root, [python, '-m', 'pytest', suite, '-q']) for suite in suites if (root / suite).is_dir()),
-        (root, [python, 'adapters/hermes/reconcile_crons.py', '--help']),
-        (root, [python, 'adapters/hermes/configure_mcp.py', '--help']),
+        # Installed from the committed lock with lifecycle scripts disabled. npm check never
+        # installs packages or contacts providers; CI and local setup perform npm ci explicitly.
+        *([(root / 'runtime/sotto-chat', ['npm', 'run', 'check'])]
+          if (root / 'runtime/sotto-chat/package.json').is_file() else []),
     ]
 
 
@@ -170,6 +208,7 @@ def main():
     preflight()
     root = Path(__file__).resolve().parents[2]
     verify_locks(root)
+    verify_unique_test_basenames(root)
     for cwd, argv in commands(root):
         print('[verify] ' + ' '.join(argv[1:]), flush=True)
         subprocess.run(argv, cwd=cwd, check=True)

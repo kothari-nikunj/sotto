@@ -1,8 +1,9 @@
 # Models — what changes if you don't use Gemini
 
-**Supported today: Gemini by default — openai and anthropic families by one env var.** The compose
+**In the pipeline code: Gemini by default — openai and anthropic families by one env var** (the
+supervised launch passes Gemini only; see *What the supervised image actually runs* below). The compose
 calls (brief, evening, meeting prep, follow-up, Tier-1 triage) go through one provider seam
-(`_shared/lib/gemini.py`, per `docs/plans/model-agnostic-pipeline.md`): set
+(`_shared/lib/gemini.py`; see [runtime capabilities](RUNTIME-CAPABILITIES.md)): set
 `SOTTO_BRIEF_MODEL=openai/<model>` or `anthropic/<model>` (and `SOTTO_TRIAGE_MODEL` likewise) with
 that family's key, and the pipeline runs there — provided the model clears the brief's 400K-token
 context floor (the prompt has hit 170K tokens in production; known-small models are refused with a
@@ -24,13 +25,13 @@ Gemini grounding**, `deep_research`: **Parallel → Exa → Gemini grounding**, 
 link someone sent): **Exa → Gemini url_context → Browser Use Cloud**. That is the hole §5(c)
 used to describe, and it is closed. The remaining Gemini-specific capabilities are listed below.
 
-**What already runs on other models today: the chat layer.** Hermes — not Sotto — owns the
-conversational model, and it ships first-class providers for Anthropic, OpenAI, Kimi/Moonshot,
-DeepSeek, xAI, OpenRouter and more. Point `model.provider` at one of those, give it that provider's
-key, and "prep me for my 2pm" / "draft a reply to Sarah" / every nudge reply runs on it with **zero
-Sotto code changes**. Brief composition is configured separately through `SOTTO_BRIEF_MODEL`.
-On the cloud container there is also a chat boot-time pin to know about (§5a). The short version of this whole page, for
-someone choosing at setup time, is in [CHANNELS.md](../CHANNELS.md).
+**What the supervised image actually runs.** The seams above are code; the launch decides which
+keys reach them. The supervised runtime passes the receiver one direct Gemini key (self-host) or the
+model proxy (managed), and no OpenAI, Anthropic, Exa, Parallel or Browser Use key, so a supervised
+installation composes and researches on Gemini ([RAILWAY.md](../RAILWAY.md#environment-variables--full-reference)).
+**The chat layer** — Ask Sotto, nudge replies, tool use — is the Node runtime (`runtime/sotto-chat`,
+Mastra), which runs the launch config's `chatModelId` through the `google` provider only. The short
+version of this whole page, for someone choosing at setup time, is in [CHANNELS.md](../CHANNELS.md).
 
 **What stays Gemini-keyed regardless of the compose family:** search grounding and `url_context`
 (the keyless research rungs — on another family, connect Exa or research is skipped and the brief
@@ -41,25 +42,32 @@ reason if not). `SOTTO_GEMINI_MODEL` keeps its meaning for exactly these lanes.
 
 Background history learning and Dreamer require the budgeted native Gemini proxy unless a
 self-host explicitly chooses `SOTTO_BACKGROUND_UNMETERED=true`. Direct-key composition does
-not silently enable this extra spending. Managed installs cannot use that opt-out.
+not silently enable this extra spending. Managed installs cannot use that opt-out, and the
+supervised self-host launch passes neither the proxy nor the opt-in, so its background learning
+stays held.
 
 ## 1. Where the LLM calls actually are
 
 | # | Call site | What it does | How often | Prompt size (measured) |
 |---|---|---|---|---|
 | 1 | `_shared/scripts/compose_brief.py` → `gemini.call_gemini` | **Brief extraction** — the whole day in, brief + actions + knowledge out | 2×/day (06:30, 17:30) + midday digest | **141K–306K chars** (see §2) |
-| 2 | `compose_brief.run_critic` | Quality critic over the generated brief | ≤2×/day; auto-skipped on quiet days (`payload < 15,000` chars **and** ≤5 actions) | 20,199 chars |
+| 2 | `compose_brief.run_critic` | Quality critic over the generated brief | ≤2×/day; auto-skipped on quiet days (`payload < 15,000` chars **and** ≤5 actions), but never for the first brief, a validator violation or a proposed task closure; `SOTTO_CRITIC=off`/`always` overrides | 20,199 chars |
 | 3 | `compose_brief.critique_and_revise` | Revise pass applying the critic's patches | only when the critic found something | 11,548 chars |
 | 4 | `_shared/scripts/research_attendees.py` | **Attendee research** — the `deep_research` capability (Parallel → Exa → Gemini grounding), 5 attendees/batch, cap 25 | ≤5 batches per brief (+ deep/focus passes) | 2,360 chars/batch |
 | 5 | `_shared/scripts/web_research.py` | **THE search seam** — the resolver, plus `web_search` (Exa → Gemini grounding: ad-hoc lookups, venue checks) and `fetch_url` (Exa → Gemini url_context → Browser Use Cloud: read a link someone sent) | on demand | query/URL only (~10² chars) |
 | 6 | `meeting-prep/scripts/compose_meeting_prep.py` | Meeting prep sweep / focused prep | ~1×/day | 27,838 chars (4 meetings, 8 researched attendees) |
 | 7 | `followup/scripts/compose_followup.py` | Evening follow-up extraction | 1×/day (evening) | 3,707-char template + the day's ended meetings |
-| 8 | `event-triage/scripts/triage_event.py` → `_gemini_once` | **Tier-1 triage** on every inbound event that survives the deterministic gates | event-driven — Gmail polled every 90 s + Bridge pushes; not capped (the caps are on *delivered* nudges) | ≤2,378 chars (`TIER1_TEXT_MAX` 1,500 + 878 scaffolding) |
-| 9 | Hermes' own chat/agent model | Ask Sotto, nudge replies, tool use, `web_extract`, compression, titles | every conversational turn | Hermes-owned |
-| 10 | Hermes TTS (`tts.provider`) | Voice notes | opt-in (`brief_audio`) | **not an LLM** — default `edge`, free, no key |
+| 8 | `event-triage/scripts/triage_event.py` → `relevance.judge` (`_shared/lib/relevance.py`) | **Tier-1 triage** on every inbound event that survives the deterministic gates, judged under the shared relevance policy | event-driven — Gmail polled every 90 s + Bridge pushes; not capped (the caps are on *delivered* nudges) | event text ≤ `TIER1_TEXT_MAX` (1,500 chars) + the shared policy and observed-conversation context |
+| 9 | The Node chat runtime's model (`runtime/sotto-chat`) | Ask Sotto, nudge replies, tool use | every conversational turn | the launch config's `chatModelId`, `google` provider only |
+| 10 | `evals/run_golden.py` → `judge_day` | **Golden eval judge** — scores each replayed brief against its data manifest | offline evals only (`--live --judge`) | manifest + brief, each ≤20,000 chars |
 
 Sites 1–8 call the shared composition or research seams described above. Site 9 is a separate
-chat model setting. Site 10 is model-independent unless you set `SOTTO_TTS_PROVIDER=gemini`.
+chat model setting. Site 10 never runs in production: the judge is pinned to `JUDGE_MODEL`
+(`gemini-3-flash-preview`, overridable with `SOTTO_JUDGE_MODEL`) and clears `SOTTO_BRIEF_MODEL`
+and `SOTTO_FALLBACK_MODEL` while it judges, so the brief model never grades its own brief. A
+baseline's run signature records the compose model (live) and the judge model (live + judge), and
+a live run composes with the fallback disabled, so a quota blip fails the day rather than scoring
+another model's brief. Spoken (voice-note) briefs are not offered.
 
 ---
 
@@ -148,23 +156,23 @@ emails, **~198K** for the pathological ceiling.
 | **Max context vs our biggest call** | 1M — fits everything incl. the 198K ceiling ✅ | 1M — fits everything ✅ | 400K — fits heavy (77K) and the ceiling ✅ | 256K — fits heavy ✅, ceiling fits but tight | 163K — fits heavy (77K) ✅, **ceiling truncates** ⚠️ |
 | **Search story** | **Irrelevant to the model choice now:** sites 4–5 go through the search seam, which answers on `EXA_API_KEY` / `PARALLEL_API_KEY` / `GOOGLE_AI_API_KEY`, whichever is present | No native web search in the pipeline's call shape; Anthropic's server-side web-search tool exists but is not wired here | No native grounding in our call shape | None | None |
 | **Structured JSON for extraction** | `responseSchema` (OpenAPI subset) + `response_mime_type` — used today, strongest guarantee | ⚠️ Sonnet **4.6** is not on Anthropic's structured-outputs model list, and assistant prefill 400s on it — you'd fall back to strict tool use or prompt-only JSON. Sonnet 5 / Opus 4.8+ do support `output_config.format` | `response_format: json_schema` (strict) — equivalent guarantee | JSON mode (`json_object`); strict `json_schema` not guaranteed → validate client-side | JSON mode only, **no** `json_schema`; documented occasional empty-content responses → needs retry + validation |
-| **~$/day at our volumes** *(see §4)* | **$0.18** primary (3.8 Flash intro rates through Dec 31, 2026; $0.36 at 2027 standard rates) · **$0.13** on the cheaper fallback | **$0.72** | **$0.55** | **$0.21** | **$0.04** |
-| **TTS impact** | none | none | none | none | none |
+| **~$/day at our volumes** *(see §4)* | **$0.18** primary (3.8 Flash intro rates through Dec 31, 2026; after that the code has no rates and estimates are unknown) · **$0.13** on the cheaper fallback | **$0.72** | **$0.55** | **$0.21** | **$0.04** |
 | **THE GAP — pipeline (sites 1–3, 6–8)** | — (works) | Needs an `anthropic_messages` client beside `call_gemini`: different auth header, `system` as a top-level field, `content[].text` response shape, `usage.input_tokens`, and a schema story (see above) | Needs an OpenAI-compatible client: base URL + `Authorization: Bearer`, `messages[]`, `choices[0].message.content`, `usage.prompt_tokens` | same as GPT-5.2 | same as GPT-5.2 |
 | **THE GAP — research (sites 4–5)** | — (works) | **None, as of the search seam.** Set `EXA_API_KEY` (search) and/or `PARALLEL_API_KEY` (deep research) and sites 4–5 run with no Gemini key at all; unset, they fall back to Gemini grounding as before | same | same | same |
-| **THE GAP — Hermes chat (site 9)** | — | **none** — `provider: anthropic`, `ANTHROPIC_API_KEY` | **none** — `provider: openai-api`, `OPENAI_API_KEY` | **none** — `provider: kimi-coding`, `KIMI_API_KEY` | **none** — `provider: deepseek`, `DEEPSEEK_API_KEY` |
+| **THE GAP — chat (site 9)** | — | Needs a provider adapter: the Node runtime and its startup renderer accept only `google` | same | same | same |
 
 **Why DeepSeek and not Grok for the fifth slot:** DeepSeek is the informative column. It is an
 order of magnitude cheaper than everything else *and* its 163K window is the only one in the set that
 our measured ceiling actually breaks — it draws the line the other columns don't. Grok is worth a
-footnote rather than a column: Hermes drives xAI over the `codex_responses` transport, a third API
-shape on top of the two the pipeline would already need, so it is the *most* expensive of the five to
-add for the least new information.
+footnote rather than a column: xAI's Responses-style transport would be a third API shape on top
+of the two the pipeline already speaks, so it is the *most* expensive of the five to add for the
+least new information.
 
 **Model-name drift:** the columns name a generation, not a pinned SKU. Vendor pricing and context
 windows move; treat the numbers as of **September 2026** and re-check before quoting them. The Gemini
-rates are the ones in `_shared/lib/metrics.py` `PRICE_TABLE` (which carries its own verification
-dates); the others are public list prices verified against vendor and aggregator pages in August 2026.
+rates are the ones in `_shared/lib/usage_accounting.py` `PRICES` (`metrics.py` `PRICE_TABLE` derives
+from it), stamped with one `PRICING_VERSION` string and valid until `INTRO_END`; the others are
+public list prices verified against vendor and aggregator pages in August 2026.
 
 ---
 
@@ -183,8 +191,7 @@ Measured input, stated-assumption output — the formula is shown so you can sub
 | Meeting prep | 1 | 7,000 | 7,000 |
 | **Total input** | | | **~116,000** |
 
-**Output is not measured here** (the brief call sets `maxOutputTokens` to the proxy's own 65,536 ceiling, which is no limit in practice; real counts land in the
-`[brief-cost]` log line). The figures above assume **~25,000 output tokens/day** — two briefs, the
+**Output is not measured here** (Gemini 3.8 Flash brief stages allow up to 65,536 combined thinking and answer tokens with low thinking; this is headroom, not expected output. Other models retain their existing limits. Real counts land in the `[brief-cost]` log line). The figures above assume **~25,000 output tokens/day** — two briefs, the
 critic/revise pair, ten grounded research batches (`MAX_OUTPUT_TOKENS` 8,192 each) and one prep.
 
     $/day  ≈  0.116 × ($/M input)  +  0.025 × ($/M output)
@@ -201,38 +208,21 @@ grounded-search result tokens and busier days — none of which this table model
 
 ## 5. The verdict
 
-### (a) What works today with zero code
+### (a) The chat layer is Gemini-only
 
-**The Hermes chat layer, on any provider Hermes ships.** Verified against Hermes' own provider
-documentation: Anthropic (`ANTHROPIC_API_KEY`, `anthropic_messages`), OpenAI (`OPENAI_API_KEY`),
-Kimi/Moonshot (`KIMI_API_KEY`), DeepSeek (`DEEPSEEK_API_KEY`), xAI (`XAI_API_KEY`, `codex_responses`),
-OpenRouter, Nous Portal, Bedrock and others — all `chat_completions` except where noted.
-
-```yaml
-# ~/.hermes/config.yaml
-model:
-  provider: "anthropic"
-  default: "claude-sonnet-4-6"
-```
-
-That switches Ask Sotto, every nudge reply, and Hermes' auxiliary tasks. **It does not switch the
-briefs**: set `SOTTO_BRIEF_MODEL` and the matching provider credentials separately.
-
-**One caveat, and it is a real one on the cloud container:** `adapters/hermes/start.sh` runs
-`hermes config set model gemini-3.8-flash` **on every boot** (and routes every auxiliary task to
-`main`), so one key covers everything out of the box — but it also means a `config.yaml` edit is
-reverted by the next redeploy. On Railway, switching the chat model is a one-line edit to that file
-in your fork, not a config change. On a **local or pre-existing** Hermes it genuinely is config only:
-`adapters/hermes/install.sh` sets the model exclusively under `--dedicated`, and otherwise says so
-("Leaving the global model untouched") and leaves your provider alone. Don't promise a knob that
-isn't there.
+The Node chat runtime (Ask Sotto, every nudge reply, tool use) runs the launch config's
+`chatModelId` and `nativeMediaModelId` through the `google` provider: a direct Gemini key on
+self-host, the model proxy's `/openai/v1` and `/native/v1beta` routes on managed tenants. The
+startup renderer refuses any other provider, so switching the chat family is code work, not a
+setting. It does not change brief composition either way.
 
 ### (b) Composition providers are implemented
 
 The shared client dispatches to native Gemini, OpenAI-compatible and Anthropic transports.
 `SOTTO_BRIEF_MODEL` selects the compose family; credentials, the context floor, structured
-output and same-family fallback checks still apply. This is separate from Hermes chat and from
-research. No additional provider client is needed to enable the existing OpenAI/Anthropic seam.
+output and same-family fallback checks still apply. This is separate from chat and from
+research. The supervised launch does not pass another family's key, so on that image this seam
+runs Gemini. No additional provider client is needed to enable the existing OpenAI/Anthropic seam.
 
 ### (c) Research when Gemini is absent — SOLVED
 
@@ -249,10 +239,11 @@ no longer true. `_shared/scripts/web_research.py` is now the seam: one resolver,
 structured research, so sites 4 AND 5 run with no Gemini key at all.
 
 The new variables are `EXA_API_KEY`, `PARALLEL_API_KEY`, and `BROWSER_USE_API_KEY` — credentials,
-which is the one kind of variable a default cannot serve. Provider
+which is the one kind of variable a default cannot serve. The supervised launch does not pass them,
+so a supervised installation researches through Gemini grounding. Provider
 details and the lane-1 rationale: [INTEGRATIONS.md](../INTEGRATIONS.md).
 
-So a non-Gemini deployment has two honest options, and both work today:
+So a non-Gemini composition (outside the supervised launch) has two honest options:
 
 1. **carry a Gemini key anyway, for research only** (still the cheapest: research is ~5,900 input
    tok/day, cents), or
@@ -289,5 +280,25 @@ The provider seam is implemented. Before changing the default model, measure com
 quality and structured-output failures on representative inputs, including heavy days, and
 verify every required research capability has credentials. The historical prompt and cost
 measurements above are examples, not a current production benchmark or a promise that every
-Hermes chat model can compose a Sotto brief. Keep background-learning admission and its spend
+chat model can compose a Sotto brief. Keep background-learning admission and its spend
 controls separate from that choice.
+
+### Managed brief timeout handling
+
+Authenticated native text calls labelled `brief_extract`, `brief_critic`, or `brief_revise`
+with the existing operation/run/attempt identifiers use a 120-second upstream socket wait
+at the proxy. Other workloads retain 300 seconds. This bounds an idle upstream wait, not
+total generation time or provider-side cancellation. The client retains its 300-second
+wait so the proxy can report the outcome. Brief responses are buffered up to the existing
+8 MiB response limit before success headers are sent.
+
+An uncertain brief socket timeout or provider HTTP 504 keeps the original spending reservation. The client does not
+retry or fall back, and its existing model journal prevents the same operation from
+retrying after restart. Failed extraction ends the generation job immediately; requested
+briefs use the existing one-time failure notice. Critic or revision uncertainty retains
+the existing best-effort behavior: retain the available draft and log the unavailable
+quality stage, without another paid attempt. A new explicit owner request is a new operation.
+
+Roll out the receiver/pack handling of `sotto_brief_outcome_uncertain` and exit 79 before
+updating the proxy. Older clients would treat a generic 504 as retryable. No provider
+charges are refunded or declared absent merely because a response timed out.

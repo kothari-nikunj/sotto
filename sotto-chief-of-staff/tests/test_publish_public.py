@@ -6,19 +6,19 @@ import subprocess
 import pytest
 
 
-HERMES = Path(__file__).resolve().parents[2]
+AGENT_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(
-    not (HERMES / "tools" / "publish-public.sh").is_file(),
+    not (AGENT_ROOT / "tools" / "publish-public.sh").is_file(),
     reason="The private publisher is not part of the public distribution.",
 )
 
 
 def _fixture(tmp_path: Path, docker_exit: int = 0):
     root = tmp_path / "source"
-    tools = root / "sotto-hermes" / "tools"
+    tools = root / "sotto-agent" / "tools"
     tools.mkdir(parents=True)
-    shutil.copy2(HERMES / "tools" / "publish-public.sh", tools / "publish-public.sh")
-    shutil.copy2(HERMES / "tools" / "verify-public-image.sh", tools / "verify-public-image.sh")
+    shutil.copy2(AGENT_ROOT / "tools" / "publish-public.sh", tools / "publish-public.sh")
+    shutil.copy2(AGENT_ROOT / "tools" / "verify-public-image.sh", tools / "verify-public-image.sh")
     generator = tools / "prepare-public-repo.sh"
     generator.write_text(
         "#!/usr/bin/env bash\n"
@@ -255,7 +255,7 @@ def test_a_preview_stays_a_preview_when_only_version_changed(tmp_path):
     for a tree that was never publishable."""
     root, publisher, _calls, env = _fixture(tmp_path)
     _seed_published_repo(tmp_path, env)
-    generator = root / "sotto-hermes" / "tools" / "prepare-public-repo.sh"
+    generator = root / "sotto-agent" / "tools" / "prepare-public-repo.sh"
     # Dirty the source: this run can only ever be a preview.
     generator.write_text(generator.read_text(encoding="utf-8") + "# dirty\n", encoding="utf-8")
 
@@ -291,7 +291,7 @@ def test_version_only_change_preserves_published_stamp_and_skips_push(tmp_path):
 
 def test_dirty_production_publish_refuses_before_workspace_or_docker(tmp_path):
     root, publisher, calls, env = _fixture(tmp_path)
-    (root / "sotto-hermes" / "tools" / "prepare-public-repo.sh").write_text("dirty\n", encoding="utf-8")
+    (root / "sotto-agent" / "tools" / "prepare-public-repo.sh").write_text("dirty\n", encoding="utf-8")
     work_parent = tmp_path / "work"
 
     proc = subprocess.run(

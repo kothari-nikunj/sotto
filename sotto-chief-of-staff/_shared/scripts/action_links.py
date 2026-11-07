@@ -45,7 +45,7 @@ def drafts_path() -> str:
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "events", "drafts.jsonl")
 
 
-def record_draft(channel: str, identifier: str, message: str, action_type: str = "") -> None:
+def record_draft(channel: str, identifier: str, message: str, action_type: str = "", *, stable_row: dict | None = None) -> dict | None:
     """One line per offered draft, including declines — they're presented as text, and the matcher
     still wants to know whether the user sent one. A draft with no supported recipient (see
     normalized_identifier) leaves no row: the outcome matcher could never match it back to a real
@@ -53,6 +53,30 @@ def record_draft(channel: str, identifier: str, message: str, action_type: str =
     message links (a bare "open the thread" tap) are likewise not drafts and leave no row."""
     if not (message or "").strip() or not normalized_identifier(channel, identifier):
         return
+    if stable_row is not None:
+        from sotto_log import bounded_append, _log_lock
+        from keys import draft_key
+        expected = {"ts", "channel", "identifier", "text", "action_type"}
+        if (set(stable_row) != expected or stable_row.get("channel") != channel.lower()
+                or stable_row.get("identifier") != normalized_identifier(channel, identifier)
+                or stable_row.get("text") != message or stable_row.get("action_type") != action_type.lower()
+                or not isinstance(stable_row.get("ts"), str)):
+            raise ValueError("offered draft mismatch")
+        datetime.fromisoformat(stable_row["ts"].replace("Z", "+00:00"))
+        path = drafts_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _log_lock(path):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        old = json.loads(line)
+                        if draft_key(old) == draft_key(stable_row):
+                            if old != stable_row:
+                                raise ValueError("offered draft collision")
+                            return {"recorded": True, "key": draft_key(stable_row)}
+            bounded_append(path, json.dumps(stable_row), DRAFTS_MAX_BYTES, DRAFTS_KEEP_LINES,
+                           already_locked=True)
+        return {"recorded": True, "key": draft_key(stable_row)}
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
         from sotto_log import bounded_append  # noqa: PLC0415

@@ -26,10 +26,7 @@ from __future__ import annotations
 
 import re
 
-try:  # Photon installs these shared modules inside its plugin package.
-    from .message_targets import strip_invalid_links
-except ImportError:
-    from message_targets import strip_invalid_links
+from message_targets import strip_invalid_links
 
 _MARKER_RE = re.compile(r"<!--.*?-->", re.S)
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$", re.M)
@@ -73,7 +70,8 @@ def to_imessage(text, *, normalize_style=True) -> str:
 
     Preserve words and web destinations; remove presentation syntax and encoded email
     actions that Messages cannot render usefully. Canonical archives stay untouched.
-    Idempotent because Hermes formats both before retries and at the send boundary.
+    Idempotent because it can run twice: the receiver formats at its delivery seam and Node
+    formats again at the Photon send boundary.
     """
     source = prose_punctuation(_s(text)) if normalize_style else _s(text)
     source = strip_invalid_links(source)
@@ -120,7 +118,7 @@ def compact_handled(text) -> str:
     match = re.search(r"^\*?(?:✅ )?Already Handled\*?[ \t]*$", text, flags=re.M)
     if not match:
         return text
-    end = re.search(r"^\*?(?:Filtered|Coming Up|Needs Attention Now|Should Handle Today)\*?[ \t]*$",
+    end = re.search(r"^\*?(?:Filtered|Coming Up|Needs Attention Now|Should Handle Today|Still Pending|Still open|What moved today|Weekly review)\*?[ \t]*$",
                     text[match.end():], flags=re.M)
     # Only recognized brief sections; a free-form chat answer is not a brief.
     if not end:

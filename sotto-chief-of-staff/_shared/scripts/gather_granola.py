@@ -50,13 +50,13 @@ import urllib.request
 _LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")
 sys.path.insert(0, _LIB)
 from connector_tokens import ConnectorAuthError, ConnectorMissing, get_access_token  # noqa: E402
-from mcp_client import McpClient  # noqa: E402
-
+from mcp_client import McpClient, open_connector_request  # noqa: E402
 SERVICE = "granola"
 DEFAULT_MCP_URL = "https://mcp.granola.ai/mcp"       # the Mac client's URL; connectors file may override
 REST_BASE = "https://public-api.granola.ai/v1"       # official REST API (Feb 2026, Business plans)
 REST_MIN_INTERVAL = 0.2                              # 5 req/s cap
-LIST_LIMIT = 50                                      # mirrors granola-mcp.ts fetchGranolaMeetings
+LIST_LIMIT = 50
+NO_TRANSCRIPT_TOOL_WARNING = 'no transcript tool on the Granola MCP — meetings carry notes/summaries only'
 DETAIL_BATCH = 10                                    # mcp.granola.ai get_meetings caps meeting_ids at 10
 
 # Tool-name tolerance (exact names first, in preference order; then substring fallback). The Mac
@@ -394,19 +394,16 @@ def _make_client(force_refresh: bool = False) -> McpClient:
 
 
 def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
-               client_factory=None, now=None) -> tuple[list, list]:
+               client_factory=None, now=None, *, metadata_only=False, selected_id=None,
+               max_meetings=None) -> tuple[list, list]:
     """List meetings via the Granola MCP, fetch transcripts for the recent window, map to the
     canonical shape. `client`/`client_factory` injectable for tests. Returns (meetings, warnings).
-    A 401 mid-session triggers ONE token refresh + retry (fresh client), then gives up."""
+    Authentication errors propagate to gather_mcp_with_retry, the sole refresh-budget owner."""
     factory = client_factory or _make_client
     warnings: list[str] = []
     if client is None:
-        try:
-            client = factory()
-            client.initialize()
-        except ConnectorAuthError:
-            client = factory(force_refresh=True)   # stale token on connect → refresh once
-            client.initialize()
+        client = factory()
+        client.initialize()
 
     tools = client.list_tools()
     list_tool = _pick_tool(tools, LIST_TOOL_EXACT, "meeting", exclude=("transcript", "folder", "account"))
@@ -439,6 +436,19 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
 
     windowed = [m for m in raw if isinstance(m, dict) and _in_window(m, days, now)]
 
+    if max_meetings is not None:
+        windowed = [m for m in windowed if _meeting_dt(m) is None
+                    or _meeting_dt(m) <= now]
+    if selected_id is not None:
+        windowed = [m for m in windowed if _meeting_id(m) == selected_id]
+    if max_meetings is not None and len(windowed) > max_meetings:
+        raise RuntimeError('meeting discovery exceeds bound')
+    if selected_id is not None and len(windowed) != 1:
+        return [map_meeting(m) for m in windowed], warnings
+    if metadata_only:
+        return [{**{k: mapped[k] for k in ('meeting_id', 'title', 'end')},
+                 'start': mapped['start'] or mapped['date'] or None}
+                for mapped in map(map_meeting, windowed)], warnings
     meetings, by_id = [], {}
     for m in windowed:
         mapped = map_meeting(m)
@@ -458,13 +468,19 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
 
     # The list tool hands back titles + metadata; the notes/summary the brief renders come from the
     # DETAIL tool. Fetch it for every meeting that still has nothing to say.
-    thin = [mid for mid, mapped in by_id.items() if not _has_content(mapped)]
+    thin = [mid for mid, mapped in by_id.items() if
+            (not (mapped.get("your_notes") or mapped.get("ai_summary"))
+             if selected_id is not None else not _has_content(mapped))]
     if thin and detail_tool:
         details = _fetch_details(client, detail_tool, _tool_props(tools, detail_tool), thin, warnings)
         for mid, detail in details.items():
             if mid in by_id:
                 _merge_content(by_id[mid], detail)
-        if not any(_has_content(by_id[mid]) for mid in thin):
+        if not any((by_id[mid].get("your_notes") or by_id[mid].get("ai_summary")
+                    or any(isinstance(details.get(mid, {}).get(field), str)
+                           for field in ("notes", "your_notes", "notes_markdown",
+                                         "summary", "ai_summary", "summary_markdown")))
+                   if selected_id is not None else _has_content(by_id[mid]) for mid in thin):
             # The detail tool answered with nothing we could key back — a shape/permission problem,
             # not a quiet week. SAY it: compose_brief turns a warning here into a "Meeting Notes
             # (Granola): unavailable" line instead of a silently note-less brief.
@@ -474,20 +490,20 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
         warnings.append(f"no meeting-detail tool on the Granola MCP — {len(thin)} meeting(s) carry "
                         f"titles only (no notes or summary to brief on)")
 
-    if not transcript_tool:
-        warnings.append("no transcript tool on the Granola MCP — meetings carry notes/summaries only")
+    if not transcript_tool and selected_id is None:
+        warnings.append(NO_TRANSCRIPT_TOOL_WARNING)
     return meetings, warnings
 
 
-def gather_mcp_with_retry(days: int, since_hours: int, client_factory=None, now=None) -> tuple[list, list]:
+def gather_mcp_with_retry(days: int, since_hours: int, client_factory=None, now=None, **options) -> tuple[list, list]:
     factory = client_factory or _make_client
     try:
-        return gather_mcp(days, since_hours, client_factory=factory, now=now)
+        return gather_mcp(days, since_hours, client_factory=factory, now=now, **options)
     except ConnectorAuthError:
         # Token went stale mid-session → refresh ONCE, fresh client, one retry.
         client = factory(force_refresh=True)
         client.initialize()
-        return gather_mcp(days, since_hours, client=client, now=now)
+        return gather_mcp(days, since_hours, client=client, now=now, **options)
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +513,7 @@ def gather_mcp_with_retry(days: int, since_hours: int, client_factory=None, now=
 def _default_http_get(url: str, headers: dict, timeout: int = 30):
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_connector_request(req, timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()

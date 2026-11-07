@@ -6,7 +6,7 @@ outbox.py — the durable delivery outbox (ROADMAP § Reliability P0, item 2).
 instead of dying.**
 
 THE BUG THIS EXISTS FOR. `receiver._deliver_text` already refuses to lie about a send — a failed
-`hermes send` leaves a loud `failed` receipt instead of a green one (Aug 2026, the seam that fixed
+send leaves a loud `failed` receipt instead of a green one (Aug 2026, the seam that fixed
 five nudge producers writing to a sink). But an honest receipt for a lost message is still a lost
 message: the words were composed, the interrupt budget was spent, the run cost real tokens, and a
 gateway that was down for ninety seconds threw all of it away. The Front Door plan puts a
@@ -19,17 +19,16 @@ the midday digest) reaches the channel through it, because every one of them is 
 `_spawn_and_deliver` and delivered by that function. So the outbox wraps exactly that call:
 enqueue BEFORE the first send attempt, transition only on the channel's ack. One writer, one file.
 
-WHAT THE CHANNEL ACKNOWLEDGES. The shared Hermes adapter requires structured success and a
-provider message ID. CLI exit zero alone is insufficient. The outbox retains this acceptance
-receipt, then applies the delivery effects. Acceptance does not prove device arrival or reading;
+WHAT THE CHANNEL ACKNOWLEDGES. The runtime adapter requires a structured acceptance receipt for
+the outbox's stable dispatch identity. The outbox retains this acceptance receipt, then applies the
+delivery effects. Acceptance does not prove device arrival or reading;
 a spawned model run exiting zero says nothing about delivery. Failed effects retry five times
 without sending the message again, then quarantine: the acceptance receipt, the label, the run id
 and the reason stay on file, and the effects' per-source addressing leaves it exactly as it does on
 the applied path — a row that will never replay has no use for a handle or a thread id.
 
-WHERE THE CHANNEL-HEALTH GATE STAYS. `receiver._delivery_channel_ready` is an on-disk probe (are
-there WhatsApp creds?), and by its own docstring it cannot tell a live channel from a dead one. It
-therefore stays exactly where it already earns its keep — UPSTREAM, before triage spends a nudge of
+WHERE THE CHANNEL-HEALTH GATE STAYS. `receiver._delivery_channel_ready` is a setup probe (has the
+owner linked this channel?), and it cannot tell a live channel from a dead one. It therefore stays exactly where it already earns its keep — UPSTREAM, before triage spends a nudge of
 the daily interrupt budget — and it is deliberately NOT repeated here. At this seam the real probe
 is the send itself, so the outbox never refuses to try. That also settles the budget question the
 obvious way: a nudge is never DECIDED while the channel is known down, so a queued-then-expired row
@@ -37,13 +36,12 @@ never spent budget there is nothing to refund. What changed is the other half �
 the budget is already spent and throwing them away is pure loss, so a channel that fails now means
 "queued and retried", never "dropped".
 
-THE ONE THING IT CANNOT PROMISE. If the process dies in the window between the channel accepting a
-message and this module recording that it did, the row is still pending and the next drain sends it
-again. The attempt is charged BEFORE the send precisely so that window is bounded by
-`MAX_ATTEMPTS` rather than unbounded — a duplicate brief is a nuisance, a silently lost one is the
-failure this module exists to end. Concurrent drains are serialized within the tenant runtime, and state transitions use
-`json_transaction`'s locked read-modify-write. Provider timeouts can still have unknown acceptance;
-this is bounded retry with duplicate suppression, not a universal exactly-once guarantee.
+THE ONE THING IT CANNOT PROMISE. A process can die between provider acceptance and recording the
+reply. The outbox holds ambiguous text and gallery outcomes for receipt reconciliation instead of
+automatically replaying them. An absent receipt cannot prove
+absence of provider contact; such a row remains pending for explicit reconciliation. Concurrent
+drains are serialized within the tenant runtime, and state transitions use `json_transaction`'s
+locked read-modify-write. This is not a universal exactly-once guarantee.
 
 THE DELIVER-ONCE GATE IS MACHINERY HERE, NOT A PROMPT (Aug 30, 2026). The evening brief went out
 twice — the cron lane claimed `briefs/<day>.evening.delivered` at 17:34 and delivered, and the
@@ -76,7 +74,8 @@ only catches one whose clock stopped moving.
 WHAT IT KEEPS, AND FOR HOW LONG. Message text is removed when a row becomes terminal.
 Delivered rows retain provider receipts and replayable effects until those effects settle;
 invalidated rows retain only the replacement-enqueue intent until it succeeds. Closed rows are
-pruned after RETENTION_SECS, except unfinished effects. The pre-delivery work queue separately
+pruned after RETENTION_SECS, except unfinished effects and terminal rows whose `on_terminal` hook has
+not yet reconciled them (they carry `terminal_reconciled` and wait for the producer, one per item). The pre-delivery work queue separately
 retains composed results for its bounded recovery period.
 
 Loaded by receiver.py via importlib (the relay/connectors/dashboard/calcache pattern); the receiver
@@ -97,6 +96,7 @@ import sys
 import threading
 import time
 import fcntl
+import re
 
 # The tree's ONE content-id scheme (sha256 of a line, 16 hex). keys.py is the byte-identical
 # vendored copy the receiver image carries; the outbox's idempotency key is that scheme applied to
@@ -118,8 +118,9 @@ HOOKS = {
     # THE locked read-modify-write for this image (connectors.json_transaction). No sane default:
     # an unlocked outbox is an outbox that double-sends.
     "json_transaction": _unwired("json_transaction"),
-    # (body, target) -> (ok, detail). receiver._send_via_channel — the ONE call that touches the
-    # channel, and the ONE function to strengthen when a channel offers a real receipt.
+    # (body, target, dispatch_id, attempt) -> (ok, detail, receipt). receiver._send_with_identity —
+    # the ONE call that touches the channel. The outbox's durable key and charged attempt number
+    # are the chat runtime's dispatch identity.
     "send": _unwired("send"),
     "send_gallery": _unwired("send_gallery"),
     "gallery_receipt": lambda key: None,
@@ -133,8 +134,44 @@ HOOKS = {
     # "send" for them), because that path already has exactly one owner and it is not this module.
     "brief_gate": _unwired("brief_gate"),
     "valid": lambda payload: True,
+    "delivery_ready": lambda payload: True,
     "on_invalid": lambda payload: None,
+    "on_terminal": lambda row: True,  # persist producer outcome before receipt retention ends
+    # A routine-only live authority check. Unwired by default so a staged or
+    # recovered routine cannot contact the channel merely by carrying a digest.
+    "routine_authorized": lambda payload: False,
+    # Receiver-owned current source + channel observation. Failure affects only
+    # future retained-text proof, never whether the original message is sent.
+    "retained_proof_current": lambda proof: False,
 }
+
+
+def _retained_candidate(payload):
+    presentation = payload.get('presentation') if isinstance(payload, dict) else None
+    text_artifact = payload.get('retained_text_artifact') if isinstance(payload, dict) else None
+    proof = (presentation.get('retained_text_proof') if isinstance(presentation, dict)
+             else text_artifact.get('retained_text_proof') if isinstance(text_artifact, dict) else None)
+    expected_versions = (1, 2) if isinstance(presentation, dict) else (3,)
+    if (not isinstance(proof, dict) or set(proof) != {
+            'version', 'source_revision', 'route_digest', 'content_sha256',
+            'gallery_payload_sha256', 'image_sha256s'}
+            or type(proof['version']) is not int or proof['version'] not in expected_versions
+            or any(not isinstance(proof[key], str) or re.fullmatch(r'[a-f0-9]{64}', proof[key]) is None
+                   for key in ('source_revision', 'route_digest', 'content_sha256',
+                               'gallery_payload_sha256'))
+            or not isinstance(proof['image_sha256s'], list)
+            or len(proof['image_sha256s']) != (0 if proof['version'] == 3 else 4)
+            or any(not isinstance(item, str) or re.fullmatch(r'[a-f0-9]{64}', item) is None
+                   for item in proof['image_sha256s'])):
+        return None
+    return proof
+
+
+def _retained_current(proof):
+    try:
+        return proof is not None and HOOKS['retained_proof_current'](proof) is True
+    except Exception:
+        return False
 
 # ── The constants (this module is their one writer) ──────────────────────────────────────────────
 
@@ -170,10 +207,9 @@ DRAIN_INTERVAL_SECS = 60      # its own beat, not the valve's: a brief must not 
 # never seems to end (a clock jump, a stuck timezone) still stops, loudly, instead of forever.
 MAX_ATTEMPTS = 96
 MAX_EFFECT_ATTEMPTS = 5       # accepted messages never resend; broken effects quarantine after five tries
-# MUST equal triage_event.VALVE_MAX_AGE_MIN — the funnel's own "a held nudge this old is not worth
-# promoting" number. Copy-plus-guard, exactly like keys.py and the dashboard's mirror of the same
-# constant: tests/test_docs_drift.py fails the suite if the two ever disagree.
-NUDGE_MAX_AGE_MIN = 240
+from shared_lib import load_shared_lib  # noqa: E402
+
+NUDGE_MAX_AGE_MIN = load_shared_lib('funnel_policy', anchor=__file__).VALVE_MAX_AGE_MIN
 RETENTION_SECS = 7 * 24 * 3600   # terminal rows linger a week so "what failed?" has an answer
 
 _DRAIN_LOCK = threading.Lock()   # one drain at a time, whatever calls it
@@ -205,6 +241,24 @@ def message_key(label: str, body: str) -> str:
     `keys.queue_key` — the tree's existing content-id — over `label` and the words, not a second
     hashing convention."""
     return _content_id(f"{label}\n{body}")
+
+
+def routine_payload_digest(payload: dict) -> str:
+    """Full SHA-256 binding for an opted-in routine's immutable handoff.
+
+    This does not replace the existing content-id or change generic duplicate
+    run behavior. The digest is retained without the body after terminal scrub.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError('invalid routine outbox payload')
+    frozen = {key: value for key, value in payload.items()
+              if key != 'routine_handoff_digest'}
+    try:
+        encoded = json.dumps(frozen, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=False, allow_nan=False).encode('utf-8')
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ValueError('invalid routine outbox payload') from error
+    return hashlib.sha256(b'sotto-routine-outbox-v1\0' + encoded).hexdigest()
 
 
 def kind_for(label: str) -> str:
@@ -240,7 +294,28 @@ def _prune(rows: list, now: float) -> list:
     transition may end a row's life — that is the whole promise)."""
     return [r for r in rows
             if r.get("status") not in TERMINAL or r.get("effects_pending")
+            or not _reconcile_terminal(r)
             or (now - float(r.get("finished_at") or r.get("created_at") or 0)) <= RETENTION_SECS]
+
+
+def _reconcile_terminal(row):
+    if row.get('terminal_reconciled'):
+        return True
+    try:
+        if HOOKS['on_terminal'](dict(row)) is False:
+            return False
+    except Exception:
+        return False  # retain the outcome until its producer can durably acknowledge it
+    row['terminal_reconciled'] = True
+    return True
+
+
+def reconcile_terminal():
+    """Recover producer state even after a crash between terminal delivery and its effect."""
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        for row in _rows(doc):
+            if row.get('status') in TERMINAL and not row.get('effects_pending'):
+                _reconcile_terminal(row)
 
 
 def _find(rows: list, key: str):
@@ -258,6 +333,7 @@ def _close(row: dict) -> dict:
     the Record need — and nothing a person said. Storing a delivered brief's text for a week would
     be exactly the situational keeping the standing bars forbid."""
     payload = dict(row.get("payload") or {})
+    row.pop('offer_route_at_contact', None)
     row.setdefault("finished_at", time.time())
     row["payload"] = {"label": payload.get("label") or ""}
     return payload
@@ -289,6 +365,9 @@ def _expiry(row: dict, now: float, today: str):
     valid_until = payload.get('valid_until')
     if valid_until is not None and now >= float(valid_until):
         return STATUS_EXPIRED, 'the useful delivery window has ended'
+    # Missed explicit timers have their own bounded deadline, independent of brief days.
+    if str(payload.get('label', '')).startswith('owner-reminder-status:') and valid_until is not None:
+        return None
     kind = row.get("kind")
     if kind == KIND_NUDGE:
         age = now - float(row.get("created_at") or 0)
@@ -312,17 +391,40 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
         rows = _prune(_rows(doc), now)
         row = _find(rows, key)
+        routine_digest = payload.get('routine_handoff_digest')
+        if routine_digest is not None:
+            if (not isinstance(routine_digest, str) or len(routine_digest) != 64 or
+                    routine_digest != routine_payload_digest(payload)):
+                raise RuntimeError('routine outbox handoff digest is invalid')
         if row is None:
             row = {"id": key, "kind": kind, "created_at": now, "day": today, "attempts": 0,
                    "next_at": now, "last_error": "", "status": STATUS_PENDING, "payload": payload,
                    'acceptance': 'not_attempted', 'acceptance_uncertain': False}
+            if routine_digest is not None:
+                row['routine_handoff_digest'] = routine_digest
             rows.append(row)
+        elif routine_digest is not None and row.get('routine_handoff_digest') != routine_digest:
+            raise RuntimeError('routine outbox handoff conflicts with prior row')
         doc["rows"] = rows
         return str(row.get("status") or STATUS_PENDING)
 
 
-def enqueue_work_feedback(job: dict) -> bool:
+def feedback_skill(label: str) -> str | None:
+    """Exact owner-requested skill labels eligible for route-bound terminal notices."""
+    match = re.fullmatch(r'skill:[a-f0-9]{64}:(meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)
+    if match:
+        return match[1]
+    if re.fullmatch(r'meeting-prep:(?:[a-f0-9]{32}|[a-f0-9]{64})', label):
+        return 'meeting-prep'
+    return None
+
+
+def enqueue_work_feedback(job: dict, *, enqueue: bool = True) -> bool | str:
     """Atomically inspect delivery and enqueue one content-free requested-work outcome.
+
+    True means no notice is owed (or it is already enqueued) and the caller may clear the job's
+    feedback; False means not yet decidable. With enqueue=False nothing is written and a notice
+    that would be enqueued now is reported as 'notice' instead.
 
     Work completion is only a handoff, not proof of delivery. Unknown acceptance gets an honest
     status notice after ten minutes, never a replacement send or a claim that nothing arrived.
@@ -339,15 +441,20 @@ def enqueue_work_feedback(job: dict) -> bool:
         if _find(rows, key) is not None:
             return True
         original = _find(rows, job['id'])
+        skill = feedback_skill(meta['label'])
+        # A completed skill with no original row produced nothing to deliver. That is success, not
+        # failure: an urgent scan stays silent by design; any other requested skill says so plainly.
+        quiet_done = bool(skill and job['status'] == 'done' and original is None)
+        if quiet_done and skill == 'proactive':
+            return True
         uncertain = False
         if original is not None:
             if original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted':
                 return True
             uncertain = bool(original.get('acceptance_uncertain') or original.get('acceptance') in (
                 'unknown', 'in_flight'))
-            if original.get('status') == STATUS_PENDING and (not uncertain or not (
-                    original.get('payload') or {}).get('presentation')):
-                return False  # Delivery still has a retry budget; the work row being done isn't failure.
+            if original.get('status') == STATUS_PENDING and not uncertain:
+                return False  # Uncontacted/retryable delivery still owns the original result.
             stamp = float(original.get('finished_at') or original.get('created_at') or now)
             if uncertain:
                 stamp = float(original.get('created_at') or now) + 600
@@ -359,15 +466,30 @@ def enqueue_work_feedback(job: dict) -> bool:
             return False
         if now - stamp >= 4 * 3600:
             return True
-        kind = 'morning' if meta['label'].endswith('sotto-morning-brief') else 'evening'
-        body = (f"I couldn't confirm whether your requested {kind} brief arrived. "
-                "Please check the conversation before requesting another copy." if uncertain else
-                f"I couldn't finish your requested {kind} brief. I won't keep retrying this request. "
-                "Please ask me for it again when you're ready.")
+        descriptions = {'meeting-prep': 'meeting prep', 'ask-research': 'research',
+                        'followup': 'follow-up', 'relationship-pulse': 'relationship pulse',
+                        'proactive': 'urgent check'}
+        description = (descriptions[skill] if skill else
+                       ('morning' if meta['label'].endswith('sotto-morning-brief') else 'evening') + ' brief')
+        if uncertain:
+            body = (f"I couldn't confirm whether your requested {description} arrived. "
+                    "Please check the conversation before requesting another copy.")
+        elif quiet_done:
+            body = f"I finished your requested {description}, but there was nothing to send."
+        elif skill:
+            body = (f"I couldn't finish your requested {description}. "
+                    "I won't keep retrying this request.")
+        else:
+            body = (f"I couldn't finish your requested {description}. I won't keep retrying this request. "
+                    "Please ask me for it again when you're ready.")
+        if not enqueue:
+            return 'notice'
         payload = {'label': 'request-feedback:' + job['id'], 'body': body, 'target': meta['target'],
                    'run_id': key, 'effects': [], 'valid_until': stamp + 4 * 3600,
                    'feedback_for': job['id'], 'feedback_owner': meta['owner'],
                    'feedback_chat_id': meta['chat_id']}
+        if skill:
+            payload['feedback_route_digest'] = meta.get('route_digest')
         rows.append({'id': key, 'kind': KIND_NUDGE, 'created_at': now, 'day': today,
                      'attempts': 0, 'next_at': now, 'last_error': '', 'status': STATUS_PENDING,
                      'payload': payload, 'acceptance': 'not_attempted', 'acceptance_uncertain': False})
@@ -375,10 +497,12 @@ def enqueue_work_feedback(job: dict) -> bool:
     return True
 
 
+
+
 def _claim(key: str, now: float, today: str):
     """Charge one attempt and hand back what to send, or say why not. One transaction, three
     answers: `None` (nothing to do — terminal, or not due yet), `aged` (it timed out — terminal),
-    `held` (an ambiguous gallery stays pending for receipt reconciliation), or `send` (go, with
+    `held` (an ambiguous send stays pending for receipt reconciliation), or `send` (go, with
     `(attempts, day)` — the brief gate needs the row's own day, not the clock's).
 
     The attempt is charged BEFORE the send, under the lock: a crash mid-send then looks exactly like
@@ -396,11 +520,9 @@ def _claim(key: str, now: float, today: str):
             row['last_error'] = 'requested delivery confirmed before feedback send'
             _close(row)
             return None
-        # Once a gallery crossed the provider boundary, relevance expiry cannot prove it was not
-        # accepted. Keep its replay inputs and poll only on the existing capped backoff; the
-        # deliver-once gate remains closed in `_begin_send`, so this never authorizes another send.
-        if ((row.get('payload') or {}).get('presentation')
-                and row.get('acceptance') in ('unknown', 'in_flight')):
+        # Once a send crossed the provider boundary, relevance expiry cannot prove it was not
+        # accepted. Keep its replay identity and poll only on the existing capped backoff.
+        if row.get('acceptance') in ('unknown', 'in_flight'):
             if now < float(row.get('next_at') or 0):
                 return None
             row['attempts'] = min(int(row.get('attempts') or 0) + 1, MAX_ATTEMPTS)
@@ -434,6 +556,12 @@ def _supersede(key: str, detail: str, recompose=False):
             row['effect_phase'] = 'invalidate'
             row['effects_next_at'] = 0
             row['payload'] = {k: v for k, v in payload.items() if k in ('label', 'valid_until')}
+            if row.get('routine_handoff_digest') is not None:
+                row['payload'].update(target=payload.get('target'),
+                                      routine_handoff_digest=row['routine_handoff_digest'])
+                for field in ('routine_source_revision', 'routine_route_digest'):
+                    if field in payload:
+                        row['payload'][field] = payload[field]
             row['payload'].update(run_id=payload.get('run_id') or key, day=row.get('day'),
                                   acceptance=row.get('acceptance', 'unknown'),
                                   acceptance_uncertain=bool(row.get('acceptance_uncertain')))
@@ -452,22 +580,26 @@ def invalidated_claim(run_id, day, label):
                 and not row.get('acceptance_uncertain'))
 
 
-def _begin_send(key):
+def _begin_send(key, retained_at_contact=False, offer_route=None):
     """Persist ambiguity before the provider call, including a crash without a response."""
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
         if not row or row.get('status') != STATUS_PENDING:
             return False
-        if ((row.get('payload') or {}).get('presentation')
-                and row.get('acceptance') in ('unknown', 'in_flight')):
-            return False  # multipart acceptance is ambiguous; never resend the gallery blindly
+        if row.get('acceptance') in ('unknown', 'in_flight'):
+            return False  # provider acceptance is ambiguous; never resend blindly
         if row.get('acceptance', 'unknown') in ('unknown', 'in_flight'):
             row['acceptance_uncertain'] = True
         row['acceptance'] = 'in_flight'
+        row['retained_proof_at_contact'] = retained_at_contact is True
+        if offer_route:
+            row['offer_route_at_contact'] = dict(offer_route)
+        else:
+            row.pop('offer_route_at_contact', None)
         return True
 
 
-def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
+def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None, *, retained_now=False):
     """Record the channel's answer. Delivered exactly once: a row already terminal is left alone, so
     two drains racing the same message cannot both mark it delivered or both give up on it."""
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
@@ -479,15 +611,34 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
         if ok:
             row['acceptance'] = 'accepted'
             row["status"], row["last_error"] = STATUS_DELIVERED, ""
+            offer_route = row.get('offer_route_at_contact')
             payload = _close(row)
             row['receipt'] = {**(receipt or {}), 'accepted_at': time.time()}
             visual_id = artifact_id(payload.get('presentation'))
-            if visual_id:
-                row['receipt']['visual_artifact_id'] = visual_id
+            text_artifact = payload.get('retained_text_artifact')
+            text_id = text_artifact.get('id') if isinstance(text_artifact, dict) else None
+            if visual_id or (isinstance(text_id, str) and re.fullmatch(r'[a-f0-9]{24}', text_id)):
+                row['receipt']['visual_artifact_id' if visual_id else 'text_artifact_id'] = visual_id or text_id
                 row['receipt']['target_hash'] = hashlib.sha256(str(payload.get('target') or '').encode()).hexdigest()
+                proof = _retained_candidate(payload)
+                if (proof is not None and row.get('retained_proof_at_contact') is True
+                        and retained_now is True and isinstance(receipt, dict)
+                        and type(receipt.get('route_proof_version')) is int
+                        and receipt['route_proof_version'] == 1
+                        and receipt.get('route_digest') == proof['route_digest']
+                        and receipt.get('payload_hash') == proof['gallery_payload_sha256']):
+                    row['receipt']['retained_text_proof'] = proof
             # Drop message text immediately, retain only replayable post-acceptance effects.
             row['payload'] = {k: v for k, v in payload.items() if k in
                               ('label', 'effects', 'run_id', 'coverage_until', 'decision_ids')}
+            if row.get('routine_handoff_digest') is not None:
+                row['payload'].update(target=payload.get('target'),
+                                      routine_handoff_digest=row['routine_handoff_digest'])
+                for field in ('routine_source_revision', 'routine_route_digest'):
+                    if field in payload:
+                        row['payload'][field] = payload[field]
+            if offer_route:
+                row['payload']['offer_route_at_contact'] = offer_route
             row['payload']['receipt'] = row['receipt']
             row['effects_pending'] = True
             row['effects_next_at'] = 0
@@ -497,8 +648,7 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
         if row['acceptance'] == 'unknown':
             row['acceptance_uncertain'] = True
         row["last_error"] = detail[:300]
-        if (row['acceptance'] == 'unknown'
-                and (row.get('payload') or {}).get('presentation')):
+        if row['acceptance'] == 'unknown':
             # Attempt exhaustion cannot turn an ambiguous provider commit into a definitive
             # failure. Keep the reconciliation identity; `_claim` will hold it without resending.
             return ("retry", dict(row.get("payload") or {}))
@@ -508,7 +658,7 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None):
         return ("retry", dict(row.get("payload") or {}))
 
 
-def _definitive_gallery_failure(key: str, acceptance: str) -> None:
+def _definitive_receipt_failure(key: str, acceptance: str) -> None:
     """A sidecar receipt can prove a prior operation stopped before provider dispatch."""
     if acceptance not in ('not_attempted', 'rejected'):
         return
@@ -519,7 +669,7 @@ def _definitive_gallery_failure(key: str, acceptance: str) -> None:
             row['acceptance_uncertain'] = False
 
 
-def _reconcile_gallery(key: str) -> bool:
+def _reconcile_ambiguous_send(key: str) -> bool:
     """Record a provider acceptance before expiry/validity can suppress future delivery.
 
     This never sends. Only a bounded provider message id is acceptance evidence; every missing,
@@ -527,7 +677,7 @@ def _reconcile_gallery(key: str) -> bool:
     """
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
-        if (not row or row.get('status') != STATUS_PENDING or not (row.get('payload') or {}).get('presentation')
+        if (not row or row.get('status') != STATUS_PENDING
                 or row.get('acceptance') not in ('unknown', 'in_flight')):
             return False
         if time.time() < float(row.get('next_at') or 0):
@@ -544,12 +694,15 @@ def _reconcile_gallery(key: str) -> bool:
     message_id = late.get('message_id')
     if (acceptance == 'accepted' and isinstance(message_id, str)
             and 0 < len(message_id) <= 512):
-        settled = _settle(key, True, '', attempts, late)
+        with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+            candidate = _retained_candidate((_find(_rows(doc), key) or {}).get('payload'))
+        settled = _settle(key, True, '', attempts, late,
+                          retained_now=_retained_current(candidate))
         if settled is not None:
             _payload_receipt(settled[1], STATUS_DELIVERED)
             _apply_effects(key)
         return True
-    _definitive_gallery_failure(key, acceptance)
+    _definitive_receipt_failure(key, acceptance)
     return False
 
 
@@ -561,6 +714,19 @@ def _payload_receipt(payload: dict, status: str, detail: str = "") -> None:
                     run_id=payload.get("run_id") or "")
 
 
+def _routine_authorized(payload: dict, expected_digest=None) -> bool:
+    if expected_digest is None and 'routine_handoff_digest' not in payload:
+        return True
+    try:
+        if not isinstance(expected_digest, str) or payload.get('routine_handoff_digest') != expected_digest:
+            return False
+        if 'body' in payload and payload['routine_handoff_digest'] != routine_payload_digest(payload):
+            return False
+        return HOOKS['routine_authorized'](payload) is True
+    except Exception:
+        return False
+
+
 def _attempt(key: str) -> bool:
     """One send attempt for one row. True iff the CHANNEL acknowledged it."""
     now, today = time.time(), str(HOOKS["local_today"]() or "")
@@ -569,8 +735,24 @@ def _attempt(key: str) -> bool:
             return False          # another thread is already sending this exact message
         _INFLIGHT.add(key)
     try:
-        if _reconcile_gallery(key):
+        with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+            row = _find(_rows(doc), key)
+            original = dict(row.get('payload') or {}) if row else None
+            snapshot = dict(row) if row else None
+            routine_digest = row.get('routine_handoff_digest') if row else None
+        if original is not None and not _routine_authorized(original, routine_digest):
+            return False
+        if _reconcile_ambiguous_send(key):
             return True
+        # Cadence holds do not spend a send attempt; expiry and uncertain receipts retain
+        # their existing owner even while delivery is quiet. Readiness failures hold this row.
+        if (snapshot and snapshot.get('acceptance') not in ('unknown', 'in_flight')
+                and _expiry(snapshot, now, today) is None):
+            try:
+                if not HOOKS['delivery_ready'](original or {}):
+                    return False
+            except Exception:
+                return False
         claim = _claim(key, now, today)
         if claim is None:
             return False
@@ -634,19 +816,29 @@ def _attempt(key: str) -> bool:
                               flush=True)
                 return False
         receipt = {}
-        if not _begin_send(key):
+        if not _routine_authorized(payload, routine_digest):
+            return False
+        candidate = _retained_candidate(payload)
+        capture = HOOKS.get('offer_route')
+        offer_route = capture(payload) if capture else {}
+        if offer_route is None:
+            return False
+        if not _begin_send(key, _retained_current(candidate), offer_route):
             return False
         try:
             if payload.get('presentation'):
                 answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '', key)
             else:
-                answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '')
+                revision = payload.get('prep_source_revision')
+                context = {'source_revision': revision} if isinstance(revision, str) and re.fullmatch(r'[a-f0-9]{64}', revision) else {}
+                answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '', key, attempts, **context)
             ok, detail = answer[:2]
             receipt = answer[2] if len(answer) > 2 else {}
         except Exception as e:  # a send that raises has unknown acceptance, never confirmed delivery
             ok, detail = False, type(e).__name__
             receipt = {'acceptance': 'unknown'}
-        settled = _settle(key, ok, detail, attempts, receipt)
+        settled = _settle(key, ok, detail, attempts, receipt,
+                          retained_now=_retained_current(candidate))
         if settled is None:
             return bool(ok)
         state, payload = settled
@@ -700,9 +892,16 @@ def _apply_effects_locked(key):
     exhausted = None
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
+        candidate = dict(row.get('payload') or {}) if row and row.get('effects_pending') else None
+        routine_digest = row.get('routine_handoff_digest') if row else None
+    if candidate is not None and not _routine_authorized(candidate, routine_digest):
+        return False
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), key)
         if not row or not row.get('effects_pending') or now < row.get('effects_next_at', 0):
             return False
         payload = dict(row.get('payload') or {})
+        routine_digest = row.get('routine_handoff_digest')
         phase = row.get('effect_phase', 'accepted')
         # The attempt is persisted before invoking external effect code so a process death counts.
         # On recovery, quarantine an already exhausted row before calling that crashing code again.
@@ -717,6 +916,8 @@ def _apply_effects_locked(key):
         _record_effect_quarantine(exhausted, phase)
         return False
     try:
+        if not _routine_authorized(payload, routine_digest):
+            return False
         # None is the legacy hook's successful return; explicit False is a retryable failure.
         ok = HOOKS['on_invalid' if phase == 'invalidate' else 'on_delivered'](payload) is not False
     except Exception as error:
@@ -771,6 +972,29 @@ def deliver(payload: dict) -> bool:
     if _enqueue(key, kind_for(label), payload, now, today) != STATUS_PENDING:
         return False          # this exact message already reached a terminal state — no double-send
     return _attempt(key)
+
+
+def receipt_for_run(run_id: str, expected_digest: str) -> dict | None:
+    """Outbox-owned compact proof; no body, target, or provider identifier escapes.
+
+    Terminal receipts retain for seven days only. Missing evidence remains a
+    routine hold, never permission to infer acceptance from WorkQueue.done.
+    """
+    if not isinstance(run_id, str) or not isinstance(expected_digest, str):
+        raise ValueError('invalid routine outbox lookup')
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        row = _find(_rows(doc), run_id)
+        if row is None:
+            return None
+        if row.get('routine_handoff_digest') != expected_digest:
+            raise RuntimeError('routine outbox receipt identity conflict')
+        receipt = row.get('receipt') or {}
+        return {'kind': 'outbox', 'run_id': run_id, 'digest': expected_digest,
+                'status': row.get('status'), 'acceptance': row.get('acceptance'),
+                'acceptance_uncertain': row.get('acceptance_uncertain'),
+                'effects_pending': row.get('effects_pending'),
+                'effects_status': row.get('effects_status'),
+                'accepted_at': receipt.get('accepted_at')}
 
 
 def drain() -> dict:

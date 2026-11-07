@@ -19,6 +19,7 @@ def _load(name, relpath):
 
 pp = _load("persist_prep", "meeting-prep/scripts/persist_prep.py")
 import knowledge as kg  # noqa: E402
+import knowledge_update as ku  # noqa: E402
 
 RESEARCH = {"attendees": [
     {"email": "dana@acme.com", "title": "CEO", "company": "Acme", "summary": "Leads Acme's platform org."},
@@ -225,7 +226,8 @@ def test_persist_drops_unsourced_recency_items(tmp_path, monkeypatch):
 
 def test_persist_company_fallback_and_sentinel_suppressed(tmp_path, monkeypatch):
     # Person → company degradation: the sentinel "No public profile found." is a research MISS and
-    # never becomes a fact; the company_summary DOES persist (with the research provenance label).
+    # never becomes a fact. The company_summary describes the employer: it becomes the company's
+    # About, never a fact about the person that resurfaces in later preps.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     research = {"attendees": [{"email": "nelson@cobalt-research.com", "title": None,
                                "company": "Cobalt Research", "summary": "No public profile found.",
@@ -236,9 +238,48 @@ def test_persist_company_fallback_and_sentinel_suppressed(tmp_path, monkeypatch)
     with open(path, encoding="utf-8") as f:
         p = kg.parse_person_file(f.read())
     (fact,) = p.facts.values()
-    assert fact.text == "Per web search: Cobalt Research — Cobalt Research does battery-materials analytics."
+    assert fact.text == "Per web search: Cobalt Research"
     assert "No public profile found" not in fact.text
     assert fact.source == "web_research"
+    company = ku.company_knowledge(company_name="Cobalt Research", domain="cobalt-research.com")
+    assert company["about"] == "Cobalt Research does battery-materials analytics."
+    assert company["updated_by"] == "web_research"
+
+
+def test_re_research_supersedes_a_bio_that_carried_the_company_summary(tmp_path, monkeypatch):
+    # Earlier runs folded the company summary into the bio. The next run's bio overlaps it, and a
+    # BUMP would keep (and strengthen) the employer blurb on the person: it must replace it.
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    stale = "Per web search: CEO at Acme — Leads Acme's platform org. — Acme sells payments rails."
+    ku.apply({"person_updates": [{"person_name": "Dana Roe", "identifier": "dana@acme.com",
+                                  "facts": [{"fact": stale, "confidence": 0.55,
+                                             "memory_type": "context", "source": "web_research",
+                                             "source_ref": "meeting-prep-research:2026-08-01"}]}]},
+             now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    research = {"attendees": [dict(RESEARCH["attendees"][0],
+                                   company_summary="Acme sells payments rails.")]}
+    pp.persist(research, ATTENDEES_IN, now=datetime(2026, 9, 15, tzinfo=timezone.utc))
+    _, p = _person(tmp_path)
+    (old,) = [f for f in p.facts.values() if f.text == stale]
+    assert old.status == "archived" and old.archived_reason == "superseded"
+    assert old.seen == 1 and old.conf == 0.55                  # retired, never reinforced
+    assert [f.text for _, f in kg.sorted_active_facts(p.facts)] == [
+        "Per web search: CEO at Acme — Leads Acme's platform org."]
+    # The same words from a later run are corroboration, not a replacement.
+    pp.persist(research, ATTENDEES_IN, now=datetime(2026, 10, 15, tzinfo=timezone.utc))
+    _, p = _person(tmp_path)
+    ((_, bio),) = kg.sorted_active_facts(p.facts)
+    assert bio.seen == 2 and len(p.facts) == 2
+
+
+def test_a_research_miss_never_thins_the_earlier_bio(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    pp.persist(RESEARCH, ATTENDEES_IN, now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    miss = {"attendees": [dict(RESEARCH["attendees"][0], summary="No public profile found.")]}
+    pp.persist(miss, ATTENDEES_IN, now=datetime(2026, 9, 15, tzinfo=timezone.utc))
+    _, p = _person(tmp_path)
+    assert [f.text for _, f in kg.sorted_active_facts(p.facts)] == [
+        "Per web search: CEO at Acme — Leads Acme's platform org."]
 
 
 def test_cli_persist_noop_on_missing_input(tmp_path):
@@ -248,7 +289,9 @@ def test_cli_persist_noop_on_missing_input(tmp_path):
         [sys.executable, os.path.join(ROOT, "meeting-prep", "scripts", "persist_prep.py"),
          "--research", str(tmp_path / "nope.json")], env=env, capture_output=True, text=True)
     assert proc.returncode == 0
-    assert json.loads(proc.stdout) == {"persisted": 0, "people": [], "companies": []}
+    result = json.loads(proc.stdout)
+    assert result['persisted'] == 0 and result['complete'] is True
+    assert result['outcomes'] == {'people': [], 'companies': []}
 
 
 # ── Company research compounds into COMPANY files ────────────────────────────────────────────────
@@ -289,21 +332,20 @@ def test_company_deep_dive_lands_in_the_company_file(tmp_path, monkeypatch):
     assert any("Per web search" in f.text for f in p.facts.values())
 
 
-def test_company_deep_dive_is_read_back_as_known_on_the_next_dig(tmp_path, monkeypatch):
+def test_company_deep_dive_is_retained_locally_but_excluded_from_next_provider_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     pp.persist(FOCUS_RESEARCH, [])
     ra = _load("ra_known", "_shared/scripts/research_attendees.py")
-    known = ra._known_company({"email": "dana@commenda.io"}, "Commenda")
+    known = _company(tmp_path)
     assert "Global tax filing tied to each payment" in known
     assert "Series A led by Nexus" in known           # news rides along as already-known
-    prompt = ra._build_focus_prompt({"name": "Dana", "email": "dana@commenda.io"},
-                                    "ctx", "", known)
-    assert "Already on file about the company (do NOT re-derive it)" in prompt
-    assert "Global tax filing tied to each payment" in prompt
+    prompt = ra._build_focus_prompt({"name": "Dana", "email": "dana@commenda.io"})
+    assert "Stored company context (not current verification)" not in prompt
+    assert "About (prior automated web research; unverified)" not in prompt
+    assert "Last research recorded:" not in prompt
+    assert "Global tax filing tied to each payment" not in prompt
     # Nothing on file → the dig runs cold, exactly as before.
-    assert ra._known_company({"email": "x@nobody-here.com"}, "Nobody Here") == ""
-    assert "Already on file about the company" not in ra._build_focus_prompt(
-        {"name": "X", "email": "x@nobody-here.com"}, "ctx", "", "")
+    assert "Stored company context" not in ra._build_focus_prompt({"name": "X", "email": "x@nobody-here.com"})
 
 
 def test_same_research_run_twice_does_not_double_write(tmp_path, monkeypatch):
@@ -382,3 +424,43 @@ def test_persistence_failure_never_costs_the_run(tmp_path, monkeypatch):
     assert "read-only file system" in out["error"]
     monkeypatch.setattr(pp.ku, "company_knowledge", boom)
     assert pp.persist(FOCUS_RESEARCH, [])["companies"] == []
+
+
+def test_company_only_writer_preserves_owner_about_and_has_no_person(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    row = {"company_deep": FOCUS_RESEARCH["attendees"][0]["company_deep"], "domain": "commenda.io"}
+    research = {"companies": [row], "attendees": FOCUS_RESEARCH["attendees"]}
+    assert pp.persist_company(research)["companies"] == ["Commenda"]
+    assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
+    body = _company(tmp_path)
+    assert "Global tax filing" in body and "https://tc.com/a" in body and "commenda.io" in body
+    edit = _load("company_only_edit", "_shared/knowledge/knowledge_edit.py")
+    edit.run(["--slug", "commenda", "--op", "company-about", "--text", "Owner corrected description."])
+    new = {**row, "company_deep": {**row["company_deep"], "traction": ["No URL should vanish", "New launch (https://tc.com/new)"]}}
+    pp.persist_company({"companies": [new]})
+    pp.persist_company({"companies": [new]})
+    body = _company(tmp_path)
+    assert "Owner corrected description." in body and "misfiled quarter" not in body
+    assert body.count("https://tc.com/new") == 1 and "No URL should vanish" not in body
+    assert "updated_by: user_edit" in body
+    assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
+
+
+def test_company_only_empty_failure_and_cli(tmp_path, monkeypatch):
+    import subprocess
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    empty = {"persisted": 0, "people": [], "companies": []}
+    assert pp.persist_company(RESEARCH) == empty
+    assert pp.persist_company({"companies": [{"company_deep": {"company": "Name only"}}]}) == empty
+    research = {"companies": [{"company_deep": FOCUS_RESEARCH["attendees"][0]["company_deep"]}]}
+    path = tmp_path / "company.json"
+    path.write_text(json.dumps(research))
+    result = subprocess.run([sys.executable, pp.__file__, "--company-only", "--research", str(path)],
+                            env=dict(os.environ), capture_output=True, text=True)
+    assert result.returncode == 0 and json.loads(result.stdout)["companies"] == ["Commenda"]
+    assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
+    def fail(_):
+        raise OSError("read-only fixture")
+    monkeypatch.setattr(pp.ku, "apply", fail)
+    result = pp.persist_company(research)
+    assert result["companies"] == [] and "read-only fixture" in result["error"]

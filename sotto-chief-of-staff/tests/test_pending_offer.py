@@ -13,12 +13,9 @@ one on file, and a set racing a get can't hand the gateway a torn half-question.
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 import textwrap
-import time
-import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -26,7 +23,6 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
-HERMES = os.path.dirname(ROOT)
 SCRIPT = os.path.join(ROOT, "_shared", "scripts", "pending_offer.py")
 
 _spec = importlib.util.spec_from_file_location("pending_offer", SCRIPT)
@@ -309,7 +305,7 @@ def test_cli_rejects_a_kind_no_lane_produces(tmp_path):
     assert p.returncode != 0
     # Only active producers can set an offer. Legacy mute files are handled on read.
     assert set(po.KINDS) == {"meeting_prep", "commitment", "chase", "handoff",
-                             "procedure", "intention"}
+                             "procedure", "intention", "followup_draft"}
 
 
 def test_legacy_retune_offer_is_not_returned(tmp_path):
@@ -439,47 +435,21 @@ def test_the_lock_is_jsonstores_and_not_a_second_one(tmp_path, monkeypatch):
 
 # ── the surfaces that have to carry the same instruction ────────────────────────────────────────
 
-def test_the_proactive_skill_tells_the_model_to_record_the_question(tmp_path):
-    """A writer nobody calls is a file that is always empty — the SKILL.md is the only thing that
-    calls `set`, so the invocation has to be IN it, with the reason."""
+def test_the_proactive_composer_records_the_question_and_the_skill_says_why(tmp_path):
+    """A writer nobody calls is a file that is always empty. On Sotto the receiver's notification
+    composer is the caller, so the `set_offer` call has to be IN it; the skill states the contract
+    the model relies on when the yes arrives in a different session."""
+    with open(os.path.join(ROOT, "_shared", "scripts", "compose_notification.py"), encoding="utf-8") as f:
+        composer = f.read()
+    assert "pending_offer.set_offer(item['kind'], question" in composer
     with open(os.path.join(ROOT, "proactive", "SKILL.md"), encoding="utf-8") as f:
         skill = f.read()
-    assert "pending_offer.py" in skill
-    assert "set \\\n     --kind meeting_prep --person" in skill or \
-           "--kind meeting_prep --person" in skill
-    assert "--question" in skill
-    assert "different session" in skill or "never saw your question" in skill
-    assert "--payload-file" in skill and "--offer-bound" in skill
-    assert 'pending_offer.py dismiss-reply --text "<actual user reply>"' in skill
+    assert "the composer stages it before delivery" in skill
+    assert "different session" in skill and "never saw your question" in skill
+    assert "never resolve it by\n   choosing the newest offer" in skill
+    assert "bound to\n   the hash of that exact action" in skill
+    assert "resolved by the runtime against that exact recorded offer" in skill
     assert 'run **`sotto-loops`** §B `dismiss`' not in skill
-
-
-def test_the_gateway_carries_the_standing_instruction(tmp_path):
-    """The other half. The gateway loads SOUL.md, and start.sh appends sotto-persona.md to it every
-    boot — so the bare-affirmative rule lives there, in the one file that already reaches it."""
-    with open(os.path.join(HERMES, "adapters", "hermes", "sotto-persona.md"), encoding="utf-8") as f:
-        persona = f.read()
-    assert "pending_offer.py" in persona
-    for affirmative in ('"yes"', '"sure"', '"ok"', '"go ahead"', '"do it"'):
-        assert affirmative in persona
-    assert "clear" in persona
-    assert "sotto-meeting-prep" in persona
-    assert "payload_sha256" in persona and "--offer-bound" in persona
-    assert 'dismiss-reply --text "<actual user reply>"' in persona
-    assert "Never bypass this handler" in persona
-    assert '`no_offer` uses the existing **`{}` fallback above**' in persona
-    assert 'inspect the anchored loop before any retry' in persona
-
-    with open(os.path.join(HERMES, "adapters", "hermes", "start.sh"), encoding="utf-8") as f:
-        start = f.read()
-    assert "sotto-persona.md" in start and "pending_offer.py" in start
-
-
-def test_start_sh_still_parses():
-    """The persona block reaches the gateway only if the boot script runs at all."""
-    p = subprocess.run(["bash", "-n", os.path.join(HERMES, "adapters", "hermes", "start.sh")],
-                       capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0, p.stderr[-2000:]
 
 
 def test_latest_answer_is_chat_scoped_but_tapback_keeps_exact_older_question(tmp_path, monkeypatch):
@@ -522,7 +492,7 @@ def test_delayed_activation_keeps_the_destination_at_offer_time(tmp_path, monkey
 
 @pytest.mark.parametrize('before', [1004.0, 1007.0, 1010.0])
 def test_a_reply_near_a_newer_question_is_ambiguous_not_the_older_one(tmp_path, monkeypatch, before):
-    """accepted_at (receiver clock, after `hermes send` returns) and the reply timestamp (provider
+    """accepted_at (receiver clock, after the runtime's send returns) and the reply timestamp (provider
     clock) differ: a reply before, or within ACCEPT_SKEW_SECONDS after, B settled may answer B."""
     path = _data(tmp_path, monkeypatch)
     base = po.set_offer('meeting_prep', 'Want prep?')
@@ -554,55 +524,6 @@ def test_scoped_decline_clears_only_the_latest_question(tmp_path, monkeypatch):
                              'photon', '--chat-id', 'owner', '--before', '100'))
     assert result['action'] == 'declined' and result['person'] == 'Bob' and result['offer_cleared']
     assert json.loads(_cli(tmp_path, 'get'))['person'] == 'Alex'
-
-
-def test_photon_offer_is_found_by_the_owner_dm_reply_context(tmp_path, monkeypatch):
-    """Real path: staged offer -> send.py receipt -> delivery_effects.finalize -> the Photon
-    adapter's reply_context for an upstream inbound DM, whose chat_id is the sidecar space id."""
-    owner = '+15551234567'
-    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
-    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
-    monkeypatch.setenv('PHOTON_HOME_CHANNEL', owner)
-    offer = po.set_offer('meeting_prep', QUESTION, person='Shivani')
-    fake = tmp_path / 'bin'
-    fake.mkdir()
-    (fake / 'hermes').write_text('#!/bin/sh\ncat >/dev/null\n'
-                                 'echo \'{"success": true, "message_id": "msg-1"}\'\n')
-    (fake / 'hermes').chmod(0o755)
-    monkeypatch.setenv('PATH', f'{fake}{os.pathsep}{os.environ["PATH"]}')
-    send = _load('sotto_send_offer_test', os.path.join(HERMES, 'adapters', 'hermes', 'send.py'))
-    photon = _load('sotto_photon_offer_test',
-                   os.path.join(HERMES, 'adapters', 'hermes', 'sotto_photon', '__init__.py'))
-    ok, _, receipt = send.send_receipt(QUESTION, 'photon')
-    assert ok
-    import delivery_effects  # noqa: PLC0415 — on sys.path once pending_offer is loaded
-    assert delivery_effects.finalize([{'kind': 'pending_offer', 'offer': offer}],
-                                     {**receipt, 'accepted_at': time.time()})
-
-    def context(text, **extra):
-        source = types.SimpleNamespace(chat_id='any;-;' + owner, user_id=owner, chat_type='dm')
-        event = types.SimpleNamespace(text=text, source=source, message_id='in-1',
-                                      timestamp=datetime.now(timezone.utc), **extra)
-        out = photon.reply_context(event)
-        assert out.text == text
-        return json.loads(re.search(r'\[Sotto transport reply context: (\{.*\})\]',
-                                    out.channel_prompt).group(1))
-
-    ctx = context('Sure')
-    assert ctx['chat_id'] == owner
-    got = po.get_offer(latest=True, target=ctx['target'], chat_id=ctx['chat_id'], before=ctx['before'])
-    assert got['offer_id'] == offer['offer_id']
-    ctx = context('reaction:added:👍', reply_to_message_id='msg-1')
-    got = po.get_offer(message_id=ctx['reply_to_message_id'], target=ctx['target'], chat_id=ctx['chat_id'])
-    assert got['offer_id'] == offer['offer_id']
-
-
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.mark.parametrize('finished', ['expired', 'claimed', 'declined'])

@@ -172,11 +172,8 @@ class Pairing:
                        'generation INTEGER NOT NULL, enabled INTEGER NOT NULL, created REAL NOT NULL, '
                        'revoked_before REAL NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS bootstraps (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, '
-                       'expires REAL NOT NULL, result TEXT NOT NULL)')
-            if 'generation' not in {r['name'] for r in db.execute('PRAGMA table_info(bootstraps)')}:
-                db.execute('ALTER TABLE bootstraps ADD COLUMN generation INTEGER NOT NULL DEFAULT 0')
-            if 'applied' not in {r['name'] for r in db.execute('PRAGMA table_info(bootstraps)')}:
-                db.execute('ALTER TABLE bootstraps ADD COLUMN applied INTEGER NOT NULL DEFAULT 1')
+                       'expires REAL NOT NULL, result TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 0, '
+                       'applied INTEGER NOT NULL DEFAULT 1)')
         self.path.chmod(0o600)
 
     def db(self):
@@ -243,15 +240,6 @@ class Pairing:
                 if existing['applied']:
                     return json.loads(existing['result'])
             else:
-                legacy = db.execute('SELECT * FROM grants WHERE id=?', (body['request_id'],)).fetchone()
-                if legacy:
-                    if (entry != 'mac' or legacy['public_key'] != body['public_key']
-                            or legacy['challenge'] != body['challenge'] or legacy['expires'] <= time.time()):
-                        raise PermissionError('Handoff expired or changed')
-                    result = result_for(legacy['expires'])
-                    db.execute('INSERT INTO bootstraps VALUES (?,?,?,?,?,1)',
-                               (body['request_id'], fingerprint, legacy['expires'], json.dumps(result), generation))
-                    return result  # Old accepted grants never reinstall Google credentials.
                 accepted = db.execute('SELECT COALESCE(MAX(generation),0) FROM bootstraps').fetchone()[0]
                 if generation < accepted or (generation > 0 and generation == accepted):
                     raise PermissionError('A newer Google connection has already been accepted')
@@ -272,7 +260,8 @@ class Pairing:
             zone = browser_zone or native_zone
             if zone and self.on_timezone:
                 self.on_timezone(zone)
-            scopes = self.adapter.install_cloud_google(body['credentials'])
+            scopes = self.adapter.install_cloud_google(body['credentials'], origin={
+                'tenant_id': tenant, 'request_id': body['request_id'], 'generation': generation})
             managed.record_google_consent(self.root, scopes)
             if entry == 'mac':
                 db.execute('INSERT INTO grants VALUES (?,?,?,?,?)', (body['request_id'], body['public_key'],
@@ -322,11 +311,6 @@ class Pairing:
         digest = hashlib.sha256(credential.encode()).hexdigest()
         with self.db() as db:
             devices = db.execute('SELECT token_hash,enabled FROM devices').fetchall()
-        if not devices:
-            # Adopt the already connected pilot without an implicit disconnect. Issuing the
-            # first device capability permanently closes this compatibility path.
-            root = os.environ.get('BRIDGE_TOKEN', '')
-            return bool(root) and hmac.compare_digest(root, credential)
         return any(row['enabled'] and hmac.compare_digest(row['token_hash'], digest) for row in devices)
 
     def devices(self):
@@ -343,14 +327,15 @@ class Pairing:
 
 
 def bridge_authenticated(root, credential):
-    """Managed Bridge endpoint authorization, including migration from the old pilot bearer."""
+    """Managed Bridge endpoint authorization: an enabled device capability, nothing else."""
     try:
         return Pairing(root, None).authenticated(credential)
     except (OSError, sqlite3.Error, ValueError):
         return False
 
 
-def handle(handler, path, root, adapter=None, *, adapter_factory=None, on_timezone=None):
+def handle(handler, path, root, adapter=None, *, adapter_factory=None, on_timezone=None,
+           runtime_status=None):
     """Called before legacy receiver auth; no managed control credential, no route."""
     control = control_token()
     if not managed.enabled() or not control or path not in ('/cloud/bootstrap', '/cloud/pair', '/cloud/consent', '/cloud/devices', '/cloud/status', '/cloud/dashboard-grant'):
@@ -372,7 +357,12 @@ def handle(handler, path, root, adapter=None, *, adapter_factory=None, on_timezo
         if path == '/cloud/dashboard-grant':
             return handler._send(200, issue_dashboard_grant(root, body))
         if path == '/cloud/status':
-            return handler._send(200, managed.connection_status(root))
+            status = managed.connection_status(root)
+            if control_status:
+                if runtime_status is None:
+                    raise ValueError('Runtime readiness unavailable')
+                status['runtime'] = runtime_status()
+            return handler._send(200, status)
         if path == '/cloud/consent':
             managed.record_bridge_consent(root, body['enabled'], body['connected'],
                                           body.get('allow_send', False))

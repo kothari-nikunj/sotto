@@ -1,0 +1,31 @@
+/* Connect is an owner decision, using Sotto's existing paper, ink and local type. */
+body.oauth-page { margin: 0; min-height: 100svh; display: grid; place-items: center; padding: 40px 20px; background: var(--paper); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; line-height: 1.55; }
+.oauth-page *, .oauth-page *::before, .oauth-page *::after { box-sizing: border-box; }
+.oauth-card { width: 100%; max-width: 600px; padding: 40px; background: var(--panel); border: 1px solid var(--hairline); border-radius: 16px; }
+.oauth-brand { margin-bottom: 28px; font: italic 700 32px/1.1 'Besley', Georgia, serif; }
+.oauth-brand span { color: var(--accent-text); }
+.oauth-card h1 { margin: 0 0 12px; font: 500 clamp(26px, 4vw, 34px)/1.25 'Besley', Georgia, serif; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.oauth-card p { margin: 0 0 24px; }
+.oauth-intro { color: var(--ink-secondary); }
+.oauth-destination { padding: 16px 18px; margin: 0 0 28px; border: 1px solid var(--hairline); border-radius: 8px; background: var(--paper); }
+.oauth-destination span { display: block; font-size: 13px; color: var(--ink-secondary); margin-bottom: 4px; }
+.oauth-destination strong { display: block; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.oauth-destination small { display: block; margin-top: 8px; font-size: 13px; color: var(--ink-secondary); }
+.oauth-card h2 { margin: 0 0 10px; font: 600 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.oauth-card ul { margin: 0 0 20px; padding-left: 20px; }
+.oauth-card li { padding-left: 3px; margin: 6px 0; }
+.oauth-boundary { color: var(--ink-secondary); }
+.oauth-actions { display: flex; gap: 12px; margin: 28px 0 20px; }
+.oauth-actions button { min-height: 48px; border-radius: 8px; padding: 12px 18px; font: 600 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-transform: none; letter-spacing: 0; cursor: pointer; }
+.oauth-actions .oauth-primary { flex: 1; background: var(--ink); color: var(--paper); border: 1px solid var(--ink); }
+.oauth-actions .oauth-secondary { background: transparent; color: var(--ink); border: 1px solid var(--border); }
+.oauth-actions button:hover { filter: brightness(.93); }
+.oauth-card :focus-visible { outline: 3px solid var(--accent-text); outline-offset: 4px; }
+.oauth-card .oauth-footnote { font-size: 13px; line-height: 1.6; color: var(--ink-secondary); margin-bottom: 0; }
+.oauth-card a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+@media (max-width: 480px) {
+  body.oauth-page { padding: 16px 12px; place-items: start center; }
+  .oauth-card { padding: 26px 22px; border-radius: 12px; }
+  .oauth-brand { margin-bottom: 24px; }
+  .oauth-actions { flex-direction: column; }
+}

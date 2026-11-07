@@ -12,12 +12,13 @@ import os
 from pathlib import Path
 import tempfile
 import re
+import secrets
 
 from chatfmt import to_imessage
 from brief_validate import is_calendar_preview_note
 from calendar_context import SCHEDULE_DAY as _DAY
 
-VERSION = 17
+VERSION = 18
 MAX_CARDS = 4
 MAX_WORDS = 200
 MAX_PREP_WORDS = 200
@@ -45,13 +46,17 @@ def _heading(line, kind):
     return None
 
 
-def build(text, kind='brief', preview=False):
+def build(text, kind='brief', preview=False, *, edition=None):
     """An extractive preview, not a second composition. None means keep ordinary text delivery."""
+    if edition not in (None, 'morning', 'evening'):
+        return None
     if kind not in ('brief', 'prep') or not isinstance(text, str) or len(text) > 100_000:
         return None
     plain = to_imessage(text, normalize_style=False).strip()
     if not plain:
         return None
+    if kind == 'prep' and len(plain.split()) <= MAX_PREP_WORDS:
+        return None  # a complete short prep is easier to read as one message than four sparse cards
     # Preserve explicit source emphasis before converting markdown to plain source text.
     # No name inference: an unlabelled sentence remains ordinary body text.
     source_emphasis = {}
@@ -63,6 +68,7 @@ def build(text, kind='brief', preview=False):
     lines = plain.splitlines()
     title = lines[0].strip()
     sections, active = [], None
+    other_updates = {'title': 'Other updates', 'blocks': []}
     agenda_day = ''
     preamble, filtered = [], False
     for index, raw in enumerate(lines):
@@ -79,20 +85,27 @@ def build(text, kind='brief', preview=False):
             active = None
             filtered = line.lower() == 'filtered'
         elif active is not None:
+            target = active
             if kind == 'brief' and active['title'] == 'Your day':
                 if is_calendar_preview_note(line):
                     continue
                 if re.fullmatch(_DAY, line.rstrip(':'), re.I):
                     agenda_day = line.rstrip(':')
                     continue
-            # Long paragraphs and links belong in text. Never cut off a qualifier, date or amount.
-            if len(line.split()) <= MAX_WORDS and (kind == 'brief' or not re.search(r'https?://|mailto:|/app#', line)):
+                # The source may leave unheaded prose after a birthday. Preserve each line,
+                # but only a timed event or birthday belongs on the calendar card. A later
+                # valid event still returns to that card with its original source line ID.
+                if (_agenda_parts(line)[1] is None and _birthday_parts(line) is None
+                        and not _TIMED_LINE.match(line)):
+                    target = other_updates
+            # Never cut off a qualifier, date or amount. Source links stay with their evidence.
+            if len(line.split()) <= MAX_WORDS:
                 block = {'text': line, 'line': index}
                 if line in source_emphasis:
                     block['emphasis_end'] = source_emphasis[line]
-                if agenda_day and active['title'] == 'Your day':
+                if agenda_day and target['title'] == 'Your day':
                     block['day'] = agenda_day
-                active['blocks'].append(block)
+                target['blocks'].append(block)
             elif kind == 'brief':
                 return None  # never hide an action merely because it is hard to fit
         elif kind == 'brief' and index > 0 and not filtered:
@@ -106,9 +119,11 @@ def build(text, kind='brief', preview=False):
                     for part in sections if part['title'] in titles for b in part['blocks']]}
                     for title, titles in groups]
     else:
-        extras = [dict(b, section=name) for name in ('Open loops', 'Handled')
+        if other_updates['blocks']:
+            sections.append(other_updates)
+        extras = [dict(b, section=name) for name in ('Other updates', 'Open loops', 'Handled')
                   for part in sections if part['title'] == name for b in part['blocks']]
-        sections = [part for part in sections if part['title'] not in ('Handled', 'Open loops')]
+        sections = [part for part in sections if part['title'] not in ('Handled', 'Open loops', 'Other updates')]
         if extras:
             sections.append({'title': 'Follow-ups', 'blocks': extras})
     cards = []
@@ -127,7 +142,7 @@ def build(text, kind='brief', preview=False):
             words += count
         if blocks:
             cards.append({'title': section['title'], 'blocks': blocks})
-    if kind == 'prep' and len(cards) > MAX_CARDS:
+    if kind == 'prep' and len(cards) != MAX_CARDS:
         return None  # keep the whole brief in text instead of losing an actionable ask
     # Four attachments produce the compact native gallery. Split only at real paragraph
     # boundaries; if there is too little source material, keep the short update as text.
@@ -140,17 +155,18 @@ def build(text, kind='brief', preview=False):
                   for i, line in enumerate(lines))
     deck = {'version': VERSION, 'kind': kind, 'title': title, 'preview': bool(preview),
             'full_text': plain, 'cards': cards, 'excerpt': omitted}
+    if kind == 'brief' and edition is not None:
+        deck['edition'] = edition
     deck['id'] = hashlib.sha256(json.dumps(deck, sort_keys=True).encode()).hexdigest()[:24]
     # Keep the companion text short; dates and links remain selectable in Messages.
-    deck['summary'] = ('Historical preview · ' if preview else '') + (_brief_caption(title) if kind == 'brief' else _display_text(title))
-    if kind == 'brief':
-        if preamble:
-            deck['summary'] += '\n' + '\n'.join(preamble)
-        links = _companion_links(plain)
-        if links:
-            deck['summary'] += '\n' + '\n'.join(links)
-        if len(deck['summary'].encode('utf-16-le')) // 2 > 1000:
-            return None  # preserve usable links without overflowing the transport caption
+    deck['summary'] = ('Historical preview · ' if preview else '') + (_brief_caption(title, edition) if kind == 'brief' else _display_text(title))
+    if kind == 'brief' and preamble:
+        deck['summary'] += '\n' + '\n'.join(preamble)
+    links = _companion_links(plain)
+    if links:
+        deck['summary'] += '\n' + '\n'.join(links)
+    if len(deck['summary'].encode('utf-16-le')) // 2 > 1000:
+        return None  # preserve usable links without overflowing the transport caption
     return deck
 
 
@@ -193,13 +209,13 @@ def _lines(draw, text, font, width):
     return output
 
 
-def _brief_caption(title):
+def _brief_caption(title, edition=None):
     match = re.fullmatch(r'Good (morning|afternoon|evening)\s*[—–-]\s*(.+)', title, re.I)
     if not match:
         return _display_text(title)
     period, date = match.groups()
     date = re.sub(r'^[A-Za-z]+,\s*', '', date)
-    return f"Good {period.lower()}. Here's your {period.lower()} brief for {date}."
+    return f"Good {period.lower()}. Here's your {edition or period.lower()} brief for {date}."
 
 
 def _display_text(text, kind=''):
@@ -213,6 +229,12 @@ def _display_text(text, kind=''):
 
 # Recognize the formats already emitted by the composer, including date-prefixed rows.
 
+
+
+# Any clock-led line ("9:30–10:00 AM — Standup", "14:00 — Review") is still an event, even
+# when it is not in the composer's exact agenda format; only prose leaves the calendar card.
+_TIMED_LINE = re.compile(rf'(?:(?:{_DAY})[,:]?\s+)?(?:\d{{1,2}}:\d{{2}}\s*(?:[AP]M)?|\d{{1,2}}\s*[AP]M)'
+                         r'(?:\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:[AP]M)?)?\s*[:—–-]\s+\S', re.I)
 
 
 def _agenda_parts(text):
@@ -315,12 +337,14 @@ def _render_pages(deck, *, measure_only=False):
         # These are typographic splits of the source, never inferred people/actions.
         # Evening editions can span tomorrow's meetings and today's birthdays. The date
         # labels below stay authoritative; do not imply every row is happening today.
-        title = ('Coming up' if agenda and re.match(r'^Good evening\b', deck['title'], re.I)
+        title = ('Coming up' if agenda and (deck.get('edition') == 'evening' or
+                     deck.get('edition') is None and re.match(r'^Good evening\b', deck['title'], re.I))
                  else 'Your day' if agenda else card['title'])
         if deck['kind'] == 'prep':
-            subject = re.split(r' [—–-] ', deck['title'], maxsplit=1)[0]
-            company = re.search(r'\(([^()]+)\)', subject)
-            title = company.group(1) if company else subject
+            # Focused prep labels the person before the meeting. Keep that short identity
+            # on each card; the full meeting title and time remain in the companion caption.
+            person, separator, _meeting = deck['title'].partition(' · ')
+            title = person if separator else re.split(r' [—–-] ', deck['title'], maxsplit=1)[0]
         title = _display_text(title)
         title_lines = _lines(draw, title, heading_font, 870)
         if len(title_lines) > 2:
@@ -329,7 +353,7 @@ def _render_pages(deck, *, measure_only=False):
         if deck['kind'] == 'brief':
             # Use the composition's own date, never today's date during a replay.
             edition = re.sub(r'^Good (morning|afternoon|evening)\s*[—–-]\s*',
-                             lambda match: match[1].capitalize() + ' brief · ', deck['title'], flags=re.I)
+                             lambda match: (deck.get('edition') or match[1]).capitalize() + ' brief · ', deck['title'], flags=re.I)
             edition = _display_text(edition)
             if draw.textlength(edition, font=meta_font) > WIDTH - 128:
                 raise LayoutError('date_width', 'brief date exceeds readable width')
@@ -553,27 +577,61 @@ def fits(deck, *, allow_tall=True):
         return False
 
 
-def render(deck, destination):
+def render(deck, destination, *, retained_source_revision=None, candidate_route_digest=None):
     """Write bounded PNGs plus an immutable manifest; private files, no network or HTML execution."""
     deck = _packed(deck)
+    retained = retained_source_revision is not None and candidate_route_digest is not None
+    if retained:
+        # A protected artifact gets a fresh ID. Recomposition or a crash retry
+        # never overwrites a prior accepted image/manifest at the same path.
+        deck = {**deck, 'id': secrets.token_hex(12)}
     destination = Path(destination) / deck['id']
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.mkdir(parents=True, exist_ok=not retained, mode=0o700)
     pages = []
+    image_hashes = []
     for index, image in enumerate(_render_pages(deck), 1):
         path = destination / f'{index:02d}.png'
         fd, name = tempfile.mkstemp(dir=destination, suffix='.tmp')
         tmp = Path(name)
         with open(fd, 'wb') as stream:
             image.save(stream, format='PNG', optimize=True)
+            if retained:
+                stream.flush()
+                os.fsync(stream.fileno())
+        if retained:
+            digest = hashlib.sha256()
+            size = 0
+            with tmp.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(65536), b''):
+                    size += len(chunk)
+                    if size > 5_000_000:
+                        raise ValueError('gallery image exceeds protected payload bound')
+                    digest.update(chunk)
+            image_hashes.append(digest.hexdigest())
         tmp.replace(path)
         pages.append(str(path))
     from source_context import permission_fingerprint
     manifest = {**deck, 'images': pages, 'source_permission_fingerprint': permission_fingerprint(),
                 'owner_channel_hash': hashlib.sha256(os.environ.get('PHOTON_HOME_CHANNEL', '').encode()).hexdigest()}
+    if retained:
+        from retained_brief_proof import stamp
+        manifest['retained_text_proof'] = stamp(manifest, retained_source_revision,
+                                               candidate_route_digest, image_hashes)
+        if len(json.dumps(manifest, ensure_ascii=False).encode('utf-8')) > 128 * 1024:
+            raise ValueError('manifest exceeds protected reader bound')
     path = destination / 'manifest.json'
     fd, name = tempfile.mkstemp(dir=destination, suffix='.tmp')
     tmp = Path(name)
     with open(fd, 'w') as stream:
         json.dump(manifest, stream, ensure_ascii=False)
+        if retained:
+            stream.flush()
+            os.fsync(stream.fileno())
     tmp.replace(path)
+    if retained:
+        directory = os.open(destination, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     return manifest

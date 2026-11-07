@@ -16,7 +16,6 @@ PACK = HERE.parents[1] / 'sotto-chief-of-staff'
 @pytest.fixture
 def rec(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    monkeypatch.setenv('SOTTO_RUN_SKILL', 'hermes -z')
     monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
     spec = importlib.util.spec_from_file_location('scheduled_receiver', HERE / 'receiver.py')
     module = importlib.util.module_from_spec(spec)
@@ -24,6 +23,9 @@ def rec(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'DATA', str(tmp_path))
     monkeypatch.setattr(module, '_find_sotto_script', lambda *rel: str(PACK.joinpath(*rel)))
     monkeypatch.setattr(module, '_record_delivery', lambda *a, **k: None)
+    # These cases run small inline Python runners to exercise deadline, coverage and recovery
+    # semantics; the declared-procedure fence itself is covered in test_receiver.
+    monkeypatch.setattr(module, '_require_sotto_procedure', lambda *_args: None)
     return module
 
 
@@ -216,7 +218,7 @@ def test_failed_claimed_brief_can_be_replaced_after_its_context_changes(rec, tmp
     valid = {'old': True, 'fresh': True}
     monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: valid[payload['run_id']])
     sent = []
-    def send(body, target):
+    def send(body, target, *_identity):
         sent.append(body)
         return ((False, 'explicit rejection', {'acceptance': 'rejected'}) if body == 'Old brief'
                 else (True, '', {'acceptance': 'accepted', 'message_id': 'new-provider-id'}))
@@ -259,7 +261,7 @@ def test_ambiguous_or_crashed_send_never_releases_the_brief_claim(rec, tmp_path,
     monkeypatch.setitem(box.HOOKS, 'valid', lambda payload: valid[0])
     monkeypatch.setattr(rec, '_fire_cron_job', lambda *a: pytest.fail('ambiguous brief was replaced'))
     results = iter(outcomes)
-    def send(body, target):
+    def send(body, target, *_identity):
         outcome = next(results)
         if outcome == 'crash':
             raise SystemExit('synthetic process exit after provider invocation')
@@ -362,7 +364,7 @@ def test_old_brief_recovery_admits_one_fresh_generation(rec, tmp_path, monkeypat
     archive.parent.mkdir()
     archive.write_text('{}')
     attempts, accepted = [], []
-    def send(body, target):
+    def send(body, target, *_identity):
         attempts.append(body)
         if body == 'Old brief':
             return False, 'channel unavailable', {'acceptance': 'rejected'}
@@ -421,7 +423,10 @@ def test_generation_contention_refunds_attempts_then_delivers_saved_artifact(rec
     real_popen = rec.subprocess.Popen
     def short_lock_wait(argv, **kwargs):
         # Use the real CLI/exit-code contract. No provider or script call is mocked.
-        bootstrap = ('import sys, runpy; sys.path.insert(0, sys.argv[1]); '
+        # runpy must reproduce the normal script entrypoint's import path.
+        bootstrap = ('import sys, runpy; from pathlib import Path; '
+                     'sys.path.insert(0, str(Path(sys.argv[2]).resolve().parent)); '
+                     'sys.path.insert(0, sys.argv[1]); '
                      'import jsonstore; jsonstore.LOCK_TIMEOUT_SECS = 0.05; '
                      'sys.argv = sys.argv[2:]; runpy.run_path(sys.argv[0], run_name="__main__")')
         return real_popen([argv[0], '-c', bootstrap, str(PACK / '_shared/lib'), *argv[1:]], **kwargs)

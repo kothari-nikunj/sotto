@@ -1,0 +1,10 @@
+{
+  "name":"Natural Mac send review, restart, separate approval and no repeat",
+  "world":{"bridgeSend":true},
+  "turns":[
+    {"text":"text hi to +15555550123 from my mac","contains":["+15555550123","hi","Send this?"],"excludes":["unavailable","unsupported"],"bridgeSends":0},
+    {"text":"yes","restartBefore":true,"contains":["Sent from your Mac"],"bridgeSends":1},
+    {"text":"thanks","bridgeSends":1},
+    {"text":"draft another one saying see you tomorrow. don't send","contains":["see you tomorrow"],"bridgeSends":1}
+  ]
+}

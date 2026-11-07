@@ -16,9 +16,10 @@ MAX_MEETING_ITEMS = 20
 NOTES_CHARS = 8000
 
 
-def obligations(meeting_id, rows=None):
+def obligations(meeting_id, rows=None, permitted=None):
     """Join by source occurrence, never a shared name or merely another meeting with a person."""
-    if not meeting_id or not allowed('granola'):
+    permitted = allowed if permitted is None else permitted
+    if not meeting_id or not permitted('granola'):
         return []
     rows = ledger_io.load_entries() if rows is None else rows
     result = []
@@ -26,8 +27,8 @@ def obligations(meeting_id, rows=None):
         thread = row.get('source_thread_id') or ''
         refs = row.get('source_refs') or []
         meeting_ref = next((ref for ref in refs if isinstance(ref, dict)
-                            and ref.get('source') == 'granola'
-                            and ref.get('source_id') == meeting_id), None)
+                            and (ref.get('source') or ref.get('sourceType')) == 'granola'
+                            and (ref.get('source_id') or ref.get('sourceId')) == meeting_id), None)
         direct = isinstance(thread, str) and thread.startswith(f'granola:{meeting_id}:')
         if not direct and meeting_ref is None:
             continue
@@ -37,10 +38,9 @@ def obligations(meeting_id, rows=None):
         refs = row.get('resolution_source_refs') or []
         evidence_visible = bool(refs) and all(
             isinstance(ref, dict) and ref.get('sourceType') in ('email', 'imessage', 'whatsapp')
-            and allowed({'email': 'gmail'}.get(ref['sourceType'], ref['sourceType'])) for ref in refs)
+            and permitted({'email': 'gmail'}.get(ref['sourceType'], ref['sourceType'])) for ref in refs)
         evidence = row.get('resolution_evidence') if evidence_visible else None
-        basis = ('user_confirmed' if resolution == 'user_resolved' and status == 'resolved' else
-                 'source_evidence' if evidence and status == 'resolved' else 'ledger_state')
+        basis = ledger_io.completion_basis(status, resolution, evidence_visible=bool(evidence))
         result.append({'anchor_key': row.get('anchor_key'), 'status': status,
                        'direction': 'they_owe_you' if ledger_io.is_waiting_on(row.get('action_type')) else 'you_owe',
                        'what': row.get('ask') or row.get('summary') or '',
@@ -55,8 +55,9 @@ def obligations(meeting_id, rows=None):
                                          str(r['deadline'] or '9999'), str(r['anchor_key'])))
 
 
-def query(meeting_id, granola):
-    if not allowed('granola'):
+def query(meeting_id, granola, *, rows=None, permitted=None):
+    permitted = allowed if permitted is None else permitted
+    if not permitted('granola'):
         return {'status': 'withheld', 'reason': 'Granola access is disabled.'}
     meetings = granola.get('meetings', []) if isinstance(granola, dict) else granola
     matches = [m for m in meetings if isinstance(m, dict)
@@ -66,7 +67,7 @@ def query(meeting_id, granola):
                 'coverage': 'Only the supplied Granola window was searched.'}
     meeting = matches[0]
     notes = {k: str(meeting.get(k) or '') for k in ('your_notes', 'ai_summary')}
-    rows = obligations(meeting_id)
+    rows = obligations(meeting_id, rows, permitted)
     return {'status': 'found', 'meeting_id': meeting_id, 'title': meeting.get('title'),
             'start': meeting.get('start') or meeting.get('date'),
             'notes': {k: v[:NOTES_CHARS] for k, v in notes.items()},

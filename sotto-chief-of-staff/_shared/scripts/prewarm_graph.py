@@ -13,6 +13,7 @@ seam — Parallel → Exa → Gemini grounding, whichever key is set), written a
 clearly-sourced, LOW-confidence "Per web search: …" facts that decay — never authoritative identity
 fields (the guessed-role burn — "Peyton the founder", "Alive Ventures" — came from UNsourced
 authoritative claims, which this never writes). Name-only stubs made week-one briefs read thin.
+What the research says about their EMPLOYER goes to that company's file, by persist_prep's rule.
 Fully guarded: no research provider / network failure / import error degrades silently to the plain
 stubs. Set SOTTO_PREWARM_RESEARCH=0 to skip enrichment entirely. The user's normal Learn step +
 on-demand meeting research promote facts over time as they're confirmed.
@@ -43,8 +44,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "..", "lib"))
 sys.path.insert(0, os.path.join(_HERE, "..", "knowledge"))
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "meeting-prep", "scripts"))
 import knowledge as kg  # noqa: E402
 import knowledge_update as ku  # noqa: E402
+import persist_prep as pp  # noqa: E402  (the one research bio and company-summary rule)
 from textutil import _arr, _looks_like_phone_number, _s, unwrap_tool_result  # noqa: E402
 from render_local import resolve_contact_names  # noqa: E402
 
@@ -167,14 +170,15 @@ def _top_contacts(local: dict) -> list:
     return ranked[:MAX_PREWARM]
 
 
-def _research_facts(updates: list) -> int:
+def _research_facts(updates: list) -> tuple[int, list]:
     """Opt-in: enrich the emailed stubs with grounded research, stored as LOW-confidence, clearly
     'per web search' facts (kept since >=0.5, but they decay and never become identity fields). Returns
-    how many people got at least one research fact. Best-effort — any failure leaves the stubs intact."""
+    how many people got at least one research fact, and the company updates for what the research
+    said about their employers. Best-effort — any failure leaves the stubs intact."""
     attendees = [{"name": u["person_name"], "email": u["identifier"]}
                  for u in updates if "@" in u.get("identifier", "")]
     if not attendees:
-        return 0
+        return 0, []
     try:
         import research_attendees as ra  # noqa: PLC0415
         # Profiles only (Pass A): prewarm persists a single bio fact per person, so Pass B's
@@ -190,7 +194,7 @@ def _research_facts(updates: list) -> int:
             else:
                 os.environ["SOTTO_RESEARCH_DEEP"] = prev_deep
     except Exception:  # noqa: BLE001  (no key, network, import) — pre-warm degrades to stubs
-        return 0
+        return 0, []
     by_email = {_s(a.get("email")).lower(): a for a in (res or {}).get("attendees", [])}
     n = 0
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -198,33 +202,20 @@ def _research_facts(updates: list) -> int:
         a = by_email.get(u["identifier"])
         if not a:
             continue
-        # ONE combined fact (persist_prep.py pattern): two separate "Per web search:" facts overlap
-        # >0.5 in knowledge_update's find_similar_fact, so the second would BUMP-swallow the richer
-        # summary. The "No public profile found." sentinel is a research MISS, not a fact about the
-        # person — mirror persist_prep's filter so it never persists into the graph.
-        bits = []
-        title, company = _s(a.get("title")).strip(), _s(a.get("company")).strip()
-        if title or company:
-            bits.append(" at ".join(x for x in (title, company) if x))
-        summary = _s(a.get("summary")).strip()
-        if summary and summary.lower() != "no public profile found.":
-            bits.append(summary)
-        company_summary = _s(a.get("company_summary")).strip()
-        if company_summary:   # person → company fallback: the company is researchable even
-            bits.append(company_summary)   # when the person isn't
-        if not bits:
+        bio = pp.research_bio(a)
+        if not bio:
             continue   # nothing grounded → the plain identity stub stands
         # APPEND — the card's own note and birthday were already on this update and are the
         # user's words; a research sweep adds to them, it never replaces them.
         u.setdefault("facts", []).append(
-            {"fact": ("Per web search: " + " — ".join(bits))[:600],
+            {"fact": bio[:600],
              "confidence": 0.55, "memory_type": "context",
              "source": "web_research",   # without it the updater stamps brief_extraction
              "source_ref": f"prewarm-research:{today}"})
         u["updated_by"] = "web_research"
         u["last_researched"] = today   # persist_prep.profile_is_fresh keys off this stamp
         n += 1
-    return n
+    return n, pp.company_updates(res, today)
 
 
 def prewarm(local: dict, research: bool = True) -> dict:
@@ -251,14 +242,14 @@ def prewarm(local: dict, research: bool = True) -> dict:
             upd["updated_by"] = CONTACTS_SOURCE   # a note/birthday write is not a brief extraction
         updates.append(upd)
 
-    researched = 0
+    researched, companies = 0, []
     if research and os.environ.get("SOTTO_PREWARM_RESEARCH", "1") != "0" and updates:   # default ON; =0 skips
-        researched = _research_facts(updates)
+        researched, companies = _research_facts(updates)
 
     if updates and any(not allowed(source) for source in source_permissions):
         raise RuntimeError("source consent changed during graph prewarm")
     if updates:
-        ku.apply({"person_updates": updates})
+        ku.apply({"person_updates": updates, "company_updates": companies})
     return {"stubs": len(updates), "researched": researched,
             "people": [u["person_name"] for u in updates]}
 

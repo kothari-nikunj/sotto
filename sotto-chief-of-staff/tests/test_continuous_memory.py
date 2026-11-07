@@ -21,6 +21,182 @@ import usefulness_feedback
 NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
 
 
+def test_history_observation_counts_report_skips_limits_and_clipped_text():
+    rows = [{'id': str(i), 'handle': '+14155550123', 'timestamp': NOW.isoformat(),
+             'text': 'x' * (learning.MESSAGE_CHARS + 1)} for i in range(learning.REVIEW_MESSAGES + 2)]
+    rows.append({'id': 'group', 'is_group_chat': True, 'text': 'private group'})
+    counts = {}
+    selected = learning.observations('imessage', rows, NOW, diagnostics=counts)
+    assert len(selected) == learning.REVIEW_MESSAGES
+    assert counts == {'rows': 163, 'eligible': 162, 'selected': 160,
+                      'skipped': 1, 'omitted': 2, 'truncated': 162}
+    assert 'private' not in json.dumps(counts)
+
+
+def test_history_coverage_advances_only_with_success_and_resets_for_next_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_cycle, 'allowed', lambda s: s == 'imessage')
+    monkeypatch.setattr(memory_cycle.prewarm_graph, 'prewarm', lambda *a, **k: None)
+    monkeypatch.setattr(memory_cycle.style_extract, 'extract', lambda *a, **k: None)
+    monkeypatch.setattr(memory_cycle.relationship_pulse, 'observe_history', lambda *a, **k: None)
+    row = {'id': 'real-row', 'handle': '+14155550123', 'timestamp': NOW.isoformat(), 'text': 'An observed fact.'}
+    fetch = lambda *a: {'status': 'ok', 'rows': [row], 'next_cursor': None, 'complete': True}
+    quiet = lambda **k: {'reviewed': 0}
+    def fail(*a, **k):
+        raise RuntimeError('synthetic extraction failure')
+    memory_cycle.run(NOW, fetch, fail, quiet)
+    path = Path(memory_cycle.state_path())
+    assert 'observation_totals' not in json.loads(path.read_text())['sources']['imessage']
+    memory_cycle.run(NOW + timedelta(hours=1), fetch, lambda *a, **k: {'reviewed': 1, 'facts': 0}, quiet)
+    first = json.loads(path.read_text())['sources']['imessage']
+    assert first['observation_totals']['pages'] == 1
+    assert first['observation_totals']['selected'] == 1
+    # A blocked initial page belongs to the backfill, never the next incremental window.
+    state = json.loads(path.read_text())
+    state['sources']['imessage']['excluded_pages'] = {'private-cursor': {'reason': 'SAFETY', 'since': first['since'], 'until': first['until']}}
+    path.write_text(json.dumps(state))
+    memory_cycle.run(NOW + timedelta(hours=2), fetch, lambda *a, **k: {'reviewed': 1, 'facts': 0}, quiet)
+    next_window = json.loads(path.read_text())['sources']['imessage']
+    assert next_window['pages'] == 2
+    assert next_window['observation_totals']['pages'] == 1
+    assert 'private-cursor' in next_window['excluded_pages']
+    from history_coverage import window_coverage
+    view = window_coverage(next_window)
+    assert view['review_scope'] == 'reviewed_window'
+    assert view['initial_review']['review_scope'] == 'partial'
+    assert view['initial_review']['observation_counts']['selected'] == 1
+    assert view['initial_review']['excluded_pages'] == 1
+    assert 'private-cursor' not in json.dumps(view)
+
+
+
+
+@pytest.mark.parametrize('bad_page', [
+    {'status': 'unavailable', 'rows': [], 'complete': True},
+    {'status': 'ok', 'rows': 'PRIVATE', 'complete': True},
+    {'status': 'ok', 'rows': [], 'complete': False, 'next_cursor': 'next-page'},
+])
+def test_unavailable_or_invalid_history_page_never_advances_success(tmp_path, monkeypatch, bad_page):
+    from history_coverage import learning_coverage
+    monkeypatch.setattr(memory_cycle, 'allowed', lambda source: source == 'imessage')
+    monkeypatch.setattr(memory_cycle.prewarm_graph, 'prewarm', lambda *a, **k: None)
+    monkeypatch.setattr(memory_cycle.style_extract, 'extract', lambda *a, **k: None)
+    monkeypatch.setattr(memory_cycle.relationship_pulse, 'observe_history', lambda *a, **k: None)
+    quiet = lambda **k: {'reviewed': 0}
+    memory_cycle.run(NOW, lambda *a: {'status': 'ok', 'rows': [], 'complete': False,
+                                    'next_cursor': 'next-page'},
+                     lambda *a, **k: {'reviewed': 0, 'facts': 0}, quiet)
+    before = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    memory_cycle.run(NOW + timedelta(hours=1), lambda *a: bad_page,
+                     lambda *a, **k: pytest.fail('invalid fetch must not reach learning'), quiet)
+    after = json.loads(Path(memory_cycle.state_path()).read_text())['sources']['imessage']
+    for field in ('last_read_success', 'last_success', 'cursor', 'pages', 'observation_totals'):
+        assert after[field] == before[field]
+    view = learning_coverage(tmp_path, ['imessage'])['sources']['imessage']
+    assert view['latest_attempt']['status'] == 'failed'
+    assert view['latest_attempt']['stage'] == 'fetch'
+    if bad_page['status'] == 'unavailable':
+        assert view['latest_attempt']['category'] == 'source_unavailable'
+    assert 'PRIVATE' not in json.dumps(view)
+
+
+def test_tier1_conversation_keeps_opposing_short_message_endings_from_queue_and_snapshot(
+        tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    first = 'Background about the contract. ' + 'A' * 408 + ' I sent the signed contract.'
+    second = 'Background about the contract. ' + 'A' * 412 + ' I have not sent the signed contract.'
+    assert len(first) == 467 and len(second) == 480
+    base = {'source': 'imessage', 'chat_guid': 'chat-1', 'handle': '+14155550123'}
+    now = datetime.now(timezone.utc)
+    queued = {**base, 'timestamp': (now - timedelta(minutes=3)).isoformat(), 'text': first}
+    snap = {**base, 'timestamp': (now - timedelta(minutes=2)).isoformat(), 'text': second}
+    current = {**base, 'timestamp': (now - timedelta(minutes=1)).isoformat(),
+               'text': 'Did that reach you?'}
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    queue = tmp_path / 'events/queue.jsonl'
+    queue.parent.mkdir(parents=True)
+    queue.write_text(json.dumps({'event': queued, 'ts': queued['timestamp']}) + '\n')
+    snapshot = tmp_path / 'knowledge/last_local_snapshot.json'
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(json.dumps({'local': {'imessage': [snap]}}))
+    messages = personal_context.current_conversation(
+        current, now, personal_context.conversation_snapshot())
+    assert [row['text'] for row in messages] == [first, second, 'Did that reach you?']
+    assert [row['source'] for row in messages] == ['imessage'] * 3
+    assert [row['ts'] for row in messages] == sorted(row['ts'] for row in messages)
+    assert all(not row['text_clipped'] and row['original_length'] == len(row['text'])
+               for row in messages)
+
+    spec = importlib.util.spec_from_file_location(
+        'b4a_triage', Path(__file__).resolve().parent.parent / 'event-triage/scripts/triage_event.py')
+    triage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(triage)
+    seen = []
+    monkeypatch.setattr(relevance, 'judge', lambda context, **kw: seen.append(context) or {
+        'class': 'ignore', 'sender_role': 'person', 'why': 'fixture'})
+    triage._classify_tier1({**current, '_sotto_conversation_rows': personal_context.conversation_snapshot()},
+                           'A contact')
+    assert len(seen) == 1 and first in seen[0] and second in seen[0]
+
+
+def test_conversation_budget_preserves_newest_endings_and_discloses_omissions(monkeypatch):
+    now = NOW
+    base = {'source': 'imessage', 'chat_guid': 'chat-2', 'handle': '+14155550123'}
+    rows = [({**base, 'timestamp': (now - timedelta(minutes=20 - i)).isoformat(),
+              'text': f'Older {i}: ' + 'x' * 940 + f' ending {i}'}, '', '') for i in range(8)]
+    current = {**base, 'timestamp': now.isoformat(), 'text': 'Current decisive ending.'}
+    messages = personal_context.current_conversation(current, now, rows)
+    assert messages[-1]['text'] == current['text']
+    assert sum(len(row['text']) for row in messages) <= personal_context.CONVERSATION_TOTAL_CHARS
+    assert messages[0]['older_observed_messages_omitted'] > 0
+    assert all(row['text'].endswith(f' ending {i}') for i, row in enumerate(messages[:-1],
+               start=8 - len(messages[:-1])))
+
+
+def test_oversized_conversation_message_discloses_clip_and_keeps_ending():
+    event = {'source': 'imessage', 'chat_guid': 'chat-3', 'timestamp': NOW.isoformat(),
+             'text': 'Intro ' + 'x' * 6000 + ' I have not sent the signed contract.'}
+    message, = personal_context.current_conversation(event, NOW, [])
+    assert len(message['text']) <= personal_context.CONVERSATION_TOTAL_CHARS
+    assert message['text'].startswith('Intro ')
+    assert message['text'].endswith('I have not sent the signed contract.')
+    assert message['text_clipped'] is True
+    assert message['original_length'] == len(event['text'])
+    assert 'omitted' in message['text']
+
+
+def test_same_timestamp_opposing_messages_do_not_deduplicate_after_projection():
+    base = {'source': 'imessage', 'chat_guid': 'chat-3', 'timestamp': NOW.isoformat()}
+    prefix = 'Shared context ' + 'a' * 410
+    rows = [({**base, 'text': prefix + ' contract was sent'}, '', ''),
+            ({**base, 'text': prefix + ' contract was not sent'}, '', '')]
+    messages = personal_context.current_conversation(rows[-1][0], NOW, rows)
+    assert len(messages) == 2
+    assert [row['text'].endswith('sent') for row in messages] == [True, True]
+    assert messages[0]['text'] != messages[1]['text']
+
+
+def test_conversation_message_count_discloses_observed_window_and_preview_stays_bounded():
+    base = {'source': 'imessage', 'chat_guid': 'chat-5'}
+    rows = [({**base, 'timestamp': (NOW - timedelta(minutes=20 - i)).isoformat(),
+              'text': f'Message {i}'}, '', '') for i in range(15)]
+    messages = personal_context.current_conversation(rows[-1][0], NOW, rows)
+    assert len(messages) == personal_context.CONVERSATION_MESSAGES
+    assert messages[0]['older_observed_messages_omitted'] == 3
+    assert messages[-1]['text'] == 'Message 14'
+    preview = personal_context.conversation_message({**base, 'text': 'a' * 500})
+    assert preview['text'] == 'a' * personal_context.CONVERSATION_TEXT_CHARS
+    assert preview['text_clipped'] and preview['original_length'] == 500
+
+
+def test_revoked_conversation_source_yields_no_messages(monkeypatch):
+    monkeypatch.setattr(source_context, 'allowed', lambda source: False)
+    event = {'source': 'imessage', 'chat_guid': 'chat-4', 'timestamp': NOW.isoformat(),
+             'text': 'A private message.'}
+    assert personal_context.current_conversation(event, NOW, [(event, '', '')]) == []
+
+
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
@@ -41,6 +217,83 @@ def fact(text='Alex builds a product design tool.', refs=None, source='observed_
 def person():
     path = Path(kg.find_person_file(identifier='alex@example.com'))
     return path, kg.parse_person_file(path.read_text())
+
+
+def test_weekly_pruning_reaches_untouched_people_without_erasing_owner_words(monkeypatch):
+    ku.apply(fact(), NOW)
+    path, p = person()
+    old = next(iter(p.facts.values()))
+    from dataclasses import replace
+    p.facts['owner'] = replace(old, text='Owner correction.', source='user_edit')
+    p.facts['corroborated'] = replace(old, text='Corroborated context.', seen=2)
+    kg.write_person_file(str(path), p, NOW)
+    later = NOW + timedelta(days=61)
+    memory_cycle._prune_weekly(later, memory_cycle.state_path())
+    stored = person()[1]
+    archived = next(f for f in stored.facts.values() if f.text == old.text)
+    assert archived.status == 'archived' and archived.archived_reason == 'stale'
+    assert archived.archived_text == old.text and archived.evidence_refs == old.evidence_refs
+    assert archived.last == old.last
+    assert stored.facts['owner'].status == stored.facts['corroborated'].status == 'active'
+    checkpoint = json.loads(Path(memory_cycle.state_path()).read_text())['pruning']
+    assert checkpoint == {'status': 'completed', 'completed_at': later.timestamp(),
+                          'people': 1, 'pruned': 1, 'unreadable': 0}
+    # A process restart reads this checkpoint, rather than rewriting unchanged memory.
+    before = path.read_bytes()
+    real = memory_cycle.knowledge_update.prune_stale_memory
+    monkeypatch.setattr(memory_cycle.knowledge_update, 'prune_stale_memory',
+                        lambda *a: pytest.fail('must not repeat inside the week'))
+    memory_cycle._prune_weekly(later + timedelta(days=6), memory_cycle.state_path())
+    assert path.read_bytes() == before
+    monkeypatch.setattr(memory_cycle.knowledge_update, 'prune_stale_memory', real)
+    memory_cycle._prune_weekly(later + timedelta(days=7), memory_cycle.state_path())
+    assert json.loads(Path(memory_cycle.state_path()).read_text())['pruning']['pruned'] == 0
+    assert path.read_bytes() == before
+
+
+def test_weekly_pruning_skips_an_unreadable_person_file_and_completes():
+    ku.apply(fact(), NOW)
+    bad = Path(kg.people_dir()) / '0000-bad.md'
+    bad.write_text('---\nname: [unclosed\n---\n')
+    original = bad.read_bytes()
+    later = NOW + timedelta(days=61)
+    memory_cycle._prune_weekly(later, memory_cycle.state_path())
+    assert next(iter(person()[1].facts.values())).archived_reason == 'stale'
+    checkpoint = json.loads(Path(memory_cycle.state_path()).read_text())['pruning']
+    assert checkpoint == {'status': 'completed', 'completed_at': later.timestamp(),
+                          'people': 1, 'pruned': 1, 'unreadable': 1}
+    assert bad.read_bytes() == original  # skipped, never rewritten
+    # Completed: the next 15-minute heartbeat does not rescan inside the week.
+    memory_cycle._prune_weekly(later + timedelta(minutes=15), memory_cycle.state_path())
+    assert json.loads(Path(memory_cycle.state_path()).read_text())['pruning'] == checkpoint
+
+
+def test_weekly_pruning_failure_retries_without_advancing_completion(monkeypatch):
+    ku.apply(fact(), NOW)
+    later = NOW + timedelta(days=61)
+    real = memory_cycle.knowledge_update.prune_stale_memory
+    def fail(*args):
+        raise OSError('private content must not enter the receipt')
+    monkeypatch.setattr(memory_cycle.knowledge_update, 'prune_stale_memory', fail)
+    memory_cycle._prune_weekly(later, memory_cycle.state_path())
+    checkpoint = json.loads(Path(memory_cycle.state_path()).read_text())['pruning']
+    assert checkpoint == {'status': 'failed', 'error': 'OSError'}
+    assert next(iter(person()[1].facts.values())).status == 'active'
+    monkeypatch.setattr(memory_cycle.knowledge_update, 'prune_stale_memory', real)
+    memory_cycle._prune_weekly(later, memory_cycle.state_path())
+    assert next(iter(person()[1].facts.values())).archived_reason == 'stale'
+
+
+def test_weekly_pruning_runs_without_paid_learning_allowance(monkeypatch):
+    ku.apply(fact(), NOW)
+    monkeypatch.delenv('SOTTO_BACKGROUND_UNMETERED')
+    monkeypatch.delenv('SOTTO_MODEL_PROXY_URL', raising=False)
+    receipt = memory_cycle.run(NOW + timedelta(days=61),
+                               lambda *a: pytest.fail('no source fetch without allowance'),
+                               lambda *a, **k: pytest.fail('no extraction'),
+                               lambda *a, **k: pytest.fail('no curation'))
+    assert receipt['dreamer']['status'] == 'held'
+    assert next(iter(person()[1].facts.values())).archived_reason == 'stale'
 
 
 def test_same_or_overlapping_evidence_does_not_confirm_itself():
@@ -256,7 +509,8 @@ def test_dreamer_does_not_checkpoint_a_concurrent_post_apply_change(monkeypatch)
         people = json.loads(prompt)
         return json.dumps({'people': [{'id': p['id'], 'summary_refs': [], 'conflicts': []}
                                       for p in people]})
-    assert dreamer.run(curate, NOW)['reviewed'] == 1
+    # A completed write that races before coverage is saved is not reviewed work.
+    assert dreamer.run(curate, NOW)['reviewed'] == 0
     state = json.loads((Path(kg.data_root()) / 'knowledge/dreamer.json').read_text())
     assert person()[1].canonical_id not in state.get('reviewed', {})
 
@@ -296,12 +550,13 @@ def test_dreamer_preserves_manual_summary_and_rejects_unknown_references():
 
 
 def test_history_checkpoint_resumes_failed_page_and_is_quiet(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_cycle, 'PAGES_PER_RUN', 1)
     monkeypatch.setattr(memory_cycle, 'allowed', lambda s: s == 'imessage')
     monkeypatch.setattr(memory_cycle.prewarm_graph, 'prewarm', lambda *a, **k: None)
     monkeypatch.setattr(memory_cycle.style_extract, 'extract', lambda *a, **k: None)
     monkeypatch.setattr(memory_cycle.relationship_pulse, 'observe_history', lambda *a, **k: None)
     sample = records()
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: sample)
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: sample)
     calls = []
     def fetch(source, window):
         calls.append((source, window['since'], window['until'], window['cursor']))
@@ -366,7 +621,7 @@ def test_transient_permission_denial_holds_cursor_and_resumes(tmp_path, monkeypa
     monkeypatch.setattr(memory_cycle.prewarm_graph, 'prewarm', lambda *a, **k: None)
     monkeypatch.setattr(memory_cycle.style_extract, 'extract', lambda *a, **k: None)
     monkeypatch.setattr(memory_cycle.relationship_pulse, 'observe_history', lambda *a, **k: None)
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: [])
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: [])
     cursors = []
     def fetch(source, window):
         cursors.append(window['cursor'])
@@ -389,7 +644,7 @@ def test_background_budget_rejection_holds_cursor_and_stops_remaining_work(tmp_p
                            (memory_cycle.relationship_pulse, 'observe_history')):
         monkeypatch.setattr(target, method, lambda *a, **k: None)
     observed = records()
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: observed)
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: observed)
     fetches, curations = [], []
     def fetch(*args):
         fetches.append(True)
@@ -659,9 +914,9 @@ def test_background_hold_is_reported_even_when_dreamer_preparation_also_failed(t
     assert receipt['history'][0]['status'] == 'held'
 
 
-def test_dreamer_transport_configuration_error_is_not_a_malformed_response(tmp_path, monkeypatch):
-    """`raise ValueError('Model proxy requires HTTPS …')` is a configuration fault, not a model
-    response. Counting it toward the two-attempt park would silence curation over a typo."""
+def test_dreamer_untyped_execution_error_is_conservatively_charged(tmp_path, monkeypatch):
+    """An untyped fault thrown by the injected execution function proves no admission boundary.
+    Preserve conservative charges; typed preflight refusals are tested separately."""
     _quiet_memory_inputs(monkeypatch)
     ku.apply(fact(), NOW)
     attempts = []
@@ -675,7 +930,8 @@ def test_dreamer_transport_configuration_error_is_not_a_malformed_response(tmp_p
                          lambda *a, **k: {'reviewed': 0, 'facts': 0}, misconfigured)
     state = json.loads(Path(memory_cycle.state_path()).read_text())
     assert len(attempts) == 3 and 'dreamer_failure' not in state
-    assert state['receipt']['dreamer'] == {'status': 'failed', 'error': 'ValueError'}
+    assert state['receipt']['dreamer']['reviewed'] == 0
+    assert state['receipt']['dreamer']['parked'] == 1
 
 
 def test_nonadvancing_source_cursor_retries_bounded_without_model_spend(tmp_path, monkeypatch):
@@ -702,6 +958,7 @@ def test_new_tuning_is_identical_in_both_explorable_docs():
     import re
     root = Path(__file__).resolve().parents[2]
     expected = {'history_days': memory_cycle.HISTORY_DAYS, 'pages_per_run': memory_cycle.PAGES_PER_RUN,
+                'prune_interval_days': memory_cycle.PRUNE_INTERVAL_SECONDS // 86400,
                 'review_messages': learning.REVIEW_MESSAGES,
                 'dream_people': dreamer.DREAM_PEOPLE, 'dream_facts': dreamer.DREAM_FACTS,
                 'feedback_days': personal_context.FEEDBACK_DAYS, 'feedback_limit': personal_context.FEEDBACK_LIMIT,
@@ -746,7 +1003,7 @@ def test_each_invocation_advances_bounded_history_and_unfinished_curation(tmp_pa
     monkeypatch.setattr(memory_cycle.style_extract, 'extract', lambda *a, **k: None)
     monkeypatch.setattr(memory_cycle.relationship_pulse, 'observe_history', lambda *a, **k: None)
     sample = records()
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: sample)
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: sample)
     path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({'day': '2026-09-07', 'dreamer_day': '2026-09-06', 'model_calls': 22}))
     legacy = tmp_path / 'knowledge/episodes.json'
@@ -760,7 +1017,7 @@ def test_each_invocation_advances_bounded_history_and_unfinished_curation(tmp_pa
     final = json.loads(path.read_text())
     assert len(curated) == 1
     assert all(key not in final for key in ('day', 'model_calls', 'dreamer_day'))
-    assert final['sources']['imessage']['pages'] == 1  # other two bounded turns were disabled sources
+    assert final['sources']['imessage']['pages'] == memory_cycle.PAGES_PER_RUN
     assert not legacy.exists()
 
 
@@ -807,7 +1064,7 @@ def test_permanent_provider_rejection_waits_for_a_changed_contract(tmp_path, mon
                            (memory_cycle.relationship_pulse, 'observe_history')):
         monkeypatch.setattr(target, method, lambda *a, **k: None)
     observed = records()
-    monkeypatch.setattr(learning, 'observations', lambda *a: observed)
+    monkeypatch.setattr(learning, 'observations', lambda *a, **kw: observed)
     attempts = []
     def learn(*a, **k):
         attempts.append(True)
@@ -837,7 +1094,7 @@ def test_unchanged_invalid_extraction_retries_once_then_parks(tmp_path, monkeypa
                            (memory_cycle.relationship_pulse, 'observe_history')):
         monkeypatch.setattr(target, method, lambda *a, **k: None)
     sample = records()
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: sample)
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: sample)
     attempts = []
     def invalid(*a, **k):
         attempts.append(True)
@@ -852,13 +1109,15 @@ def test_unchanged_invalid_extraction_retries_once_then_parks(tmp_path, monkeypa
 
 
 def _quiet_memory_inputs(monkeypatch, source='imessage'):
+    # These protocol fixtures checkpoint one page per invocation; full-budget tests run below.
+    monkeypatch.setattr(memory_cycle, 'PAGES_PER_RUN', 1)
     monkeypatch.setattr(memory_cycle, 'allowed', lambda value: value == source)
     monkeypatch.setattr(memory_cycle, 'resolve_contact_names', lambda value: value)
     for target, method in ((memory_cycle.prewarm_graph, 'prewarm'),
                            (memory_cycle.style_extract, 'extract'),
                            (memory_cycle.relationship_pulse, 'observe_history')):
         monkeypatch.setattr(target, method, lambda *a, **k: None)
-    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a: [])
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', lambda *a, **kw: [])
 
 
 def test_unchanged_history_protocol_failure_parks_and_protocol_change_releases(tmp_path, monkeypatch):
@@ -919,11 +1178,15 @@ def test_history_availability_and_rate_limit_failures_never_enter_protocol_latch
 
 
 def test_expired_gmail_continuation_restarts_frozen_window_once_then_advances(tmp_path, monkeypatch):
+    observations = memory_cycle.context_learning.observations
     _quiet_memory_inputs(monkeypatch, source='gmail')
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', observations)
     path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True)
     path.write_text(json.dumps({'next_source': 2, 'sources': {'gmail': {
         'since': 10, 'until': 20, 'cursor': 'expired', 'complete': False,
-        'pages': 1, 'window_page_base': 0, 'rows': 10, 'reviewed': 10}}}))
+        'pages': 1, 'window_page_base': 0, 'rows': 10, 'reviewed': 10,
+        'observation_totals': {'pages': 1, 'rows': 10, 'eligible': 10, 'selected': 10,
+                               'skipped': 0, 'omitted': 0, 'truncated': 0, 'rejected_people': 0}}}}))
     calls = []
     def fetch(source, window):
         calls.append(window.get('cursor'))
@@ -936,6 +1199,9 @@ def test_expired_gmail_continuation_restarts_frozen_window_once_then_advances(tm
                          lambda *a, **k: {'reviewed': 0, 'facts': 0}, quiet)
     window = json.loads(path.read_text())['sources']['gmail']
     assert calls == ['expired', 'expired', None]
+    assert window['window_page_base'] == 1
+    assert window['observation_totals']['rows'] == 0
+    assert window['observation_totals']['pages'] == 1
     assert window['cursor'] == 'fresh' and window['since'] == 10 and window['until'] == 20
     # The marker records the depth the dead token reached, so the next restart must beat it.
     assert window['continuation_reset'] == {'at': (NOW + timedelta(hours=1)).isoformat(),
@@ -963,7 +1229,7 @@ def test_gmail_fetch_rejection_that_is_not_a_dead_token_never_replays_a_paid_pag
     window = json.loads(path.read_text())['sources']['gmail']
     assert calls == ['paid-to-here'] * memory_cycle.UNCHANGED_PROTOCOL_ATTEMPTS
     assert window['cursor'] == 'paid-to-here' and 'continuation_reset' not in window
-    assert receipts[-1][0] == {'source': 'gmail', 'status': 'blocked',
+    assert next(row for row in receipts[-1] if row['source'] == 'gmail') == {'source': 'gmail', 'status': 'blocked',
                                'error_code': 'history_protocol_rejected',
                                'reason': 'provider_request_rejected'}
     assert 'PRIVATE' not in path.read_text() and 'provider.invalid' not in path.read_text()
@@ -998,8 +1264,8 @@ def test_gmail_continuation_restart_is_earned_by_progress_not_by_an_adapter_upda
     assert window['continuation_reset'] == {'at': (NOW + timedelta(hours=1)).isoformat(),
                                             'pages': 3, 'reached': 3}
     assert window['protocol_failure']['code'] == 'continuation_restart_exhausted'
-    assert receipts[5][0]['error_code'] == 'continuation_restart_exhausted'
-    assert receipts[6][0] == {'source': 'gmail', 'status': 'blocked',
+    assert next(row for row in receipts[5] if row['source'] == 'gmail')['error_code'] == 'continuation_restart_exhausted'
+    assert next(row for row in receipts[6] if row['source'] == 'gmail') == {'source': 'gmail', 'status': 'blocked',
                               'error_code': 'history_protocol_rejected',
                               'reason': 'continuation_restart_exhausted'}
 
@@ -1056,7 +1322,7 @@ def test_gmail_restart_progress_excludes_completed_windows(tmp_path, monkeypatch
     # The old 100 pages remain in diagnostics but cannot inflate this window's one-page depth.
     # Its next attempt reached two pages, so a second expired token earns a second reset.
     assert calls == [None, 'dead-one', 'dead-one', None, 'deeper', 'dead-two', 'dead-two', None]
-    assert window['pages'] == 104 and window['window_page_base'] == 100
+    assert window['pages'] == 104 and window['window_page_base'] == 103
     assert window['continuation_reset'] == {'at': (NOW + timedelta(hours=6)).isoformat(),
                                             'pages': 103, 'reached': 2}
     assert window['cursor'] == 'deeper' and 'protocol_failure' not in window
@@ -1085,7 +1351,9 @@ def test_gmail_legacy_reset_marker_still_blocks_replay_after_release(tmp_path, m
 
 
 def test_gmail_old_unmeasured_window_gets_only_one_restart(tmp_path, monkeypatch):
+    observations = memory_cycle.context_learning.observations
     _quiet_memory_inputs(monkeypatch, source='gmail')
+    monkeypatch.setattr(memory_cycle.context_learning, 'observations', observations)
     path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True)
     path.write_text(json.dumps({'next_source': 2, 'sources': {'gmail': {
         'since': 10, 'until': 20, 'cursor': 'expired', 'complete': False,
@@ -1115,15 +1383,19 @@ def test_unchanged_dreamer_failure_parks_but_changed_evidence_same_person_releas
     ku.apply(fact(), NOW)
     calls = []
     def malformed(now=None):
-        calls.append(True)
-        return dreamer.run(lambda *a, **k: '{bad json', now)
+        def model(*args, **kwargs):
+            calls.append(True)
+            return '{bad json'
+        return dreamer.run(model, now)
     complete = lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': None, 'complete': True}
     learned = lambda *a, **k: {'reviewed': 0, 'facts': 0}
     for hour in range(3):
         memory_cycle.run(NOW + timedelta(hours=hour), complete, learned, malformed)
     state = json.loads(Path(memory_cycle.state_path()).read_text())
-    assert len(calls) == memory_cycle.UNCHANGED_DREAMER_ATTEMPTS == state['dreamer_failure']['attempts'] == 2
-    assert state['receipt']['dreamer']['status'] == 'blocked'
+    assert len(calls) == memory_cycle.UNCHANGED_DREAMER_ATTEMPTS == 2
+    assert state['receipt']['dreamer']['parked'] == 1
+    assert all(row['attempts'] == 2 for rows in dreamer.jsonstore.read(dreamer._state_path())['facts'].values()
+               for row in rows.values())
 
     # The identity is unchanged; new durable evidence alone must release the parked request.
     ku.apply(fact('Alex is advising a climate startup.', ['gmail:new']), NOW + timedelta(hours=3))
@@ -1216,6 +1488,7 @@ def test_partial_validity_cannot_bypass_consent_recheck(tmp_path, monkeypatch):
 
 
 def test_mixed_extraction_advances_history_and_retains_safe_rejection_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_cycle, 'PAGES_PER_RUN', 1)
     monkeypatch.setattr(memory_cycle, 'allowed', lambda source: source == 'gmail')
     monkeypatch.setattr(memory_cycle, 'resolve_contact_names', lambda value: value)
     for target, method in ((memory_cycle.prewarm_graph, 'prewarm'), (memory_cycle.style_extract, 'extract'),
@@ -1223,7 +1496,7 @@ def test_mixed_extraction_advances_history_and_retains_safe_rejection_counts(tmp
         monkeypatch.setattr(target, method, lambda *a, **k: None)
     observed = [*records(), {**records()[0], 'ref': 'gmail:other',
                             'subject': 'other@example.com', 'name': 'Other'}]
-    monkeypatch.setattr(learning, 'observations', lambda source, rows, now: rows)
+    monkeypatch.setattr(learning, 'observations', lambda source, rows, now, **kw: rows)
     path = Path(memory_cycle.state_path()); path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({'next_source': 2, 'sources': {'gmail': {
         'since': 1, 'until': 2, 'cursor': None, 'rejected_request_revision': 'old-contract',
@@ -1310,7 +1583,7 @@ def test_bridge_timeout_retains_page_and_retries_without_extraction_latch(tmp_pa
 @pytest.mark.parametrize('reason', ['PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST'])
 def test_provider_blocked_page_is_excluded_once_and_later_history_advances(tmp_path, monkeypatch, reason):
     _quiet_memory_inputs(monkeypatch)
-    monkeypatch.setattr(learning, 'observations', lambda source, rows, now: rows)
+    monkeypatch.setattr(learning, 'observations', lambda source, rows, now, **kw: rows)
     calls = []
     def fetch(source, window):
         return {'status': 'ok', 'rows': [{'text': 'PRIVATE', 'ref': 'private-ref'}],
@@ -1447,7 +1720,7 @@ def test_unknown_page_id_is_not_guessed_from_a_valid_reference(tmp_path, output_
 def test_unknown_subject_parks_same_page_then_new_contract_resumes_without_skipping(monkeypatch):
     observed = records()
     _quiet_memory_inputs(monkeypatch, source='gmail')
-    monkeypatch.setattr(learning, 'observations', lambda *a: observed)
+    monkeypatch.setattr(learning, 'observations', lambda *a, **kw: observed)
     revision = learning.request_revision()
     monkeypatch.setattr(learning, 'request_revision', lambda: 'old-subject-contract')
     fetched, calls = [], []
@@ -1582,8 +1855,166 @@ def test_dreamer_does_not_checkpoint_facts_uncovered_beyond_the_batch(monkeypatc
     def curate(prompt, config, **kwargs):
         rows = json.loads(prompt)
         return json.dumps({'people': [{'id': p['id'], 'summary_refs': list(p['facts'])[:1],
-            'conflicts': [], 'equivalent_groups': [list(p['facts'])]} for p in rows]})
+            'conflicts': [], 'equivalent_groups': [list(p['facts'])] if len(p['facts']) >= 2 else []} for p in rows]})
     assert dreamer.run(curate, NOW)['reviewed'] == 1
     assert dreamer.prepare()['candidates']  # newly uncovered third fact still needs review
     assert dreamer.run(curate, NOW)['reviewed'] == 1
     assert not dreamer.prepare()['candidates']
+
+
+@pytest.mark.parametrize('wording', ['keeper', 'sibling', 'transitive'])
+def test_a1_duplicate_family_replay_cannot_confirm_any_wording(wording):
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    p.facts['f_tail'] = kg.FactMeta(text='Ari and Bo are Alex’s children.', status='archived',
+        archived_reason='duplicate', duplicate_of=b, source='observed_message',
+        source_ref='gmail:three', evidence_refs=['gmail:three'], first='2026-09-06', last='2026-09-06')
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts
+    text = before[{'keeper': a, 'sibling': b, 'transitive': 'f_tail'}[wording]].text
+    result = ku.apply(fact(text, ['gmail:three'], date='2026-10-06'), NOW + timedelta(days=30))
+    assert result['applied']['confirmed'] == 0
+    assert person()[1].facts == before
+
+
+def test_a1_stale_keeper_replay_does_not_revive_but_new_evidence_does():
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    p.facts[a].status, p.facts[a].archived_reason = 'archived', 'stale'
+    p.facts[a].archived_text = p.facts[a].text
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts
+    ku.apply(fact(before[a].text, ['imessage:two'], date='2026-10-06'), NOW + timedelta(days=30))
+    assert person()[1].facts == before
+    fresh = ku.apply(fact(before[b].text, ['gmail:new'], date='2026-10-06'), NOW + timedelta(days=30))
+    assert fresh['applied']['confirmed'] == 1
+    assert person()[1].facts[a].status == 'active' and person()[1].facts[a].seen == 2
+    assert person()[1].facts[b] == before[b]
+
+
+@pytest.mark.parametrize('bad_link', ['cycle', 'missing', 'wrong_person'])
+def test_a1_invalid_duplicate_lineage_does_not_mutate_or_confirm(bad_link):
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    p.facts[a].status, p.facts[a].archived_reason = 'archived', 'duplicate'
+    p.facts[a].duplicate_of = b if bad_link == 'cycle' else 'f_elsewhere'
+    if bad_link == 'wrong_person':
+        elsewhere = fact('Alex is an architect.', ['gmail:foreign'])
+        elsewhere['person_updates'][0].update(identifier='other@example.com', person_name='Other')
+        ku.apply(elsewhere, NOW)
+        other_path = kg.find_person_file(identifier='other@example.com')
+        other = kg.parse_person_file(Path(other_path).read_text())
+        other.facts['f_elsewhere'] = kg.FactMeta(text=p.facts[a].text, source='observed_message',
+            source_ref='gmail:foreign', evidence_refs=['gmail:foreign'], first='2026-09-06', last='2026-09-06')
+        kg.write_person_file(other_path, other, NOW)
+        other_bytes = Path(other_path).read_bytes()
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts
+    ku.apply(fact(before[b].text, ['gmail:new']), NOW)
+    assert person()[1].facts == before
+    if bad_link == 'wrong_person':
+        assert Path(other_path).read_bytes() == other_bytes
+
+
+@pytest.mark.parametrize('incomplete', ['saturated', 'legacy_missing'])
+def test_a1_family_incomplete_evidence_needs_source_chronology(incomplete):
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    if incomplete == 'saturated':
+        p.facts[b].evidence_refs = [f'archive:{i}' for i in range(64)]
+    else:
+        p.facts[b].evidence_refs = []
+        p.facts[b].seen = 3
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts[a]
+    assert ku.apply(fact(before.text, ['gmail:evicted'], date='2026-09-06'), NOW)['applied']['confirmed'] == 0
+    after = person()[1].facts[a]
+    assert (after.seen, after.conf, after.first, after.last, after.status) == (
+        before.seen, before.conf, before.first, before.last, before.status)
+    assert ku.apply(fact(before.text, ['gmail:genuinely-later'], date='2026-09-07'), NOW + timedelta(days=1))['applied']['confirmed'] == 1
+
+
+
+def test_a1_new_evidence_once_in_one_batch_preserves_sibling_provenance():
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    before = person()[1].facts
+    update = fact(before[a].text, ['gmail:new'])
+    update['person_updates'][0]['facts'].append(fact(before[b].text, ['gmail:new'])['person_updates'][0]['facts'][0])
+    result = ku.apply(update, NOW)
+    assert result['applied']['confirmed'] == 1 and person()[1].facts[a].seen == 2
+    assert person()[1].facts[b] == before[b]
+    assert person()[1].facts[a].source == before[a].source
+    assert person()[1].facts[a].source_ref == before[a].source_ref
+
+
+@pytest.mark.parametrize('last', ['2026-09-07', ''])
+def test_a1_saturated_sibling_latest_or_unknown_date_fences_stale_keeper(last):
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    p.facts[a].status, p.facts[a].archived_reason = 'archived', 'stale'
+    p.facts[a].archived_text = p.facts[a].text
+    p.facts[b].evidence_refs = [f'archive:{i}' for i in range(64)]
+    p.facts[b].last = last
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts[a]
+    ku.apply(fact(before.text, ['gmail:evicted'], date='2026-09-07'), NOW + timedelta(days=1))
+    after = person()[1].facts[a]
+    assert (after.status, after.archived_reason, after.seen, after.conf, after.first, after.last) == (
+        before.status, before.archived_reason, before.seen, before.conf, before.first, before.last)
+
+
+def test_a1_explicit_owner_confirmation_still_upgrades_authority():
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    before = person()[1].facts
+    result = ku.apply(fact(before[a].text, ['owner:confirmation'], source='user_edit'), NOW)
+    assert result['applied']['confirmed'] == 1
+    assert person()[1].facts[a].source == 'user_edit' and person()[1].facts[a].seen == 2
+    assert person()[1].facts[b] == before[b]
+
+
+def test_a1_explicit_owner_archive_remains_authoritative_for_duplicate_family():
+    import knowledge_edit
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    knowledge_edit.op_archive(path.stem, a, NOW)
+    before = person()[1].facts
+    assert before[a].archived_reason == 'user_archived'
+    ku.apply(fact(before[b].text, ['gmail:new'], date='2026-10-06'), NOW + timedelta(days=30))
+    assert person()[1].facts == before
+
+
+def test_a1_retained_family_evidence_also_blocks_research_replay():
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    before = person()[1].facts
+    ku.apply(fact(before[a].text, ['imessage:two'], source='web_research'), NOW)
+    assert person()[1].facts == before
+
+
+
+def test_a1_legacy_incompleteness_survives_repeated_calls_and_restart():
+    ku.apply(fact(refs=['gmail:original']), NOW)
+    path, p = person()
+    fid = next(iter(p.facts))
+    p.facts[fid].evidence_refs = []
+    kg.write_person_file(str(path), p, NOW)
+    for refs, observed, confirmed in [(['gmail:evicted-one'], '2026-09-06', 0),
+                                    (['gmail:evicted-two'], '2026-09-06', 0),
+                                    (['gmail:later'], '2026-09-07', 1),
+                                    (['gmail:evicted-three'], '2026-09-07', 0)]:
+        result = ku.apply(fact(refs=refs, date=observed), NOW + timedelta(days=1))
+        assert result['applied']['confirmed'] == confirmed
+        # Re-read the actual serialized record after each separate locked apply.
+        saved = person()[1].facts[fid]
+        assert saved.evidence_refs == [] and saved.source_ref == 'gmail:original'
+    assert saved.seen == 2 and saved.last == '2026-09-07'
+
+
+def test_a1_impossible_family_observation_date_is_unknown():
+    a, b = _fold_children(['gmail:one'], ['imessage:two'])
+    path, p = person()
+    p.facts[b].evidence_refs = []
+    p.facts[b].last = '2026-00-01'
+    kg.write_person_file(str(path), p, NOW)
+    before = person()[1].facts
+    ku.apply(fact(before[a].text, ['gmail:new'], date='2026-09-07'), NOW + timedelta(days=1))
+    assert person()[1].facts == before

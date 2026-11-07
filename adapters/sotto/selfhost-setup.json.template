@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "tenantId": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+  "accountId": "REPLACE_WITH_ACCOUNT_ID",
+  "lineKey": "telegram-owner",
+  "volumeId": "REPLACE_WITH_STABLE_LOCAL_VOLUME_ID",
+  "instructions": "REPLACE_WITH_OWNER_INSTRUCTIONS",
+  "botToken": "REPLACE_WITH_BOTFATHER_TOKEN",
+  "pairingPhrase": "REPLACE_WITH_RANDOM_24_TO_64_CHARACTER_PHRASE",
+  "modelDirect": {
+    "provider": "google",
+    "apiKey": "REPLACE_WITH_DIRECT_GEMINI_API_KEY",
+    "chatModelId": "gemini-3.8-flash",
+    "nativeMediaModelId": "gemini-3.8-flash"
+  },
+  "runtime": {"port": 19981, "bearerToken": "REPLACE_WITH_UNIQUE_RUNTIME_SECRET_AT_LEAST_32_CHARS"},
+  "relay": {"receiverPort": 19982, "rootBearer": "REPLACE_WITH_UNIQUE_RELAY_SECRET_AT_LEAST_32_CHARS"},
+  "controlToken": "REPLACE_WITH_UNIQUE_CONTROL_SECRET_AT_LEAST_32_CHARS",
+  "timezone": "UTC"
+}

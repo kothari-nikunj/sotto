@@ -1,0 +1,25 @@
+{
+  "source_report": "outputs/commitment-journey-oct19/complete.json",
+  "source_report_sha256": "d12fcc6b9bfbb1065f9674ec9ad3055a85c779cac9a7aaeff7579ed54b048948",
+  "snapshot_day": "2026-10-20",
+  "scope": "Exact synthetic production composer/critic/resolver files from the verified final replay; no invented ledger fields.",
+  "files_sha256": {
+    "knowledge/continuity/follow-up-cid-c-abc193-6e9d9906.md": "af83b75e5eb634144de990e4a5dadd9db3820519c452a401488797b88895c497",
+    "knowledge/continuity/follow-up-cid-c-abc193-origin-7cd4bc10033d34fe-3ee642a2.md": "75711cfb9dd3d733523c5433076326440cf5d404cf18ebb0fc8ba7a433248a3a",
+    "knowledge/people/c_abc193.md": "6829934706f03e407c9a38a4883b904c2f226698d2830e9dd62e0606c90d1b5c"
+  },
+  "rows": [
+    {
+      "anchor_key": "follow_up:cid:c_abc193",
+      "status": "resolved",
+      "ask": "send the pricing document tomorrow",
+      "deadline": "2026-10-19"
+    },
+    {
+      "anchor_key": "follow_up:cid:c_abc193:origin:7cd4bc10033d34fe",
+      "status": "open",
+      "ask": "send the launch checklist tomorrow",
+      "deadline": "2026-10-19"
+    }
+  ]
+}

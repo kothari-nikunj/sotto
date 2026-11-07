@@ -6,7 +6,7 @@ that must never regress quietly: referential integrity (one human, one alias, ev
 same-domain relationship, the leak scan's refusal to write, and the "scrubbed is not shareable"
 mechanics (map outside the corpus, corpus self-ignoring).
 
-Design: docs/plans/golden-corpus.md. Runbook: evals/LABELING.md.
+Design: docs/archive/plans/golden-corpus.md. Runbook: evals/LABELING.md.
 """
 import importlib.util
 import json
@@ -575,3 +575,20 @@ def test_a_name_known_only_from_a_relation_is_pseudonymized_too(corpus):
     summaries = " ".join(e["frontmatter"].get("summary", "")
                          for e in corpus["manifest"]["seed_ledger"])
     assert person["alias"]["name"] in summaries
+
+
+def test_chronological_corpus_does_not_seed_today_into_earlier_days(tmp_path):
+    res = build_corpus(tmp_path / 'chronological', chronological=True)
+    assert res['rc'] == 0
+    assert res['manifest']['seed_ledger'] == []
+    assert res['manifest']['preferences'] == {}
+    assert res['manifest']['replay_policy']['unversioned_state_seeded'] is False
+    for day in res['days'].values():
+        assert day['replay_clock'] == 'day_end'
+        assert day['inputs']['local']['contacts'] == []
+        assert day['inputs']['local']['reminders'] == []
+        assert day['inputs']['local']['source_status'] == {}
+        assert day['inputs']['type'] == 'evening'
+    # Yesterday does not contain today's reply. Retained source evidence still exists.
+    assert len(res['days']['day-01']['inputs']['google']['emails']) == 1
+    assert len(res['days']['day-00']['inputs']['google']['emails']) == 2

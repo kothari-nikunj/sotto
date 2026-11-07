@@ -160,6 +160,77 @@ def test_friday_question_shares_standing_rule_allowance(volume, monkeypatch):
     assert cb._append_weekly_review(dict(original), {"type": "morning"}, NOW) == original
 
 
+@pytest.mark.parametrize('repeated', [False, True])
+def test_weekly_review_adds_choice_without_repeating_visible_task(volume, monkeypatch, repeated):
+    import pending_offer
+    entry = row('agreement', 'Send the signed agreement')
+    scanned = {'anchor_key': 'agreement', 'name': 'Alex Chen', 'what': entry['summary'],
+               'times_surfaced': retune_scan.STALE_SURFACED if repeated else 0,
+               'surface_count_provenance': 'accepted_delivery'}
+    monkeypatch.setattr(ledger_io, 'load_active', lambda **kwargs: [entry])
+    monkeypatch.setattr(ledger_io, 'load_entries', lambda: [])
+    monkeypatch.setattr(retune_scan, 'scan', lambda **kwargs: {'stale_loops': [scanned]})
+    monkeypatch.setattr(review_candidates, 'choose', lambda *args: None)
+    offers = []
+    monkeypatch.setattr(pending_offer, 'set_offer', lambda *args, **kwargs: offers.append(kwargs))
+    out = {'brief_markdown': '## Needs Attention Now\nAlex Chen: Send the signed agreement. '
+                             '<!--id:alex@example.com--> <!--loop:agreement-->\n'}
+    cb._append_weekly_review(out, {'type': 'evening'}, NOW)
+    assert out['brief_markdown'].count('Send the signed agreement') == 1
+    assert '## Weekly review' in out['brief_markdown']
+    assert cb._represented_loop_rows([entry], out['brief_markdown']) == [entry]
+    if repeated:
+        assert 'Keep it, snooze it, or let it go?' in out['brief_markdown']
+        assert out['_review_question'] == 'weekly_repeated'
+        assert offers == [{'person': 'Alex Chen', 'detail': entry['summary'], 'anchor_key': 'agreement'}]
+    else:
+        assert 'Keep, snooze or dismiss any of the unfinished tasks above' in out['brief_markdown']
+        assert not offers and '_review_question' not in out
+
+
+def test_weekly_review_respects_source_bound_display_approval(volume, monkeypatch):
+    import delivery_effects
+    entry = row('agreement', 'Send the signed agreement')
+    scanned = {'anchor_key': 'agreement', 'name': 'Alex Chen', 'what': entry['summary'],
+               'times_surfaced': 0, 'surface_count_provenance': 'accepted_delivery'}
+    monkeypatch.setattr(ledger_io, 'load_active', lambda **kwargs: [entry])
+    monkeypatch.setattr(ledger_io, 'load_entries', lambda: [])
+    monkeypatch.setattr(retune_scan, 'scan', lambda **kwargs: {'stale_loops': [scanned]})
+    monkeypatch.setattr(review_candidates, 'choose', lambda *args: None)
+    line = 'Alex Chen<!--id:alex@example.com-->: Return the countersigned contract. <!--loop:agreement-->'
+    out = {'brief_markdown': '## Needs Attention Now\n' + line + '\n',
+           '_reviewed_mentions': {'agreement': (delivery_effects.loop_version(entry), line)}}
+    # The same approval that keeps Still open from repeating this task binds every later appendix.
+    assert cb._append_still_open(dict(out), [entry], NOW, '2026-09-18')['brief_markdown'] == out['brief_markdown']
+    cb._append_weekly_review(out, {'type': 'evening'}, NOW)
+    assert 'Send the signed agreement' not in out['brief_markdown']
+    assert 'Keep, snooze or dismiss any of the unfinished tasks above' in out['brief_markdown']
+    stale = {**out, 'brief_markdown': '## Needs Attention Now\n' + line + '\n',
+             '_reviewed_mentions': {'agreement': ('older-version', line)}}
+    cb._append_weekly_review(stale, {'type': 'evening'}, NOW)
+    assert 'Send the signed agreement <!--loop:agreement-->' in stale['brief_markdown']
+
+
+def test_weekly_hidden_marker_cannot_suppress_the_reviewed_task(volume, monkeypatch):
+    import pending_offer
+    entry = row('agreement', 'Send the signed agreement')
+    scanned = {'anchor_key': 'agreement', 'name': 'Alex Chen', 'what': entry['summary'],
+               'times_surfaced': retune_scan.STALE_SURFACED,
+               'surface_count_provenance': 'accepted_delivery'}
+    monkeypatch.setattr(ledger_io, 'load_active', lambda **kwargs: [entry])
+    monkeypatch.setattr(ledger_io, 'load_entries', lambda: [])
+    monkeypatch.setattr(retune_scan, 'scan', lambda **kwargs: {'stale_loops': [scanned]})
+    offers = []
+    monkeypatch.setattr(pending_offer, 'set_offer', lambda *args, **kwargs: offers.append(kwargs))
+    out = {'brief_markdown': '## Needs Attention Now\nAlex Chen: Confirm lunch. <!--loop:agreement-->\n'}
+    assert cb._represented_loop_rows([entry], out['brief_markdown']) == []
+    cb._append_weekly_review(out, {'type': 'evening'}, NOW)
+    weekly = out['brief_markdown'].split('## Weekly review', 1)[1]
+    assert 'Send the signed agreement <!--loop:agreement-->' in weekly
+    assert cb._represented_loop_rows([entry], out['brief_markdown']) == [entry]
+    assert offers[0]['anchor_key'] == 'agreement' and offers[0]['detail'] in weekly
+
+
 def test_quoted_question_does_not_consume_appended_friday_allowance(volume, monkeypatch):
     monkeypatch.setattr(ledger_io, "load_active", lambda **kwargs: [])
     monkeypatch.setattr(ledger_io, "load_entries", lambda: [])
@@ -292,3 +363,12 @@ def test_history_warning_distinguishes_recent_access_and_excluded_pages(volume, 
     assert "Some older iMessage messages couldn't be learned" in text
     assert 'past context has gaps' in text and 'is paused' not in text
     assert 'recent messages are available' not in health(volume, {'sources': {'imessage': {'error': 'error'}}})
+
+
+def test_partial_current_messages_do_not_hide_stalled_history(volume, monkeypatch):
+    monkeypatch.setattr(source_context, "allowed", lambda source: source == "imessage")
+    state = {"sources": {"imessage": {"last_success": "2026-09-10T12:00:00Z"}}}
+    inputs = {"local": {"source_status": {"imessage": "partial"}}}
+    text = health(volume, state, inputs)
+    assert "Learning from older iMessage messages is paused" in text
+    assert "recent messages are available" in text

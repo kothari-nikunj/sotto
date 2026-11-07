@@ -1,0 +1,132 @@
+{
+  "name": "history-coverage-read-versus-extraction-health",
+  "world": {
+    "knowledge": {
+      "person_updates": [
+        {
+          "person_name": "Dana Reed",
+          "identifier": "dana@cedar.example",
+          "updated_by": "web_research",
+          "facts": [
+            {
+              "fact": "Dana Reed founded Cedar Labs.",
+              "memory_type": "context",
+              "confidence": 0.9,
+              "source": "web_research",
+              "source_ref": "https://cedar.example/team"
+            }
+          ]
+        }
+      ]
+    },
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"contacts\": {\"consented\": true, \"connected\": true}}}",
+      "knowledge/history-state.json": "{\"sources\": {\"gmail\": {\"since\": 1791936000, \"until\": 1792022400, \"complete\": true, \"initial_complete\": true, \"pages\": 3, \"window_page_base\": 2, \"cursor\": \"PRIVATE-CURSOR-NOT-FOR-CHAT\", \"error\": \"PRIVATE-MESSAGE-NOT-FOR-CHAT\", \"observation_totals\": {\"pages\": 1, \"rows\": 20, \"eligible\": 20, \"selected\": 10, \"skipped\": 0, \"omitted\": 10, \"truncated\": 2, \"rejected_people\": 0}, \"last_read_success\": \"2026-10-20T08:00:00Z\", \"last_success\": \"2026-10-20T07:00:00Z\", \"last_attempt\": {\"status\": \"failed\", \"at\": \"2026-10-20T09:00:00Z\", \"stage\": \"memory_extraction\"}, \"error_stage\": \"memory_extraction\", \"http_status\": 503}}}"
+    },
+    "contacts": [
+      {
+        "name": "Dana Reed",
+        "phones": [
+          "+15555550123"
+        ],
+        "emails": [
+          "dana@cedar.example"
+        ]
+      }
+    ],
+    "savedSourceGrants": [
+      "gmail",
+      "google_contacts"
+    ]
+  },
+  "turns": [
+    {
+      "text": "Check the saved Gmail learning coverage. When did a read last succeed, when did extraction last succeed, and what happened on the latest attempt? No fresh searches.",
+      "containsAny": [
+        [
+          "08:00",
+          "8:00",
+          "8 AM",
+          "8am"
+        ],
+        [
+          "07:00",
+          "7:00",
+          "7 AM",
+          "7am"
+        ],
+        [
+          "failed",
+          "failure",
+          "unavailable"
+        ]
+      ],
+      "excludes": [
+        "PRIVATE-CURSOR",
+        "PRIVATE-MESSAGE"
+      ],
+      "websiteReads": 0,
+      "contactReads": 0
+    },
+    {
+      "text": "So does that mean all email history with Dana has been reviewed?",
+      "containsAny": [
+        [
+          "partial",
+          "incomplete",
+          "cannot",
+          "does not",
+          "doesn\u2019t",
+          "doesn't",
+          "No"
+        ]
+      ],
+      "websiteReads": 0,
+      "contactReads": 0,
+      "excludes": [
+        "have not been reviewed",
+        "were never read",
+        "are uncovered",
+        "remain uncovered"
+      ]
+    },
+    {
+      "text": "anything else missing from that saved coverage?",
+      "containsAny": [
+        [
+          "omitted",
+          "shortened",
+          "truncated",
+          "not selected",
+          "left out"
+        ]
+      ],
+      "websiteReads": 0,
+      "contactReads": 0,
+      "excludes": [
+        "remain uncovered",
+        "are uncovered",
+        "have not been reviewed",
+        "were never read"
+      ]
+    },
+    {
+      "text": "Does a successful source read prove every fact was learned or that I owe Dana a reply?",
+      "containsAny": [
+        [
+          "does not",
+          "doesn\u2019t",
+          "doesn't",
+          "cannot",
+          "not proof",
+          "No"
+        ]
+      ],
+      "excludes": [
+        "yes, you still owe"
+      ],
+      "websiteReads": 0,
+      "contactReads": 0
+    }
+  ]
+}

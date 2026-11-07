@@ -1,0 +1,154 @@
+{
+  "name": "synthetic-learning-recovery-machinery",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "learningJourney": {
+      "email": "mira@example.com",
+      "name": "Mira Patel",
+      "fact": "Mira Patel designs coastal flood sensors at Harbor Instruments."
+    },
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}}}"
+    }
+  },
+  "turns": [
+    {
+      "text": "What have you learned about mira@example.com? Be clear about learning gaps.",
+      "receiverBefore": [
+        {
+          "journey": "learning",
+          "stage": "rejected"
+        }
+      ],
+      "contains": [
+        "learning"
+      ],
+      "returnedEvidenceContains": [
+        "unsupported_model_settings",
+        "memory_extraction"
+      ],
+      "returnedEvidenceExcludes": [
+        "Mira Patel designs coastal flood sensors at Harbor Instruments.",
+        "obligation_history"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "containsAny": [
+        [
+          "failed",
+          "failure",
+          "error",
+          "not successfully completed",
+          "not yet completed a successful",
+          "blocked",
+          "configuration issue"
+        ],
+        [
+          "incomplete",
+          "not successfully completed",
+          "not yet completed a successful"
+        ]
+      ],
+      "excludes": [
+        "unreviewed",
+        "never reviewed",
+        "never read",
+        "never been reviewed",
+        "not been reviewed",
+        "never processed"
+      ]
+    },
+    {
+      "text": "What does mira@example.com build?",
+      "receiverBefore": [
+        {
+          "journey": "learning",
+          "stage": "resumed"
+        }
+      ],
+      "resetConversationBefore": true,
+      "contains": [
+        "coastal flood sensors",
+        "Harbor Instruments"
+      ],
+      "returnedEvidenceContains": [
+        "coastal flood sensors",
+        "Harbor Instruments",
+        "outside_window_review"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "excludes": [
+        "unreviewed",
+        "never reviewed",
+        "never read",
+        "never been reviewed",
+        "not been reviewed",
+        "never processed"
+      ],
+      "returnedEvidenceExcludes": [
+        "obligation_history"
+      ]
+    },
+    {
+      "text": "What do you know about mira@example.com? Have you read all our history?",
+      "receiverBefore": [
+        {
+          "journey": "learning",
+          "stage": "replayed"
+        }
+      ],
+      "restartBefore": true,
+      "resetConversationBefore": true,
+      "contains": [
+        "coastal flood sensors",
+        "Harbor Instruments"
+      ],
+      "returnedEvidenceContains": [
+        "coastal flood sensors",
+        "Harbor Instruments",
+        "outside_window_review"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "containsAny": [
+        [
+          "unknown",
+          "cannot confirm",
+          "can’t confirm",
+          "can't confirm"
+        ],
+        [
+          "window",
+          "six-week",
+          "42-day"
+        ]
+      ],
+      "excludes": [
+        "unreviewed",
+        "never reviewed",
+        "never read",
+        "never been reviewed",
+        "not been reviewed",
+        "never processed"
+      ],
+      "returnedEvidenceExcludes": [
+        "obligation_history"
+      ]
+    }
+  ]
+}

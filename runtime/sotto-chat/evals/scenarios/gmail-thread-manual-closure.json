@@ -1,0 +1,181 @@
+{
+  "name": "synthetic-manual-closure-original-thread-read",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}",
+      "knowledge/continuity/follow-up-cid-c-abc193-6e9d9906.md": "---\nanchor_key: follow_up:cid:c_abc193\naction_type: follow_up\nchannel: gmail\ncontact_name: Dana Vale\ncontact_identifier: dana.vale@example.test\ncanonical_id: c_abc193\nstatus: resolved\ncreated_at: '2026-10-15T10:00:00-07:00'\nsummary: Approve the Cedar option grant\nask: approve the Cedar option grant\nmeeting_time: null\ndeadline: '2026-10-25'\nsource_thread_id: cedar-grant-thread\nsource_message_id: cedar-request\ngroup_id: null\nsource: null\nsource_refs:\n- sourceType: gmail\n  sourceId: cedar-request\n  snippet: Please approve the Cedar option grant.\n  timestamp: '2026-10-15T10:00:00-07:00'\nresolution_mode: null\nsource_brief_at: '2026-10-18 10:00:00'\nresolution: user_resolved\nresolved_at: '2026-10-19'\nclosed_at: '2026-10-19T08:00:00Z'\nsource_timestamp: '2026-10-15T10:00:00-07:00'\n---\n",
+      "knowledge/continuity/follow-up-cid-c-abc193-origin-7cd4bc10033d34fe-3ee642a2.md": "---\nanchor_key: follow_up:cid:c_abc193:origin:7cd4bc10033d34fe\naction_type: follow_up\nchannel: gmail\ncontact_name: Dana Vale\ncontact_identifier: dana.vale@example.test\ncanonical_id: c_abc193\nstatus: open\ncreated_at: '2026-10-15T10:00:00-07:00'\nsummary: Send the launch checklist\nask: send the launch checklist\nmeeting_time: null\ndeadline: '2026-10-25'\nsource_thread_id: cedar-checklist-thread\nsource_message_id: checklist-request\ngroup_id: null\nsource: null\nsource_refs:\n- sourceType: gmail\n  sourceId: checklist-request\n  snippet: Please send the launch checklist.\n  timestamp: '2026-10-15T10:00:00-07:00'\nresolution_mode: null\nsource_brief_at: '2026-10-20 10:00:00'\nsource_timestamp: '2026-10-15T10:00:00-07:00'\n---\n",
+      "knowledge/people/c_abc193.md": "---\nschema: 1\ncanonical_id: c_abc193\nname: Dana Vale\nidentifiers:\n- dana.vale@example.test\nfacts: {}\n---\n"
+    },
+    "gmailMessages": {
+      "cedar-approval": {
+        "id": "cedar-approval",
+        "threadId": "cedar-grant-thread",
+        "internalDate": "1792207260000",
+        "labelIds": [
+          "SENT"
+        ],
+        "snippet": "Approved — please proceed with the Cedar option grant.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "To",
+              "value": "dana.vale@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar option grant approval"
+            },
+            {
+              "name": "Date",
+              "value": "Fri, 16 Oct 2026 20:21:00 -0700"
+            }
+          ],
+          "body": {
+            "data": "QXBwcm92ZWQg4oCUIHBsZWFzZSBwcm9jZWVkIHdpdGggdGhlIENlZGFyIG9wdGlvbiBncmFudC4="
+          }
+        }
+      },
+      "cedar-request": {
+        "id": "cedar-request",
+        "threadId": "cedar-grant-thread",
+        "internalDate": "1792083600000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Please approve the Cedar option grant.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "dana.vale@example.test"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar option grant approval"
+            },
+            {
+              "name": "Date",
+              "value": "Thu, 15 Oct 2026 10:00:00 -0700"
+            }
+          ],
+          "body": {
+            "data": "UGxlYXNlIGFwcHJvdmUgdGhlIENlZGFyIG9wdGlvbiBncmFudC4="
+          }
+        }
+      },
+      "cedar-forwarding": {
+        "id": "cedar-forwarding",
+        "threadId": "cedar-grant-thread",
+        "internalDate": "1792087200000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "May I forward the grant packet to counsel?",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "dana.vale@example.test"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar option grant approval"
+            },
+            {
+              "name": "Date",
+              "value": "Thu, 15 Oct 2026 11:00:00 -0700"
+            }
+          ],
+          "body": {
+            "data": "TWF5IEkgZm9yd2FyZCB0aGUgZ3JhbnQgcGFja2V0IHRvIGNvdW5zZWw_"
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "Did I reply to the Cedar option grant approval request? Check the original email conversation.",
+      "contains": [
+        "Cedar",
+        "Approved",
+        "please proceed",
+        "16"
+      ],
+      "containsAny": [
+        [
+          "approved",
+          "approval"
+        ]
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 1
+    },
+    {
+      "text": "What did I say exactly, and when?",
+      "contains": [
+        "Approved",
+        "please proceed",
+        "16"
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 1
+    },
+    {
+      "text": "Is that handled, then?",
+      "containsAny": [
+        [
+          "handled",
+          "closed",
+          "resolved",
+          "approved"
+        ]
+      ],
+      "publicReads": 0,
+      "latencyClass": "ordinary",
+      "googleReads": 0
+    },
+    {
+      "text": "And what about the other thing I owe Dana — the launch checklist? Check what is saved.",
+      "contains": [
+        "checklist"
+      ],
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "still owe",
+          "not recorded"
+        ]
+      ],
+      "excludes": [
+        "checklist was sent",
+        "checklist is complete"
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 0
+    }
+  ]
+}

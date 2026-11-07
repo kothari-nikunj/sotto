@@ -72,11 +72,22 @@ import time
 from datetime import datetime, timedelta, timezone
 
 try:
-    from calendar_context import human_attendees, user_participates, meeting_events, is_context_event
+    from calendar_context import active_participation, human_attendees, user_participates, meeting_events, is_context_event, blocks_time
 except ModuleNotFoundError:  # source checkout; the image copies the same module beside us
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                    'sotto-chief-of-staff', '_shared', 'lib'))
-    from calendar_context import human_attendees, user_participates, meeting_events, is_context_event
+    from calendar_context import active_participation, human_attendees, user_participates, meeting_events, is_context_event, blocks_time
+
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shared_lib import load_shared_lib  # noqa: E402
+
+_CACHE_CONTRACT = load_shared_lib('calendar_cache_contract', anchor=__file__)
+REFRESH_SECS_DEFAULT = _CACHE_CONTRACT.REFRESH_SECS_DEFAULT
+CACHE_DIRNAME = _CACHE_CONTRACT.CACHE_DIRNAME
+CACHE_FILENAME = _CACHE_CONTRACT.CACHE_FILENAME
+MEETING_END_SOURCE = _CACHE_CONTRACT.MEETING_END_SOURCE
+CALENDAR_CHANGE_SOURCE = _CACHE_CONTRACT.CALENDAR_CHANGE_SOURCE
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -105,18 +116,10 @@ HOOKS = {
 
 CALENDAR_TTL_SECS = 600                # the plan's 10-minute number, unchanged by the extraction
 GATHER_TIMEOUT_SECS = 60               # gather_google.py --skip-gmail subprocess budget
-REFRESH_SECS_DEFAULT = 900             # the */15 cadence the valve heartbeat already uses
-CACHE_DIRNAME = "cache"
-CACHE_FILENAME = "calendar_today.json"
 # Post-meeting tap: the date-keyed record of event-ends already handled (exactly-once), and the
-# `source` string that IS the contract with triage_event.py's post_meeting branch.
 TAP_STATE_FILENAME = "meeting_taps.json"
 CHANGE_STATE_FILENAME = "calendar_changes.json"
-MEETING_END_SOURCE = "meeting_end"
-# Calendar-diff nudges: the `source` string that IS the contract with triage_event.py's
-# calendar_change branch, and the relevance windows (named constants, not knobs). A change matters
-# in real time only while it is imminent — everything further out is the brief's job.
-CALENDAR_CHANGE_SOURCE = "calendar_change"
+# Calendar changes interrupt only while imminent; later events belong in the brief.
 CHANGE_WINDOW_HOURS = 24           # moved/cancelled: the meeting starts within this window
 DECLINE_WINDOW_HOURS = 48          # a decline is worth knowing a bit earlier — reschedules take time
 # A NEW invite is "last-minute" only when the meeting starts THIS soon. A next-day invite is
@@ -148,16 +151,15 @@ ROOM_MARKER = "resource.calendar.google"
 DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
-def _s(v) -> str:
-    return v.strip() if isinstance(v, str) else ""
+_projection = load_shared_lib("calendar_prep_projection", anchor=__file__)
+_s = _projection.calendar_text
 
 
 def _root() -> str:
     return HOOKS["data_root"]()
 
 
-def _iso(ts: float | None = None) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if ts is None else ts))
+_iso = load_shared_lib("utc_time", anchor=__file__).iso_utc
 
 
 def _date_shift(date: str, days: int) -> str:
@@ -198,8 +200,24 @@ def _norm_cal_event(e):
         "attendees": [a for a in ((_norm_cal_attendee(x) for x in raw_att)
                                   if isinstance(raw_att, list) else ()) if a],
     }
+    if e.get("calendar_id"):
+        ev["_owner_participates"] = user_participates(e, _change_account())
+    ev["_active_participation"] = active_participation(e, _change_account())  # raw RSVP is dropped below
+    if not blocks_time(e, _change_account()):
+        ev["busy"] = False  # retain visible evidence without claiming the owner is occupied
     if _s(e.get("id")):
         ev["_id"] = _s(e["id"])  # internal identity survives moves; stripped from dashboard projection
+    if e.get("_calendar_copy_ids"):
+        ev["_copy_ids"] = list(e["_calendar_copy_ids"])
+    if _s(e.get("iCalUID")):
+        ev["_uid"] = _s(e["iCalUID"])  # the same invite on another calendar; stripped likewise
+    original = e.get('originalStartTime')
+    if isinstance(original, dict):
+        original = original.get('dateTime') or original.get('date')
+    if original:
+        ev['_original_start'] = _s(original)
+    if e.get('recurringEventId') and not original:
+        ev['_uid'] = ''  # series UID alone cannot distinguish unknown occurrences
     loc = _s(e.get("location"))
     if loc:
         ev["location"] = loc
@@ -228,7 +246,7 @@ def _run_calendar_gather():
         try:
             completed = subprocess.run([sys.executable, script, "--skip-gmail", "--cal-out", cal_out,
                             "--gmail-out", os.path.join(td, "gmail.json"),
-                            "--source-results-out", result_out],
+                            "--source-results-out", result_out, "--window-days", "2"],
                            capture_output=True, text=True, timeout=GATHER_TIMEOUT_SECS,
                            env={**os.environ, "SOTTO_DATA": _root()})
             if completed.returncode:
@@ -247,7 +265,7 @@ def _run_calendar_gather():
         except (subprocess.TimeoutExpired, OSError, ValueError, KeyError, TypeError):
             observation = {"status": "unavailable", "complete": False, "observed_at": _iso()}
             raw = []
-    raw = meeting_events(raw)
+    raw = meeting_events(raw, _change_account())
     _LAST_GATHER.clear()
     _LAST_GATHER.update(observation)
     valid = observation.get("status") == "ok" and observation.get("complete") is True
@@ -258,6 +276,7 @@ def _run_calendar_gather():
         _LAST_RAW["events"] = raw
         _LAST_RAW["coverage"] = observation.get("coverage") or {}
         _LAST_RAW['observed_at'] = observation.get('observed_at')
+        _LAST_RAW['calendars'] = observation.get('calendars')
     elif observation.get("status") == "disabled":
         _LAST_RAW.update(events=None, coverage={})
         # Calendar permission was explicitly removed. Overwrite the old comparable baseline so a
@@ -269,7 +288,10 @@ def _run_calendar_gather():
         ev.pop("_my_response", None)
     today = HOOKS["local_today"]()
     keep = {d for d in (today, _date_shift(today, 1)) if d}
-    events = [ev for ev in events if not DATE_RE.match(ev["start"][:10]) or ev["start"][:10] in keep]
+    events = [ev for ev in events if any(_overlaps_local_day(ev, day) for day in keep)
+              or (_parse_aware(ev['end']) is not None
+                  and 0 <= (datetime.now(timezone.utc) - _parse_aware(ev['end'])).total_seconds()
+                  <= tap_lookback_min() * 60)]
     events.sort(key=lambda ev: ev["start"])
     return events
 
@@ -293,19 +315,39 @@ def snapshot() -> dict | None:
     (≤60s, once) gather and then reads the fresh value — which is strictly better than starting a
     competing 60s subprocess. A failed/empty gather is cached like any other result."""
     with _CAL_LOCK:
+        if 'source_revision' in HOOKS:
+            revision = HOOKS['source_revision']()
+            if 'source_revision' not in _CAL_CACHE:
+                # Reuse the existing durable comparison receipt across a restart.
+                # Older/unbound baselines intentionally reset once.
+                _events, source, _account, _acknowledged, _detected = _read_change_state()
+                _CAL_CACHE['source_revision'] = (source or {}).get('source_revision')
+            if revision != _CAL_CACHE.get('source_revision') or revision is None:
+                _CAL_CACHE.update(ts=0.0, value=None, source_revision=revision)
+                _LAST_RAW.update(events=None, valid=False)
+                _invalidate_change_baseline('unavailable')
+                HOOKS['write_json'](cache_path(), {'events': [], 'status': 'unavailable', 'complete': False, 'generated_at': _iso()})
+            if revision is None:
+                return {'events': [], 'generated_at': _iso(), 'status': 'unavailable', 'complete': False, 'unavailable': True}
         val = _CAL_CACHE["value"]
         if val is not None and time.time() - _CAL_CACHE["ts"] < CALENDAR_TTL_SECS:
             return {**val, "cached": True}
         events = _run_calendar_gather()
+        if 'source_revision' in HOOKS and HOOKS['source_revision']() != revision:
+            _CAL_CACHE.update(ts=0.0, value=None)
+            _LAST_RAW.update(events=None, valid=False)
+            _invalidate_change_baseline('unavailable')
+            HOOKS['write_json'](cache_path(), {'events': [], 'status': 'unavailable', 'complete': False, 'generated_at': _iso()})
+            return {'events': [], 'generated_at': _iso(), 'status': 'unavailable', 'complete': False, 'unavailable': True}
         if events is None:
             return None
         status = _LAST_GATHER.get("status", "unavailable")
         valid = status == "ok" and _LAST_GATHER.get("complete") is True
         if status == "ok" and not valid:
             status = "partial"
-        if valid:
+        if valid or (status == "partial" and events):
             val = {"events": events, "generated_at": _LAST_GATHER.get("observed_at") or _iso(),
-                   "status": "ok", "complete": True}
+                   "status": status, "complete": valid}
         elif status == "disabled":
             val = {"events": [], "generated_at": _LAST_GATHER.get("observed_at") or _iso(),
                    "status": "disabled", "complete": False, "unavailable": True}
@@ -384,6 +426,24 @@ def _other_attendees(ev, self_email: str) -> int:
     return len(_other_attendee_rows(ev, self_email))
 
 
+def _overlaps_local_day(event, day):
+    """Use the owner's day and Google's exclusive end, including overnight/all-day spans."""
+    from timeutil import configured_tz, _resolve_tz
+    start, end = _s(event.get('start')), _s(event.get('end'))
+    if DATE_RE.fullmatch(start):
+        return start <= day < end if DATE_RE.fullmatch(end) else start == day
+    lo, hi = _parse_aware(start), _parse_aware(end)
+    if lo is None:
+        return False
+    try:
+        boundary = datetime.fromisoformat(day).replace(tzinfo=_resolve_tz(configured_tz()) or timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    if hi is None:
+        return boundary <= lo < boundary + timedelta(days=1)
+    return lo < boundary + timedelta(days=1) and hi > boundary
+
+
 def today_rows(events, today: str = "") -> list:
     """Today's events in the triage shape: {summary, start, end, attendees, all_day}. `attendees`
     is the OTHER-human count (see _other_attendees) — triage needs times, not people. `all_day` is
@@ -393,17 +453,13 @@ def today_rows(events, today: str = "") -> list:
     self_email = _self_email(events)
     rows = []
     for ev in events:
-        start = _s(ev.get("start"))
-        if start[:10] != today:
+        if ev.get("_owner_participates") is False:
             continue
-        rows.append({
-            "summary": _s(ev.get("summary")),
-            "start": start,
-            "end": _s(ev.get("end")),
-            "attendees": _other_attendees(ev, self_email),
-            "all_day": bool(DATE_RE.match(start)),
-            **({"id": ev["_id"]} if ev.get("_id") else {}),
-        })
+        start = _s(ev.get("start"))
+        if not _overlaps_local_day(ev, today):
+            continue
+        rows.append(_projection.day_row(
+            ev, _other_attendees(ev, self_email), bool(DATE_RE.match(start))))
     return rows
 
 
@@ -416,7 +472,7 @@ def refresh_secs() -> int:
 
 
 def cache_path() -> str:
-    return os.path.join(_root(), CACHE_DIRNAME, CACHE_FILENAME)
+    return _CACHE_CONTRACT.calendar_cache_path(_root())
 
 
 def refresh_once() -> bool:
@@ -429,7 +485,9 @@ def refresh_once() -> bool:
     travels with the file so the reader can derive its own staleness bound from the writer's real
     cadence instead of guessing."""
     snap = snapshot()
-    if snap is None or snap.get("status", "ok") not in ("ok", "disabled"):
+    if snap is None or snap.get("status", "ok") not in ("ok", "disabled", "partial"):
+        return False
+    if snap.get("unavailable") and snap.get("status") != "disabled":
         return False
     today = HOOKS["local_today"]()
     payload = {
@@ -508,10 +566,29 @@ def _parse_aware(ts: str):
     return dt if dt.tzinfo is not None else None
 
 
-def _tap_key(ev: dict) -> str:
-    """Identity of an event-END for the exactly-once record. normalize_event drops the Calendar id
-    before the cache, so the key is the tuple that IS unique on one calendar: start|end|summary."""
+def _legacy_tap_key(ev: dict) -> str:
+    """The key every checkpoint used while one calendar was read: start|end|summary. Two meetings
+    sharing a slot and a title share it, so it now names only a row that carries no id at all, and
+    whatever a checkpoint written before the upgrade already recorded (see tap_tick)."""
     return f"{_s(ev.get('start'))}|{_s(ev.get('end'))}|{_s(ev.get('summary'))}"
+
+
+def _tap_key(ev: dict) -> str:
+    """Identity of an event-END for the exactly-once record: WHICH meeting, then the start|end of
+    this occurrence — a moved meeting or the next instance of a series is a new end, as before.
+    The meeting is its iCalUID where the provider sends one: `_id` is calendar-scoped, so it
+    differs between the copies of one invite, and nothing upstream joins calendars — the UID is
+    what makes an invite held on the primary AND a shared calendar ONE tap. Without a UID it is
+    the scoped `_id`. The prefixes keep the two apart from each other and from a legacy key, which
+    always starts with a date."""
+    occurrence = f"{_s(ev.get('start'))}|{_s(ev.get('end'))}"
+    if ev.get('_original_start'):
+        occurrence += '|original:' + ev['_original_start']
+    if _s(ev.get("_uid")):
+        return f"uid:{_s(ev['_uid'])}|{occurrence}"
+    if _s(ev.get("_id")):
+        return f"id:{_s(ev['_id'])}|{occurrence}"
+    return _legacy_tap_key(ev)
 
 
 def _is_internal_standup(summary: str, others: list, self_email: str) -> bool:
@@ -531,17 +608,18 @@ def ended_meetings(events, now_utc: datetime, today: str = "") -> list:
     oldest end first. Pure over the RAW snapshot events (the ones that still carry attendee names —
     calendar_today.json deliberately keeps only a count). Skipped, silently: all-day events (a
     label on the day, not a meeting), solo blocks, naive/unparseable times, and internal-only
-    standups when TAP_SKIP_INTERNAL is on."""
+    standups when TAP_SKIP_INTERNAL is on. One candidate per _tap_key: a second copy of the same
+    invite is the same meeting, and the first copy that passes every test above speaks for it."""
     today = today or HOOKS["local_today"]()
     self_email = _self_email(events)
     grace, lookback = tap_grace_min() * 60, tap_lookback_min() * 60
     skip_internal = TAP_SKIP_INTERNAL
-    out = []
+    out, seen = [], set()
     for ev in events:
-        if not isinstance(ev, dict):
+        if not isinstance(ev, dict) or not active_participation(ev, self_email):
             continue
         start, end = _s(ev.get("start")), _s(ev.get("end"))
-        if start[:10] != today or DATE_RE.match(start) or DATE_RE.match(end):
+        if DATE_RE.match(start) or DATE_RE.match(end):
             continue
         end_dt = _parse_aware(end)
         if end_dt is None:
@@ -555,7 +633,14 @@ def ended_meetings(events, now_utc: datetime, today: str = "") -> list:
         summary = _s(ev.get("summary"))
         if skip_internal and _is_internal_standup(summary, others, self_email):
             continue
-        out.append({"key": _tap_key(ev), "summary": summary, "start": start, "end": end,
+        key = _tap_key(ev)
+        identity_alias = f"id:{_s(ev.get('_id'))}|{start}|{end}" if ev.get("_id") else ""
+        if key in seen:
+            if identity_alias:
+                next(c for c in out if c["key"] == key)["aliases"].append(identity_alias)
+            continue
+        seen.add(key)
+        out.append({"key": key, "aliases": ([identity_alias] if identity_alias else []) + [f"id:{copy_id}|{start}|{end}" for copy_id in ev.get("_copy_ids", [])], "summary": summary, "start": start, "end": end,
                     "attendees": others, "meeting_link": _s(ev.get("meeting_link")),
                     "location": _s(ev.get("location")),
                     **({"calendar_event_id": ev['_id']} if ev.get('_id') else {})})
@@ -634,7 +719,7 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     if cap <= 0:
         return 0
     snap = snapshot()
-    if snap is None or snap.get("status", "ok") != "ok":
+    if snap is None or snap.get("status", "ok") not in ("ok", "partial") or snap.get("unavailable"):
         return 0                      # no valid current observation on this box — nothing to detect
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     today = HOOKS["local_today"]()
@@ -645,6 +730,17 @@ def tap_tick(now_utc: datetime | None = None) -> int:
     if not trustworthy:
         print("[sotto] meeting tap checkpoint is unreadable; admissions paused", flush=True)
         return 0
+    for cand in cands:
+        # A checkpoint written before keys carried identity owns this end under the old tuple.
+        # Keep that key rather than rekeying: a fired tap stays fired, and a pending one replays
+        # the rowid its ownership proof was recorded under instead of minting a second send. An
+        # end that carries an id is never WRITTEN under this shape, so two new meetings sharing a
+        # slot and a title cannot meet here.
+        legacy = _legacy_tap_key(cand)
+        aliases = [cand["key"], legacy, *cand.get("aliases", [])]
+        held = next((key for key in aliases if key in fired), None) or next((key for key in aliases if key in pending), None)
+        if held:
+            cand["key"] = held
     dispatched = 0
     by_key = {cand["key"]: cand for cand in cands}
     ordered = [by_key[k] for k in pending if k in by_key]
@@ -757,7 +853,10 @@ def _change_observation() -> dict | None:
     if _parse_aware(observed_at) is None or since is None or until is None or since >= until:
         return None
     return {"status": "ok", "complete": True, "observed_at": observed_at,
-            "coverage": {"since": coverage["since"], "until": coverage["until"]}}
+            **({"source_revision": _CAL_CACHE.get("source_revision")} if "source_revision" in HOOKS else {}),
+            "coverage": {"since": coverage["since"], "until": coverage["until"]},
+            **({"calendar_ids": sorted(row["calendar_id"] for row in _LAST_RAW["calendars"]
+                if row.get("status") == "ok")} if isinstance(_LAST_RAW.get("calendars"), list) else {})}
 
 
 def _change_account() -> str:
@@ -767,8 +866,8 @@ def _change_account() -> str:
 
 def _change_events(events: list) -> list:
     """Keep only fields the diff consumes; descriptions and links do not belong in durable state."""
-    fields = ("id", "iCalUID", "recurringEventId", "originalStartTime", "summary", "start", "end", "status", "attendees", "organizer",
-              "my_response")
+    fields = ("id", "calendar_id", "provider_event_id", "iCalUID", "recurringEventId", "originalStartTime", "summary", "start", "end", "status", "attendees", "organizer",
+              "my_response", "_calendar_primary")
     return [{key: ev[key] for key in fields if key in ev}
             for ev in meeting_events(events) if isinstance(ev, dict)]
 
@@ -857,7 +956,7 @@ def _wall(start: str) -> str:
     return dt.strftime("%-I:%M %p") if os.name != "nt" else dt.strftime("%I:%M %p").lstrip("0")
 
 
-def calendar_changes(baseline: list, current: list, now_utc: datetime, self_email: str) -> list:
+def calendar_changes(baseline: list, current: list, now_utc: datetime, self_email: str, *, calendar_ids=None) -> list:
     """The diff that matters, as candidate dicts — pure, so it tests like ended_meetings.
     Four kinds, each one sentence: a NEW event with another human starting within
     INVITE_SOON_HOURS is a last-minute invite (a next-day invite is scheduling, not an
@@ -867,7 +966,7 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
     within the window is a removal (explicit cancelled status proves a cancellation).
     Skipped, silently: supporting prep entries, all-day events, solo blocks,
     internal-only standups (the tap's own rule), and anything already past."""
-    baseline, current = meeting_events(baseline), meeting_events(current)
+    baseline, current = meeting_events(baseline, self_email), meeting_events(current, self_email)
     old_by_id = {_s(e.get("id")): e for e in baseline if _s(e.get("id"))}
     new_by_id = {_s(e.get("id")): e for e in current if _s(e.get("id"))}
     # Providers can replace the event ID during a move. Only a unique, shared calendar UID
@@ -881,7 +980,9 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         new_matches = [row for row in new_by_id.values() if row.get('iCalUID') == uid]
         recurring = any(row.get('recurringEventId') or row.get('originalStartTime')
                         for row in [ev] + [old_by_id[key] for key in old_matches])
-        if not recurring and len(old_matches) == len(new_matches) == 1 and old_matches[0] not in new_by_id:
+        exact_instance = bool(ev.get('originalStartTime')) and all(
+            row.get('originalStartTime') == ev['originalStartTime'] for row in [old_by_id[key] for key in old_matches])
+        if (not recurring or exact_instance) and len(old_matches) == len(new_matches) == 1 and old_matches[0] not in new_by_id:
             replacements[eid] = old_matches[0]
     out = []
 
@@ -890,6 +991,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         return h is not None and (-allow_started_min / 60.0) <= h <= window_h
 
     def _eligible(ev):
+        if ev.get("calendar_id") and not user_participates(ev, self_email):
+            return None
         if is_context_event(ev):
             return None  # Moving/removing supporting notes never cancels the actual meeting.
         others = _raw_others(ev, self_email)
@@ -915,7 +1018,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
                             "who": "", "attendees": others})
             continue
         old_start = _s(old.get("start"))
-        if old_start and start and old_start != start and (
+        if old_start and start and old_start != start and not (
+                _parse_aware(old_start) is not None and _parse_aware(start) == _parse_aware(old_start)) and (
                 _relevant(ev, CHANGE_WINDOW_HOURS) or
                 _relevant(old, CHANGE_WINDOW_HOURS)):
             out.append({"kind": "moved", "key": f"{eid}:moved:{start}",
@@ -939,6 +1043,8 @@ def calendar_changes(baseline: list, current: list, now_utc: datetime, self_emai
         if eid in replacements.values():
             continue
         gone = eid not in new_by_id
+        if gone and calendar_ids is not None and old.get("calendar_id") and old["calendar_id"] not in calendar_ids:
+            continue  # lost calendar visibility never proves a removed meeting
         cancelled = not gone and _s(new_by_id[eid].get("status")).lower() == "cancelled"
         if not (gone or cancelled):
             continue
@@ -1027,7 +1133,7 @@ def change_tick(now_utc: datetime | None = None) -> int:
         return 0
     now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
     self_email = _self_email([e for e in map(_norm_cal_event, current) if e])
-    cands = calendar_changes(baseline, current, now_utc, self_email)
+    cands = calendar_changes(baseline, current, now_utc, self_email, calendar_ids=source.get("calendar_ids"))
     coverage = _LAST_RAW.get("coverage") or {}
     since, until = _parse_aware(coverage.get("since")), _parse_aware(coverage.get("until"))
     cands = [c for c in cands if c["kind"] not in ("cancelled", "removed") or

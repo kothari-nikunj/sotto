@@ -7,6 +7,7 @@ ROOT = os.path.join(HERE, "..")
 spec = importlib.util.spec_from_file_location("cf", os.path.join(ROOT, "followup", "scripts", "compose_followup.py"))
 cf = importlib.util.module_from_spec(spec); spec.loader.exec_module(cf)
 SKILL = open(os.path.join(ROOT, "followup", "SKILL.md"), encoding="utf-8").read()
+PIPELINE = open(os.path.join(ROOT, "_shared", "scripts", "followup_pipeline.py"), encoding="utf-8").read()
 
 
 def _iso(hours_ago):
@@ -14,9 +15,12 @@ def _iso(hours_ago):
 
 
 def test_granola_backlog_route_does_not_reuse_the_36_hour_followup_window():
-    assert "--days 14 --transcripts-since-hours 0" in SKILL
-    assert "--since-hours 336 --reconcile-open-loops" in SKILL
-    assert "answer\n   “what is open” from `open_loops`" in SKILL
+    # The skill names the two lanes the runtime exposes; the receiver's pipeline owns the windows.
+    assert "`run_sotto_script followup`" in SKILL and "`run_sotto_script followup --backlog`" in SKILL
+    assert "fourteen days of notes, without\n     paying to fetch old transcripts" in SKILL
+    assert "“what is open” comes from `open_loops`" in SKILL
+    # recent: 3 days of notes, 36h transcripts, 36h window; backlog: 14 days, no transcripts, 336h.
+    assert "(3, 36, 36) if selection['mode'] == 'recent' else (14, 0, 336)" in PIPELINE
 
 
 def test_recent_ended_filters_window_and_requires_body():
@@ -168,7 +172,7 @@ def test_cli_applies_commitments_before_it_prints_success(tmp_path, monkeypatch,
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["ledger"]["written"] == 1
     assert emitted["open_loops"]["counts"] == {"you_owe": 1, "waiting_on_them": 0}
-    assert emitted["open_loops"]["you_owe"][0]["what"].startswith("You committed to: Send the deck")
+    assert emitted["open_loops"]["you_owe"][0]["what"] == "Send the deck"
     assert list((tmp_path / "knowledge" / "continuity").glob("*.md"))
 
 

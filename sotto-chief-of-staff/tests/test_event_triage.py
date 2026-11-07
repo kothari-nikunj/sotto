@@ -1472,6 +1472,11 @@ def test_solo_block_and_all_day_event_never_hold(tmp_path, monkeypatch):
     assert _urgent_batch(tmp_path, monkeypatch, rowid=903)["verdict"] == "agent"
 
 
+def test_visible_free_event_does_not_delay_an_urgent_notification(tmp_path, monkeypatch):
+    _seed_calendar(tmp_path, [{**_cal_event(), 'busy': False}])
+    assert _urgent_batch(tmp_path, monkeypatch)['verdict'] == 'agent'
+
+
 def test_missed_call_is_exempt_from_the_meeting_hold(tmp_path, monkeypatch):
     """A missed call reaches you mid-meeting; a post-meeting tap stays hold-able.
     Imminent prep is hold-exempt AND budget-exempt — it expires with its meeting (test below)."""

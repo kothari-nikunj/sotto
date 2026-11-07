@@ -1,0 +1,57 @@
+# Build from the sotto-agent context; include only runtime sources, published skills,
+# Python compatibility files and the existing hashed requirements lock.
+**
+!runtime/
+runtime/*
+!runtime/sotto-chat/
+runtime/sotto-chat/*
+!runtime/sotto-chat/package.json
+!runtime/sotto-chat/package-lock.json
+!runtime/sotto-chat/tsconfig.json
+!runtime/sotto-chat/tsconfig.build.json
+!runtime/sotto-chat/src/
+!runtime/sotto-chat/src/**
+
+!runtime/trigger-receiver/
+runtime/trigger-receiver/*
+!runtime/trigger-receiver/*.py
+!runtime/trigger-receiver/static/
+!runtime/trigger-receiver/static/**
+runtime/trigger-receiver/test_*.py
+
+!adapters/
+adapters/*
+!adapters/sotto/
+!adapters/sotto/**
+!sotto-chief-of-staff/
+!sotto-chief-of-staff/**
+!requirements.txt
+
+# Generated/runtime/user state and local credentials never enter this image build context.
+**/node_modules/
+**/dist/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.sqlite
+**/*.sqlite-*
+**/*.db
+**/*.db-*
+**/.env
+**/.env.*
+**/*runtime*.json
+**/*credentials*.json
+**/token*
+**/*secret*
+**/evals/corpus/
+**/evals/baselines/*
+# Mirrors the root .gitignore and the publish CORPUS GUARD (checked by
+# sotto-chief-of-staff/tests/test_build_context_privacy.py).
+**/*signing.key
+**/bridge-access-codes.log
+**/corpus-v*
+**/*.map.json
+**/labels*.yaml
+**/*.pyc
+**/.DS_Store

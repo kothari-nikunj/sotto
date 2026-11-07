@@ -1,0 +1,191 @@
+{
+  "name": "two-journey-chronological-noncompletion",
+  "world": {
+    "savedSourceGrants": [
+      "gmail",
+      "imessage"
+    ],
+    "commitmentJourney": {},
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}"
+    }
+  },
+  "turns": [
+    {
+      "text": "What did I promise Maya Journey? Check the saved obligations.",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "request",
+          "scenario": "noncompletion"
+        }
+      ],
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document",
+        "launch checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700
+    },
+    {
+      "text": "the checklist too?",
+      "contains": [
+        "checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "excludes": [
+        "yes, that establishes fulfillment",
+        "yes, that finishes the promise"
+      ],
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "outstanding",
+          "not yet",
+          "not sent",
+          "no fulfillment",
+          "no completion",
+          "no later",
+          "any later",
+          "no evidence",
+          "still owe",
+          "still need"
+        ]
+      ]
+    },
+    {
+      "text": "What is 2 plus 2?",
+      "contains": [
+        "4"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "knowledgeQueryReads": 0,
+      "maxCharacters": 100,
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "I texted Maya Journey: \u201cI have not sent the pricing document yet.\u201d Does that establish fulfillment of the pricing promise? Check its saved state and the checklist too.",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "fulfillment",
+          "scenario": "noncompletion"
+        },
+        {
+          "journey": "commitment",
+          "stage": "resolve",
+          "scenario": "noncompletion"
+        }
+      ],
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document",
+        "launch checklist"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "excludes": [
+        "yes, that finishes",
+        "yes, that establishes fulfillment",
+        "yes, that finishes the promise"
+      ],
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "outstanding",
+          "not yet",
+          "not sent",
+          "no fulfillment",
+          "no completion",
+          "no later",
+          "any later",
+          "no evidence",
+          "still owe",
+          "still need"
+        ]
+      ]
+    },
+    {
+      "text": "After restarting, what remains open for Maya?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "restart",
+          "scenario": "noncompletion"
+        }
+      ],
+      "restartBefore": true,
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document",
+        "launch checklist"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "excludes": [
+        "yes, that finishes",
+        "yes, that establishes fulfillment",
+        "yes, that finishes the promise"
+      ],
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "outstanding",
+          "not yet",
+          "not sent",
+          "no fulfillment",
+          "no completion",
+          "no later",
+          "any later",
+          "no evidence",
+          "still owe",
+          "still need"
+        ]
+      ]
+    }
+  ]
+}

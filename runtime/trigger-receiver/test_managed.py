@@ -83,6 +83,26 @@ def test_google_consent_opens_only_granted_sources_and_preserves_bridge(tmp_path
     assert sources['imessage']['connected'] is True
 
 
+def test_google_contacts_authority_is_separate_from_mac_contacts(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json', sources={'contacts': {'connected': True, 'consented': True}})
+    managed.record_google_consent(tmp_path, [])
+    before = managed.source_authority_state(tmp_path)
+    assert 'contacts' in before['allowed_sources']
+    assert before['google_sources'] == []
+    managed.record_google_consent(tmp_path, ['https://www.googleapis.com/auth/contacts.readonly'])
+    connected = managed.source_authority_state(tmp_path)
+    assert connected['google_sources'] == ['google_contacts']
+    assert 'contacts' in connected['allowed_sources']
+    assert connected['revision'] != before['revision']
+    managed.record_google_consent(tmp_path, [])
+    after = managed.source_authority_state(tmp_path)
+    assert after['google_sources'] == []
+    assert 'contacts' in after['allowed_sources']
+    assert after['revision'] != connected['revision']
+
+
 @pytest.mark.parametrize('source, revoke', [
     ('imessage', lambda root: managed.record_bridge_consent(root, [], [])),
     ('gmail', lambda root: managed.record_google_consent(root, [])),
@@ -167,7 +187,7 @@ def test_connector_consent_rejects_unknown_sources(tmp_path, monkeypatch):
 
 
 def test_photon_policy_rejects_groups_even_from_owner():
-    path = Path(__file__).resolve().parents[2] / 'adapters/hermes/sotto_photon/__init__.py'
+    path = Path(__file__).resolve().parents[2] / 'adapters/sotto/photon_owner.py'
     spec = importlib.util.spec_from_file_location('managed_photon', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -175,126 +195,6 @@ def test_photon_policy_rejects_groups_even_from_owner():
     assert not module.permits(SimpleNamespace(chat_type='group', user_id='owner'), 'owner')
     assert not module.permits(SimpleNamespace(chat_type='dm', user_id='stranger'), 'owner')
     assert not module.permits(None, 'owner')
-
-
-@pytest.mark.parametrize('mode', ['managed', 'self-host'])
-def test_photon_formats_chat_and_standalone_at_registered_boundary(tmp_path, monkeypatch, mode):
-    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', mode)
-    import asyncio
-    import sys
-    import types
-
-    root = Path(__file__).resolve().parents[2]
-    spec = importlib.util.spec_from_file_location('managed_format_fixture', root / 'adapters/hermes/sotto_photon/__init__.py',
-                                                 submodule_search_locations=[])
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    fmt_spec = importlib.util.spec_from_file_location(spec.name + '.chatfmt', root / 'sotto-chief-of-staff/_shared/lib/chatfmt.py')
-    fmt = importlib.util.module_from_spec(fmt_spec)
-    fmt_spec.loader.exec_module(fmt)
-    monkeypatch.setitem(sys.modules, fmt_spec.name, fmt)
-    gallery_spec = importlib.util.spec_from_file_location(spec.name + '.gallery', root / 'adapters/hermes/gallery.py')
-    gallery = importlib.util.module_from_spec(gallery_spec)
-    gallery_spec.loader.exec_module(gallery)
-    monkeypatch.setitem(sys.modules, gallery_spec.name, gallery)
-    upstream = types.ModuleType('plugins.platforms.photon.adapter')
-    deliveries = []
-    fail_delivery = False
-
-    async def deliver(self, chat_id, content, reply_to=None, metadata=None):
-        deliveries.append(content)
-        return SimpleNamespace(success=not fail_delivery)
-
-    async def original_handle(self, event):
-        return 'handled'
-
-    upstream.PhotonAdapter = type('Adapter', (), {'send': deliver,
-                                                   'handle_message': original_handle})
-    upstream.SendResult = SimpleNamespace
-    gateway = types.ModuleType('gateway.run')
-    gateway._PROVIDER_ERROR_REPLIES = ()
-    monkeypatch.setitem(sys.modules, 'gateway.run', gateway)
-    sent = []
-
-    async def standalone(config, chat_id, message, **kwargs):
-        sent.append(message)
-        assert not upstream._markdown_enabled()
-        return {'success': True, 'message_id': 'provider-fixture'}
-
-    upstream._standalone_send = standalone
-    # Match the actual upstream keyword; an unrecognized platform_prompt must fail.
-    def register_platform(*, adapter_factory, standalone_sender_fn, allow_update_command, platform_hint):
-        return locals()
-
-    class Context:
-        def register_platform(self, **kwargs):
-            self.registration = register_platform(**kwargs)
-
-    upstream.register = lambda ctx: ctx.register_platform(adapter_factory=None, standalone_sender_fn=None,
-                                                          allow_update_command=True, platform_hint='Markdown rendered')
-    for name in ('plugins', 'plugins.platforms', 'plugins.platforms.photon'):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(sys.modules, 'plugins.platforms.photon.adapter', upstream)
-    monkeypatch.setenv('PHOTON_HOME_CHANNEL', 'owner')
-    ctx = Context()
-    module.register(ctx)
-    registration = ctx.registration
-    adapter = registration['adapter_factory']()
-    raw = '### Reply\n> **Hello**\n[Read](https://example.com)'
-    expected = 'Reply\nHello\nRead: https://example.com'
-    assert adapter.format_message(adapter.format_message(raw)) == expected
-    result = asyncio.run(registration['standalone_sender_fn'](None, 'owner', raw))
-    assert result['message_id'] == 'provider-fixture' and sent == [expected]
-    assert registration['allow_update_command'] is (mode != 'managed')
-    assert 'plain-text' in registration['platform_hint']
-    rejected = asyncio.run(registration['standalone_sender_fn'](None, 'stranger', raw))
-    if mode == 'self-host':
-        assert rejected['message_id'] == 'provider-fixture' and len(sent) == 2
-        monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-        monkeypatch.delenv('SOTTO_TENANT_ID', raising=False)
-        monkeypatch.setenv('PHOTON_ALLOWED_USERS', 'owner')
-        monkeypatch.setenv('PHOTON_PROJECT_ID', 'project')
-        monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'false')
-        receipt = tmp_path / 'config/photon-activation.json'
-        group = SimpleNamespace(source=SimpleNamespace(chat_type='group', user_id='owner',
-                                                       chat_id='group-chat'))
-        outsider = SimpleNamespace(source=SimpleNamespace(chat_type='dm', user_id='stranger',
-                                                          chat_id='stranger-chat'))
-        owner = SimpleNamespace(source=SimpleNamespace(chat_type='dm', user_id='owner',
-                                                       chat_id='owner-chat'))
-        assert asyncio.run(adapter.handle_message(group)) == 'handled'
-        assert asyncio.run(adapter.handle_message(outsider)) == 'handled'
-        assert not receipt.exists()
-        assert asyncio.run(adapter.handle_message(owner)) == 'handled'
-        assert json.loads(receipt.read_text()) == {'tenant_id': '', 'owner': 'owner',
-                                                    'chat_id': 'owner-chat', 'activated': True,
-                                                    'project_fingerprint': module.project_fingerprint('project')}
-        receipt.unlink()
-        monkeypatch.setenv('PHOTON_ALLOW_ALL_USERS', 'true')
-        assert asyncio.run(adapter.handle_message(owner)) == 'handled'
-        assert not receipt.exists()
-        return  # tenant budget/owner restrictions apply only to managed mode
-    assert 'error' in rejected and len(sent) == 1
-    # The rejection is the owner-only guard in `owner_send` (product code), not a provider/gateway
-    # failure — the `gateway.run` fixture above exists only so `register()` can import cleanly, and
-    # this adapter never reads or mutates it.
-    assert rejected['error'] == 'Managed iMessage can only address the tenant owner'
-
-    async def exercise_notices():
-        nonlocal fail_delivery
-        fail_delivery = True
-        assert not (await adapter.send('owner', module.BUDGET_NOTICE)).success
-        fail_delivery = False
-        results = await asyncio.gather(*(adapter.send('owner', module.BUDGET_NOTICE) for _ in range(4)))
-        assert all(r.success for r in results)
-        assert deliveries == [module.BUDGET_NOTICE, module.BUDGET_NOTICE]
-        assert results[-1].raw_response['suppressed'] == 'duplicate_budget_notice'
-        await adapter.send('owner', 'Normal reply after recovery')
-        await adapter.send('owner', module.BUDGET_NOTICE)
-        assert deliveries[-2:] == ['Normal reply after recovery', module.BUDGET_NOTICE]
-
-    asyncio.run(exercise_notices())
 
 
 def test_bridge_consent_holds_until_actual_read_and_survives_sleep(tmp_path, monkeypatch):
@@ -491,3 +391,130 @@ def test_send_permission_is_tenant_scoped(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_TENANT_ID', 'another')
     listing = managed.filter_tool_list(tmp_path, {'tools': [{'name': 'send_message'}]})
     assert listing == {'tools': []}
+
+
+def test_note_body_requires_notes_consent_at_listing_request_and_response(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    call = {'method': 'tools/call', 'params': {'name': 'get_note', 'arguments': {'id': 7}}}
+    result = {'structuredContent': {'body': 'private note'}, 'isError': False}
+    listing = {'tools': [{'name': 'get_note'}, {'name': 'health'}]}
+    state(tmp_path, 'managed-capabilities.json', sources={'apple_notes': {'consented': True, 'connected': True}})
+    assert managed.validate_tool_request(tmp_path, call)
+    assert managed.validate_tool_response(tmp_path, call, result)
+    assert managed.filter_tool_list(tmp_path, listing) == listing
+    state(tmp_path, 'managed-capabilities.json', sources={'apple_notes': {'consented': False, 'connected': True}})
+    assert not managed.validate_tool_request(tmp_path, call)
+    assert not managed.validate_tool_response(tmp_path, call, result)
+    assert managed.filter_tool_list(tmp_path, listing)['tools'] == [{'name': 'health'}]
+
+
+def test_local_search_scope_and_response_authority(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json', sources={'imessage': {'consented': True}})
+
+    def call(sources):
+        return {'method': 'tools/call', 'params': {'name': 'search_local', 'arguments': {'sources': sources}}}
+
+    for sources in [None, [], ['contacts'], ['imessage', 'whatsapp'], [None]]:
+        assert not managed.validate_tool_request(tmp_path, call(sources))
+    request = call(['imessage'])
+    assert managed.validate_tool_request(tmp_path, request)
+    listing = {'tools': [{'name': 'search_local'}, {'name': 'health'}]}
+    assert managed.filter_tool_list(tmp_path, listing) == listing
+    payload = {'status': 'ok', 'results': [{'source': 'imessage', 'source_id': '7', 'excerpt': 'October', 'author': 'me',
+                                            'matched_fields': ['body']}],
+               'coverage': {'imessage': {'status': 'ok', 'complete': True, 'indexed': 1, 'truncated': 0,
+                                         'stopped_early': False, 'newest_at': '2026-11-05T14:51:24Z'}}}
+    assert managed.validate_tool_response(tmp_path, request, {'structuredContent': payload})
+    legacy = {'status': 'ok', 'results': [{'source': 'imessage', 'timestamp': '2026-11-01T08:30:00Z'},
+                                       {'source': 'imessage', 'timestamp': '2026-11-01T09:30:00Z'}],
+              'coverage': {'imessage': {'status': 'ok', 'complete': True, 'indexed': 2}}}
+    assert managed.validate_tool_response(tmp_path, request, {'structuredContent': legacy})
+    for invalid in [
+        {**payload, 'results': [{'source': 'whatsapp', 'excerpt': 'blocked'}]},
+        {**payload, 'coverage': {'whatsapp': {'status': 'ok'}}},
+        {**payload, 'secret': 'blocked'},
+        {**payload, 'results': [{'source': ['imessage'], 'excerpt': 'blocked'}]},
+        {**payload, 'results': [{'source': 'imessage', 'secret': 'blocked'}]},
+    ]:
+        assert not managed.validate_tool_response(tmp_path, request, {'structuredContent': invalid})
+    state(tmp_path, 'managed-capabilities.json', sources={'imessage': {'consented': False}})
+    assert not managed.validate_tool_response(tmp_path, request, {'structuredContent': payload})
+    assert managed.filter_tool_list(tmp_path, listing) == {'tools': [{'name': 'health'}]}
+
+
+def test_snapshot_coverage_obeys_source_consent(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    detail = {'rows_scanned': 1000, 'scan_observed': True, 'limit_reached': True,
+              'content_partial': True, 'bounded': True, 'status': 'partial'}
+    managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': detail}}})
+    for source in ('contacts', 'deferred_unread_whatsapp'):
+        with pytest.raises(ValueError):
+            managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {source: detail}}})
+    with pytest.raises(ValueError):
+        managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': {'body': 'not metadata'}}}})
+
+
+def test_additive_native_metadata_keeps_existing_source_authority(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    managed.record_bridge_consent(tmp_path, ['imessage', 'calls'], ['imessage', 'calls'])
+    local = {'imessage': [{'text': '[attachment — contents not read]', 'content_partial': True,
+                           'attachments': [{'id': 'a1', 'name': 'report.pdf', 'mime_type': 'application/pdf', 'size_bytes': 42}]}],
+             'calls': [{'phone': '+15555550101', 'record_id': '1', 'service_provider': 'FaceTime',
+                        'timestamp': '2026-10-15 01:00:00', 'timestamp_utc': '2026-10-15T05:00:00Z'}]}
+    request = {'method': 'tools/call', 'params': {'name': 'read_local', 'arguments': {}}}
+    assert managed.validate_tool_response(tmp_path, request, {'structuredContent': local})
+    # Legacy rows are still accepted, and new nested metadata needs no extra top-level capability.
+    assert managed.validate_tool_response(tmp_path, request, {'structuredContent': {'imessage': [{'text': 'hello'}]}})
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    assert not managed.validate_tool_response(tmp_path, request, {'structuredContent': local})
+    managed.record_bridge_consent(tmp_path, [], [])
+    assert not managed.validate_tool_response(tmp_path, request, {'structuredContent': {'imessage': local['imessage']}})
+
+
+@pytest.mark.parametrize('detail', [
+    {'status': 'private source text'}, {'rows_scanned': -1}, {'rows_scanned': True},
+    {'scan_observed': 'true'}, {'limit_reached': 1}, {'observed_at': 'private source text'},
+])
+def test_snapshot_coverage_rejects_untyped_metadata(tmp_path, monkeypatch, detail):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    with pytest.raises(ValueError):
+        managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': detail}}})
+
+
+def test_rich_snapshot_coverage_is_typed_and_still_consent_gated(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    detail = {'status': 'empty', 'requested_window': {'since': '2026-10-20T00:00:00Z', 'until': '2026-10-21T00:00:00Z'},
+              'effective_window': {'since': None, 'until': None, 'basis': 'sent'},
+              'rows_returned': 0, 'query_row_caps': [100], 'omitted_rows': None,
+              'last_successful_read_at': '2026-10-21T00:00:00Z', 'failure_category': None,
+              'components': {'deferred_unread': {'status': 'failed', 'failure_category': 'query'}},
+              'attachments': {'metadata': 'available', 'body': 'not_read'}}
+    managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': detail}}})
+    managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': {
+        **detail, 'effective_window': {'since': None, 'until': None, 'basis': 'due_or_created'}}}}})
+    for changed in [
+        {'rows_returned': True}, {'rows_returned': 2 ** 53}, {'omitted_rows': -1},
+        {'query_row_caps': [1, 1]}, {'query_row_caps': list(range(33))},
+        {'effective_window': {'since': None, 'until': None, 'basis': 'private body'}},
+        {'effective_window': {'since': None, 'until': None, 'basis': 'due_or_modified'}},
+        {'components': {'profiles': {'status': 'ok', 'failure_category': None}}},
+        {'components': {'private name': {'status': 'ok', 'failure_category': None}}},
+        {'components': {'deferred_unread': {'status': 'failed', 'failure_category': 'private body'}}},
+        {'attachments': {'metadata': 'available', 'body': 'read'}},
+        {'requested_window': {'since': '2026-10-21T00:00:00Z', 'until': '2026-10-20T00:00:00Z'}},
+    ]:
+        with pytest.raises(ValueError):
+            managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'imessage': {**detail, **changed}}}})
+    with pytest.raises(ValueError):
+        managed.validate_local_ingress(tmp_path, {'local_data': {'source_coverage': {'whatsapp': detail}}})

@@ -48,9 +48,9 @@ the acting session regenerated. Its limit is stated where it is claimed
 the same agent computes both sides — there the hash makes a receipt disputable, not the act
 prevented.
 
-WHY IT DOESN'T GO THROUGH THE HOST CLI: the Hermes `google-workspace` `google_api.py` has no
-`gmail draft` verb (its gmail actions are search/get/send/reply/labels/modify), and that CLI is
-installed from upstream, not from this repo. This call uses the SAME token file the CLI reads.
+WHY DRAFTS DON'T GO THROUGH THE PACKAGED CLI: `adapters/sotto/google_api.py` has no `gmail draft`
+verb (its write verbs are gmail send/reply and calendar create/patch/delete), so this call builds
+the Gmail client directly on the SAME token file the CLI reads.
 Managed draft creation checks for a compose/modify grant first; Gmail read permission alone
 does not permit drafts. Managed failures preserve the draft text, never emit a mailto fallback.
 """
@@ -61,6 +61,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 from email.mime.text import MIMEText
@@ -81,7 +82,7 @@ from gather_google import _find_google_api, _gmail_service, _google_service, _to
 # for every verb is the same: propose it in the brief.
 #
 # Set by the trigger receiver in the environment of every skill it spawns for a cron / proactive /
-# event-triage run — the lanes where `hermes -z` auto-bypasses approvals. Any non-empty value counts
+# event-triage run — the lanes with no owner present to approve anything. Any non-empty value counts
 # (fail closed: an unparseable value means unattended, never attended).
 UNATTENDED_ENV = "SOTTO_UNATTENDED"
 
@@ -291,7 +292,32 @@ def _event_start(event: dict) -> str:
     return s or ""
 
 
-def _rsvp(event_id: str, response: str, calendar: str = "primary", comment: str = "") -> dict:
+def _reviewed_rsvp_self(event: dict) -> int:
+    """Exact original self resolution for a reviewed admitted RSVP; no contact lookup."""
+    attendees = event.get("attendees")
+    if event.get("attendeesOmitted") or not isinstance(attendees, list) or any(not isinstance(a, dict) for a in attendees):
+        raise ValueError("Incomplete attendees")
+    if any("self" in a and type(a["self"]) is not bool for a in attendees):
+        raise ValueError("Invalid self marker")
+    organizer = event.get("organizer")
+    if organizer is not None and (not isinstance(organizer, dict)
+            or "self" in organizer and type(organizer["self"]) is not bool):
+        raise ValueError("Invalid organizer marker")
+    selected = [i for i, a in enumerate(attendees) if a.get("self") is True]
+    if not selected:
+        email = _self_attendee_email(event)
+        selected = [i for i, a in enumerate(attendees) if email and str(a.get("email") or "").lower() == email]
+    if len(selected) != 1:
+        raise ValueError("Missing or ambiguous self attendee")
+    index = selected[0]
+    email = attendees[index].get("email")
+    if not isinstance(email, str) or not email or sum(str(a.get("email") or "").lower() == email.lower() for a in attendees) != 1:
+        raise ValueError("Ambiguous self address")
+    return index
+
+
+def _rsvp(event_id: str, response: str, calendar: str = "primary", comment: str = "", *,
+          reviewed_etag: str | None = None, reviewed_self_email: str | None = None) -> dict:
     """Set the account's own responseStatus on an event and PATCH it back.
 
     The Calendar API REPLACES the attendees list on patch, so we fetch the event, mutate ONLY the self
@@ -342,6 +368,17 @@ def _rsvp(event_id: str, response: str, calendar: str = "primary", comment: str 
             return {"status": "error", "error": "you're the organizer — nothing to RSVP"}
         return {"status": "error", "error": "you're not an attendee on this event — nothing to RSVP"}
 
+    if reviewed_etag is not None:
+        try:
+            self_idx = _reviewed_rsvp_self(ev)
+            if (ev.get("id") != event_id or ev.get("status") == "cancelled"
+                    or ev.get("etag") != reviewed_etag or attendees[self_idx].get("email") != reviewed_self_email
+                    or (attendees[self_idx].get("responseStatus") == response
+                        and (not comment or attendees[self_idx].get("comment") == comment))):
+                return {"status": "error", "error": "Reviewed RSVP changed"}
+        except ValueError:
+            return {"status": "error", "error": "Reviewed self attendee unavailable"}
+
     # Mutate ONLY the self entry (copy it); every other attendee stays the same object → byte-identical.
     updated = dict(attendees[self_idx])
     updated["responseStatus"] = response
@@ -373,7 +410,8 @@ def _rsvp(event_id: str, response: str, calendar: str = "primary", comment: str 
         return {"status": "error", "error": f"RSVP patch failed: {err}"}
 
     return {"status": "rsvped", "event_id": event_id, "response": response,
-            "summary": ev.get("summary") or "", "start": _event_start(ev)}
+            "summary": ev.get("summary") or "", "start": _event_start(ev),
+            **({"event": res} if reviewed_etag is not None else {})}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -480,8 +518,92 @@ def _gmail_draft(to: str, body: str, subject: str = "", thread_id: str = "") -> 
             "to": to, "subject": subject}
 
 
+def _gmail_reviewed_draft(service, review: dict, before_create) -> dict:
+    """One exact reviewed threaded draft; caller owns attended approval and grants.
+
+    No thread-tail lookup or fallback may change the reviewed MIME fields.
+    Provider failures propagate so the durable caller treats contact as uncertain.
+    """
+    msg = MIMEText(review['body'])
+    msg['To'] = review['to']
+    msg['Subject'] = review['subject']
+    msg['In-Reply-To'] = review['reply_message_id']
+    msg['References'] = review['reply_message_id']
+    before_create()
+    result = service.users().drafts().create(userId='me', body={'message': {
+        'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode(),
+        'threadId': review['thread_id']}}).execute()
+    message = result.get('message') if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or not isinstance(result.get('id'), str) or not result['id']
+            or not isinstance(message, dict) or message.get('threadId') != review['thread_id']):
+        raise RuntimeError('Gmail draft acceptance unconfirmed')
+    return {'status': 'drafted', 'draft_id': result['id'], 'thread_id': message['threadId']}
+
+
+def _gmail_reviewed_new_draft(service, review: dict, before_create) -> dict:
+    """Save the exact reviewed new email; no thread lookup, reply headers or send."""
+    msg = MIMEText(review['body'])
+    msg['To'] = review['to']
+    if review['subject']:
+        msg['Subject'] = review['subject']
+    before_create()
+    result = service.users().drafts().create(userId='me', body={'message': {
+        'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode()}}).execute()
+    message = result.get('message') if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or not isinstance(result.get('id'), str) or not result['id']
+            or not isinstance(message, dict) or not isinstance(message.get('threadId'), str)
+            or not message['threadId']):
+        raise RuntimeError('Gmail draft acceptance unconfirmed')
+    return {'status': 'drafted', 'draft_id': result['id'], 'thread_id': message['threadId']}
+
+
+def _gmail_adapter():
+    """Load the original installed Google adapter, shared with its CLI locator."""
+    import importlib.util
+    path = _find_google_api()
+    if not path:
+        raise RuntimeError('Google adapter unavailable')
+    spec = importlib.util.spec_from_file_location('sotto_reviewed_google_api', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gmail_send_service():
+    return _gmail_adapter()._owner_gmail_service()
+
+
+
+def _gmail_reviewed_new_send(service, review, validate_profile, before_send):
+    """Use the original fresh MIME sender with the same reviewed credential session."""
+    adapter = _gmail_adapter()
+    def sender(payload):
+        validate_profile(service.users().getProfile(userId='me').execute())
+        before_send()
+        return service.send_reviewed(payload)
+    return adapter._gmail_send(service, to=review['to'], subject=review['subject'],
+                              body=review['body'], sender=sender)
+
+def _gmail_reviewed_reply(service, review, validate, before_send):
+    adapter = _gmail_adapter()
+    def sender(payload):
+        before_send()
+        return service.send_reviewed(payload)
+    return adapter._gmail_send(service, body=review['body'],
+        reply_message_id=review['message_id'], reviewed=validate, sender=sender)
+
+
+def _calendar_guest_plan(attendees: str, self_email: str) -> dict:
+    """Original organizer inclusion, shared with the attended full review."""
+    listed = {x.strip().lower() for x in attendees.split(",") if x.strip()}
+    own = self_email.strip().lower() if attendees else ""
+    added = bool(own) and own not in listed
+    return {"organizer_email": own or None, "organizer_added": added,
+            "effective_attendees": sorted(listed | ({own} if own else set()))}
+
+
 def _calendar_create(summary: str, start: str, end: str, attendees: str = "",
-                     location: str = "", description: str = "") -> dict:
+                     location: str = "", description: str = "", *, reviewed_create: dict | None = None) -> dict:
     """Create the event, with the two honesty repairs the host CLI forces on us."""
     base = ["calendar", "create", "--summary", summary, "--start", start, "--end", end]
     self_email, self_added, listed = "", False, set()
@@ -494,17 +616,25 @@ def _calendar_create(summary: str, start: str, end: str, attendees: str = "",
         # there; when we don't know it at all, behavior is unchanged.
         self_email = _settings_email()
         listed = {x.strip().lower() for x in attendees.split(",") if x.strip()}
-        self_added = bool(self_email) and self_email.lower() not in listed
+        self_added = _calendar_guest_plan(attendees, self_email)["organizer_added"]
         if self_added:
             attendees = f"{attendees},{self_email}"
         base += ["--attendees", attendees]
+    if reviewed_create is not None:
+        plan = _calendar_guest_plan(",".join(listed), self_email)
+        if (plan != {key: reviewed_create[key] for key in ("organizer_email", "organizer_added", "effective_attendees")}
+                or not re.fullmatch(r"[0-9a-f]{64}", reviewed_create.get("event_id", ""))):
+            return {"status": "error", "error": "Reviewed creation identity changed"}
+        base += ["--event-id", reviewed_create["event_id"]]
     extras = []
     if location:
         extras += ["--location", location]
     if description:
         extras += ["--description", description]
+    if reviewed_create is not None and attendees and (_settings_email() or "").strip().lower() != (reviewed_create["organizer_email"] or ""):
+        return {"status": "error", "error": "Reviewed organizer changed"}
     out = _run(base + extras)
-    if extras and isinstance(out, dict) and out.get("status") == "error" \
+    if reviewed_create is None and extras and isinstance(out, dict) and out.get("status") == "error" \
             and _looks_unsupported_subcommand(out.get("error", "")):
         # Host CLI predates --location/--description (argparse rejects unknown flags with a
         # usage dump): create bare, then best-effort patch the fields on. The event must never
@@ -546,7 +676,7 @@ def _fields(raw: str, allowed: set) -> dict:
     return fields
 
 
-def _native_action(a) -> dict:
+def _native_action(a, *, calendar_if_match: str | None = None, reviewed_contact: dict | None = None) -> dict:
     """Bounded Google writes; called only through the unattended/approval gate."""
     capability = ("contacts_write" if a.cmd.startswith("contacts-") else
                   "calendar_write" if a.cmd.startswith("calendar-") else "gmail_write")
@@ -566,11 +696,17 @@ def _native_action(a) -> dict:
             return {"status": "modified", "message_id": result["id"]}
         if a.cmd == "calendar-update":
             fields = _fields(a.fields_json, EVENT_FIELDS)
-            result = _google_service("calendar", "v3").events().patch(
-                calendarId=a.calendar, eventId=a.event_id, body=fields, sendUpdates="all").execute()
+            request = _google_service("calendar", "v3").events().patch(
+                calendarId=a.calendar, eventId=a.event_id, body=fields, sendUpdates="all")
+            if calendar_if_match is not None:
+                if not isinstance(calendar_if_match, str) or not calendar_if_match or any(ord(c) < 32 for c in calendar_if_match):
+                    raise ValueError("Calendar version is invalid")
+                request.headers["If-Match"] = calendar_if_match
+            result = request.execute()
             if not result.get("id"):
                 raise ValueError("Google returned no event ID; change is unconfirmed")
-            return {"status": "updated", "event_id": result["id"], "htmlLink": result.get("htmlLink", "")}
+            return {"status": "updated", "event_id": result["id"], "htmlLink": result.get("htmlLink", ""),
+                    **({"event": result} if calendar_if_match is not None else {})}
         resource = getattr(a, "resource_name", "")
         if a.cmd != "contacts-create" and (not resource.startswith("people/c") or "/" in resource[7:]):
             raise ValueError("Use the exact people/c… resourceName returned by contacts-search or contacts-get")
@@ -578,24 +714,36 @@ def _native_action(a) -> dict:
         if any(not isinstance(value, list) for value in fields.values()):
             raise ValueError("Contact fields must be arrays in Google People format")
         people = _google_service("people", "v1").people()
+        current = None
+        if reviewed_contact is not None and a.cmd != "contacts-create":
+            from contact_snapshot import snapshot, validate_snapshot
+            validate_snapshot(reviewed_contact)
+            current = people.get(resourceName=resource, personFields=CONTACT_MASK,
+                                 sources=["READ_SOURCE_TYPE_CONTACT"]).execute()
+            if snapshot(current) != reviewed_contact:
+                raise ValueError("Reviewed contact changed")
         if a.cmd == "contacts-delete":
             people.deleteContact(resourceName=resource).execute()
             return {"status": "deleted", "resource_name": resource}
         if a.cmd == "contacts-create":
             result = people.createContact(body=fields, personFields=CONTACT_MASK).execute()
         else:
-            current = people.get(resourceName=resource, personFields=CONTACT_MASK,
-                                 sources=["READ_SOURCE_TYPE_CONTACT"]).execute()
+            if current is None:
+                current = people.get(resourceName=resource, personFields=CONTACT_MASK,
+                                     sources=["READ_SOURCE_TYPE_CONTACT"]).execute()
             sources = [x for x in current.get("metadata", {}).get("sources", []) if x.get("type") == "CONTACT"]
             if not sources or any(not x.get("etag") for x in sources):
                 raise ValueError("Google returned no contact version; update refused")
+            if reviewed_contact is not None:
+                sources = reviewed_contact["contact_sources"]
             result = people.updateContact(resourceName=resource,
                 updatePersonFields=",".join(sorted(fields)), personFields=CONTACT_MASK,
                 body={**fields, "etag": current.get("etag", ""), "metadata": {"sources": sources}}).execute()
         if not result.get("resourceName"):
             raise ValueError("Google returned no contact ID; change is unconfirmed")
         return {"status": "created" if a.cmd == "contacts-create" else "updated",
-                "resource_name": result["resourceName"]}
+                "resource_name": result["resourceName"],
+                **({"person": result} if reviewed_contact is not None else {})}
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "error": str(exc)[:600]}
 

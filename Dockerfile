@@ -1,174 +1,157 @@
-# Cloud Hermes + Sotto (Railway/Render/Fly). Runs the agent, the skills (with their Python scripts),
-# and the trigger receiver. A persistent volume mounts at /data ($SOTTO_DATA) for the exhaust.
+# The self-host Sotto image: the supervised Node chat runtime, trigger receiver, adapters and skills,
+# built from source and started by the root self-host bootstrap. Railway builds this file by default
+# (railway.toml), and tools/setup_selfhost_railway.py uploads a pinned source checkout for it.
 #
 # BUILD CONTEXT = the folder holding this Dockerfile (its COPY paths are relative to it). In a
-# standalone Sotto repo this folder IS the repo root → Railway needs no Root Directory / Dockerfile
-# Path at all (auto-detected). In the dailybrief monorepo, set Railway Root Directory = sotto-hermes.
+# standalone Sotto repo this folder IS the repo root, so Railway needs no Root Directory or Dockerfile
+# Path. In the dailybrief monorepo, set Railway Root Directory = sotto-agent.
+# Dockerfile.dockerignore limits the context to the files copied below.
+#
+# Every line from the first FROM down to the self-host overlay is runtime/sotto-chat/Dockerfile.runtime
+# verbatim: its stages, packaged files and credential-free image checks.
+# sotto-chief-of-staff/tests/test_root_image.py fails when the two drift; change Dockerfile.runtime
+# first, then copy the same block here. Base images stay pinned by tag and multi-arch digest.
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-build
+WORKDIR /build/runtime/sotto-chat
+COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY runtime/sotto-chat/tsconfig.json runtime/sotto-chat/tsconfig.build.json ./
+COPY runtime/sotto-chat/src/ ./src/
+RUN npm run typecheck && npm run build \
+ && node --input-type=module -e 'await import("./dist/bootstrap/main.js"); await import("chat"); await import("@chat-adapter/telegram"); await import("@photon-ai/chat-adapter-imessage"); await import("@spectrum-ts/core");'
 
-# Base image: pinned to an EXACT patch tag *and* its multi-arch manifest digest. The tag says which
-# Python this is for a human; the digest is what actually gets pulled, so a rebuilt image is the same
-# bytes even after upstream re-tags `3.12-slim-bookworm` at the next patch. Both were resolved from
-# Docker Hub on 2026-08-12 (`docker-content-digest` for python:3.12.13-slim-bookworm, which was also
-# what the floating 3.12-slim-bookworm tag pointed at that day).
-# To move to a newer Python: change BOTH halves together — a tag without its matching digest is a lie
-# in the file, and the digest is what wins.
-FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-production
+WORKDIR /build/runtime/sotto-chat
+COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 
-# The supervisor remains root so it can seed and reconcile the persistent Hermes home. In managed
-# mode `managed_exec.py` drops the receiver and gateway to the shared `sotto` UID before either
-# imports runtime code; the receiver also becomes nondumpable. Image code and the FHS Hermes runtime
-# stay root-owned and non-writable. Self-host retains the historical root runtime for compatibility.
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime
+ENV NODE_ENV=production \
+    MASTRA_TELEMETRY_DISABLED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Prereqs for Hermes' installer (per Nous docs: git, curl, xz-utils; build tools; ripgrep/ffmpeg the
-# agent uses) + tini as a proper init (reaps the receiver/pairing/bridge child processes and forwards
-# signals). Without these the install.sh below fails — so we do NOT mask its exit code.
-# `--no-install-recommends` keeps the list to exactly what is named here.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates xz-utils build-essential ripgrep ffmpeg tini \
- && useradd --create-home --uid 10001 sotto \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libatomic1 libstdc++6 tini \
+ && groupadd --gid 10000 sotto-runtime \
+ && useradd --uid 10000 --gid 10000 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin sotto-runtime \
+ && groupadd --gid 10001 sotto \
+ && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin sotto \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Hermes (Nous Research's official installer — also pulls Python/Node into its own runtime).
-# No account/license needed; it just needs an LLM key at runtime (we pass GOOGLE_AI_API_KEY).
-#
-# The installer is VENDORED at adapters/hermes/hermes-install.sh — the build never fetches
-# https://hermes-agent.nousresearch.com/install.sh. Upstream serves that URL MUTABLY and replaced
-# the script in place three times in Aug 2026: twice between our review and the build (the sha pin
-# we used then failed those builds closed, correctly), and once more after a cache eviction turned
-# the stale pin into every build failing until someone re-verified. Vendoring ends the recurrence:
-# the bytes that run are the bytes reviewed in git, and a build needs no network to stay honest.
-#
-# To upgrade Hermes, deliberately select a tested full SHA in hermes.commit.
-# The installer refresh below changes installer bytes only, not that runtime pin.
-# To refresh the installer, review and commit the diff:
-#   curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
-#     -o adapters/hermes/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
-# (the -A string matters — the host serves different bytes to unknown user agents), or run
-# tools/ship.sh --refresh-hermes, which does exactly that. The COPY below busts the Docker cache
-# precisely when the file changes: a routine code push never re-runs the installer, a committed
-# upgrade always does. The Hermes version an image actually carries is recorded at build time in
-# /app/hermes-image-version.txt (see below).
-# (Vendored 2026-08-31, sha256 2076946edc23b3aed4a82ccb2e6b38ab593575626206dbdd192384e375b6d57c.)
-COPY adapters/hermes/hermes-install.sh /tmp/hermes-install.sh
-COPY adapters/hermes/hermes.commit /tmp/hermes.commit
-RUN HERMES_INSTALL_DIR=/usr/local/lib/hermes-agent \
-      UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
-      UV_PYTHON_BIN_DIR=/usr/local/share/uv/bin \
-      bash /tmp/hermes-install.sh \
-      --commit "$(cat /tmp/hermes.commit)" --force-commit \
- && test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "$(cat /tmp/hermes.commit)" \
- && install -m 0755 /root/.local/bin/hermes /usr/local/bin/hermes \
- && install -m 0755 /root/.local/bin/hermes-agent /usr/local/bin/hermes-agent \
- && mkdir -p /usr/local/share/uv/python /usr/local/share/uv/bin \
- && chown -R root:root /usr/local/lib/hermes-agent /usr/local/share/uv /usr/local/bin/hermes /usr/local/bin/hermes-agent \
- && chmod -R go-w /usr/local/lib/hermes-agent /usr/local/share/uv \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin hermes --version >/dev/null \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin hermes send --help | grep -q -- --json \
- && mkdir -p /app \
- && cp /tmp/hermes.commit /app/hermes-image-commit.txt \
- && rm -f /tmp/hermes-install.sh /tmp/hermes.commit
-# The installer puts `hermes` on PATH for the install user; make common locations explicit for start.sh.
-ENV PATH="/usr/local/bin:/usr/local/share/uv/bin:${PATH}"
-# Snapshot what the INSTALLER owns inside ~/.hermes (captured BEFORE any Sotto skills are copied) and
-# the Hermes version this image was built with. start.sh uses these to (a) print the running vs image
-# version in every boot log and (b) refresh the installer-owned entries on the /data volume when
-# SOTTO_REFRESH_HERMES=1 — without them, an upgraded image can be silently shadowed by the volume's
-# first-boot copy of ~/.hermes.
-RUN mkdir -p /app \
- && (ls -A /root/.hermes 2>/dev/null || true) > /app/hermes-image-manifest.txt \
- && { hermes --version 2>/dev/null || hermes version 2>/dev/null || echo unknown; } | head -1 > /app/hermes-image-version.txt
-
-# Python runtime deps, EXACTLY pinned in requirements.txt (pyyaml for skills front-matter; the Google
-# Workspace client libs for the bundled google-workspace skill's google_api.py). WITHOUT the Google
-# libs, `google_api.py gmail/calendar` dies with `ModuleNotFoundError: No module named 'googleapiclient'`
-# even though the OAuth token is valid (setup.py --check only validates the token, not the client lib) —
-# so briefs silently fall to local-only and the agent improvises `pip install` mid-run. Baked into the
-# image → always present, no per-run install, no improvisation.
-#
-# Installed with `python3 -m pip` against the PATH python (the same interpreter execute_code/gather_google
-# use). Installation verifies the full transitive lock and hashes; a failure stops the build.
-# Deliberately AFTER the Hermes layer: editing a pin then costs one pip layer, not a re-download and
-# re-run of the installer.
-COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
-
-# Photon must run under the managed Sotto UID, which cannot traverse /root. Keep the
-# installer's Node/npm tree in an immutable shared location and install the locked sidecar deps
-# in the image, before runtime code becomes read-only. Check the actual managed-user imports.
-RUN cp -a /root/.hermes/node /usr/local/lib/sotto-node \
- && ln -s /usr/local/lib/sotto-node/bin/node /usr/local/bin/node \
- && ln -s /usr/local/lib/sotto-node/bin/npm /usr/local/bin/npm \
- && ln -s /usr/local/lib/sotto-node/bin/npx /usr/local/bin/npx \
- && chmod -R a+rX,go-w /usr/local/lib/sotto-node \
- && npm ci --prefix /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
- && chmod -R go-w /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin node --version \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin npm --version \
- && runuser -u sotto -- env HOME=/home/sotto PATH=/usr/local/bin:/usr/bin:/bin \
-      sh -c 'cd /usr/local/lib/hermes-agent/plugins/platforms/photon/sidecar && node --input-type=module -e "import {group,text,attachment} from \"spectrum-ts\"; if (![group,text,attachment].every(f => typeof f === \"function\")) process.exit(1)"'
-
-ENV SOTTO_DATA=/data
-RUN mkdir -p /data ~/.hermes/skills ~/.hermes/skill-bundles
-
-# Sotto layer. ONE copy of the Hermes adapter: /app/adapters/hermes/ holds start.sh, the persona,
-# crons.json, configure_mcp.py and wa_pair.py, and every consumer reads them from there (start.sh
-# already referenced its siblings by that path). No second copy at /app/ to drift from it.
-COPY sotto-chief-of-staff/ /root/.hermes/skills/sotto/
-COPY sotto-chief-of-staff/ /app/sotto-skills/
-COPY adapters/hermes/sotto.bundle.yaml /root/.hermes/skill-bundles/sotto.yaml
+WORKDIR /app/runtime/sotto-chat
+COPY --from=node-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-build /build/runtime/sotto-chat/dist ./dist
+COPY --from=node-production /build/runtime/sotto-chat/node_modules ./node_modules
+COPY runtime/sotto-chat/package.json ./package.json
+COPY adapters/sotto/ /app/adapters/sotto/
 COPY runtime/trigger-receiver/ /app/trigger-receiver/
-# THE timezone chain — one file in the skills tree, carried beside the receiver so the receiver, the
-# dashboard and start.sh run the same code the skills do (no import across trees, and no copy in git).
 COPY sotto-chief-of-staff/_shared/lib/tzchain.py /app/trigger-receiver/tzchain.py
+COPY sotto-chief-of-staff/_shared/lib/history_coverage.py /app/trigger-receiver/history_coverage.py
 COPY sotto-chief-of-staff/_shared/lib/work_queue.py /app/trigger-receiver/work_queue.py
+COPY sotto-chief-of-staff/_shared/lib/routine_cursor.py /app/trigger-receiver/routine_cursor.py
+COPY sotto-chief-of-staff/_shared/lib/routine_cursor.NOTICE /app/trigger-receiver/routine_cursor.NOTICE
 COPY sotto-chief-of-staff/_shared/lib/calendar_context.py /app/trigger-receiver/calendar_context.py
 COPY sotto-chief-of-staff/_shared/lib/source_catalog.py /app/trigger-receiver/source_catalog.py
 COPY sotto-chief-of-staff/_shared/lib/message_targets.py /app/trigger-receiver/message_targets.py
-COPY adapters/hermes/ /app/adapters/hermes/
-# Exercise identity replacement attacks as the actual managed UID, and verify
-# the pinned Hermes still loads its persona and writes sessions after migration.
-RUN python3 /app/adapters/hermes/check_identity.py
-# Exercise nonempty nudges and four-photo briefs through the real receiver, adapters,
-# outbox and receipts as the managed UID, with synthetic sources and local transport fixtures.
-RUN runuser -u sotto -- python3 -I -B /app/trigger-receiver/check_runtime.py
-# Fail the BUILD on a Hermes pin bump, not every container at boot. start.sh and install.sh apply
-# provider_error_compat.py to the installed gateway source, gated on whole-file SHA256 pins; before
-# this step, a hermes.commit bump built green and then crash-looped every deploy. `--check` verifies
-# both pinned hashes and every patch anchor against the Hermes installed above, and writes nothing —
-# boot still applies the patch for real. When this fails, follow "Provider-error gateway pin" in
-# adapters/hermes/README.md: re-review the new gateway source and regenerate the two constants.
-RUN python3 /app/adapters/hermes/provider_error_compat.py --check \
-      /usr/local/lib/hermes-agent/gateway/run.py
-RUN python3 /app/adapters/hermes/first_contact_compat.py --check \
-      /usr/local/lib/hermes-agent/gateway/run_turn.py
-RUN python3 /app/adapters/hermes/gallery_obligation_compat.py --check \
-      /usr/local/lib/hermes-agent/gateway/platforms/base.py \
- && python3 /app/adapters/hermes/gallery_obligation_compat.py --check \
-      /usr/local/lib/hermes-agent/gateway/run_startup.py
-# The two interactive playgrounds live in docs/ (one source of truth) and are SERVED from
-# /static/* — so they are copied in beside the frontend assets at build time. That keeps
-# dashboard.py's whitelist an exact-name lookup against a single root; the alternative (a second
-# static root resolved at runtime) has no single relative path that is correct both here and in
-# the source tree. Whitelisted in dashboard.STATIC_FILES; they carry no user data.
-COPY docs/playground-architecture.html docs/playground-feedback-loops.html /app/trigger-receiver/static/
-# Which published build this image IS: `YYYY-MM-DD.<short-sha>`, stamped into the distribution tree
-# by tools/prepare-public-repo.sh on every publish. The receiver compares it against the same file
-# in the public repo and flags an available update on the Integrations page (RAILWAY.md § Staying
-# updated). In the monorepo the file reads `dev` — an unstamped build never checks and never flags.
-COPY VERSION /app/VERSION
-
-# Required at runtime (set as Railway/Render env, do NOT bake): GOOGLE_AI_API_KEY, SOTTO_TRIGGER_TOKEN,
-# the gateway token, and BRIDGE_TOKEN (the reverse-relay bearer configure_mcp.py registers on boot).
-# Seed the Sotto persona into SOUL.md at build time; start.sh refreshes it on the volume every boot.
-RUN cat /app/adapters/hermes/sotto-persona.md /app/sotto-skills/_shared/references/writing-style.md >> /root/.hermes/SOUL.md 2>/dev/null || true
-
-# Two processes: the trigger receiver (HTTP) + Hermes (agent loop + gateway + scheduler).
-# Railway exposes $PORT → the receiver. Hermes runs alongside. tini is PID 1 so the background
-# receiver/pairing/whatsapp-bridge children are reaped and SIGTERM is forwarded on redeploy.
-# Dependency permissions are sealed in their stable install layers above. Rewalking the entire
-# Hermes/uv tree here copies gigabytes into a fresh layer on every application-only change.
-RUN chmod +x /app/adapters/hermes/start.sh /app/adapters/hermes/managed_exec.py \
- && chown -R root:root /app \
+COPY sotto-chief-of-staff/ /app/sotto-skills/
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt \
  && chmod -R go-w /app
-ENTRYPOINT ["tini", "--"]
-CMD ["python3", "/app/adapters/hermes/runtime_lock.py", "/app/adapters/hermes/start.sh"]
+
+# Credential-free offline image checks: resolve the real packaged skill index, validate a private
+# explicit config, confirm config check does not create runtime state, and exercise Python CLI help.
+USER 10000:10000
+RUN <<'SH'
+set -eu
+umask 077
+cat > /tmp/runtime-image-check.json <<'JSON'
+{"version":1,"channel":"telegram","stateDirectory":"/tmp/runtime-image-check-state","mediaRoot":"/tmp/runtime-image-check-media","bearerToken":"offline-config-check-only-not-a-credential-123456789","port":0,"owner":{"accountId":"offline-check-owner","ownerId":"123456789"},"lineKey":"primary","target":"owner","providerThreadId":"telegram:123456789","credentials":{"telegramToken":"offline-check-only","telegramLinkFile":{"bot_token":"offline-check-only","allowed_user":123456789}},"instructions":"Offline package check only.","modelProxy":{"origin":"https://proxy.example","bearer":"offline-check-only","chatModelId":"chat-model","nativeMediaModelId":"media-model"},"skillPackRoot":"/app/sotto-skills"}
+JSON
+node /app/runtime/sotto-chat/dist/bootstrap/main.js --check /tmp/runtime-image-check.json
+test ! -e /tmp/runtime-image-check-state
+node --input-type=module - <<'JS'
+import { resolveAgentSkills } from '@mastra/core/skills';
+import { readSkillIndex } from './dist/tools/skills.js';
+import { loadAgentSkills } from './dist/agent/skill-loader.js';
+const indexed = await readSkillIndex('/app/sotto-skills');
+const skills = resolveAgentSkills(await loadAgentSkills(indexed.map(entry => entry.path)));
+const loaded = await skills.list();
+if (JSON.stringify(loaded.map(skill => skill.name).sort()) !==
+    JSON.stringify(indexed.map(skill => skill.name).sort())) {
+  throw new Error('Packaged skills did not load in the native model runtime');
+}
+console.log(`Native runtime loaded all ${loaded.length} packaged skills`);
+JS
+python3 -I -B /app/adapters/sotto/run.py --help >/dev/null
+python3 -I -B /app/adapters/sotto/google_api.py --help >/dev/null
+python3 -I -B /app/adapters/sotto/google_setup.py --help >/dev/null
+python3 -I -B -c 'import google.auth, googleapiclient.discovery'
+SOTTO_DEPLOYMENT_MODE=managed SOTTO_DATA=/tmp/runtime-image-receiver-check \
+SOTTO_SKILLS_ROOT=/app/sotto-skills \
+python3 -I -B - <<'PY'
+import grp
+import importlib.util
+import pwd
+import subprocess
+import sys
+from pathlib import Path
+for path in ('/app/trigger-receiver', '/app/adapters/sotto'):
+    sys.path.insert(0, path)
+import control_vault, managed_exec, model_lease, photon_owner, runtime_lock, tenant_lifecycle
+for script in ('root_supervisor.py', 'prepare_fresh.py'):
+    result = subprocess.run([sys.executable, '-I', '-B', '/app/adapters/sotto/' + script,
+                             '--invalid'], cwd='/tmp', capture_output=True, text=True)
+    assert result.returncode == 2 and 'Traceback' not in result.stderr, (script, result.stderr)
+import root_supervisor, role_stager, prepare_fresh
+assert all(callable(module.main) for module in (root_supervisor, role_stager, prepare_fresh))
+assert control_vault.get({}) == ''
+account = pwd.getpwnam('sotto')
+assert (account.pw_uid, account.pw_gid) == (10001, 10001)
+assert grp.getgrgid(account.pw_gid).gr_name == 'sotto'
+receiver_path = Path('/app/trigger-receiver/receiver.py')
+spec = importlib.util.spec_from_file_location('receiver_image_check', receiver_path)
+receiver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(receiver)
+assert receiver._runtime_adapter().__name__ == 'sotto_runtime_api'
+expected = {'sotto-morning-brief', 'sotto-evening-brief', 'sotto-relationship-pulse',
+            'sotto-proactive', 'sotto-midday-digest'}
+jobs = receiver._sotto_cron_jobs()
+assert {job[0] for job in jobs} == expected
+brief = str(receiver_path.with_name('brief_runner.py'))
+procedure = str(receiver_path.with_name('procedure_runner.py'))
+receiver._require_sotto_procedure([sys.executable, brief])
+receiver._require_sotto_procedure([sys.executable, procedure])
+memory = receiver._find_sotto_script('_shared', 'scripts', 'memory_cycle.py')
+assert memory
+receiver._require_sotto_procedure([sys.executable, memory])
+try:
+    receiver._require_sotto_procedure(['/bin/sh', '-c', 'true'])
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('undeclared runner was admitted')
+assert not Path('/tmp/runtime-image-receiver-check').exists()
+print('receiver package, fixed manifest, adapters and Sotto runner fence passed')
+PY
+rm -f /tmp/runtime-image-check.json
+SH
+
+
+# ---- self-host overlay ------------------------------------------------------------------------
+# The bootstrap starts as root under Tini (PID 1): it stages the private launch bundle, verifies the
+# /data mount and drops each workload to its own UID (adapters/sotto/SELFHOST.md).
+USER 0:0
+# The two interactive playgrounds live in docs/ (one source of truth) and are served from /static/*,
+# whitelisted by exact name in dashboard.STATIC_FILES; they carry no user data.
+COPY docs/playground-architecture.html docs/playground-feedback-loops.html /app/trigger-receiver/static/
+# Which published build this image is: `YYYY-MM-DD.<short-sha>`, stamped by
+# tools/prepare-public-repo.sh on every publish. The receiver compares it against the same file in
+# the public repo and flags an available update. In the monorepo the file reads `dev`, and an
+# unstamped build never checks.
+COPY VERSION /app/VERSION
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Railway mode reads the launch envelope from SOTTO_SELFHOST_LAUNCH. On a fresh volume the setup
+# helper first deploys the one-time `--prepare` start command, then switches to this one.
+CMD ["python3", "-I", "-B", "/app/adapters/sotto/selfhost_bootstrap.py", "--run"]

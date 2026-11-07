@@ -1,0 +1,3 @@
+# Hermes pin 245e48008fa814b3251f50755eb656bd9fb86cb1 lists PTB 22.8.
+# The receiver startup fixture needs the core package only; it never starts polling.
+python-telegram-bot==22.8

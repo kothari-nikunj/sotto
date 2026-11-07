@@ -16,6 +16,21 @@ import gmail_read
 from gmail_read import extract_body, message_fields
 
 
+def test_poll_google_cli_discovery_uses_only_the_packaged_sotto_path(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "poll_gmail_sotto_discovery", os.path.join(ROOT, "event-triage", "scripts", "poll_gmail.py"))
+    poll_gmail = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(poll_gmail)
+    stray = tmp_path / "skills" / "google-workspace" / "scripts" / "google_api.py"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("")
+    monkeypatch.setenv("SOTTO_HOME", str(tmp_path))
+    assert poll_gmail._find_google_api().endswith("/adapters/sotto/google_api.py")
+    with monkeypatch.context() as patch:
+        patch.setattr(poll_gmail.os.path, "isfile", lambda _: False)
+        assert poll_gmail._find_google_api() is None
+
+
 def _b64(value):
     return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
 
@@ -335,3 +350,12 @@ def test_malformed_persisted_state_fails_closed(tmp_path, monkeypatch, contents)
     path.write_text(contents)
     with pytest.raises((ValueError, json.JSONDecodeError)):
         pg._load_state()
+
+
+def test_mixed_html_section_is_not_lost_to_a_different_plain_section():
+    payload = {'mimeType': 'multipart/mixed', 'parts': [
+        {'mimeType': 'multipart/alternative', 'parts': [
+            {'mimeType': 'text/plain', 'body': {'data': _b64('Here is the document.')}},
+            {'mimeType': 'text/html', 'body': {'data': _b64('<p>Here is the document.</p>')}}]},
+        {'mimeType': 'text/html', 'body': {'data': _b64('<p>It is not approved yet.</p>')}}]}
+    assert extract_body(payload) == 'Here is the document.\n\nIt is not approved yet.'

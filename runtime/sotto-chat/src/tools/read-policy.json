@@ -1,0 +1,13 @@
+{
+  "contextWindowMs": 900000,
+  "denied": "\\b(?:nvm|never\\s*mind|scratch\\s+that|actually\\s+(?:dont|no)|don['\u2019]?t|do\\s+not|doesn['\u2019]t|never|no|not|without|ignore|skip|rather\\s+than|except|forget|cancel|stop|avoid|instead\\s+of|not\\s+now|no\\s+thanks)\\b",
+  "reported": "^\\s*(?:[\"\u201c\u201d`]|(?:she|he|they|someone|the\\s+(?:email|page|message))\\s+(?:said|says|asked|asks|wants|told)\\b)",
+  "request": "(?:^|[.!?]\\s+)(?:(?:please|pls|plz|yes|yeah|ok|okay|sure|actually|and|also|then)\\s*[,!]?\\s+)*(?:(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?)?(?:(?:queue|start|run)\\s+(?:the\\s+)?research|deep\\s+research|tell|show|give|read|open|check|research|look|find|search|summari[sz]e|explain|compare|write|prepare|prep|refresh|update|what|who|how|any|anything|which|where|when|more|their\\s+(?:site|website)|its\\s+(?:site|website))\\b",
+  "subjectSentence": "\\b(?:research|look\\s+up|tell\\s+me|don['\u2019]t|forget|due|said|asked|please)\\b",
+  "personalRecall": "\\bhow\\s+(?:was|were)\\s+(?:(?:my|the|our|your)\\s+)?(?:lunch|dinner|breakfast|meeting|call|coffee|trip)\\b",
+  "streetAddress": "\\b\\d+\\s+(?:[\\w]+\\s+){1,4}(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|blvd|boulevard)\\b",
+  "courtesy": "\\bno worries\\b",
+  "targetAnswer": "^(?:https?://)?((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63})/?$",
+  "reference": "\\b(?:it|its|this|that|they|their|them|her|him|his|those|these|more|again|same)\\b",
+  "prepSavedOnly": "\\b(?:only|rewrite|rephrase|shorten|condense|edit|translate|reword)\\b"
+}

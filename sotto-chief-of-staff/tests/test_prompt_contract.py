@@ -1,6 +1,6 @@
 """Prompt ↔ renderer contract for the FLEX extraction prompt (Sprint 1 CI guard).
 
-Guards from the prompt-overhaul review (docs/plans/roadmap-v2-the-editor.md, Sprint 1):
+Guards from the prompt-overhaul review (docs/archive/plans/roadmap-v2-the-editor.md, Sprint 1):
 (a) every data-section header the extraction prompt NAMES must match a header some formatter
     actually emits — the phantom-section bug ("Open Commitments for Key People" vs the real
     "Commitment History for Key People (historical context only)"; "TRACKED OPEN LOOPS", which
@@ -155,6 +155,19 @@ def test_gold_example_within_em_dash_budget():
     assert count <= 2, f"gold example narrative uses {count} em dashes (budget: 2)"
 
 
+def test_distilled_voice_does_not_relax_shared_punctuation_policy():
+    with open(os.path.join(ROOT, '_shared', 'references', 'writing-style.md'), encoding='utf-8') as f:
+        assert 'Do not use em dashes.' in f.read()
+    for rel in (('_shared', 'references', 'voice.md'),
+                ('morning-brief', 'references', 'extraction-prompt.md'),
+                ('followup', 'references', 'followup-prompt.md'),
+                ('meeting-prep', 'references', 'meeting-prep-prompt.md')):
+        with open(os.path.join(ROOT, *rel), encoding='utf-8') as f:
+            text = f.read()
+        assert 'no em dashes' in text.casefold(), rel
+        assert not re.search(r'(?:at most|≤)\s*1\s+em dash', text, re.I), rel
+
+
 def test_gold_example_bans_unsupported_inference_phrases():
     section = _example_output_section().lower()
     for phrase in ("might be urgent", "that's not like him", "that's not like her"):
@@ -257,3 +270,22 @@ def test_banned_list_stated_once_in_system_instruction():
     """One canonical list (Voice & Tone); the checklist references it instead of duplicating."""
     system = PROMPT.split(SEAM, 1)[0]
     assert system.count('"high-priority tracked open loop"') == 1
+
+
+def test_requested_draft_continuation_preserves_intent_and_source_time():
+    """The loaded skill must distinguish drafting consent from the underlying decision."""
+    text = open(os.path.join(ROOT, 'draft-reply', 'SKILL.md'), encoding='utf-8').read()
+    inline = text.split('## Procedure', 1)[1].split('0. **', 1)[0]
+    verify = text.split('3. **Verify (gate)**', 1)[1].split('4. **', 1)[0]
+    alternatives = text.split('## The no-draft', 1)[1].split('### Presenting', 1)[0]
+    assert 'one ready-to-use version' in inline and 'ask the owner one useful question' in inline
+    assert 'not acceptance or' in inline and 'Shorter' in inline
+    assert 'source message\'s timestamp' in verify and 'current drafting date' in verify
+    assert 'Owner availability' in verify and 'Do not invent busyness' in verify
+    assert 'source age or a later weekday alone does not establish a missed deadline' in verify
+    assert 'Shorter edits preserve these temporal qualifiers' in verify
+    assert 'only after the owner has chosen to take the meeting' in inline
+    assert 'before composing any draft or fetching voice guidance' in inline
+    assert 'Do not supply a placeholder neutral draft or promise future action' in inline
+    assert 'source-relative week that has clearly ended' in verify
+    assert 'does not override an owner-requested inline draft' in alternatives

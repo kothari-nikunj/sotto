@@ -29,7 +29,7 @@ def test_empty_and_templates_make_no_model_call(isolated, monkeypatch):
     text = notification.compose('proactive', items, now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
     assert '30 minutes' in text and text.endswith('Want the full prep on Sam?')
     doc = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
-    assert doc['effects'][0]['kind'] == 'pending_offer'
+    assert any(e['kind'] == 'pending_offer' for e in doc['effects'])
     prep = next(e for e in doc['effects'] if e['kind'] == 'meeting_prep_delivered')
     assert prep == {'kind': 'meeting_prep_delivered', 'mode': 'offer',
                     'calendar_event_id': '', 'calendar_start': '2026-09-17T12:30:00Z', 'date': ''}
@@ -62,6 +62,17 @@ def test_calendar_claim_cannot_be_rewritten_as_cancellation(isolated, monkeypatc
     bundle = {'events': [{'class': 'calendar_change', 'event': {'source': 'calendar_change',
         'change': 'removed', 'text': 'Acme on Fri, Sep 25 at 10:00 AM is no longer on your calendar.'}}]}
     assert notification.compose('event', bundle) == bundle['events'][0]['event']['text']
+
+
+def test_handoff_delivers_reminder_receipt_without_model_or_send(isolated, monkeypatch):
+    monkeypatch.setattr(notification, '_write', lambda *a: pytest.fail('handoff must not call model'))
+    monkeypatch.setattr(notification.action_links, 'link_for', lambda *a, **k: pytest.fail('no send link'))
+    text = "I've reminded you twice about Maya and the contract — want a follow-up draft, or let it go?"
+    item = {'kind': 'handoff', 'key': 'handoff-maya', 'person': 'Maya', 'detail': text}
+    assert notification.compose('proactive', [item]) == text
+    effects = json.loads((isolated / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())['effects']
+    offer = next(effect['offer'] for effect in effects if effect['kind'] == 'pending_offer')
+    assert offer['question'] == text and offer['kind'] == 'handoff'
 
 
 def test_held_calendar_change_gets_a_short_detection_prefix(isolated, monkeypatch):
@@ -293,6 +304,35 @@ def test_verified_slots_do_not_overlap_and_unknown_constraints_do_not_guess():
     assert notification.slots('Thursday or Friday?', calendar, now) == []
 
 
+@pytest.mark.parametrize('identity_source', ['environment', 'settings'])
+def test_verified_slots_ignore_free_and_other_owners_events_but_keep_real_commitments(monkeypatch, tmp_path, identity_source):
+    if identity_source == 'environment':
+        monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    else:
+        monkeypatch.delenv('SOTTO_USER_EMAIL', raising=False)
+        monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+        (tmp_path / 'config').mkdir()
+        (tmp_path / 'config/settings.json').write_text(json.dumps({'google_account_email': 'owner@example.com'}))
+    now = datetime(2026, 9, 17, 8, tzinfo=timezone.utc)
+    day = {'start': '2026-09-17', 'end': '2026-09-18', 'calendar_id': 'primary'}
+    calendar = {'all_calendars_complete': True, 'since': now.isoformat(),
+                'until': '2026-09-18T08:00:00Z', 'events': [
+                    {**day, 'transparency': 'transparent'},
+                    {**day, 'eventType': 'workingLocation'},
+                    {**day, 'calendar_id': 'colleague@example.com',
+                     'attendees': [{'email': 'colleague@example.com', 'self': True}]},
+                    {**day, 'my_response': 'declined'}, {**day, 'status': 'cancelled'},
+                    {**day, 'start': '2026-09-17T09:30:00Z', 'end': '2026-09-17T10:00:00Z',
+                     'calendar_id': 'team@example.com',
+                     'attendees': [{'email': 'owner@example.com', 'responseStatus': 'accepted'}]},
+                    {**day, 'start': '2026-09-17T10:00:00Z', 'end': '2026-09-17T10:30:00Z',
+                     'eventType': 'focusTime'}]}
+    assert notification.slots('30 minutes Thursday?', calendar, now) == [
+        'Thu Sep 17, 09:00 AM UTC', 'Thu Sep 17, 10:30 AM UTC', 'Thu Sep 17, 11:00 AM UTC']
+    calendar['events'].append({**day, 'eventType': 'outOfOffice'})
+    assert notification.slots('30 minutes Thursday?', calendar, now) == []
+
+
 def test_scheduling_requires_both_choices_and_uses_code_slots(isolated, monkeypatch):
     row = {'id': 'x', 'text': 'Sam asked to meet.', 'draft': '{{slots}} works for me.', 'decline': 'I will pass, thanks.'}
     monkeypatch.setattr(gemini, '_gemini_once', lambda *a, **kw: json.dumps({'items': [row]}))
@@ -497,7 +537,7 @@ def test_optional_knowledge_failure_does_not_drop_candidate(isolated, monkeypatc
     monkeypatch.setattr(notification.style_apply, 'apply', lambda _: {})
     monkeypatch.setattr(notification, '_read_json_script', lambda *a: (_ for _ in ()).throw(RuntimeError('offline')))
     items = [{'id': 'x', 'kind': 'commitment', 'person': 'Sam'}]
-    # Fixture replaces enrich; call the original function captured by its module source.
+    # The fixture replaces enrich; load the original function.
     import importlib.util
     spec = importlib.util.spec_from_file_location('notification_real_enrich', notification.__file__)
     module = importlib.util.module_from_spec(spec)
@@ -595,9 +635,15 @@ def test_stale_scheduling_candidate_gets_current_invitation_and_thread_before_wr
 
 def test_group_commitment_gets_calendar_and_the_group_confirmation(real_enrichment, monkeypatch):
     import personal_context
+    import yaml
     now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
-    loop = {'anchor_key': 'ask', 'identifier': '', 'name': 'Planning group', 'group_id': 'group-id'}
-    monkeypatch.setattr(notification.loops_query, 'query', lambda: {'you_owe': [loop], 'waiting_on_them': []})
+    loop = {'anchor_key': 'ask', 'status': 'open', 'action_type': 'reply',
+            'contact_identifier': '', 'contact_name': 'Planning group', 'group_id': 'group-id',
+            'source': 'imessage', 'channel': 'imessage', 'summary': 'Confirm the group plan',
+            'created_at': '2026-09-23'}
+    directory = real_enrichment / 'knowledge' / 'continuity'
+    directory.mkdir(parents=True)
+    (directory / 'group.md').write_text('---\n' + yaml.safe_dump(loop) + '---\n')
     monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [({'source': 'imessage',
         'chat_guid': 'group-id', 'text': 'Booked, see you Thursday.', 'timestamp': '2026-09-23T20:00:00Z'}, '', '')])
     monkeypatch.setattr(notification, '_calendar', lambda: {'events': [{'summary': 'Jordan meeting'}]})
@@ -607,6 +653,69 @@ def test_group_commitment_gets_calendar_and_the_group_confirmation(real_enrichme
     assert sent['calendar']['events'][0]['summary'] == 'Jordan meeting'
     assert sent['current_conversation'][0]['text'] == 'Booked, see you Thursday.'
     assert 'group-id' not in json.dumps(sent)
+
+
+_CEDAR = {'anchor_key': 'gmail:waiting_on:cedar', 'status': 'open', 'source': 'gmail',
+          'source_message_id': 'cedar-message', 'source_thread_id': 'cedar-thread',
+          'source_refs': [{'sourceType': 'gmail', 'sourceId': 'cedar-message'}],
+          'contact_name': 'Dana', 'contact_identifier': 'dana@example.com',
+          'action_type': 'waiting_on', 'summary': 'Send Cedar deck', 'created_at': '2026-08-20'}
+
+
+@pytest.fixture
+def chase_ledger(real_enrichment, monkeypatch):
+    import continuity_resolve as cr
+    import personal_context
+    monkeypatch.setattr(notification, '_calendar', lambda: None)
+    monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [])
+    cr._persist(dict(_CEDAR))
+    return real_enrichment / 'knowledge' / 'continuity'
+
+
+def _chase():
+    import continuity_resolve as cr
+    row = cr._load_items()[_CEDAR['anchor_key']]
+    return {'id': 'c1', 'kind': 'chase', 'anchor_key': _CEDAR['anchor_key'], 'person': 'Dana',
+            'identifier': 'dana@example.com', 'title': 'Dana - Send Cedar deck', 'detail': 'asked 7 days ago',
+            'loop_version': notification.delivery_effects.loop_version(row),
+            'loop_identity': notification.delivery_effects.loop_identity(row)}
+
+
+def test_a_loop_nudge_survives_a_ledger_that_grew_past_the_old_bound(chase_ledger):
+    """PR #817 review: 1024 files was reachable by design (parked rows are never pruned), and
+    every batch with a chase, commitment or hand-off then failed to compose."""
+    for i in range(1030):
+        (chase_ledger / f'old-{i}.md').write_text(
+            f"---\nanchor_key: k{i}\nstatus: parked\nparked_at: '2026-03-01'\n"
+            "action_type: follow_up\nsummary: x\n---\n")
+    enriched, = notification.enrich([_chase()], datetime(2026, 8, 27, 12, tzinfo=timezone.utc))
+    assert not enriched.get('resolved')
+    assert enriched['_loop_snapshot']['anchor_key'] == _CEDAR['anchor_key']
+
+
+def test_a_malformed_ledger_file_does_not_fail_a_loop_nudge(chase_ledger):
+    (chase_ledger / 'notes.md').write_text("hello, not frontmatter\n")
+    (chase_ledger / 'broken.md').write_text("---\nsummary: [unclosed\n---\n")
+    enriched, = notification.enrich([_chase()], datetime(2026, 8, 27, 12, tzinfo=timezone.utc))
+    assert not enriched.get('resolved')
+    assert enriched['_loop_snapshot']['anchor_key'] == _CEDAR['anchor_key']
+
+
+@pytest.mark.parametrize('failure', ['untrusted_row', 'unavailable'])
+def test_a_partial_loop_read_composes_from_the_ordinary_view_without_binding(chase_ledger, monkeypatch,
+                                                                             capsys, failure):
+    import protected_ledger_io
+    if failure == 'untrusted_row':
+        (chase_ledger / 'dup.md').write_text('---\nsource: gmail\nsource: user_added\nsummary: x\n---\n')
+    else:
+        monkeypatch.setattr(protected_ledger_io, 'MAX_FILES', 0)
+    view = {'you_owe': [], 'waiting_on_them': [{'anchor_key': _CEDAR['anchor_key'], 'name': 'Dana',
+                                                'identifier': 'dana@example.com', 'what': 'Send Cedar deck'}]}
+    monkeypatch.setattr(notification.loops_query, 'query', lambda: view)
+    enriched, = notification.enrich([_chase()], datetime(2026, 8, 27, 12, tzinfo=timezone.utc))
+    assert not enriched.get('resolved')
+    assert enriched['_loop_snapshot'] is None and enriched.get('_composition_sources') is None
+    assert 'coverage partial' in capsys.readouterr().err
 
 
 def test_resolved_original_message_is_removed_before_writer(real_enrichment, monkeypatch):

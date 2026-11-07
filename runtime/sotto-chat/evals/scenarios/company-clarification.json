@@ -1,0 +1,120 @@
+{
+  "name": "company-natural-research-followthrough",
+  "world": {
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Spur",
+          "domain": "old-spur.example",
+          "about": "Spur makes automated website QA tools."
+        }
+      ]
+    },
+    "companyResearch": {
+      "Spur": {
+        "companies": [
+          {
+            "identity_status": "identified",
+            "company_deep": {
+              "company": "Spur",
+              "builds": [
+                "Natural-language QA testing for websites."
+              ],
+              "founder_story": "Founded by two QA engineers.",
+              "traction": [],
+              "market": "GlimmerCheck and DiffGuard compete in automated QA testing (https://industry.example/qa)."
+            }
+          }
+        ]
+      },
+      "spurtest.example": {
+        "companies": [
+          {
+            "identity_status": "identified",
+            "company_deep": {
+              "company": "Spur",
+              "builds": [
+                "Orbit-19: natural-language QA testing for websites."
+              ],
+              "founder_story": "Founded by two QA engineers.",
+              "traction": [],
+              "market": "GlimmerCheck and DiffGuard compete in automated QA testing (https://industry.example/qa)."
+            }
+          }
+        ]
+      }
+    },
+    "websites": {
+      "https://spurtest.example/": "Spur official site. Website QA testing; current product name Orbit-19. Competitors include GlimmerCheck and DiffGuard."
+    }
+  },
+  "turns": [
+    {
+      "text": "what do we know about Spur and its website?",
+      "contains": [
+        "QA",
+        "old-spur.example"
+      ],
+      "researchReads": 0
+    },
+    {
+      "text": "Any competitors to know?",
+      "contains": [
+        "GlimmerCheck",
+        "DiffGuard"
+      ],
+      "researchReads": 1,
+      "excludes": [
+        "Which company",
+        "primary website"
+      ]
+    },
+    {
+      "text": "Queue research for Spur?",
+      "excludes": [
+        "could not queue",
+        "couldn\u2019t queue",
+        "specific lookup"
+      ],
+      "containsAny": [
+        [
+          "GlimmerCheck",
+          "already completed",
+          "already done",
+          "already researched"
+        ]
+      ]
+    },
+    {
+      "text": "https://spurtest.example/",
+      "contains": [
+        "Orbit-19"
+      ],
+      "excludes": [
+        "could you ask",
+        "say \u201cresearch",
+        "research spurtest.example\u201d"
+      ],
+      "publicReads": 1
+    },
+    {
+      "text": "what was that product name again?",
+      "contains": [
+        "Orbit-19"
+      ],
+      "maxCharacters": 350,
+      "researchReads": 0
+    },
+    {
+      "text": "what's their website again?",
+      "contains": [
+        "spurtest.example"
+      ],
+      "excludes": [
+        "identity metadata"
+      ],
+      "maxCharacters": 350,
+      "researchReads": 0
+    }
+  ]
+}

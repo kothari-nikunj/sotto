@@ -1,0 +1,71 @@
+{
+  "name": "Scalar task adds require canonical records and receipts",
+  "world": {
+    "loopTasks": [],
+    "savedSourceGrants": []
+  },
+  "turns": [
+    {
+      "text": "Add a task: Sotto loop check elm.",
+      "contains": [
+        "Sotto loop check elm"
+      ],
+      "taskRecords": [
+        {
+          "title": "Sotto loop check elm",
+          "status": "open"
+        }
+      ],
+      "taskAddReceipts": [
+        "Sotto loop check elm"
+      ],
+      "bridgeSends": 0,
+      "googleReads": 0,
+      "publicReads": 0
+    },
+    {
+      "text": "Add a task: Sotto loop check fir.",
+      "contains": [
+        "Sotto loop check fir"
+      ],
+      "taskRecords": [
+        {
+          "title": "Sotto loop check elm",
+          "status": "open"
+        },
+        {
+          "title": "Sotto loop check fir",
+          "status": "open"
+        }
+      ],
+      "taskAddReceipts": [
+        "Sotto loop check fir"
+      ],
+      "bridgeSends": 0,
+      "googleReads": 0,
+      "publicReads": 0
+    },
+    {
+      "text": "List both tasks I just added.",
+      "contains": [
+        "Sotto loop check elm",
+        "Sotto loop check fir"
+      ],
+      "taskRecords": [
+        {
+          "title": "Sotto loop check elm",
+          "status": "open"
+        },
+        {
+          "title": "Sotto loop check fir",
+          "status": "open"
+        }
+      ],
+      "taskAddReceipts": [],
+      "canonicalUnchanged": true,
+      "bridgeSends": 0,
+      "googleReads": 0,
+      "publicReads": 0
+    }
+  ]
+}

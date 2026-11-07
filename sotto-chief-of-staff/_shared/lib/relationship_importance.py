@@ -312,6 +312,42 @@ def for_contact(contact, history, vip_people, now, aliases=None):
     return classify(record.get('importance_evidence', {}), now, explicit_vip=explicit)
 
 
+def saved_attention(root):
+    """Bounded retained canonical queue; this is not a fresh relationship assessment."""
+    import json
+    path = Path(root) / 'knowledge' / 'relationship_state.json'
+    try:
+        with path.open('rb') as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+    except FileNotFoundError:
+        return {'status':'missing','freshness':'unknown','attention_queue':[],'truncated':False}
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError('saved attention unavailable')
+    def invalid_constant(_value):
+        raise ValueError('saved attention unavailable')
+    state = json.loads(raw.decode('utf-8'), parse_constant=invalid_constant)
+    if type(state) is not dict:
+        raise ValueError('saved attention unavailable')
+    if 'attention_queue' not in state:
+        return {'status':'missing','freshness':'unknown','attention_queue':[],'truncated':False}
+    queue = state['attention_queue']
+    if type(queue) is not list:
+        raise ValueError('saved attention unavailable')
+    projected, truncated = [], False
+    for row in queue:
+        if (type(row) is not dict or row.get('queue_type') not in ('waiting_on_you','losing_touch','lapsed')
+                or type(row.get('display_name')) is not str or not 0 < len(row['display_name']) <= 200
+                or type(row.get('reason')) is not str or len(row['reason']) > 1000
+                or any(0xD800 <= ord(c) <= 0xDFFF for c in row['display_name'] + row['reason'])):
+            truncated = True
+            continue
+        if len(projected) == 12:
+            truncated = True
+            continue
+        projected.append({key:row[key] for key in ('display_name','queue_type','reason')})
+    return {'status':'available','freshness':'unknown','attention_queue':projected,'truncated':truncated}
+
+
 def main():
     import argparse
     import json
@@ -319,8 +355,14 @@ def main():
     from pathlib import Path
     parser = argparse.ArgumentParser(description='Explain relationship importance from saved activity')
     parser.add_argument('--person')
+    parser.add_argument('--attention', action='store_true')
     args = parser.parse_args()
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
+    if args.attention:
+        if args.person is not None:
+            parser.error('--attention does not take --person')
+        print(json.dumps(saved_attention(root)))
+        return
     def read(path):
         try:
             value = json.loads(path.read_text())

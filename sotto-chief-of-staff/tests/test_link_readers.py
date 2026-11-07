@@ -283,34 +283,23 @@ def test_unattended_serves_the_cache_but_never_fetches(tmp_path):
 def test_skills_document_both_readers():
     with open(os.path.join(ROOT, "ask", "SKILL.md"), encoding="utf-8") as f:
         ask = f.read()
-    assert "--url" in ask and "docsend_fetch.py" in ask
+    assert "run_sotto_script web-read --url" in ask and "run_sotto_script docsend-fetch --url" in ask
     assert "refuses in unattended runs" in ask                 # the view-receipt warning is stated
     with open(os.path.join(ROOT, "event-triage", "SKILL.md"), encoding="utf-8") as f:
         ev = f.read()
-    assert "web_research.py\" --url" in ev
-    assert "Never `docsend_fetch.py`" in ev                    # chat-only, stated where agents read
+    assert "web-read --url" in ev                              # links are read on request, in chat
+    assert "Never `docsend-fetch`" in ev                       # chat-only, stated where agents read
 
 
-def test_a_docsend_link_routes_to_the_reader_from_the_persona_and_the_skill_description():
+def test_a_docsend_link_routes_to_the_reader_from_the_skill_description():
     """Sep 4, 2026, live channel: asked "is DocSend working? <link>" then "can you get the pdf?",
     the agent ran an inline `python3 -c` urllib request against docsend.com (the security scan
-    flagged it) and then reported "I can't pull the PDF directly" — while docsend_fetch.py, which
-    saves the PDF and the dashboard serves, sat unused. Two seams: the persona's hard rules name
-    the tool and ban hand-fetching a URL, and `sotto-ask`'s description mentions DocSend so the
-    skill that documents the reader is the one that loads for a deck link."""
-    persona = os.path.join(ROOT, "..", "adapters", "hermes", "sotto-persona.md")
-    with open(persona, encoding="utf-8") as f:
-        soul = f.read()
-    rule = soul[soul.index("A link is read by its reader"):]
-    rule = rule[:rule.index("Never loop on failure")]
-    assert "docsend_fetch.py\" --url" in rule and "docsend.com/view/" in rule
-    assert "/api/decks/<view_id>.pdf" in rule                # the reply carries where the PDF is
-    assert "python3 -c" in rule and "urllib" in rule and "curl" in rule   # the hand-fetch ban
-    assert "can't pull the PDF" in rule                       # the false report is named
-    assert "web_research.py --url" in rule.replace("`", "")   # every other link has a reader too
+    flagged it) and then reported "I can't pull the PDF directly" — while the DocSend reader, which
+    saves the PDF and the dashboard serves, sat unused. `sotto-ask`'s description mentions
+    DocSend so the skill that documents the reader is the one that loads for a deck link."""
     with open(os.path.join(ROOT, "ask", "SKILL.md"), encoding="utf-8") as f:
         head = f.read().split("---")[1]
-    assert "docsend.com/view/" in head and "docsend_fetch.py" in head
+    assert "docsend.com/view/" in head and "`docsend-fetch`" in head
 
 
 # DocSend's gate as served on Sep 3, 2026 (field names verbatim from the owner's container; values

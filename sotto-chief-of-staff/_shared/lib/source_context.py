@@ -8,6 +8,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,12 +17,59 @@ from datetime import datetime, timezone
 
 from textutil import unwrap_tool_result
 import jsonstore
-from source_catalog import SOURCE_FIELDS, SOURCE_LABELS, LOCAL_SNAPSHOT_TTL_HOURS
+from source_catalog import SOURCE_FIELDS, SOURCE_LABELS, LOCAL_SNAPSHOT_TTL_HOURS, valid_source_coverage
 
 
 SOURCE_STATUSES = frozenset({'ok', 'partial', 'unavailable', 'disabled', 'skipped'})
 BRIDGE_STATUSES = frozenset({'ok', 'disabled', 'unavailable', 'degraded', 'needs_fda', 'partial'})
 CONTEXT_SOURCES = tuple(SOURCE_FIELDS) + ('gmail', 'calendar', 'granola', 'x', 'x_bookmarks')
+_AUTHORITY_REVISION = re.compile(r'\A[A-Za-z0-9_-]{1,160}\Z')
+
+
+def bridge_source_policy(health, managed_mode):
+    """Parse one *live* Bridge health result; stale read metadata has no authority.
+
+    Revisions are opaque transition tokens from the Mac. A missing legacy token
+    cannot be reconstructed from the current allowlist, even when it is empty.
+    """
+    if not isinstance(health, dict) or health.get('connected') is not True:
+        return None
+    policy = health.get('source_policy')
+    if not isinstance(policy, dict) or set(policy) != {
+            'version', 'bridge_revision', 'cloud_revision', 'managed', 'allowed_sources'}:
+        return None
+    if type(policy['version']) is not int or policy['version'] != 1 \
+            or type(policy['managed']) is not bool or policy['managed'] is not managed_mode:
+        return None
+    bridge_revision, cloud_revision = policy['bridge_revision'], policy['cloud_revision']
+    if not isinstance(bridge_revision, str) or _AUTHORITY_REVISION.fullmatch(bridge_revision) is None:
+        return None
+    if managed_mode and (not isinstance(cloud_revision, str)
+                         or _AUTHORITY_REVISION.fullmatch(cloud_revision) is None):
+        return None
+    if not managed_mode and cloud_revision is not None:
+        return None
+    allowed_sources = policy['allowed_sources']
+    if (not isinstance(allowed_sources, list) or any(not isinstance(source, str)
+            or source not in SOURCE_FIELDS for source in allowed_sources)
+            or allowed_sources != sorted(set(allowed_sources))):
+        return None
+    return {'bridge_revision': bridge_revision, 'cloud_revision': cloud_revision,
+            'allowed_sources': allowed_sources}
+
+
+def bridge_search_policy(health):
+    """Content-free search bounds from the same live health probe as source authority."""
+    unknown = {'status': 'unknown'}
+    if not isinstance(health, dict) or health.get('connected') is not True:
+        return unknown
+    policy = health.get('local_search')
+    if (not isinstance(policy, dict) or policy.get('status') != 'known'
+            or type(policy.get('enabled')) is not bool
+            or type(policy.get('history_days')) is not int
+            or not 1 <= policy['history_days'] <= 365):
+        return unknown
+    return {'status': 'known', 'enabled': policy['enabled'], 'history_days': policy['history_days']}
 
 
 class BridgeReadError(RuntimeError):
@@ -52,7 +100,13 @@ class HistoryContinuationError(HistoryProtocolError):
 
 def permission_fingerprint():
     """Stable work identity: a source toggle starts a new brief instead of reusing old text."""
+    import source_corrections
+    corrections = source_corrections.revision()
     permissions = {source: allowed(source) for source in CONTEXT_SOURCES}
+    if source_corrections.revision() != corrections:
+        raise ValueError('source corrections changed during permission read')
+    if corrections:
+        permissions = {'sources': permissions, 'source_corrections': corrections}
     return hashlib.sha256(json.dumps(permissions, sort_keys=True).encode()).hexdigest()[:24]
 
 
@@ -72,6 +126,14 @@ def used_sources(local=None, gmail=None, calendar=None, granola=None, x_context=
             rows = (rows.get(key) or rows.get('stale_threads') or rows.get('staleThreads') or [])
         if rows and (already_projected or allowed(source)):
             sources.add(source)
+    meeting = gmail.get('meeting_context') if isinstance(gmail, dict) else None
+    if meeting and (already_projected or (allowed('gmail') and allowed('calendar'))):
+        sources.update(('gmail', 'calendar'))
+    sources.update(source for fields in SOURCE_FIELDS.values() for field in fields
+                   if isinstance(local.get(field), list)
+                   for row in (local.get(field) or []) if isinstance(row, dict)
+                   for source in (row.get('_loop_context_sources') or [])
+                   if isinstance(source, str) and source in CONTEXT_SOURCES)
     x_rows = ((x_context or {}).get('attendees', []) if isinstance(x_context, dict)
               else (x_context or [])) if already_projected else project_x(x_context).get('attendees', [])
     x_rows = [row for row in x_rows if isinstance(row, dict)] if isinstance(x_rows, list) else []
@@ -95,10 +157,13 @@ def email_dependency_sources(payload):
     """Source grants used to choose supplemental Gmail rows or excerpts for open obligations."""
     rows = payload if isinstance(payload, list) else (
         payload.get('emails', payload.get('messages', [])) if isinstance(payload, dict) else [])
-    return sorted({source for row in rows if isinstance(row, dict)
+    sources = {source for row in rows if isinstance(row, dict)
                    for key in ('_loop_context_sources', '_loop_context_body_sources')
                    for source in (row.get(key) or [])
-                   if isinstance(source, str) and source in CONTEXT_SOURCES})
+                   if isinstance(source, str) and source in CONTEXT_SOURCES}
+    if isinstance(payload, dict) and payload.get('meeting_context'):
+        sources.update(('gmail', 'calendar'))
+    return sorted(sources)
 
 
 def project_emails(payload):
@@ -109,6 +174,11 @@ def project_emails(payload):
     if not allowed('gmail'):
         return []
     result = dict(payload) if isinstance(payload, dict) else payload
+    if isinstance(result, dict) and 'meeting_context' in result:
+        context = result['meeting_context']
+        if (not allowed('calendar') or not isinstance(context, dict)
+                or context.get('sources') != ['calendar', 'gmail']):
+            result.pop('meeting_context', None)
     rows = result.get('emails', result.get('messages', [])) if isinstance(result, dict) else result
     if not isinstance(rows, list):
         return result
@@ -133,7 +203,7 @@ def project_emails(payload):
 EVIDENCE_EXCERPT_LABEL = '\n\n[Additional excerpt from the same email]\n'
 
 
-def email_evidence_parts(row):
+def email_evidence_parts(row, *, include_attachments=False):
     """The consent-filtered texts of one message, each verbatim from the email.
 
     The ordinary body and a supplemental loop excerpt are separate reads of the same message.
@@ -146,26 +216,56 @@ def email_evidence_parts(row):
     row = rows[0]
     base = str(row.get('body') or row.get('text') or row.get('snippet') or '')
     extra = str(row.get('_loop_context_body') or '')
-    if not extra or extra in base:
-        return [base] if base else []
-    if base in extra:
-        return [extra]
-    return [base, extra]
+    parts = ([base] if base else []) if not extra or extra in base else ([extra] if base in extra else [base, extra])
+    if not include_attachments:
+        return parts
+    from attachments import MAX_ATTACHMENTS_PER_EMAIL, MAX_ATTACHMENT_CHARS, TRUNCATION_MARKER
+    readable = 0
+    for attachment in row.get('attachments') or []:
+        if not isinstance(attachment, dict) or attachment.get('unreadable'):
+            continue
+        text = attachment.get('text')
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if readable >= MAX_ATTACHMENTS_PER_EMAIL:
+            break
+        readable += 1
+        parts.append(text.strip()[:MAX_ATTACHMENT_CHARS].split(TRUNCATION_MARKER)[0])
+    return parts
 
 
-def email_evidence_text(row):
+def email_evidence_text(row, *, include_attachments=False):
     """One consent-filtered view of a message for the writer and critic prompts.
 
     Supplemental excerpts stay separate in storage so revoking their selecting source leaves
     the ordinary Gmail read intact. Never replace surrounding words with just a proposed quote.
     Quote matching uses `email_evidence_parts`, never this joined rendering.
     """
-    return EVIDENCE_EXCERPT_LABEL.join(email_evidence_parts(row))
+    return EVIDENCE_EXCERPT_LABEL.join(email_evidence_parts(row, include_attachments=include_attachments))
 
 
 def email_quote_found(row, quote):
     """Whether a whitespace-normalized quote appears verbatim inside one part of the email."""
-    return any(quote in ' '.join(part.split()) for part in email_evidence_parts(row))
+    return any(quote in ' '.join(part.split()) for part in email_evidence_parts(row, include_attachments=True))
+
+
+def observed_capture_quote(parts, quote):
+    """Recover actual source wording when extraction only changes typographic quotes.
+
+    Words, case, punctuation other than curly quote glyphs, and part boundaries stay
+    exact. Return observed text for persistence; never retain the model's substituted
+    glyphs as a purported verbatim source clause. Completion checks remain strict.
+    """
+    folding = str.maketrans({'‘': "'", '’': "'", '“': '"', '”': '"'})
+    wanted = ' '.join(quote.split()).translate(folding)
+    if not wanted:
+        return None
+    for part in parts:
+        actual = ' '.join(part.split())
+        index = actual.translate(folding).find(wanted)
+        if index >= 0:
+            return actual[index:index + len(wanted)]
+    return None
 
 
 def project_x(payload):
@@ -435,6 +535,31 @@ def record_bridge_status(payload, data_root=None):
                                    'observed_epoch': received_stamp.timestamp(), 'order_epoch': stamp.timestamp(), 'field_counts': counts,
                                    'has_data': any(counts.values()),
                                    'payload_valid': not invalid and bool(counts)}
+                coverage = payload.get('source_coverage')
+                malformed_coverage = 'source_coverage' in payload and not isinstance(coverage, dict)
+                coverage = coverage if isinstance(coverage, dict) else {}
+                detail = coverage.get(source)
+                invalid_coverage = malformed_coverage or (source in coverage and not valid_source_coverage(detail))
+                if invalid_coverage and read_status == 'ok':
+                    # Invalid metadata is not an absent legacy receipt. Keep usable rows,
+                    # but do not manufacture successful coverage from the fallback status.
+                    read_status = current['read']['status'] = 'partial'
+                if isinstance(detail, dict) and valid_source_coverage(detail):
+                    current['read']['coverage'] = json.loads(json.dumps(detail))
+                companion = coverage.get('deferred_unread_' + source) if source in ('imessage', 'whatsapp') else None
+                if isinstance(companion, dict) and valid_source_coverage(companion):
+                    current['read']['deferred_unread_coverage'] = json.loads(json.dumps(companion))
+                # Read success is independent of a later probe or failed companion.
+                # Rich receipts name an actual successful primary read; legacy partial is unknown.
+                detail = current['read'].get('coverage', {})
+                if 'last_successful_read_at' in detail:
+                    success = detail.get('last_successful_read_at')
+                    if (read_status in ('ok', 'partial', 'degraded')
+                            and detail.get('status') in ('ok', 'empty', 'partial') and success is not None):
+                        success_at = datetime.fromisoformat(success.replace('Z', '+00:00'))
+                        current['last_successful_read_at'] = min(success_at, received_stamp).isoformat()
+                elif read_status == 'ok' and not invalid and counts and detail.get('status', 'ok') == 'ok':
+                    current['last_successful_read_at'] = received_stamp.isoformat()
                 if requested is not None:
                     current['read']['request_epoch'] = requested
                 if status == 'disabled':
@@ -496,7 +621,10 @@ def source_health(data_root=None, now=None):
                 and not row.get('last_available_at') and not read.get('has_data')):
             status = 'not_present'  # No evidence this optional source was ever available.
         if status == 'ok':
-            if age is None or age > LOCAL_SNAPSHOT_TTL_HOURS * 3600:
+            coverage = read.get('coverage', {})
+            if valid_source_coverage(coverage) and coverage.get('status') == 'unread':
+                status = 'unverified'  # A source not queried has not established an empty result.
+            elif age is None or age > LOCAL_SNAPSHOT_TTL_HOURS * 3600:
                 status = 'stale'
             elif not read.get('has_data'):
                 status = 'empty'
@@ -507,6 +635,13 @@ def source_health(data_root=None, now=None):
             item.update(observed_at=read.get('observed_at'), age_seconds=age,
                         field_counts={key: value for key, value in counts.items()
                                       if key in SOURCE_FIELDS[source] and type(value) is int and value >= 0})
+            success = row.get('last_successful_read_at')
+            if valid_source_coverage({'last_successful_read_at': success}):
+                item['last_successful_read_at'] = success
+            for key in ('coverage', 'deferred_unread_coverage'):
+                detail = read.get(key)
+                if isinstance(detail, dict) and valid_source_coverage(detail):
+                    item[key] = json.loads(json.dumps(detail))
         result.append(item)
     x = rows.get('x', {})
     x = x if isinstance(x, dict) else {}
@@ -537,6 +672,20 @@ def project_local(local):
             if source in statuses or any(field in local for field in fields):
                 statuses[source] = 'disabled'
                 availability[source] = 'disabled'
+    # Supplemental exact-handle history also depends on the source obligation that chose it.
+    # Apply this before every model, Learn and delivery consumer; native snapshot rows keep
+    # their own source permission and are never rewritten on an ID collision.
+    for field in ('imessage',):
+        if isinstance(result.get(field), list):
+            result[field] = [row for row in result[field] if not isinstance(row, dict)
+                             or '_loop_context_sources' not in row
+                             or _dependencies_allowed(row['_loop_context_sources'])]
+    if isinstance(result.get('source_coverage'), dict):
+        result['source_coverage'] = {
+            key: value for key, value in result['source_coverage'].items()
+            if statuses.get(key.removeprefix('deferred_unread_')) != 'disabled'
+            and allowed(key.removeprefix('deferred_unread_'))
+        }
     if statuses:
         result['source_status'] = statuses
     if availability:
@@ -545,6 +694,17 @@ def project_local(local):
 
 
 def allowed(source):
+    # Only the admitted proactive child receives this receiver-captured restriction.
+    # It narrows original permissions; legacy scheduled callers have no override.
+    captured = os.environ.get('SOTTO_PROACTIVE_CAPTURED_SOURCES')
+    if captured is not None:
+        try:
+            sources = json.loads(captured)
+            if (type(sources) is not list or any(type(s) is not str or s not in CONTEXT_SOURCES for s in sources)
+                    or sources != sorted(set(sources)) or source not in sources):
+                return False
+        except (ValueError, TypeError):
+            return False
     if source in ('x', 'x_bookmarks'):
         # X is an optional operator-configured integration in both hosting modes. It has
         # no Bridge switch or cloud OAuth setup; explicitly supplied owner credentials
@@ -580,7 +740,7 @@ def allowed(source):
         return False
 
 
-def bridge_call(name, arguments=None):
+def bridge_call(name, arguments=None, *, timeout=100):
     key = os.environ.get('BRIDGE_TOKEN') or os.environ.get('SOTTO_MCP_TOKEN') or os.environ.get('SOTTO_TRIGGER_TOKEN')
     if not key:
         raise BridgeReadError('bridge_not_configured')
@@ -590,7 +750,7 @@ def bridge_call(name, arguments=None):
     req = urllib.request.Request('http://127.0.0.1:' + os.environ.get('PORT', os.environ.get('SOTTO_TRIGGER_PORT', '8787')) + '/mcp',
         data=json.dumps(rpc).encode(),
         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=100) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         reply = json.load(response)
     result = reply.get('result', {})
     if reply.get('error'):

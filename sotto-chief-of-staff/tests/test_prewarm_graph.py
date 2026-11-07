@@ -138,6 +138,26 @@ def test_research_persists_one_combined_fact_profiles_only(tmp_path, monkeypatch
     assert parsed.updated_by == "web_research"
 
 
+def test_research_company_summary_goes_to_the_company_not_the_person(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.delenv("SOTTO_PREWARM_RESEARCH", raising=False)
+
+    class _FakeRA:
+        @staticmethod
+        def research(attendees, context, comms=None):
+            return {"attendees": [
+                {"email": "dhruv@acme.com", "title": "Eng Lead", "company": "Acme",
+                 "summary": "Builds infra tools.", "company_summary": "Acme makes anvils.",
+                 "relevance": []}]}
+
+    monkeypatch.setitem(sys.modules, "research_attendees", _FakeRA)
+    assert pw.prewarm(_local())["researched"] == 1
+    dhruv = kg.parse_person_file(open(kg.find_person_file(name="Dhruv", identifier="dhruv@acme.com")).read())
+    assert [f.text for f in dhruv.facts.values()] == ["Per web search: Eng Lead at Acme — Builds infra tools."]
+    company = pw.ku.company_knowledge(company_name="Acme", domain="acme.com")
+    assert (company["about"], company["updated_by"]) == ("Acme makes anvils.", "web_research")
+
+
 def test_research_sentinel_no_public_profile_never_persists(tmp_path, monkeypatch):
     # "No public profile found." is a research MISS, not a fact — mirror persist_prep's filter.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
@@ -196,7 +216,7 @@ def test_setup_seed_rechecks_consent_immediately_before_graph_write(tmp_path, mo
     def revoke_during_optional_work(_updates):
         nonlocal revoked
         revoked = True
-        return 0
+        return 0, []
 
     monkeypatch.setattr(source_context, "allowed", permission)
     monkeypatch.setattr(pw, "_research_facts", revoke_during_optional_work)

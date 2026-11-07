@@ -189,29 +189,6 @@ def test_pending_offer_accepts_the_procedure_kind(tmp_path):
     assert got.get("kind") == "procedure" and got.get("detail") == "Never book Fridays."
 
 
-def test_persona_documents_read_and_confirmed_capture():
-    persona = os.path.join(ROOT, "..", "adapters", "hermes", "sotto-persona.md")
-    with open(persona, encoding="utf-8") as f:
-        text = f.read()
-    assert "master_file.py" in text                          # the read command is spelled out
-    assert "append --section Procedures" in text             # …and the capture command
-    assert "confirm" in text.lower()                         # explicit words, confirmed first
-    assert "`procedure`" in text                             # the yes-handler for the evening offer
-
-
-def test_persona_searches_for_emails_before_asking():
-    """REGRESSION (Aug 2026, the Ron invite): the agent had Gmail tools in hand, needed an
-    attendee's email, and asked the user instead of searching. The persona now spells out the
-    lookup order — graph, then Gmail — with asking as the last resort."""
-    persona = os.path.join(ROOT, "..", "adapters", "hermes", "sotto-persona.md")
-    with open(persona, encoding="utf-8") as f:
-        text = f.read()
-    assert "search before you ever ask" in text.lower()
-    assert 'knowledge_query.py" --person' in text             # step 1: the graph
-    assert "search your Gmail tool" in text                   # step 2: Gmail From/To history
-    assert "last resort" in text                              # asking comes third, not first
-
-
 def test_priorities_are_bounded_stable_and_replace_as_a_set(tmp_path):
     _env(tmp_path)
     mf.set_section("Priorities", "- Fund close\n- Maya's school")
@@ -225,3 +202,43 @@ def test_priorities_are_bounded_stable_and_replace_as_a_set(tmp_path):
     assert second["revision"] != first["revision"]
     with pytest.raises(ValueError, match="at most 3"):
         mf.set_section("Priorities", "one\ntwo\nthree\nfour")
+
+
+@pytest.mark.parametrize('instant, expected', [
+    ('2026-10-14T02:14:00+00:00', 'Tuesday, 2026-10-13T19:14:00-07:00'),
+    ('2026-10-14T07:01:00+00:00', 'Wednesday, 2026-10-14T00:01:00-07:00'),
+    ('2026-12-14T02:14:00+00:00', 'Sunday, 2026-12-13T18:14:00-08:00'),
+])
+def test_chat_prompt_clock_uses_owner_zone_and_refreshes_without_saving(tmp_path, monkeypatch, instant, expected):
+    from datetime import datetime
+    import tzchain
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.delenv('SOTTO_TIMEZONE', raising=False)
+    monkeypatch.delenv('TZ', raising=False)
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config' / 'settings.json').write_text(json.dumps({'timezone':'America/Los_Angeles'}))
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(instant).astimezone(tz)
+    monkeypatch.setattr(tzchain, 'datetime', Clock)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob('*'))
+    result = mf.render_for_chat_prompt('')
+    assert expected in result
+    assert '(America/Los_Angeles)' in result
+    assert 'MASTER CONTEXT' not in result
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob('*')) == before
+    assert mf.render_for_chat_prompt('A saved rule.').endswith(mf.render_for_prompt('A saved rule.'))
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
+    assert datetime.fromisoformat(instant).isoformat(timespec='seconds') in mf.render_for_chat_prompt('')
+
+
+@pytest.mark.parametrize('zone', ['', 'Invalid/Zone'])
+def test_chat_clock_does_not_present_utc_fallback_as_owner_local_date(tmp_path, monkeypatch, zone):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE', zone)
+    monkeypatch.delenv('TZ', raising=False)
+    result = mf.render_for_chat_prompt('')
+    assert result.startswith('Current UTC instant: ')
+    assert "local timezone is unavailable" in result
+    assert 'Current local date' not in result

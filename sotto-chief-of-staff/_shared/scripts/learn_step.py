@@ -191,7 +191,7 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
             dispositions = {"added", "confirmed", "superseded", "updated", "duplicate",
                             "ignored", "rejected"}
             reasons = {"accepted", "low_confidence", "protected_owner_correction",
-                       "owner_confirmation", "no_new_evidence", "evidence_refs_only",
+                       "owner_confirmation", "no_new_evidence", "evidence_refs_only", "source_changed",
                        "independent_evidence", "older_observation", "archived_match",
                        "missing_person_identity", "revived"}
             if isinstance(fact_outcomes, dict):
@@ -266,7 +266,7 @@ def _run_one(script: str, argv: list, run=subprocess.run) -> dict:
             result["detail"] = "some extracted facts were rejected; see bounded disposition counts"
         if (proof.get("input_evidence") or {}).get("rejected", 0):
             result["status"] = "partial"
-            result["detail"] = "some extracted facts lacked observed source references"
+            result["detail"] = "some knowledge proposals lacked permitted observed source references"
     return result
 
 

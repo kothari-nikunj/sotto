@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """gather_google.py — deterministically fetch Gmail (last 24h inbox + a small `in:sent` lane) +
-Calendar (next 3 days) via Hermes' google-workspace `google_api.py`, normalized to the shapes
+Calendar (next 3 days) via Sotto's packaged Google CLI (`adapters/sotto/google_api.py`), normalized to the shapes
 compose_brief expects, and write /tmp/sotto_gmail.json + /tmp/sotto_cal.json.
 
-WHY: the brief skill used to tell the agent to "use the google-workspace tools" and write the files by
-hand. The agent kept skipping it → local-only briefs (0 emails), the #1 quality failure. The real
-google-workspace interface is a CLI:
+WHY: the brief skill used to tell the agent to "use the Google tools" and write the files by
+hand. The agent kept skipping it → local-only briefs (0 emails), the #1 quality failure. The Google
+interface is a CLI:
     google_api.py gmail search "newer_than:1d" --max N   -> [{id,threadId,from,subject,date,snippet,labels}]
     google_api.py gmail get MESSAGE_ID                    -> full message (body, headers, labels)
     google_api.py calendar list --start ISO --end ISO     -> [{id,summary,start,end,location,description,htmlLink}]
@@ -33,13 +33,13 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
-import glob
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import getaddresses
 
@@ -54,7 +54,17 @@ from gmail_read import (fetch_message as _native_fetch_message, gmail_service as
                         google_service as _shared_google_service,
                         token_path as _shared_token_path)  # noqa: E402
 
+from textutil import first_nonempty as _pick, format_address as _addr_str  # noqa: E402
+from timeutil import configured_user_email  # noqa: E402
+from calendar_gather import calendar_gather, calendar_result  # noqa: E402
+
 BODY_FETCH_WORKERS = 5   # concurrent full-body fetches, each with its own client/transport
+BRIEF_THREAD_CHARS = 4000  # same opening/latest excerpt as prep, per selected inbox thread
+# google_api paces metadata reads at four starts per second, so 20 rows need <= 4.75 s of pacing and
+# leave the rest of the 12 s child deadline for interpreter start, token refresh and the list call.
+# A busy inbox then returns a capped `partial` receipt instead of being killed into `unavailable`.
+PULSE_REFRESH_MAX_MESSAGES = 20
+PULSE_REFRESH_TIMEOUT_SECONDS = 12
 
 # Sent lane (roadmap Step 2 item 0): a second, SMALL `in:sent newer_than:1d` search alongside the
 # inbox one. Two consumers, both of which need the user's own outgoing EMAIL and had no source for it:
@@ -80,6 +90,10 @@ STALE_MAX_THREADS = 20       # threads.get calls per gather, newest first
 ATTENDEE_COMMS_CAP = 15        # unique attendee emails searched per run
 ATTENDEE_COMMS_WORKERS = 5     # concurrent per-attendee searches
 ATTENDEE_COMMS_MAX_PER = 5     # messages kept per attendee
+ATTENDEE_THREAD_CAP = 2       # exact IDs from the current attendee search, focused prep only
+ATTENDEE_THREAD_MESSAGES = 8  # opening two + latest six, never an unbounded thread dump
+ATTENDEE_THREADS_TOTAL_CHARS = 24000  # one focused-run budget, shared across attendees/threads
+ATTENDEE_THREAD_CHARS = 8000  # includes attribution; shared by both context consumers
 ATTENDEE_COMMS_TIMEOUT = 30    # seconds per gmail search
 
 
@@ -95,16 +109,12 @@ def _diag(msg: str) -> None:
 
 
 def _find_google_api():
-    """Locate the google-workspace skill's google_api.py in the Hermes install."""
-    bases = [os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"),
-             "/root/.hermes", "/usr/local/lib/hermes-agent"]
-    for base in bases:
-        if not base:
-            continue
-        hits = glob.glob(os.path.join(base, "**", "google-workspace", "scripts", "google_api.py"),
-                         recursive=True)
-        if hits:
-            return hits[0]
+    """Locate Sotto's packaged Google CLI: the image path, or its source-checkout twin."""
+    source = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..',
+                                          'adapters', 'sotto', 'google_api.py'))
+    for candidate in (source, '/app/adapters/sotto/google_api.py'):
+        if os.path.isfile(candidate):
+            return candidate
     return None
 
 
@@ -113,20 +123,22 @@ class GoogleCLIError(RuntimeError):
 
 
 def _refresh_google_token():
-    """Refresh through Sotto's locked compare-and-write so the upstream CLI never refreshes an
-    expired token itself and overwrites a reconnect that landed meanwhile (source tree, then image)."""
+    """Refresh through Sotto's locked compare-and-write before the provider CLI reads a token."""
     here = os.path.dirname(os.path.abspath(__file__))
-    for root in (os.path.join(here, "..", "..", ".."), "/app"):
-        setup = os.path.join(root, "adapters", "hermes", "google_setup.py")
+    source = os.path.abspath(os.path.join(here, '..', '..', '..', 'adapters', 'sotto', 'google_setup.py'))
+    for setup in (source, '/app/adapters/sotto/google_setup.py'):
         if os.path.isfile(setup):
-            r = subprocess.run([sys.executable or "python3", setup, "--check"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode:
-                raise GoogleCLIError("Google token check failed")
+            result = subprocess.run([sys.executable or 'python3', setup, '--check'],
+                                    capture_output=True, text=True, timeout=60)
+            if result.returncode:
+                raise GoogleCLIError('Google token check failed')
             return
+    # The Google client must not silently refresh and overwrite a reconnect outside the
+    # locked compare-and-write path.
+    raise GoogleCLIError('Sotto Google setup implementation is missing')
 
 
-_HTTP_STATUS = re.compile(r"(?:HttpError\s+|HTTP\s*|Error\s+|status(?: code)?\s*[=: ]\s*)(403|429)\b", re.I)
+_HTTP_STATUS = re.compile(r"(?:HttpError\s+|HTTP\s*|Error\s+|(?:http_)?status(?: code)?\s*[=: ]\s*)(403|429)\b", re.I)
 _QUOTA_REASON = re.compile(r"\b(?:userRateLimitExceeded|rateLimitExceeded|quotaExceeded)\b|"
                            r"\bquota\s+exceeded\b|\bTotal Query Cost Units per minute per user\b", re.I)
 
@@ -193,30 +205,12 @@ def _as_list(v):
     return []
 
 
-def _pick(d: dict, *keys):
-    """First non-empty value among `keys` (host-agnostic: the google-workspace CLI, a Gmail/Calendar
-    MCP server, and raw Google API all name these fields slightly differently)."""
-    for k in keys:
-        v = d.get(k) if isinstance(d, dict) else None
-        if v not in (None, "", [], {}):
-            return v
-    return None
 
 
-def _addr_str(v):
-    """Coerce a from/to field to a string. MCP servers sometimes return {name,email} or a list."""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        name, email = v.get("name") or "", v.get("email") or v.get("address") or ""
-        return f"{name} <{email}>".strip() if email else (name or "")
-    if isinstance(v, list):
-        return ", ".join(_addr_str(x) for x in v if x)
-    return ""
 
 
 def normalize_email(it: dict, full: dict) -> dict:
-    """Map a Gmail item (google_api CLI OR a Gmail MCP OR raw API) → compose_brief's email shape.
+    """Map a Gmail item (google_api CLI OR raw API) → compose_brief's email shape.
     Tolerant of field-name variants so the SAME brief works whichever host provided the data."""
     labels = _pick(full, "labels", "labelIds") or _pick(it, "labels", "labelIds", "label_ids") or []
     labels = [str(x).upper() for x in labels] if isinstance(labels, list) else []
@@ -233,11 +227,17 @@ def normalize_email(it: dict, full: dict) -> dict:
         "labelIds": labels,
         "isSent": "SENT" in labels,
     }
+    # Native recipient evidence for owner-sent introductions; never infer it from body prose.
+    bcc = _addr_str(_pick(full, 'bcc') or _pick(it, 'bcc'))
+    if bcc:
+        normalized['bcc'] = bcc
+    if full.get('thread_context'):
+        normalized['thread_context'] = full['thread_context']
     return normalized
 
 
 def normalize_event(e: dict) -> dict:
-    """Map a calendar event (google_api CLI OR a Calendar MCP OR raw API) → compose_brief's event
+    """Map a calendar event (google_api CLI OR raw API) → compose_brief's event
     shape (start as a string). Tolerant of field-name variants across hosts."""
     def _t(*keys):
         v = _pick(e, *keys)
@@ -259,16 +259,23 @@ def normalize_event(e: dict) -> dict:
     # Preserve exact provider linkage when present. These are opaque identifiers only; callers may
     # use an exact Gmail thread binding but must not infer one from a shared attendee or title.
     for key in ("threadId", "thread_id", "iCalUID", "recurringEventId", "originalStartTime",
-                "status", "conferenceData", "hangoutLink", "htmlLink"):
+                "status", "transparency", "eventType", "conferenceData", "hangoutLink", "htmlLink", "calendar_id", "organizer", "_calendar_primary"):
         if e.get(key) not in (None, "", [], {}):
             normalized[key] = e[key]
+    if e.get('calendar_id') and normalized.get('id'):
+        # Downstream gather/cache/offer identities are calendar-scoped. Typed Google reads
+        # retain the raw provider id + calendar_id pair for the existing reviewed writer.
+        import hashlib
+        normalized['provider_event_id'] = normalized['id']
+        normalized['id'] = 'gcal_' + hashlib.sha256(json.dumps([e['calendar_id'], normalized['id']], separators=(',', ':')).encode()).hexdigest()
     return normalized
 
 
 def my_response(e: dict) -> str:
     """The self attendee's responseStatus, lowercased ("" when the event carries none)."""
     for a in (e.get("attendees") or []) if isinstance(e, dict) else []:
-        if isinstance(a, dict) and a.get("self"):
+        if isinstance(a, dict) and (((e.get("calendar_id") in (None, "", "primary") or e.get("_calendar_primary") is True) and a.get("self")) or
+                str(a.get("email") or "").lower() == configured_user_email() != ""):
             return str(a.get("responseStatus") or "").strip().lower()
     return ""
 
@@ -300,15 +307,51 @@ def _fetch_body(api, mid, quota_stop=None):
         return mid, None
 
 
+def _fetch_thread_bodies(tid, mids, quota_stop):
+    """Replace the cohort's message reads with one exact-thread read, not another round trip.
+
+    The target messages retain their own bodies, IDs and attachment payloads. Older thread
+    excerpts are separately labelled background, never evidence attributed to the current ID.
+    """
+    from gmail_read import message_fields
+    from source_context import allowed
+    if quota_stop.is_set() or not allowed('gmail'):
+        return {}
+    service = None
+    try:
+        service = _gmail_service()
+        thread = service.users().threads().get(userId='me', id=tid, format='full').execute()
+        if not allowed('gmail'):
+            return {}
+        context, inventory = _bounded_thread_context(thread, tid, set(mids), BRIEF_THREAD_CHARS,
+                                                     rendered_ids=set(mids))
+        if context is None:
+            return {}
+        messages = {str(m['id']): m for m in thread['messages'] if isinstance(m, dict)
+                    and str(m.get('id')) in inventory and m.get('threadId') == tid}
+        result = {mid: message_fields(messages[mid]) for mid in mids if mid in messages}
+        if result:
+            result[next(iter(result))]['thread_context'] = context
+        return result
+    except Exception as error:
+        if _source_error(error) == 'rate_limited':
+            quota_stop.set()
+        return {}  # preserve the labelled partial search result; no hidden retry
+    finally:
+        if service is not None and callable(getattr(service, 'close', None)):
+            try:
+                service.close()
+            except Exception:
+                pass
+
+
 # ── the attachment lane ─────────────────────────────────────────────────────────────────────────
 # An attachment Sotto can read becomes text under its email; one it can't is named, never guessed.
 #
 # WHY THIS DOESN'T GO THROUGH THE HOST CLI — the same reason google_action.py's `gmail-draft`
-# doesn't, and by the precedent that file set: the Hermes `google-workspace` `google_api.py` has no
-# attachments verb (its gmail actions are search/get/send/reply/labels/modify), and that CLI is
-# installed from UPSTREAM, not from this repo — a subcommand added to it would be overwritten by the
-# next image build. Worse, its `gmail get` discards the MIME part tree entirely (it returns only the
-# flattened body), so the filenames aren't reachable through it at any price. The granted token
+# doesn't, and by the precedent that file set: the packaged Google CLI is a narrow compatibility
+# surface with no attachments verb (its gmail verbs are search/get/send/reply), and its `gmail get`
+# returns the flattened message rather than a client a MIME walk can page. The granted token
 # already carries the Gmail read scope, so this reads straight from the Gmail API using the SAME
 # token file the CLI authenticates with. `_gmail_service` below is that one shared client builder;
 # google_action.py imports it from here rather than keeping a second copy.
@@ -319,13 +362,14 @@ def _fetch_body(api, mid, quota_stop=None):
 
 
 def _token_path() -> str:
-    """The google-workspace token file — the SAME one google_api.py authenticates with
-    ($HERMES_HOME/google_token.json, written by its setup.py). "" when Google isn't connected."""
+    """The Google token file — the SAME one google_api.py authenticates with
+    ($SOTTO_HOME/google_token.json, written by Sotto's google_setup.py). "" when Google isn't
+    connected."""
     return _shared_token_path()
 
 
-def _gmail_service():
-    return _shared_gmail_service()
+def _gmail_service(*, timeout=None):
+    return _shared_gmail_service(**({"timeout": timeout} if timeout is not None else {}))
 
 
 def _google_service(api, version):
@@ -448,7 +492,7 @@ def _attachments_for(mids: list, payloads=None, quota_stop=None) -> dict:
 
 
 def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
-                  attachments: bool = False):
+                  attachments: bool = False, thread_context: bool = False):
     """One Gmail search → normalized rows, with full bodies for the top `bodies` hits (and, when
     `attachments` is on, their attachments converted to Markdown under them)."""
     items = _as_list(_run(api, ["gmail", "search", query, "--max", str(max_n)], timeout=timeout))
@@ -458,9 +502,20 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
     mids = [it.get("id") for it in items[:bodies] if it.get("id")]
     full = {}
     quota_stop = threading.Event()
-    if mids:
-        with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(mids))) as ex:
-            for mid, msg in ex.map(lambda m: _fetch_body(api, m, quota_stop), mids):
+    thread_groups = {}
+    if thread_context and _token_path():
+        for item in items[:bodies]:
+            if item.get('id') and item.get('threadId'):
+                thread_groups.setdefault(str(item['threadId']), []).append(item['id'])
+        if thread_groups:
+            with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(thread_groups))) as ex:
+                for found in ex.map(lambda pair: _fetch_thread_bodies(*pair, quota_stop), thread_groups.items()):
+                    full.update(found)
+    covered = {mid for group in thread_groups.values() for mid in group}
+    mids_without_thread = [mid for mid in mids if mid not in covered]
+    if mids_without_thread:
+        with ThreadPoolExecutor(max_workers=min(BODY_FETCH_WORKERS, len(mids_without_thread))) as ex:
+            for mid, msg in ex.map(lambda m: _fetch_body(api, m, quota_stop), mids_without_thread):
                 if msg is not None:
                     full[mid] = msg
     # The attachment lane rides the SAME cohort as the bodies: an email thin enough to be
@@ -481,6 +536,8 @@ def _search_gmail(api, query: str, max_n: int, bodies: int, timeout: int = 60,
         if not isinstance(it, dict):
             continue
         e = normalize_email(it, full.get(it.get("id"), {}))
+        if it.get('id') in covered and it.get('id') not in full:
+            e['thread_context'] = 'Exact thread unavailable; only the current search excerpt was read.'
         # Only a native MIME read proves this is a complete body, not a search snippet.
         if isinstance((full.get(it.get('id')) or {}).get('payload'), dict):
             e['_body_complete'] = True
@@ -543,11 +600,12 @@ def _sliced_gmail(api, base_query: str, max_n: int, bodies: int, days: int,
     return out
 
 
-def gather_gmail(api, max_n: int, bodies: int, days: int = 1):
+def gather_gmail(api, max_n: int, bodies: int, days: int = 1, *, attachments: bool = True):
     """The inbox lane — the ONE lane that carries attachments (the sent lane below does not)."""
     if days <= 1:
-        return _search_gmail(api, "newer_than:1d", max_n, bodies, attachments=True)
-    return _sliced_gmail(api, "", max_n, bodies, days, attachments=True)
+        return _search_gmail(api, "newer_than:1d", max_n, bodies, attachments=attachments,
+                             thread_context=True)
+    return _sliced_gmail(api, "", max_n, bodies, days, attachments=attachments)
 
 
 def mark_sent(e: dict) -> dict:
@@ -663,7 +721,7 @@ def gather_stale_sent(api, service=None, now=None) -> list:
     per candidate through the same Gmail client the attachment lane uses. Any failure is the
     caller's to swallow — a stale lane that breaks costs the lane, never the brief."""
     q = f"in:sent older_than:{STALE_SILENT_DAYS}d newer_than:{STALE_MAX_DAYS}d -in:chats"
-    items = _as_list(_run(api, ["gmail", "search", q, "--max", str(STALE_MAX_THREADS * 2)]))
+    items = _as_list(_run(api, ["gmail", "search", q, "--max", str(STALE_MAX_THREADS * 2), "--ids-only"]))
     rows = [normalize_email(it, {}) for it in items if isinstance(it, dict)]
     tids = []
     for r in rows:
@@ -678,7 +736,7 @@ def gather_stale_sent(api, service=None, now=None) -> list:
     try:
         for tid in tids:
             try:
-                threads[tid] = svc.users().threads().get(
+                thread = svc.users().threads().get(
                     userId="me", id=tid, format="metadata",
                     metadataHeaders=["From", "To", "Cc", "Subject"]).execute()
             except Exception as error:  # noqa: BLE001 — one unreadable thread costs only itself
@@ -686,6 +744,30 @@ def gather_stale_sent(api, service=None, now=None) -> list:
                     rate_limited = True
                     break
                 continue
+            # Most candidates need only the last message, already in threads.get.
+            # Keep the original candidate fallback when that message lacks a field.
+            row = next(row for row in rows if str(row.get('threadId') or '') == tid)
+            messages = [m for m in ((thread or {}).get('messages') or []) if isinstance(m, dict)]
+            if messages:
+                last = max(messages, key=lambda m: int(m.get('internalDate') or 0))
+                if not (_header(last, 'To') and _header(last, 'Subject') and last.get('snippet')):
+                    candidate = next((m for m in messages if m.get('id') == row.get('id')), None)
+                    if (candidate is None
+                            or (not _header(last, 'To') and not _header(candidate, 'To'))
+                            or (not _header(last, 'Subject') and not _header(candidate, 'Subject'))
+                            or (not last.get('snippet') and not candidate.get('snippet'))):
+                        try:
+                            candidate = svc.users().messages().get(userId='me', id=str(row['id']), format='metadata',
+                                metadataHeaders=['From', 'To', 'Subject', 'Date']).execute()
+                        except Exception as error:
+                            if _source_error(error) == 'rate_limited':
+                                rate_limited = True
+                                break  # no incomplete fallback, and no later provider reads
+                            raise
+                    row['to'] = _header(candidate, 'To')
+                    row['subject'] = _header(candidate, 'Subject')
+                    row['snippet'] = str(candidate.get('snippet') or '')
+            threads[tid] = thread
     finally:
         if service is None:
             close = getattr(svc, 'close', None)
@@ -709,60 +791,43 @@ def gather_calendar(api, back_days: int = 0, service=None, observation=None):
     if observation is not None:
         observation.update(coverage={"since": (now - datetime.timedelta(days=max(0, back_days))).strftime(fmt),
                                      "until": end.strftime(fmt)}, complete=False)
-    # Hermes' list command drops attendees/RSVPs and does not follow nextPageToken.
-    # Use the same granted credentials as attachments, keeping Google's complete event
-    # shape through our existing normalizer. The CLI remains for hosts without that token.
+    # Read through the same granted credentials as attachments, keeping Google's complete
+    # event shape (attendees/RSVPs, every page) through our existing normalizer. The CLI
+    # remains the path when no token file is present.
     if service is not None or _token_path():
         owned = service is None
         service = service if service is not None else _google_service('calendar', 'v3')
-        out, seen, tokens, page = [], set(), set(), None
         try:
-            for _ in range(20):
-                params = {'calendarId': 'primary',
-                          'timeMin': (now - datetime.timedelta(days=max(0, back_days))).strftime(fmt),
-                          'timeMax': end.strftime(fmt), 'singleEvents': True,
-                          'orderBy': 'startTime', 'maxResults': 250}
-                if page:
-                    params['pageToken'] = page
-                result = service.events().list(**params).execute()
-                for raw in result.get('items', []):
-                    if raw.get('status') == 'cancelled':
-                        continue
-                    event = normalize_event(raw)
-                    key = str(event.get('id') or '') or json.dumps(event, sort_keys=True)
-                    if key not in seen:
-                        seen.add(key)
-                        out.append(event)
-                page = result.get('nextPageToken')
-                if not page:
-                    if observation is not None:
-                        observation["complete"] = True
-                    return meeting_events(out)
-                if page in tokens:
-                    raise RuntimeError('Calendar pagination repeated a page token')
-                tokens.add(page)
-            raise RuntimeError('Calendar window exceeds the pagination safety limit')
+            from google_calendar_read import read_service
+            rows = read_service(service, (now - datetime.timedelta(days=max(0, back_days))).strftime(fmt), end.strftime(fmt))
+            if observation is not None:
+                observation.update(complete=rows.complete, calendars=rows.calendars)
+            return meeting_events([normalize_event(raw) for raw in rows], configured_user_email())
         finally:
             if owned:
                 service.close()
     if back_days <= 0:
-        items = _as_list(_run(api, ["calendar", "list", "--start", now.strftime(fmt),
-                                    "--end", end.strftime(fmt)]))
-        return meeting_events([normalize_event(e) for e in items])
+        value = _run(api, ["calendar", "list", "--start", now.strftime(fmt), "--end", end.strftime(fmt)])
+        if observation is not None:
+            observation['complete'] = not isinstance(value, dict) or value.get('complete') is True
+        return meeting_events([normalize_event(e) for e in _as_list(value)], configured_user_email())
     out, seen = [], set()
+    if observation is not None:
+        observation['complete'] = True
     lo = now - datetime.timedelta(days=back_days)
     while lo < end:
         hi = min(lo + datetime.timedelta(days=CAL_SLICE_DAYS), end)
-        items = _as_list(_run(api, ["calendar", "list", "--start", lo.strftime(fmt),
-                                    "--end", hi.strftime(fmt)], timeout=BACKFILL_TIMEOUT))
-        for e in (normalize_event(x) for x in items):
+        value = _run(api, ["calendar", "list", "--start", lo.strftime(fmt), "--end", hi.strftime(fmt)], timeout=BACKFILL_TIMEOUT)
+        if observation is not None and isinstance(value, dict) and value.get('complete') is not True:
+            observation['complete'] = False
+        for e in (normalize_event(x) for x in _as_list(value)):
             key = str(e.get("id") or "") or json.dumps(e, sort_keys=True)
             if key in seen:
                 continue
             seen.add(key)
             out.append(e)
         lo = hi
-    return meeting_events(out)
+    return meeting_events(out, configured_user_email())
 
 
 def _attendee_emails_from_file(path: str) -> list:
@@ -803,18 +868,187 @@ def _attendee_emails_from_file(path: str) -> list:
     return out[:ATTENDEE_COMMS_CAP]
 
 
-def _fetch_attendee_comms(api, email: str) -> tuple:
+def _sender_mute():
+    """The owner's explicit sender mutes as a predicate, via the same matcher compose applies.
+
+    None when nothing is muted; unreadable preferences mute nothing, as in compose."""
+    try:
+        import preferences  # noqa: PLC0415
+        muted = list(preferences.load_explicit().get('mute_senders') or [])
+    except Exception:  # noqa: BLE001
+        return None
+    from textutil import _sender_addr
+    return (lambda sender: preferences.sender_is_muted(_sender_addr(sender), muted)) if muted else None
+
+
+def _bounded_thread_context(thread, tid, expected, thread_chars, rendered_ids=frozenset(), *, muted_names=()):
+    """One shared, dated thread excerpt for prep and brief readers; never action authority."""
+    from gmail_read import message_fields
+    from personal_context import conversation_message
+    if not isinstance(thread, dict) or thread.get('id') != tid:
+        return None, set()
+    messages = thread.get('messages')
+    if not isinstance(messages, list):
+        return None, set()
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    usable = []
+    for message in messages:
+        if (not isinstance(message, dict) or message.get('threadId') != tid
+                or not message.get('id') or {'TRASH', 'SPAM', 'DRAFT'} & set(message.get('labelIds') or [])):
+            continue
+        stamp = str(message.get('internalDate') or '')
+        if not stamp.isdigit() or int(stamp) > now:
+            continue
+        usable.append(message)
+    usable.sort(key=lambda message: int(message['internalDate']))
+    inventory = {str(message['id']) for message in usable}
+    excluded = len(usable) != len(messages) or not expected <= inventory
+    if muted_names:
+        def name_muted(message):
+            fields = message_fields(message)
+            return any(name.strip().casefold() in muted_names for name, _ in getaddresses([
+                _addr_str(fields.get(key)) for key in ('from', 'to', 'cc')]))
+        audible = [message for message in usable if not name_muted(message)]
+        excluded = excluded or len(audible) != len(usable)
+        usable = audible
+    muted = _sender_mute()
+    if muted is not None:
+        # A muted sender's words never reach a prep or brief reader through thread background,
+        # before rendering; the owner's own SENT messages are never muted.
+        audible = [message for message in usable if 'SENT' in (message.get('labelIds') or [])
+                   or not muted(_addr_str(message_fields(message).get('from')))]
+        excluded = excluded or len(audible) != len(usable)
+        usable = audible
+    # The brief already renders these exact messages in full. Spend the background
+    # budget on the missing conversation, including middle-message agreements.
+    usable = [message for message in usable if str(message['id']) not in rendered_ids]
+    limit = min(ATTENDEE_THREAD_MESSAGES, max(2, thread_chars // 400))
+    opening = 2 if limit >= 4 else 1
+    selected = usable if len(usable) <= limit else usable[:opening] + usable[-(limit-opening):]
+    if not selected:
+        return (('Exact thread background partial; some messages were withheld.' if excluded else '')
+                if inventory else None), inventory
+    clipped = len(selected) != len(usable) or excluded
+    blocks = []
+    # Equal bounded space keeps the opening and newest correction even on a long thread.
+    budget = (thread_chars - 200) // len(selected)
+    for raw in selected:
+        full = message_fields(raw)
+        sender = _addr_str(full.get('from'))[:200]
+        direction = 'owner sent' if 'SENT' in (full.get('labels') or []) else 'sender ' + sender
+        header = f"email {str(full.get('date') or '')[:40]} [{raw['id']}] ({direction}): "
+        body = str(full.get('body') or full.get('snippet') or '')
+        if len(header) > budget - 64:
+            header = header[:budget - 64]
+            clipped = True
+        room = budget - len(header) - 1
+        excerpt = conversation_message({'source': 'gmail', 'id': raw['id'], 'body': body},
+                                       text_limit=room, preserve_ending=True)
+        clipped = clipped or excerpt['text_clipped']
+        blocks.append(header + excerpt['text'])
+    heading = 'Exact Gmail thread, bounded read' + (' (partial; some content omitted)' if clipped else '') + ':\n'
+    return heading + '\n'.join(blocks), inventory
+
+
+def _expand_attendee_threads(rows, quota_stop, thread_chars=ATTENDEE_THREAD_CHARS, *, deadline=None, known_context=None, sources=('gmail',), observation=None, muted_names=(), rendered_ids=frozenset()):
+    """Reuse the native thread reader for bounded focused-prep context, no retained cache."""
+    from source_context import allowed
+    permitted = lambda: all(allowed(source) for source in sources)
+    if not permitted():
+        return []
+    tids = list(dict.fromkeys(row['thread_id'] for row in rows if row.get('thread_id')))[:ATTENDEE_THREAD_CAP]
+    expanded, inventories, partial, service = {}, {}, set(tids), None
+    try:
+        for tid in tids:
+            if not permitted():
+                return []
+            if (known_context or {}).get(tid):
+                expanded[tid] = known_context[tid][:thread_chars]
+                inventories[tid] = None  # reuse provides no native inventory; preserve sibling snippets
+                partial.discard(tid)
+                if observation is not None:
+                    observation['reused_threads'] = observation.get('reused_threads', 0) + 1
+                continue
+            if quota_stop.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                continue  # A later exact cached context needs no new read or time allowance.
+            try:
+                if deadline is not None:
+                    if service is not None:
+                        service.close()
+                    service = _gmail_service(timeout=max(0.1, deadline - time.monotonic()))
+                elif service is None:
+                    service = _gmail_service()  # each attendee worker owns its transport
+                if not permitted():
+                    return []
+                if observation is not None:
+                    observation['requests'] += 1
+                thread = service.users().threads().get(userId='me', id=tid, format='full').execute()
+                if not permitted():
+                    return []
+                context, inventory = _bounded_thread_context(thread, tid,
+                    {row.get('message_id') for row in rows if row.get('thread_id') == tid and row.get('message_id')},
+                    thread_chars, rendered_ids=rendered_ids, muted_names=muted_names)
+                if context is None:
+                    continue
+                expanded[tid] = context
+                inventories[tid] = inventory
+                partial.discard(tid)
+            except Exception as error:
+                if observation is not None:
+                    observation['thread_reads_failed'] = observation.get('thread_reads_failed', 0) + 1
+                if _source_error(error) == 'rate_limited':
+                    quota_stop.set()
+                    break
+                # Preserve current search snippets, clearly marked as incomplete.
+    finally:
+        if service is not None and callable(getattr(service, 'close', None)):
+            try:
+                service.close()
+            except Exception:
+                pass
+    if not permitted():
+        return []
+    result, seen = [], set()
+    for row in rows:
+        tid = row.get('thread_id')
+        if tid in expanded:
+            if tid in seen:
+                if inventories[tid] is not None:
+                    if row.get('message_id') in inventories[tid]:
+                        continue
+                    row = {**row, 'thread_context': 'Thread read omitted this message; current search snippet only.'}
+            else:
+                seen.add(tid)
+                row = {**row, 'thread_context': expanded[tid]}
+        elif tid in partial:
+            row = {**row, 'thread_context': 'Full thread unavailable; only the current search snippet was read.'}
+        result.append(row)
+    return result
+
+
+def _fetch_attendee_comms(api, email: str, *, expand_threads=False, quota_stop=None, thread_chars=ATTENDEE_THREAD_CHARS) -> tuple:
     """One per-attendee Gmail search (30d window, both directions). A failure just means that
     attendee gets no thread context. Only SENT proves the owner authored a message; another
     participant in an introduction thread is not the owner. Unattributed direction stays null,
     with the actual sender retained for attribution and mute checks."""
+    if expand_threads:
+        from source_context import allowed
+        if not allowed('gmail') or quota_stop is not None and quota_stop.is_set():
+            return email, []
     try:
-        items = _as_list(_run(api, ["gmail", "search",
-                                    f"{{from:{email} to:{email}}} newer_than:30d",
+        query = (f"{{from:{email} to:{email} cc:{email}}} newer_than:30d -in:trash -in:spam" if expand_threads
+                 else f"{{from:{email} to:{email}}} newer_than:30d")
+        items = _as_list(_run(api, ["gmail", "search", query,
                                     "--max", str(ATTENDEE_COMMS_MAX_PER)],
                               timeout=ATTENDEE_COMMS_TIMEOUT))
     except Exception:
         return email, []
+    rows = _attendee_comms_rows(items, {email})
+    return email, _expand_attendee_threads(rows, quota_stop or threading.Event(), thread_chars) if expand_threads else rows
+
+
+def _attendee_comms_rows(items, emails):
+    """The same attributed search projection for focused prep and ordinary brief background."""
     rows = []
     for it in items:
         if not isinstance(it, dict):
@@ -828,7 +1062,7 @@ def _fetch_attendee_comms(api, email: str) -> tuple:
             "date": str(_pick(it, "date", "internalDate", "received_at") or ""),
             "subject": str(_pick(it, "subject", "title") or ""),
             "snippet": str(_pick(it, "snippet", "preview", "body_preview") or ""),
-            "from_me": True if "SENT" in labels else (False if sender == email else None),
+            "from_me": True if "SENT" in labels else (False if sender in emails else None),
             "sender_name": name,
             "sender_identifier": sender,
         }
@@ -839,43 +1073,128 @@ def _fetch_attendee_comms(api, email: str) -> tuple:
         if thread_id:
             row['thread_id'] = thread_id
         rows.append(row)
-    return email, rows[:ATTENDEE_COMMS_MAX_PER]
+    rows = rows[:ATTENDEE_COMMS_MAX_PER]
+    return rows
 
 
-def gather_attendee_comms(api, attendees_path: str) -> dict:
+def gather_attendee_comms(api, attendees_path: str, *, expand_threads=False) -> dict:
     """{attendee_email: [{date,subject,snippet,from_me}]} for every unique attendee email in the
     list file (cap 15), searched concurrently. Attendees whose search found nothing are omitted."""
     emails = _attendee_emails_from_file(attendees_path)
     if not emails:
         return {}
     out = {}
+    quota_stop = threading.Event()
+    thread_chars = min(ATTENDEE_THREAD_CHARS, ATTENDEE_THREADS_TOTAL_CHARS // (len(emails) * ATTENDEE_THREAD_CAP))
     with ThreadPoolExecutor(max_workers=min(ATTENDEE_COMMS_WORKERS, len(emails))) as ex:
-        for email, rows in ex.map(lambda e: _fetch_attendee_comms(api, e), emails):
+        for email, rows in ex.map(lambda e: _fetch_attendee_comms(api, e, expand_threads=expand_threads, quota_stop=quota_stop, thread_chars=thread_chars), emails):
             if rows:
                 out[email] = rows
+    if expand_threads:
+        from source_context import allowed
+        if not allowed('gmail'):
+            return {}
     return out
 
 
-def normalize_mcp(gmail_raw_path, cal_raw_path, sent_raw_path=None):
-    """HOST-AGNOSTIC fallback: when the google-workspace CLI isn't the auth path (e.g. the host has
-    Google connected as a Gmail/Calendar MCP server, as OpenClaw or some Hermes setups do), the agent
-    dumps the RAW MCP tool results to files and we normalize them to the SAME shape the CLI path emits.
-    Keeps field-mapping deterministic instead of asking the agent to hand-map (which drifts)."""
-    def _load(p):
-        if not p:
-            return []
+def gather_brief_meeting_context(api, events, known_messages=()):
+    """One optional 15s best-effort deadline: one search and at most two thread reads total.
+
+    This is dated background for the existing brief model, never native action evidence.
+    Calendar chooses the cohort, so both grants gate every read and later projection.
+    """
+    from calendar_context import accepted_or_organized, prep_meeting_events, work_attendees
+    from source_context import allowed
+    from render_local import _meeting_context_mutes
+    from preferences import sender_is_muted
+    import relevance
+    mutes = _meeting_context_mutes()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    deadline = time.monotonic() + 15
+    permitted = lambda: allowed('calendar') and allowed('gmail')
+    receipt = {'status': 'partial', 'complete': False, 'requests': 0, 'attendees': 0,
+               'sampled_attendees': 0, 'messages': 0}
+    owner = configured_user_email()
+    targets, attendees = [], []
+    for event in prep_meeting_events(events, owner):
+        if (not isinstance(event.get('id'), str) or not event['id'].strip()
+                or not accepted_or_organized(event, owner)):
+            continue
         try:
-            with open(p, encoding="utf-8") as f:
-                return _as_list(json.load(f))
-        except Exception:
-            return []
-    emails = [normalize_email(it, it) for it in _load(gmail_raw_path)]
-    # Sent-lane parity for MCP hosts: dump the `in:sent newer_than:1d` tool result too and it merges
-    # in with the SAME dedup + isSent guarantee the CLI path applies. Without --from-mcp-sent an MCP
-    # host simply has no sent lane (its inbox dump may still carry SENT-labelled rows) — the one gap.
-    sent = [mark_sent(normalize_email(it, it)) for it in _load(sent_raw_path)]
-    events = [normalize_event(e) for e in _load(cal_raw_path)]
-    return merge_sent(emails, sent), events
+            start = datetime.datetime.fromisoformat(str(event.get('start') or '').replace('Z', '+00:00'))
+            if start.tzinfo is None or not 0 <= (start - now).total_seconds() <= 72 * 3600:
+                continue
+        except ValueError:
+            continue
+        people = [person for person in work_attendees(event, owner)
+                  if person['name'].strip().casefold() not in mutes['mute_people']
+                  and not sender_is_muted(person['email'], mutes['mute_senders'])
+                  and not any(char in person['email'] for char in ('\\', '"', '{', '}', ':'))]
+        if people:
+            targets.append(({'event_id': event.get('id'), 'start': event.get('start'),
+                             'title': str(event.get('summary') or '')[:200]}, {p['email'] for p in people}))
+            attendees.extend(person['email'] for person in people)
+    attendees = list(dict.fromkeys(attendees))
+    receipt['attendees'] = len(attendees)
+    sampled = attendees[:ATTENDEE_COMMS_CAP]
+    receipt['sampled_attendees'] = len(sampled)
+    receipt['omitted_attendees'] = max(0, len(attendees) - len(sampled))
+    if not sampled or not permitted():
+        receipt['status'] = 'not_applicable' if not sampled else 'disabled'
+        return None, receipt
+    # Only unquoted, non-operator work addresses reach this quoted Gmail query.
+    terms = ['%s:%s' % (field, json.dumps(email)) for email in sampled for field in ('from', 'to', 'cc')]
+    query = '{' + ' '.join(terms) + '} newer_than:30d -in:trash -in:spam'
+    try:
+        receipt['requests'] = 1
+        items = _as_list(_run(api, ['gmail', 'search', query, '--max', str(ATTENDEE_COMMS_MAX_PER)],
+                              timeout=max(0.1, deadline - time.monotonic())))
+        if not permitted():
+            return None, {**receipt, 'status': 'disabled'}
+        selected_items, matches = [], []
+        native_ids = {str(row.get('id')) for row in known_messages if isinstance(row, dict) and row.get('id')}
+        mute = _sender_mute()
+        for item in items[:ATTENDEE_COMMS_MAX_PER]:
+            if (not isinstance(item, dict) or str(item.get('id') or '') in native_ids
+                    or relevance.is_automated_assistant(item)
+                    or (mute and mute(_addr_str(item.get('from'))))):
+                continue
+            addresses = {address.casefold() for _, address in getaddresses([
+                _addr_str(item.get(field)) for field in ('from', 'to', 'cc')])}
+            matched = addresses.intersection(sampled)
+            if matched:
+                selected_items.append(item)
+                matches.append(sorted(matched))
+        rows = _attendee_comms_rows(selected_items, set(sampled))
+        for row, matched in zip(rows, matches):
+            row['attendee_identifiers'] = matched
+        known = {} if any(mutes.values()) else {str(row.get('threadId')): row['thread_context'] for row in known_messages
+                 if isinstance(row, dict) and row.get('threadId') and row.get('thread_context')}
+        # The shared reader receives only this aggregate cohort; its two-thread cap is not multiplied.
+        rows = _expand_attendee_threads(rows, threading.Event(), deadline=deadline, known_context=known,
+                                       sources=('calendar', 'gmail'), observation=receipt, muted_names=mutes['mute_people'], rendered_ids=native_ids)
+        if not permitted():
+            return None, {**receipt, 'status': 'disabled', 'messages': 0}
+        if _meeting_context_mutes() != mutes:
+            return None, {**receipt, 'status': 'unavailable', 'error': 'preferences_changed', 'messages': 0}
+        receipt['messages'] = len(rows)
+        receipt['message_limit_reached'] = len(items) >= ATTENDEE_COMMS_MAX_PER
+        receipt['thread_limit'] = ATTENDEE_THREAD_CAP
+        receipt['omitted_threads'] = max(0, len({row['thread_id'] for row in rows if row.get('thread_id')})
+                                         - ATTENDEE_THREAD_CAP)
+        receipt['budget_exhausted'] = time.monotonic() >= deadline
+        selected_targets = [event for event, addresses in targets if addresses.intersection(sampled)]
+        receipt['omitted_events'] = len(targets) - len(selected_targets[:ATTENDEE_COMMS_CAP])
+        context = {'sources': ['calendar', 'gmail'], 'mutes': mutes, 'events': selected_targets[:ATTENDEE_COMMS_CAP],
+                   'messages': rows, 'receipt': receipt}
+        # Bound all excerpt and metadata characters together, retaining an honest partial receipt.
+        while len(json.dumps(context, ensure_ascii=False)) > ATTENDEE_THREADS_TOTAL_CHARS and rows:
+            rows.pop()
+            receipt['messages'] = len(rows)
+            receipt['content_omitted'] = True
+        return context, receipt
+    except Exception as error:
+        return None, {**receipt, 'status': 'unavailable', 'error': _source_error(error)}
 
 
 CONTINUATION_REJECTED_REASONS = frozenset({
@@ -956,6 +1275,8 @@ def main():
     ap.add_argument("--gmail-out", default="/tmp/sotto_gmail.json")
     ap.add_argument("--cal-out", default="/tmp/sotto_cal.json")
     ap.add_argument("--source-results-out", help="write per-source status/completeness receipts beside legacy arrays")
+    ap.add_argument("--pulse-since-epoch", type=int,
+                    help="bounded attended pulse refresh: one both-direction metadata query since this observation")
     ap.add_argument("--loop-local", help="effective local snapshot for bounded open-obligation evidence refresh")
     ap.add_argument("--max", type=int, default=40)
     ap.add_argument("--bodies", type=int, default=12)
@@ -971,18 +1292,12 @@ def main():
                     help="skip the in:sent lane (the email-voice/draft-diff exhaust)")
     ap.add_argument("--skip-stale", action="store_true",
                     help="skip the stale-sent lane (emails you sent that nobody answered)")
-    # Host-agnostic MCP fallback: pass RAW dumps of the host's Gmail/Calendar MCP tool results and we
-    # normalize them to the canonical shape (no CLI needed). Use these when `--check` says the CLI is
-    # unavailable but the host can reach Google another way.
-    ap.add_argument("--from-mcp-gmail", help="raw Gmail MCP tool-result JSON to normalize (no CLI)")
-    ap.add_argument("--from-mcp-calendar", help="raw Calendar MCP tool-result JSON to normalize (no CLI)")
-    ap.add_argument("--from-mcp-sent",
-                    help="raw Gmail MCP tool-result JSON for `in:sent newer_than:1d` (merged, marked isSent)")
     ap.add_argument("--ensure-deps", action="store_true",
                     help="ONLY run the googleapiclient self-heal (setup-time), no gather")
     ap.add_argument("--attendee-comms", dest="attendee_comms",
                     help="attendee-list JSON ([{name,email}] or calendar-derived) — ONLY gather "
                          "per-attendee Gmail threads (30d, both directions) to --comms-out")
+    ap.add_argument("--expand-threads", action="store_true", help="focused prep: bounded exact Gmail thread context")
     ap.add_argument("--comms-out", dest="comms_out", default="/tmp/sotto_attendee_comms.json",
                     help="output file for --attendee-comms (default /tmp/sotto_attendee_comms.json)")
     a = ap.parse_args()
@@ -1006,6 +1321,35 @@ def main():
         elif result['status'] == 'partial':
             result.setdefault('error', 'rate_limited')
 
+    if a.pulse_since_epoch is not None:
+        # Foreground pulses reuse canonical memory; history traversal stays in memory_cycle.
+        # One metadata-only query, both directions, with a strict child-process deadline.
+        epoch = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        if not epoch - 366 * 86400 <= a.pulse_since_epoch <= epoch:
+            ap.error('pulse observation is out of bounds')
+        rows, receipt = [], source_result('unavailable', observed_at=observed_at)
+        if allowed('gmail'):
+            try:
+                api = _find_google_api()
+                if not api:
+                    raise GoogleCLIError('Google reader unavailable')
+                rows = _search_gmail(api, f'after:{a.pulse_since_epoch} before:{epoch + 1}',
+                                     PULSE_REFRESH_MAX_MESSAGES, 0, timeout=PULSE_REFRESH_TIMEOUT_SECONDS)
+                capped = bool(getattr(rows, 'capped', len(rows) >= PULSE_REFRESH_MAX_MESSAGES))
+                receipt = source_result('partial' if capped else 'ok', observed_at=observed_at,
+                    complete=not capped, since=datetime.datetime.fromtimestamp(
+                        a.pulse_since_epoch, datetime.timezone.utc).isoformat(), until=observed_at)
+            except Exception as error:  # noqa: BLE001 — receipt contains only a bounded code
+                receipt = source_result('unavailable', observed_at=observed_at, error=_source_error(error))
+        if not allowed('gmail'):
+            rows, receipt = [], source_result('disabled', observed_at=observed_at)
+        jsonstore.write_atomic(a.gmail_out, list(rows))
+        jsonstore.write_atomic(a.cal_out, [])
+        source_results['gmail'] = receipt
+        write_source_results()
+        print(json.dumps({'emails': len(rows), 'status': receipt['status']}))
+        return
+
 
     if a.ensure_deps:
         # Setup-time heal: pay the (up to 240s) pip install during onboarding, so the first brief's
@@ -1022,13 +1366,13 @@ def main():
         comms, err = {}, None
         api = _find_google_api()
         if not api:
-            err = ("google_api.py not found — the google-workspace CLI isn't this host's Google "
-                   "path; attendee threads unavailable")
+            err = ("google_api.py not found — Sotto's packaged Google CLI is missing; "
+                   "attendee threads unavailable")
         else:
             _ensure_google_deps()
             try:
                 _refresh_google_token()
-                comms = gather_attendee_comms(api, a.attendee_comms)
+                comms = gather_attendee_comms(api, a.attendee_comms, expand_threads=a.expand_threads)
             except Exception as e:  # noqa: BLE001
                 comms, err = {}, f"attendee-comms: {e}"
         with open(a.comms_out, "w", encoding="utf-8") as f:
@@ -1040,39 +1384,13 @@ def main():
         _diag(msg)
         return
 
-    if a.from_mcp_gmail or a.from_mcp_calendar or a.from_mcp_sent:
-        emails, events = normalize_mcp(a.from_mcp_gmail, a.from_mcp_calendar, a.from_mcp_sent)
-        # An arbitrary MCP dump has no verified pagination/window contract. It remains useful
-        # context but never proves an absent event was cancelled.
-        for source, supplied in (('gmail', a.from_mcp_gmail or a.from_mcp_sent), ('calendar', a.from_mcp_calendar)):
-            source_results[source] = source_result('partial' if supplied else 'skipped')
-            if not allowed(source):
-                source_results[source] = source_result('disabled')
-        if not allowed('gmail'):
-            emails = []
-        if not allowed('calendar'):
-            events = []
-        write_source_results()
-        with open(a.gmail_out, "w", encoding="utf-8") as f:
-            json.dump(emails, f)
-        with open(a.cal_out, "w", encoding="utf-8") as f:
-            json.dump(events, f)
-        n_sent = sum(1 for e in emails if e.get("isSent"))
-        msg = (f"[gather_google] normalized from MCP: {len(emails)} emails ({n_sent} sent), "
-               f"{len(events)} events → {a.gmail_out}, {a.cal_out}")
-        print(msg)
-        _diag(msg)
-        return
-
     api = _find_google_api()
     emails, sent, events, stale, err = [], [], [], [], None
-    loop_emails, loop_receipt = [], None
+    loop_emails, loop_texts, loop_receipt = [], [], None
+    meeting_context, meeting_receipt = None, None
     gmail_rate_limited = False  # bound even when the inbox gate and the loop gate disagree
     if not api:
-        err = ("google_api.py not found — the google-workspace CLI isn't this host's Google path. "
-               "FALLBACK: fetch Gmail (newer_than:1d), sent mail (in:sent newer_than:1d) + Calendar "
-               "(next 3d) with the host's Gmail/Calendar MCP tools, dump them to files, and re-run "
-               "with --from-mcp-gmail/--from-mcp-sent/--from-mcp-calendar.")
+        err = "google_api.py not found — Sotto's packaged Google CLI is missing"
     else:
         _diag(f"[gather_google] using {api}")
         _ensure_google_deps()   # guarantee googleapiclient in THIS interpreter before any fetch
@@ -1080,94 +1398,128 @@ def main():
             _refresh_google_token()
         except Exception as e:  # noqa: BLE001 — both sources keep their "unavailable" receipt
             api, err = None, f"google token: {e}"
-        if api and not a.skip_gmail and allowed('gmail'):
-            try:
-                emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
-                capped = (getattr(emails, 'capped') if isinstance(emails, GmailRows)
-                          else a.max > 0 and len(emails) >= a.max)
-                gmail_rate_limited = getattr(emails, 'rate_limited', False)
-                source_results['gmail'] = source_result('partial' if capped or gmail_rate_limited else 'ok',
-                    complete=not capped and not gmail_rate_limited,
-                    since=(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.window_days)).isoformat(),
-                    until=observed_at, error='rate_limited' if gmail_rate_limited else None)
-            except Exception as e:  # noqa: BLE001
-                err = f"gmail: {e}"
-                error_code = _source_error(e)
-                gmail_rate_limited = error_code == 'rate_limited'
-                source_results["gmail"] = source_result("unavailable", error=error_code)
-            # Sent lane is exhaust, not brief content — its own try so a failure here can never
-            # cost the brief its inbox.
-            if not gmail_rate_limited and not a.skip_sent and a.sent_max > 0:
+        with calendar_gather(api, max(0, a.window_days - 1), gather_calendar,
+                             enabled=not a.skip_calendar) as calendar_future:
+            if api and not a.skip_gmail and allowed('gmail'):
                 try:
-                    sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max), days=a.window_days)
-                    gmail_rate_limited = getattr(sent, 'rate_limited', False)
-                    if gmail_rate_limited:
-                        mark_gmail_lane_rate_limited()
+                    emails = gather_gmail(api, a.max, a.bodies, days=a.window_days)
+                    capped = (getattr(emails, 'capped') if isinstance(emails, GmailRows)
+                              else a.max > 0 and len(emails) >= a.max)
+                    gmail_rate_limited = getattr(emails, 'rate_limited', False)
+                    source_results['gmail'] = source_result('partial' if capped or gmail_rate_limited else 'ok',
+                        complete=not capped and not gmail_rate_limited,
+                        since=(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.window_days)).isoformat(),
+                        until=observed_at, error='rate_limited' if gmail_rate_limited else None)
                 except Exception as e:  # noqa: BLE001
-                    err = (err + f"; sent: {e}") if err else f"sent: {e}"
-                    gmail_rate_limited = _source_error(e) == 'rate_limited'
-                    if gmail_rate_limited:
-                        mark_gmail_lane_rate_limited()
-            # The stale-sent lane: its own try, and only on the daily window (a backfill has no
-            # "today" to be stale against).
-            if not gmail_rate_limited and not a.skip_stale and a.window_days <= 1:
-                try:
-                    stale = gather_stale_sent(api)
-                    gmail_rate_limited = getattr(stale, 'rate_limited', False)
-                    if gmail_rate_limited:
-                        mark_gmail_lane_rate_limited()
-                except Exception as e:  # noqa: BLE001
-                    err = (err + f"; stale: {e}") if err else f"stale: {e}"
-                    gmail_rate_limited = _source_error(e) == 'rate_limited'
-                    if gmail_rate_limited:
-                        mark_gmail_lane_rate_limited()
-        if (api and a.loop_local and not a.skip_gmail and allowed('gmail')
-                and not gmail_rate_limited):
-            # Read evidence, never infer completion here. The same merged rows go to both the
-            # brief model and its evidence validator. Nothing is persisted outside usual inputs.
-            try:
-                import ledger_io
-                import loop_context
-                from source_context import project_local
-                with open(a.loop_local, encoding='utf-8') as handle:
-                    loop_local = project_local(json.load(handle))
-                loops = ledger_io.load_active()
-                if loops:
-                    service = _gmail_service()
+                    err = f"gmail: {e}"
+                    error_code = _source_error(e)
+                    gmail_rate_limited = error_code == 'rate_limited'
+                    source_results["gmail"] = source_result("unavailable", error=error_code)
+                # Sent lane is exhaust, not brief content — its own try so a failure here can never
+                # cost the brief its inbox.
+                if not gmail_rate_limited and not a.skip_sent and a.sent_max > 0:
                     try:
-                        loop_emails, loop_receipt = loop_context.refresh(
-                            loops, loop_local, service, normalize_email, allowed=allowed,
-                            known_messages=[*emails, *sent], known_threads=getattr(stale, 'threads', {}),
-                            classify_error=_source_error)
-                    finally:
-                        service.close()
-                    if loop_receipt.get('error') == 'rate_limited':
-                        mark_gmail_lane_rate_limited()
-            except Exception:  # optional context never costs the main gather or exposes source text
-                loop_receipt = {'status': 'unavailable', 'error': 'read_failed', 'complete': False}
-        if api and not a.skip_calendar and allowed('calendar'):
-            try:
-                observation = {}
-                events = gather_calendar(api, back_days=max(0, a.window_days - 1), observation=observation)
-                complete = observation.get('complete') is True
-                source_results['calendar'] = source_result('ok' if complete else 'partial', complete=complete,
-                    **observation.get('coverage', {}))
-            except Exception as e:  # noqa: BLE001
-                err = (err + f"; calendar: {e}") if err else f"calendar: {e}"
-                source_results["calendar"] = source_result("unavailable", error=_source_error(e))
+                        sent = gather_sent(api, a.sent_max, min(SENT_BODIES, a.sent_max), days=a.window_days)
+                        gmail_rate_limited = getattr(sent, 'rate_limited', False)
+                        if gmail_rate_limited:
+                            mark_gmail_lane_rate_limited()
+                    except Exception as e:  # noqa: BLE001
+                        err = (err + f"; sent: {e}") if err else f"sent: {e}"
+                        gmail_rate_limited = _source_error(e) == 'rate_limited'
+                        if gmail_rate_limited:
+                            mark_gmail_lane_rate_limited()
+                # The stale-sent lane: its own try, and only on the daily window (a backfill has no
+                # "today" to be stale against).
+                if not gmail_rate_limited and not a.skip_stale and a.window_days <= 1:
+                    try:
+                        stale = gather_stale_sent(api)
+                        gmail_rate_limited = getattr(stale, 'rate_limited', False)
+                        if gmail_rate_limited:
+                            mark_gmail_lane_rate_limited()
+                    except Exception as e:  # noqa: BLE001
+                        err = (err + f"; stale: {e}") if err else f"stale: {e}"
+                        gmail_rate_limited = _source_error(e) == 'rate_limited'
+                        if gmail_rate_limited:
+                            mark_gmail_lane_rate_limited()
+            if (api and a.loop_local and not a.skip_gmail and allowed('gmail')
+                    and not gmail_rate_limited):
+                # Read evidence, never infer completion here. The same merged rows go to both the
+                # brief model and its evidence validator. Nothing is persisted outside usual inputs.
+                try:
+                    import ledger_io
+                    import loop_context
+                    from source_context import bridge_call, project_local
+                    with open(a.loop_local, encoding='utf-8') as handle:
+                        loop_local = project_local(json.load(handle))
+                    loops = ledger_io.load_active()
+                    if loops:
+                        service = _gmail_service()
+                        try:
+                            loop_updates, loop_receipt = loop_context.refresh_context(
+                                loops, loop_local, service, normalize_email, allowed=allowed,
+                                known_messages=[*emails, *sent], known_threads=getattr(stale, 'threads', {}),
+                                classify_error=_source_error,
+                                read_messages=lambda identifier, timeout: bridge_call(
+                                    'get_messages', {'identifier': identifier, 'limit': loop_context.MAX_MESSAGES},
+                                    timeout=timeout))
+                            loop_emails, loop_texts = loop_updates['emails'], loop_updates['imessage']
+                        finally:
+                            service.close()
+                        if loop_receipt.get('error') == 'rate_limited':
+                            mark_gmail_lane_rate_limited()
+                except Exception:  # optional context never costs the main gather or exposes source text
+                    loop_receipt = {'status': 'unavailable', 'error': 'read_failed', 'complete': False}
+            if calendar_future is not None:
+                events, source_results['calendar'], cal_error = calendar_result(calendar_future, _source_error)
+                if cal_error:
+                    err = f'{err}; {cal_error}' if err else cal_error
+
+
+    if (api and a.loop_local and a.window_days == 1 and not a.skip_gmail and not a.skip_calendar
+            and not gmail_rate_limited and allowed('gmail') and allowed('calendar')):
+        try:
+            meeting_context, meeting_receipt = gather_brief_meeting_context(api, events, [*emails, *sent])
+        except Exception:  # An optional context failure must preserve the ordinary source files.
+            meeting_receipt = {'status': 'unavailable', 'error': 'read_failed', 'complete': False}
 
     # Recheck grants after I/O; a concurrent revocation must also discard staged results.
     for source in ('gmail', 'calendar'):
         if not allowed(source):
             source_results[source] = source_result('disabled')
             if source == 'gmail':
-                emails, sent, stale, loop_emails = [], [], [], []
+                emails, sent, stale, loop_emails, loop_texts = [], [], [], [], []
                 loop_receipt = {"status": "disabled", "complete": False}
             else:
                 events = []
     if loop_receipt and not all(allowed(source) for source in loop_receipt.get('sources', ['gmail'])):
-        loop_emails = []
+        loop_emails, loop_texts = [], []
         loop_receipt.update(status='disabled', messages=0)
+    if loop_texts and a.loop_local:
+        try:
+            from render_local import message_evidence_id
+            from source_context import project_local
+            # Preserve the ordinary snapshot and its coverage. Supplemental historical rows do not
+            # make that source-wide window complete or replace a newer message with a cached copy.
+            with open(a.loop_local, encoding='utf-8') as handle:
+                loop_local = project_local(json.load(handle))
+            existing = list(loop_local.get('imessage') or [])
+            seen = {message_evidence_id(message, 'imessage') for message in existing if isinstance(message, dict)}
+            loop_local['imessage'] = existing + [message for message in loop_texts
+                if message_evidence_id(message, 'imessage') not in seen]
+            import jsonstore
+            jsonstore.write_atomic(a.loop_local, project_local(loop_local))
+        except Exception:
+            # Optional supplemental history must not cost the ordinary Gmail/calendar gather.
+            loop_receipt['imessage_error'] = 'context_merge_failed'
+            loop_receipt.setdefault('error', 'context_merge_failed')
+            loop_receipt['messages'] = len(loop_emails)
+            loop_receipt.setdefault('message_counts', {})['imessage'] = 0
+    if meeting_receipt is not None:
+        source_results['gmail']['meeting_context'] = meeting_receipt
+    if not allowed('gmail') or not allowed('calendar'):
+        meeting_context = None
+        if meeting_receipt is not None:
+            meeting_receipt.update(status='disabled', messages=0)
     if loop_receipt is not None:
         source_results['gmail']['loop_context'] = loop_receipt
     write_source_results()
@@ -1188,8 +1540,10 @@ def main():
         from loop_context import merge_context
         emails = merge_context(emails, loop_emails)
     n_sent = sum(1 for e in emails if e.get("isSent"))
-    if truncated_at or stale:
+    if truncated_at or stale or meeting_context:
         gmail_payload = {"emails": emails}
+        if meeting_context:
+            gmail_payload["meeting_context"] = meeting_context
         if truncated_at:
             gmail_payload["truncated_at"] = truncated_at
             if a.window_days > 1:

@@ -25,11 +25,16 @@ evals/
   run_evals.py          the fixture harness (both modes) + the invariant checks
   run_golden.py         the Golden Corpus replay harness (§ Golden Corpus below)
   replay_tracking.py    offline continuous month: current tracking vs the proposed contract
+  run_memory_evidence.py  isolated current/grounded Dreamer comparison; scripted default, explicit live mode
+  memory_evidence.py    experiment-only evidence binding, never imported by production Dreamer
+  inspect_source_coverage.py  offline receiver/state/prompt coverage inspection with forbidden external calls
   LABELING.md           optional maintainer judgment-evaluation runbook
   fixtures/
     rich_day.json       busy day: 6+ meetings, 20+ emails, messages, loops, birthday, group chat
     quiet_day.json      1 meeting, 3 routine emails — the critic-auto-skip regime
+    early_prep_day.json  54-hour substantive prep versus a routine nearer meeting; existing offer/action path
     edge_day.json       adversarial: malformed ledger, unicode/emoji, phone-only id, empty Google, muted person, expired loop
+    memory_evidence.json  invented fact/source pairs with separately held verdict labels
   corpus/               NEVER COMMITTED, NEVER SHIPPED — built on the owner's machine only
   baselines/
     scores.json         written by `--live --update-baseline` (absent until you record one)
@@ -42,12 +47,15 @@ tests/
   test_golden_corpus.py  the pseudonymizer + builder, end to end on synthetic data
   test_run_golden.py     the replay harness + its refusals
   test_replay_tracking.py  continuous tracking probe isolation, determinism and honest exit status
+  test_memory_evidence_eval.py  source/fact binding, protected owner facts and isolated curation readback
 ```
 
 ## Run it
 
+Start from the Sotto source root (`sotto-agent/` in the monorepo, or the standalone repository root):
+
 ```bash
-cd sotto-hermes/sotto-chief-of-staff
+cd sotto-chief-of-staff
 
 # offline invariant scorecard (default; exits nonzero on any failure)
 python3 evals/run_evals.py            # or: --deterministic
@@ -57,6 +65,86 @@ python3 -m pytest tests/test_evals.py -q
 ```
 
 ## Fixtures — deterministic time
+
+### Source-grounded memory experiment
+
+```bash
+# Offline contract rehearsal; no source access or model calls.
+python3 evals/run_memory_evidence.py --output /tmp/memory-contracts.json
+python3 -m pytest tests/test_memory_evidence_eval.py -q
+
+# Explicit paid comparison, using an already configured native provider credential.
+python3 evals/run_memory_evidence.py --live --model gemini/gemini-3.8-flash \
+  --repeat 3 --output /tmp/memory-live.json
+```
+
+This compares the real Dreamer and `knowledge_update.consolidate` writer against an experimental
+model seam that also receives the exact cited **invented** messages. Each arm/case/sample gets a
+fresh temporary data directory, ignoring inherited `SOTTO_DATA`. Sources are a fixed fixture
+catalog, never Gmail, Bridge or a user's transcripts. The harness reads the committed graph,
+checks factual/provenance preservation, and repeats curation to check that unchanged work makes
+no new model call or person-file write. This is same-process readback, not crash/restart proof.
+
+The grounded arm requires supported, contradicted, inconclusive, unavailable or owner-protected
+judgments for every fact. Checks bind to exact fact versions and source-record hashes with
+nonempty verbatim quotes; code requires a unique exact match, including overlapping occurrences, and derives Unicode-code-point
+offsets, retaining offsets rather than duplicated source text in the report. Missing, revoked,
+wrong-person, obsolete, partial, ambiguous
+or over-budget evidence is withheld whole. A mixed-support fact is unavailable if any required
+source cannot be supplied. Owner corrections remain protected. Facts assessed as contradicted,
+inconclusive or unavailable cannot enter summary selections or duplicate groups; the experiment
+**does not archive or rewrite them**.
+An empty summary does not suppress those facts from other graph readers.
+
+`memory_evidence.py` holds only experiment contracts. It is not imported by the receiver or
+production Dreamer, and no verification status is persisted as canonical truth. The model sees
+no expected verdicts or fixture labels. Binding validates citations, not semantic entailment;
+the separately held fixture labels grade the model's judgments and selections. Source reference
+and fact IDs do not encode the expected verdict. Reports retain validated versions and spans.
+
+The default adapter is explicitly scripted, so its passing result proves machinery, not improved
+accuracy. `judgment_measured` is false, aggregate `quality` is null, and latency/usage are unknown.
+In live mode both arms use the same explicit native model, one attempt per arm/case, without
+fallback or a separate judge. Record every failed sample. Reports include actual call latency,
+prompt/system UTF-8 bytes at the experiment seam, before the transport adds writing style
+(excluding that style suffix, schema and transport overhead), response bytes and shared native
+usage receipts when available; absent receipts remain null. Semantic judgments are counted
+separately from unavailable/owner-protection policy checks. Correct policy counts are validator
+invariants for completed samples, not measured model accuracy. The report fingerprints its fixture,
+experiment, Dreamer, canonical writer/reader, native client, transport, writing style, model-work
+accounting and metrics files; these are selected-file hashes,
+not a full repository/configuration snapshot. Selected inputs are copied once and fingerprinted
+for all repeats. Repeated samples alternate arm order.
+`--case` selects fixture IDs; `--repeat` accepts 1–10. Output files must be new. Credential preflight precedes exclusive file creation; creation still
+precedes paid contact. Reports are written only after all samples finish. An interruption can
+leave an empty file and lose completed samples; there is no automatic resumption or retry of paid
+attempts. Preserve any report and reconcile attempted calls before manually starting a new run. A full one-repeat
+run makes at most two model requests per fixture; an unchanged within-arm repeat makes none.
+
+Exit 1 means a contract/error occurred in either arm, or a live grounded judgment/selection missed
+its label. Baseline judgment quality is diagnostic, so the current arm need not pass the grounded
+quality gate. Eligible summary omissions are diagnostic, since Dreamer may choose fewer facts
+or an empty summary. Every grounded status must still match its label, and unsupported selections
+still fail. A report has no end-to-end answer-quality, production-speed or statistical claim.
+Offline socket attempts and all subprocess attempts fail the run, including caught exceptions;
+live sockets are admitted only during the explicit native model call.
+
+
+### Source coverage inspection
+
+```bash
+python3 evals/inspect_source_coverage.py > /tmp/sotto-source-coverage.json
+python3 -m pytest tests/test_inspect_source_coverage.py -q
+```
+
+The JSON exposes invented receipts, retained state and the actual brief-model coverage input,
+including partial usable parent data, a failed companion, failed-read and health-probe freshness,
+empty authorized Google reads, learner read-versus-extraction timestamps, and revocation.
+The script ignores inherited `SOTTO_DATA`, uses a temporary store, and fails on any network or
+subprocess attempt, even if production code catches the exception. The companion TS authority
+test passes these receiver-inspected receipts through the production chat-tool projection.
+This verifies synthetic boundaries; it does not call a model, a provider or a Mac.
+
 
 ### Continuous tracking-contract probe
 
@@ -79,8 +167,8 @@ without running a migration adds no migration assurance.
 The JSON report includes every expected/observed result and five persisted-state snapshots. It
 does not evaluate extraction quality, onboarding, actual brief/dashboard rendering, adapter reply
 IDs, or future migration. The reminder selection budget is bypassed to isolate the meaning of a
-delivered reminder. The full design and outstanding release gates live in the single
-[ROADMAP](../../docs/plans/ROADMAP.md#september-4-investigation-evidence-and-the-executable-baseline).
+delivered reminder.
+
 
 ### Single-day fixture clocks
 
@@ -160,7 +248,6 @@ in the layout above, so the dev workflow is unchanged.
 Synthetic fixtures test machinery. The corpus tests **judgment** — the actual noise-to-signal ratio,
 group dynamics and voice of one real inbox. It is the owner's own history, pseudonymized with
 referential integrity, frozen, and replayed through the real pipeline against labels he wrote once.
-Design: `docs/plans/golden-corpus.md`.
 
 ```bash
 # 1. BUILD — on the machine with the volume (the container / a Mac with $SOTTO_DATA)
@@ -204,7 +291,7 @@ absent from `RAILWAY.md`'s table (see CLAUDE.md § standing bars: *defaults matt
 | Variable | Used by | What it does |
 |---|---|---|
 | `SOTTO_LLM_STUB` | `_shared/lib/gemini.py` and every composer | Replaces the Gemini call with a canned response so the pipeline runs offline and deterministically. The whole `--deterministic` eval lane and most of `tests/` ride it. |
-| `SOTTO_JUDGE_MODEL` | `evals/run_golden.py` | Overrides the pinned LLM-judge model for a `--live` golden run. Pinning matters: judge drift is score drift. |
+| `SOTTO_JUDGE_MODEL` | `evals/run_golden.py` | Overrides the pinned LLM-judge model for a `--live` golden run (blank means the pinned default). Pinning matters: judge drift is score drift. The judge call ignores `SOTTO_BRIEF_MODEL` and any fallback, a live compose runs without `SOTTO_FALLBACK_MODEL` (a quota blip fails the day rather than scoring another model), and a live baseline records its compose and judge models: a run on other models is reported as a mismatch, so baselines recorded before this need re-recording once. |
 | `SOTTO_CORPUS_KEY` | `tools/build_golden_corpus.py` | The hex key that pseudonymizes real identities into the corpus. Lives on the volume (`$SOTTO_DATA/corpus-keys/`), never in a checkout. |
 
 The optional browser label editor remains at `/app#labels`; it is a maintainer tool, absent from
@@ -238,3 +325,84 @@ The continuous replay now adds two positive evidence-bound completion cases and 
 gate under `tests/test_replay_tracking.py`. A delivered reminder is described as a reminder to the
 user, not evidence of contacting the other person. All first-week and full-month contracts must
 pass. These synthetic checks do not measure live model quality.
+
+
+### Golden replay coverage
+
+`run_golden.py` reuses production consent projection, the protected current ledger, critic policy
+in live mode, and the canonical resolver for reviewed task updates. Dry mode blocks model work
+and measures deterministic contracts only. Use `--sample 0` to replay every intervening day;
+a sampled run preserves selected-day ordering but is not full longitudinal coverage.
+
+Every run reports `COVERAGE` with expected/executed/failed/unlabeled case IDs and the cases scored
+for each metric. An execution failure (including an unavailable requested judge), missing metric,
+changed case coverage, mode, effective live critic policy, or compose/judge model cannot yield
+quality PASS; the mismatch lists each run field that differs from the baseline's. Dry replay
+records critic as disabled regardless of the environment. Failed or scoreless runs cannot overwrite
+a baseline. Older baselines without case coverage require an explicit `--update-baseline` after
+review; the harness never silently upgrades them. Synthetic scripted-critic regression tests are
+contract evidence, not measured current-model accuracy.
+The regression `--threshold` must be finite and between 0 and 1; an invalid value is rejected
+before replay or baseline comparison.
+
+
+Golden metric policy `active-states-and-absolute-entity-error-v2` includes open, waiting, blocked
+and failed obligations in remaining-work scoring. Entity deduplication reports mean absolute daily
+count error, so opposite errors cannot cancel across days. Baselines created under earlier metric
+semantics require explicit reviewed replacement; synthetic regression results are not model quality.
+
+## Attended conversation journeys
+
+The [actual-model conversation runner](../../runtime/sotto-chat/evals/README.md) exercises multi-turn chat, skill loading, receiver admission, queued research and final delivery with synthetic source/transport boundaries. It complements these brief evals; neither claims unexercised capabilities passed.
+
+### Chronological retained-history replay
+
+Build with `tools/build_golden_corpus.py --chronological` (alongside the existing required
+arguments) to replay all retained days in order at day end. This mode omits today's
+ledger, preferences, Contacts cards and reminders. It refuses day sampling and nonempty
+current-state seeds; the ordinary snapshot mode remains available for output comparisons.
+
+This removes current-state seeding, not every historical limitation: retained messages
+are their current versions, not an edit/unsend archive, and current identifiers are
+used only to pseudonymize identities. Review labels before calling a run acceptance.
+Never publish the corpus or identity map.
+
+Chronological event replay runs before that day's composition and learning, sorts inbound
+events across sources by their observed timestamps, and bounds conversation context to
+each event's time. Later outbound replies become context only for later events. Missing
+inbound timestamps fail the replay instead of guessing an order. The run signature records
+this replay policy; baselines from the previous ordering require reviewed replacement.
+
+## Historical source correction inspection
+
+The synthetic automatic-admission/worker inspection was retired with that dormant runtime.
+Versioned native reads, source authority fences and graph provenance projections retain their
+unit coverage. Historical ledgers remain untouched; no automatic edit/unsend withdrawal is enabled.
+
+### Advance meeting preparation fixture
+
+`early_prep_day` supplies two invented external calendar events: a routine check-in one hour
+away and a decision review 54 hours away whose invitation explicitly requests comparing three
+rollout plans and preparing migration-risk questions. The existing useful-help writer and critic
+are instructed to consider concrete advance work within the current 72-hour calendar window.
+The deterministic fixture supplies its extraction; the real composer must preserve its exact
+calendar action/source, attach the concise briefing offer to the source meeting title beside the visible full attendee
+name and task clause, keep the nearer meeting only under the source-generated Coming Up
+heading without a prep offer or optional action sectionType, and create no
+ledger obligation from either calendar action. It verifies rendering and continuity machinery,
+not whether a model chooses the right meeting or writes useful preparation. The production
+renderer also withholds a prep offer unless complete calendar coverage proves one exact source
+event/start; equal titles do not override that occurrence proof, and human-readable action time is display text. The action and
+preparation paragraph remain visible when the offer cannot be proved safe. A single rendered
+prep offer can join the existing accepted-delivery offer mechanism; mixed actionable offers
+remain ambiguous to a generic yes, and retry preserves the original expiry.
+
+Actual-model acceptance remains pending. Use this same fixture input and the existing brief
+composer/critic with the approved candidate model configuration and allowance; inspect the
+complete resulting narrative/actions, not only a critic score. The meaningful judgment is that
+the evidenced comparison earns advance attention while the routine nearer meeting does not.
+Require faithful dates, concrete work/reason, source/occurrence binding, no invented urgency or
+commitment inventory, and a usable existing prep offer. The existing `--live` mode scores all
+fixtures and uses its configured native model path; it does not by itself qualify the approved
+proxy configuration, an owner request, provider delivery or a device's presentation. No model
+was called to author or validate this fixture.

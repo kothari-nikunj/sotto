@@ -1,318 +1,109 @@
-# Deploying Sotto to Railway — click-by-click
+# Deploying Sotto to Railway
+
+The maintainer source-build Railway helper is `tools/setup_selfhost_railway.py`. It creates a
+fresh service, `/data` volume and public domain, stores a private launch envelope as the
+service's `SOTTO_SELFHOST_LAUNCH` variable, and builds the repository's root `Dockerfile` (the
+supervised Sotto image: Node chat runtime, trigger receiver, skills and the root bootstrap under
+Tini) from a pinned clean checkout. The step-by-step, including the exact config file and every
+resume case, is the [maintainer helper reference](docs/MAINTAINER-RAILWAY-HELPER.md#self-hosted-on-railway-supervised-sotto-photon).
+This page is the Railway-side reference: what the helper builds, what you do after it, every
+environment variable, and troubleshooting. What happens inside the container at boot is described
+once, in [docs/ARCHITECTURE.md § Boot](docs/ARCHITECTURE.md#boot).
+
+The helper installs; it does not upgrade. It refuses any service, volume or state it did not
+create, so an installed service is not updated by rerunning it (see [Staying updated](#staying-updated)).
+The helper covers Photon iMessage only. A Telegram owner bot is a separate, limited self-host
+profile with its own operator-file setup: [adapters/sotto/SELFHOST.md](adapters/sotto/SELFHOST.md#telegram-owner-bot).
 
 For an existing hosted deployment, verify its explicit service target and scheduler ownership using the [bounded work runbook](docs/BOUNDED-MODEL-WORK.md#deployment-ownership-and-rollout).
 
-This is the click-by-click Railway setup for the public Sotto runtime (Hermes + skills + trigger receiver).
-The supported fresh-install route is a manual GitHub deployment. No verified Photon one-click
-deployment is currently published. The checked-in [Photon preset contract](deploy/railway-photon-preset.json)
-records the required settings and has a local validator; it is not a Railway-importable template file.
-Railway templates are created and managed in Railway's template editor. The Mac side (Bridge) is tunnel-free —
-[download the signed app from GitHub Releases](https://github.com/kothari-nikunj/sotto/releases/latest),
-then see §8.
+The opt-in Sotto managed and self-host provisioners leave `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`
+unset. In the live managed pilot, adding `60` coincided with bootstrap refusing its required process
+topology; the same image started after the setting was removed. Railway's mechanism is unconfirmed,
+so check and remove that setting on an existing service before updating it. Railway's default
+zero-second drain does not guarantee the supervisor time for graceful cleanup on redeploy; restart
+recovery must handle an interrupted stop. See [Railway deployment teardown](https://docs.railway.com/deployments/deployment-teardown).
+The supervisor signals Node with `SIGUSR2`. The Node Bridge client uses direct authenticated
+loopback JSON-RPC without MCP SDK exit hooks. Direct bare-Node `SIGTERM`/`SIGHUP` still lacks the
+supervisor's verified process drain and is not the supported shutdown path.
 
-**For self-hosted iMessage:** use the manual GitHub deployment with your own Photon project and
-connection. Set the [Photon variables](CHANNELS.md#photon-imessage-and-photo-briefs), Gemini key and
-unique Bridge secret, and attach the volume and public domain. Railway does not provision Photon
-credentials or a messaging line. The same public runtime supports Telegram and Photon.
-
-> **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the self-host walkthrough. Leave
-> Railway's Root Directory blank; the Dockerfile is at the repository root.
+> **New to this? Start with [ONBOARDING.md](ONBOARDING.md)** — the self-host walkthrough.
 
 ## 0. Before you start (prerequisites)
 
 - **A Railway account on a paid (or verified) plan.** Volumes and always-on services are not
-  available on the free/trial tier, and Sotto needs both — the `/data` volume keeps your channel link
-  + memory, and the 6:30/17:30 cron briefs need the container running around the clock.
+  available on the free/trial tier, and Sotto needs both — the `/data` volume keeps your
+  credentials and memory, and the 6:30/17:30 briefs need the container running around the clock.
+- **A fresh, single-environment Railway project**, selected by its exact project and environment
+  IDs. The helper refuses a project containing unrelated services.
 - **A Gemini API key** ([aistudio.google.com](https://aistudio.google.com) → Get API key).
-- **A delivery provider** — your own Photon project and connection for iMessage, a Telegram bot token
-  from [@BotFather](https://t.me/BotFather), or the WhatsApp variables in step 5.
-- **This repo on your GitHub** (fork or push it) so Railway can deploy from it.
+- **Your own Photon Spectrum Cloud project** with a working iMessage line: its project ID and
+  secret, and the physical line's number. Creating a Railway service or installing the Mac Bridge
+  does not allocate that line. See [CHANNELS.md](CHANNELS.md#photon-imessage).
+- **The owner's phone number** in `+E.164` form — the number you message Sotto from.
+- **Python 3.11 or newer, Git and a signed-in Railway CLI** that supports `railway api`.
+- **A clean checkout of this repository.** The helper uploads only the pinned tracked files.
 
-## Manual-deploy essentials
+## 1. Run the setup helper
 
-Complete these service settings before opening the setup link:
+Follow [the maintainer helper reference](docs/MAINTAINER-RAILWAY-HELPER.md#self-hosted-on-railway-supervised-sotto-photon):
+derive the source pins with `--inspect-source`, write the protected mode-`0600` config outside the
+checkout, then run the helper with that config and a state file. Rerun the same command with the
+same files after any interruption; the helper reconciles each step with what Railway shows and
+never sends a create, upload or start setting twice unless you pass `--retry-unconfirmed`.
 
-1. **Root Directory** — leave blank; the Dockerfile is at the repository root. Details:
-   [step 2](#2-builder--build-context-critical).
-2. **Variables** — Settings ▸ Variables ([step 5](#5-variables)):
-   - `GOOGLE_AI_API_KEY` = your Gemini key. The boot script also accepts `GEMINI_API_KEY` or
-     `GOOGLE_API_KEY` and maps whichever is set to all three names.
-   - For Telegram, `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) gave you —
-     then use the private pairing link printed during boot. For iMessage, omit it and use the
-     [Photon settings](CHANNELS.md#photon-imessage-and-photo-briefs). WhatsApp: step 5.
-   - For Photon, set `SOTTO_CRON_DELIVER=photon` and the four `PHOTON_*` values in the Photon guide.
-   - `SOTTO_USER_EMAIL` = your primary email — **optional; auto-derived after you connect Google**
-     on the `/setup` wizard. Set it only to force a different address than the account you connect.
-   - `BRIDGE_TOKEN` = a long random secret — generate one: `openssl rand -hex 24`. **Not optional.**
-     Without it the Mac pairing link on `/setup` carries an **empty token** — the app looks paired
-     but pairing **silently fails**. Set it *before* you first open the setup link.
-3. **Volume mounted at `/data`** — [step 3](#3-add-a-volume-persistent-storage--required). Without
-   it every redeploy wipes the channel link, Google token, and all of Sotto's memory.
-4. **Generate the public domain BEFORE opening the setup link** —
-   [step 4](#4-generate-a-public-domain-so-the-mac-can-reach-it). Without a domain, the setup link
-   printed in the deploy logs **falls back to `http://localhost:…`** (useless), and the Mac pairing
-   link has no reachable host. Generate the domain, redeploy, then open the freshly logged link.
+## 2. What the helper creates
 
-With those four in place, steps 1–8 below are the full click-by-click.
+| Railway object | Value |
+|---|---|
+| Service | one marked service, built with the `DOCKERFILE` builder from the root `Dockerfile`, `/health` health check |
+| Volume | one volume mounted at `/data` (must be a truly empty ext4 filesystem) |
+| Domain | one public domain targeting port 8080, created before the first deployment |
+| Variables | exactly `SOTTO_SETUP_REQUEST` and `SOTTO_SELFHOST_LAUNCH`; any other non-`RAILWAY_*` variable makes the helper stop |
+| Deployments | first the one-time `selfhost_bootstrap.py --prepare` start command, then `selfhost_bootstrap.py --run` on the same volume |
 
-## 1. Create the service
-Railway dashboard ▸ **New Project** ▸ **Deploy from GitHub repo** ▸ pick your repo.
+The launch envelope holds the owner and line identity, the generated runtime, Bridge and control
+tokens, the Photon and Gemini credentials, the timezone from your config, and the Railway IDs it
+is bound to. The bootstrap refuses to start when Railway's injected metadata no longer matches it.
+Do not edit either variable by hand.
 
-## 2. Builder + build context (CRITICAL)
-The `Dockerfile` sits at the **repository root**, and its `COPY` lines are relative to that folder.
+The `--prepare` deployment prepares the empty volume and then serves only `/health` for at most
+15 minutes. The `--run` deployment starts the root supervisor, which runs Node chat and the
+receiver; it is also the command for every same-volume restart. The helper never sends a message,
+creates a Google OAuth client or makes a paid model probe, so its `receiver_reachable` result
+proves reachability only.
 
-> The repo ships a `railway.toml` that already pins `builder = "DOCKERFILE"` — on most deploys
-> Railway honors it and the settings below are just what to verify (or set when the UI disagrees).
+## 3. Open your setup link
 
-- **Settings ▸ Build ▸ Builder** → **Dockerfile**
-- Leave **Root Directory** and **Dockerfile Path** blank. Railway auto-detects `./Dockerfile`; context = repo root. Done.
+Use [the private setup surface](ONBOARDING.md#source-created-server-private-setup-surface).
 
-> Why blank: Railway auto-detects the root `Dockerfile`, and its `COPY` paths resolve from the repository root.
+## 4. Connect Google (Gmail + Calendar)
 
-## 3. Add a Volume (persistent storage — required)
-The knowledge graph, continuity ledger, style profile, briefs, **and the WhatsApp login session** live
-here. Without it, every restart wipes them.
+Follow [self-host Google recovery and diagnostics](ONBOARDING.md#self-host-google-recovery-and-diagnostics).
 
-- In the service, press **⌘K / Ctrl+K** (or right-click the service card) ▸ **Add Volume**.
-- **Mount path:** `/data`
-- Save → it prompts a redeploy.
+## 5. Connect Granola (optional, one click)
 
-> Railway only persists **runtime** writes to a volume (build-time writes don't stick). Sotto writes at
-> runtime and `$SOTTO_DATA=/data` is already set in the image, so this just works. `start.sh` also routes
-> Hermes' own state (session/config/SOUL) onto `/data` so redeploys don't force a WhatsApp re-scan.
+Follow [connected-service protocol and diagnostics](ONBOARDING.md#connected-service-protocol-and-diagnostics).
 
-## 4. Generate a public domain (so the Mac can reach it)
-The Bridge on your Mac pushes "I'm awake" events to the cloud, so the container needs a public URL.
+## 6. Say hello on Photon
 
-- **Settings ▸ Networking ▸ Generate Domain** → gives `https://<app>.up.railway.app`.
-- Your trigger endpoint is that URL + `/sotto/trigger`. Use it as `--trigger-url` on the Mac.
-- **Do this before opening the setup link** (step 6). The `[sotto] Setup link` line in the deploy
-  logs is built from the public domain — with no domain it falls back to `http://localhost:…` and
-  nothing on it (wizard, pairing link, QR page) is reachable. Generate the domain, redeploy, use the
-  new logged link.
+Use [the source-created server's Photon receipt checks](ONBOARDING.md#source-created-server-photon-receipt).
 
-> Don't set `PORT` yourself — Railway injects it and the trigger receiver binds `0.0.0.0:$PORT`. The
-> generated domain routes to that receiver.
+## 7. Wait for the first brief
 
-## 5. Variables
-**Settings ▸ Variables:**
-- `GOOGLE_AI_API_KEY` = your Gemini key (any 1M-context model). Google's own docs sometimes call it
-  `GEMINI_API_KEY` or `GOOGLE_API_KEY` — boot accepts any of the three names and maps it to all three.
-- `TELEGRAM_BOT_TOKEN` = the token [@BotFather](https://t.me/BotFather) replies with (`/newbot`).
-  **The only channel variable you need:** the boot log prints a one-tap link
-  (`https://t.me/<your-bot>?start=<this deploy's setup code>`); tap it within five minutes and your
-  chat id is written into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` for you
-  (remembered on the `/data` volume, so it happens once). A message that doesn't carry the code is
-  ignored — a bot's username is discoverable, so an unauthenticated capture would hand your briefs
-  to whoever messaged first. Set `TELEGRAM_ALLOWED_USERS` yourself and the capture never runs.
-- `SOTTO_USER_EMAIL` = your primary email — **optional; auto-derived after you connect Google.**
-  It's how Sotto recognizes YOU — skips researching you as a meeting attendee, keeps the
-  post-meeting tap from naming you as your own guest, and adds you to the guest list on invites it
-  creates so they look exactly like ones you sent yourself — and the `/setup` connect now *learns*
-  it from the account you authorize (persisted to `/data/config/settings.json`). Set this variable
-  only to override that with a different address.
-- `BRIDGE_TOKEN` = the Mac↔cloud shared bearer — **required on a manual deploy**; generate it with
-  `openssl rand -hex 24`. Plainly: without it the
-  pairing link the `/setup` wizard renders carries an **empty token**, so Mac pairing **silently
-  fails** — set it before you open the setup link. No `BRIDGE_URL` exists anymore — the Mac dials
-  *out* to this host's relay.
-  *(The wake-push authenticates with `BRIDGE_TOKEN` too — `SOTTO_TRIGGER_TOKEN` exists only if you want a separate bearer for it.)*
-
-> `start.sh` writes these into `~/.hermes/.env` on boot — Hermes reads messaging-platform settings
-> from `.env`, not `config.yaml`. Keep access restricted to your owner identity. Do not enable
-> `GATEWAY_ALLOW_ALL_USERS` to work around a pairing or sender mismatch.
-
-**Want Photon iMessage instead?** Set `SOTTO_CRON_DELIVER=photon`, `PHOTON_PROJECT_ID`,
-`PHOTON_PROJECT_SECRET`, `PHOTON_HOME_CHANNEL` and `PHOTON_ALLOWED_USERS` as described in
-[the complete Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs). The last two identify
-you, not Sotto's sending number. Boot installs the shared adapter automatically. Self-host leaves
-`SOTTO_DEPLOYMENT_MODE` unset; iMessage does not require selecting Sotto Cloud in the Mac app.
-
-**Which channel?** One sentence decides it, and the boot log says which and why: *Sotto delivers to
-Telegram unless this volume already holds a paired WhatsApp session and no `TELEGRAM_BOT_TOKEN` is
-set.* So a fresh deploy is Telegram, an instance that was set up on WhatsApp keeps WhatsApp across
-redeploys with nothing to set, and `SOTTO_CRON_DELIVER` overrides both. The managed Cloud pilot
-(`SOTTO_DEPLOYMENT_MODE=managed`) is the one exception: its boot fixes `SOTTO_CRON_DELIVER=photon`
-and does not read the resolver above ([adapters/hermes/README.md](adapters/hermes/README.md)).
-
-**Want WhatsApp instead?** Three variables, and nothing about it was removed — the container still
-pairs it for you and serves the QR at `/whatsapp/qr`:
-
-- `WHATSAPP_ENABLED` = `true` — runs the boot-time pairing step and the WhatsApp gateway.
-- `WHATSAPP_ALLOWED_USERS` = your number with country code, no `+` (e.g. `15551234567`). Hermes
-  **denies all users until this is set**.
-- `WHATSAPP_HOME_CHANNEL` = same number — where the brief is delivered proactively.
-- …plus `SOTTO_CRON_DELIVER` = `whatsapp` to move the briefs there (`local`, or whatever name
-  `hermes gateway setup` registered for BlueBubbles/iMessage, work the same way).
-
-Every channel variable (`WHATSAPP_*`, `TELEGRAM_*`, `BLUEBUBBLES_*`, `SIGNAL_*`, `DISCORD_*`,
-`SLACK_*`) is forwarded into `~/.hermes/.env` on every boot **by prefix** — these names belong to
-Hermes, not Sotto, and the boot log prints `[sotto] gateway variable forwarded to Hermes: <NAME>` for
-each. Which names your Hermes wants, how tested each channel is, and the per-channel walkthroughs:
-**[CHANNELS.md](CHANNELS.md)**.
-
-## 6. Deploy + link your channel
-*(On Telegram — the default — there is no QR: the deploy log prints a one-tap
-`https://t.me/…?start=…` link, you tap it, and the log reads `[sotto] telegram linked ✓`. The
-pairing half of this section is the WhatsApp path, which runs only with `WHATSAPP_ENABLED=true`.)*
-
-- **Deploy.** Watch the **Deploy logs** — Hermes installs here (a failure is loud by design). Grab the
-  **setup link** they print (the line starting **`[sotto] Setup link`**): the setup pages (`/setup`,
-  `/whatsapp/qr`, `/google/*`, `/debug/google`) are gated behind that link's access code. Open it once
-  and a cookie covers the rest; lost it? it reprints on every boot (or read `/data/setup_code`).
-  `SOTTO_SETUP_CODE` optionally pins the code. Old bare bookmarks (no `?code=`) now return 403.
-- On the Telegram path there is nothing to open: boot runs the chat-id capture and the log reads
-  `[sotto] telegram linked ✓ — briefs and nudges deliver to chat …`. (`telegram NOT linked yet` means
-  your message missed the five-minute window — text the bot and restart the deploy.)
-- With `WHATSAPP_ENABLED=true`, first boot instead runs `hermes whatsapp` (the pairing step — the
-  gateway itself won't pair) and prints a QR. **Scan it from the clean web page, not the deploy logs**
-  (Railway's log viewer distorts the terminal QR):
-  - open **`/whatsapp/qr`** via the logged setup link (or from the `/setup` wizard — the code rides along),
-  - WhatsApp ▸ **Linked Devices** ▸ Link a Device ▸ scan.
-  `creds.json` persists on `/data`, so later boots skip pairing and go straight to the gateway.
-
-## 6b. Connect Google (Gmail + Calendar)
-Use the browser flow from `/setup`:
-1. **Create a Web application OAuth client** (one-time): [console.cloud.google.com](https://console.cloud.google.com) →
-   new project → enable **Gmail API** + **Google Calendar API** → **OAuth consent screen** in the left
-   nav (newer consoles call this page **Google Auth Platform**) → audience **External** → **Publish
-   app** so the status reads **In production** → Credentials → **OAuth client ID → Web application**.
-   > ⚠️ **The day-8 trap:** a consent screen left in **Testing** issues refresh tokens that **expire
-   > after ~7 days** — Google silently disconnects and every brief loses Gmail/Calendar on day 8.
-   > Set the app to **In production** (Google does *not* require verification for you using your own
-   > data — ignore the scary "needs verification" banner).
-
-   Under **Authorized redirect URIs**, enter the exact callback displayed in `/setup`:
-   `https://<RAILWAY_PUBLIC_DOMAIN>/google/oauth/callback`. Download the Web client JSON.
-   *(Workspace accounts: if your org blocks unverified apps, allowlist the client in Admin console, or use a personal account.)*
-2. Paste the JSON into the `/setup` Google box and click **Continue with Google**. Approve access
-   on Google's page; the browser returns automatically to Sotto and shows a clean success page.
-   Authorization uses browser-bound, single-use PKCE and state. No code is copied from a
-   `localhost:1` page. The token persists on `/data` and auto-refreshes.
-   Existing connected Desktop-client tokens continue to work. To authorize again from a Desktop
-   client, replace the client in `/setup` with the Web client JSON. If sign-in fails because the
-   saved client's secret was rotated or deleted, it belongs to another project, or the callback is
-   not registered, choose **Use a different Google client** in `/setup` or on the retry page; an
-   existing token keeps working until the new client connects.
-   `GOOGLE_AUTH_CODE` is no longer used; boot logs a reminder to remove it. Boot seeds
-   `GOOGLE_OAUTH_CLIENT_JSON` only when no client is already saved. Boot does not create a consent URL.
-3. **Verify any time:** open **`/debug/google`** (setup code/cookie required) — it returns `{"google_connected": true}` when the
-   token works. Google is **server-side and Bridge-independent**: if this says connected, every cron
-   brief gets fresh Gmail + Calendar even with the Mac asleep. If a brief says "Google isn't connected"
-   but this says `true`, the agent skipped the gather — not an auth problem. (Local data is the only
-   thing that's cached as an offline backup; Google is always fetched live.)
-   This self-host flow leaves the Mac Bridge unchanged and uses no Sotto OAuth broker.
-
-## 6c. Connect Granola (optional, one click)
-Granola connects from the **`/setup` wizard → Connected services** tile: click **Connect**, approve
-on Granola's consent screen in your browser, done. Under the hood the receiver registers *itself*
-with Granola's remote MCP (OAuth 2.1 Dynamic Client Registration + PKCE — no pre-registered client,
-no secret) and stores the access+refresh tokens on `/data` (`connectors/granola.json`); briefs,
-meeting prep, and follow-ups then gather meeting notes + **transcripts** headlessly. Works on **any
-Granola plan** — it's your login, not a Business-only API key. No env vars, no redeploy; the boot
-log shows `granola connector: linked` once connected. If the flow fails, the error page names the
-exact step (discovery / registration / state / exchange) + the provider's error. Full doctrine:
-[INTEGRATIONS.md](INTEGRATIONS.md).
-
-Fallbacks, only if you want them:
-- `GRANOLA_API_KEY` — break-glass **official REST API** mode (`https://public-api.granola.ai/v1`;
-  Business/Enterprise plans mint the `grn_…` keys in Granola's settings).
-- `GRANOLA_MCP_CMD` (+ `GRANOLA_API_TOKEN`) — legacy: register your own stdio Granola MCP server;
-  `start.sh` writes the `mcp_servers.granola` entry and passes the token under the common env names.
-
-Granola is optional — fine to skip and ship Gmail + Calendar + the Bridge first.
-
-## 6d. X attendee context (optional)
-
-Set `X_BEARER_TOKEN` on the instance service to read public profiles and recent Posts for upcoming
-meeting attendees. Optional bookmarks additionally require `X_USER_ACCESS_TOKEN` with bookmark
-read access and `X_OWNER_USER_ID`. These are your own X app credentials, separate from Google or
-Granola sign-in. Set secrets in Railway Variables, never in chat or source control, then redeploy
-the instance so its processes inherit them. The same variables work in self-host.
-
-The authenticated dashboard's `/api/overview` source diagnostics report X as `unconfigured` when
-credentials are absent, `unverified` until a real request succeeds, and `degraded` after an API
-failure. A token's presence alone never proves the API works. The record includes a last-success
-timestamp and safe error categories; it does not include handles or private saved Posts. Ordinary
-background prep performs the check when there are eligible attendees, with no additional probe
-or paid call scheduled just for health. Removing the credentials stops use of staged X material
-and invalidates queued messages that used it. Public-profile facts already in the graph remain
-editable memory. X is optional; briefs still use web research, meeting notes and your history.
-
-## 7. Talk to Sotto
-On **Photon iMessage**, send a hello from your configured owner identity to the address of your
-Photon connection. Confirm the reply in Messages, then connect a context source on `/setup` and
-wait for the automatic first brief. The delivery channel does not require an always-awake Mac.
-
-On **Telegram** (the default) you talk to Sotto in the chat with your bot:
-- Send **"hi"** → the agent replies, and reacts to your message as status (👀 working · ✅ replied ·
-  ❌ error; `SOTTO_REACTIONS=0` turns the tapbacks off).
-- A reply confirms the chat round-trip (Telegram → Hermes → Gemini). A useful brief also needs
-  a context source: Google (step 6), Granola (step 6c), or selected Mac sources through the
-  optional **Bridge** (step 8). See [ONBOARDING.md](ONBOARDING.md).
-
-On **WhatsApp**, Sotto defaults to **personal number / self-chat** (`SOTTO_WHATSAPP_MODE=2` — the
-installer answers this for you), so *your own WhatsApp is the bot* and you talk to Sotto by
-**messaging yourself**: WhatsApp ▸ new chat ▸ **"Message Yourself"** (your name with "(You)"), or
-search your own number. Its replies are prefixed ***Sotto*** so you can tell them from yours
-(`start.sh` sets `whatsapp.reply_prefix`; `SOTTO_HIDE_AGENT_NAME=1` drops it). *(Prefer a dedicated
-bot number instead of self-chat? Set `SOTTO_WHATSAPP_MODE=1` and pair a second WhatsApp number — then
-people message that number directly.)*
+Use [the source-created server's first-brief checks](ONBOARDING.md#source-created-server-first-brief).
 
 ## 8. Connect the Mac Bridge (local iMessage/SMS/calls)
-Gmail + Calendar come from Google; your **local** signals come from the Sotto Bridge on your Mac. It
-connects **tunnel-free**: the Mac dials *out* to this Railway host, so there's nothing to expose — no
-Cloudflare, no domain, no inbound port. How the reverse link works end to end: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (the relay module).
 
-1. **Railway → Variables:** make sure `BRIDGE_TOKEN` is set — the shared bearer. The setup helper
-   generates it automatically (you never see or type it); on a manual deploy, set a long random secret
-   you pick (`openssl rand -hex 24`) and redeploy. `start.sh` registers `sotto-local` at the host's own
-   always-up relay (`/mcp`), so Hermes never 530s even when your Mac is asleep. Either way you won't
-   type the token into the Mac app — the pairing link below carries it. *(The wake-push uses
-   `BRIDGE_TOKEN` too; `SOTTO_TRIGGER_TOKEN` only exists to give it a separate bearer.)*
-2. **On your Mac:** install the signed **Sotto Bridge** menu bar app — [download it from GitHub
-   Releases](https://github.com/kothari-nikunj/sotto/releases/latest); it ships as a signed DMG
-   only (the Bridge source isn't in this repo) — then **pair it in one click**:
-   - Open the **setup link from the deploy logs** (step 6 — `/setup` needs its access code) on that Mac
-     → click **“Open in Sotto Bridge”**. It fills the host + token (no typing, and the host always
-     carries `https://`).
-   - *Fallback:* copy the **pairing code** in the wizard and paste it into the app's **“Paste pairing
-     link”** field. Or enter **Host URL** + **Bridge token** (`BRIDGE_TOKEN`) manually.
-   - Grant **Full Disk Access** when prompted; flip **Start at login** on.
-   The app supervises `sotto-bridged --connect …` (dials out) — the menu bar dot turns solid when
-   connected, and reloading `/setup` shows tile ① as **DONE** ("Your Mac is linked and reachable").
-   Then message **"Sotto, set up"** — it probes the Bridge's health and, if Full Disk Access is
-   missing, says so in plain words and waits for you rather than proceeding half-blind.
-   *(Prefer no GUI? Run it directly: `sotto-bridged --connect https://your-app.up.railway.app --token <BRIDGE_TOKEN>`.)*
-   - **Diagnose a source before connecting:** run `sotto-bridged --doctor` — a read-only, per-source
-     readout (each local source prints `ok (N rows readable)` / `needs Full Disk Access` /
-     `unavailable`, plus the exact "grant FDA to the *right* app" fix). It writes nothing and touches
-     no network; exit `0` means every enabled source reads. **`ok (0 rows readable)` means nothing
-     matched in the last 6 hours** — the probe window, not a lifetime count — so a source you haven't
-     used since lunch is still `ok`. See the troubleshooting table below.
-
-> The auto wake-push (brief fires the instant your Mac wakes) is optional — the **6:30/17:30 cron**
-> fires the brief regardless, and you can ask for one anytime. If the Bridge is offline at brief time,
-> the brief degrades to the last cached snapshot. And if a triggered brief dies mid-run, its claim goes
-> stale after **30 minutes** and the next trigger retries it — no silently lost briefs.
+Follow [the source-created server's Bridge diagnostics](ONBOARDING.md#source-created-server-bridge-diagnostics).
 
 ## Railway template status
 
-The previous Telegram template button is not a verified deployment route and must not be presented
-as one-click setup. The checked-in [`deploy/railway-photon-preset.json`](deploy/railway-photon-preset.json)
-is a review contract for a future Photon template, not Railway's native template schema. Validate its
-local invariants with:
-
-```bash
-python3 tools/verify_railway_photon_preset.py
-python3 -m pytest -q tools/test_railway_photon_preset.py
-```
-
-Before sharing a Railway template link, create it in Railway's Template Editor from a clean service,
-verify its generated secret, service source, `/data` volume, networking/domain, variables and owner
-allowlist against that contract, then deploy it from a fresh Railway account and verify first visible
-delivery. Railway's documented template functions include `${{secret(48)}}`; the template itself is
-created and published in Railway, not imported from this JSON contract.
+No Railway template is published, and none is a verified deployment route: the supported fresh
+install is the setup helper, whose private launch envelope binds the service, volume and domain IDs
+Railway assigns at creation. Before sharing a Railway template link, create it in Railway's Template
+Editor from a clean service and deploy it from a fresh Railway account through first visible
+delivery.
 
 ## The dashboard
 
@@ -322,121 +113,137 @@ glance, open loops with one-tap resolve, the archive of every delivered brief, e
 **setup code** — the same code in the `[sotto] Setup link` line of your boot logs (also on the volume
 at `/data/setup_code`) — and the session lasts **30 days**. Five wrong codes lock that visitor's login
 for **60 seconds**, doubling on each repeat offense up to a 15-minute ceiling: wait it out and retry
-with the code from your boot log rather than guessing again. `SOTTO_DASHBOARD=0` turns the
-whole surface off (`/app` and `/api/*` answer 404).
+with the code from your boot log rather than guessing again.
 
 ## Personal routines (your own scheduled jobs)
+
 Say a recurring job in plain language — *"every Friday at 4, summarize my open loops by person"* —
-and Sotto proposes it back in words, then registers it as a real cron on **your** clock (the zone
-from `/setup`, no UTC math). *"What routines do I have"* lists them; *"stop the Friday summary"*
-removes one. The `sotto-routines` skill owns this.
+and Sotto shows the full proposal back; only a distinct later yes creates it. *"What routines do I
+have"* lists them, and you can adjust or cancel one the same way. The receiver stores the
+definitions in `runtime/owner-routines.json` and fires them from its own minute heartbeat through
+the same work queue and outbox as the system jobs.
 
 | Rule | Why it matters |
 |---|---|
-| **Every personal routine is named `user-<slug>`** — that prefix is the FENCE | Boot (`start.sh`) removes stale Hermes registrations for Sotto's five receiver-owned system jobs; the shared receiver schedule owns them in Cloud and receiver-based self-host. Reconciliation skips `user-` jobs entirely, so a redeploy never eats your routine. Sotto also never *removes* a job without that prefix, and never creates one with it that shadows a system job. The five system jobs live in `adapters/hermes/crons.json` — the one schedule source — and are changed via *set up Sotto*, not here. |
-| **Cap: 10 routines** | The 11th asks which one to drop rather than growing an unread schedule. |
-| **Delivery** | Routines land wherever `SOTTO_CRON_DELIVER` points (default: your Telegram chat) — same target as the briefs. Boot disables Hermes' generic `Cronjob Response` envelope, so briefs, nudges, and routines arrive as their clean user-facing copy rather than with a job id and scheduler footer. Routines draft; they never send on your behalf, and a routine cannot schedule another routine. |
-| **Timezone changes don't move existing routines (v1)** | Hermes captures the zone when a job is created. Changing your timezone updates Sotto's system jobs on the next receiver tick — your personal routines keep firing on the **old** clock until you recreate them (ask Sotto to; it's one line each). |
+| **The five system jobs are not routines** | They are declared once in `adapters/sotto/crons.json` and fire on the receiver's clock. A routine can never shadow or remove one. |
+| **Cap: 10 active routines** | The 11th asks which one to drop rather than growing an unread schedule. |
+| **Delivery** | Routines land on your owner channel, the same target as the briefs. Routines draft; they never send on your behalf. |
+| **Each routine keeps the zone it was created in** | The routine stores its timezone with its definition, so a later zone change does not move it; recreate it to move it. |
 
 ## Environment variables — full reference
 
-**If a setting isn't here, Sotto has a good default and there is nothing to tune.** This table is
-the whole surface: credentials, and the choices two reasonable people would make differently. The
-numbers behind the behaviour — tap windows, valve rates, escalation and staleness thresholds,
-research caps — are named constants in the code that owns them, not variables you set.
+**On the supervised image, the receiver and Node never see Railway's ambient variables.** The
+bootstrap clears its environment, and the supervisor builds each child's environment explicitly
+from the launch envelope (`adapters/sotto/process_handoff.py`). So the table below has four groups:
+the Railway variables you or the helper actually set; values the supervisor injects from the
+envelope; values one receiver run hands its own child; and settings the code reads that the
+supervised launch never passes, so each keeps its default. The numbers behind the behaviour — tap
+windows, valve rates, escalation and staleness thresholds, research caps — are named constants in
+the code that owns them, not variables.
+
+**Railway service variables**
 
 | Variable | Purpose | When |
 |---|---|---|
-| `SOTTO_DEPLOYMENT_MODE` | `self-host` (default) or `managed`; managed mode requires the operator-provided settings below and Photon owner configuration. | managed operator only |
-| `SOTTO_TENANT_ID` | Stable managed tenant identity; capability/activation receipts must match. | managed operator only |
-| `SOTTO_MODEL_PROXY_URL` | HTTPS proxy root; native pipeline uses `/native/v1beta`, Hermes uses `/openai/v1`. Also required for metered self-host background history/Dreamer. | managed or metered background |
-| `SOTTO_MODEL_PROXY_TOKEN` | Tenant model bearer for both routes. The receiver renews its expiry through the proxy; bearer rotation remains an explicit operator change. Also pairs with the proxy URL for self-host background learning. | managed or metered background |
-| `SOTTO_CONTROL_TOKEN` | Independent receiver/account bootstrap and model lease credential. Keep out of Hermes and worker environments; configure its SHA-256 as the proxy tenant’s `renewal_token_sha256`. | managed operator only |
-| `SOTTO_VOLUME_ID` | Identity of the real attached managed volume. Initialize `.sotto-volume.json` explicitly before first upgraded boot; a missing/mismatched mount stops startup. | required in managed mode |
-| `SOTTO_IMESSAGE_NUMBER` | This tenant's assigned Sotto number, displayed after pairing and excluded from Bridge iMessage context. | managed operator only |
-| `SOTTO_PROXY_TENANTS` | Proxy service only: configured tenant token hashes, expiry and admission budgets; never set on a tenant instance. Pilot provisioning only. | proxy operator only |
-| `SOTTO_DATA` | the exhaust volume path — **do not set**; baked into the image as `/data` (listed so the table stays the whole surface). The setup helper sets the same `/data` value explicitly; leave it. | never (helper sets `/data`) |
-| `SOTTO_SETUP_REQUEST` | ownership marker written by the setup helper; a resume refuses a service whose marker is missing or different ("not owned by this setup"). Set by the helper — leave it alone; a manual deploy never sets it. | helper only |
-| `GOOGLE_AI_API_KEY` | LLM key (Gemini, 1M ctx). **Required for self-host briefs** — the brief/prep/follow-up/triage pipeline posts to Gemini's REST API directly, so no other vendor's key substitutes for it today. `start.sh` maps it to `GEMINI_API_KEY`/`GOOGLE_API_KEY` so Hermes' chat model uses it too; that half is switchable ([CHANNELS.md](CHANNELS.md#switching-the-chat-model), [docs/MODELS.md](docs/MODELS.md)). | **required** (step 5) |
-| `TELEGRAM_BOT_TOKEN` | your bot's token from [@BotFather](https://t.me/BotFather) — **the one channel variable on the default path**. Boot validates it, prints a one-tap `https://t.me/<bot>?start=<setup code>` link, waits up to five minutes for a message carrying that code (anything else is ignored, so a stranger who finds your bot can't claim it), and writes the chat id into Hermes as `TELEGRAM_ALLOWED_USERS` + `TELEGRAM_HOME_CHANNEL` (remembered on `/data`, so it happens once; a timeout just retries next boot). | **required** (default channel) |
-| `WHATSAPP_ALLOWED_USERS` | WhatsApp path only: who may use the bot — your number, country code, no `+` (e.g. `15551234567`). Deny-all until set. | optional (channel) |
-| `WHATSAPP_HOME_CHANNEL` | WhatsApp path only: where the brief is delivered proactively — your number. **Required for scheduled/proactive delivery there:** the 6:30/17:30 crons, proactive nudges, and follow-ups deliver to this channel — unset, they have nowhere to land (interactive chat still replies). | optional (channel) |
-| `SOTTO_TIMEZONE` | IANA zone (e.g. `America/Los_Angeles`) for the **6:30 morning / 17:30 evening** briefs + time injection. **Now optional** — the `/setup` wizard auto-detects your zone from the browser and persists it to `/data/config/settings.json`; the briefs move to the new zone on the next minute (the receiver's scheduler reads it every tick) and the agent's own crons are re-registered on the spot, no redeploy. Set this only to override the auto-detected zone. | optional |
-| `SOTTO_CRON_DELIVER` | **THE channel choice.** Where everything scheduled is delivered — briefs, midday digest, weekly pulse, proactive watcher, and your personal `user-` routines; there is no per-job override by design. Defaults to **`telegram`**, except on a volume that already holds a paired WhatsApp session with no `TELEGRAM_BOT_TOKEN` set, which stays `whatsapp` (so an existing deploy never loses its channel); set `photon`, `whatsapp`, `local`, or whatever name `hermes gateway setup` registered to choose. It is also the nudge delivery-gate — a channel Sotto can probe (Telegram's captured chat id, WhatsApp's session, Photon's authenticated owner DM) must be linked, and a channel with no probe at all never holds a nudge. An unlinked Telegram also keeps the gateway down, so your pairing message survives for the next boot. The boot log states the channel and why. See [CHANNELS.md](CHANNELS.md). | optional |
-| `WHATSAPP_ENABLED` | `true` runs the boot-time WhatsApp pairing step and the WhatsApp gateway. **Defaults to `false`**, except when WhatsApp is the resolved delivery channel (then `true`) — so nobody waits 15 minutes for a QR scan they never intended. | optional (channel) |
-| `WHATSAPP_*` · `TELEGRAM_*` · `BLUEBUBBLES_*` · `SIGNAL_*` · `DISCORD_*` · `SLACK_*` | **your channel's own variables** — these names belong to Hermes, not Sotto (run `hermes gateway setup` once to see the ones your version wants). Every variable you set with one of these prefixes is forwarded into `~/.hermes/.env` on boot, by prefix and with no channel special-cased; the boot log names each one it forwarded. Set none and nothing happens. | optional (channel) |
-| `SOTTO_USER_EMAIL` | your own email address; used to exclude yourself from attendee research and post-meeting taps, and to list you as a guest on invites Sotto creates. **Optional override — derived automatically from your Google account when you connect it** (the `From` of your own sent mail, persisted as `google_account_email` in `/data/config/settings.json`); set this only to force a different address. | optional |
-| `SOTTO_GEMINI_MODEL` | Override the Gemini model (default `gemini-3.8-flash`): the compose default and the model for native grounding, url_context and DocSend vision. Must be 1M-context. A proxy-backed background cycle also checks the effective primary against the proxy's advertised native models before fetching history. | optional |
-| `SOTTO_BRIEF_MODEL` | run the compose calls on another family: `openai/<model>` or `anthropic/<model>` (bare names mean gemini). Needs that family's key below; the model must clear the brief's 400K-token context floor. Gemini stays the default — set this only to bring the family you already pay for. | optional (model family) |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | that family's key when `SOTTO_BRIEF_MODEL`/`SOTTO_TRIAGE_MODEL` name it. | optional (model family) |
-| `SOTTO_OPENAI_BASE_URL` | point the openai family at any OpenAI-compatible endpoint (LiteLLM/OpenRouter proxy, a local gateway carrying your Codex or Claude **subscription** auth). With this set, `OPENAI_API_KEY` is optional. | optional (model family) |
-| `SOTTO_CRITIC` | the brief's second-pass Gemini **critic + revise** quality gate (`auto` \| `always` \| `off`, default `auto`). `auto` skips the two extra Gemini calls on a **small/low-risk** brief (rendered source payload `<15000` chars AND `≤5` actions) and runs them otherwise; `always` = every brief; `off` = never. | optional (quality) |
-| `SOTTO_FALLBACK_MODEL` | Backup model for a foreground brief on a 429/5xx/timeout. On Gemini it defaults to `gemini-3-flash-preview`; other families have no default. A cross-family value is refused and the backup must clear the same 400K context floor. Background history extraction and Dreamer use one primary attempt and leave retries to the next cycle; this setting does not affect them. | optional (resilience) |
-| `SOTTO_FALLBACK_API_KEY` | optional second Gemini key (different project) used for the fallback — dodges per-project quota (the 429 storm). Can be set alone (same model, backup key) or with `SOTTO_FALLBACK_MODEL`. | optional (resilience) |
-| `SOTTO_BACKGROUND_UNMETERED` | Exact `true` explicitly allows self-host history learning and Dreamer to use direct BYOK without a finite proxy budget. Unset is the safe default: background learning waits for the proxy URL/token and a finite tenant `budget_cents`. Foreground chat and ordinary briefs are unaffected. | optional owner choice |
-| `SOTTO_ALLOW_SELF_IMPROVE` | `1` to allow Hermes' skill self-writes + Curator on this instance. Default (unset) **protects** Sotto's skills: gates `skills.write_approval`, disables curator pruning. Set `1` only on a shared general-purpose Hermes. | optional |
-| `SOTTO_SPAWN_TOOLSETS` | comma-separated **Hermes toolset ids** the spawned one-shot runs (briefs, nudges, event agents) are scoped to — e.g. `sotto-local,google-workspace`. **Unset by design, and usually should stay unset:** toolset ids vary by install, so a wrong guess would break *every* brief and no default can be safely picked for you. Run `hermes tools --summary` to see the ids this deploy actually has before setting it. Ignored unless the runner is `hermes` (`SOTTO_RUN_SKILL` may name another agent, which would choke on the flag). | optional |
-| `SOTTO_REFRESH_HERMES` | `1` for **one boot** refreshes installer-owned Hermes home files on `/data` from the image (see *Staying updated*). A denylist protects WhatsApp login, sessions, config, SOUL, and the knowledge graph. The installed Hermes code is pinned in the image at `/usr/local/lib/hermes-agent`; this setting does not replace that code. | optional (upgrade) |
-| `SOTTO_RESEARCH_DEEP` | `1` (default) runs the second, recency-focused attendee-research pass (recent posts/news, not just a bio); `0` keeps only the cheap first pass. | optional |
-| `SOTTO_PREWARM_RESEARCH` | first-run seed: background-researches your most-frequent contacts while pre-warming the knowledge graph (stored as clearly-labeled low-confidence notes). Default **on**; `=0` skips the research and seeds plain identity stubs only. | optional |
-| `SOTTO_DASHBOARD` | `0` disables the web dashboard entirely — `/app` and `/api/*` answer 404 (default: on). See *The dashboard* above. | optional |
-| `SOTTO_UPDATE_CHECK` | `0` turns off the once-a-day "a newer Sotto is published" check (default: on — one GET of the repo's `VERSION`). It is the ONE switch: off, and the `/setup` line, the dashboard banner and the once-per-version brief line all go quiet with it. See *Staying updated* below. | optional |
-| `SOTTO_PROACTIVE` | `1` (default) runs the mostly-silent proactive watcher on the receiver's own scheduler (a `crons.json` `runner: receiver` row, so a no-nudge run is an empty receipt and never a message) (meeting-about-to-start / due commitment / something you're owed / birthday, draft-ready, never auto-send). Its whole push spends ONE unit of `SOTTO_NUDGE_BUDGET`, and it honors the same mutes, in-meeting hold and delivery-channel check the event funnel does. `0` disables it. | optional |
-| `SOTTO_PROACTIVE_CRON` | proactive watcher interval (default `*/15 * * * *`). | optional |
-| `SOTTO_QUIET_START` / `SOTTO_QUIET_END` | quiet-hours window, shared by the proactive watcher AND the real-time event funnel + release valve (defaults `21` / `7` — no nudges 9pm–7am; a missed call from a VIP is the one carve-out). | optional |
-| `SOTTO_CHASE_AFTER_DAYS` | how many silent days before something you're **waiting on** becomes chase-eligible, and the gap between chases (default `3`). Something you're owed **never expires on its own — not by age, and not by its deadline** (a passed deadline just makes it chase-eligible immediately): it closes when they actually deliver, gets at most **two** chases (one nudge a day, budget applies, and only a chase that was actually DELIVERED counts), and then Sotto stops and asks you by name — *"I've nudged Maya twice about the contract — nudge her again, or let it go?"* | optional |
-| `SOTTO_BIRTHDAY_LEAD_DAYS` | how many days ahead of a birthday the gift-idea nudge fires (default `3`; `0` = day-of only). Each fires once per person per year, and the day-of one is skipped entirely when a brief already delivered that day (it carried the 🎂 line and the same tap link). | optional |
-| `SOTTO_EVENTS` | **Bridge-side** kill switch for real-time event push (`/bridge/events`). Default on; `0` stops the watcher entirely. | optional (events) |
-| `SOTTO_EVENTS_TICK_SECS` | **Bridge-side** event-watcher tick interval in seconds (default `3`). | optional (events) |
-| `SOTTO_EMAIL_POLL_SECS` | cloud-side Gmail poll interval feeding new inbox mail into the triage funnel (default `90`; `0` disables email events). | optional (events) |
-| `SOTTO_TRIAGE_MODEL` | the cheap Tier-1 event-triage model (default `gemini-3.5-flash-lite`). | optional (events) |
-| `SOTTO_EVENT_COOLDOWN_MIN` | per-thread agent-nudge cooldown — at most one event nudge per thread per this many minutes (default `20`; suppressed events queue for the digest). | optional (events) |
-| `SOTTO_NUDGE_BUDGET` | configured ceiling for unsolicited nudges per **local day** (default `4`). “Fewer nudges” halves the effective cap, “no nudges” sets it to zero, and “more nudges” restores this ceiling; chat cannot exceed it. At zero every unsolicited path is suppressed, including held promotions, proactive work and pending outbox sends. Scheduled briefs, digests and direct requests remain available. | optional (events) |
-| `SOTTO_TAP_MAX_PER_DAY` | post-meeting taps per **local day** (default `3`), enforced once at dispatch. Independent of `SOTTO_NUDGE_BUDGET`. | optional (events) |
-| `SOTTO_MEETING_TAP` | `1` (default) fires the post-meeting tap ("your 2:00 PM with Sarah wrapped — want me to send the follow-up?"); `0` disables it. | optional (events) |
-| `SOTTO_CALENDAR_NUDGES` | `1` (default) nudges on changes to the imminent calendar the moment the 15-min refresh sees them — a decline, a last-minute invite, a move, a cancellation; `0` disables. Exempt from the daily budget (a change expires with its meeting); quiet hours/snooze/mutes still hold it. | optional (events) |
-| `SOTTO_USER_NAME` | your name, used to detect an @-mention in a group chat. Unset → group messages **always** queue and never nudge (the conservative default). | optional (events) |
-| `SOTTO_VALVE` | `1` (default) runs the release valve — the heartbeat that lets an event held by cooldown/quiet hours/catch-up/budget/a meeting out as a nudge once the hold lifts. `0` disables it (held events then wait for the digest or the next brief). | optional (events) |
-| `SOTTO_OUTBOX` | `1` (default) runs the delivery outbox's retry heartbeat — a brief or nudge the channel didn't acknowledge is retried every minute, backing off to a 15-min cap, until it lands, ages out, or gives up loudly. `0` disables **only the retrying**: every message is still written down before it is sent, so nothing is ever sent unrecorded. | optional (delivery) |
-| `SOTTO_CALENDAR_REFRESH_SECS` | how often the receiver refreshes today's calendar (default `900` = 15 min). Powers the in-meeting hold, the dashboard's calendar, and post-meeting tap detection; `0` disables all three. A cache older than 2 intervals — or stamped with another day — is never used to hold a nudge. | optional (events) |
-| `SOTTO_DIGEST_MIN` | how many queued **signals from people you know** (Tier-1 `ambient`, plus anything held by cooldown/quiet hours/catch-up/budget/snooze/a meeting) it takes for the 12:30 midday digest to deliver — default `8`; below it the digest stays silent. The window starts at the last brief that actually delivered, so the digest can't repeat it. | optional (events) |
-| `SOTTO_DIGEST` | `1` (default) runs the `sotto-midday-digest` job on the receiver's own scheduler (12:30 local, adaptive catch-up; a quiet day is an empty receipt, never a message). `0` disables it. | optional (events) |
-| `SOTTO_WAKE_PUSH` | **BRIDGE-side** (set where the Bridge runs, not Railway) — fires the brief/nudge the moment your Mac wakes. Default **on**; `=0` (or `false`) disables (the 6:30/17:30 cron still fires). The cron↔wake-push deliver-once gate makes double-delivery impossible. | optional (Bridge) |
+| `SOTTO_SELFHOST_LAUNCH` | the supervised self-host runtime's private launch envelope (manifest, generated tokens, Photon and Gemini credentials, timezone), bound to this service, `/data` volume, domain and setup marker. Written once by `tools/setup_selfhost_railway.py` and read by `adapters/sotto/selfhost_bootstrap.py`; do not edit it — a mismatch with Railway's injected metadata refuses startup. | helper only (self-host) |
+| `SOTTO_SETUP_REQUEST` | ownership marker written by the setup helper; the bootstrap requires it to match the envelope, and a resume refuses a service whose marker is missing or different ("not owned by this setup"). Leave it alone. | helper only |
+| `SOTTO_MANAGED_LAUNCH` | the same kind of private launch envelope for a Sotto Cloud managed tenant, read by `adapters/sotto/managed_bootstrap.py`. Written by Sotto's own tenant provisioning; never set it on a self-host. | Sotto Cloud provisioning only |
+| `SOTTO_PROXY_TENANTS` | Proxy service only: configured tenant token hashes, expiry and admission budgets; never set on a tenant instance. | proxy operator only |
+| *(do not set)* `PORT` | injected by Railway; the self-host bootstrap requires `8080` and the receiver binds it. | — |
+| *(do not set)* `RAILWAY_PUBLIC_DOMAIN` · `RAILWAY_PROJECT_ID` · `RAILWAY_ENVIRONMENT_ID` · `RAILWAY_SERVICE_ID` · `RAILWAY_VOLUME_MOUNT_PATH` · `RAILWAY_VOLUME_NAME` | injected by Railway; the bootstrap checks them against the envelope before starting, and the setup link and Google callback are built from the public domain. | — |
+| *(do not set)* `RAILWAY_DEPLOYMENT_ID` | Railway injects the deployment revision. The model proxy records it as `proxy_deployment`; caller `application` and `deployment` come from trusted proxy tenant configuration. Authenticated tenant ID is the report owner. | — |
+
+**Set by the supervisor from the launch envelope** (the receiver's whole environment; none of
+these are Railway variables)
+
+| Variable | Purpose | When |
+|---|---|---|
+| *(do not set — the supervisor injects it)* `SOTTO_DATA` | the volume path, `/data`. Skill scripts the receiver runs inherit it. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_HOME` | the receiver's private credential home, always `$SOTTO_DATA/sotto-home` (`/data/sotto-home`): the Google token and client secret live there, owned by UID 10001 with mode 0700. `prepare_fresh.py` creates it; the launch envelope names it and the supervisor passes only that exact path. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_RUNTIME_PROFILE` | the supervised runtime's fixed-five profile (`managed-photon-fixed-five-v1`, `self-host-photon-fixed-five-v1` or `self-host-telegram-fixed-five-v1`), which gates its owner tools and schedules. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_ROUTINE_EPOCH` | the current 32-hex replacement-epoch id that binds personal routines and owner tools to this installation; the supervisor drops any inherited value and sets only its own. | — |
+| *(do not set — the supervisor injects them)* `SOTTO_CHAT_RUNTIME_URL` · `SOTTO_CHAT_RUNTIME_TOKEN` | the loopback address (`http://127.0.0.1:<runtime port>`; 8081 under the setup helper) and generated bearer the receiver uses to reach the Node chat runtime, rendered from the launch manifest. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_DEPLOYMENT_MODE` | `self_host` or `managed`, from the manifest. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_TENANT_ID` | the stable tenant identity; capability and activation receipts must match it. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_VOLUME_ID` | the identity of the attached volume, checked against the `.sotto-volume.json` marker `prepare_fresh.py` wrote; a missing or mismatched mount stops startup. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_CRON_DELIVER` | the one delivery channel (`photon` or `telegram`) for everything scheduled — briefs, midday digest, weekly pulse, proactive watcher and personal routines. It is also the nudge delivery gate: the channel's probe (Photon's authenticated owner DM, Telegram's captured chat id) must read linked. | — |
+| *(do not set — the supervisor injects them)* `SOTTO_MCP_TOKEN` · `SOTTO_CONTROL_TOKEN` | the Bridge root bearer the helper generated (the Bridge's lanes and the operator surfaces take it; Node gets only the derived read bearer) and the independent control credential (bootstrap and model-lease renewal; kept out of Node and skill environments). | — |
+| *(do not set — the supervisor injects them)* `SOTTO_SKILLS_ROOT` · `SOTTO_TRIGGER_PORT` | the packaged skill tree (`/app/sotto-skills`) and the receiver's port. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_TIMEZONE` | the IANA zone from your setup config (`sotto_runtime.timezone`). It wins over the `/setup` tile's browser detection, which only applies when no zone is configured. A conflicting timezone POST is rejected without changing saved settings or schedule stamps. The briefs run at **6:30 morning / 17:30 evening** in this zone. | — |
+| *(do not set — the supervisor injects it)* `SOTTO_BACKGROUND_UNMETERED` | self-host only: `true` only when the protected helper config explicitly selects `sotto_runtime.background_unmetered: true`; otherwise `false`. Allows progressive history learning and Dreamer against the direct Gemini key without a dollar cap. Source consent remains required. Managed launches cannot use this override. | — |
+| *(do not set — the supervisor injects it)* `GOOGLE_AI_API_KEY` | self-host only: the direct Gemini key from the envelope, used by the brief/prep/follow-up/triage pipeline. Managed tenants use the model proxy instead. | — |
+| *(do not set — the supervisor injects them)* `PHOTON_PROJECT_ID` · `PHOTON_PROJECT_SECRET` · `PHOTON_HOME_CHANNEL` · `PHOTON_ALLOWED_USERS` · `SOTTO_IMESSAGE_NUMBER` | Photon profiles: the project credentials, the owner's number (home channel and the only allowed user) and the physical Sotto line. | — |
+| *(do not set — the supervisor injects them)* `TELEGRAM_BOT_TOKEN` · `TELEGRAM_ALLOWED_USERS` · `TELEGRAM_HOME_CHANNEL` | Telegram profile only: the bot token and the captured numeric owner id. | — |
+| *(do not set — the supervisor injects them)* `SOTTO_MODEL_PROXY_URL` · `SOTTO_MODEL_PROXY_TOKEN` | managed only: the model proxy root (pipeline calls use `/native/v1beta`) and the tenant bearer. The receiver renews its expiry through the proxy; bearer rotation remains an explicit operator change. | — |
+
+The setup helper's envelope can also carry model and research overrides (`SOTTO_BRIEF_MODEL`,
+`SOTTO_GEMINI_MODEL`, `SOTTO_FALLBACK_MODEL`, `SOTTO_RESEARCH_DEEP`) in its `receiverOverrides`
+block; the helper writes `SOTTO_TIMEZONE` and the explicit/default-off
+`SOTTO_BACKGROUND_UNMETERED` choice there.
+
+**Internal — set by one receiver run for its child**
+
+| Variable | Purpose | When |
+|---|---|---|
+| *(internal — do not set)* `SOTTO_CAPTURED_SOURCES` · `SOTTO_PROACTIVE_CAPTURED_SOURCES` | set by the receiver on one child run: the JSON list of sources the owner had granted when an attended live read (Granola history, triage queue) or a proactive run started, so that child reads only those. | — |
+| *(internal — do not set)* `SOTTO_SKILL_COMPOSITION_PROOF` | set by the receiver on a meeting-prep, ask-research, follow-up, relationship-pulse or proactive skill run: the source-revision proof the child rechecks before it acts. | — |
+| *(internal — do not set)* `SOTTO_READ_ONLY` | `1` on an attended read child: knowledge queries then never repair or write the graph. | — |
+| *(internal — do not set)* `SOTTO_SETUP_LOG_FD` | the supervisor's one-use descriptor for the receiver's private setup-link boot line. Removed and closed before worker threads start; ordinary receiver/Node output stays suppressed. | — |
+| *(internal — do not set)* `SOTTO_UNATTENDED` | `1` on every skill run the receiver spawns — the seam `google_action.py`'s send gate reads. | — |
+
+**Defaults the supervised launch does not change.** The code still reads each name below, and
+[HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.md) refers to the rules by these names. No launch path
+passes them to the receiver, so on the supervised image each one is fixed at the default shown.
+
+| Variable | Default and meaning | When |
+|---|---|---|
+| `SOTTO_USER_EMAIL` | derived from your connected Google account (the `From` of your own sent mail, persisted as `google_account_email` in `/data/config/settings.json`); used to exclude yourself from attendee research and post-meeting taps, and to list you as a guest on invites Sotto creates. | fixed |
+| `SOTTO_GEMINI_MODEL` | `gemini-3.8-flash`: the compose default and the model for native grounding, url_context and DocSend vision. Must be 1M-context. | envelope override only |
+| `SOTTO_BRIEF_MODEL` | Gemini; `openai/<model>` or `anthropic/<model>` would run the compose calls on another family, which also needs that family's key — and the launch passes no `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `SOTTO_OPENAI_BASE_URL`. | envelope override only |
+| `SOTTO_FALLBACK_MODEL` · `SOTTO_FALLBACK_API_KEY` | `gemini-3-flash-preview`, same key: the backup model for a foreground brief on a 429/5xx/timeout. A cross-family value is refused and the backup must clear the brief's 400K context floor. Background history extraction and Dreamer use one primary attempt. | envelope override only (model) |
+| `SOTTO_CRITIC` | `auto`: the brief's second-pass Gemini critic + revise gate skips its two extra calls on a small/low-risk brief (rendered source payload `<15000` chars AND `≤5` actions) and runs them otherwise. | fixed |
+| `SOTTO_RESEARCH_DEEP` | `1`: run the second, recency-focused attendee-research pass. | envelope override only |
+| `SOTTO_PREWARM_RESEARCH` | on: first-run seed background-researches your most-frequent contacts (stored as clearly-labeled low-confidence notes). | fixed |
+| `SOTTO_TRIAGE_MODEL` | `gemini-3.5-flash-lite`: the cheap Tier-1 event-triage model. | fixed (events) |
+| `SOTTO_EMAIL_POLL_SECS` | `90`: cloud-side Gmail poll interval feeding new inbox mail into the triage funnel. | fixed (events) |
+| `SOTTO_EVENT_COOLDOWN_MIN` | `20`: at most one event nudge per thread per this many minutes; suppressed events queue for the digest. | fixed (events) |
+| `SOTTO_NUDGE_BUDGET` | `4` unsolicited nudges per **local day**. “Fewer nudges” halves the effective cap, “no nudges” sets it to zero, and “more nudges” restores this ceiling; chat cannot exceed it. At zero every unsolicited path is suppressed, including held promotions, proactive work and pending outbox sends. Scheduled briefs, digests and direct requests remain available. | fixed (events) |
+| `SOTTO_TAP_MAX_PER_DAY` | `3` post-meeting taps per **local day**, enforced once at dispatch and independent of the nudge budget. | fixed (events) |
+| `SOTTO_MEETING_TAP` | `1`: the post-meeting tap ("your 2:00 PM with Sarah wrapped — want me to send the follow-up?"). | fixed (events) |
+| `SOTTO_CALENDAR_NUDGES` | `1`: nudges on changes to the imminent calendar — a decline, a last-minute invite, a move, a cancellation. Exempt from the daily budget; quiet hours/snooze/mutes still hold it. | fixed (events) |
+| `SOTTO_CALENDAR_REFRESH_SECS` | `900`: today's-calendar refresh. Powers the in-meeting hold, the dashboard's calendar, and post-meeting tap detection. A cache older than 2 intervals — or stamped with another day — is never used to hold a nudge. | fixed (events) |
+| `SOTTO_QUIET_START` / `SOTTO_QUIET_END` | `21` / `7`: no nudges 9pm–7am, shared by the proactive watcher, the event funnel and the release valve; a missed call from a VIP is the one carve-out. `/quiet for 2h` pauses nudges for a while ([SELFHOST.md](adapters/sotto/SELFHOST.md#owner-nudge-pause)). | fixed |
+| `SOTTO_CHASE_AFTER_DAYS` | `3` silent days before something you're **waiting on** becomes chase-eligible, and the gap between chases. Something you're owed **never expires on its own — not by age, and not by its deadline** (a passed deadline just makes it chase-eligible immediately): it closes when they actually deliver, gets at most **two** chases (one nudge a day, budget applies, and only a chase that was actually DELIVERED counts), and then Sotto stops and asks you by name. | fixed |
+| `SOTTO_BIRTHDAY_LEAD_DAYS` | `3` days ahead of a birthday the gift-idea nudge fires. Each fires once per person per year, and the day-of one is skipped when a brief already delivered that day. | fixed |
+| `SOTTO_USER_NAME` | unset: group messages **always** queue and never nudge (no @-mention detection). | fixed (events) |
+| `SOTTO_VALVE` | `1`: the release valve lets an event held by cooldown/quiet hours/catch-up/budget/a meeting out as a nudge once the hold lifts. | fixed (events) |
+| `SOTTO_OUTBOX` | `1`: a brief or nudge the channel didn't acknowledge is retried every minute, backing off to a 15-min cap, until it lands, ages out, or gives up loudly. Every message is written down before it is sent. | fixed (delivery) |
+| `SOTTO_DIGEST_MIN` | `8` queued **signals from people you know** before the 12:30 midday digest delivers; below it the digest stays silent. The window starts at the last brief that actually delivered. | fixed (events) |
+| `SOTTO_PROACTIVE` · `SOTTO_DIGEST` · `SOTTO_PROACTIVE_CRON` | on, on, `*/15 * * * *`: the proactive watcher and the midday digest always run on the receiver's schedule. The fixed-five profile refuses any other value. | fixed |
+| `SOTTO_DASHBOARD` · `SOTTO_UPDATE_CHECK` | on: the `/app` dashboard, and the once-a-day "a newer Sotto is published" check (one GET of the repo's `VERSION`; silent on an unstamped build). | fixed |
+| `SOTTO_VISUAL_BRIEFS` | `1`: Photon morning/evening briefs and focused meeting backgrounds use the shared card renderer ([visual briefs](docs/VISUAL-BRIEFS.md)). | fixed |
+| `SOTTO_SETUP_CODE` | unset: the setup code is generated once and persisted at `/data/setup_code`. | fixed |
+| `SOTTO_TRIGGER_TOKEN` | unset: the Bridge wake-push authenticates with the Bridge bearer. | fixed |
+| `PHOTON_ALLOW_ALL_USERS` | unset: Photon stays restricted to the owner. Any value other than unset or `false` is treated as unrestricted, so owner activation never completes and Photon never counts as linked. | fixed |
+| `GOOGLE_OAUTH_CLIENT_JSON` | unset: paste the client JSON in `/setup` instead. | fixed |
+| `GRANOLA_API_KEY` | unset: Granola connects through its OAuth tile (§5). | fixed |
+| `EXA_API_KEY` · `PARALLEL_API_KEY` · `BROWSER_USE_API_KEY` | unset: web search and deep research use Gemini grounding, and link reads use Gemini url_context. The Connections page lists these providers read-only. | fixed (research) |
+| `X_BEARER_TOKEN` · `X_USER_ACCESS_TOKEN` · `X_OWNER_USER_ID` | unset: no X attendee context; `/api/overview` reports X as `unconfigured`. | fixed (X) |
+
+**Bridge-side settings** are read by the Sotto Bridge on your Mac, not by Railway:
+
+| Variable | Purpose | When |
+|---|---|---|
+| `SOTTO_EVENTS` | **Bridge-side** kill switch for real-time event push (`/bridge/events`). Default on; `0` stops the watcher entirely. | optional (Bridge) |
+| `SOTTO_EVENTS_TICK_SECS` | **Bridge-side** event-watcher tick interval in seconds (default `3`). | optional (Bridge) |
+| `SOTTO_WAKE_PUSH` | **Bridge-side** — fires the brief/nudge the moment your Mac wakes. Default **on**; `=0` (or `false`) disables (the 6:30/17:30 schedule still fires). The schedule↔wake-push deliver-once gate makes double-delivery impossible. | optional (Bridge) |
 | `SOTTO_WAKE_MORNING_MIN` / `SOTTO_WAKE_MORNING_CUTOFF` | **Bridge-side** morning wake-push window in minutes-past-midnight — wake past this and before the cutoff triggers the morning brief (defaults `420` / `1080` = **7:00 – 18:00**). | optional (Bridge) |
 | `SOTTO_WAKE_EVENING_MIN` / `SOTTO_WAKE_EVENING_CUTOFF` | **Bridge-side** evening wake-push window (defaults `1050` / `1380` = **17:30 – 23:00**). | optional (Bridge) |
-| `SOTTO_TTS` / `SOTTO_TTS_PROVIDER` / `SOTTO_TTS_VOICE` | voice (read + listen). `SOTTO_TTS=1` (default) enables Hermes TTS; provider `edge` (default, free, no key) or `gemini` (uses your Google key); voice id override. `SOTTO_TTS=0` for text-only. | optional |
-| `SOTTO_WHATSAPP_MODE` | `2` self-chat (default) · `1` dedicated bot number (needs a 2nd WhatsApp number). | optional |
-| `SOTTO_WHATSAPP_PAIR_TIMEOUT` | how long the boot-time **WhatsApp** QR pairing step stays open, in seconds (default `900` = 15 min) — both the pairer and boot's wait derive from this one var, so raising it really buys more scan time. Miss the window and a redeploy reopens pairing anyway. (Telegram's capture has no variable: its five-minute wait is a named constant in `telegram_link.py`, and a miss costs nothing but the next boot.) | optional |
-| `SOTTO_HIDE_AGENT_NAME` | `1` drops the ***Sotto*** reply prefix on WhatsApp messages entirely (default: prefixed, so you can tell its messages from yours in self-chat). | optional |
-| `SOTTO_TOOL_PROGRESS` | what streams into chat while Sotto works: `off` (default — nothing mid-turn; the typing indicator and the periodic "⏳ Working" heartbeat cover the wait) · `new` (plain-language narration + one edit-in-place tool bubble, cleaned up on delivery) · `all`/`verbose` (debugging). | optional (UX) |
-| `SOTTO_REACTIONS` | `1` (default): Sotto reacts to your messages with Telegram tapbacks as status — 👀 seen/working · ✅ replied · ❌ error. `0` disables. Photon iMessage uses contextual working icons (🔎 research, 📝 drafting, 📅 calendar, 🧠 memory, 💭 general), then replaces directly with ✅ finished, ⚠️ failed or ⏸️ interrupted. Standalone thanks keep ❤️. Replacement never removes first. This is reply status, not a receipt for an external action. Hermes has no bot reactions on WhatsApp. | optional (UX) |
-| `GATEWAY_ALLOW_ALL_USERS` | `true` = open access (testing only). | optional |
-| `PHOTON_ALLOW_ALL_USERS` | Photon only. Unset or `false` keeps Photon restricted to `PHOTON_ALLOWED_USERS` (the setup helper sets `false`); any other value is treated as unrestricted, so owner activation never completes and Photon never counts as linked. Leave it unset or `false`. | optional (channel) |
-| `GOOGLE_OAUTH_CLIENT_JSON` | **optional now** — paste the client JSON in the `/setup` wizard instead (no var, no redeploy). This var remains as a legacy/headless fallback (loaded at boot). | optional (legacy) |
-| `GOOGLE_AUTH_CODE` | no longer used — remove it; boot only logs a reminder. Connect from `/setup`. | remove |
-| *(none — use `/setup`)* | **Granola connects with zero variables**: the wizard's Connected-services tile (step 6c) runs the OAuth flow and stores tokens on `/data`. | — |
-| `GRANOLA_API_KEY` | break-glass Granola **REST** mode (official API, Business/Enterprise plans) instead of the Connect tile. | optional |
-| `EXA_API_KEY` | web-research key ([exa.ai](https://exa.ai)). Present = Sotto searches with Exa instead of Gemini grounding, and uses it for deep research when Parallel isn't set. **Shown on the Connections page** alongside Granola, connected or not. | optional (research) |
-| `BROWSER_USE_API_KEY` | optional [Browser Use Cloud](https://cloud.browser-use.com) key: when set, a link that neither Exa nor Gemini can read (JS-heavy, bot-walled) escalates to their hosted browser — the LAST rung, because a browser session costs their credits and 10-60s — **read-only by fence**: one page per task, never your logins, never a synced profile, session stopped when the read ends. Their cloud sees the URL and the rendered page. | optional (link reading) |
-| `PARALLEL_API_KEY` | deep-research key ([parallel.ai](https://parallel.ai)). Present = attendee/company research runs as a Parallel task run. **Shown on the Connections page.** | optional (research) |
-| `X_BEARER_TOKEN` | the owner's X app bearer token. Enables Phase-1 exact handle confirmation and recent public Posts for upcoming attendees. Read-only; X people-search is never used by an ambient lane. | optional (X) |
-| `X_USER_ACCESS_TOKEN` | OAuth2 user access token with `bookmark.read`. Adds the owner's newest bookmarks to prep only when their author is an upcoming attendee. Without it, identity + public Posts still work from `X_BEARER_TOKEN`. | optional (X bookmarks) |
-| `X_OWNER_USER_ID` | the owner's numeric X user id, required with `X_USER_ACCESS_TOKEN` for bookmarks. Supplying it avoids a repeated `/users/me` resource read. | optional (X bookmarks) |
-| `GRANOLA_API_TOKEN` + `GRANOLA_MCP_CMD` | legacy custom stdio Granola MCP (step 6c fallbacks) — token + a remote-capable server command. | optional (legacy) |
-| `BRIDGE_TOKEN` | the ONE secret behind Mac↔cloud auth: the Bridge and the relay use it directly, while Hermes is handed a one-way **derived** bearer (`HMAC(BRIDGE_TOKEN, "sotto-mcp")`) at boot — the agent never holds the root, so a compromised chat session can't act as your Mac. Still one value to set. Manual deploys: pick a long random secret (`openssl rand -hex 24`) **before opening the setup link** — unset, the pairing link carries an empty token and pairing silently fails. (A template deploy will auto-generate it, `${{ secret(48) }}`.) You never type it into the Mac app — the `/setup` pairing link carries it. | **required** for the Bridge |
-| `SOTTO_TRIGGER_TOKEN` | separate bearer for the Bridge → cloud wake-push. Unset = the wake-push authenticates with `BRIDGE_TOKEN` (one shared bearer; wake-push is on by default in the Mac app). | optional |
-| `SOTTO_SETUP_CODE` | pin the access code gating the setup surface (`/setup`, `/pair`, `/whatsapp/qr`, `/google/*`, `/debug/google`). It is also the **Telegram pairing phrase**: boot's chat-id capture only accepts a message carrying it, so a stranger who guesses your bot's @username cannot claim the deploy. Unset = auto-generated once and persisted on `/data`; the full setup link and the pairing link both print in every boot's deploy logs. | optional |
-| *(do not set)* `PORT` | injected by Railway; the receiver binds it. | — |
-| *(do not set)* `RAILWAY_DEPLOYMENT_ID` | Railway injects the deployment revision. The model proxy records it as `proxy_deployment`; caller `application` and `deployment` come from trusted proxy tenant configuration. Authenticated tenant ID is the report owner. | — |
-| *(do not set)* `RAILWAY_PUBLIC_DOMAIN` | set by Railway once you **Generate Domain** (step 4) — the setup/Google/QR links in the deploy logs are built from it. If it's absent (no domain yet), those links fall back to `http://localhost:…`. | — |
 
 ### Removed settings
 
 These were variables once and are now **named constants in the code** (Aug 2026 — a setting needs a
-reason a default can't serve). If one is still set in your deploy it is **ignored**, and every boot
-prints one `[sotto] NOTE:` line naming it and the constant that replaced it — delete the variable and
-the line goes away. Nothing about your deploy changes either way; the defaults are byte-identical to
-what these knobs shipped with.
+reason a default can't serve). Nothing reads them.
 
 | Removed variable | Now the constant |
 |---|---|
@@ -449,86 +256,56 @@ what these knobs shipped with.
 | `SOTTO_STALE_AGE_DAYS` · `SOTTO_STALE_SURFACED` | `STALE_AGE_DAYS` (4) · `STALE_SURFACED` (3) |
 | `SOTTO_RESEARCH_RECENCY_DAYS` | `DEFAULT_RECENCY_DAYS` (90) |
 | `SOTTO_PREWARM_MAX` | `MAX_PREWARM` (12) |
-| `SOTTO_RESEARCH_CONCURRENCY` | `RESEARCH_CONCURRENCY` (5, in `adapters/hermes/start.sh`) |
-
-`SOTTO_RESEARCH_DEEP`, `SOTTO_PREWARM_RESEARCH` and the rest of the table above are **not** affected —
-they are real choices and are still read.
+| `SOTTO_RESEARCH_CONCURRENCY` | `RESEARCH_CONCURRENCY` (5) |
 
 ## Staying updated
 
-**The rule, in one sentence: Sotto tells you when it's out of date, and one redeploy is the update.**
-Your server checks the published `VERSION` once a day and, when a newer build exists, says so.
-Nothing updates itself; you choose when to redeploy, and your `/data` volume (knowledge graph,
-WhatsApp login, Google token) survives every redeploy untouched.
+**The rule, in one sentence: Sotto tells you when it's out of date, and updating an installed
+service is a manual operator job — no command in this repository performs it.** Your server checks
+the published `VERSION` once a day and, when a newer build exists, says so. Nothing updates itself.
 
 **Where it says so.** Three quiet places, all fed by that same daily check: one line at the foot of
 `/setup` (your Integrations page), one subdued line at the top of the dashboard's Today page, and
 **one line in your next brief** — morning or evening, whichever comes first, once per published
 version and never again. A new version is housekeeping, so it never arrives as its own message, it
-never spends your daily interrupt budget, and it never repeats. `SOTTO_UPDATE_CHECK=0` turns the
-daily check off and, with it, all three notices — there is no separate switch to find.
+never spends your daily interrupt budget, and it never repeats.
 
-**For a manual deployment from a fork or your own copy:** On GitHub, open your repo → **Sync
-fork** → **Update branch**. That lands the new code on your `main`, and Railway — which redeploys on
-every push to the repo it tracks — rebuilds and restarts on its own. (Deployed straight from the
-public repo rather than a fork? Then you're already tracking it: hit **Deploy** in Railway, or push
-nothing at all and wait for the next upstream push.)
+**Why there is no upgrade command.** The setup helper only creates fresh installs and refuses a
+service it did not just create, and a helper-created service has no repository source for Railway
+to redeploy from. The `--run` start command is the same-volume restart path for the release that
+prepared the volume; restarting does not change the code it runs.
 
-Either way `start.sh` refreshes the Sotto skills + persona from the freshly built image on **every
-boot**, so there is never anything to hand-update.
+**The runtime comes with the build.** The root Dockerfile builds the chat runtime, receiver and
+skills from this repository, with base images pinned by digest and Python and npm dependencies
+installed from their committed hash locks. There is nothing to hand-update on the volume.
 
-**3. Hermes comes with the build.** The Hermes runtime is installed while the image is built, so a
-rebuild is also a Hermes install. Two caveats, both already handled:
-
-- The installer is **vendored** at `adapters/hermes/hermes-install.sh` (upstream serves a mutable
-  URL, so the build never fetches it — the bytes that run are the bytes reviewed in git), and
-  Docker **caches** the install layer, so a routine code push reuses the Hermes already baked. A
-  Hermes upgrade is a deliberate act: re-fetch the script, review the diff, commit
-  (`tools/ship.sh --refresh-hermes` does all three) — the changed file busts the cache and the
-  next build installs the latest.
-- Your `/data` volume holds a first-boot copy of `~/.hermes`. The installed Hermes code runs from
-  `/usr/local/lib/hermes-agent`, and boot checks its Git commit against the image pin. The boot log
-  and `/setup` show Hermes version strings without the changing upstream hash. A different upstream
-  hash alone does not mean the volume is stale or call for `SOTTO_REFRESH_HERMES=1`. Use that setting
-  for one boot only when adopting newer installer-owned home files from the image; it preserves
-  WhatsApp login, sessions, config and knowledge. Then unset it.
-
-**4. The Mac Bridge updates itself.** The Bridge checks
+**The Mac Bridge updates itself.** The Bridge checks
 [Releases](https://github.com/kothari-nikunj/sotto/releases/latest) once a day and shows
 **Update available** in its menu when a newer signed build exists; one click downloads the DMG,
 verifies the signature (same Apple Team as the app you're running — anything else is refused),
 installs in place and relaunches. Your pairing (host + token) and Full Disk Access persist (the
 signing identity never changes, so macOS treats it as the same app). Prefer manual? Downloading the
 DMG and dragging it over the old app still works exactly the same way.
-**One-off, on the update to 1.2.7 or newer:** the Bridge asks an already-installed copy for an
-**access code** once and pauses streaming to your cloud until you enter one — pairing, Full Disk
-Access and settings all survive, so entering it resumes streaming with nothing to re-pair. No code
-yet? Ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
-
-Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and never fetch it from upstream's mutable URL — the integrity story is git itself: the bytes that install Hermes are the bytes committed and reviewed. To adopt a newer installer, fetch with upstream's expected user agent (`curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" https://hermes-agent.nousresearch.com/install.sh`), review the diff, and commit it over the vendored file — or let `tools/ship.sh --refresh-hermes` walk you through exactly that.
+**Current access policy:** choosing Railway for self-host setup requires no Bridge invitation code.
+A completed self-host install also stays unlocked when a legacy code expires. Invited Sotto Cloud
+continues to require its verified account and matching pairing receipt. Neither path grants Mac
+source permissions; Full Disk Access and your source choices still apply. The one-time code gate
+introduced in 1.2.7 is historical behavior, not a requirement for current self-host updates.
 
 ## Troubleshooting
 | Symptom | Fix |
 |---|---|
-| Build: `COPY … not found` | Wrong build context — leave Root Directory blank so Railway builds from the repo root (step 2). |
-| Build: `Dockerfile does not exist` | Clear the Dockerfile Path so Railway auto-detects `./Dockerfile` at the repo root. |
-| `hermes: command not found` at boot | Hermes install/PATH in the image — capture the build-log line. |
-| Deploy log: `No messaging platforms enabled` | `start.sh` enables WhatsApp via `~/.hermes/.env`; redeploy on the latest `main`. |
-| Deploy log: `No user allowlists configured` | Your channel has no allowlist yet — text your bot so boot can capture the id (Telegram), or set `WHATSAPP_ALLOWED_USERS` (step 5); `GATEWAY_ALLOW_ALL_USERS=true` opens it up for a test. |
-| Deploy log: `WhatsApp enabled but not paired` | First boot — `start.sh` runs `hermes whatsapp`; scan the QR in the deploy logs within ~15 min. |
-| Setup link in the logs says `localhost` | No public domain yet — the logged link falls back to `http://localhost:…`. **Settings ▸ Networking ▸ Generate Domain** (step 4), redeploy, use the freshly printed link. |
-| Missed the ~15-min QR window | Not fatal — the container recycles and pairing reopens on the next boot. Redeploy (or restart) and scan the fresh QR at `/whatsapp/qr`. A transient "No pairing in progress" on that page just means the pairing step hasn't (re)started yet — wait for the boot to reach it. |
-| Briefs never arrive (chat may still reply) | Usually a bad Gemini key or exhausted quota. Check the boot key-check log line — `[sotto] Gemini key OK (model … available)` vs `[sotto] WARNING: Gemini key/model check failed (HTTP …)` — and tail **`/debug/brief-log`** for the last brief attempt (bearer-protected: `curl -H "Authorization: Bearer $BRIDGE_TOKEN" https://<app>.up.railway.app/debug/brief-log`). Fix `GOOGLE_AI_API_KEY` / `SOTTO_GEMINI_MODEL`, or wait out / raise the quota (see `SOTTO_FALLBACK_API_KEY`). |
-| No reply when messaging yourself (self-chat) | Confirm `WHATSAPP_ALLOWED_USERS` matches your number **exactly** (country code, no `+`, no spaces) — a mismatch is silently denied. Check the gateway logs for a deny line. Still nothing? Try `SOTTO_WHATSAPP_MODE=1` with a second WhatsApp number to rule self-chat delivery in/out. |
-| Google disconnects after ~a week (day 8) | OAuth consent screen left in **Testing** — its refresh tokens expire after ~7 days. Publish the app to **In production** (§6b — no Google verification needed for your own data), then reconnect once. |
-| `/setup` (or `/whatsapp/qr`, `/google/*`) returns **403 Forbidden** | The setup surface needs its access code — open the full link from the deploy logs (`[sotto] Setup link`); a cookie then covers the other pages. Old bare bookmarks 403 by design. |
-| Lost the setup link | It reprints on **every boot** (redeploy and check the logs), or read `/data/setup_code` on the volume. `SOTTO_SETUP_CODE` pins it. |
-| Boot log says `telegram NOT linked yet` | Your first message hadn't reached the bot inside the five-minute capture window. Text the bot, then **restart the deploy** — the capture runs at boot. Nothing else is affected; briefs still compose. |
-| Telegram bot never replies | `TELEGRAM_ALLOWED_USERS` must be your **numeric** chat id, not your @username — Hermes denies everyone until it matches. Boot captures the right one ([CHANNELS.md](CHANNELS.md#telegram-setup-default)); a hand-typed value is where this goes wrong. Also check the boot log named each `TELEGRAM_*` you set: `[sotto] gateway variable forwarded to Hermes: …`. |
+| Helper stops with `create_unconfirmed`, `deployment_pending` or `preparation_unconfirmed` | Rerun the same command with the same config and state; only follow its `--retry-unconfirmed` instruction after checking Railway as it says. Do not delete the state or deploy by hand ([maintainer helper reference](docs/MAINTAINER-RAILWAY-HELPER.md#self-hosted-on-railway-supervised-sotto-photon)). |
+| Deploy log: `self-host bootstrap unavailable; review tenant before retry` | The bootstrap refused its input: the envelope no longer matches Railway's service, domain, volume or setup marker, `/data` is not the expected empty ext4 mount on `--prepare`, or Tini is not PID 1. Inspect the exact service; do not edit the variables or rerun `--prepare` on a prepared volume. |
+| Setup link in the logs says `localhost` | No public domain on this service. The helper creates it before the first deployment, so inspect that exact service, then use the freshly printed link. |
+| Briefs never arrive (chat may still reply) | Usually a bad Gemini key or exhausted quota. Tail **`/debug/brief-log`** for the last brief attempt; it needs the Bridge bearer, which the helper keeps in its protected state file. |
+| Google disconnects after ~a week (day 8) | OAuth consent screen left in **Testing** — its refresh tokens expire after ~7 days. Publish the app to **In production** (§4 — no Google verification needed for your own data), then reconnect once. |
+| `/setup` (or `/google/*`) returns **403 Forbidden** | Sign in to `/app` as the self-host owner, then open Integrations. Alternatively use the full setup link from deploy logs. Expired sessions need sign-in again; Cloud lease sessions do not grant bootstrap setup access. |
+| Lost the setup link | It reprints on **every boot** (restart and check the logs), or read `/data/setup_code` on the volume. |
+| Photon tile never reads connected | Send the hello from the exact owner phone in your config to the configured Sotto line; an Apple ID email never activates. The receipt is bound to the Photon project. |
 | The Bridge's **"Meeting notes (Granola) & more → Open…"** button opens a **403** page | You paired with an older Bridge or an older host: newer pairing links carry the setup code, and the button then opens `/setup` correctly. Meanwhile: open the `[sotto] Setup link` from your deploy logs once in the same browser — the cookie then covers it. Re-pairing (paste the current setup page's link into the Bridge) also fixes it for good. |
-| Briefs fire at the wrong hour | The boot log states the zone: `tz=…` on the `[sotto] cron scheduler:` line. `tz=UTC` means neither `SOTTO_TIMEZONE`/`TZ` nor a wizard zone was found. Open `/setup` — tile ④ detects your browser's zone; the briefs pick it up on the next minute (the receiver schedules them and re-reads the zone every tick), no redeploy. (Personal `user-` routines keep their old clock; recreate those.) |
-| WhatsApp QR re-prompts every deploy | Volume not mounted at `/data` (step 3), or `start.sh` state-persist step failed. |
-| Mac can't reach the trigger | No public domain (step 4), or `SOTTO_TRIGGER_TOKEN` mismatch. |
+| Briefs fire at the wrong hour | The zone comes from `sotto_runtime.timezone` in your setup config and `/setup` tile ④ shows it. A helper-created install cannot change it in place. |
+| Mac can't reach the host | Check the menu bar dot and re-pair from the current `/setup` link. |
 | Local data missing from briefs (messages/calls/contacts empty) | Run `sotto-bridged --doctor` on the Mac — it names each source `ok` / `needs Full Disk Access` / `unavailable` and prints the exact FDA fix (grant Full Disk Access to the *right* app: the `.app` for GUI runs, the terminal for CLI runs). Exit `0` = all sources read. |
 
 
@@ -536,34 +313,30 @@ Builds run the **vendored** installer (`adapters/hermes/hermes-install.sh`) and 
 
 The proxy tenant configuration accepts `budget_cents: null` to disable the spending admission cutoff while retaining usage records and credential checks. Numeric budgets return HTTP 402 with `sotto_budget_exhausted` when exhausted; upstream HTTP 429 remains a separate transient rate-limit condition. The personal pilot uses no spending cutoff at the owner’s request.
 
-### Metered self-host background learning
+### Background history learning on self-host
 
-Deploy the existing `cloud/model-proxy/Dockerfile` as a separate service with its own persistent
-`SOTTO_DATA` volume, `GOOGLE_AI_API_KEY`, and `SOTTO_PROXY_TENANTS`. Give the self-host tenant a
-finite integer `budget_cents`, an enabled flag, expiry, and SHA-256 bearer hash. Then set that
-service's HTTPS root as `SOTTO_MODEL_PROXY_URL` and the unhashed tenant bearer as
-`SOTTO_MODEL_PROXY_TOKEN` on the Sotto service. History learning and Dreamer wait if either value
-is absent, the budget is null, or the allowance is exhausted. The proxy reserves a conservative
-$2 maximum allowance before each upstream call and records usage in its existing SQLite ledger;
-this bounds admission and is not a reconstruction of the provider invoice. To accept unmetered
-direct BYOK background spend instead, set `SOTTO_BACKGROUND_UNMETERED=true` explicitly.
-The Sotto service authenticates a content-free `GET /v1/capabilities/background-budget` before it
-reads history. Upgrade an older proxy that returns 404; unsupported, unauthorized, unlimited or
-exhausted capability responses keep background work held. The model POST enforces the same finite
-requirement atomically with its ledger reservation. Bearer expiry is rechecked inside that
-transaction after reading the request body and waiting for the ledger lock; an expired bearer
-returns 401 without reserving spend or contacting the provider.
+Progressive history learning and Dreamer run only through a model proxy with a finite
+`budget_cents`, or with the explicit unmetered opt-in `SOTTO_BACKGROUND_UNMETERED=true`. The
+helper's optional protected `sotto_runtime.background_unmetered` JSON boolean defaults to `false`.
+Without an explicit `true` choice, background learning stays held before any source fetch and reports the hold
+in `knowledge/history-state.json`. Ordinary chat, briefs and the first useful look are unaffected:
+they use recent context. Managed tenants route background work through their proxy. The choice is
+fixed when the volume is installed; changing it means a fresh installation.
 
-Personal comparison pilot: all 11 Bridge source types can be enabled with explicit consent in the same source settings as self-host. `SOTTO_PROACTIVE=1` and `SOTTO_DIGEST=1` restore the existing proactive and digest schedules; their output uses the same Photon destination as briefs. Quiet hours, interrupt gates and duplicate suppression still apply.
+The proxy side of that contract, for reference: a proxy-backed cycle authenticates a content-free
+`GET /v1/capabilities/background-budget` before it reads history; unsupported, unauthorized,
+unlimited or exhausted capability responses keep background work held. The proxy reserves a
+conservative $2 maximum allowance before each upstream call and records usage in its existing
+SQLite ledger; this bounds admission and is not a reconstruction of the provider invoice. Bearer
+expiry is rechecked inside the reservation transaction; an expired bearer returns 401 without
+reserving spend or contacting the provider.
+
+Personal comparison pilot: all 11 Bridge source types can be enabled with explicit consent in the same source settings as self-host. The proactive and digest schedules run with output to the same Photon destination as briefs. Quiet hours, interrupt gates and duplicate suppression still apply.
 
 ## Managed operations and recovery
 
-The runtime supervisor recycles the container if either essential process exits. Managed startup
-checks the attached volume before launching writers. See [the tenant recovery runbook](adapters/hermes/RECOVERY.md)
-for the one-time volume migration, model lease renewal, scoped Bridge revocation and verified offline
-export/restore. Tenant cold restore is covered by synthetic tests; fleet control-state recovery and
-automated backups still require operator verification.
-
-### Visual brief pilot
-
-`SOTTO_VISUAL_BRIEFS` defaults to `1`: Photon morning/evening briefs and focused meeting backgrounds use the shared card renderer. Set `0` to keep text. See [visual brief testing and delivery limits](docs/VISUAL-BRIEFS.md).
+The runtime supervisor recycles the container if either essential process exits. Startup checks
+the attached volume before launching writers. See [tenant volume operations](adapters/sotto/VOLUME.md)
+for model lease renewal and scoped Bridge revocation. There is no tenant export or restore: a lost
+volume is replaced by a fresh installation. Fleet control-state recovery and automated backups
+still require operator verification.

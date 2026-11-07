@@ -107,23 +107,13 @@ def _events(calendar) -> list:
     return []
 
 
-def _freemail_domains() -> set:
-    """Use the research lane's one canonical freemail list without copying it here."""
-    try:
-        import research_attendees as ra  # noqa: PLC0415
-        return ra.FREEMAIL_DOMAINS
-    except Exception:  # noqa: BLE001 — filtering should degrade to the existing corporate rule
-        return set()
-
 
 def upcoming_attendees(calendar) -> list:
     """Unique external attendees in calendar order, capped by the existing research ceiling."""
     owner = _settings_email()
     owner_domain = owner.split("@", 1)[1] if "@" in owner else ""
-    # No freemail list at all (research_attendees failed to import) → no colleague filter: without
-    # the list, a gmail owner would count every other gmail attendee as a colleague and drop them.
-    # A few extra lookups beat a silently empty prep (review, Sep 3).
-    freemail = _freemail_domains()
+    from textutil import FREEMAIL_DOMAINS
+    freemail = FREEMAIL_DOMAINS
     if not freemail or owner_domain in freemail:
         owner_domain = ""
     out, seen = [], set()
@@ -467,7 +457,8 @@ def profile_agreement(attendee: dict, person: kg.PersonFile | None, user: dict,
     # Fail CLOSED: if the freemail list cannot be loaded, no domain counts as corporate — the list
     # is what makes "the domain ties the address to the company" true, and without it a gmail
     # address would be handed the corporate LINK path.
-    freemail = _freemail_domains()
+    from textutil import FREEMAIL_DOMAINS
+    freemail = FREEMAIL_DOMAINS
     corporate = bool(freemail) and "@" in email and email.split("@", 1)[1] not in freemail
     if published_source and agrees(published_name) and corporate and agreed:
         return LINK, "published name and company agree with the address' own domain"

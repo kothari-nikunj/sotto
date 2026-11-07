@@ -1,0 +1,122 @@
+{
+  "name": "synthetic-chronological-acknowledgment-machinery",
+  "world": {
+    "savedSourceGrants": [
+      "gmail",
+      "imessage"
+    ],
+    "commitmentJourney": {},
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}"
+    }
+  },
+  "turns": [
+    {
+      "text": "What did I promise Maya Journey? Check the saved obligations.",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "request",
+          "scenario": "acknowledgment"
+        }
+      ],
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "excludes": [
+        "was sent",
+        "completed"
+      ]
+    },
+    {
+      "text": "Did my unrelated acknowledgment to Maya fulfill either promise?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "fulfillment",
+          "scenario": "acknowledgment"
+        },
+        {
+          "journey": "commitment",
+          "stage": "resolve",
+          "scenario": "acknowledgment"
+        }
+      ],
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "excludes": [
+        "was sent",
+        "completed"
+      ]
+    },
+    {
+      "text": "After restarting, what remains open for Maya?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "restart",
+          "scenario": "acknowledgment"
+        }
+      ],
+      "restartBefore": true,
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing document",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "maxCharacters": 700,
+      "knowledgeQueryReads": 1,
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "excludes": [
+        "was sent",
+        "completed"
+      ]
+    }
+  ]
+}

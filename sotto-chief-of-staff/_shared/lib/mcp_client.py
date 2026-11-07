@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,12 +39,28 @@ class McpError(Exception):
     pass
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913, PLR0917 — urllib override
+        previous = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        previous_port = 443 if previous.port is None else previous.port
+        target_port = 443 if target.port is None else target.port
+        if (target.username is not None or previous.scheme != 'https' or target.scheme != 'https'
+                or previous.hostname != target.hostname or previous_port != target_port):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_connector_request(req, timeout):
+    return urllib.request.build_opener(_SameOriginRedirect()).open(req, timeout=timeout)
+
+
 def _default_transport(url: str, body: bytes, headers: dict, timeout: int):
     """POST one JSON-RPC message. Returns (status, response_headers_dict, body_bytes).
     Injectable for tests (and for any host that needs a proxy-aware transport)."""
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_connector_request(req, timeout) as resp:
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers or {}), e.read()
@@ -94,6 +111,8 @@ class McpClient:
                                                self._headers(), timeout)
         if status in (401, 403):
             raise ConnectorAuthError(f"MCP server rejected the token (HTTP {status})")
+        if 300 <= status < 400:
+            raise McpError(f"MCP redirect refused (HTTP {status})")
         if status >= 400:
             raise McpError(f"MCP HTTP {status}: {body[:300]!r}")
         # Session id may be (re)issued on any response; capture case-insensitively.

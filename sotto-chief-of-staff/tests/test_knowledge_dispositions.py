@@ -42,13 +42,28 @@ def test_bounded_items_keep_exact_totals_for_identity_rejections(tmp_path, monke
     assert receipt['items'][-1]['fact_index'] == 255
 
 
-def test_revived_fact_is_updated_not_reported_as_an_unchanged_duplicate(monkeypatch):
-    fact = kg.FactMeta(text='Enjoys hiking', status='archived', source_ref='synthetic',
-                       evidence_refs=['synthetic'], first='2026-01-01', last='2026-01-01')
+def test_stale_replay_is_duplicate_and_new_evidence_revives():
+    fact = kg.FactMeta(text='Enjoys hiking', status='archived', source='observed_message',
+                       archived_reason='stale', archived_text='Enjoys hiking',
+                       source_ref='synthetic', evidence_refs=['synthetic'],
+                       first='2026-01-01', last='2026-01-01')
     person = kg.PersonFile(facts={'f_existing': fact})
-    monkeypatch.setattr(kg, 'find_similar_fact', lambda *args: (kg.BUMP, 'f_existing'))
+    before = dict(vars(fact))
+    counts = {'new': 0, 'confirmed': 0}
     outcome = writer._apply_fact(person, 'c_synthetic',
-                                 {'fact': fact.text, 'source_ref': 'synthetic'},
-                                 '2026-10-01', {'new': 0, 'confirmed': 0})
+                                 {'fact': fact.text, 'source': 'observed_message',
+                                  'source_ref': 'synthetic'}, '2026-10-01', counts)
+    assert outcome == {'disposition': 'duplicate', 'reason': 'no_new_evidence',
+                       'fact_id': 'f_existing'}
+    assert vars(fact) == before
+    assert counts == {'new': 0, 'confirmed': 0}
+    outcome = writer._apply_fact(person, 'c_synthetic',
+                                 {'fact': fact.text, 'source': 'observed_message',
+                                  'source_ref': 'synthetic-new'}, '2026-10-01', counts)
+    assert outcome == {'disposition': 'confirmed', 'reason': 'independent_evidence',
+                       'fact_id': 'f_existing'}
     assert fact.status == 'active'
-    assert outcome == {'disposition': 'updated', 'reason': 'revived', 'fact_id': 'f_existing'}
+    assert fact.archived_reason is None and fact.archived_text is None
+    assert fact.evidence_refs == ['synthetic', 'synthetic-new']
+    assert fact.seen == before['seen'] + 1
+    assert counts == {'new': 0, 'confirmed': 1}

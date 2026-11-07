@@ -11,6 +11,8 @@ PORT SOURCE: app/src-tauri/src/database/relationship_analytics.rs
   - compute_attention_queue ("waiting_on_you": they sent last, 3-14d; "losing_touch": cadence
     increasing + historically strong + 14d+ silent)
 The Mac computed this in people.db; here it's a deterministic pass over the wide read_local snapshot.
+Reply-review suggestions additionally require a visible request cue or missed call; silence alone
+does not establish an obligation. At most five contextual suggestions are returned.
 
 Usage (execute_code): relationship_pulse.py /tmp/sotto_local_6w.json   (or stdin)
 Prints JSON: { "attention_queue":[...], "relationship_insights":[...], "lapsed":[...],
@@ -22,8 +24,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from html import unescape
+from datetime import date, datetime, timezone
 
 _SHARED = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "scripts")
 _SHARED_LIB = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "lib")
@@ -33,8 +37,10 @@ if _SHARED_LIB not in sys.path:
 from email.utils import getaddresses  # noqa: E402
 from textutil import _arr, _is_likely_automated, _looks_like_phone_number, _s  # noqa: E402
 from timeutil import _parse_ts, configured_user_email  # noqa: E402
-from render_local import _is_sent_email, resolve_contact_names  # noqa: E402
+from render_local import (_is_sent_email, rekey_seed_to_graph, resolve_contact_names,  # noqa: E402
+                          seed_contact_index_from_contacts)
 from chatfmt import to_chat  # noqa: E402
+from ledger_io import dated_request_text  # noqa: E402
 from relationship_importance import (activity_evidence, attention_tiebreak, classify,
                                      engagement_signals, meaningful_relationship,
                                      relationship_meeting_attendees)  # noqa: E402
@@ -43,9 +49,45 @@ WAITING_MIN_DAYS = 3       # relationship_analytics.rs:469
 WAITING_MAX_DAYS = 14
 LOSING_TOUCH_DAYS = 14     # relationship_analytics.rs:494
 MIN_INTERACTIONS_FOR_TREND = 8   # need 8 dates → 7 intervals (rs:1149-1151)
-MAX_QUEUE = 20
-MAX_LAPSED = 10
+MAX_QUEUE = 5
+MAX_LAPSED = 5
+PULSE_ITEM_CHARS = 140
 HISTORY_MAX_AGE_DAYS = 365       # drop history entries silent for over a year (not a relationship)
+MESSAGE_CHANNELS = ("imessage", "whatsapp", "calls")   # the Bridge lanes this pass reads
+LAPSE_DISCLAIMER = "Some history may be missing, so I’ve left out ‘fully lost touch’ suggestions."
+# Shared state keeps only the non-content shape of an inbound touch. Message text and subjects live
+# only in the attended reply that read them: consent can change after relationship_state.json is
+# written, and the brief, dashboard and triage all read that file.
+STORED_INBOUND_FIELDS = ("at", "channel", "missed_call", "bulk", "direct", "request")
+STORED_CONTEXT_FIELDS = ("channel", "date", "missed_call", "request")
+_REQUEST_CUE = re.compile(r"\b(?:(?:can|could|would|will) you\b|please (?:send|share|confirm|review|reply|call)\b)", re.I)
+
+
+def complete_channels(source_status=None, *, email_complete=False) -> list:
+    """The channels this window read in full — the only ones whose silence can prove a lapse.
+
+    `source_status` is the Bridge's per-source read status; only `ok` is a full read. A snapshot
+    without one (an older Bridge, or a hand-saved read) keeps the original assumption that its
+    message lanes were read. Email is complete only when its own read said so."""
+    if source_status is None:
+        channels = set(MESSAGE_CHANNELS)
+    else:
+        from source_context import _local_statuses  # noqa: PLC0415 — the Bridge status reader
+        statuses = _local_statuses(source_status)
+        channels = {channel for channel in MESSAGE_CHANNELS if statuses.get(channel) == "ok"}
+    if email_complete:
+        channels.add("email")
+    return sorted(channels)
+
+
+def _absence_proven(entry: dict, absence_complete) -> bool:
+    """A lapse needs every channel you used with them read in full this window. A row from before
+    per-channel history counts as a message-lane relationship."""
+    if isinstance(absence_complete, bool):
+        return absence_complete
+    covered = set(absence_complete or ())
+    used = entry.get("channels") if isinstance(entry.get("channels"), dict) else {}
+    return bool(covered) and (set(used) or set(MESSAGE_CHANNELS)) <= covered
 
 
 def _data_root() -> str:
@@ -56,19 +98,50 @@ def _state_path() -> str:
     return os.path.join(_data_root(), "knowledge", "relationship_state.json")
 
 
+def _stored_inbound(value) -> dict:
+    """The persisted inbound shape; any text or subject (including from an older file) is dropped."""
+    return {key: value[key] for key in STORED_INBOUND_FIELDS if key in value} if isinstance(value, dict) else {}
+
+
+def _stored_history_row(row):
+    if isinstance(row, dict) and "latest_inbound" in row:
+        return {**row, "latest_inbound": _stored_inbound(row.get("latest_inbound"))}
+    return row
+
+
+def _stored_queue_row(row):
+    context = row.get("context") if isinstance(row, dict) else None
+    if not isinstance(context, dict):
+        return row
+    return {**row, "context": {key: context[key] for key in STORED_CONTEXT_FIELDS if key in context}}
+
+
+def _has_request(latest: dict) -> bool:
+    """A visible request cue: read from fresh text, or the boolean a prior observation stored."""
+    if "text" in latest:
+        return bool(_REQUEST_CUE.search(_excerpt(latest.get("text"))))
+    return latest.get("request") is True
+
+
 def _load_history() -> dict:
     """Per-contact snapshots from the last run: {name: {last_contact, interactions, trend}}.
-    Missing/corrupt state → {} (first run degrades to the old no-memory behavior)."""
+    Missing/corrupt state → {} (first run degrades to the old no-memory behavior). Stored message
+    text from an older writer is ignored here and scrubbed on the next write."""
     try:
         with open(_state_path(), encoding="utf-8") as f:
             h = (json.load(f) or {}).get("history")
-        return h if isinstance(h, dict) else {}
+        return {key: _stored_history_row(row) for key, row in h.items()} if isinstance(h, dict) else {}
     except Exception:
         return {}
 
 
 def _ts(s: str):
     return _parse_ts(_s(s))
+
+
+def _aware_ts(value):
+    parsed = _ts(value)
+    return parsed.replace(tzinfo=timezone.utc) if parsed and parsed.tzinfo is None else parsed
 
 
 _KG = None
@@ -113,7 +186,8 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
     can finally say "last texted yesterday, last emailed never"."""
     people: dict = {}
 
-    def add(name, ts, from_me, channel, cid="", conversation_id="", native_id="", engaged=True):
+    def add(name, ts, from_me, channel, cid="", conversation_id="", native_id="", engaged=True,
+            context=None):
         nm = _s(name).strip()
         # "Unknown" is the resolver's sentinel — merging every unresolved sender into one fake
         # contact would fabricate cadence/waiting signals for a person who doesn't exist.
@@ -133,10 +207,12 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
             p["cid"] = _s(cid).strip()
         p["dates"].append(d)
         (p["from_me"] if from_me else p["from_them"]).append(d)
+        if not from_me and d >= (p.get("latest_inbound") or {}).get("at", d):
+            p["latest_inbound"] = {"at": d, "channel": channel, "native_id": _s(native_id)[:512], **(context or {})}
         if engaged:
             p["engaged_dates"].append(d)
             (p["engaged_from_me"] if from_me else p["engaged_from_them"]).append(d)
-        if conversation_id:
+        if conversation_id and engaged:
             p["events"].append({"at": d, "from_me": bool(from_me), "channel": channel,
                                 "conversation_id": _s(conversation_id), "native_id": _s(native_id)})
         prev = p["by_channel"].get(channel)
@@ -149,15 +225,17 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         add(m.get("resolved_name"), m.get("timestamp"), m.get("is_from_me"),
             "imessage", m.get("canonical_id"),
             m.get("chat_identifier") or m.get("chat_id") or m.get("handle"),
-            m.get("message_id") or m.get("guid") or m.get("id"))
+            m.get("message_id") or m.get("guid") or m.get("id"), context={"text": m.get("text")})
     for m in _arr(local, "whatsapp"):
         if m.get("is_group_chat"):
             continue
         nm = _s(m.get("resolved_name")) or _s(m.get("partner_name"))
         add(nm, m.get("timestamp"), m.get("is_from_me"), "whatsapp", m.get("canonical_id"),
-            m.get("chat_id") or m.get("partner_id"), m.get("message_id") or m.get("id"))
+            m.get("chat_id") or m.get("partner_id"), m.get("message_id") or m.get("id"),
+            context={"text": m.get("text")})
     for c in _arr(local, "missed_calls"):
-        add(c.get("name"), c.get("timestamp"), False, "calls", c.get("canonical_id"), engaged=False)
+        add(c.get("name"), c.get("timestamp"), False, "calls", c.get("canonical_id"), engaged=False,
+            context={"missed_call": True})
     for c in _arr(local, "recent_calls"):
         # Processed calls carry direction, while duration proves the call connected.
         try:
@@ -176,6 +254,7 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
     for m in _arr(local, "emails"):
         if not isinstance(m, dict):
             continue
+        bulk = _bulk_email(m)
         sent = _is_sent_email(m)
         addrs = _email_addrs(m.get("to"), m.get("cc")) if sent \
             else _email_addrs(m.get("from") or m.get("sender"))[:1]
@@ -186,7 +265,10 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
             if not who:
                 continue
             add(who["name"], m.get("date") or m.get("timestamp"), sent, "email", who["cid"],
-                m.get("threadId") or m.get("thread_id"), m.get("id") or m.get("message_id"))
+                m.get("threadId") or m.get("thread_id"), m.get("id") or m.get("message_id"),
+                engaged=not bulk,
+                context={"text": m.get("snippet"), "subject": m.get("subject"), "bulk": bulk,
+                         "direct": bool(me and me in _email_addrs(m.get("to")))})
     # A channel that resolves a name but not an id (processed calls) must not split a person in
     # two: fold each name-keyed entry into the cid-keyed entry carrying the same display name —
     # exactly what the old all-name keying did implicitly.
@@ -200,10 +282,53 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         dst["engaged_dates"] += src["engaged_dates"]
         dst["engaged_from_me"] += src["engaged_from_me"]
         dst["engaged_from_them"] += src["engaged_from_them"]
+        incoming = src.get("latest_inbound")
+        if incoming and incoming["at"] >= (dst.get("latest_inbound") or {}).get("at", incoming["at"]):
+            dst["latest_inbound"] = incoming
         for ch, d in src["by_channel"].items():
             if ch not in dst["by_channel"] or d > dst["by_channel"][ch]:
                 dst["by_channel"][ch] = d
     return people
+
+
+def _bulk_email(message: dict) -> bool:
+    """Use visible bulk evidence; a known sender alone does not make a newsletter personal."""
+    labels = message.get("labelIds") or message.get("labels") or []
+    if isinstance(labels, list) and {str(label).upper() for label in labels} & {
+            "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS", "SPAM", "TRASH"}:
+        return True
+    headers = (message.get("payload") or {}).get("headers", [])
+    if isinstance(headers, list) and any(
+            _s(header.get("name")).lower() in {"list-id", "list-unsubscribe"}
+            for header in headers if isinstance(header, dict)):
+        return True
+    text = _s(message.get("snippet")).lower()
+    return "unsubscribe" in text or "manage your subscription" in text
+
+
+def _excerpt(value, limit=180) -> str:
+    # Do not promote a request quoted from an older message into a new ask.
+    text = re.split(r"(?im)^\s*(?:>|on .+ wrote:|[- ]*forwarded message[- ]*)", unescape(_s(value)))[0]
+    text = " ".join(text.split()).replace("*", "").strip()
+    return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+
+def _reply_context(person: dict):
+    """A conservative visible cue to review, never a declaration that a reply is owed."""
+    latest = person.get("latest_inbound") or {}
+    if latest.get("bulk"):
+        return None
+    if latest.get("missed_call"):
+        return {"channel": "calls", "date": latest["at"].date().isoformat(), "missed_call": True}
+    if latest.get("channel") == "email" and not latest.get("direct"):
+        return None  # a CC or unknown recipient is not an ask addressed to the owner
+    # Deliberately small: ambiguous questions, greetings and subject-only rows stay out.
+    if not _has_request(latest):
+        return None
+    context = {"channel": latest["channel"], "date": latest["at"].date().isoformat(), "request": True}
+    if "text" in latest:   # a fresh, in-memory observation; retained state carries no wording
+        context.update(subject=_excerpt(latest.get("subject"), 90), excerpt=_excerpt(latest.get("text")))
+    return context
 
 
 def _own_email() -> str:
@@ -289,7 +414,205 @@ def _cadence_trend(dates: list) -> str:
     return "stable"
 
 
-def compute(local: dict, now: datetime | None = None, history: dict | None = None) -> dict:
+def _ambiguous_history_names(local, index):
+    """The graph's by-name lookup chooses a latest file; inspect all exact identities instead."""
+    # Only a uniquely linked Contacts card shares the graph identity; collisions stay separate.
+    ambiguous = set()
+    groups = [rekey_seed_to_graph(seed_contact_index_from_contacts(_arr(local, 'contacts')),
+                                  _arr(local, 'contact_index'), ambiguous_names=ambiguous),
+              _arr(local, 'contact_index')]
+    graph, kg = [], _knowledge()
+    if kg:
+        for path in set((index.get('by_cid') or {}).values()):
+            try:
+                with open(path, encoding='utf-8') as stream:
+                    person = kg.parse_person_file(stream.read())
+                graph.append({'display_name': person.name, 'canonical_id': person.canonical_id})
+            except Exception:
+                return None  # an unreadable global identity set cannot prove a unique name
+    groups.append(graph)
+    names = {}
+    for rows in groups:
+        for row in rows:
+            name = _s(row.get('display_name') or row.get('name')).strip().casefold()
+            if _s(row.get('canonical_id')).strip():  # a row with no identity cannot be a second person
+                names.setdefault(name, set()).add(row.get('canonical_id'))
+    return ambiguous | {name for name, ids in names.items() if len(ids) > 1}
+
+
+def _retained_activity(people, history, now, ambiguous):
+    """Reuse dated canonical observations; never reconstruct message text from a summary."""
+    for key, old in history.items():
+        if not isinstance(old, dict):
+            continue
+        last = _aware_ts(old.get('last_contact'))
+        if not last or not 0 <= (now - last).total_seconds() <= 42 * 86400:
+            continue  # older absent rows still use the existing guarded lapse path
+        if not key.startswith('c_') and (ambiguous is None or (old.get('name') or key).casefold() in ambiguous):
+            continue
+        if key not in people and not key.startswith('c_'):
+            matches = [fresh_key for fresh_key, fresh in people.items()
+                       if fresh['cid'] and fresh['name'] == (old.get('name') or key)]
+            if len(matches) == 1:
+                key = matches[0]  # identity migration must not detach a saved ask from a fresh reply
+        p = people.setdefault(key, {'name': old.get('name') or key,
+            'cid': key if key.startswith('c_') else '', 'dates': [], 'from_me': [],
+            'from_them': [], 'by_channel': {}, 'events': [], 'engaged_dates': [],
+            'engaged_from_me': [], 'engaged_from_them': []})
+        p['dates'].append(last)
+        evidence = old.get('importance_evidence') or {}
+        for target, field in (('engaged_dates', 'active_days'),
+                              ('engaged_from_me', 'sent_days'), ('engaged_from_them', 'received_days')):
+            p[target].extend(at for day in evidence.get(field, []) if (at := _aware_ts(day)))
+        for target, field in (('from_me', 'last_from_you'), ('from_them', 'last_from_them')):
+            at = _aware_ts(old.get(field))
+            if at:
+                p[target].append(at)
+        for channel, value in (old.get('channels') or {}).items():
+            at = _aware_ts(value)
+            if at and at > p['by_channel'].get(channel, datetime.min.replace(tzinfo=timezone.utc)):
+                p['by_channel'][channel] = at
+        incoming = _stored_inbound(old.get('latest_inbound'))  # never retained wording
+        at = _aware_ts(incoming.get('at'))
+        if at and at > (p.get('latest_inbound') or {}).get('at', datetime.min.replace(tzinfo=timezone.utc)):
+            p['latest_inbound'] = {**incoming, 'at': at}
+
+
+def _compact_commitments(rows):
+    """Group display only by proved canonical people; unknown identities stay separate."""
+    try:
+        import importlib.util
+        path = os.path.join(_SHARED, '..', '..', 'morning-brief', 'scripts', 'continuity_resolve.py')
+        spec = importlib.util.spec_from_file_location('pulse_continuity_identity', path)
+        resolver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resolver)
+        identity = resolver.person_identity()
+    except Exception:
+        resolver, identity = None, {}
+    grouped = {}
+    known = (identity.get('index') or {}).get('by_cid') or {}
+    unique = identity.get('unique_identifiers') or {}
+    for row, direction in rows:
+        stored = _s(row.get('canonical_id')).strip().lower()
+        stored = stored if stored in known else ''
+        raw = _s(row.get('identifier')).strip()
+        alias = unique.get(resolver.alias_identifier(raw)) if resolver and raw else None
+        # An identifier is an identity: with one, only its unique graph owner proves the person (a
+        # stored ID it does not prove stays separate); without one, a graph-known stored ID does.
+        cid = (alias or '') if raw else stored
+        if raw and stored and alias != stored:
+            cid = ''
+        key = (resolver.contact_anchor(cid, '', ''), direction, bool(row.get('birthday_courtesy'))) if cid and not row.get('group_id') else ('row', id(row), direction)
+        grouped.setdefault(key, []).append((row, direction, cid))
+    return list(grouped.values())
+
+
+
+def _calendar_due(value):
+    raw = _s(value)
+    try:
+        return date.fromisoformat(raw).isoformat() if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw) else ''
+    except ValueError:
+        return ''
+
+
+def _human_date(value, now=None):
+    day = _calendar_due(value)
+    if not day:
+        return ''
+    parsed = date.fromisoformat(day)
+    current = (now or datetime.now(timezone.utc)).date()
+    return f"{parsed.strftime('%b')} {parsed.day}" + (f", {parsed.year}" if parsed.year != current.year else '')
+
+
+def _compact_text(value):
+    text = _excerpt(value, PULSE_ITEM_CHARS)
+    if text.endswith('…') and ' ' in text:
+        text = text.rsplit(' ', 1)[0].rstrip('.,;:') + '…'
+    return text
+
+
+def _direct_address(value):
+    """An email or phone a draft can be addressed to; an opaque group or chat id is not one."""
+    value = _s(value).strip().lower()
+    if not value or value.endswith('@g.us') or ';' in value:
+        return False
+    if '@' in value:
+        return bool(re.fullmatch(r'[^@\s]+@[^@\s]+\.[a-z]{2,}', value))
+    return bool(re.fullmatch(r'\+?[\d\s().-]+', value)) and len(re.sub(r'\D', '', value)) >= 7
+
+
+def _request_key(item):
+    """One open item for display counts: its precise ask AND its summary, so two tasks that
+    share a short ask are still two."""
+    return (_s(_commitment_request(item)).strip().casefold(), _s(item.get('what')).strip().casefold())
+
+
+def _commitment_request(row):
+    # Courtesy wording is normalized by the protected query; its original ask is not a debt.
+    ask = _s(row.get('ask')).strip()
+    return row.get('what') if row.get('birthday_courtesy') or not re.search(r'\w', ask) else ask
+
+
+def with_commitments(result, loops, now=None):
+    """Prioritize the canonical active ledger; this read never creates or resolves a debt."""
+    rows = [(row, direction) for direction in ('you_owe', 'waiting_on_them')
+            for row in loops.get(direction, []) if row.get('name') not in ('', '(unknown)')]
+    rows.sort(key=lambda pair: (bool(pair[0].get('birthday_courtesy')), not pair[0].get('overdue'), -(pair[0].get('age_days') or 0)))
+    if not rows:
+        return result
+    groups = _compact_commitments(rows)
+    # A name-only chat request is safe to suggest only when the whole inventory
+    # has one matching group, including items omitted from this compact display.
+    # Every display name in a group counts: a short name on a later row is still that name.
+    names = [name for group in groups
+             for name in {_excerpt(item['name'], 100).casefold() for item, _, _ in group}]
+    hidden = len(groups) - MAX_QUEUE
+    proven = {cid for group in groups for _, _, cid in group if cid}
+    groups = [[(item, direction) for item, direction, _ in group] for group in groups[:MAX_QUEUE]]
+    rows = [group[0] for group in groups]
+    lines = ['**Follow-ups**']
+    help_name = ''
+    for group in groups:
+        row, direction = group[0]
+        deadline = '' if row.get('birthday_courtesy') else _calendar_due(row.get('deadline'))
+        due = f" ({'was due' if row.get('overdue') else 'due'} {_human_date(deadline, now)})" if deadline else ''
+        direction_text = 'Waiting for them: ' if direction == 'waiting_on_them' else ''
+        same_ask = [item for item, _ in group if _request_key(item) == _request_key(row)]
+        # Relative wording stays quoted under its recording date: an ask re-captured later keeps
+        # its original `created_at`, so it is never rewritten as a dated instruction.
+        text = dated_request_text(_compact_text(_commitment_request(row)), same_ask, now)
+        if row.get('birthday_courtesy'):
+            text = f"{text} (Optional, no urgency)"
+        extra = len({(_request_key(item), _calendar_due(item.get('deadline')))
+                     for item, _ in group}) - 1
+        if extra:
+            text += f"; {extra} other open item{'s' if extra != 1 else ''}"
+        text = text.rstrip('.') if due else text
+        ending = '' if not due and text.removesuffix('”').endswith(('.', '?', '!', '…')) else '.'
+        if (not help_name and not extra and not row.get('birthday_courtesy')
+                and direction == 'you_owe' and _direct_address(row.get('identifier')) and not row.get('group_id')
+                and names.count(_excerpt(row['name'], 100).casefold()) == 1):
+            help_name = _excerpt(row['name'], 100)
+        lines.append(f"- **{_excerpt(row['name'], 100)}** — {direction_text if not row.get('birthday_courtesy') else ''}{text}{due}{ending}")
+    if hidden > 0:
+        lines.append(f"{hidden} other item{'s are' if hidden != 1 else ' is'} on your list.")
+    if help_name:
+        lines.append(f'I can draft a reply to {help_name}.')
+    # A suggestion is folded into a commitment only through a proven canonical identity, never a name.
+    queue = [row for row in result.get('attention_queue', [])
+             if _s(row.get('canonical_id')).strip().lower() not in proven][:MAX_QUEUE - len(rows)]
+    if queue:
+        lines.append(_render([row for row in queue if row['queue_type'] != 'lapsed'],
+                             [row for row in queue if row['queue_type'] == 'lapsed']))
+    # A held-back lapse keeps its one-line disclaimer when commitments lead the message.
+    markdown = to_chat('\n'.join(lines)) + ('\n' + LAPSE_DISCLAIMER if result.get('lapse_withheld') else '')
+    return {**result, 'pulse_markdown': markdown, 'commitments': [row for row, _ in rows]}
+
+
+def compute(local: dict, now: datetime | None = None, history: dict | None = None, *,
+            absence_complete=False) -> dict:
+    """`absence_complete` is True, False, or the channels read in full (see complete_channels)."""
     now = now or datetime.now(timezone.utc)
     history = history or {}
     local = resolve_contact_names(local)
@@ -299,20 +622,28 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
     except Exception:
         index = {}
     people = _interactions_by_contact(local, index)
+    ambiguous = _ambiguous_history_names(local, index)
+    # Retained observations may still surface a saved ask, but a pass with no fresh observation
+    # (Bridge offline) is degraded: it must not re-derive or overwrite the state it was read from.
+    fresh = bool(people)
+    _retained_activity(people, history, now, ambiguous)
     meetings = _held_meetings(local, now, index)
+    fresh = fresh or bool(meetings)   # a held meeting is a fresh observation too
     for key, held in meetings.items():
         person = people.setdefault(key, {"name": held["name"], "cid": held["cid"], "dates": [],
             "from_me": [], "from_them": [], "by_channel": {}, "events": [], "engaged_dates": [],
             "engaged_from_me": [], "engaged_from_them": []})
         person["dates"].extend(held["dates"])
 
-    # Empty/degraded snapshot guard: a window with NO interactions at all means the read failed or
-    # the Bridge was offline, not that the user ghosted everyone. Emitting lapsed entries here would
+    # Empty/degraded snapshot guard: no usable known-person interactions may mean unavailable
+    # reads or interactions without a known identity; it does not establish relationship lapse. Emitting lapsed entries here would
     # mark a 2-days-ago contact "fully lost touch", and merging would poison the longitudinal state.
     # Return empty results with degraded=True — _persist_state skips writing, keeping prior state.
-    if not people:
+    if not people and not any(isinstance(row, dict) and _absence_proven(row, absence_complete)
+                             and meaningful_relationship(row.get('importance_evidence'))
+                             for row in history.values()):
         return {"attention_queue": [], "relationship_insights": [], "lapsed": [],
-                "pulse_markdown": ("I couldn't read any interactions this window — "
+                "pulse_markdown": ("I could not identify any known-person interactions this window — "
                                    "skipping the pulse rather than guessing."),
                 "degraded": True}
 
@@ -325,6 +656,9 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         last_them = max(p["from_them"]) if p["from_them"] else None
         last_you = max(p["from_me"]) if p["from_me"] else None
         prev = history.get(key, {}) if isinstance(history.get(key), dict) else {}
+        if (not prev and p['cid'] and ambiguous is not None and p['name'].casefold() not in ambiguous
+                and isinstance(history.get(p['name']), dict)):
+            prev = history[p['name']]
         person_evidence = {"dates": p["engaged_dates"], "from_me": p["engaged_from_me"],
             "from_them": p["engaged_from_them"],
             "held_meetings": (meetings.get(key) or {}).get("dates", [])}
@@ -335,7 +669,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
             "key": key, "name": p["name"], "cid": p["cid"],
             "interactions": len(p["dates"]), "days_since": days_since,
             "last_from_them": last_them, "last_from_you": last_you,
-            "trend": _cadence_trend(p["dates"]),
+            "trend": _cadence_trend(sorted(set(p["engaged_dates"]))),
             "by_channel": p["by_channel"], "importance_evidence": evidence,
             "importance": classify(evidence, now), "engagement": engagement,
             "graph_context": context,
@@ -347,24 +681,31 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         meaningful = meaningful_relationship({
             "sent_days": people[pp["key"]]["engaged_from_me"],
             "received_days": people[pp["key"]]["engaged_from_them"]})
-        # waiting_on_you: they sent last and you haven't answered (3-14 days)
+        # A last inbound touch alone proves no obligation. Only a visible request/missed call
+        # earns a suggestion, phrased as a review because coverage and intent may be incomplete.
         lt, ly = pp["last_from_them"], pp["last_from_you"]
+        reply = _reply_context(people[pp["key"]])
+        tier_rank = {"regular": 0, "vip": 1, "vvip": 2}.get(pp["importance"]["tier"], 0)
         if lt is not None and (ly is None or lt > ly):
             days = int((now - lt).total_seconds() // 86400)
-            if WAITING_MIN_DAYS <= days <= WAITING_MAX_DAYS:
-                e = {"display_name": pp["name"], "queue_type": "waiting_on_you",
-                     "reason": f"Unanswered {days} days" if days >= 7 else f"Waiting {days} days for reply",
-                     "days_waiting": days, "priority": days * 10 + attention_tiebreak(pp["engagement"], now),
-                     "engagement": pp["engagement"]}
+            if reply and WAITING_MIN_DAYS <= days <= WAITING_MAX_DAYS:
+                e = {"display_name": pp["name"], "canonical_id": pp["cid"], "queue_type": "waiting_on_you",
+                     "reason": f"{'Missed call' if reply.get('missed_call') else 'Possible reply'} {days} days ago; "
+                               "no later response in available history",
+                     "days_waiting": days, "priority": 1000 + tier_rank * 100 + int(meaningful) * 50 + days * 2
+                         + attention_tiebreak(pp["engagement"], now),
+                     "engagement": pp["engagement"], "context": reply,
+                     "importance": pp["importance"]}
                 if pp["graph_context"]:
                     e["graph_context"] = pp["graph_context"]
                 queue.append(e)
         # losing_touch: drifting apart, historically strong, 14d+ silent
         if pp["trend"] == "increasing" and meaningful and pp["days_since"] >= LOSING_TOUCH_DAYS:
-            e = {"display_name": pp["name"], "queue_type": "losing_touch",
-                 "reason": f"Communication declining — last spoke {pp['days_since']} days ago",
-                 "days_waiting": 0, "priority": pp["days_since"] * 10 + attention_tiebreak(pp["engagement"], now),
-                 "engagement": pp["engagement"]}
+            e = {"display_name": pp["name"], "canonical_id": pp["cid"], "queue_type": "losing_touch",
+                 "reason": f"Communication had slowed; last observed contact {pp['days_since']} days ago",
+                 "days_waiting": 0, "priority": 500 + tier_rank * 100 + min(pp["days_since"], 90)
+                     + attention_tiebreak(pp["engagement"], now),
+                 "engagement": pp["engagement"], "importance": pp["importance"]}
             if pp["graph_context"]:
                 e["graph_context"] = pp["graph_context"]
             queue.append(e)
@@ -375,7 +716,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
     # ── Longitudinal: lapsed contacts — previously regular, now absent from the whole window ─────
     # Without history, a contact silent longer than the ~6-week read vanishes entirely. The prior
     # run's snapshot lets us surface them as fully-lost-touch, ranked BELOW losing_touch.
-    lapsed = []
+    lapsed, withheld = [], False
     current_keys = set(people.keys())
     current_names = {p["name"] for p in people.values()}
     for hkey, h in history.items():
@@ -387,11 +728,21 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         if not meaningful:
             continue
         last_known = _s(h.get("last_contact"))
+        last = _ts(last_known)
+        if last is None:
+            continue
+        last = last.replace(tzinfo=timezone.utc) if last.tzinfo is None else last
+        if (now.date() - last.astimezone(now.tzinfo).date()).days <= 42:
+            continue
+        if not _absence_proven(h, absence_complete):
+            withheld = True   # silence on a channel this window did not fully read proves nothing
+            continue
         context = _graph_context(display, hkey if hkey != display else "", index)
         reason = "You've fully lost touch — no contact in this whole window"
         if last_known:
             reason += f" (last contact {last_known})"
-        e = {"display_name": display, "queue_type": "lapsed", "reason": reason,
+        e = {"display_name": display, "canonical_id": hkey if hkey.startswith("c_") else "",
+             "queue_type": "lapsed", "reason": reason,
              "last_contact": last_known, "days_waiting": 0,
              "priority": attention_tiebreak(h.get("engagement"), now),
              "engagement": h.get("engagement") or {}}
@@ -399,7 +750,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
             e["graph_context"] = context
         lapsed.append(e)
     lapsed.sort(key=lambda q: q["priority"], reverse=True)
-    lapsed = lapsed[:MAX_LAPSED]
+    lapsed = lapsed[:min(MAX_LAPSED, max(0, MAX_QUEUE - len(queue)))]
 
     insights = [{"display_name": q["display_name"], "insight_type": "gone_silent", "description": q["reason"]}
                 for q in queue if q["queue_type"] == "losing_touch"]
@@ -433,7 +784,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
         # Peak-merge against BOTH possible prior keys: this key, and (for a person the resolver
         # only now identified) the old display-name key — the migration path off name-keyed state.
         prev = history.get(pp["key"]) if isinstance(history.get(pp["key"]), dict) else {}
-        if not prev and pp["cid"]:
+        if not prev and pp["cid"] and ambiguous is not None and pp['name'].casefold() not in ambiguous:
             prev = history.get(pp["name"]) if isinstance(history.get(pp["name"]), dict) else {}
         try:
             prev_n = int(prev.get("interactions") or 0)
@@ -452,11 +803,19 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
                              "interactions": max(pp["interactions"], prev_n), "trend": pp["trend"],
                              "channels": channels, "importance_evidence": pp["importance_evidence"],
                              "engagement": pp["engagement"]}
+        for field, value in (('last_from_you', pp['last_from_you']), ('last_from_them', pp['last_from_them'])):
+            if value:
+                merged[pp['key']][field] = value.isoformat()
+        incoming = people[pp['key']].get('latest_inbound')
+        if incoming:
+            merged[pp['key']]['latest_inbound'] = _stored_inbound(
+                {**incoming, 'at': incoming['at'].isoformat(), 'request': _has_request(incoming)})
         merged[pp["key"]]["importance"] = pp["importance"]
 
     return {"attention_queue": queue + lapsed, "relationship_insights": insights,
             "lapsed": lapsed, "history": merged,
-            "pulse_markdown": to_chat(_render(queue, lapsed))}
+            "pulse_markdown": to_chat(_render(queue, lapsed)) + ("\n" + LAPSE_DISCLAIMER if withheld else ""),
+            "lapse_withheld": withheld, **({} if fresh else {"degraded": True})}
 
 
 def _render(queue: list, lapsed: list | None = None) -> str:
@@ -468,18 +827,37 @@ def _render(queue: list, lapsed: list | None = None) -> str:
     waiting = [q for q in queue if q["queue_type"] == "waiting_on_you"]
     losing = [q for q in queue if q["queue_type"] == "losing_touch"]
     if not waiting and not losing and not lapsed:
-        return "Relationships look healthy this week — no one's waiting on you, no one's gone quiet."
+        return "No clear follow-up to suggest from the available relationship history this week."
     def _line(q):
         who = q["display_name"]
         company = _s((q.get("graph_context") or {}).get("company"))
         if company:
             who = f"{who} ({company})"
-        return f"- **{who}** — {q['reason'].lower()}"
+        context = q.get("context") or {}
+        if context:
+            when = _human_date(context.get('date'))
+            when = f" on {when}" if when else ''
+            if context.get('missed_call'):
+                text = f"Missed call{when}; consider calling back if still relevant."
+            elif context.get('subject'):
+                text = f"Email{when} about {_compact_text(context['subject'])}; review and reply if still relevant."
+            elif context.get('excerpt'):
+                # Their words stay quoted and attributed; relative wording keeps its recorded date.
+                excerpt = _compact_text(context['excerpt'])
+                request = dated_request_text(excerpt, [{'created_at': context.get('date', '')}])
+                if request == excerpt:
+                    request = f"Request{when}: “{excerpt}”"
+                text = f"{request} — review and reply if still relevant."
+            else:
+                text = f"Earlier request{when}; review and reply if still relevant."
+            return f"- **{who}** — {text}"
+        return f"- **{who}** — {q['reason']}. Consider a check-in."
 
     lines = []
     if waiting:
-        lines.append("**Waiting on you**")
+        lines.append("**Worth a reply review**")
         lines += [_line(q) for q in waiting]
+        lines.append("No later response found in the available history.")
     if losing:
         lines.append("\n**Going quiet** (you used to talk more)")
         lines += [_line(q) for q in losing]
@@ -515,6 +893,12 @@ def _persist_state(result: dict, history_only=False, now=None):
                 'last_contact': max(old.get('last_contact', ''), row.get('last_contact', '')),
                 'channels': channels, 'importance_evidence': evidence, 'importance': classify(evidence, now),
                 'engagement': engagement_signals({}, merged_engagement, now)}
+            for field in ('last_from_you', 'last_from_them'):
+                previous[key][field] = max((old.get(field, ''), row.get(field, '')),
+                    key=lambda value: _aware_ts(value) or datetime.min.replace(tzinfo=timezone.utc))
+            old_in, new_in = old.get('latest_inbound') or {}, row.get('latest_inbound') or {}
+            previous[key]['latest_inbound'] = _stored_inbound(max((old_in, new_in), key=lambda value:
+                _aware_ts(value.get('at')) or datetime.min.replace(tzinfo=timezone.utc)))
             previous[key]['interactions'] = max(int(old.get('interactions') or 0), int(row.get('interactions') or 0))
             if history_only and old:
                 previous[key]['trend'] = old.get('trend', row.get('trend'))
@@ -527,11 +911,13 @@ def _persist_state(result: dict, history_only=False, now=None):
             if last and key not in names:
                 last = last.replace(tzinfo=timezone.utc) if last.tzinfo is None else last
                 if (now - last).total_seconds() <= HISTORY_MAX_AGE_DAYS * 86400:
-                    kept[key] = row
+                    kept[key] = _stored_history_row(row)   # scrub wording an older writer kept
         state['history'] = kept
         if not history_only:
             state['attention_queue'] = result['attention_queue']
             state['relationship_insights'] = result['relationship_insights']
+        if isinstance(state.get('attention_queue'), list):
+            state['attention_queue'] = [_stored_queue_row(row) for row in state['attention_queue']]
 
 
 def observe_history(local, now=None):
@@ -551,6 +937,7 @@ def main():
     local = json.loads(raw) if raw.strip() else {}
     if not isinstance(local, dict):
         local = {}
+    email_complete = False
     if gmail_path:
         try:
             with open(gmail_path, encoding="utf-8") as f:
@@ -558,9 +945,13 @@ def main():
             emails = g.get("emails") if isinstance(g, dict) else g
             if isinstance(emails, list) and "emails" not in local:
                 local = {**local, "emails": emails}
+                # The gather wraps its rows with `truncated_at` when any read hit its limit.
+                email_complete = not (isinstance(g, dict) and g.get("truncated_at"))
         except (OSError, ValueError):
             pass                                   # no mail file → the message-only pulse
-    result = compute(local, history=_load_history())
+    covered = complete_channels(local.get("source_status") if "source_status" in local else None,
+                                email_complete=email_complete)
+    result = compute(local, history=_load_history(), absence_complete=covered)
     _persist_state(result)
     print(json.dumps(result))
 
