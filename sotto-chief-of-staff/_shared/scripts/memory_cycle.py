@@ -16,6 +16,7 @@ import context_learning  # noqa: E402
 import dreamer  # noqa: E402
 import gather_google  # noqa: E402
 import jsonstore  # noqa: E402
+import knowledge_update  # noqa: E402
 import gemini_transport  # noqa: E402
 import prewarm_graph  # noqa: E402
 import relationship_pulse  # noqa: E402
@@ -25,6 +26,7 @@ from source_context import (BridgeReadError, HistoryContinuationError, HistoryPr
                             bridge_call, history_page)
 
 HISTORY_DAYS = 42
+PRUNE_INTERVAL_SECONDS = 7 * 86400
 PAGES_PER_RUN = 3
 SOURCE_RETRY_SECONDS = 3600
 UNCHANGED_EXTRACTION_ATTEMPTS = 2
@@ -80,12 +82,13 @@ def _exclude_blocked_page(window, payload, reason, now):
     window.update(cursor=payload.get('next_cursor'), complete=payload['complete'],
                   pages=window.get('pages', 0) + 1,
                   rows=window.get('rows', 0) + len(payload['rows']),
-                  last_advanced=now.isoformat())
+                  last_advanced=now.isoformat(),
+                  last_attempt={'at': now.isoformat(), 'status': 'excluded', 'stage': 'memory_extraction'})
     if payload['complete']:
         window['initial_complete'] = True  # traversal completed; excluded_pages records learning gaps
         window.pop('continuation_reset', None)
     for name in ('retry_after', 'error', 'error_stage', 'error_code', 'http_status',
-                 'provider_reason', 'extraction_failure', 'protocol_failure', 'rejected_request_revision',
+                 'provider_reason', 'provider_failure', 'extraction_failure', 'protocol_failure', 'rejected_request_revision',
                  'pending_content_block'):
         window.pop(name, None)
 
@@ -111,11 +114,19 @@ def _run(now, fetch, learn, curate, path):
                 contacts = []
         results = []
         background_hold = None
-        for _ in range(PAGES_PER_RUN):
+        pages = 0
+        finished = set()
+        # A pass can inspect every source once for each available page slot.
+        for _ in range(PAGES_PER_RUN * len(SOURCES)):
+            if pages >= PAGES_PER_RUN:
+                break
             index = int(state.get('next_source', 0)) % len(SOURCES)
             source = SOURCES[index]
             state['next_source'] = (index + 1) % len(SOURCES)
+            if source in finished:
+                continue
             if not allowed(source):
+                finished.add(source)
                 # Permission reads can fail closed and source toggles can be temporary. Hold the
                 # paid-history checkpoint intact; explicit revoke/forget owns privacy deletion.
                 # No fetch, extraction, or cursor advance occurs while this source is forbidden.
@@ -139,16 +150,25 @@ def _run(now, fetch, learn, curate, path):
                     window.pop('retry_after', None)
                 window['pending_content_block'] = blocked_reason
             if rejected == context_learning.request_revision() and not blocked_reason:
+                finished.add(source)
                 results.append({'source': source, 'status': 'blocked', 'error_code': 'provider_request_rejected'})
                 continue
             if rejected and not blocked_reason:
                 window.pop('rejected_request_revision', None)
                 window.pop('retry_after', None)
             if window.get('complete'):
+                if ('initial_coverage' not in window and window.get('initial_complete')
+                        and window.get('since') == window.get('initial_since')
+                        and window.get('until') == window.get('initial_until')):
+                    window['initial_coverage'] = {key: window[key] for key in
+                        ('since', 'until', 'complete', 'initial_complete', 'pages', 'window_page_base', 'observation_totals')
+                        if key in window}
+                    window['initial_coverage']['excluded_page_count'] = len(window.get('excluded_pages', {}))
                 # Preserve boundary overlap; second-resolution timestamps must not skip a
                 # message whose native timestamp has fractional seconds.
                 window.update(since=window['until'], until=epoch, cursor=None, complete=False,
                               window_page_base=window.get('pages', 0))
+                window.pop('observation_totals', None)
             page_identity = {key: window.get(key) for key in ('since', 'until', 'cursor')}
             page_key = hashlib.sha256(json.dumps(page_identity, sort_keys=True).encode()).hexdigest()
             excluded = (window.get('excluded_pages') or {}).get(page_key, {})
@@ -163,6 +183,7 @@ def _run(now, fetch, learn, curate, path):
                     and int(protocol_failure.get('recheck_after', 0)) > epoch):
                 # A window that cannot progress says which deterministic rejection parked it,
                 # so an exhausted continuation restart is visible without reading the state file.
+                finished.add(source)
                 results.append({'source': source, 'status': 'blocked',
                                 'error_code': 'history_protocol_rejected',
                                 'reason': protocol_failure.get('code')})
@@ -171,21 +192,37 @@ def _run(now, fetch, learn, curate, path):
                 window.pop('protocol_failure', None)
                 window.pop('retry_after', None)
             if window.get('retry_after', 0) > epoch:
+                finished.add(source)
+                results.append({'source': source, 'status': 'held',
+                                'error_code': 'retry_backoff', 'retry_after': window['retry_after']})
                 continue
+            pages += 1
             stage = 'fetch'
+            source_failure = None
             try:
                 payload = fetch(source, window)
-                if not allowed(source) or payload.get('status') != 'ok':
+                source_allowed = allowed(source)
+                if not source_allowed or payload.get('status') != 'ok':
+                    source_failure = ('source_unavailable' if source_allowed
+                                      and payload.get('status') == 'unavailable' else
+                                      'source_not_allowed' if not source_allowed
+                                      or payload.get('status') == 'disabled' else 'source_read_failed')
                     raise RuntimeError('context source unavailable')
+                if payload.get('complete') is True:
+                    finished.add(source)
                 rows = payload['rows']
                 if not isinstance(rows, list) or not isinstance(payload.get('complete'), bool):
                     raise HistoryProtocolError('invalid_history_page')
                 if not payload['complete'] and (not payload.get('next_cursor')
                                                or payload['next_cursor'] == window.get('cursor')):
                     raise HistoryProtocolError('history_cursor_did_not_advance')
+                # A valid fetched page is not yet successfully extracted knowledge. Failed
+                # fetches leave this timestamp intact; extraction has its own existing success.
+                window['last_read_success'] = now.isoformat()
                 if blocked_reason:
                     # Upgrade an already parked provider-blocked page without resubmitting it.
                     _exclude_blocked_page(window, payload, blocked_reason, now)
+                    finished.add(source)
                     results.append({'source': source, 'status': 'excluded',
                                     'reason': blocked_reason, 'reviewed': 0})
                     jsonstore.write_atomic(path, state, indent=2)
@@ -203,7 +240,10 @@ def _run(now, fetch, learn, curate, path):
                 if not allowed(source):
                     raise RuntimeError('source consent changed during history read')
                 relationship_pulse.observe_history(activity, now=now)
-                records = context_learning.observations(source, rows if source == 'gmail' else local.get(source, []), now)
+                observation = {}
+                records = context_learning.observations(
+                    source, rows if source == 'gmail' else local.get(source, []), now,
+                    diagnostics=observation)
                 stage = 'memory_extraction'
                 if not allowed(source):
                     raise RuntimeError('source consent changed during history read')
@@ -215,6 +255,7 @@ def _run(now, fetch, learn, curate, path):
                     if not allowed(source):
                         raise RuntimeError('source consent changed during history read') from error
                     _exclude_blocked_page(window, payload, error.provider_reason, now)
+                    finished.add(source)
                     results.append({'source': source, 'status': 'excluded',
                                     'reason': error.provider_reason, 'reviewed': 0})
                     jsonstore.write_atomic(path, state, indent=2)
@@ -223,12 +264,19 @@ def _run(now, fetch, learn, curate, path):
                     raise RuntimeError('source consent changed during history read')
                 window.update(cursor=payload.get('next_cursor'), complete=payload['complete'],
                               pages=window.get('pages', 0) + 1, rows=window.get('rows', 0) + len(rows),
-                              reviewed=window.get('reviewed', 0) + result['reviewed'], last_success=now.isoformat())
+                              reviewed=window.get('reviewed', 0) + result['reviewed'], last_success=now.isoformat(),
+                              last_attempt={'at': now.isoformat(), 'status': 'succeeded'})
+                # Commit coverage with the successful page only. Failed attempts leave both
+                # the cursor and these counts untouched, so retries do not inflate coverage.
+                totals = window.setdefault('observation_totals', {})
+                for key, value in {**observation, 'pages': 1,
+                                   'rejected_people': sum(result.get('rejected_people', {}).values())}.items():
+                    totals[key] = totals.get(key, 0) + value
                 if payload['complete']:
                     window['initial_complete'] = True
                     window.pop('continuation_reset', None)
                 window.pop('retry_after', None)
-                for key in ('error', 'error_stage', 'error_code', 'http_status', 'provider_reason'):
+                for key in ('error', 'error_stage', 'error_code', 'http_status', 'provider_reason', 'provider_failure'):
                     window.pop(key, None)
                 window.pop('extraction_failure', None)
                 window.pop('protocol_failure', None)
@@ -240,21 +288,31 @@ def _run(now, fetch, learn, curate, path):
                         counts[code] = counts.get(code, 0) + count
                 results.append({'source': source, **result, 'complete': window['complete']})
             except Exception as error:  # one broken source cannot stop the other connected sources
+                finished.add(source)
                 held_reason = (error.reason if isinstance(error, gemini_transport.BackgroundModelHeldError)
                                else 'model_admission_busy'
                                if gemini_transport.proxy_admission_busy(error)
                                else 'background_budget_exhausted'
                                if isinstance(error, HTTPError) and error.code == 402 else None)
                 if held_reason:
+                    window['last_attempt'] = {'at': now.isoformat(), 'status': 'held', 'stage': stage,
+                                              'reason': held_reason}
                     results.append({'source': source, 'status': 'held', 'error_code': held_reason})
                     background_hold = held_reason
                     jsonstore.write_atomic(path, state, indent=2)
                     break
                 diagnostic = {'error': type(error).__name__, 'error_stage': stage}
+                window['last_attempt'] = {'at': now.isoformat(), 'status': 'failed', 'stage': stage}
+                if source_failure:
+                    diagnostic['error_code'] = source_failure
                 if isinstance(error, BridgeReadError):
                     diagnostic['error_code'] = error.code
                 if isinstance(error, context_learning.gemini.ModelResponseError):
                     diagnostic['provider_reason'] = error.provider_reason
+                    if error.code == 'model_output_limit':
+                        diagnostic['provider_failure'] = 'output_limit'
+                elif isinstance(error, context_learning.MemoryExtractionError):
+                    diagnostic['provider_failure'] = 'extraction_validation_failed'
                 deterministic_protocol = isinstance(error, HistoryProtocolError) or (
                     stage == 'fetch' and isinstance(error, HTTPError) and error.code in (400, 422))
                 if deterministic_protocol:
@@ -290,39 +348,53 @@ def _run(now, fetch, learn, curate, path):
                             diagnostic['error_code'] = 'continuation_restart_exhausted'
                         elif attempts >= UNCHANGED_PROTOCOL_ATTEMPTS:
                             window['cursor'] = None
+                            # Coverage describes this traversal, not repeated paid attempts.
+                            window['window_page_base'] = window.get('pages', 0)
+                            window.pop('observation_totals', None)
                             window['continuation_reset'] = {
                                 'at': now.isoformat(), 'pages': int(window.get('pages', 0)),
                                 'reached': reached}
                             window.pop('protocol_failure', None)
                             diagnostic['error_code'] = 'invalid_continuation_reset'
-                if isinstance(error, (context_learning.MemoryExtractionError,
-                                      context_learning.gemini.ModelResponseError)):
-                    diagnostic['error_code'] = error.code
+                if (isinstance(error, (context_learning.MemoryExtractionError,
+                                       context_learning.gemini.ModelResponseError))
+                        or stage == 'memory_extraction' and isinstance(error, HTTPError)
+                        and error.code in (401, 403)):
+                    code = (context_learning.gemini.request_failure(error)
+                            if isinstance(error, HTTPError) else error.code)
+                    diagnostic['error_code'] = code
                     revision = context_learning.request_revision()
                     failure = window.get('extraction_failure') or {}
                     attempts = (int(failure.get('attempts', 0)) + 1
                                 if failure.get('revision') == revision else 1)
                     window['extraction_failure'] = {'revision': revision, 'attempts': attempts,
-                                                    'code': error.code}
+                                                    'code': code}
+                    # A new scheduled occurrence must not reset unchanged authorization failures.
                     # Permit one stochastic malformed response, then park the unchanged page and
                     # request contract. Code/model/config changes release this same revision latch.
                     if attempts >= UNCHANGED_EXTRACTION_ATTEMPTS:
                         window['rejected_request_revision'] = revision
                 if isinstance(error, HTTPError):
                     diagnostic['http_status'] = error.code
+                    diagnostic['provider_failure'] = context_learning.gemini.request_failure(error)
                     if stage == 'memory_extraction' and error.code in (400, 413, 422):
                         diagnostic['error_code'] = 'provider_request_rejected'
                         window['rejected_request_revision'] = context_learning.request_revision()
                 window.pop('error_code', None)
                 window.pop('http_status', None)
                 window.pop('provider_reason', None)
+                window.pop('provider_failure', None)
                 window.update(retry_after=epoch + SOURCE_RETRY_SECONDS, **diagnostic)
                 results.append({'source': source, 'status': 'failed', **diagnostic})
             jsonstore.write_atomic(path, state, indent=2)
         # dreamer selects at most DREAM_PEOPLE changed records and returns without a model call
         # when nothing remains, so each invocation advances one bounded unfinished batch.
         try:
-            prepared = dreamer.prepare()
+            prepared = (dreamer.prepare(legacy_failure=state["dreamer_failure"])
+                        if curate is dreamer.run and state.get("dreamer_failure") else dreamer.prepare())
+            if curate is dreamer.run:
+                # Dreamer has durably imported or held the old unidentified batch.
+                state.pop("dreamer_failure", None)
             dreamer_key = {'request': prepared['request_revision'],
                            'candidates': prepared['candidate_revision']}
         except Exception as error:
@@ -355,7 +427,7 @@ def _run(now, fetch, learn, curate, path):
                     curation = {'status': 'held', 'reason': 'model_admission_busy'}
                     # A proxy refusal made no model call and cannot park this unchanged batch.
                 else:
-                    if error.code in (400, 413, 422):
+                    if error.code in (400, 413, 422) and curate is not dreamer.run:
                         previous = state.get('dreamer_failure') or {}
                         attempts = (int(previous.get('attempts', 0)) + 1
                                     if all(previous.get(key) == value for key, value in dreamer_key.items()) else 1)
@@ -364,14 +436,16 @@ def _run(now, fetch, learn, curate, path):
                     curation = ({'status': 'held', 'reason': 'background_budget_exhausted'} if error.code == 402
                                 else {'status': 'failed', 'error': type(error).__name__})
             except (dreamer.DreamerResponseError, context_learning.gemini.ModelResponseError) as error:
-                previous = state.get('dreamer_failure') or {}
-                attempts = (int(previous.get('attempts', 0)) + 1
-                            if all(previous.get(key) == value for key, value in dreamer_key.items()) else 1)
                 code = error.code if isinstance(error, context_learning.gemini.ModelResponseError) else str(error)
-                state['dreamer_failure'] = {**dreamer_key, 'attempts': attempts, 'code': code}
+                if curate is not dreamer.run:
+                    previous = state.get('dreamer_failure') or {}
+                    attempts = (int(previous.get('attempts', 0)) + 1
+                                if all(previous.get(key) == value for key, value in dreamer_key.items()) else 1)
+                    state['dreamer_failure'] = {**dreamer_key, 'attempts': attempts, 'code': code}
                 curation = {'status': 'failed', 'error': type(error).__name__, 'error_code': code}
                 if isinstance(error, context_learning.gemini.ModelResponseError):
-                    state['dreamer_failure']['provider_reason'] = error.provider_reason
+                    if curate is not dreamer.run:
+                        state['dreamer_failure']['provider_reason'] = error.provider_reason
                     curation['provider_reason'] = error.provider_reason
             except Exception as error:
                 curation = {'status': 'failed', 'error': type(error).__name__}
@@ -381,9 +455,29 @@ def _run(now, fetch, learn, curate, path):
         return state['receipt']
 
 
+def _prune_weekly(now, path):
+    """Reuse this heartbeat and checkpoint; maintenance needs no model allowance."""
+    with jsonstore.lock(path + '.run'):
+        state = jsonstore.read(path, default={}, strict=True)
+        previous = state.get('pruning', {})
+        last = previous.get('completed_at')
+        if isinstance(last, (int, float)) and now.timestamp() - last < PRUNE_INTERVAL_SECONDS:
+            return
+        try:
+            counts = knowledge_update.prune_stale_memory(now)
+        except Exception as error:
+            # A bad record must not prevent independent history/curation work. Do not claim
+            # the sweep completed, or log private memory; the next heartbeat may retry.
+            state['pruning'] = {'status': 'failed', 'error': type(error).__name__}
+        else:
+            state['pruning'] = {'status': 'completed', 'completed_at': now.timestamp(), **counts}
+        jsonstore.write_atomic(path, state, indent=2)
+
+
 def run(now=None, fetch=page, learn=context_learning.learn, curate=dreamer.run):
     now = now or datetime.now(timezone.utc)
     path = state_path()
+    _prune_weekly(now, path)
     try:
         with gemini_transport.background_learning():
             return _run(now, fetch, learn, curate, path)

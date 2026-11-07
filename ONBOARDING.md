@@ -1,138 +1,134 @@
-# Set up Sotto on your own server
+# Set up Sotto in Bridge
 
-This guide is for self-hosting: you run Sotto on your own Railway account and use your own Gemini key.
-It does not require a Sotto Cloud account. The optional Mac Bridge connects your selected local sources.
-Choose delivery first: **iMessage through your own Photon connection** is the primary assisted
-self-host route; **Telegram** is an alternative. Budget about 30 minutes for the server and source setup after you have the
-provider accounts. Photon access and provisioning are separate prerequisites.
+Bridge guides **Sotto Cloud or self-hosting in your Railway account**. iMessage is the default
+conversation; Telegram is an optional self-host choice. The Mac shares sources you approve and
+does not host the agent. There is no web chat.
 
-**Using Codex or Claude Code?** Open this repository with the agent and follow
-[`docs/AGENT-ONBOARDING.md`](docs/AGENT-ONBOARDING.md). It can prepare the protected config and run
-the resumable self-host Railway helper, or guide an invited Cloud user through hosted sign-in. Keep
-credentials out of chat and let the agent stop for Google consent, OS permissions, and provider
-approval. The helper has completed a fresh live install; each new setup still proves itself only
-through its own health, Google, Bridge and first-brief checks.
+**Qualification:** these instructions describe supported setup paths. A working existing pilot
+does not establish a qualified fresh installation. Before putting another customer's retained data
+on a release, qualify its exact signed Bridge/runtime pair, restart and upgrade behavior, useful
+first delivery, and data restoration. See [runtime capabilities](docs/RUNTIME-CAPABILITIES.md)
+for current use limits and [volume operations](adapters/sotto/VOLUME.md) for recovery constraints.
 
-**For iMessage:** follow [the Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs) for the
-channel variables, use the manual Railway deployment in step 1, then continue with the same setup
-page in step 2. Skip BotFather and Telegram pairing. This is still self-hosting: choose **Use my own
-server instead** in the Mac app. WhatsApp has an appendix at the end of this page.
+## Sotto Cloud
 
-> The checked-in Photon preset is a reviewable contract, not an importable Railway template. For a
-> guided CLI deployment, use the public helper in the agent playbook; the manual Railway steps below
-> remain available. The helper has completed a fresh live end-to-end install.
+1. Open Sotto Bridge and choose **Continue with Google**. This signs you up and connects your
+   Google context in one authorization: allow **Gmail or Google Calendar**, or both. Identity-only
+   or contacts-only consent cannot finish setup. If you decline, retry the same connection; your
+   existing account and setup remain saved.
+2. **Allow Full Disk Access.** Open System Settings → Privacy & Security → Full Disk Access,
+   enable Sotto Bridge, then return. This is required before the source choices appear; there is
+   no skip action. The permission alone does not start collection.
+3. **Choose what Sotto reads.** Review the source toggles, then choose **Save sources and continue**.
+   Only selected sources are shared. Existing source choices survive reconnects.
+4. **Open iMessage**, send the prepared hello from your connected owner account, and check that
+   Sotto replies in the same conversation. Bridge observes the connection automatically. Finish
+   setup once it is connected; the first brief can finish in the background.
 
-> **The model in one line:** Sotto = skills + persona running on a cloud **agent** (Hermes on Railway),
-> fed your local Mac signals by the **Bridge** menu-bar app. The cloud writes the briefs; your Mac only
-> reads permitted data and nudges timing. Replies default to drafts. Sending to another person
-> requires your explicit approval and a separately enabled sending capability.
+Cloud supplies hosting, model access and the Photon iMessage connection. You do not see Railway,
+enter infrastructure credentials, supply a Google AI key, or configure a Google OAuth client.
+The current Cloud wizard uses iMessage; an optional Cloud Telegram connection is not yet available.
 
-## 0 · What you'll need
+**Cloud availability:** this is still an invited-account flow backed by pre-created, isolated
+Railway tenants and prepared Photon lines. Signing in adopts or resumes that tenant; public
+sign-up does not yet allocate one automatically. The combined Google step is implemented in
+source, not evidence that a new Cloud release or pilot migration has happened.
 
-| You need | Why | Where it goes |
-|---|---|---|
-| A **Railway** account (**paid/verified plan** — volumes + always-on need it) | hosts the agent + storage | — |
-| A **Gemini API key** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | the model calls | once, into Railway |
-| **One delivery provider:** a Telegram bot token from [@BotFather](https://t.me/BotFather), or your own [Photon connection and credentials](CHANNELS.md#photon-imessage-and-photo-briefs) for iMessage | where briefs are delivered | once, into Railway |
-| A **Google OAuth client** (5-minute console task, step 3②) | Gmail + Calendar | pasted in the wizard |
-| *(optional)* The signed **Sotto Bridge.app** — [download from Releases](https://github.com/kothari-nikunj/sotto/releases/latest) — if you have a Mac and want iMessage, WhatsApp, calls, Notes and Contacts in your briefs; without it Sotto runs on Gmail + Calendar alone, a supported deploy | reads your Mac | drag to /Applications |
+## Self-host on Railway
 
-Everything else, including linking your Mac, connecting Google, your channel, your timezone, and optional
-extras like Granola — happens on **one wizard page** (`/setup`), no redeploys.
+Choose **Other setup options → Self-host Sotto** in Bridge.
 
-**Each channel and model has its own setup requirements.** Full detail (and
-how tested each one is) in **[CHANNELS.md — Choosing your channel and model](CHANNELS.md)**:
+1. **Connect Railway.** Choose **Continue with Railway**, sign in on Railway's consent screen,
+   and select your workspace. Bridge creates a fresh empty Sotto project when you choose
+   **Create Sotto project**. You do not need to prepare a project or paste an account API token
+   in the normal flow. Existing API-token setup remains under Advanced.
+2. **Connect Gemini.** Enter your Google AI API key. Conversation and audio share this key;
+   Google bills your usage. Gmail and Calendar OAuth is a separate self-host connection.
+3. **Choose your conversation.** iMessage is selected by default. Arrange an active Photon
+   project and dedicated iMessage line, then enter the project ID, project secret, Sotto line
+   and your owner phone number. These Photon steps are manual for now. For optional Telegram,
+   create a dedicated bot with BotFather, enter its token, open the pairing link and press Start
+   privately. Bridge observes the pairing automatically; no numeric owner ID is needed.
+4. **Review and create.** Review provider charges and the background-work option, then choose
+   **Create Sotto on Railway**. Bridge creates the service, persistent volume and domain,
+   prepares the fresh volume and starts Sotto. Keep Bridge open during preparation. Resume
+   observes saved operations without repeating an uncertain create or a second initializer.
+5. **Connect this Mac**, grant **Full Disk Access**, and return to Bridge. This grant is required
+   before source choices and cannot be skipped. Review sources, then **Save & Connect**.
+6. Open your conversation and send an owner hello. Check the real reply and first brief on your
+   device. **Connect Google** opens your server's private setup page when you want Gmail or
+   Calendar; that consent is separate from the Google AI model key.
 
-| Your channel | | Your model |
-|---|---|---|
-| **Telegram** — default. **One variable** (`TELEGRAM_BOT_TOKEN`): you tap the pairing link boot prints and it captures your chat id — no id hunting, no phone pairing. The path this guide follows. | | **Gemini** — default, and what the brief pipeline calls today. One key covers everything. |
-| **iMessage (Photon)** — your own provider connection, project credentials and exact owner identity. [Setup and variable table](CHANNELS.md#photon-imessage-and-photo-briefs). Delivery continues while your Mac sleeps. | | Same model settings as the other channels. |
-| **WhatsApp** — a real contact instead of a bot, at the price of a QR scan. Three variables (`WHATSAPP_ENABLED=true`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`) plus `SOTTO_CRON_DELIVER=whatsapp` — the **[appendix](#appendix--whatsapp-instead-of-telegram)** at the end of this page. | | **Anthropic / OpenAI** can also compose briefs through `SOTTO_BRIEF_MODEL`; chat is configured separately. Other Hermes chat providers do not automatically support every Sotto capability. See [model limits](docs/MODELS.md). |
-| **iMessage (BlueBubbles)** — blue bubbles, but an always-on Mac + Firebase + a tunnel. Hand-wired recipe, hours not minutes. | | **Exa / Parallel** — web research only, and independent of the rest: set the key and research stops going through Gemini. |
+**Release status:** these native flows are implemented in source. New server creation requires a
+signed Bridge release containing a qualified runtime image pinned by digest. Railway sign-in also
+requires a registered native OAuth client bundled into that release. This change does not claim
+that registration, image qualification or signed release has happened. Without the image descriptor,
+creation is unavailable; without OAuth configuration, advanced API-token setup remains available.
+Existing deployments can still pair through their private setup link. See
+[release qualification](tools/RUNTIME-RELEASE.md).
 
-## 1 · Deploy the backend on Railway
+There is no repository checkout, local Python, Railway CLI or local inference install in this user
+flow. Railway and provider usage are billed by those providers; background work is opt-in. Secrets
+and provisioning progress are saved in this Mac's Keychain. Resume retains the selected account and
+protected deployment journal. A different Telegram bot can be paired before provisioning starts.
+Existing or former Hermes volumes are never adopted.
 
-**Telegram only: first, make your bot** (~1 min): in Telegram, message [@BotFather](https://t.me/BotFather) →
-`/newbot` → name it → it replies with a **bot token**. That token is the only channel setting you
-need; your chat id is captured for you on the first message you send the bot.
+If Railway definitively rejects the project request, Bridge says so; a timed-out or lost response
+stays unconfirmed and is only observed, never sent again. **Start over** asks for confirmation, then
+removes only the Railway sign-in, project request, deployment journal and Telegram pairing saved
+in this Mac's Keychain. It is refused while a setup step is running and deletes nothing in Railway
+or Telegram: the confirmation names any project Bridge knows about so you can remove it in the
+Railway dashboard, where it is billed until deleted.
 
-**Use the manual deployment path.** Get this repo where Railway can
-see it: **Fork** it on GitHub (recommended — that's what **Sync fork** later updates), or point
-Railway straight at the public repo. Then in [Railway](https://railway.app): **New Project → Deploy
-from GitHub repo** → pick it. Leave Root Directory blank; Railway builds from the repository root.
-Set the channel and service settings before opening the private setup link:
+For agent assistance, follow [agent-guided setup](#agent-guided-setup). Maintainers retain a
+[separate source-build helper reference](docs/MAINTAINER-RAILWAY-HELPER.md); it is not a prerequisite
+for the native onboarding flow.
 
-1. **Variables → New Variable** — add your model key, channel settings and Bridge secret:
-   - `GOOGLE_AI_API_KEY` = your Gemini key *(Google's own docs sometimes call it `GEMINI_API_KEY` or
-     `GOOGLE_API_KEY` — Sotto accepts any of the three names, so paste it under whichever you copied)*
-   - For Telegram, `TELEGRAM_BOT_TOKEN` = the token @BotFather gave you. For iMessage, omit this
-     and use all five [Photon settings](CHANNELS.md#photon-imessage-and-photo-briefs), including
-     `SOTTO_CRON_DELIVER=photon` and your exact owner identity.
-   - `BRIDGE_TOKEN` = a long random secret — run `openssl rand -hex 24` and paste the output.
-     *Without this, the Mac pairing link carries an empty token and pairing silently fails.*
-   *(WhatsApp instead? [The appendix](#appendix--whatsapp-instead-of-telegram) — three variables, one
-   QR, nothing else about this guide changes.)*
-2. **⌘K → Add Volume**, mount path `/data` (your knowledge graph, your channel link and Google token
-   live here). *No volume = every redeploy wipes your login and memory.*
-3. **Settings → Networking → Generate Domain** — do this **before** opening the setup link in step 2,
-   then redeploy once. Without a domain the logged link falls back to a dead `localhost` URL.
+The remaining sections describe the existing receiver setup page, also available to installations
+created before native provisioning. It manages connections and consent; conversation remains in
+Telegram or iMessage.
 
-Deploy and wait for the build (the container installs Hermes + Sotto automatically). **For Photon,
-verify the gateway connection and send a hello from your configured identity to its iMessage
-address**, as described in the channel guide. For Telegram, **while it boots, tap the pairing link
-in the logs** — the `[sotto] telegram: ➜ TAP THIS TO LINK YOUR CHAT:`
-line. It opens your bot and sends a one-time code, which is how the deploy knows the chat is *yours*
-and not a stranger's who guessed the bot's name. Two success signals in the deploy logs:
-`[sotto] Gemini key OK (model … available)` and `[sotto] telegram linked ✓ — briefs and nudges
-deliver to chat …`. A `[sotto] WARNING: Gemini key/model check failed` means the key is wrong or out
-of quota — fix it before going further, because every brief depends on it. A
-`[sotto] telegram NOT linked yet` just means you hadn't tapped within the five-minute window: tap the
-link and restart the deploy, and it links then. Nothing else is lost either way.
-
-For Telegram, use `TELEGRAM_BOT_TOKEN` and `SOTTO_CRON_DELIVER=telegram` instead of the Photon
-variables. A Railway template link will be added only after its owner settings and a fresh-account
-deployment have been verified.
-
-## 2 · Open your setup link
+## 1 · Open your setup link
 
 Railway → your service → **Deployments → View logs** → find the line starting **`[sotto] Setup link`**
 and open it. That's your `/setup` wizard plus its private access code — only someone with this link can
-see your pairing token or your channel's QR. Open it once and your browser is remembered for the rest of the
+see your pairing token. Open it once and your browser is remembered for the rest of the
 wizard; lose it and it reprints on every boot (it's also on the volume at `/data/setup_code`).
-- *Link says `localhost`?* You have no public domain yet — go back and do step 1.3, redeploy, and use
-  the freshly printed link. *A bare `https://<your-domain>/setup` with no `?code=` returns **403** by
-  design.*
+- *Link says `localhost`?* The service has no public domain yet. The setup helper creates it before
+  the first deployment, so inspect that exact service, then use the freshly printed link.
+  *Without a setup credential or owner dashboard session, a bare `/setup` returns **403**.*
 
 One page, five numbered tiles (the fifth is optional). Each tile's state label reads **TO DO** until
 it's finished and **DONE** after — reload the page (the wizard's own **recheck** link) to see one flip.
 
-## 3 · The wizard, tile by tile
+## 2 · The wizard, tile by tile
 
 **① Link your Mac** — [Download Sotto Bridge.app](https://github.com/kothari-nikunj/sotto/releases/latest),
 drag it to `/Applications`, open it.
-- **For self-host, first run asks for a Bridge access code.** Paste the code from your invite;
-  the app verifies it on your Mac. Self-host deployment itself does not need a code. If you need
-  one, ask in [Issues](https://github.com/kothari-nikunj/sotto/issues).
+- **For self-host, choose the Railway option.** The new native flow does not require a Bridge
+  invite code. A completed self-host install stays unlocked if a legacy code expires. This does
+  not grant Cloud entitlement or Mac source access. Legacy code recovery remains available.
 - **For invited Sotto Cloud accounts, choose Continue with Google instead.** Your verified Google
   invitation unlocks Cloud setup without a Bridge access code. After Google consent, the browser
   returns to Sotto Bridge automatically; if your browser asks, allow it to open the app. If the
   return does not happen, choose **Open Sotto Bridge** on that browser page. No secret code is copied.
-- **Choose hosting in the one Sotto setup window.** Cloud is an invite-only pilot for registered accounts. Cloud uses Google → Mac sources / Full Disk
-  Access → Messages → First brief. Google sign-in alone does not start reading this Mac.
-- **For self-host, choose Use my own server instead; the steps are Connect → Choose sources → Disk access.**
-  This also applies to Photon iMessage delivery. The Bridge adds sources; it does not supply a number.
-  1. **Connect.** On your host's `/setup` page, click **Open in Sotto Bridge** or paste its pairing
-     link. Continue becomes available once the host and token are present.
-  2. **Choose sources.** Every supported Mac reader starts on, just like the existing Mac app.
-     Turn off anything you do not want shared before continuing. Existing users keep saved choices.
-  3. **Disk access.** Click **Enable Full Disk Access…**, add **Sotto Bridge** under System Settings
-     → Privacy & Security → Full Disk Access, then return. The live card shows **Granted**.
-     **Save & Connect** starts the selected readers. **Skip Mac sources for now** turns all readers
-     off and completes setup; enable sources later in Settings after granting access.
-- Cloud uses that same source list and disk-access card before the Messages step. Continue starts
-  selected Mac readers only after the grant; startup and reconnect cannot bypass source confirmation.
-  A source being on does not claim it is available or has already been read. Meeting-note services
-  still connect through their own authorization on the host's `/setup` page.
+- **Cloud follows Google → Full Disk Access → source choices → iMessage.** Google sign-in and
+  Gmail-or-Calendar consent are one step. It does not begin reading this Mac. Cloud's current
+  invited account must already have a prepared tenant and Photon line.
+- **Self-host follows server setup → Full Disk Access → source choices → conversation.**
+  Connect an existing server through **Open in Sotto Bridge** or its pairing link. Bridge checks
+  its private status route; older receivers require an update. A saved URL alone is not readiness.
+  Model/provider editing on an existing runtime is separate from fresh provisioning.
+- **Full Disk Access comes before source selection in both hosting modes.** Click **Open Full Disk
+  Access** in Bridge, drag **Sotto Bridge.app** from the card into the Full Disk Access list in
+  System Settings, then turn it on. You can also use the Add button in System Settings. Return to
+  Bridge and wait for **Full Disk Access enabled** before reviewing and saving your source choices.
+  Saving those choices starts the selected readers.
+- **Conversation.** Open the configured iMessage line or Telegram bot and confirm a reply in the
+  intended conversation. Setup reports the first brief's state while it finishes asynchronously;
+  a provider receipt does not prove that it appeared on your device.
+- A source toggle does not claim its data has already been read. Meeting-note services still
+  connect through their own authorization on the host's `/setup` page.
 - **Success signal on the cloud side:** reload `/setup` — tile ① now reads **DONE** with
   "Your Mac is linked and reachable."
 - **It keeps itself current.** The Bridge checks daily for a new signed release; when there is one
@@ -145,7 +141,7 @@ drag it to `/Applications`, open it.
   the morning brief arrives moments later (the 6:30 cloud schedule covers the closed-laptop case;
   they coordinate, you never get two).
 
-**② Connect Google** — you create your own OAuth client once (this keeps you off Google's verification
+**② Connect Google (self-host only)** — you create your own OAuth client once (this keeps you off Google's verification
 wall — it's your own data):
 1. [console.cloud.google.com](https://console.cloud.google.com) → **New Project** "Sotto" → select it.
 2. **APIs & Services → Enable APIs** → enable **Gmail API** and **Google Calendar API**.
@@ -167,24 +163,19 @@ wall — it's your own data):
    *Existing connected Desktop-client tokens keep working. New authorizations from a Desktop
    client require replacing it with the Web client in `/setup`.*
 
-**③ Link Telegram** — nothing to click: this tile reports the handshake your deploy already did. It
-reads **"Waiting for your first message to @yourbot"** until you tap the pairing link in the deploy
-logs, and **"Telegram is linked"** once boot has captured your chat id (reload to see it flip).
-*Still waiting after you tapped it?* The capture runs at **boot** — restart the deploy (Railway ▸
-Deployments ▸ ⋮ ▸ Restart) and it links within seconds; your message is still waiting on Telegram's
-servers, because an unlinked deploy leaves its gateway down rather than consuming it. Details and the by-hand fallback:
-**[CHANNELS.md § Telegram setup](CHANNELS.md#telegram-setup-default)**.
-> **On WhatsApp instead?** This tile becomes **Link WhatsApp** with a **Show WhatsApp QR** button —
-> see the [appendix](#appendix--whatsapp-instead-of-telegram). **On Photon iMessage?** There is no
-> Telegram pairing step. Verify a real reply through your own Photon connection; the generic
-> channel tile does not prove it can send. See [Photon setup](CHANNELS.md#photon-imessage-and-photo-briefs).
-> **On iMessage/BlueBubbles?** The tile
-> says there is nothing to link and never blocks the wizard;
-> [CHANNELS.md § iMessage via BlueBubbles](CHANNELS.md#imessage-via-bluebubbles) is a hand-wired
-> recipe measured in hours, not minutes.
+**③ Connect iMessage** — nothing to click: Bridge already configured Photon from your protected
+input, and this tile reports the owner hello. It reads that Photon is configured for your (masked)
+number until an authenticated direct message from that exact owner phone arrives, then that the
+owner message was received (reload to see it flip). Send one hello from the owner phone to your
+Sotto line and confirm the reply appears in Messages; the tile's receipt alone does not prove the
+reply was displayed. See [Photon iMessage](CHANNELS.md#photon-imessage).
+> **On the Telegram profile?** The tile reads **Link Telegram** and reports the owner link your
+> setup captured before the runtime started; see
+> [SELFHOST.md § Telegram owner bot](adapters/sotto/SELFHOST.md#telegram-owner-bot).
 
-**④ Timezone** — auto-detected from your browser when the page loads; the tile reads "Timezone set to
-&lt;your zone&gt;" and the page reloads itself. Nothing to click.
+**④ Timezone** — the zone from your setup config (`sotto_runtime.timezone`); the tile reads
+"Timezone set to &lt;your zone&gt;". Nothing to click. (The page detects your browser's zone only on an
+installation with no configured zone.)
 
 **⑤ Connected services (optional)** — one-click OAuth for extra sources. Click **Connect →** next to
 **Granola (meeting notes)**: your browser opens Granola's consent screen, you approve, and you land
@@ -195,19 +186,21 @@ It works on **any Granola plan** (it's your login, not an API key), the tokens l
 everything else works without it. More lanes + adding other services:
 [INTEGRATIONS.md](INTEGRATIONS.md).
 
-## 4 · Check your first brief
+## 3 · Check your first brief
 
 Once a context source and your message channel are connected, Sotto prepares its first brief
 automatically. The setup page shows whether it is preparing, waiting to send, delayed for a retry,
-or sent. You do not need to request a second brief. Google can work without a Mac, and selected
-Mac sources can work without Google. Granola can also provide the initial context.
+or sent. You do not need to request a second brief. Self-hosted runtimes can use selected Mac
+sources or Granola without Google. Cloud onboarding requires Gmail or Calendar; its Mac access
+and source review remain separate required Bridge steps. After setup, server-side Google reading
+continues while the Mac sleeps.
 
-You can message your bot on Telegram, your Photon connection's address in iMessage, or yourself
-in WhatsApp self-chat to ask for help. Your own Gemini key pays for the model calls. You do not need a
+You can message your Sotto line in iMessage (or your bot, on the Telegram profile) to ask for
+help. Your own Gemini key pays for the model calls. You do not need a
 Sotto Cloud subscription.
 
 Confirm the first brief actually appears on your device. Photon can send four photos when the
-layout and provider support it; Telegram and WhatsApp use text by default. A send receipt alone
+layout and provider support it; Telegram uses text. A send receipt alone
 does not prove device display. If an interactive tool requests permission, review the specific
 action; blanket approval is not a setup step, and the automatic first brief needs no second chat run.
 
@@ -217,6 +210,11 @@ controls described below. Do not start a second welcome run while the first look
 ordinary brief can be requested later by saying **"good morning"**.
 
 From here it's all conversation:
+
+Capabilities vary by channel; the examples below describe the Photon path. Telegram now supports
+accepted-brief readback and explicit fresh brief requests. Other attended mutations remain
+limited; see [the capability inventory](docs/BEHAVIOR-INVENTORY.json).
+
 - *"good morning"* / *"good evening"* — the briefs
 - *"prep me for my 2pm"* / *"follow up on my meetings"*
 - *"find 30 min with Alex next week"* / *"accept my 3pm"* — proposes from your real calendar, then books/RSVPs on your OK
@@ -266,10 +264,11 @@ The rules behind all three: [docs/HOW-SOTTO-DECIDES.md](docs/HOW-SOTTO-DECIDES.m
 ## Background memory needs a separate spending choice
 
 The receiver's first useful look uses recent context. Progressive history learning and Dreamer
-need a budgeted model proxy, or a deliberate `SOTTO_BACKGROUND_UNMETERED=true` opt-in to
-background calls billed to your own key. Ordinary chat and briefs continue without that opt-in;
-background learning reports a hold. Do not assume six weeks of history were reviewed just because
-the first brief arrived. Check `knowledge/history-state.json` and [RAILWAY.md](RAILWAY.md).
+need a budgeted model proxy, or a deliberate unmetered opt-in, and the self-host launch configures
+neither, so on a helper-created install background learning reports a hold while ordinary chat and
+briefs continue. Do not assume six weeks of history were reviewed just because the first brief
+arrived. Check `knowledge/history-state.json` and
+[RAILWAY.md](RAILWAY.md#background-history-learning-on-self-host).
 
 ## What runs on its own
 
@@ -289,20 +288,18 @@ never auto-sends**:
   when there's nothing to send.
 - **Relationship pulse** — Mondays at 9am (who you're losing touch with).
 
-All of it lands on **one** channel — `SOTTO_CRON_DELIVER`, which defaults to `telegram` (the chat
-your bot captured). Point it at `whatsapp` and every line above moves with it; there is no
-per-job override by design. Tune or disable any of them with the `SOTTO_PROACTIVE*` variables in
-[RAILWAY.md](RAILWAY.md).
+All of it lands on **one** channel — your owner channel, fixed by your setup. There is no per-job
+override by design, and on the supervised image these schedules always run; their defaults are in
+[RAILWAY.md](RAILWAY.md#environment-variables--full-reference).
 
 ## If something's off
 
 The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: setup link says
-`localhost` (generate a domain), no reply from your bot (the allowlist must be the numeric chat id —
-the boot capture gets it right), briefs
-never arrive (check the boot key-check line + `/debug/brief-log`), Google dying after a week (consent
+`localhost`, no reply on iMessage (send from the exact owner phone in your config), briefs
+never arrive (`/debug/brief-log`), Google dying after a week (consent
 screen left in Testing — step 3②.3). **Replies feel stale, or Sotto starts echoing a delivered brief
 back at you:** send **`/new`** in the chat — it starts a fresh session on the latest persona.
-Sessions also reset nightly and on every redeploy; `/new` is the one you control. **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
+Sessions also rotate nightly; `/new` is the one you control. **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
 icon, drag `/Applications/Sotto Bridge.app` to the Trash, and remove its Full Disk Access entry in
 System Settings → Privacy & Security. That's everything — it keeps no other state on the Mac.
 
@@ -314,67 +311,226 @@ whoever runs the policy to allow both **by signing certificate**, not by file: S
 bundled engine are signed `Developer ID Application: Nikunj Deepak Kothari (2YQN7TTF85)`. A
 per-binary approval dies at the next auto-update; a certificate rule covers every version.
 
-**Staying current:** Sotto's skills update themselves on every redeploy, and your server tells you
-when a newer Sotto is published — one quiet line at the foot of your `/setup` (Integrations) page.
-On GitHub hit **Sync fork → Update branch** on your copy; Railway redeploys on the push, and that
-redeploy *is* the update. The Bridge
+**Staying current:** your server tells you when a newer Sotto is published — one quiet line at
+the foot of your `/setup` (Integrations) page. A helper-created service has no repository source
+to redeploy from, and the helper only creates fresh installs, so applying that update is not
+automated. The Bridge
 flags updates in its own menu and installs them itself after verifying the signature (pairing +
-permissions persist). The full picture — including upgrading the underlying Hermes runtime — is
+permissions persist). The full picture — including how a rebuild updates the runtime — is
 **RAILWAY.md § Staying updated**.
 
----
+## Agent-guided setup
 
-## Appendix · WhatsApp instead of Telegram
+Sotto has two hosting choices: invited Sotto Cloud or self-hosted Railway. Bridge is the setup
+surface; conversation stays in iMessage or Telegram. No local runtime or user-facing CLI is needed
+in the native path. Account sign-ins, provider purchases, Google consent and Mac permissions belong
+to the user. Never paste credentials into chat, logs, command arguments or version control.
 
-WhatsApp is still first-class — the container pairs it for you, serves a clean QR, and holds a nudge
-until the link is live. It is simply no longer the default. Take it when you'd rather Sotto reached
-you as a **contact** than as a bot, and you don't mind scanning a QR.
+### Copy-paste prompt
 
-**Three variables in step 1.1 instead of `TELEGRAM_BOT_TOKEN`:**
+> Help me set up Sotto in Bridge. Follow AGENTS.md and ONBOARDING.md#agent-guided-setup. Ask which hosting
+> option I want if I have not chosen. Guide the account connections and verify the actual reply
+> and brief on my device before claiming success.
 
-| Variable | Value |
-|---|---|
-| `WHATSAPP_ENABLED` | `true` — turns the boot-time pairing step and the WhatsApp gateway back on |
-| `WHATSAPP_ALLOWED_USERS` | your number, country code, no `+` (e.g. `15551234567`). Hermes **denies everyone** until it matches |
-| `WHATSAPP_HOME_CHANNEL` | the same number — where briefs and nudges are delivered |
+### Self-hosted Railway
 
-…plus `SOTTO_CRON_DELIVER=whatsapp`, which moves the briefs, the midday digest, the weekly pulse, the
-proactive watcher and your own routines together. (`WHATSAPP_ENABLED=true` alone would pair WhatsApp
-for *chat* while the briefs still went to Telegram.)
+Use [the native self-host steps](#self-host-on-railway). The native wizard follows Railway authorization and
+workspace/project creation → Gemini key → iMessage via Photon (default) or optional Telegram →
+review and create server → Full Disk Access → source choices → conversation.
 
-**Then scan the QR.** Tile ③ of the `/setup` wizard becomes **Link WhatsApp**: click
-**Show WhatsApp QR →**, then on your phone: WhatsApp → **Linked Devices → Link a Device** → scan.
-**Success signal:** reload `/setup` and tile ③ reads "WhatsApp is linked". *Missed the ~15-minute
-window, or the page says "No pairing in progress"? Neither is fatal — redeploy and pairing reopens on
-the next boot with a fresh QR.* Scan from the web page rather than the deploy logs; Railway's log
-viewer distorts the terminal QR.
+New server creation is available only when the signed Bridge contains a qualified digest-pinned
+runtime descriptor. Normal Railway sign-in additionally requires a registered native OAuth client
+bundled into that release. Neither registration nor a qualified signed release is claimed by source
+implementation. Without the descriptor, creation is disabled; existing servers can still pair.
+Without OAuth configuration, API-token setup is available under Advanced. Do not turn a missing
+release artifact into instructions to install Python, Git or Railway CLI.
 
-Everything else in this guide is identical, except that you message **yourself** on WhatsApp
-(self-chat mode — you are the bot) where it says to message your bot. Two WhatsApp-only knobs:
-`SOTTO_WHATSAPP_MODE=1` uses a second, dedicated number instead of self-chat, and
-`SOTTO_HIDE_AGENT_NAME=1` drops the ***Sotto*** prefix on its replies. Tapbacks (👀 ✅ ❌) are
-Telegram-only — Hermes has no bot reactions on WhatsApp.
+Guide **Continue with Railway**, workspace selection and **Create Sotto project**. Bridge creates
+an empty project; the paid service and volume are created only after the final review. The user
+enters one Google AI key privately in Bridge. Photon setup is manual for now: arrange an active
+project and dedicated iMessage line, then enter the project ID, secret, Sotto line and owner phone.
+For Telegram, use a dedicated BotFather token and the owner's private Start message. Bridge observes
+pairing automatically and stops polling before the runtime takes over. Never ask for a numeric
+Telegram owner ID.
 
-**Already on WhatsApp from an earlier deploy?** Nothing to do, and nothing to fear on the next
-redeploy: *the channel is Telegram unless this volume already holds a paired WhatsApp session and no
-`TELEGRAM_BOT_TOKEN` is set.* Your paired session speaks for you; the boot log names the channel it
-chose and why.
+Credentials and operation intent are persisted in Keychain before provider mutations. Resume
+checks the same target; never delete protected state to force a retry, adopt an old volume, or
+create a second initializer. Keep Bridge open while preparation is observed. An uncertain mutation
+stays pending for investigation rather than being sent again.
 
----
+After the server is reachable, choose **Connect this Mac**, then require Full Disk Access before
+showing or saving source choices. The user enables Sotto Bridge in System Settings and returns to
+the app; there is no skip route in either hosting mode. The grant alone does not start collection:
+the user then reviews source toggles and saves the choices. **Connect Google** opens the receiver's
+private setup surface for self-host Google OAuth when wanted; that connection is distinct from the
+Google AI model key.
 
-## Already have a Hermes or OpenClaw? (existing host)
+Do not send a test message, perform a paid model probe, start another chat process, or touch a
+pilot as an installation probe. Let the user send one owner hello and confirm the reply. Observe
+the same pending welcome attempt; do not request duplicates to test delivery. A fresh requested
+brief is separately supported on Telegram and Photon and is not scheduled-delivery evidence.
+Telegram remains a limited profile: attended meeting prep, offered replies and owner skill requests
+are still Photon-only. See [BEHAVIOR-INVENTORY.json](docs/BEHAVIOR-INVENTORY.json) for tested boundaries.
 
-You just add the Sotto layer — no redeploy of your host:
+### Invited Sotto Cloud
 
-- **Existing Hermes:** `BRIDGE_TOKEN=<your-token> ./adapters/hermes/install.sh` — adds the skills,
-  persona, `sotto-local` MCP, and schedule without touching your global model. Cloud host → set
-  `BRIDGE_TOKEN` in its env; local host → the Bridge runs over stdio (pick **"This Mac"** in the app).
-- **OpenClaw:** `./adapters/openclaw/install.sh` — copies the skills, writes the persona + operating
-  rules into the agent workspace (`SOUL.md` / `IDENTITY.md` / `AGENTS.md`), and registers the Bridge
-  MCP via the OpenClaw CLI. See [adapters/openclaw/README.md](adapters/openclaw/README.md) for what
-  was validated live and the short "Still unverified" list.
+Choose this only for an invited account with its tenant and Photon line already prepared. Bridge
+starts at **Continue with Google**: account sign-up and Gmail-or-Calendar consent happen in the same
+authorization. Require at least one readable source and durable Google connection; contacts-only
+or identity-only sign-in cannot complete setup. If consent is declined, offer reconnect without
+erasing the existing account, tenant or saved setup. An older runtime without explicit Google
+readiness must be updated; Mac-only context or a previous brief cannot substitute for this grant.
 
-## Local instead of cloud?
+Next, require Full Disk Access, then show source choices. Reading begins after the user saves those
+choices. Open the prepared hello in iMessage and let the user send it from the connected owner
+account. The app observes the channel connection; the first brief can finish asynchronously.
+iMessage is the current Cloud wizard's conversation. Optional Cloud Telegram pairing is not yet
+available; do not send Cloud users through the self-host bot setup as a substitute.
 
-Everything runs on your Mac over stdio — no Railway, no pairing, no hosting bill; briefs only fire
-while the Mac is awake. Full walkthrough: **[LOCAL-SETUP.md](LOCAL-SETUP.md)**.
+Railway is Cloud's backend, never a customer setup step. Cloud users need no Railway access,
+project, Gemini key, Photon credentials or Google OAuth client JSON. Sotto supplies those managed
+services. The existing broker adopts/resumes pre-created tenants; automatic public signup
+allocation is not wired up. Do not claim that signing in creates a new Railway tenant.
+Google consent and macOS source permissions remain user actions. The hosted service and its
+providers process data as described in [`docs/DATA-FLOW.md`](docs/DATA-FLOW.md).
+
+If you are operating the hosted service rather than joining as an invited user, this public guide
+does not cover operator provisioning.
+
+### What counts as verified
+
+Keep these claims separate in the final report: exact deployment success and `/health`; Google
+OAuth success page; Bridge connected with selected sources and grants; channel owner pairing/message received;
+first brief visibly delivered; and recovery of the same pending/failed attempt without duplicates.
+Do not infer first-welcome or scheduled-delivery success from an ordinary manual brief, or infer
+device appearance from a provider receipt alone. This guide describes the intended released path;
+they do not claim every end-to-end configuration has been live-tested.
+
+### Optional: connect other assistants
+
+At the end of either Bridge setup path, **Use Sotto with other assistants?** opens
+this installation's connection page. It is also available in Account settings and
+on the receiver's setup page. The owner can skip it without affecting Sotto.
+
+For assistants supporting remote MCP with OAuth, copy the displayed server URL into
+the assistant's custom connector settings, sign in to Sotto, and approve read-only
+access. Do not ask for a shared API key, put a pairing code in the connector URL, or
+run operator enrollment scripts. Each owner uses their own deployment and source
+permissions. The page explains expiration and provides Disconnect. Availability of
+custom connectors depends on the client; do not claim a successful connection until
+the actual client has read a permitted source. A skill pack is not required.
+
+## Source-created server reference
+
+These details apply to source-built self-host installations. Use the [maintainer Railway helper reference](docs/MAINTAINER-RAILWAY-HELPER.md#self-hosted-on-railway-supervised-sotto-photon) for the protected source-build config and resume procedure. This reference is not a prerequisite for native Bridge setup or invited Sotto Cloud; use their separate paths above.
+
+### Source-created server: private setup surface
+
+Railway → your service → **Deployments → View logs** → find the line starting **`[sotto] Setup
+link`** and open it privately. That is your `/setup` wizard plus its access code: the setup pages
+(`/setup`, `/pair`, `/google/*`, `/debug/google`) are gated behind it. Open it once and a cookie
+covers the rest. Lost it? It reprints on every boot, and it is on the volume at `/data/setup_code`.
+A signed-in self-host owner can also open `/setup` from the dashboard with the existing
+session. That path does not reveal the bootstrap pairing link; use the original setup link
+to pair a new Mac. Without either credential, a bare `/setup` returns **403**.
+
+> Don't set `PORT` yourself — Railway injects it, and the self-host bootstrap requires `8080`.
+
+### Self-host Google recovery and diagnostics
+
+Use the browser flow from `/setup`:
+1. **Create a Web application OAuth client** (one-time): [console.cloud.google.com](https://console.cloud.google.com) →
+   new project → enable **Gmail API** + **Google Calendar API** → **OAuth consent screen** in the left
+   nav (newer consoles call this page **Google Auth Platform**) → audience **External** → **Publish
+   app** so the status reads **In production** → Credentials → **OAuth client ID → Web application**.
+   > ⚠️ **The day-8 trap:** a consent screen left in **Testing** issues refresh tokens that **expire
+   > after ~7 days** — Google silently disconnects and every brief loses Gmail/Calendar on day 8.
+   > Set the app to **In production** (Google does *not* require verification for you using your own
+   > data — ignore the scary "needs verification" banner).
+
+   Under **Authorized redirect URIs**, enter the exact callback displayed in `/setup`:
+   `https://<RAILWAY_PUBLIC_DOMAIN>/google/oauth/callback`. Download the Web client JSON.
+   *(Workspace accounts: if your org blocks unverified apps, allowlist the client in Admin console, or use a personal account.)*
+2. Paste the JSON into the `/setup` Google box and click **Continue with Google**. Approve access
+   on Google's page; the browser returns automatically to Sotto and shows a clean success page.
+   Authorization uses browser-bound, single-use PKCE and state. No code is copied from a
+   `localhost` page. The token persists in `/data/sotto-home` and auto-refreshes. If sign-in fails
+   because the saved client's secret was rotated or deleted, it belongs to another project, or the
+   callback is not registered, choose **Use a different Google client** in `/setup` or on the retry
+   page; an existing token keeps working until the new client connects.
+3. **Verify any time:** open **`/debug/google`** (setup code/cookie or owner dashboard session required) — it returns `{"google_connected": true}` when the
+   token works. Google is **server-side and Bridge-independent**: if this says connected, every
+   scheduled brief gets fresh Gmail + Calendar even with the Mac asleep. (Local data is the only
+   thing that's cached as an offline backup; Google is always fetched live.)
+   This self-host flow leaves the Mac Bridge unchanged and uses no Sotto OAuth broker.
+
+### Connected-service protocol and diagnostics
+
+Granola connects from the **`/setup` wizard → Connected services** tile: click **Connect**, approve
+on Granola's consent screen in your browser, done. Under the hood the receiver registers *itself*
+with Granola's remote MCP (OAuth 2.1 Dynamic Client Registration + PKCE — no pre-registered client,
+no secret) and stores the access+refresh tokens on `/data` (`connectors/granola.json`); briefs,
+meeting prep, and follow-ups then gather meeting notes + **transcripts** headlessly. Works on **any
+Granola plan** — it's your login, not a Business-only API key. No variables, no redeploy. If the
+flow fails, the error page names the exact step (discovery / registration / state / exchange) + the
+provider's error. Full doctrine: [INTEGRATIONS.md](INTEGRATIONS.md).
+
+Granola is optional — fine to skip and ship Gmail + Calendar + the Bridge first.
+
+**Key-based providers** (Exa, Parallel, Browser Use Cloud, X) are read from the receiver's
+environment, and the Connections page shows them read-only. The supervised launch builds that
+environment from the launch envelope alone (see the [environment reference](RAILWAY.md#environment-variables--full-reference)),
+so a helper-created install runs without them: research uses Gemini grounding, and X attendee
+context reports `unconfigured` in `/api/overview`.
+
+### Source-created server: Photon receipt
+
+The helper already configured Photon, the exact owner identity and the physical line from your
+protected config. Send one hello **from the owner phone** to the Sotto line, then confirm Sotto's
+reply appears in Messages. The `/setup` iMessage tile shows missing provider setup, waiting for the
+owner's first direct message, or that the owner message was received; it marks connected only after
+an authenticated owner direct message, and that receipt alone does not prove the reply appeared.
+The receipt is bound to the Photon project. Delivery does not require an always-awake Mac.
+
+### Source-created server: first brief
+
+Once a context source (Google, Granola or the Bridge) and the Photon owner hello are in place,
+Sotto prepares its first brief automatically. `/setup` shows whether it is preparing, waiting to
+send, delayed for a retry, or sent. Confirm it appears on your device; do not start a second
+welcome run while the first one is pending. See [first-brief checks](#3--check-your-first-brief).
+
+### Source-created server: Bridge diagnostics
+Gmail + Calendar come from Google; your **local** signals come from the Sotto Bridge on your Mac. It
+connects **tunnel-free**: the Mac dials *out* to this Railway host over the reverse link
+(`/bridge/poll`, `/bridge/respond`), so there's nothing to expose — no Cloudflare, no inbound port
+on the Mac. How the reverse link works end to end: **[runtime architecture](docs/ARCHITECTURE.md)** (the relay module).
+
+1. **The token is already set.** The helper generated the Bridge bearer inside the launch envelope;
+   you never see or type it. The `/setup` pairing link carries it. *(The wake-push uses the same
+   bearer.)*
+2. **On your Mac:** install the signed **Sotto Bridge** menu bar app — [download it from GitHub
+   Releases](https://github.com/kothari-nikunj/sotto/releases/latest); it ships as a signed DMG
+   only (the Bridge source isn't in this repo) — then **pair it in one click**:
+   - Choose **Railway** for self-host setup. No Bridge invitation code is required. The
+     server's private setup link still authorizes pairing ([native setup](#self-host-on-railway)).
+   - Open the **setup link from the deploy logs** (see [private setup surface](#source-created-server-private-setup-surface)) on that Mac
+     → click **“Open in Sotto Bridge”**. It fills the host + token (no typing, and the host always
+     carries `https://`).
+   - *Fallback:* copy the **pairing code** in the wizard and paste it into the app's **“Paste pairing
+     link”** field.
+   - Grant **Full Disk Access** when prompted; flip **Start at login** on.
+   The app supervises `sotto-bridged --connect …` (dials out) — the menu bar dot turns solid when
+   connected, and reloading `/setup` shows tile ① as **DONE** ("Your Mac is linked and reachable").
+   - **Diagnose a source before connecting:** run `sotto-bridged --doctor` — a read-only, per-source
+     readout (each local source prints `ok (N rows readable)` / `needs Full Disk Access` /
+     `unavailable`, plus the exact "grant FDA to the *right* app" fix). It writes nothing and touches
+     no network; exit `0` means every enabled source reads. **`ok (0 rows readable)` means nothing
+     matched in the last 6 hours** — the probe window, not a lifetime count — so a source you haven't
+     used since lunch is still `ok`. See the troubleshooting table below.
+
+> The auto wake-push (brief fires the instant your Mac wakes) is optional — the **6:30/17:30
+> schedule** fires the brief regardless, and you can ask for one anytime. If the Bridge is offline
+> at brief time, the brief degrades to the last cached snapshot. And if a triggered brief dies
+> mid-run, its claim goes stale after **30 minutes** and the next trigger retries it — no silently
+> lost briefs.
+

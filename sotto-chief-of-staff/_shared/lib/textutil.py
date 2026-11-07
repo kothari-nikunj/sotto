@@ -87,6 +87,12 @@ def normalize_attendee_research(v) -> list:
     return []
 
 
+def current_message_rows(messages):
+    """A supplemental loop-evidence read is not new activity in the daily snapshot."""
+    return [row for row in messages or []
+            if not isinstance(row, dict) or row.get('_loop_context') is not True]
+
+
 def _s(v) -> str:
     return v if isinstance(v, str) else ("" if v is None else str(v))
 
@@ -104,9 +110,9 @@ def _digits(s: str) -> str:
 
 
 def normalize_phone_for_comparison(phone: str) -> str:
-    """Last 10 digits — handles US country-code variations (contacts.ts)."""
+    """Ignore punctuation and the optional NANP 1 prefix, never other country codes."""
     d = _digits(phone)
-    return d[-10:] if len(d) >= 10 else d
+    return d[1:] if len(d) == 11 and d.startswith('1') else d
 
 
 
@@ -116,10 +122,8 @@ def _format_phone_for_display(d: str) -> str:
         return f"({d[0:3]}) {d[3:6]}-{d[6:]}"
     if len(d) == 11 and d.startswith("1"):
         return f"+1 ({d[1:4]}) {d[4:7]}-{d[7:]}"
-    if len(d) > 11 and d.startswith("1"):
-        return f"+1 ({d[1:4]}) {d[4:7]}-{d[7:11]}"
     if len(d) > 10:
-        return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
+        return f"+{d}"
     if len(d) > 0:
         return f"+{d}"
     return "Unknown"
@@ -129,9 +133,12 @@ def _format_phone_for_display(d: str) -> str:
 
 def _normalize_identifier(idv: str) -> str:
     trimmed = (idv or "").strip().lower()
-    before_at = re.sub(r"@.*", "", trimmed)
-    if re.fullmatch(r"[\d\s\-\+\(\)]+", before_at or ""):
-        return _digits(trimmed)[-10:]
+    if trimmed.endswith('@lid'):
+        return ''  # rotating privacy identifiers are not person-store keys
+    jid = re.fullmatch(r'([0-9]+)@(s\.whatsapp\.net|c\.us)', trimmed)
+    phone = jid.group(1) if jid else trimmed
+    if re.fullmatch(r"\+?[0-9\s().-]+", phone):
+        return normalize_phone_for_comparison(phone)
     return trimmed
 
 
@@ -263,3 +270,25 @@ def _extract_sender_name(from_header: str) -> str:
     if "<" in f:
         return f.split("<", 1)[0].strip().strip('"')
     return "" if "@" in f else f
+
+
+def first_nonempty(d: dict, *keys):
+    """First non-empty value among `keys` (the Google CLI and the raw Google API name these fields
+    slightly differently)."""
+    for k in keys:
+        v = d.get(k) if isinstance(d, dict) else None
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
+def format_address(v):
+    """Coerce a from/to field to a string. Some sources return {name,email} or a list."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        name, email = v.get("name") or "", v.get("email") or v.get("address") or ""
+        return f"{name} <{email}>".strip() if email else (name or "")
+    if isinstance(v, list):
+        return ", ".join(format_address(x) for x in v if x)
+    return ""

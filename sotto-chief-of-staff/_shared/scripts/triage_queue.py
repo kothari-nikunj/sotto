@@ -21,22 +21,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 # The brief's own thread-processing + contact resolution, from the modules that OWN them.
 from textutil import _arr, _looks_like_phone_number, _s, unwrap_tool_result  # noqa: E402
+from jsonfiles import load as _load  # noqa: E402
 from render_local import (  # noqa: E402
     _group_messages_into_threads, _is_sent_email, _thread_needs_response, build_contact_lookup,
     build_identity_resolver,
 )
 
 PROMO_LABELS = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "SPAM"}
-
-
-def _load(path, default):
-    if not path:
-        return default
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
 
 
 def local_queue(local, channel):
@@ -84,6 +75,7 @@ def email_queue(emails):
             "from": _s(last.get("from")),
             "subject": _s(last.get("subject")),
             "threadId": tid,
+            "message_id": _s(last.get("id")),
             "channel": "email",
             "last_snippet": (_s(last.get("snippet")) or _s(last.get("body")))[:240],
             "important": "IMPORTANT" in labels,

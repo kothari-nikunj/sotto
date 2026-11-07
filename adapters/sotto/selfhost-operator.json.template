@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "tenantRoot": "/data",
+  "manifest": {
+    "version": 1,
+    "deployment": "self_host",
+    "channel": "telegram",
+    "tenantId": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "owner": {"accountId": "REPLACE_WITH_ACCOUNT_ID", "ownerId": "REPLACE_WITH_NUMERIC_TELEGRAM_OWNER_ID"},
+    "lineKey": "telegram-owner",
+    "target": "telegram",
+    "providerThreadId": "telegram:REPLACE_WITH_NUMERIC_TELEGRAM_OWNER_ID",
+    "telegramLink": {"bot_token": "REPLACE_WITH_PAIRED_BOT_TOKEN", "allowed_user": 0},
+    "stateDirectory": "/data/node-state",
+    "mediaRoot": "/data/node-media",
+    "instructions": "REPLACE_WITH_OWNER_INSTRUCTIONS",
+    "runtime": {"port": 19981, "bearerToken": "REPLACE_WITH_UNIQUE_RUNTIME_SECRET_AT_LEAST_32_CHARS"},
+    "relay": {"receiverPort": 19982, "rootBearer": "REPLACE_WITH_UNIQUE_RELAY_SECRET_AT_LEAST_32_CHARS"},
+    "modelDirect": {
+      "provider": "google",
+      "apiKey": "REPLACE_WITH_DIRECT_GEMINI_API_KEY",
+      "chatModelId": "gemini-3.8-flash",
+      "nativeMediaModelId": "gemini-3.8-flash"
+    },
+    "credentials": {"telegramToken": "REPLACE_WITH_PAIRED_BOT_TOKEN"}
+  },
+  "receiverAuthority": {
+    "SOTTO_MCP_TOKEN": "REPLACE_WITH_SAME_RELAY_ROOT_BEARER",
+    "SOTTO_CONTROL_TOKEN": "REPLACE_WITH_UNIQUE_CONTROL_SECRET_AT_LEAST_32_CHARS",
+    "SOTTO_TENANT_ID": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "SOTTO_DATA": "/data",
+    "SOTTO_HOME": "/data/sotto-home",
+    "SOTTO_VOLUME_ID": "REPLACE_WITH_STABLE_LOCAL_VOLUME_ID"
+  },
+  "stableIdentity": {
+    "channel": "telegram",
+    "target": "telegram",
+    "tenantId": "REPLACE_WITH_STABLE_LOCAL_TENANT_ID",
+    "accountId": "REPLACE_WITH_ACCOUNT_ID",
+    "ownerId": "REPLACE_WITH_NUMERIC_TELEGRAM_OWNER_ID",
+    "lineKey": "telegram-owner",
+    "providerThreadId": "telegram:REPLACE_WITH_NUMERIC_TELEGRAM_OWNER_ID",
+    "botFingerprint": "REPLACE_WITH_SHA256_OF_sotto-telegram-bot-v1_COLON_TOKEN"
+  },
+  "publicReceiverAuthority": null,
+  "trustedServiceId": "",
+  "receiverOverrides": {"SOTTO_TIMEZONE": "UTC"}
+}

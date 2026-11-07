@@ -52,7 +52,7 @@ def test_every_runtime_resolves_the_day_from_the_one_file(tmp_path, monkeypatch)
     rec.DASHBOARD.HOOKS["data_root"] = lambda: str(tmp_path)
     assert rec.DASHBOARD._local_today() == expected
     for rel in ("runtime/trigger-receiver/receiver.py", "runtime/trigger-receiver/dashboard.py",
-                "sotto-chief-of-staff/_shared/lib/timeutil.py", "adapters/hermes/start.sh"):
+                "sotto-chief-of-staff/_shared/lib/timeutil.py"):
         text = open(os.path.join(REPO, rel), encoding="utf-8").read()
         # (reading settings["timezone"] to DISPLAY it is fine; resolving the zone from env is the chain)
         assert not re.search(r'environ\.get\("SOTTO_TIMEZONE"\)|environ\.get\("TZ"\)|\$\{TZ:-\}', text), \

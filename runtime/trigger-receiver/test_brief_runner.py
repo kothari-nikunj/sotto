@@ -47,11 +47,11 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
             assert json.loads(path('--local').read_text())['imessage'][0]['text'] == 'fixture'
             out = json.dumps({'brief_text': 'Exact composed brief', 'actions': [{'summary': 'fixture debt'}],
                               'extracted_knowledge': {'person_updates': []},
-                              'loop_updates': [{'loopId': 'fixture', 'status': 'resolved'}]})
+                              'loop_updates': [{'loopId': 'fixture', 'status': 'waiting'}]})
         if name == 'learn_step.py':
             assert argv[argv.index('--phase')+1] == 'essential'
             assert json.loads(path('--continuity').read_text())['new_actions'] == [{'summary': 'fixture debt'}]
-            assert json.loads(path('--continuity').read_text())['loop_updates'] == [{'loopId': 'fixture', 'status': 'resolved'}]
+            assert json.loads(path('--continuity').read_text())['loop_updates'] == [{'loopId': 'fixture', 'status': 'waiting'}]
             assert json.loads(path('--knowledge-out').read_text()) == {'person_updates': []}
             out = json.dumps({'completion': 'complete', 'ok': True, 'steps': {}})
         return SimpleNamespace(returncode=0, stdout=out, stderr='')
@@ -102,7 +102,7 @@ def procedure(tmp_path, monkeypatch):
         if name == 'gather_google.py':
             state['google_args'].append(argv)
             output('--gmail-out', [])
-            output('--cal-out', [{'id': 'meeting-1', 'start': '2026-09-08T10:00:00-07:00'}])
+            output('--cal-out', [{'id': 'meeting-1', 'start': '2026-09-08T10:00:00-07:00', '_calendar_primary': True}])
             output('--source-results-out', {'gmail': {'status': 'ok'},
                                             'calendar': {'status': 'ok', 'complete': True}})
         elif name == 'gather_granola.py':
@@ -110,7 +110,7 @@ def procedure(tmp_path, monkeypatch):
         elif '--out' in argv:
             output('--out', {'attendees': []})
         if name == 'compose_brief.py':
-            result = {'brief_text': 'A useful brief', 'actions': [], 'extracted_knowledge': {}}
+            result = state.get('artifact', {'brief_text': 'A useful brief', 'actions': [], 'extracted_knowledge': {}})
         if name == 'learn_step.py':
             result = {'completion': 'complete', 'ok': True, 'steps': {}}
         if name == 'select_attendees.py':
@@ -120,6 +120,72 @@ def procedure(tmp_path, monkeypatch):
     request = {'pack': str(PACK), 'payload_path': str(payload), 'kind': 'morning',
                'day': '2026-09-08', 'work_key': 'synthetic-brief-generation'}
     return request, state
+
+
+def _prep_artifact():
+    question = 'I can prepare a briefing for Cedar review.'
+    return {'brief_markdown': question, 'brief_text': question, 'actions': [], 'extracted_knowledge': {},
+            '_prep_offer': {'person': 'Dana Rivers', 'question': question, 'ambiguous': False,
+                            'meeting': {'event_id': 'meeting-1', 'start': '2026-09-08T10:00:00-07:00'}}}
+
+
+@pytest.mark.parametrize('offer', [False, True])
+def test_optional_prep_import_works_with_only_production_library_path(procedure, monkeypatch, offer):
+    import sys
+    request, state = procedure
+    monkeypatch.setattr(sys, 'path', [path for path in sys.path if not str(path).endswith('/_shared/scripts')])
+    monkeypatch.delitem(sys.modules, 'pending_offer', raising=False)
+    if offer:
+        state['artifact'] = _prep_artifact()
+    result = brief_runner.run(request)
+    assert result == (state['artifact']['brief_text'] if offer else 'A useful brief')
+    if offer:
+        assert Path(sys.modules['pending_offer'].__file__).resolve() == PACK / '_shared/scripts/pending_offer.py'
+    else:
+        assert 'pending_offer' not in sys.modules
+
+
+@pytest.mark.parametrize('failure', ['import', 'persist'])
+def test_optional_prep_failure_keeps_delivered_brief_and_mandatory_effects(procedure, monkeypatch, capsys, failure):
+    import builtins
+    import jsonstore
+    request, state = procedure
+    state['artifact'] = _prep_artifact()
+    if failure == 'import':
+        original = builtins.__import__
+        def importing(name, *args, **kwargs):
+            if name == 'pending_offer':
+                raise ModuleNotFoundError('private fixture input')
+            return original(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, '__import__', importing)
+    else:
+        original = jsonstore.write_atomic
+        failed = []
+        def write(path, value, *args, **kwargs):
+            if Path(path).name == 'artifact.json' and '_prep_offer_record' in value and not failed:
+                failed.append(True)
+                raise OSError('private fixture input')
+            return original(path, value, *args, **kwargs)
+        monkeypatch.setattr(jsonstore, 'write_atomic', write)
+    assert brief_runner.run(request) == state['artifact']['brief_text']
+    output = capsys.readouterr().err
+    assert 'prep offer skipped:' in output and 'private fixture input' not in output
+    import delivery_effects
+    effects = json.loads(Path(delivery_effects._path('a'*32)).read_text())['effects']
+    assert any(effect['kind'] == 'source_permissions' for effect in effects)
+    assert not any(effect['kind'] == 'pending_offer' for effect in effects)
+
+
+def test_mandatory_delivery_effect_failure_still_holds_the_brief(procedure, monkeypatch):
+    import delivery_effects
+    request, state = procedure
+    state['artifact'] = _prep_artifact()
+    def stage(effects, *args, **kwargs):
+        assert any(effect['kind'] == 'source_permissions' for effect in effects)
+        raise RuntimeError('mandatory delivery proof unavailable')
+    monkeypatch.setattr(delivery_effects, 'stage', stage)
+    with pytest.raises(RuntimeError, match='mandatory delivery proof unavailable'):
+        brief_runner.run(request)
 
 
 def test_effective_local_handoff_reaches_continuity_and_learning(procedure, monkeypatch):
@@ -764,7 +830,6 @@ def test_learning_admission_failure_does_not_withhold_validated_brief(procedure,
         attempts.append(1)
         raise OSError('private source payload must not be logged')
     monkeypatch.setattr(work_queue, 'enqueue', unavailable)
-    state['fail_phase'] = 'essential'
     assert brief_runner.run(request) == 'A useful brief'
     assert len(attempts) == 1
     scratch = next((tmp_path / 'events/work-inputs').glob('brief-*'))
@@ -912,7 +977,8 @@ def test_partial_learning_keeps_only_consent_gated_rejected_evidence_briefly(
         return result
 
     monkeypatch.setattr(brief_runner.subprocess, 'run', with_partial_learning)
-    assert brief_runner.run({**request, 'work_key': 'synthetic-partial-learning'}) == 'A useful brief'
+    with pytest.raises(RuntimeError, match='closure was not committed'):
+        brief_runner.run({**request, 'work_key': 'synthetic-partial-learning'})
     if revoke:
         assert not list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
         return
@@ -983,7 +1049,8 @@ def test_revoking_the_only_evidence_source_erases_the_earlier_diagnostic(
     request, _state = procedure
     revoked = _stage_rejected_imessage_proposal(monkeypatch)
     work_key = 'synthetic-partial-learning'
-    assert brief_runner.run({**request, 'work_key': work_key}) == 'A useful brief'
+    with pytest.raises(RuntimeError, match='closure was not committed'):
+        brief_runner.run({**request, 'work_key': work_key})
     assert list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
     revoked.add('imessage')   # the user turns iMessage off before the background follow-up
     assert brief_runner.run(_queued_learning_followup(tmp_path, work_key)) == 'NO_NUDGES'
@@ -996,7 +1063,8 @@ def test_followup_rewrite_keeps_the_diagnostics_capture_time(procedure, tmp_path
     request, _state = procedure
     _stage_rejected_imessage_proposal(monkeypatch)
     work_key = 'synthetic-partial-learning'
-    assert brief_runner.run({**request, 'work_key': work_key}) == 'A useful brief'
+    with pytest.raises(RuntimeError, match='closure was not committed'):
+        brief_runner.run({**request, 'work_key': work_key})
     path, = list((tmp_path / 'events/learning-diagnostics').glob('brief-*.json'))
     captured = time.time() - 6 * 86400   # evidence captured six days ago
     path.write_text(json.dumps({**json.loads(path.read_text()), 'created_at': captured}))
@@ -1006,3 +1074,245 @@ def test_followup_rewrite_keeps_the_diagnostics_capture_time(procedure, tmp_path
     assert path.stat().st_mtime == pytest.approx(captured)
     retention.sweep(now=captured + 8 * 86400)   # day eight after capture
     assert not path.exists()
+
+
+def test_history_discovery_rechecks_saved_evidence_before_any_gather_or_compose(procedure, monkeypatch):
+    request, state = procedure
+    import onboarding
+    request.update(kind='welcome', history_discovery=True, work_key=onboarding.DISCOVERY_KEY)
+    monkeypatch.setattr(onboarding, 'discovery_context', lambda *_: None)
+    with pytest.raises(RuntimeError, match='evidence unavailable'):
+        brief_runner.run(request)
+    assert state['calls'] == []
+
+
+def test_history_discovery_consumes_saved_sources_and_preserves_background_request(procedure, monkeypatch):
+    request, state = procedure
+    import onboarding
+    request.update(kind='welcome', history_discovery=True, work_key=onboarding.DISCOVERY_KEY)
+    context = {'observations': [{'canonical_id': 'alex', 'person': 'Invented Alex',
+               'fact': 'Developing a community garden', 'source_refs': ['whatsapp:invented-1'],
+               'observed_date': '2026-10-01'}], 'sources': ['whatsapp'], 'coverage': {}}
+    monkeypatch.setattr(onboarding, 'discovery_context', lambda *_: context)
+    original = brief_runner.subprocess.run
+    seen = []
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == 'compose_brief.py':
+            path = Path(argv[argv.index('--history-discovery') + 1])
+            assert json.loads(path.read_text()) == context
+            seen.append(True)
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert seen == [True]
+    assert not any(name in ('style_extract.py', 'prewarm_graph.py') for name, *_ in state['calls'])
+    root = Path(os.environ['SOTTO_DATA'])
+    scratch = root / 'events/work-inputs' / ('brief-' + hashlib.sha256(onboarding.DISCOVERY_KEY.encode()).hexdigest()[:24])
+    assert 'whatsapp' in json.loads((scratch / 'artifact.json').read_text())['_source_permissions']
+    # Durable follow-up uses the same fixed discovery work key; it cannot become an ordinary welcome.
+    import sqlite3
+    with sqlite3.connect(root / 'events/work.sqlite3') as db:
+        row = db.execute('SELECT payload FROM jobs').fetchone()
+    payload = json.loads(row[0])
+    assert json.loads(payload['prompt'])['history_discovery'] is True
+
+
+@pytest.mark.parametrize('revoke_at', ['gather_google.py', 'compose_brief.py'])
+def test_discovery_permission_change_cannot_stage_private_fact(procedure, monkeypatch, revoke_at):
+    request, _ = procedure
+    import onboarding
+    import source_context
+    request.update(kind='welcome', history_discovery=True, work_key=onboarding.DISCOVERY_KEY)
+    context = {'observations': [{'canonical_id': 'alex', 'person': 'Invented Alex',
+               'fact': 'Synthetic historical observation', 'source_refs': ['whatsapp:invented-1']}],
+               'sources': ['whatsapp'], 'coverage': {}}
+    monkeypatch.setattr(onboarding, 'discovery_context', lambda *_: context)
+    original = brief_runner.subprocess.run
+    original_allowed = source_context.allowed
+    permission = [True]
+    monkeypatch.setattr(source_context, 'allowed', lambda source: permission[0] if source == 'whatsapp' else original_allowed(source))
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == 'compose_brief.py':
+            knowledge = json.loads(Path(argv[argv.index('--knowledge') + 1]).read_text())
+            assert knowledge == {'person_knowledge': {}}
+            discovery = json.loads(Path(argv[argv.index('--history-discovery') + 1]).read_text())
+            assert discovery == context
+        if Path(argv[1]).name == revoke_at:
+            permission[0] = False
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(RuntimeError, match='source permission changed'):
+        brief_runner.run(request)
+
+
+def test_discovery_saved_artifact_cannot_be_rebound_to_new_consent_generation(procedure, monkeypatch):
+    request, state = procedure
+    import onboarding
+    request.update(kind='welcome', history_discovery=True, work_key=onboarding.DISCOVERY_KEY)
+    monkeypatch.setattr(onboarding, 'discovery_context', lambda *_: {
+        'observations': [{'person': 'Invented Alex', 'fact': 'Synthetic observation',
+                          'source_refs': ['whatsapp:invented']}],
+        'sources': ['whatsapp'], 'coverage': {}})
+    monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF', json.dumps({'source_revision': 'a' * 64, 'route_digest': 'b' * 64}))
+    assert brief_runner.run(request) == 'A useful brief'
+    calls = list(state['calls'])
+    monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF', json.dumps({'source_revision': 'c' * 64, 'route_digest': 'b' * 64}))
+    with pytest.raises(RuntimeError, match='source permission changed'):
+        brief_runner.run(request)
+    assert state['calls'] == calls  # old text is discarded before being handed to the outbox
+
+
+@pytest.mark.parametrize('failing_script,expected', [
+    ('compose_brief.py', brief_runner.BriefModelOutcomeUncertainError),
+    ('gather_google.py', RuntimeError),
+])
+def test_uncertain_model_exit_is_preserved_only_from_composer(procedure, monkeypatch, failing_script, expected):
+    import work_queue
+    request, _ = procedure
+    original = brief_runner.subprocess.run
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == failing_script:
+            return SimpleNamespace(returncode=work_queue.MODEL_OUTCOME_UNCERTAIN_EXIT,
+                                   stdout='', stderr='private provider details')
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    with pytest.raises(expected) as caught:
+        brief_runner.run(request)
+    assert 'private' not in str(caught.value)
+
+
+@pytest.mark.parametrize('owner_source', ['environment', 'settings'])
+def test_calendar_receipt_uses_same_projection_as_delivery_cache(procedure, tmp_path, monkeypatch, owner_source):
+    """Raw invite copies/context rows are absent by design, not cancelled meetings."""
+    from datetime import datetime, timedelta, timezone
+    import delivery_effects
+    from calendar_context import meeting_events, user_participates
+    request, state = procedure
+    if owner_source == 'environment':
+        monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    else:
+        monkeypatch.delenv('SOTTO_USER_EMAIL', raising=False)
+        config = tmp_path / 'config'; config.mkdir(exist_ok=True)
+        (config / 'settings.json').write_text(json.dumps({'google_account_email': 'owner@example.com'}))
+    now = datetime.now(timezone.utc)
+    start, end = [(now + timedelta(minutes=m)).isoformat() for m in (30, 60)]
+    base = {'start': start, 'end': end, 'my_response': 'accepted'}
+    events = [
+        {**base, 'id': 'primary-meeting', 'calendar_id': 'primary', 'iCalUID': 'invite',
+         'summary': 'Mtg | Example', '_calendar_primary': True},
+        {**base, 'id': 'shared-copy', 'calendar_id': 'team@example.com', 'iCalUID': 'invite',
+         'summary': 'Mtg | Example', 'attendees': [{'email': 'owner@example.com'}]},
+        {**base, 'id': 'context', 'calendar_id': 'primary', 'summary': 'Context: Example',
+         '_calendar_primary': True},
+        {**base, 'id': 'colleague', 'calendar_id': 'team@example.com', 'summary': 'Colleague meeting',
+         'attendees': [{'email': 'colleague@example.com', 'self': True}]},
+    ]
+    events.append({**base, 'id': 'attended-shared', 'calendar_id': 'team@example.com',
+                   'summary': 'Other meeting', 'attendees': [{'email': 'owner@example.com'}]})
+    original = brief_runner.subprocess.run
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if Path(argv[1]).name == 'gather_google.py':
+            Path(argv[argv.index('--cal-out') + 1]).write_text(json.dumps(events))
+        return result
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    manifest = json.loads((tmp_path / ('events/delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    staged = [e for e in manifest['effects'] if e.get('calendar_event_id')]
+    rows = [e for e in meeting_events(events, 'owner@example.com')
+            if user_participates(e, 'owner@example.com')]
+    path = tmp_path / 'cache/calendar_today.json'; path.parent.mkdir(exist_ok=True)
+    cache = {'status': 'ok', 'complete': True, 'projection': 'day', 'date': start[:10],
+             'generated_at': datetime.now(timezone.utc).isoformat(), 'events': rows}
+    path.write_text(json.dumps(cache))
+    assert delivery_effects.valid(staged)
+    assert {e['calendar_event_id'] for e in staged} == {'primary-meeting', 'attended-shared'}
+    cache['events'] = []
+    path.write_text(json.dumps(cache))
+    assert not delivery_effects.valid(staged)  # A real cancellation is still withheld.
+
+
+@pytest.mark.parametrize('committed', [True, False])
+@pytest.mark.parametrize('projection', [None, {'resolved': ['contract'], 'rejected_by_reason': {}},
+                                       {'resolved': [], 'unavailable': True}])
+def test_closure_delivery_requires_real_saved_evidence(procedure, tmp_path, monkeypatch, committed, projection):
+    import yaml
+    request, _ = procedure
+    original = brief_runner.subprocess.run
+    evidence = [{'sourceType': 'email', 'sourceId': 'sent-1', 'snippet': 'The contract is attached.'}]
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            result.stdout = json.dumps({**json.loads(result.stdout), 'brief_text': 'Contract delivered.',
+                                       **({'_loop_projection': projection} if projection is not None else {}),
+                                       'loop_updates': [{'loopId': 'contract', 'loopVersion': 'v1', 'status': 'resolved',
+                                                         'evidence': evidence}]})
+        if name == 'learn_step.py' and committed:
+            folder = tmp_path / 'knowledge/continuity'
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'contract.md').write_text('---\n' + yaml.safe_dump({
+                'anchor_key': 'contract', 'status': 'resolved', 'resolution_source_refs': evidence,
+                'resolution_loop_version': 'v1',
+                'summary': 'Send the contract', 'contact_identifier': 'dana@example.com'}) + '---\n')
+        return result
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    if committed:
+        assert brief_runner.run(request) == 'Contract delivered.'
+        saved = json.loads((tmp_path / 'events' / ('delivery-effects-' + 'a' * 32 + '.json')).read_text())
+        assert any(effect.get('closed_loop') == 'contract' for effect in saved['effects'])
+    else:
+        with pytest.raises(RuntimeError, match='closure was not committed'):
+            brief_runner.run(request)
+        artifact, = (tmp_path / 'events/work-inputs').glob('brief-*/artifact.json')
+        assert json.loads(artifact.read_text())['_closure_uncommitted'] is True
+
+
+def test_rejected_closure_does_not_block_brief_that_keeps_task_open(procedure, tmp_path, monkeypatch):
+    import yaml
+    request, _ = procedure
+    folder = tmp_path / 'knowledge/continuity'
+    folder.mkdir(parents=True, exist_ok=True)
+    task = folder / 'contract.md'
+    task.write_text('---\n' + yaml.safe_dump({'anchor_key': 'contract', 'status': 'open',
+        'summary': 'Send the contract', 'contact_identifier': 'dana@example.com'}) + '---\n')
+    original = brief_runner.subprocess.run
+    proposal = {'loopId': 'contract', 'loopVersion': 'v1', 'status': 'resolved',
+                'evidence': [{'sourceType': 'email', 'sourceId': 'sent-1', 'snippet': 'The contract is attached.'}]}
+    observed = []
+    def invoke(argv, **kwargs):
+        result = original(argv, **kwargs)
+        name = Path(argv[1]).name
+        if name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            result.stdout = json.dumps({**json.loads(result.stdout),
+                'brief_text': 'Still open: Send the contract.', 'loop_updates': [proposal],
+                '_loop_projection': {'resolved': [], 'waiting': [],
+                                     'rejected_by_reason': {'unreviewed_resolution': 1}}})
+        if name == 'learn_step.py':
+            continuity = Path(argv[argv.index('--continuity') + 1])
+            observed.extend(json.loads(continuity.read_text())['loop_updates'])
+        return result
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'Still open: Send the contract.'
+    assert observed == [proposal]  # normal learning still records the rejected proposal
+    assert yaml.safe_load(task.read_text().split('---')[1])['status'] == 'open'
+    saved = json.loads((tmp_path / 'events' / ('delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    assert not any(effect.get('closed_loop') for effect in saved['effects'])
+
+
+def test_owner_composition_direction_reaches_composer_unchanged(procedure, monkeypatch):
+    request, state = procedure
+    direction = "focusing on tomorrow’s meetings and the open pricing decision."
+    request['composition_direction'] = direction
+    original = brief_runner.subprocess.run
+    seen = []
+    def invoke(argv, **kwargs):
+        if Path(argv[1]).name == 'compose_brief.py' and '--seed-snapshot' not in argv:
+            path = Path(argv[argv.index('--composition-direction') + 1])
+            seen.append(json.loads(path.read_text()))
+        return original(argv, **kwargs)
+    monkeypatch.setattr(brief_runner.subprocess, 'run', invoke)
+    assert brief_runner.run(request) == 'A useful brief'
+    assert seen == [direction]
+    artifact = next(Path(os.environ['SOTTO_DATA']).glob('events/work-inputs/brief-*/artifact.json'))
+    assert json.loads(artifact.read_text())['_composition_direction'] is True

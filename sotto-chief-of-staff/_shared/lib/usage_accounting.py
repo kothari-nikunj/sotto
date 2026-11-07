@@ -44,6 +44,66 @@ def normalize(usage):
             'usage_completeness': 'complete' if None not in (prompt, cached, billed) else 'partial' if usage else 'unknown'}
 
 
+def google_openai_receipt(usage, max_output):
+    """Validate the Gemini compatibility receipt; completion excludes billed thinking."""
+    if not isinstance(usage, dict) or not set(usage) <= {
+            'prompt_tokens', 'completion_tokens', 'total_tokens',
+            'prompt_tokens_details', 'completion_tokens_details'}:
+        return None
+    prompt = _count(usage.get('prompt_tokens'))
+    completion = _count(usage.get('completion_tokens'))
+    total = _count(usage.get('total_tokens'))
+    if (prompt is None or completion is None or total is None or prompt > 1048576
+            or total < prompt + completion or total - prompt > max_output):
+        return None
+    input_details = usage.get('prompt_tokens_details')
+    if input_details is not None:
+        if (not isinstance(input_details, dict) or not set(input_details) <= {'cached_tokens', 'audio_tokens'}
+                or _count(input_details.get('audio_tokens', 0)) != 0):
+            return None
+    cached = _count(input_details.get('cached_tokens')) if isinstance(input_details, dict) else None
+    if isinstance(input_details, dict) and 'cached_tokens' in input_details and (cached is None or cached > prompt):
+        return None
+    output_details = usage.get('completion_tokens_details')
+    if output_details is not None:
+        if (not isinstance(output_details, dict) or not set(output_details) <= {
+                'reasoning_tokens', 'audio_tokens', 'accepted_prediction_tokens', 'rejected_prediction_tokens'}
+                or any(_count(output_details.get(key, 0)) != 0 for key in (
+                    'audio_tokens', 'accepted_prediction_tokens', 'rejected_prediction_tokens'))):
+            return None
+        if ('reasoning_tokens' in output_details
+                and _count(output_details['reasoning_tokens']) != total - prompt - completion):
+            return None
+    return {'prompt': prompt, 'completion': completion, 'total': total,
+            'reasoning': total - prompt - completion, 'cached': cached}
+
+
+def normalize_google_openai(usage, max_output):
+    """Preserve reportable raw counts without treating visible completion as billed output."""
+    usage = usage if isinstance(usage, dict) else {}
+    prompt = _count(usage.get('prompt_tokens'))
+    completion = _count(usage.get('completion_tokens'))
+    total = _count(usage.get('total_tokens'))
+    prompt_details = usage.get('prompt_tokens_details')
+    completion_details = usage.get('completion_tokens_details')
+    result = {'reported_prompt_tokens': prompt, 'reported_completion_tokens': completion,
+              'reported_total_tokens': total,
+              'reported_cached_tokens': (_count(prompt_details.get('cached_tokens'))
+                                         if isinstance(prompt_details, dict) else None),
+              'reported_reasoning_tokens': (_count(completion_details.get('reasoning_tokens'))
+                                            if isinstance(completion_details, dict) else None),
+              'input_tokens': prompt,
+              'cached_input_tokens': None, 'visible_output_tokens': completion,
+              'reasoning_tokens': None, 'billed_output_tokens': None,
+              'usage_completeness': 'partial' if usage else 'unknown'}
+    receipt = google_openai_receipt(usage, max_output)
+    if receipt is not None:
+        result.update(cached_input_tokens=receipt['cached'], reasoning_tokens=receipt['reasoning'],
+                      billed_output_tokens=receipt['total'] - receipt['prompt'],
+                      usage_completeness='complete' if receipt['cached'] is not None else 'partial')
+    return result
+
+
 def estimate(model, counts, created=None):
     created = datetime.now(timezone.utc).timestamp() if created is None else created
     prices = PRICES.get(model)

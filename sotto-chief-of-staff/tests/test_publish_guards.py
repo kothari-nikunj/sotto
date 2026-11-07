@@ -12,8 +12,8 @@ import tempfile
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-HERMES = os.path.dirname(ROOT)                    # sotto-hermes/ — where the generator lives
-GENERATOR = os.path.join(HERMES, "tools", "prepare-public-repo.sh")
+AGENT_ROOT = os.path.dirname(ROOT)                    # sotto-agent/ — where the generator lives
+GENERATOR = os.path.join(AGENT_ROOT, "tools", "prepare-public-repo.sh")
 
 # The generator is a PRIVATE tool — `tools/` is excluded from the published tree — but these tests
 # ship with it. A contributor cloning the public repo therefore cannot run them, and until Aug 2026
@@ -60,7 +60,7 @@ def test_no_secret_patterns_in_distributable_tree():
 
 
 # ── CORPUS GUARD — the Golden Corpus is real user data and must never ship ────────────────────────
-# "Scrubbed" never means "shareable" (docs/plans/golden-corpus.md). The corpus is gitignored, so a
+# "Scrubbed" never means "shareable" (docs/archive/plans/golden-corpus.md). The corpus is gitignored, so a
 # clean checkout has none — but the OWNER's checkout does, and `cp -a` is gitignore-blind. These
 # tests stand in for the one thing nobody can retry: a published inbox.
 
@@ -125,12 +125,12 @@ def test_corpus_paths_are_gitignored():
     """Belt to the generator's braces: `git add -A` on the owner's machine must not stage a corpus."""
     for rel in ("sotto-chief-of-staff/evals/corpus/corpus-v1/days/day-00.json",
                 "sotto-chief-of-staff/evals/corpus-v1.map.json"):
-        proc = subprocess.run(["git", "check-ignore", "-q", rel], cwd=HERMES)
+        proc = subprocess.run(["git", "check-ignore", "-q", rel], cwd=AGENT_ROOT)
         assert proc.returncode == 0, f"{rel} is NOT gitignored — a corpus could be committed"
 
 
 # ── IGNORED GUARD — `cp -a` is gitignore-blind, so an ignored file inside a shipped directory ships
-# The one that made this real: a local `adapters/hermes/.env` (gitignored at the monorepo root) sat
+# The one that made this real: a local `adapters/sotto/.env` (gitignored at the monorepo root) sat
 # inside a distributable directory. All six older guards passed it unless it happened to carry a
 # vendor-prefixed key shape, and ship.sh's untracked check could not see it either — `git status
 # --porcelain` never lists ignored files.
@@ -141,7 +141,7 @@ def _run_generator(target):
 
 
 def test_a_gitignored_env_file_in_a_shipped_dir_fails_the_publish():
-    planted = os.path.join(HERMES, "adapters", "hermes", ".env")
+    planted = os.path.join(AGENT_ROOT, "adapters", "sotto", ".env")
     assert not os.path.exists(planted), "a real .env is in the way — remove it first"
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)                                    # the generator refuses a non-empty target
@@ -149,11 +149,11 @@ def test_a_gitignored_env_file_in_a_shipped_dir_fails_the_publish():
         with open(planted, "w", encoding="utf-8") as f:
             f.write("BRIDGE" + "_TOKEN=" + "z" * 48 + "\n")
         # It IS gitignored in the source (that is exactly why nothing else caught it)…
-        assert subprocess.run(["git", "check-ignore", "-q", planted], cwd=HERMES).returncode == 0
+        assert subprocess.run(["git", "check-ignore", "-q", planted], cwd=AGENT_ROOT).returncode == 0
         proc = _run_generator(target)
         assert proc.returncode != 0, "a gitignored .env published:\n" + proc.stdout
         assert "IGNORED GUARD: FAIL" in proc.stdout
-        assert "adapters/hermes/.env" in proc.stdout
+        assert "adapters/sotto/.env" in proc.stdout
     finally:
         if os.path.exists(planted):
             os.remove(planted)
@@ -168,7 +168,7 @@ def test_the_template_env_file_still_ships():
         proc = _run_generator(target)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "IGNORED GUARD: PASS" in proc.stdout
-        assert os.path.exists(os.path.join(target, "adapters", "hermes", ".env.template"))
+        assert os.path.exists(os.path.join(target, "adapters", "sotto", ".env.template"))
     finally:
         shutil.rmtree(target, ignore_errors=True)
 
@@ -178,7 +178,7 @@ def test_the_secrets_guard_catches_an_opaque_token_assignment():
     — EXA_API_KEY, PARALLEL_API_KEY, BRIDGE_TOKEN, SOTTO_TRIGGER_TOKEN, SOTTO_SETUP_CODE — are
     opaque strings, so the shape that catches them is the ASSIGNMENT. Planted as a NON-ignored file
     so this exercises the SECRETS guard rather than the IGNORED one."""
-    planted = os.path.join(HERMES, "adapters", "hermes", "scratch-notes.md")
+    planted = os.path.join(AGENT_ROOT, "adapters", "sotto", "scratch-notes.md")
     assert not os.path.exists(planted)
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)
@@ -207,7 +207,7 @@ def _publish_with_planted_note(body: str, suffix: str = ".md"):
     # one would collide with the older opaque-assignment test (and with a second checkout running the
     # suite at the same time).
     fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=suffix,
-                                   dir=os.path.join(HERMES, "adapters", "hermes"))
+                                   dir=os.path.join(AGENT_ROOT, "adapters", "sotto"))
     os.close(fd)
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)                                    # the generator refuses a non-empty target
@@ -328,7 +328,7 @@ def test_the_shipped_ci_workflow_names_no_credential():
         spec.loader.exec_module(module)
         from pathlib import Path
         commands = [argv[1:] for _cwd, argv in module.commands(Path(target))]
-        for suite in ("tests", "runtime/trigger-receiver", "adapters/hermes", "cloud/model-proxy"):
+        for suite in ("tests", "runtime/trigger-receiver", "adapters/sotto", "cloud/model-proxy"):
             assert ["-m", "pytest", suite, "-q"] in commands
         # The hosted account broker never ships, and the shipped gate does not name a suite it lacks.
         assert ["-m", "pytest", "cloud/accounts", "-q"] not in commands
@@ -352,8 +352,8 @@ def test_the_shipped_ci_workflow_names_no_credential():
 def test_a_second_workflow_anywhere_in_the_tree_fails_the_publish():
     """The guard is no longer 'no .github', so prove the narrower rule still bites: a workflow that
     rides along inside a shipped directory must stop the publish."""
-    planted_dir = os.path.join(HERMES, "adapters", "hermes", ".github", "workflows")
-    assert not os.path.exists(os.path.join(HERMES, "adapters", "hermes", ".github"))
+    planted_dir = os.path.join(AGENT_ROOT, "adapters", "sotto", ".github", "workflows")
+    assert not os.path.exists(os.path.join(AGENT_ROOT, "adapters", "sotto", ".github"))
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)
     try:
@@ -365,14 +365,14 @@ def test_a_second_workflow_anywhere_in_the_tree_fails_the_publish():
         assert "WORKFLOW GUARD: FAIL" in proc.stdout
         assert "rides-along.yml" in proc.stdout
     finally:
-        shutil.rmtree(os.path.join(HERMES, "adapters", "hermes", ".github"), ignore_errors=True)
+        shutil.rmtree(os.path.join(AGENT_ROOT, "adapters", "sotto", ".github"), ignore_errors=True)
         shutil.rmtree(target, ignore_errors=True)
 
 
 def test_the_shipped_gitignore_ignores_a_deployers_env_file():
-    """The .gitignore that ships IS sotto-hermes/.gitignore. Until Aug 2026 it ignored build junk but
-    not `adapters/hermes/.env` — which the monorepo root ignores and the public repo therefore did
-    not — so a deployer who followed LOCAL-SETUP.md saw their own credentials file sitting untracked
+    """The .gitignore that ships IS sotto-agent/.gitignore. Until Aug 2026 it ignored build junk but
+    not `adapters/sotto/.env` — which the monorepo root ignores and the public repo therefore did
+    not — so a deployer who filled in the template saw their own credentials file sitting untracked
     in `git status`. Asserted through git itself, not a substring match."""
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)
@@ -380,10 +380,10 @@ def test_the_shipped_gitignore_ignores_a_deployers_env_file():
         proc = _run_generator(target)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-        ignored = subprocess.run(["git", "check-ignore", "-q", "adapters/hermes/.env"], cwd=target)
-        assert ignored.returncode == 0, "the shipped .gitignore does not ignore adapters/hermes/.env"
+        ignored = subprocess.run(["git", "check-ignore", "-q", "adapters/sotto/.env"], cwd=target)
+        assert ignored.returncode == 0, "the shipped .gitignore does not ignore adapters/sotto/.env"
         # …and it must not swallow the template beside it, which is a real shipped file.
-        kept = subprocess.run(["git", "check-ignore", "-q", "adapters/hermes/.env.template"], cwd=target)
+        kept = subprocess.run(["git", "check-ignore", "-q", "adapters/sotto/.env.template"], cwd=target)
         assert kept.returncode != 0, "the shipped .gitignore ignores .env.template"
     finally:
         shutil.rmtree(target, ignore_errors=True)
@@ -429,49 +429,6 @@ def test_the_shipped_lock_script_does_not_name_the_broker():
         shutil.rmtree(target, ignore_errors=True)
 
 
-# ── DOC TRANSFORMS — a dead `sed` is drift no guard can see ───────────────────────────────────────
-# The generator rewrites the shipped docs with seds anchored to the source doc's exact wording. The
-# seven guards check what must NOT be in the tree; none of them can tell that a rewrite silently
-# stopped matching. In Aug 2026 LOCAL-SETUP.md was restructured into "option A: download / option B:
-# build from source" and the block went stale in three ways at once: a title rewrite that matched
-# nothing, a download blurb substituted INTO option B's `cargo build` fence, and the same `--doctor`
-# command emitted twice. Every one of those shipped, green. This asserts the SHAPE of the produced
-# file instead, so the next restructure fails here rather than in a deployer's terminal.
-
-def test_the_public_local_setup_offers_exactly_one_way_to_get_the_bridge():
-    target = tempfile.mkdtemp(prefix="sotto-dist-")
-    os.rmdir(target)                                    # the generator refuses a non-empty target
-    try:
-        proc = _run_generator(target)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        with open(os.path.join(target, "LOCAL-SETUP.md"), encoding="utf-8") as f:
-            doc = f.read()
-
-        # This repo ships no Bridge source, so nothing may tell a reader to build one.
-        for forbidden in ("cargo build", "Option B", "option B", "build from source",
-                          "rustup.rs", "core/target/release"):
-            assert forbidden not in doc, f"the shipped LOCAL-SETUP still mentions {forbidden!r}"
-
-        # …and the one way that IS offered has to be whole: the app, its bundled engine, and a single
-        # verify command pointed at it.
-        bridged = "/Applications/Sotto Bridge.app/Contents/Resources/sotto-bridged"
-        assert bridged in doc, "option A (download the signed app) did not survive the rewrite"
-        doctor = [ln.strip() for ln in doc.splitlines() if "--doctor" in ln]
-        assert len(doctor) == 1, f"expected exactly one --doctor invocation, got {doctor}"
-        assert bridged in doctor[0], f"--doctor points somewhere that does not exist here: {doctor[0]}"
-
-        # The guide is shared verbatim now. A prose rewrite must not leave a dangling
-        # source-build sentence or drop the pinned-runtime/dependency steps again.
-        assert doc == Path(HERMES, "LOCAL-SETUP.md").read_text()
-        assert "bash adapters/hermes/install-runtime.sh" in doc
-        assert "--require-hashes -r requirements.txt" in doc
-        assert "SOTTO_BACKGROUND_UNMETERED=true" in doc
-        for name in ("install-runtime.sh", "local_preflight.py"):
-            assert Path(target, "adapters/hermes", name).is_file()
-    finally:
-        shutil.rmtree(target, ignore_errors=True)
-
-
 def test_every_doc_the_readme_links_actually_ships():
     """The generator's copy list is an ALLOWLIST, so adding a doc to the repo does not publish it —
     a LICENSE added and never copied would leave the public repo unlicensed while every guard went
@@ -489,20 +446,68 @@ def test_every_doc_the_readme_links_actually_ships():
         assert not missing, (
             f"README links these, but the generator never copies them: {missing}\n"
             "Add each to tools/prepare-public-repo.sh's copy list.")
-        preset = os.path.join(target, "deploy", "railway-photon-preset.json")
-        validator = os.path.join(target, "tools", "verify_railway_photon_preset.py")
-        assert os.path.isfile(preset), "RAILWAY.md links a preset missing from the distribution"
-        assert os.path.isfile(validator), "the public Photon preset has no shipped validator"
         setup_helper = os.path.join(target, "tools", "setup_selfhost_railway.py")
         setup_test = os.path.join(target, "tools", "test_setup_selfhost_railway.py")
         assert os.path.isfile(setup_helper), "the agent setup guide links an unshipped Railway helper"
         assert os.path.isfile(setup_test), "the public helper has no shipped offline contract tests"
         assert os.path.isfile(os.path.join(target, "AGENTS.md")), "agent entrypoint instructions are missing"
-        assert os.path.isfile(os.path.join(target, "docs", "AGENT-ONBOARDING.md")), "agent setup playbook is missing"
-        checked = subprocess.run(["python3", validator], capture_output=True, text=True)
-        assert checked.returncode == 0, checked.stdout + checked.stderr
+        assert os.path.isfile(os.path.join(target, "ONBOARDING.md")), "agent setup playbook is missing"
+        # Every shipped doc, not only the README: a relative link must land on a shipped file.
+        broken = set()
+        for doc in Path(target).rglob("*.md"):
+            if "node_modules" in doc.parts:
+                continue
+            for link in re.findall(r"\]\((?![a-z]+:|#)([^)\s#]+)(?:#[^)]*)?\)", doc.read_text(errors="ignore")):
+                if not (doc.parent / link).exists():
+                    broken.add((str(doc.relative_to(target)), link))
+        # Internal roadmap/history links are stripped; every remaining link must resolve.
+        assert not broken, sorted(broken)
+        # Internal implementation ledgers never ship, wherever they sit.
+        assert not os.path.exists(os.path.join(target, "runtime", "sotto-chat", "IMPLEMENTATION.md"))
+        assert not os.path.exists(os.path.join(target, "docs", "archive"))
+        assert not os.path.exists(os.path.join(target, "docs", "specs"))
+        assert os.path.isfile(os.path.join(target, "docs", "RUNTIME-CAPABILITIES.md"))
     finally:
         shutil.rmtree(target, ignore_errors=True)
+
+
+
+def _source_with_check_wrapper(tmp_path):
+    source = tmp_path / "source"
+    shutil.copytree(AGENT_ROOT, source, symlinks=True, ignore=shutil.ignore_patterns(
+        "node_modules", "dist", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "target"))
+    (tmp_path / "bin").mkdir()
+    shutil.copy2(Path(AGENT_ROOT).parent / "bin/check", tmp_path / "bin/check")
+    return source
+
+
+def test_the_build_guard_covers_every_dockerfile_the_public_ci_builds(tmp_path):
+    """The generated ci.yml builds runtime/sotto-chat/Dockerfile.runtime and the fixed-cross overlay
+    besides the root Dockerfile; a COPY source or context filter missing for any of them must stop
+    the publish, not the published repo's first CI run. Mutates a scratch copy, never the source."""
+    source = _source_with_check_wrapper(tmp_path)
+    with open(source / "runtime/sotto-chat/Dockerfile.runtime", "a", encoding="utf-8") as f:
+        f.write("COPY runtime/sotto-chat/never-shipped.json /app/never-shipped.json\n")
+    (source / "runtime/sotto-chat/Dockerfile.runtime.dockerignore").unlink()
+    proc = subprocess.run(["bash", str(source / "tools/prepare-public-repo.sh"), str(tmp_path / "out"),
+                           "kothari-nikunj/sotto"], capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "BUILD GUARD: FAIL" in proc.stdout
+    assert "runtime/sotto-chat/Dockerfile.runtime:runtime/sotto-chat/never-shipped.json" in proc.stdout
+    assert "runtime/sotto-chat/Dockerfile.runtime.dockerignore" in proc.stdout
+
+
+def test_local_speech_venv_is_never_copied_into_the_public_tree(tmp_path):
+    """The local-speech README creates .venv in place; it carries absolute local paths."""
+    source = _source_with_check_wrapper(tmp_path)
+    planted = source / "runtime/local-speech/.venv/bin/activate"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("VIRTUAL_ENV=/Users/someone/private\n", encoding="utf-8")
+    proc = subprocess.run(["bash", str(source / "tools/prepare-public-repo.sh"), str(tmp_path / "out"),
+                           "kothari-nikunj/sotto"], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (tmp_path / "out/runtime/local-speech/speech.py").is_file()
+    assert not (tmp_path / "out/runtime/local-speech/.venv").exists()
 
 
 def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fails_the_publish():
@@ -510,9 +515,9 @@ def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fa
     must not, because the shipped tree does not. Marked passages vanish (markers included), a
     marked table row vanishes without breaking the table, and an UNMARKED mention is a moat leak."""
     fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=".md",
-                                   dir=os.path.join(HERMES, "adapters", "hermes"))
+                                   dir=os.path.join(AGENT_ROOT, "adapters", "sotto"))
     os.close(fd)
-    rel = os.path.relpath(planted, HERMES)
+    rel = os.path.relpath(planted, AGENT_ROOT)
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)
     try:

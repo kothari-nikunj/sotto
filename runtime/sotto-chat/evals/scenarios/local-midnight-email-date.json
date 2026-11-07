@@ -1,0 +1,71 @@
+{
+  "name": "local-midnight-email-previous-evening",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "gmailMessages": {
+      "cedar-evening": {
+        "id": "cedar-evening",
+        "threadId": "cedar-agenda",
+        "internalDate": "1793766600000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "The revised Cedar agenda is attached for our next review.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Rowan Vale <rowan@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar revised agenda"
+            },
+            {
+              "name": "Date",
+              "value": "Wed, 04 Nov 2026 04:30:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "VGhlIHJldmlzZWQgQ2VkYXIgYWdlbmRhIGlzIGF0dGFjaGVkIGZvciBvdXIgbmV4dCByZXZpZXcu"
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "It is November 4 at 12:15 a.m. in Los Angeles. When did Rowan send the revised Cedar agenda? Don't change anything.",
+      "containsAny": [
+        [
+          "yesterday",
+          "last night",
+          "November 3",
+          "Nov 3",
+          "Nov. 3"
+        ],
+        [
+          "8:30",
+          "20:30"
+        ]
+      ],
+      "excludes": [
+        "earlier today",
+        "this morning"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    }
+  ]
+}

@@ -1,85 +1,51 @@
-# Host adapters
+# Adapters
 
-**Which host should you pick?** (full setup guides linked)
+Sotto has one runtime: the supervised Sotto runtime, built by the repository's root `Dockerfile`
+(and `runtime/sotto-chat/Dockerfile.runtime` underneath it). The skills tree is host-agnostic.
+Nothing under `sotto-chief-of-staff/` imports an agent runtime: it is `SKILL.md` + scripts over
+`$SOTTO_DATA`, the Bridge's JSON-RPC tools for the Mac, plain HTTP for the receiver.
 
-| Host | Setup | Cost | Always-on | Guide |
-|---|---|---|---|---|
-| **Cloud Hermes (Railway)** | ~10 steps, ~35 min the first time | hosting bill | yes — fires even with the Mac asleep | [ONBOARDING.md](../ONBOARDING.md) · [RAILWAY.md](../RAILWAY.md) |
-| **Local Hermes (Mac)** | `install.sh`, ~5 min | $0 | only while the Mac is awake | [LOCAL-SETUP.md](../LOCAL-SETUP.md) |
-| **OpenClaw** | `adapters/openclaw/install.sh` + wire 3 CLI lines | depends | depends | [openclaw/README.md](openclaw/README.md) |
-
-**The skills tree is host-agnostic. The adapters are not equally finished.** Nothing under
-`sotto-chief-of-staff/` imports an agent runtime: it is `SKILL.md` + `execute_code` over
-`$SOTTO_DATA`, MCP for the Mac, plain HTTP for the receiver.
-
-For self-host Hermes, Google onboarding runs in the receiver's `/setup` browser page using the
-owner's Web application OAuth client and the exact HTTPS callback shown there. The callback is
-browser-bound, PKCE/state protected, and single-use; it returns automatically to Sotto. Existing
-Desktop-client tokens remain connected, while future authorization requires the Web client. The
-Mac Bridge is unchanged and self-host does not use a Sotto OAuth broker for this flow.
+For self-host, Google onboarding runs in the receiver's `/setup` browser page using the owner's Web
+application OAuth client and the exact HTTPS callback shown there. The callback is browser-bound,
+PKCE/state protected, and single-use; it returns automatically to Sotto. The Mac Bridge is
+unchanged and self-host does not use a Sotto OAuth broker for this flow.
 
 | Portable core (no host coupling) | Built on |
 |---|---|
-| **Sotto Bridge** (Mac app) | **MCP** server (stdio + HTTP) — any MCP client |
-| `sotto-chief-of-staff/` skills + scripts | **agentskills** `SKILL.md` + `execute_code` over `$SOTTO_DATA` |
-| `runtime/trigger-receiver/` | plain HTTP; host-neutral for briefs (`$SOTTO_RUN_SKILL`). The setup wizard, dashboard writes, and the event funnel additionally locate the skills tree via `$SOTTO_SKILLS_ROOT` or the Hermes layout |
+| **Sotto Bridge** (Mac app) | Mac source reader that dials **out** to the receiver's relay over the reverse link (`/bridge/poll`, `/bridge/respond`); the chat runtime reaches its MCP-shaped JSON-RPC tools through the relay's loopback `/mcp` |
+| `sotto-chief-of-staff/` skills + scripts | **agentskills** `SKILL.md` + scripts over `$SOTTO_DATA` |
+| `runtime/trigger-receiver/` | plain HTTP: scheduling, accepted work, delivery, the setup wizard and dashboard |
 | `contracts/` | JSON Schema + the exhaust file layout |
 
-That is a claim about the tree, not a claim that every host works the same. The two adapters are at
-different stages:
+## `adapters/sotto/`
 
-| Adapter | Where it stands |
+The receiver's runtime adapter, the root supervisor, the
+managed and self-host bootstraps, startup configuration and Google setup. See
+[sotto/README.md](sotto/README.md) and [sotto/SELFHOST.md](sotto/SELFHOST.md). It also holds:
+
+| Files | Used for |
 |---|---|
-| **Hermes** | The reference. Cloud boot, local install, crons, delivery, the setup wizard and the dashboard are all exercised against it, and it is the host the rest of these docs assume. |
-| **OpenClaw** | Installs and runs, with two lists attached. Four lanes could not be executed in the lab (no linked channel, no model key, no Google account, Linux). Three host couplings also remain **in the core**: three `SKILL.md` files print `hermes cron create …`, and the receiver's timezone re-registration shells out to `hermes` — so the setup flow's scheduling step, the personal-routines skill, and the first-night re-registration do not work there yet. |
+| `managed_exec.py` · `control_vault.py` · `runtime_lock.py` | Drop workloads to their UIDs, capture the control credential before runtime imports, hold the tenant lock |
+| `tenant_lifecycle.py` · `replacement_epoch.py` | The root supervisor's Linux lifecycle and the replacement epoch fresh routines bind to |
+| `model_lease.py` | The receiver heartbeat renews the proxy model lease |
+| `crons.json` | The one system schedule (below); the receiver reads it directly |
+| `photon_owner.py` | Photon owner policy and the activation receipt the receiver writes |
+| `.env.template` | The Railway service variables the setup helper writes (everything else: RAILWAY.md) |
+| `VOLUME.md` | Tenant volume operations |
 
-Both lists are in [openclaw/README.md](openclaw/README.md#still-unverified). Read them before
-treating OpenClaw as a drop-in for Hermes.
+**The cron schedule has ONE source: `adapters/sotto/crons.json`**.
+It is an array of `{name, schedule, prompt, skill}` plus two optional keys — `gate`, the env var
+that must not be `0` for the job to run (`SOTTO_PROACTIVE`, `SOTTO_DIGEST`), and `schedule_env`, an
+env var that overrides the schedule (`SOTTO_PROACTIVE_CRON`). `receiver._cron_tick` fires every row
+on the receiver's own 60-second heartbeat,
+so a scheduled run takes the identical spawn → outbox → deliver-once path a wake-push brief takes
+(retries, a receipt, one brief per day, and the `NO_NUDGES` silence seam). It reads fixed daily
+`M H * * *`, weekly and `*/N * * * *` interval schedules and the configured zone every tick, so a
+timezone change moves the next fire with nothing to re-register. Delivery is not per job:
+`SOTTO_CRON_DELIVER` is the one target for all of them.
 
-A **host adapter** is the thin, swappable glue that wires the core into one runtime. Everything
-host-specific lives here:
+**The `user-` namespace is reserved.** Routines named `user-<slug>` are the owner's personal
+routines (the `sotto-routines` skill); they never appear in `crons.json`.
 
-| Adapter file | What it covers | Hermes | OpenClaw |
-|---|---|---|---|
-| bundle file | "load these skills under one slash command" | `sotto.bundle.yaml` (skill-bundle) | no bundle equivalent — the bundle's `instruction` goes into `workspace/AGENTS.md` (`## Sotto`) |
-| persona | name the chief-of-staff identity | `sotto-persona.md` → `~/.hermes/SOUL.md` | `sotto-persona.md` → `workspace/SOUL.md` (+ name in `workspace/IDENTITY.md`) |
-| config template | model + `mcp_servers` + scheduler | `config.template.yaml` | `~/.openclaw/openclaw.json` (JSON5) |
-| MCP registration | register `sotto-local` | `configure_mcp.py` (writes config.yaml) | `openclaw mcp add`/`mcp set` (JSON5 snippet printed as fallback) |
-| scheduler / cron | the fallback timer | `hermes cron create … --skill` | `openclaw cron add "<cron>" "<prompt>"` (prompt-based, no `--skill`) — printed by `install.sh` |
-| skill-run command | how the trigger receiver runs a skill (one-shot: prompt in, final text out) | `SOTTO_RUN_SKILL="hermes -z"` | `SOTTO_RUN_SKILL="openclaw agent -m"` |
-| installer | one command to wire it all | `adapters/hermes/install.sh` | `adapters/openclaw/install.sh` (validated end to end against a live OpenClaw, Aug 2026 — the short "Still unverified" list is in [openclaw/README.md](openclaw/README.md)) |
-
-**The cron schedule has ONE source: `adapters/hermes/crons.json`** (host-neutral despite living under
-`hermes/`). It is an array of `{name, schedule, prompt, skill}` plus three optional keys — `gate`, the
-env var that must not be `0` for the job to register (`SOTTO_PROACTIVE`, `SOTTO_DIGEST`),
-`schedule_env`, an env var that overrides the schedule (`SOTTO_PROACTIVE_CRON`), and `runner`, which
-says WHO fires the job: `"receiver"` means the trigger receiver schedules and delivers it through
-its outbox, absent means the host agent's scheduler runs it. Delivery is *not*
-per job: `SOTTO_CRON_DELIVER` is the one target for all of them. Four registrars read this file —
-`adapters/hermes/start.sh` (cloud boot), both `install.sh`s, and `receiver._sotto_cron_jobs` (the
-timezone re-registration) — so a schedule can never drift between them.
-
-**`"runner": "receiver"` — the briefs, the watcher, the digest, and the weekly pulse.** All five
-system rows carry it, so no
-registrar hands them to a host scheduler; `receiver._cron_tick` fires them on the receiver's own
-60-second heartbeat, which means a scheduled run takes the identical spawn → outbox → deliver-once
-path a wake-push brief takes (retries, a receipt, one brief per day, and the `NO_NUDGES` silence
-seam — a run with nothing to say is an empty receipt, not a message) instead of being delivered by
-the agent with none of that. It reads fixed daily `M H * * *` and `*/N * * * *` interval schedules,
-and reads the configured zone every tick, so a timezone change moves the next fire with nothing to
-re-register. The weekly pulse (`0 9 * * 1`) follows the same receiver path.
-The reconciler still lists these rows among its removal markers, which is what strips an existing
-deployment's stale host registrations on the next boot.
-
-*The one exception, and why:* both `install.sh`s still print/create these jobs for the host
-scheduler, because a laptop-only install may run no receiver at all and would otherwise have no
-scheduled brief. Where both run, the deliver-once marker keeps the day to one brief — the second
-composition is receipted `superseded` and never sent.
-
-**The `user-` namespace is reserved and off-limits to every registrar.** Crons named `user-<slug>`
-are the owner's personal routines (the `sotto-routines` skill); they never appear in `crons.json`,
-boot cleanup skips them by prefix, and the timezone re-registration drops them. A host adapter that
-adds its own scheduler wiring must keep that fence: touch only the jobs `crons.json` names.
-
-**Rule:** if a change would only make sense on one runtime, it belongs in `adapters/<host>/`, never in
-the core. Adding a new host = a new `adapters/<host>/`, not a fork.
+**Rule:** if a change would only make sense on one runtime boundary, it belongs in `adapters/`,
+never in the core.

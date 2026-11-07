@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import meeting_context as context
 
 
@@ -17,10 +19,11 @@ def test_meeting_evidence_folded_into_existing_email_loop_stays_linked(monkeypat
     assert context.obligations('meeting', [row]) == []
 
 
-def test_reopened_row_does_not_inherit_old_completion_claim(monkeypatch):
+@pytest.mark.parametrize('active_status', ['open', 'waiting', 'failed', 'blocked'])
+def test_reopened_row_does_not_inherit_old_completion_claim(monkeypatch, active_status):
     monkeypatch.setattr(context, 'allowed', lambda source: True)
-    row = {'source_thread_id': 'granola:m:ask', 'status': 'open', 'resolution': 'user_resolved'}
-    assert context.obligations('m', [row])[0]['completion_basis'] == 'ledger_state'
+    row = {'source_thread_id': 'granola:m:ask', 'status': active_status, 'resolution': 'user_resolved'}
+    assert context.obligations('m', [row])[0]['completion_basis'] == 'not_recorded'
 
 
 def test_exact_occurrence_keeps_directions_and_distinguishes_closure_basis(monkeypatch):

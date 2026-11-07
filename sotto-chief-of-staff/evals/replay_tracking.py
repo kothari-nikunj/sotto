@@ -23,6 +23,7 @@ for rel in ("_shared/lib", "_shared/scripts", "_shared/knowledge", "morning-brie
     sys.path.insert(0, str(PACK / rel))
 
 import continuity_resolve as cr  # noqa: E402
+import compose_brief as cb  # noqa: E402
 import draft_outcomes as drafts  # noqa: E402
 import ledger_io  # noqa: E402
 import knowledge_edit  # noqa: E402
@@ -44,7 +45,7 @@ def sandbox():
 
 def _action(name, phone, ask, kind="follow_up", **extra):
     return {"contact_name": name, "contact_identifier": phone, "channel": "imessage",
-            "action_type": kind, "summary": ask, "ask": ask, **extra}
+            "action_type": kind, "summary": ask, "ask": ask, "source": "imessage", **extra}
 
 
 def _append(path, row):
@@ -59,6 +60,22 @@ def _rows(path):
 
 def _iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _review_completions(updates, local, now, *, approve=True):
+    """Script the synthetic positive critic judgment through the real composition boundary."""
+    def model(prompt, inputs):
+        if inputs.get('_critic'):
+            return json.dumps({'patches': [], 'score': 95, 'summary': 'Synthetic task fulfilled.',
+                'loop_verdicts': [{'proposal_id': cr.critic_review_receipt(update),
+                                   'verdict': 'approve'} for update in updates] if approve else []})
+        return json.dumps({'markdown': '# Brief\n\nThe evidenced task is complete.',
+                           'actionItems': [], 'loopUpdates': updates})
+
+    result = cb.compose({'type': 'morning', 'now': _iso(now),
+                         'local': {**local, 'action_ledger': ledger_io.load_entries()}},
+                        llm=model, critic=True)
+    return result['loop_updates']
 
 
 def replay():
@@ -189,8 +206,8 @@ def replay():
                 new = [_action('Ada', people['Ada'], 'Review the new budget',
                                evidence=budget_refs, newObligation=True)]
 
-            # These closures stand for brief proposals the critic pass reviewed and stamped.
-            loop_updates = [{**u, "criticReceipt": cr.record_critic_approval(u)} for u in loop_updates]
+            if loop_updates:
+                loop_updates = _review_completions(loop_updates, local, now)
             resolved_pass = cr.resolve({"today": now.strftime('%Y-%m-%d'), "new_actions": new,
                                         "local": local, "loopUpdates": loop_updates}, now)
             with patch.object(drafts.log_outcome, 'datetime', wraps=datetime) as clock:
@@ -252,10 +269,10 @@ def replay():
                                 "met": all(check['met'] for check in first_week),
                                 "failed": [check['id'] for check in first_week if not check['met']]},
             "checks": checks, "checkpoints": checkpoints,
-            "limitations": ["Synthetic inputs; no LLM extraction or user-judgment score",
+            "limitations": ["Synthetic inputs; scripted extraction and explicit critic verdicts, not model quality",
                             "Distinct requests supply observed evidence and the explicit newObligation extraction signal",
                             "Does not test migration",
-                            "Does not execute onboarding, brief generation, dashboard, or adapter reply binding",
+                            "Does not execute onboarding, real-model brief generation, dashboard, or adapter reply binding",
                             "Reminder selection budget is bypassed to exercise delivered-reminder semantics"]}
 
 

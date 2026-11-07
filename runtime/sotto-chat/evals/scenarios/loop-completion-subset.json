@@ -1,0 +1,146 @@
+{
+  "name": "Natural subset selection with legacy date and uncertain completion",
+  "world": {
+    "loopTasks": [
+      {
+        "anchor_key": "subset-1",
+        "action_type": "follow_up",
+        "channel": "email",
+        "status": "open",
+        "created_at": "2026-10-19",
+        "summary": "Review unrelated contract",
+        "ask": "Review unrelated contract",
+        "contact_name": "Test Contact",
+        "contact_identifier": "test@example.com",
+        "source": "gmail",
+        "source_message_id": "m1",
+        "source_thread_id": "t1",
+        "deadline": "tomorrow"
+      },
+      {
+        "anchor_key": "subset-2",
+        "action_type": "follow_up",
+        "channel": "email",
+        "status": "open",
+        "created_at": "2026-10-19",
+        "summary": "Sotto loop check amber",
+        "ask": "Sotto loop check amber",
+        "contact_name": "Test Contact",
+        "contact_identifier": "test@example.com",
+        "source": "gmail",
+        "source_message_id": "m2",
+        "source_thread_id": "t2",
+        "deadline": ""
+      },
+      {
+        "anchor_key": "subset-3",
+        "action_type": "follow_up",
+        "channel": "email",
+        "status": "open",
+        "created_at": "2026-10-19",
+        "summary": "Sotto loop check birch",
+        "ask": "Sotto loop check birch",
+        "contact_name": "Test Contact",
+        "contact_identifier": "test@example.com",
+        "source": "gmail",
+        "source_message_id": "m3",
+        "source_thread_id": "t3",
+        "deadline": ""
+      },
+      {
+        "anchor_key": "subset-4",
+        "action_type": "follow_up",
+        "channel": "email",
+        "status": "open",
+        "created_at": "2026-10-19",
+        "summary": "Sotto loop check cedar",
+        "ask": "Sotto loop check cedar",
+        "contact_name": "Test Contact",
+        "contact_identifier": "test@example.com",
+        "source": "gmail",
+        "source_message_id": "m4",
+        "source_thread_id": "t4",
+        "deadline": ""
+      }
+    ]
+  },
+  "turns": [
+    {
+      "text": "Show me just the Sotto loop check amber, birch, and cedar tasks, in that order.",
+      "contains": [
+        "1.",
+        "2.",
+        "3.",
+        "amber",
+        "birch",
+        "cedar"
+      ],
+      "excludes": [
+        "Review unrelated contract"
+      ],
+      "taskStates": {
+        "subset-1": "open",
+        "subset-2": "open",
+        "subset-3": "open",
+        "subset-4": "open"
+      },
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "1 and 3 are done. close them",
+      "contains": [
+        "Marked done"
+      ],
+      "taskStates": {
+        "subset-1": "open",
+        "subset-2": "resolved",
+        "subset-3": "open",
+        "subset-4": "resolved"
+      },
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "what's still open?",
+      "contains": [
+        "Review unrelated contract",
+        "birch"
+      ],
+      "excludes": [
+        "amber",
+        "cedar"
+      ],
+      "taskStates": {
+        "subset-1": "open",
+        "subset-2": "resolved",
+        "subset-3": "open",
+        "subset-4": "resolved"
+      },
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "1 might be done",
+      "taskStates": {
+        "subset-1": "open",
+        "subset-2": "resolved",
+        "subset-3": "open",
+        "subset-4": "resolved"
+      },
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "show me the open tasks again",
+      "restartBefore": true,
+      "contains": [
+        "Review unrelated contract",
+        "birch"
+      ],
+      "taskStates": {
+        "subset-1": "open",
+        "subset-2": "resolved",
+        "subset-3": "open",
+        "subset-4": "resolved"
+      },
+      "latencyClass": "ordinary"
+    }
+  ]
+}

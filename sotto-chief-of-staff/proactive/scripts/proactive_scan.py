@@ -29,9 +29,10 @@ Six nudge kinds:
                     (the lead nudge is the one that can still become a gift). The day-of nudge is
                     skipped entirely once a brief has DELIVERED today: that brief carried the 🎂
                     line and the quick-wish tap, so this would be the same nudge twice.
-  - handoff       — one thing you're owed has been chased its two times and still has no answer, so
-                    Sotto stops guessing and asks: "I've nudged Maya twice about the contract —
-                    nudge her again, or let it go?" Person, thing, binary choice. It has its OWN
+  - handoff       — one thing you're owed has reached its two reminders to YOU, so Sotto asks:
+                    "I've reminded you twice about Maya and the contract — want a follow-up
+                    draft, or let it go?" Person, thing, binary choice. Reminder delivery never
+                    proves that Maya was contacted. It has its OWN
                     clock — asked the first tick it comes due, outside the 2h post-brief window —
                     not the tidy-up cooldown below, and it ignores that offer's pile threshold; it
                     never hides inside the generic offer — "your open-loops list is getting heavy"
@@ -89,31 +90,23 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # Reuse the brief's tz + contact helpers so "today"/external/birthday logic matches the brief exactly.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
+from prep_identity import PrepIdentityResolver  # noqa: E402
 from textutil import _arr, _s, unwrap_tool_result  # noqa: E402
 from calendar_context import work_attendees, meeting_events  # noqa: E402
 from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email  # noqa: E402
 import delivery_effects  # noqa: E402
+from jsonfiles import load as _load  # noqa: E402
+from envutil import int_env as _int_env  # noqa: E402
 # The funnel itself — this file calls triage() in-process, so there is one gate order and not a
 # second copy of it. (Same cross-skill sys.path pattern this file already uses for retune_scan;
 # skill dirs aren't packages.)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
                                 "event-triage", "scripts"))
-
-
-def _load(path, default):
-    if not path:
-        return default
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
 
 
 def _state_path(date: str) -> str:
@@ -144,13 +137,6 @@ def _save_state(date: str, nudged: set):
     _state_lock for the whole read-decide-write, so the file can never be half-updated either."""
     with delivery_effects.proactive_state(date) as state:
         state['nudged'] = sorted(nudged)
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
 
 
 BRIEF_SUPPRESS_HOURS = 2   # a brief within this window just covered the open loops — don't restate
@@ -310,94 +296,17 @@ def _finalize(kind: str, anchor_key: str) -> None:
 
 def _delivered_prep_occurrences(date: str) -> set:
     """Meeting occurrences whose offer or full prep reached the provider."""
-    try:
-        with delivery_effects.proactive_state(date) as state:
-            return {str(value) for value in state.get('prep_deliveries', []) if str(value)}
-    except Exception:  # noqa: BLE001
-        return set()
+    return delivery_effects.delivered_prep_occurrences(date)
 
 
-def _prep_name(attendee, local, now, snapshot=None):
-    """Display evidence bound to this email; never title-case an email handle into a person.
-
-    Published research can fill a missing name, but never changes identity or overwrites a
-    contact/calendar name. The existing seven-day cache needs no new network read or research call.
-    """
-    from render_local import build_identity_resolver
-    from source_context import project_local
-    from research_attendees import CACHE_KEEP_DAYS
-    email = _s(attendee.get('email')).strip().lower()
-    def human_name(value):
-        value = _s(value).strip()
-        return value if (value and len(value) <= 120 and '\n' not in value and '@' not in value
-                         and value != email.partition('@')[0]) else ''
-    try:
-        identity = build_identity_resolver(project_local(local or {}))(email) or {}
-    except Exception:  # noqa: BLE001 - optional identity enrichment must not withhold a reminder
-        identity = {}
-    contact = human_name(identity.get('name'))
-    supplied = human_name(attendee.get('displayName'))
-    if contact and identity.get('confidence') == 'high':
-        return contact
-    if supplied:
-        return supplied
-    if contact:
-        return contact
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / '_shared/knowledge'))
-        import knowledge as kg
-        path = kg.find_person_file(name='', identifier=email) if email else None
-        if path:
-            name = human_name(kg.parse_person_file(Path(path).read_text()).name)
-            if name:
-                return name
-    except Exception:  # noqa: BLE001 - malformed optional graph data degrades to the meeting title
-        pass
-    # Existing email envelopes can name a founder even after the research cache expires.
-    # Match the address/name pair itself, including To/Cc on an introduction the owner sent.
-    # Body mentions, signatures and names attached to a different address never qualify.
-    from email.utils import getaddresses
-    from personal_context import conversation_snapshot
-    from source_context import allowed
-    import preferences
-    if email and allowed('gmail'):
-        names = set()
-        explicit = preferences.load_explicit()
-        for event, _, _ in (snapshot() if callable(snapshot) else conversation_snapshot()):
-            if event.get('source') not in ('email', 'gmail'):
-                continue
-            participants = getaddresses([_s(event[key]) for key in ('from', 'to', 'cc') if event.get(key)])
-            for display_name, address in participants:
-                if address.casefold() != email:
-                    continue
-                name = human_name(display_name)
-                if name and not preferences.proactively_muted(name, {**event, 'email': email}, explicit):
-                    names.add(name)
-        if len(names) == 1 and allowed('gmail'):
-            attendee['_name_source'] = 'gmail'
-            return names.pop()
-    # Older graphs often contain only the email handle even though research knows the full name.
-    for offset in range(CACHE_KEEP_DAYS + 1):
-        day = (now - timedelta(days=offset)).strftime('%Y-%m-%d')
-        path = Path(os.environ.get('SOTTO_DATA', '/data')) / 'cache' / f'research_{day}.json'
-        try:
-            data = json.loads(path.read_text())
-            names = {human_name(r.get('full_name')) for r in data.get('attendees', [])
-                     if isinstance(r, dict) and _s(r.get('email')).strip().lower() == email}
-        except (OSError, ValueError, AttributeError, TypeError):
-            continue
-        names.discard('')
-        if names:
-            return next(iter(names)) if len(names) == 1 else ''
-    return ''
 
 
 def _prep_lines(attendee: dict, continuity) -> tuple:
     """(who, open_loop) for the first external attendee of an imminent meeting — the prep the nudge
     carries. `who` is the graph's typed title/company ("VP Eng at Acme"), never a guess; empty when
     the graph has no file. `open_loop` is the one dated loop you owe them from the scan's own
-    continuity input, else "". Both degrade to "" on any failure — a nudge without prep beats no
-    nudge."""
+    continuity input, else "". A known address must match exactly; a name alone can select only
+    one unambiguous row. Both degrade to "" on any failure — a nudge without prep beats no nudge."""
     email = _s(attendee.get("email")).lower().strip()
     name = _s(attendee.get("displayName")).strip()
     who = ""
@@ -416,13 +325,15 @@ def _prep_lines(attendee: dict, continuity) -> tuple:
     loop = ""
     try:
         rows = continuity if isinstance(continuity, list) else _arr(continuity, "items")
-        for c in rows:
-            if not isinstance(c, dict):
-                continue
-            ident = _s(c.get("identifier")).lower().strip()
-            if (email and ident == email) or (name and _s(c.get("name")).strip().lower() == name.lower()):
-                loop = _s(c.get("title")).split(" — ", 1)[-1][:80]
-                break
+        rows = [c for c in rows if isinstance(c, dict)]
+        if email:
+            matches = [c for c in rows if _s(c.get("identifier")).lower().strip() == email]
+        else:
+            matches = [c for c in rows if name and _s(c.get("name")).strip().casefold() == name.casefold()]
+            if len(matches) != 1:
+                matches = []
+        if matches:
+            loop = _s(matches[0].get("title")).split(" — ", 1)[-1][:80]
     except Exception:  # noqa: BLE001
         loop = ""
     return who, loop
@@ -447,6 +358,7 @@ def _open_loops() -> list:
                     "title": f"{_s(it.get('name'))} — {_s(it.get('what'))}",
                     "name": _s(it.get("name")),
                     "anchor_key": _s(it.get("anchor_key")),
+                    "loop_version": it.get("loop_version"), "loop_identity": it.get("loop_identity"),
                     "deadline": _s(it.get("deadline")),
                     "channel": _s(it.get("channel")),
                     "identifier": _s(it.get("identifier")),
@@ -475,17 +387,18 @@ def _chase_candidates(today: str) -> list:
                     "title": f"{_s(it.get('name'))} — {_s(it.get('what'))}",
                     "name": _s(it.get("name")),
                     "anchor_key": _s(it.get("anchor_key")),
+                    "loop_version": it.get("loop_version"), "loop_identity": it.get("loop_identity"),
                     "chased_count": chased,
                     "detail": ("overdue" if it.get("overdue") else f"asked {age} days ago"
                                if age else "still open")
-                              + (" · chased once already" if chased >= 1 else ""),
+                              + (" · reminded you once already" if chased >= 1 else ""),
                     "channel": _s(it.get("channel")), "identifier": _s(it.get("identifier")),
                     "thread_id": _s(it.get("thread_id"))})
     return out
 
 
 def _handoff_candidates() -> list:
-    """The waiting-ons that have been chased their two times, still have no answer, and have NOT yet
+    """The waiting-ons whose two reminders reached the owner and have NOT yet
     been handed back — the ones the ledger owes the user a question about. They are NOT a heavy-pile
     problem, so they never surface as the generic tidy-up offer: each gets its own plain, named
     question, because "your open-loops list is getting heavy" tells a first-time user nothing about
@@ -510,24 +423,22 @@ def _handoff_candidates() -> list:
                     "title": f"{name} — {what}",
                     "name": name,
                     "anchor_key": _s(it.get("anchor_key")),
+                    "loop_version": it.get("loop_version"), "loop_identity": it.get("loop_identity"),
                     # The whole message, written here so it is the same sentence every time:
                     # person + thing + a binary choice, and not one word of Sotto's vocabulary.
-                    "question": (f"I've nudged {name} twice about {what.lower() or 'this'} — "
-                                 "nudge them again, or let it go?"),
+                    "question": (f"I've reminded you twice about {name} and {what or 'this'} — "
+                                 "want a follow-up draft, or let it go?"),
                     "channel": _s(it.get("channel")),
                     "identifier": _s(it.get("identifier"))})
     return out
 
 
-def _all_open_anchor_keys() -> set[str] | None:
-    """Every live loop anchor, both directions; conditional recipes may track either direction."""
-    try:
-        import loops_query as lq  # noqa: PLC0415
-        data = lq.query()
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(data, dict):
-        return None
+def _open_anchor_keys(rows: list, now_local: datetime) -> set[str]:
+    """Every live loop anchor among `rows`, both directions, by the loop view's own open rule."""
+    import ledger_io  # noqa: PLC0415
+    import loops_query as lq  # noqa: PLC0415
+    data = lq._query_rows(ledger_io.active_entries(rows, now_local), None,
+                          log_diagnostic=False, now=now_local)
     return {_s(item.get("anchor_key"))
             for lane in (data.get("you_owe") or [], data.get("waiting_on_them") or [])
             for item in lane if isinstance(item, dict) and _s(item.get("anchor_key"))}
@@ -536,27 +447,74 @@ def _all_open_anchor_keys() -> set[str] | None:
 def _intention_candidates(now_local: datetime, continuity=None) -> list:
     """Due recipes, auto-canceling conditional ones whose tracked open loop already closed.
 
-    `continuity` is an explicit test/caller override. Production reads both ledger directions:
-    "if Sarah hasn't replied" tracks waiting_on_them, which the due-commitment view omits on
-    purpose.
+    One rule per kind of condition:
+    - an ordinary anchored reminder (`schedule_wakeup.py create --anchor-key`) fires while its
+      loop is open and cancels once that loop is closed, parked, snoozed or gone, exactly as it
+      always has; a loop whose content provenance is proved must also pass the protected check;
+    - an owner-bound condition (`condition_binding`, from the owner reminder tool) fires only
+      while its exact proved loop is active under current grants, cancels only once that loop is
+      terminal, and otherwise waits.
+    The ledger read is scoped to the due anchors and tolerant: one unreadable file never holds
+    the other reminders, it only stops an absence from counting as "gone". An unavailable ledger
+    holds every anchored reminder for the next tick; it never guesses that a condition passed.
+    `continuity` is an explicit test/caller override: the ledger rows themselves.
     """
     try:
         import schedule_wakeup  # noqa: PLC0415
-        if continuity is None:
-            open_anchors = _all_open_anchor_keys()
-        else:
-            open_anchors = {_s(item.get("anchor_key")) for item in
-                            (continuity if isinstance(continuity, list)
-                             else _arr(continuity, "items"))
-                            if isinstance(item, dict) and _s(item.get("anchor_key"))}
+        from delivery_effects import loop_identity  # noqa: PLC0415
+        from ledger_provenance import classify_ledger_sources  # noqa: PLC0415
+        from source_context import allowed  # noqa: PLC0415
+        due = [row for row in schedule_wakeup.due(now_local)
+               if not schedule_wakeup.owner_timer(row)]
+        anchors = {_s(item.get("anchor_key")) for item in due} - {""}
+        rows, complete = [], True
+        if anchors:
+            try:
+                if continuity is None:
+                    from protected_ledger_io import load_protected_scope  # noqa: PLC0415
+                    rows, complete = load_protected_scope(os.environ.get("SOTTO_DATA", "/data"), anchors)
+                else:
+                    rows = [row for row in (continuity if isinstance(continuity, list)
+                                            else _arr(continuity, "items")) if isinstance(row, dict)]
+            except (OSError, ValueError, RuntimeError):
+                rows = None
+
+        def proved(row):
+            try:
+                return row.get("content_provenance") is not None and bool(classify_ledger_sources(row))
+            except (ValueError, TypeError, KeyError):
+                return False
+
         out = []
-        for item in schedule_wakeup.due(now_local):
+        for item in due:
             anchor = _s(item.get("anchor_key"))
-            if anchor and open_anchors is None:
-                continue  # ledger unavailable: retry later; never guess that the condition passed
-            if anchor and anchor not in open_anchors:
+            if not anchor:
+                out.append(item)
+                continue
+            if rows is None:
+                continue
+            selected = [row for row in rows if row.get("anchor_key") == anchor]
+            binding = item.get("condition_binding")
+            try:
+                if binding is not None:
+                    if len(selected) != 1:
+                        continue          # a proved condition never reads "missing" as closed
+                    state = schedule_wakeup.conditional_current_state(binding, now=now_local, rows=selected)[0]
+                elif any(proved(row) for row in selected):
+                    if len(selected) != 1:
+                        continue
+                    exact = {"anchor_key": anchor, "loop_identity": loop_identity(selected[0]), "sources": []}
+                    state = schedule_wakeup.conditional_loop(exact, now=now_local, permitted=allowed,
+                                                             rows=selected)[0]
+                elif not selected and not complete:
+                    continue              # an unread file may hold this loop: never cancel on it
+                else:
+                    state = "active" if anchor in _open_anchor_keys(selected, now_local) else "terminal"
+            except (ValueError, OSError, RuntimeError, TypeError):
+                continue
+            if state == "terminal":
                 schedule_wakeup.transition(item["id"], "canceled")
-            else:
+            elif state == "active":
                 out.append(item)
         return out
     except Exception:  # noqa: BLE001
@@ -610,7 +568,7 @@ def _birthday_importance(local, now):
 
 
 def scan(calendar, continuity, local, user_email, now_local,
-         prepped_occurrences=None, brief_recent: bool = False,
+         prepped_occurrences=None, brief_recent: bool = False, prep_location_updates=None,
          chase_candidates=None, brief_today: bool = False, handoff_candidates=None,
          brief_named=None, intentions=None, handoff_allowed: bool = False,
          birthday_importance=None) -> dict:
@@ -650,7 +608,7 @@ def scan(calendar, continuity, local, user_email, now_local,
             loaded.append(conversation_snapshot())
         return loaded[0]
 
-    for e in meeting_events(events):
+    for e in meeting_events(events, user_email):
         if (not isinstance(e, dict) or _s(e.get("my_response")).lower() == "declined"
                 or _s(e.get("status")).lower() == "cancelled"):
             continue                  # a meeting you declined is not a room you're walking into
@@ -665,15 +623,20 @@ def scan(calendar, continuity, local, user_email, now_local,
         ext = work_attendees(e, user_email)
         if not ext:
             continue  # internal/solo meeting — no prep nudge
+        update = delivery_effects.prep_location_nudge(e, st.isoformat(), prep_location_updates)
+        if update:
+            nudges.append(update)
+            continue
         # Research is reusable input, not evidence that anything reached the user. Suppress only
         # this exact occurrence after its offer or full prep is provider-accepted.
         occurrence = delivery_effects.meeting_occurrence(_s(e.get('id')), st.isoformat())
-        if occurrence and occurrence in set(prepped_occurrences or ()):
+        if any(delivery_effects.meeting_occurrence(str(event_id), st.isoformat()) in set(prepped_occurrences or ())
+               for event_id in [e.get('id'), *(e.get('_calendar_copy_ids') or [])] if event_id):
             continue
         # The nudge CARRIES the prep instead of asking whether to do it: who they are (the graph's
         # own title/company for the first external attendee) and the one open loop with them, if
         # any. Two lines a chief of staff would say at the door; the deeper prep is behind a yes.
-        name = _prep_name(ext[0], local, now_local, snapshot)
+        name, name_source = PrepIdentityResolver(local, snapshot).resolve(ext[0], now_local)
         attendee = {**ext[0], "displayName": name}
         who, loop = _prep_lines(attendee, continuity)
         nudges.append({"kind": "meeting_prep", "key": f"mtg:{occurrence}",
@@ -683,7 +646,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "valid_until": st.isoformat(),
                        "title": _s(e.get("summary")) or "Meeting",
                        "person": attendee["displayName"],
-                       "name_source": attendee.get('_name_source', ''),
+                       "name_source": name_source,
                        "identifier": _s(ext[0].get("email")).lower().strip(),
                        # Preserve provider-supplied exact linkage. The composer treats absent
                        # linkage honestly: attendee mail remains recent background, never proof of
@@ -715,6 +678,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                            "detail": ("overdue" if dl < today else "due today"),
                            "channel": _s(c.get("channel")), "identifier": _s(c.get("identifier")),
                            "anchor_key": _s(c.get('anchor_key')),
+                       "loop_version": c.get("loop_version"), "loop_identity": c.get("loop_identity"),
                            "thread_id": _s(c.get("thread_id"))})
 
     # 2b) The chase — something you're WAITING ON that the ledger marked chase-pending today. At
@@ -740,6 +704,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "title": _s(c.get("title")) or "Still waiting on this",
                        "person": _s(c.get("name")),
                        "anchor_key": _s(c.get("anchor_key")),
+                       "loop_version": c.get("loop_version"), "loop_identity": c.get("loop_identity"),
                        "detail": _s(c.get("detail")),
                        "channel": _s(c.get("channel")), "identifier": _s(c.get("identifier")),
                        "thread_id": _s(c.get("thread_id"))})
@@ -797,6 +762,7 @@ def scan(calendar, continuity, local, user_email, now_local,
                        "title": _s(h.get("title")) or "Still no answer",
                        "person": _s(h.get("name")), "detail": _s(h.get("question")),
                        "anchor_key": _s(h.get("anchor_key")),
+                       "loop_version": h.get("loop_version"), "loop_identity": h.get("loop_identity"),
                        "channel": _s(h.get("channel")),
                        "identifier": _s(h.get("identifier"))})
     return {"nudges": nudges}
@@ -830,9 +796,10 @@ def main():
 
     # The 2h window mutes birthday/handoff repeats after a brief already covered them.
     brief_recent = _recent_brief_delivered(now_local)
+    prep_location_updates, delivered = delivery_effects.prep_location_evidence(calendar, date, now_local.timestamp())
     due = scan(calendar, continuity, local, user_email, now_local,
                birthday_importance=_birthday_importance(local, now_local),
-               prepped_occurrences=_delivered_prep_occurrences(date), brief_recent=brief_recent,
+               prepped_occurrences=delivered, prep_location_updates=prep_location_updates, brief_recent=brief_recent,
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
                handoff_candidates=_handoff_candidates(), handoff_allowed=not brief_recent,

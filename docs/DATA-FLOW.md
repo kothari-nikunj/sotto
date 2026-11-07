@@ -1,7 +1,6 @@
 # Where your data goes
 
-Bounded model work adds opaque attempt/usage records in `events/model-work.sqlite3` (90-day pruning
-on use) and private validated output in `events/notification-artifacts/` and
+Bounded model work adds opaque attempt/usage records in `events/model-work.sqlite3` (**90 days**, pruned on use) and private validated output in `events/notification-artifacts/` and
 `events/research-artifacts/` and `events/triage-artifacts/` (seven days; also erased by `forget.py --caches`). No prompts enter the
 usage ledger. The model proxy stores only attribution IDs, component sizes and usage counts.
 See [the accounting and retention contract](BOUNDED-MODEL-WORK.md).
@@ -12,17 +11,18 @@ that owes you a precise answer about where it all ends up, so this page names **
 **every** file it writes, and **how long each one stays**. If something here reads worse than you
 expected, that is the point of writing it down.
 
-The one-line version: **there is no Sotto-operated server, and your data still leaves your machine
-— it goes to the model provider and the host that *you* chose.** "Self-hosted" removes a third party
-of ours from the path. It does not mean local.
+In a self-host install, your data leaves your machine for the host and model provider you choose.
+Self-hosted does not mean local. Source authority and canonical memory remain in the tenant runtime.
 
-## The three parties in a normal install
+
+## Who receives data
 
 | Who | What they see | Why |
 |---|---|---|
 | **Your host** (Railway, or your own Mac in local mode) | Everything, at rest, on the volume you own | It runs the container and holds `$SOTTO_DATA` |
-| **Your model provider** (Gemini — the brief pipeline is Gemini-only today, see [MODELS.md](MODELS.md); the chat layer is switchable) | The **text of the brief prompt** — message bodies, email bodies, calendar events, notes, and the facts already in your graph | A brief is one model call, and the material is the prompt |
-| **Google** (if you connect Gmail/Calendar) | Nothing new — it is already their data | OAuth read scopes |
+| **Your model provider** (Gemini for briefs; chat model selected by runtime configuration) | The text supplied to each model stage, including permitted source excerpts and canonical facts | Brief composition and any enabled critic/revision make model calls; the selected chat engine makes its own calls |
+| **An assistant you connect through Sotto MCP** | Private source excerpts and saved facts returned by its explicitly granted read tools | You opt in per client. The assistant/model provider can process returned context under its own policies; Sotto does not run its agent for these reads. |
+| **Google** (if connected) | Permitted Gmail, Calendar and Contacts queries; reviewed and confirmed sends or updates | Google API access under the granted scopes |
 
 Optional, only if you enable them: your **search provider** (Exa / Parallel / Gemini grounding) sees
 the *names and companies* of people you are meeting — and, when you ask Sotto to read a specific
@@ -41,9 +41,21 @@ the timestamp, per-page time) in their DocSend analytics — which is why deck-r
 you ask in chat and refuses to run unattended (a deck already read answers from its saved copy under
 `decks/` — a re-ask, or a brief mentioning it, never logs a second view).
 
-**Nothing goes anywhere else.** There is no telemetry, no analytics, no crash reporting, no update
-ping that carries content. The only outbound call Sotto makes on its own behalf is a daily
-unauthenticated GET of a `VERSION` file on GitHub to see whether a newer release exists.
+### Optional assistant connections
+
+`/client-mcp` reuses the receiver's readers with separate expiring native or hosted OAuth grants.
+Each call needs both a granted tool and current source permission, checked again before returning
+content. A source marked available does not prove it has been read. Mac sources need an online,
+permitted Bridge; hosted clients reach it through the existing outbound relay.
+
+These grants are read-only. They cannot send messages, change tasks or start Sotto's agent.
+Adding a tool to the server does not add it to existing grants. Disconnecting prevents future
+reads; it cannot recall context already returned to another assistant. The dashboard exposes a
+bounded, content-free recent-call log for diagnosis, not a complete source-access archive.
+
+**Update checks carry no source content.** Sotto fetches a public `VERSION` file on GitHub
+daily to check for a newer release. This is separate from the provider calls and authorized
+client reads described above.
 
 ## What the model provider actually receives
 
@@ -64,8 +76,8 @@ It is sent under your API key, to your provider, and is subject to that provider
 training terms — not ours. Check them. For Google AI Studio keys in particular, free-tier and paid
 terms differ on whether prompts may be used to improve their models.
 
-**Local mode does not change this.** `LOCAL-SETUP.md` removes the cloud *host*; the model call is
-identical. Fully local would need a local model, which Sotto does not ship — see the last section.
+**There is no local-only mode.** Every model call goes to your configured provider; fully local
+would need a local model, which Sotto does not ship — see the last section.
 
 ## Everything written to disk, and for how long
 
@@ -77,13 +89,15 @@ Two things enforce it. `forget.py` (below) deletes a named category **when you a
 sweep at 3:30 AM local** — `runtime/trigger-receiver/retention.py`, fired from the receiver's own
 clock — ages out the exhaust **without being asked**, which is why the "Retention" column below is a
 number and not a hope. The sweep's table is the single source for that column; anything it does not
-name is either aged by its own writer (said so in the row) or never auto-deleted at all.
+name is either aged by its own writer (said so in the row) or never auto-deleted at all. The sweep skips symbolic links below
+the configured data mount, including lock sidecars. It truncates only regular logs with one hard link.
 
 | File | Contains | Retention |
 |---|---|---|
 | `knowledge/last_local_snapshot.json` | The latest consent-filtered Bridge payload, with per-source observation times; a partial read may retain still-usable older rows | **Reconciled each brief, never auto-deleted.** The 24h TTL stops old source content being reused, not stored. Contacts retain the existing identity carry-forward exception for thin live reads. Disabled fields are excluded on read and the next save. Delete with `forget.py --snapshot`. |
 | `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted, and an archived fact that is observed again is re-learned in place; only a fact you archived yourself stays archived |
 | `knowledge/x_link_suggestions.json` | The X resolver's own notes about people the graph has no file for: metadata-only identity candidates too weak (or too conflicted) to link, and the negative results that stop tomorrow's brief re-asking X the same question | **Never auto-deleted** — bounded to 100 suggestions, and negatives self-prune at 90 days on each write. A negative never creates a person file; confirmation UI is a later phase |
+| `knowledge/source-retractions.json` | Legacy experimental hashes, not trustworthy deletion proof | **Inert; no active reader or writer.** Existing files remain available for inspection, but do not project fact withdrawals or block learning. Existing archived facts are not automatically restored. B1 must define migration before historical retraction returns. |
 | `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
 | `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
@@ -92,19 +106,26 @@ name is either aged by its own writer (said so in the row) or never auto-deleted
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines, **and lines older than 90 days are dropped** |
 | `events/delivery.jsonl` | Run and transport outcomes, including accepted, failed, expired and superseded results; acceptance is not proof of reading | **90 days** |
 | `events/sends.jsonl` | One metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` — the hash of the exact bytes that left, never the bytes | **180 days** — the authorization trail, kept twice as long on purpose |
+| Node chat `node-state/operations.sqlite` | Durable inbound events, prepared replies, provider dispatch attempts and external-action results | The receiver's existing 3:30 AM sweep asks the Node runtime to prune terminal delivery proof after **90 days** and terminal action proof after **180 days**. Pending events/actions, unknown outcomes and accepted replies covering pending events remain. Gallery receipts remain until a receiver acknowledgement protocol exists; no age-only sweep deletes them. This operational cleanup does not purge Mastra chat transcripts, for which no automatic lifetime is set. |
+| Sotto incoming media descriptors in `operations.sqlite` | Bounded provider IDs/content paths and metadata attached to the admitted owner message; no fetch closures or download credentials | These follow inbound-event retention. Downloaded bytes stay in the active run only. Restart re-reads the exact provider reference or reports unavailable content; a prepared reply never requires rehydration. |
+| Node chat `node-state/agent-memory.db` | Mastra conversational context, separate from canonical knowledge and operational recovery | The receiver owns session rotation. A changed or unverifiable source-permission revision clears all conversation threads before reuse; a change during generation also clears them and withholds the result. No additional age-based transcript lifetime is imposed. |
+| Sotto chat `operations.sqlite` activation tables | Exact Photon cloud tenant/project/owner/account/line/thread manifest and one pending owner-admission event ID; no credentials | The pending obligation pins its admitted event until the receiver writes its existing activation receipt and ACKs. Acknowledgement releases that retention pin; the last event ID remains a replay tombstone. A new owner DM after ACK can create repair evidence. This metadata never grants source access. |
+| Sotto chat `agent-memory.db.source-authority.json` | The revision against which transcript deletion completed; **not a permission grant** | Replaced atomically only after required deletion succeeds. Missing, unsafe or invalid metadata forces deletion before history can be reused. No source content or credentials are stored here. |
+| Node chat `node-state/chat-sdk.sqlite` | Adapter cache, subscriptions, locks, lists and queues | The existing receiver retention call removes expired entries using their original SDK expiry. Permanent entries and subscriptions remain. This database never proves operational delivery or provider acknowledgement. |
 | `events/drafts.jsonl` | Every draft Sotto offered you, **including its text** | **30 days** |
-| `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. The effects' per-source addressing leaves the moment they settle — applied **or** quarantined — so no row holds a handle, address or thread id it can no longer use. Closed metadata lasts 7 days after terminal delivery and effects resolution; unfinished acceptance or invalidation effects remain retryable until finalized. |
+| `events/owner-gmail-drafts.json` | Gmail drafts and replies you reviewed in chat, **including their text**, plus the receipts that keep an approval single-use | Words normally **30 days from admission**; a committed typed result with unfinished local learning retains its bounded words until exact inspection repairs it, and never past **60 days**. Compacted receipts and consumed-approval tombstones retain ids and hashes indefinitely so replay cannot repeat a Gmail effect. The ledger has no total record-count bound, and each rewrite grows with the number of retained receipts. |
+| `runtime/owner-routines.json` | Routines you approved in chat (name, schedule, prompt) and their single-use approval receipts | Until you cancel them; never swept — it is live configuration, and only your approved changes (or an owner-route change, which retires old-route routines) write it |
+| `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. The effects' per-source addressing leaves the moment they settle — applied **or** quarantined — so no row holds a handle, address or thread id it can no longer use. Closed metadata lasts 7 days after terminal delivery and effects resolution; unfinished acceptance or invalidation effects remain retryable until finalized. A terminal row whose producer has not yet reconciled it (an owner reminder whose send is unknown, in flight or not yet accepted, or whose reconciliation failed) is kept past 7 days until reconciliation succeeds, one row per reminder. |
 | `events/delivery-effects-<run>.json` | Merged source/Calendar eligibility, original cutoff and delivery-dependent effects for one work run | Removed after the completed result reaches the outbox; retryable failures retain it. Abandoned staged files expire after **7 days**. |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
 | `style.json` | Verbatim samples of things **you** wrote, plus hash-only markers for the drafts already confirmed | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, the drafts-you-shipped bucket at its newest 20 per register, and the confirmed-action markers pruned on every extract to the drafts still in `events/drafts.jsonl`, so they inherit that ledger's 30-day bound); the sweep exempts it on that strength |
 | `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
-| `hermes/sessions/` | Hermes' own chat transcripts — one archived per day by the nightly session archive (which keeps transcripts; `/resume` reopens them), plus one per deploy | **Known gap:** Hermes' state is exempt from the sweep, and whether Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day |
 | `cache/brief-granola.json` | Gathered meeting notes plus their observation time | **1 day**; older than 30 minutes is disclosed when reused, and data older than 24 hours is not reused |
 | `events/work.sqlite3` (+ SQLite journal or WAL/SHM) | Accepted jobs, leases and recoverable completed results | Raw payload/results removed on terminal transition; metadata and input ownership aliases expire after **7 days** |
 | `events/work-inputs/brief-*/` | Resumable brief inputs, artifacts and completion manifests | Raw current/prepared inputs removed after ancillary success; remaining staged files expire after **7 days** |
 | `config/source-state.json` | Bridge source status and observation time, without message bodies | Bounded current state; never swept |
-| `.sotto-volume.json` · `.sotto-runtime.lock` · `.sotto-recovery-hold.json` · `config/model-lease.json` | Adapter-owned volume identity, writer lock, restore hold and model lease metadata | Adapter lifecycle state; never swept |
+| `.sotto-volume.json` · `.sotto-runtime.lock` · `.sotto-epoch.json` · `config/model-lease.json` | Adapter-owned volume identity, writer lock, replacement epoch and model lease metadata | Adapter lifecycle state; never swept |
 | `cache/research_<date>.json` | Attendee research render cache | 7 days, pruned by the research run |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect; never swept |
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |
@@ -129,6 +150,22 @@ so a future mistake in the table still cannot reach your memory. A missed sweep 
 that was down — costs nothing: every rule is an age, so the next day's sweep removes exactly what
 the missed one would have.
 
+
+### Retention rationale
+
+The lifetimes are in the table above. Their reasons are retained here.
+
+| Family | Why |
+|---|---|
+| Delivery receipts, triage verdicts, dashboard writes | "did it land?" and "why wasn't I nudged?" are questions about last week, not last year |
+| Drafts Sotto offered you | matched to what you sent within a day; a month is learning, longer would be an archive of things you didn't say |
+| Delivered briefs, their per-day markers, and each one's Learn receipt (`learned.json`) | the same clock as the snapshot each was built from |
+| Staged payloads and a crashed run's leftovers | read by the run they were staged for; a week collects the ones whose run died |
+| The nudge-dedup stamps | only today's is ever read |
+| The brief log | truncated in place, because a running brief holds it open |
+
+The style profile is self-capped by its writer; the drafts-you-shipped bucket keeps its newest 20 per register. Each preferences owner-command receipt map keeps its newest 100 settled receipts and never drops one still in flight, so retries can retain their original outcome. These writer limits are separate from the daily sweep.
+
 ## Deleting it — `forget.py`
 
 Deleting the whole `$SOTTO_DATA` directory works and leaves Sotto with no memory at all. When you
@@ -142,9 +179,9 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 | Verb | Removes |
 |---|---|
 | `--snapshot` | `knowledge/last_local_snapshot.json`, staged `briefs/*.payload.json`, and resumable `events/work-inputs/brief-*` JSON inputs and artifacts |
-| `--caches` | `cache/research_*.json`, `cache/calendar_today.json`, `cache/visual-briefs/*/*` — rebuilt when needed |
+| `--caches` | `cache/research_*.json`, `events/{notification,triage,research}-artifacts/*.json`, `cache/calendar_today.json`, `cache/visual-briefs/*/*` — rebuilt when needed |
 | `--logs` | truncates `logs/compose_brief.log` (truncated, not unlinked: a running process holds it open) |
-| `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl` |
+| `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl`, `events/learning-diagnostics/*.json` and their `*.json.lock` files |
 | `--all` | every category above |
 
 **It never touches `knowledge/people/`, `knowledge/companies/` or `knowledge/continuity/`.** That is
@@ -169,19 +206,18 @@ stating plainly:
    name resolution doesn't collapse. That is deliberate — and it means disabling Contacts leaves the
    previously captured ones on disk until the file is deleted.
 
-## What we do not do
+## Storage and action boundaries
 
-- No Sotto server, account, or hosted component of any kind.
-- No telemetry or analytics, of any kind, ever.
-- Sotto never sends a message on your behalf. Every outbound message is a draft behind a tap.
+- Operational usage and delivery receipts are stored as described above; model prompts are not stored in the proxy ledger.
+- Automated briefs and approved notifications use the outbox. External actions require the owner approval enforced by their existing tool and delivery boundaries.
 - No credential is written to the volume by the dashboard. Provider keys live in your host's
   environment.
 
 ## Known gaps, stated rather than hidden
 
-- **The Bridge is distributed as a signed binary and its source is not in this repo.** It is the
-  component with Full Disk Access. You are trusting a binary you cannot read. If that is not
-  acceptable to you, that is a reasonable place to stop.
+- **The Mac Bridge is distributed as a signed app.** It is the component that requests Full
+  Disk Access. Its source is not part of the public distribution, so the installed app and its
+  requested permissions are the relevant trust boundary.
 - **No local-model mode.** See below.
 - **The setup cookie's value is the setup code itself** — no expiry, no logout; rotating the
   code is the revocation story. A deliberate simplicity trade-off (owner, Aug 2026) on a

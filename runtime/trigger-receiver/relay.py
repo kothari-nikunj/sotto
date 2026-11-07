@@ -4,17 +4,17 @@ Reverse-MCP relay — the tunnel-free transport.
 
 Instead of the cloud reaching IN to the Mac (Cloudflare tunnel → 530s, inbound exposure), the Mac
 dials OUT to this relay (which runs beside the agent on the always-on host). The relay presents a
-LOCALHOST-stable MCP server to Hermes (`sotto-local` points at it), and forwards tool calls down the
+LOCALHOST-stable MCP server to the chat runtime (its `bridge.url`), and forwards tool calls down the
 held-open outbound link to whichever Bridge is connected.
 
 Flow:
-  - Hermes → POST /mcp  (JSON-RPC)            → Relay.mcp_call(...)
+  - runtime → POST /mcp  (JSON-RPC)           → Relay.mcp_call(...)
   - Bridge → GET  /bridge/poll  (long-poll)   → Relay.poll(...)        delivers the next tool call
-  - Bridge → POST /bridge/respond             → Relay.respond(...)     returns the result to Hermes
+  - Bridge → POST /bridge/respond             → Relay.respond(...)     returns the result to the runtime
 
 Key property: `initialize`, `ping`, and `tools/list` are answered by the relay itself (ping is the
 MCP keepalive — the relay IS the server being probed, so it must answer even with the Mac away;
-tools/list from a cache primed on the first Bridge connection), so Hermes ALWAYS sees a healthy MCP
+tools/list from a cache primed on the first Bridge connection), so the runtime ALWAYS sees a healthy MCP
 server — even while the Mac is asleep. Only `tools/call` needs the Bridge; if it's offline, the call returns a clear error the
 skills already handle ("Bridge offline"), and it reconnects automatically when the Mac comes back.
 No tunnel, no domain, no inbound port exposing chat.db. Stdlib only.
@@ -26,6 +26,8 @@ from `tools/list`, and `validate_response` withholds a result whose content isn'
 from __future__ import annotations
 
 import json
+import hashlib
+from collections import OrderedDict
 import queue
 import secrets
 import sys
@@ -34,10 +36,18 @@ import time
 from datetime import datetime, timezone
 
 # Mirror the real Bridge's identity (sotto-bridge/core/src/mcp.rs: PROTOCOL_VERSION + server_info),
-# so Hermes sees ONE consistent server whether initialize is answered here or the Mac is connected.
+# so the runtime sees ONE consistent server whether initialize is answered here or the Mac is connected.
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sotto-bridge", "version": "1.0"}
 BRIDGE_REQUEST_STARTED_AT = "_bridge_request_started_at"
+# Optional Bridge result fields this receiver accepts, stamped on every forwarded request's
+# `params._meta`. A Bridge sends such a field only when it is listed here (mcp.rs ACCEPTS_META), so
+# a newer Bridge still reads cleanly into an older receiver that would reject the unknown key.
+BRIDGE_ACCEPTS_META = "sotto/accepts"
+BRIDGE_ACCEPTS = ("source_coverage", "source_coverage_v2", "search_metadata_v1")
+# A connected Bridge re-lists its tools in the background at most this often (send policy and
+# Bridge upgrades change the listing without a reconnect).
+TOOLS_RELIST_SECONDS = 300.0
 # Minimal fallback tool list used only before the Bridge has ever connected (no cache yet).
 _FALLBACK_TOOLS = [
     {"name": "read_local", "description": "Local Mac context (messages/calls/contacts/…).",
@@ -62,12 +72,15 @@ def _ok(rid, result):
 
 
 class Relay:
-    """Thread-safe reverse-RPC bridge between Hermes (/mcp) and the Bridge (poll/respond)."""
+    """Thread-safe reverse-RPC bridge between the chat runtime (/mcp) and the Bridge (poll/respond)."""
 
     def __init__(self, bridge_timeout: float = 40.0):
         self._q: queue.Queue = queue.Queue()      # tool-call requests awaiting the Bridge's poll
         self._waiters: dict = {}                    # internal id -> {event, value, external_id}
         self._lock = threading.Lock()
+        # Content-free receipts cover a lost HTTP acknowledgement; bounded in time and count.
+        self._completed = OrderedDict()
+
         # monotonic time of the last Bridge poll/respond. -inf, NOT 0.0: monotonic() is host uptime
         # on Linux, so a 0.0 start read as "connected" for the first bridge_timeout seconds after boot.
         self._last_poll = float("-inf")
@@ -82,17 +95,41 @@ class Relay:
         self.validate_response = lambda request, result: True
         self.filter_tools = lambda result: result   # tools/list: don't advertise a denied tool
         self._tools_cache = None                    # last good tools/list result (primed on connect)
+        self._tools_listed_at = float("-inf")       # monotonic time the Bridge last listed that catalog
+        self._tools_refresh = None                  # the one in-flight background re-list, if any
 
     # ---- status -----------------------------------------------------------
     def bridge_connected(self) -> bool:
         return (time.monotonic() - self._last_poll) < self._bridge_timeout
 
-    def _touch(self):
-        self._last_poll = time.monotonic()
+    def _touch(self, *, polling: bool = True):
+        now = time.monotonic()
+        if polling and now - self._last_poll >= self._bridge_timeout:
+            # A poll after a gap is a reconnect (wake or Bridge upgrade): keep the last schemas
+            # but mark them stale so the next listing re-lists in the background. A respond after
+            # a long tool call is not a reconnect, so only poll() decides this.
+            self._tools_listed_at = float("-inf")
+        self._last_poll = now
 
-    # ---- Hermes side (/mcp) ----------------------------------------------
+    def _store_tools(self, catalog):
+        self._tools_cache = catalog
+        self._tools_listed_at = time.monotonic()
+
+    def _refresh_tools(self, req: dict):
+        """Re-list in the background, at most one at a time; a failure keeps the last catalog."""
+        with self._lock:
+            if self._tools_refresh is not None and self._tools_refresh.is_alive():
+                return
+            def run():
+                resp = self._forward({**req, "id": f"tools-refresh-{secrets.token_hex(4)}"}, timeout=20.0)
+                if resp and "result" in resp:
+                    self._store_tools(resp["result"])
+            self._tools_refresh = threading.Thread(target=run, name="relay-tools-refresh", daemon=True)
+            self._tools_refresh.start()
+
+    # ---- runtime side (/mcp) ---------------------------------------------
     def mcp_call(self, req: dict, timeout: float = 90.0):
-        """Handle one JSON-RPC message from Hermes. Returns a response dict, or None for a
+        """Handle one JSON-RPC message from the chat runtime. Returns a response dict, or None for a
         notification (no reply expected)."""
         method = req.get("method")
         rid = req.get("id")
@@ -102,7 +139,7 @@ class Relay:
         if method in ("notifications/initialized", "notifications/cancelled") or rid is None:
             return None
         if method == "ping":
-            # The MCP keepalive. Hermes probes the server every few minutes; the relay IS that
+            # The MCP keepalive. A client probes the server every few minutes; the relay IS that
             # server and it's alive, so answer locally (the real Bridge does the same in mcp.rs).
             # Forwarding — or the old fall-through to the offline error — made every probe while
             # the Mac slept log "keepalive failed, triggering reconnect: Sotto Bridge offline"
@@ -112,10 +149,21 @@ class Relay:
             # Answer from cache so the toolset stays visible even when the Mac is asleep. The
             # cache keeps the Bridge's raw listing; filtering happens on the way out, so a
             # consent change is reflected without waiting for the Mac to re-list.
+            # A primed schema catalog is process-local, not source or send authority.
+            # Re-filter it on every request; do not wait on the Mac again for warm discovery.
+            # A connected Bridge whose catalog is stale (reconnect) or older than
+            # TOOLS_RELIST_SECONDS re-lists in the background, so runtime changes such as a
+            # newly valid send policy appear without a wait.
+            catalog = self._tools_cache
+            if catalog is not None:
+                if (self.bridge_connected()
+                        and time.monotonic() - self._tools_listed_at >= TOOLS_RELIST_SECONDS):
+                    self._refresh_tools(req)
+                return _ok(rid, self.filter_tools(catalog))
             if self.bridge_connected():
                 resp = self._forward(req, timeout=20.0)
                 if resp and "result" in resp:
-                    self._tools_cache = resp["result"]
+                    self._store_tools(resp["result"])
                     return _ok(rid, self.filter_tools(resp["result"]))
             return _ok(rid, self.filter_tools(self._tools_cache or {"tools": _FALLBACK_TOOLS}))
         if method == "tools/call":
@@ -127,7 +175,7 @@ class Relay:
             if not self.bridge_connected():
                 name = (req.get("params") or {}).get("name")
                 if name == "health":
-                    # Answer the keepalive `health` probe LOCALLY when the Mac is offline. Hermes pings
+                    # Answer the keepalive `health` probe LOCALLY when the Mac is offline. A client pings
                     # health to keep the MCP server alive; forwarding it to an absent Bridge fails and
                     # storms reconnects every night the Mac sleeps. Returning a SUCCESSFUL result that
                     # truthfully says connected:false keeps the server healthy AND lets the agent report
@@ -157,10 +205,21 @@ class Relay:
         forwarded = {key: value for key, value in req.items()
                      if key != BRIDGE_REQUEST_STARTED_AT}
         forwarded["id"] = internal_id
+        params = forwarded.get("params")
+        if params is None or isinstance(params, dict):
+            meta = (params or {}).get("_meta")
+            accepts = list(BRIDGE_ACCEPTS)
+            if ((params or {}).get("name") == "get_note" and isinstance(meta, dict)
+                    and isinstance(meta.get(BRIDGE_ACCEPTS_META), list)
+                    and "note_page_v1" in meta[BRIDGE_ACCEPTS_META]):
+                accepts.append("note_page_v1")
+            forwarded["params"] = {**(params or {}), "_meta": {
+                **(meta if isinstance(meta, dict) else {}), BRIDGE_ACCEPTS_META: accepts}}
         ev = threading.Event()
         with self._lock:
             self._waiters[internal_id] = {"event": ev, "value": None,
-                                          "external_id": external_id, "request": request, "deadline": time.monotonic() + timeout}
+                                          "external_id": external_id, "request": request, "deadline": time.monotonic() + timeout,
+                                          "response_lock": threading.Lock()}
         self._q.put((time.monotonic() + timeout, forwarded))
         if ev.wait(timeout):
             with self._lock:
@@ -174,7 +233,7 @@ class Relay:
     def poll(self, timeout: float = 25.0):
         """Long-poll: block up to `timeout` for the next request to hand the Bridge. Returns the
         request dict, or None (→ the Bridge re-polls). Marks the Bridge alive."""
-        self._touch()
+        self._touch(polling=True)
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -190,7 +249,7 @@ class Relay:
                     self.cancel(req, 'Bridge permission changed before execution.')
                     continue
                 return req
-            # The Hermes caller has already timed out. Never execute its stale tool call when the
+            # The runtime caller has already timed out. Never execute its stale tool call when the
             # Mac reconnects; continue within the original long-poll budget for a live request.
 
     def cancel(self, request, reason):
@@ -204,32 +263,46 @@ class Relay:
                 slot['event'].set()
 
     def respond(self, resp: dict):
-        """Deliver the Bridge's result for a request id back to the waiting Hermes call."""
-        self._touch()
-        rid = resp.get("id")
+        """Accept once; acknowledge identical retries without repeating observation side effects."""
+        if not isinstance(resp, dict) or not isinstance(resp.get('id'), str):
+            return False
+        self._touch(polling=False)
+        rid = resp['id']
+        # Hash before validation hooks enrich the result. Retain no response content in receipts.
+        digest = hashlib.sha256(json.dumps(resp, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         with self._lock:
+            now = time.monotonic()
+            for key, (_, expires) in list(self._completed.items()):
+                if expires <= now:
+                    del self._completed[key]
+            if rid in self._completed:
+                return self._completed[rid][0] == digest
             slot = self._waiters.get(rid)
-            request = slot['request'] if slot else None
         if slot is None:
             return False
-        # Consent validation reads capability state and the ingress rules; observation writes a
-        # ledger under a file lock. Neither may run under `_lock`: every forward, poll hand-off
-        # and unrelated respond waits on it, and one slow hook stalled a different tool call by
-        # its whole duration (review, Sep 11).
-        result = resp.get('result') or {}
-        if self.validate_response(request, result) is not True:
-            return False
-        try:
-            self.on_response(request, result)
-        except Exception as error:
-            # Observation is best-effort. The authenticated Bridge response already exists;
-            # never turn a bookkeeping failure into a caller timeout and a repeated tool call.
-            print(f"[sotto] relay response observation failed: {type(error).__name__}",
-                  file=sys.stderr, flush=True)
-        with self._lock:
-            slot = self._waiters.get(rid)
-            if slot is None:
-                return False   # the caller gave up while the hooks ran; its result is nobody's
-            slot["value"] = {**resp, "id": slot["external_id"]}
-            slot["event"].set()
-            return True
+        # Serialize only this request. Slow hooks never hold the relay-wide lock.
+        with slot['response_lock']:
+            with self._lock:
+                if rid in self._completed:
+                    return self._completed[rid][0] == digest
+                if (self._waiters.get(rid) is not slot or slot['event'].is_set()
+                        or slot['deadline'] <= time.monotonic()):
+                    return False
+            request = slot['request']
+            result = resp.get('result') or {}
+            if self.validate_response(request, result) is not True:
+                return False
+            try:
+                self.on_response(request, result)
+            except Exception as error:
+                print(f"[sotto] relay response observation failed: {type(error).__name__}",
+                      file=sys.stderr, flush=True)
+            with self._lock:
+                if self._waiters.get(rid) is not slot or slot['event'].is_set():
+                    return False
+                slot['value'] = {**resp, 'id': slot['external_id']}
+                self._completed[rid] = (digest, time.monotonic() + 120)
+                while len(self._completed) > 256:
+                    self._completed.popitem(last=False)
+                slot['event'].set()
+                return True

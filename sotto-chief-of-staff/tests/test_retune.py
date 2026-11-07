@@ -111,7 +111,7 @@ def test_twice_chased_waiting_on_is_handed_to_the_retune_lane(tmp_path, monkeypa
           summary="the signed contract", chased_count=2, last_chased_at="2026-01-05")
     _loop(tmp_path, "k2", contact_name="Vendor", action_type="waiting_on", summary="a quote")
     out = {s["anchor_key"]: s for s in scan.scan()["stale_loops"]}
-    assert out["k1"]["suggestion"] == "chased twice — nudge again or drop"
+    assert out["k1"]["suggestion"] == "reminded you twice — draft a follow-up or drop"
     assert out["k1"]["chased_count"] == 2
     assert out["k2"]["suggestion"] == "nudge or drop" and out["k2"]["chased_count"] == 0
 
@@ -154,3 +154,93 @@ def test_chased_out_is_exposed_so_the_hand_off_can_bypass_the_tidy_up_threshold(
     _loop(tmp_path, "k2", contact_name="Vendor", action_type="waiting_on", chased_count=1)
     out = {s["anchor_key"]: s for s in scan.scan()["stale_loops"]}
     assert out["k1"]["chased_out"] is True and out["k2"]["chased_out"] is False
+
+
+def test_protected_permitted_scan_reuses_original_evidence_and_visibility(tmp_path, monkeypatch):
+    from ledger_provenance import digest_frontmatter
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE', '+00:00')
+    now = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+    rows = {
+        'source': {'action_type': 'waiting_on', 'chased_count': 2, 'created_at': '2026-10-01'},
+        'mixed': {'created_at': '2026-10-01'},
+        'owner': {'created_at': '2026-10-02'},
+        'fresh': {'created_at': '2026-10-06', 'times_surfaced': 100},
+        'delivered': {'created_at': '2026-10-06', 'delivery_surface': {'schema': 1, 'delivery_keys': ['one', 'two', 'three']}},
+        'overdue': {'created_at': '2026-10-06', 'deadline': '2026-10-05'},
+        'snoozed': {'created_at': '2026-10-01', 'snoozed_until': '2026-10-07'},
+        'parked': {'created_at': '2026-10-01', 'status': 'parked'},
+        'terminal': {'created_at': '2026-10-01', 'status': 'resolved'},
+    }
+    directory = tmp_path / 'knowledge/continuity'
+    directory.mkdir(parents=True)
+    for key, fields in rows.items():
+        row = {'anchor_key': key, 'status': 'open', 'action_type': 'reply', 'contact_name': key,
+               'summary': 'Original evidence', **fields}
+        sources = ['calendar', 'gmail'] if key == 'mixed' else [] if key == 'owner' else ['gmail']
+        row.update(source='gmail' if sources else 'user_added', channel='email' if sources else 'manual',
+                   source_thread_id='' if sources else 'manual:' + key,
+                   source_refs=[{'sourceType': source, 'sourceId': key} for source in sources])
+        row['content_provenance'] = {'version': 1, 'kind': 'sources' if sources else 'owner',
+                                     'sources': sources, 'digest': digest_frontmatter(row)}
+        (directory / f'{key}.md').write_text('---\n' + yaml.safe_dump(row, sort_keys=False) + '---\n')
+    (tmp_path / 'preferences.json').write_text(json.dumps({'explicit': {'mute_people': ['Maya'], 'tone_notes': ['Brief.']}}))
+    before = {str(p): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    result = scan.scan_permitted_rows(str(tmp_path), ['gmail'], now=now)
+    assert result['coverage'] == 'currently_permitted_canonical_loops'
+    found = {r['anchor_key']: r for r in result['stale_loops']}
+    assert set(found) == {'source', 'owner', 'overdue', 'delivered'}
+    assert found['delivered']['times_surfaced'] == 3
+    assert found['delivered']['surface_count_provenance'] == 'accepted_delivery'
+    assert found['source']['chased_out'] and found['source']['suggestion'] == 'reminded you twice — draft a follow-up or drop'
+    assert found['overdue']['overdue']
+    assert result['current']['mute_people'] == ['Maya'] and result['current']['tone_notes'] == ['Brief.']
+    assert result['mute_suggestions'] == []
+    assert {r['anchor_key'] for r in scan.scan_permitted_rows(str(tmp_path), [], now=now)['stale_loops']} == {'owner'}
+    assert 'mixed' in {r['anchor_key'] for r in scan.scan_permitted_rows(str(tmp_path), ['gmail', 'calendar'], now=now)['stale_loops']}
+    assert {str(p): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file() and not p.name.endswith('.lock')} == before
+
+
+def test_unnamed_owner_tasks_have_same_honest_label_in_both_readers():
+    from ledger_provenance import digest_frontmatter
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    manual = {'anchor_key': 'thread:manual:label', 'channel': 'manual',
+              'source': 'user_added', 'source_thread_id': 'manual:label',
+              'contact_name': '', 'summary': 'Review packet', 'action_type': 'follow_up',
+              'status': 'open', 'created_at': '2026-10-01'}
+    named = {**manual, 'contact_name': 'Avery'}
+    sourced = {**manual, 'channel': 'gmail', 'source': 'gmail', 'source_thread_id': 'thread'}
+    unproved = dict(manual)
+    for row in (manual, named):
+        row['content_provenance'] = {'version': 1, 'kind': 'owner', 'sources': [],
+                                     'digest': digest_frontmatter(row)}
+    for row, expected in ((manual, 'Your task'), (named, 'Avery'),
+                          (sourced, '(unknown)'), (unproved, '(unknown)')):
+        assert lq._entry(row, now, '2026-11-04')['name'] == expected
+        assert scan._scan_rows([row], now=now, include_all=True)['stale_loops'][0]['name'] == expected
+
+
+
+def test_actionable_ask_labels_both_views_without_changing_deadlines_or_records():
+    from copy import deepcopy
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    base = {'anchor_key': 'source:packet', 'contact_name': 'Avery',
+            'summary': 'Avery and Morgan discussed the packet approval process',
+            'ask': '  Send Morgan the revised packet before Friday  ',
+            'action_type': 'follow_up', 'status': 'open', 'created_at': '2026-10-01',
+            'deadline': '2026-11-06'}
+    cases = [(base, 'Send Morgan the revised packet before Friday'),
+             ({**base, 'ask': ''}, base['summary']),
+             ({**base, 'ask': ' \t '}, base['summary']),
+             ({key: value for key, value in base.items() if key != 'ask'}, base['summary']),
+             ({**base, 'ask': None, 'summary': '  Review packet  '}, 'Review packet'),
+             ({**base, 'ask': '', 'summary': ' '}, 'follow up')]
+    for row, expected in cases:
+        before = deepcopy(row)
+        regular = lq._entry(row, now, '2026-11-04')
+        cleanup = scan._scan_rows([row], now=now, include_all=True)['stale_loops'][0]
+        assert regular['what'] == cleanup['what'] == expected
+        assert regular['deadline'] == cleanup['deadline'] == '2026-11-06'
+        assert row == before

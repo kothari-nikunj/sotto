@@ -59,7 +59,7 @@ carrying the full event — plus surfaced.jsonl, the one-line-per-verdict ledger
 place an agent verdict such as a live missed call is retained) for the SAME person on a DIFFERENT
 channel within ESCALATION_WINDOW_MIN_DEFAULT (45 min). Identity matching is deliberately
 conservative — an exact resolved-name match or an exact normalized-identifier match (the same
-last-10-digit/lowercase-email rule the graph uses); nothing fuzzy, ever. Sotto's OWN output is never
+full-digit-phone/lowercase-email rule the graph uses); nothing fuzzy, ever. Sotto's OWN output is never
 evidence that a person reached you (a post-meeting tap, a proactive nudge), and neither is the
 user's own outbound (class "signal", whose recorded sender is the RECIPIENT). The join fires only when
 the evidence is real: at least one of the joined events is a CALL, or one of them carries an
@@ -218,17 +218,20 @@ for _p in (_SHARED_LIB, _SHARED_SCRIPTS, _SHARED_KNOWLEDGE):
 
 from keys import queue_key  # noqa: E402,F401  (the queue-line id, shared with the dashboard)
 from textutil import (  # noqa: E402
-    _s, _is_likely_automated, _looks_like_phone_number, _sender_addr, _extract_sender_name,
+    _s, _is_likely_automated, _looks_like_phone_number, _sender_addr,
     _normalize_identifier,
 )
 from render_local import (  # noqa: E402
-    _is_system_message, build_contact_lookup, resolve_imessage_name, resolve_whatsapp_name,
-    resolve_call_name,
+    _is_system_message, build_contact_lookup,
 )
 from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email, parse_observed_time  # noqa: E402
 import gemini as _gemini  # noqa: E402,F401 — compatibility alias for existing provider-seam tests
 import preferences as _prefs  # noqa: E402
 import brief_validate
+from envutil import int_env as _int_env  # noqa: E402
+from personal_context import (  # noqa: E402
+    event_source, resolve_sender as _resolve_sender, graph_display_name as _graph_display_name,
+)
 import relevance  # noqa: E402
 
 # Bounds for the ambient queue file (rotate-keeping-tail, same mechanism as compose_brief.log).
@@ -245,11 +248,11 @@ TIER1_TEXT_MAX = 1500             # chars of event text sent to Tier 1 (keeps th
 VALVE_MAX_PER_TICK = 2
 # …and across ticks: the valve is a trickle, not a flood. Promotions spend the daily interrupt
 # budget like any other nudge, so this is the second, tighter ceiling on the same spend.
-VALVE_MAX_PER_HOUR = 2
+from funnel_policy import VALVE_MAX_PER_HOUR  # noqa: E402
 # How old a held event may be and still be promoted: a real ask from 3h ago still deserves a nudge,
 # a 2-day-old one doesn't. "meeting_hold" entries skip this check — a long meeting must not expire
 # an ask Sotto itself held.
-VALVE_MAX_AGE_MIN = 240
+from funnel_policy import VALVE_MAX_AGE_MIN  # noqa: E402
 ASK_DEADLINE_HORIZON_SECONDS = brief_validate.ACTION_DEADLINE_HORIZON_SECONDS
 # Reconnect grace: an event older than this (or any message in a Bridge catch-up batch) never nudges
 # in real time — it queues for the digest/next brief. Missed calls get a LONGER leash instead of a
@@ -280,8 +283,7 @@ PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting
 # it expires with its meeting and proactive_scan dedupes it once per day per key, so a spent budget
 # used to demote "your pitch starts in 20 minutes" to class "budget" — which the valve refuses to
 # promote (no proactive source ever promotes), leaving a held prep with no path back at all.
-BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change",
-                                   "meeting_prep"})
+from funnel_policy import BUDGET_EXEMPT_CLASSES  # noqa: E402
 # The in-meeting hold exempts LESS than the budget does: a missed call or a multi-channel escalation
 # is precisely what should reach you mid-meeting, but a tap that fires while you're in your NEXT
 # meeting must still hold (that's the back-to-back case the valve promotes out of). So this is
@@ -321,14 +323,16 @@ ESCALATION_VERBS = {"calls": "called", "email": "emailed", "imessage": "texted",
 
 # The post-meeting tap's synthetic event: the `source` string IS the contract with calcache.py
 # (runtime/trigger-receiver/calcache.MEETING_END_SOURCE). Nothing else in the funnel emits it.
-MEETING_END_SOURCE = "meeting_end"
+from calendar_cache_contract import (  # noqa: E402
+    MEETING_END_SOURCE, CALENDAR_CHANGE_SOURCE, CACHE_DIRNAME, CACHE_FILENAME,
+    REFRESH_SECS_DEFAULT as CALENDAR_REFRESH_SECS_DEFAULT,
+)
 # The calendar-diff nudge's synthetic event: the `source` string IS the contract with
 # runtime/trigger-receiver/calcache.CALENDAR_CHANGE_SOURCE. Nothing else in the funnel emits it.
-CALENDAR_CHANGE_SOURCE = "calendar_change"
 # The proactive watcher's synthetic event: the `source` string IS the contract with
 # proactive_scan._proactive_event, the one adapter between the watcher's nudge shape and this
 # funnel. A chase/birthday/commitment nudge is Sotto talking, not a person.
-PROACTIVE_SOURCE = "proactive"
+from funnel_policy import PROACTIVE_SOURCE  # noqa: E402
 # Rows that are never EVIDENCE for the escalation join: Sotto's own output (the tap, the proactive
 # nudge) is never evidence that a person reached you; neither is the user's own outbound, whose
 # recorded sender is the person they wrote TO. Both would manufacture a cross-channel escalation
@@ -337,8 +341,7 @@ NON_EVIDENCE_SOURCES = frozenset({MEETING_END_SOURCE, PROACTIVE_SOURCE, CALENDAR
 NON_EVIDENCE_CLASSES = frozenset({"signal"})
 
 # ── The shared calendar cache (written by runtime/trigger-receiver/calcache.py) ────────────────────
-CALENDAR_CACHE_REL = ("cache", "calendar_today.json")
-CALENDAR_REFRESH_SECS_DEFAULT = 900     # mirrors calcache.REFRESH_SECS_DEFAULT
+CALENDAR_CACHE_REL = (CACHE_DIRNAME, CACHE_FILENAME)
 CALENDAR_REFRESH_SECS_BOUNDS = (60, 3600)   # a file claiming an absurd cadence is clamped, not trusted
 CALENDAR_STALE_INTERVALS = 2            # older than 2 refresh intervals ⇒ never hold on it
 
@@ -349,13 +352,6 @@ def _data_root() -> str:
 
 def _events_dir() -> str:
     return os.path.join(_data_root(), "events")
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
 
 
 @contextmanager
@@ -546,7 +542,7 @@ def _meeting_hold_until(now_local, now_utc: datetime) -> str:
         return ""
     ends = []
     for ev in events:
-        if not isinstance(ev, dict) or ev.get("all_day"):
+        if not isinstance(ev, dict) or ev.get("all_day") or ev.get("busy") is False:
             continue
         if _event_attendee_count(ev) < 1:
             continue
@@ -586,6 +582,17 @@ def _event_text(e: dict) -> str:
     return _s(e.get("text")) or _s(e.get("body"))
 
 
+def _message_noise(e: dict, text: str, ident: str) -> tuple[str, str]:
+    if event_source(e) == "gmail":
+        if _is_likely_automated(ident):
+            return "automated", f"automated sender {ident}"
+    elif _is_system_message(text):
+        return "system", "system/status message"
+    elif _looks_like_otp(text) or _is_shortcode(ident.split("@", maxsplit=1)[0]):
+        return "automated", "OTP/shortcode blast"
+    return "", ""
+
+
 def _is_missed_call(e: dict) -> bool:
     return not e.get("is_outgoing") and not e.get("is_answered")
 
@@ -614,24 +621,6 @@ def _thread_key(e: dict) -> str:
     return f"{src}:{_s(e.get('rowid'))}"
 
 
-def _resolve_sender(e: dict, lookup: dict) -> tuple[str, str]:
-    """(display name, raw identifier) via the brief's own resolvers over the snapshot's contacts."""
-    src = _s(e.get("source"))
-    if src == "email":
-        frm = _s(e.get("from"))
-        addr = _sender_addr(frm)
-        name = (lookup.get(addr) if addr else "") or _extract_sender_name(frm)
-        return (name or addr or "Unknown"), addr
-    if src == "whatsapp":
-        jid = _s(e.get("sender_jid")) or _s(e.get("contact_jid"))
-        return resolve_whatsapp_name(jid, _s(e.get("partner_name")), lookup), jid
-    if src == "calls":
-        phone = _s(e.get("phone"))
-        return (resolve_call_name(phone, lookup) or ""), phone
-    handle = _s(e.get("handle"))
-    return resolve_imessage_name(handle, lookup), handle
-
-
 def _is_known_name(name: str) -> bool:
     """Known = Contacts (or WhatsApp push name) resolved a real human name — same standard the
     brief's _thread_is_known_person applies to a 1:1 thread."""
@@ -645,27 +634,6 @@ def _graph_knows(name: str, ident: str) -> bool:
         return bool(knowledge.find_person_file(name=name or "", identifier=ident or ""))
     except Exception:  # noqa: BLE001
         return False
-
-
-def _graph_display_name(ident: str) -> str:
-    """The graph's display name for an identifier the snapshot's contacts couldn't resolve, or "".
-    Prewarm seeds person files (keyed by handle/JID/email) for exactly the people the user messages
-    most — so this answers precisely when a thin snapshot has blinded contact resolution. Without
-    it, a starved snapshot made EVERY text an "unknown sender 1:1" and message nudges went to zero
-    (Aug 2026) while the graph knew the sender all along."""
-    if not _s(ident):
-        return ""
-    try:
-        import knowledge  # noqa: PLC0415  (_shared/knowledge, already on sys.path)
-        path = knowledge.find_person_file(identifier=ident)
-        if not path:
-            return ""
-        with open(path, encoding="utf-8") as f:
-            p = knowledge.parse_person_file(f.read())
-        name = _s(getattr(p, "name", ""))
-        return name if _is_known_name(name) else ""
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 def _is_vip(name: str, ident: str, rel_state: dict, prefs: dict | None = None) -> bool:
@@ -853,33 +821,39 @@ def _queue_path() -> str:
 
 def _append_queue(verdict_class: str, sender: str, event: dict, held_class: str = "",
                   relevance_deadline: str = "", priority_id: str = "",
-                  priority_revision: str = "") -> None:
-    """One JSONL line per queued event. Bounded (rotate-keeping-tail) so the file can't grow forever
-    on the /data volume. `held_class` (only on entries demoted FROM an agent verdict) preserves the
-    class the event earned before cooldown/quiet/catchup demotion — the release valve and the
-    sotto-event skill use it so a demoted scheduling_ask still gets the scheduling treatment when
-    promoted. Best-effort — a failed append must never fail the triage."""
-    try:
-        from sotto_log import bounded_append  # noqa: PLC0415
-        entry = {
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "verdict_class": verdict_class,
-            "sender": sender,
-            "event": event,
-        }
-        if held_class:
-            entry["held_class"] = held_class
-        if relevance_deadline:
-            entry['relevance_deadline'] = relevance_deadline
-        if priority_id and priority_revision:
-            entry['priority_id'] = priority_id
-            entry['priority_revision'] = priority_revision
-        # Same lock the valve's rewrite takes: an append that landed mid-rewrite would be dropped.
+                  priority_revision: str = "", pending=None) -> None:
+    """Stage a deferred row, or atomically admit one standalone row."""
+    entry = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verdict_class": verdict_class,
+        "sender": sender,
+        "event": event,
+    }
+    if held_class:
+        entry["held_class"] = held_class
+    if relevance_deadline:
+        entry['relevance_deadline'] = relevance_deadline
+    if priority_id and priority_revision:
+        entry['priority_id'] = priority_id
+        entry['priority_revision'] = priority_revision
+    if pending is not None:
+        pending.append(entry)
+    else:
+        _commit_queue([entry])
+
+
+def _commit_queue(entries, surfaces=(), accepted=()):
+    from deferred_queue import append_batch
+    accepted = {_ingress_key(row['event']) for row in accepted}
+    for surface in surfaces:
+        if _ingress_key(surface[4]) in accepted:
+            _record_surfaced(*surface)
+    if entries:
         with _locked(_queue_path()):
-            bounded_append(_queue_path(), json.dumps(entry), QUEUE_MAX_BYTES, QUEUE_KEEP_LINES,
-                           already_locked=True)
-    except Exception:  # noqa: BLE001
-        pass
+            append_batch(_queue_path(), entries, QUEUE_MAX_BYTES, QUEUE_KEEP_LINES)
+    for surface in surfaces:
+        if _ingress_key(surface[4]) not in accepted:
+            _record_surfaced(*surface)
 
 
 # ── Surfaced ledger (one line per verdict — the "why didn't I get nudged?" substrate) ─────────────
@@ -932,7 +906,7 @@ def _escalation_window_min() -> int:
 
 
 def _event_identifiers(e: dict) -> set:
-    """Every normalized 1:1 identifier an event carries (phone → last 10 digits, email/JID →
+    """Every normalized 1:1 identifier an event carries (phone → full digits, email/JID →
     lowercase), by the SAME rule the knowledge graph and the brief normalize by. Group ids are
     excluded on purpose: a chat guid identifies a room, not a person."""
     out = set()
@@ -1393,19 +1367,9 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
     if assistant_evidence:
         return "drop", "automated", f"software assistant — {assistant_evidence}", name
 
-    # 2) Explicit mutes (the sotto-feedback channel) — "stop surfacing X" must stick here too, on
-    #    EVERY channel, and BEFORE the per-channel branches below: while this gate sat after the
-    #    calls branch, a muted person's missed call still nudged — budget-exempt, and VIP-exempt
-    #    from quiet hours (Sep 2026). One predicate (preferences.proactively_muted) answers this
-    #    for ingress, the valve, a tapped promotion and the digest: when this gate only muted email
-    #    senders, "stop surfacing X" dropped yesterday's queued item and still let today's text
-    #    from the same number through to a live nudge.
-    try:
-        if _prefs.proactively_muted(name, e, ctx["prefs"]):
-            return ("drop", "muted",
-                    f"you asked Sotto to stop surfacing {name or ident}", name)
-    except Exception:  # noqa: BLE001 — malformed prefs must never swallow an event
-        pass
+    # 2) Apply the same mute filter to the primary event and its thread background.
+    if not ctx["sender_allowed"](e):
+        return "drop", "muted", f"you asked Sotto to stop surfacing {name or ident}", name
 
     # 3) Calls carry no text — decide entirely on direction + who.
     if src == "calls":
@@ -1424,15 +1388,10 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
 
     text = _event_text(e)
 
-    # 4) Automated noise — the same filters the brief applies before the LLM ever sees a thread.
-    if src == "email":
-        if _is_likely_automated(ident):
-            return "drop", "automated", f"automated sender {ident}", name
-    else:
-        if _is_system_message(text):
-            return "drop", "system", "system/status message", name
-        if _looks_like_otp(text) or _is_shortcode(ident.split("@")[0]):
-            return "drop", "automated", "OTP/shortcode blast", name
+    # 4) Filter deterministic noise before the model sees it.
+    noise, reason = _message_noise(e, text, ident)
+    if noise:
+        return "drop", noise, reason, name
 
     # 4b) A formal calendar invite or RSVP notification arriving as email → queue, always. The
     #     calendar lane owns meeting interrupts (calcache: a NEW invite nudges only within
@@ -1511,8 +1470,7 @@ def _ingress_key(event):
 
 
 def triage(payload: dict, now_local=None, now_utc=None) -> dict:
-    """The whole funnel for one batch: Tier 0 → Tier 1 → cooldown → queue writes → verdict.
-    `now_local`/`now_utc` are injectable for tests; production uses the configured timezone."""
+    """Classify one batch and commit its accepted work, queue rows and decision receipts."""
     events = [e for e in (payload.get("events") or []) if isinstance(e, dict)]
     for event in events:
         event.pop('_sotto_relevance_deadline', None)
@@ -1536,16 +1494,21 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         "rel_state": _load_relationship_state(),
         "prefs": _load_prefs(),
     }
-    from personal_context import conversation_snapshot
-    ctx['conversation_rows'] = conversation_snapshot()
+    from personal_context import conversation_snapshot, conversation_filter
     ctx["snooze_until"] = _s(ctx["prefs"].get("nudge_snooze_until"))
     ctx["snoozed"] = _snoozed(ctx["prefs"], now_local)
     ctx["lookup"] = build_contact_lookup(ctx["snapshot"].get("contacts")
                                          if isinstance(ctx["snapshot"].get("contacts"), list) else [])
-    # A source that breaks must SAY so: an empty contact lookup with message events in the batch
-    # means name resolution is running blind (thin/absent snapshot) — the graph fallback in gate 7
-    # still resolves the people Sotto knows, but the log must name the degradation, because from
-    # the outside it looks identical to "everyone who texted today was a stranger".
+    ctx["sender_allowed"] = conversation_filter(ctx["prefs"], ctx["lookup"], graph_name=_graph_display_name)
+
+    def context_allowed(event):
+        if not ctx["sender_allowed"](event) or relevance.automated_assistant_evidence(event):
+            return False
+        _, ident = _resolve_sender(event, ctx["lookup"])
+        return not _message_noise(event, _event_text(event), ident)[0]
+
+    ctx['conversation_rows'] = ([] if ctx['quiet'] or ctx['snoozed'] else
+                                conversation_snapshot(events, include=context_allowed))
     if not ctx["lookup"] and any(_s(e.get("source")) in ("imessage", "whatsapp", "calls")
                                  for e in events):
         try:
@@ -1557,8 +1520,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
     now_ts = time.time()
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
-    # Resolved ONCE per batch (one small file read, not one per event): "2:30 PM" while the user is
-    # in a peopled meeting, "" otherwise. Quiet hours, but for rooms.
+    # One shared meeting-cache read per batch.
     ctx["meeting_until"] = _meeting_hold_until(now_local, now_utc)
     catchup = bool(payload.get("catchup"))
     max_age = EVENT_MAX_AGE_MIN
@@ -1567,9 +1529,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
     bundle_charged = False           # ONE interrupt per bundle, not one per event (below)
 
     def _charge_once() -> bool:
-        """May this bundle still nudge? A bundle is ONE message however many events it carries
-        (event-triage/SKILL.md: "one message total, one interrupt spent"), so the first non-exempt
-        agent verdict spends the day's unit — atomically — and the rest of the batch ride it free."""
+        """Reserve at most one interrupt for this bundle; later events ride the same unit."""
         nonlocal bundle_charged
         if not bundle_charged:
             # Ordinary ingress transfers ownership and spends under one budget lock at the end.
@@ -1580,7 +1540,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             else:
                 bundle_charged = _budget_left(day) > 0
         return bundle_charged
-
+    pending_queue, pending_surfaces = [], []
     for e in events:
         decision_id = uuid.uuid4().hex[:16]
         ctx["held_class"] = ""        # per-event scratch: a Tier-0 cadence demotion writes it
@@ -1661,7 +1621,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
             _append_queue(cls, name, e, held_class=held_class,
                           relevance_deadline=_s(ctx.get('relevance_deadline')),
                           priority_id=_s(ctx.get('priority_id')),
-                          priority_revision=_s(ctx.get('priority_revision')))
+                          priority_revision=_s(ctx.get('priority_revision')), pending=pending_queue)
         elif verdict == "agent":
             agent_events.append({"event": e, "sender": name, "class": cls, "why": reason,
                                  "decision_id": decision_id,
@@ -1670,7 +1630,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
                                  **({'priority_id': ctx['priority_id'],
                                      'priority_revision': ctx['priority_revision']}
                                     if ctx.get('priority_id') and ctx.get('priority_revision') else {})})
-        _record_surfaced(verdict, cls, reason, name, e, decision_id)  # decision, not delivery
+        pending_surfaces.append((verdict, cls, reason, name, e, decision_id))
         reasons.append(reason)
     overall = "agent" if agent_events else ("queue" if queued else "drop")
     bundle = {}
@@ -1692,7 +1652,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
                     retained.append(row)
                 else:
                     _append_queue('budget', row['sender'], row['event'], held_class=row['class'],
-                                  relevance_deadline=_s(row.get('relevance_deadline')))
+                                  relevance_deadline=_s(row.get('relevance_deadline')), pending=pending_queue)
             bundle['events'] = retained
             agent_events = retained
             overall = 'agent' if retained else 'queue'
@@ -1701,6 +1661,7 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
                                         day, False, now_ts)
         for row in agent_events:
             _stamp_cooldown(_thread_key(row['event']), now_ts)
+    _commit_queue(pending_queue, pending_surfaces, agent_events if job_id else ())
     return {"verdict": overall,
             "reason": "; ".join(reasons[:5]) if reasons else "no events",
             "bundle": bundle, **({'job_id': job_id} if job_id else {})}
@@ -1758,9 +1719,7 @@ def _user_spoke_since(entry: dict, ev: dict, answered: dict) -> bool:
 
 
 def _entry_muted(entry: dict, prefs: dict | None) -> bool:
-    """Is this QUEUE ENTRY from someone the user muted? The same predicate the ingress gate and the
-    digest ask (preferences.proactively_muted), reading the entry's resolved sender and its event.
-    Malformed prefs read as muted: a mute that cannot be parsed must not become a nudge."""
+    """Apply current mutes to a queue/context row; malformed preferences hold the item."""
     if not isinstance(entry, dict):
         return False
     ev = entry.get("event") if isinstance(entry.get("event"), dict) else {}

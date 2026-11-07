@@ -1,0 +1,160 @@
+{
+  "instructions": "Synthetic machinery contract. Tools and responses are scripted at external model boundary; no semantic or actual-model acceptance. No writes.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-meeting-prep"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "calendar_get",
+        "arguments": {
+          "event_id": "fixturecalendar01",
+          "calendar_id": "owner@inside.test"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "meeting-prep",
+          "args": [
+            "--focus",
+            "Cedar notebook pickup review with Ada"
+          ],
+          "meeting": {
+            "event_id": "fixturecalendar01",
+            "start": "{{CALENDAR_START:fixturecalendar01}}"
+          }
+        }
+      },
+      "toolResultContains": [
+        "fixturecalendar01",
+        "west entrance"
+      ]
+    },
+    {
+      "tool": {
+        "name": "accepted_brief_detail",
+        "arguments": {
+          "latest": true,
+          "offset": 0,
+          "limit": 4000
+        }
+      }
+    },
+    {
+      "text": "Ask Ada: where is the notebook? What is the west entrance handoff? What clinic pilot notes need review?",
+      "toolResultContains": [
+        "west entrance"
+      ]
+    },
+    {
+      "tool": {
+        "name": "accepted_brief_detail",
+        "arguments": {
+          "latest": true,
+          "offset": 0,
+          "limit": 4000
+        }
+      }
+    },
+    {
+      "text": "The prep included a VentureCo investment claim, but the provider records describe the clinic pilot. Those records do not establish the investment claim or that two domains identify one company.",
+      "toolResultContains": [
+        "research_evidence"
+      ]
+    },
+    {
+      "text": "4."
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--company",
+            "Birch Labs"
+          ]
+        }
+      }
+    },
+    {
+      "text": "Birch Labs makes garden planning tools.",
+      "toolResultContains": [
+        "garden"
+      ]
+    },
+    {
+      "tool": {
+        "name": "accepted_brief_detail",
+        "arguments": {
+          "latest": true,
+          "offset": 0,
+          "limit": 4000
+        }
+      }
+    },
+    {
+      "text": "Ask Ada about the notebook handoff at the west entrance and the clinic pilot notes.",
+      "toolResultContains": [
+        "west entrance"
+      ]
+    },
+    {
+      "tool": {
+        "name": "accepted_brief_detail",
+        "arguments": {
+          "latest": true,
+          "offset": 0,
+          "limit": 4000
+        }
+      }
+    },
+    {
+      "text": "The prep research came from provider-reported records; the record alone does not establish that its claims are true.",
+      "toolResultContains": [
+        "research_evidence"
+      ]
+    }
+  ],
+  "nativeResponses": [
+    {
+      "requestContains": [
+        "Cedar notebook pickup",
+        "ada@example.invalid",
+        "west entrance"
+      ],
+      "response": {
+        "prep_markdown": "Cedar notebook pickup review with Ada\nYour thread\nYou will collect the cedar notebook at the west entrance and review the clinic pilot notes with Ada.\nWhat Cedar Labs builds\nCedar Labs builds clinic workflow tools.\nThe founder\nAda is the operations lead and coordinates the notebook pilot.\nTraction & signals\nCedar Labs received an investment from VentureCo.\nAngles\nAsk Ada to confirm the notebook handoff at the west entrance and which clinic pilot notes need review.",
+        "meetings": [
+          {
+            "event_id": "gcal_d0d493d507613be9c0320924444d11df8e5384e9659e78cfc9e9acf7212f7231",
+            "title": "Cedar notebook pickup review with Ada",
+            "attendees": [
+              "ada@example.invalid"
+            ],
+            "talking_points": [
+              "Confirm the notebook handoff at the west entrance."
+            ],
+            "start": "{{CALENDAR_START:fixturecalendar01}}"
+          }
+        ]
+      }
+    }
+  ]
+}

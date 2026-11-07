@@ -1,0 +1,160 @@
+{
+  "name": "calendar-current-occurrence-bounded-availability-and-shared-context",
+  "world": {
+    "savedSourceGrants": [
+      "calendar"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"calendar\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "calendarEvents": [
+      {
+        "id": "cedar-moved-20261104",
+        "summary": "Cedar weekly review",
+        "status": "confirmed",
+        "start": {
+          "dateTime": "2026-11-04T10:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "end": {
+          "dateTime": "2026-11-04T11:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          }
+        ],
+        "recurringEventId": "cedar-weekly",
+        "originalStartTime": {
+          "dateTime": "2026-11-04T09:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        }
+      },
+      {
+        "id": "lunch-review",
+        "summary": "Budget review",
+        "status": "confirmed",
+        "start": {
+          "dateTime": "2026-11-04T13:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "end": {
+          "dateTime": "2026-11-04T14:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          }
+        ]
+      },
+      {
+        "id": "shared-rowan",
+        "summary": "Rowan site visit",
+        "status": "confirmed",
+        "start": {
+          "dateTime": "2026-11-04T11:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "end": {
+          "dateTime": "2026-11-04T12:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "organizer": {
+          "email": "rowan@example.test",
+          "self": false
+        },
+        "attendees": [
+          {
+            "email": "rowan@example.test",
+            "self": false,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "declined"
+          }
+        ]
+      },
+      {
+        "id": "evening-hold",
+        "summary": "Optional neighborhood supper",
+        "status": "tentative",
+        "start": {
+          "dateTime": "2026-11-04T19:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "end": {
+          "dateTime": "2026-11-04T20:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "tentative"
+          }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    {
+      "text": "What time is my Cedar weekly review on November 4, and when am I free that day between 9 and 5? Use Los Angeles time. Don't change anything.",
+      "contains": [
+        "Cedar"
+      ],
+      "containsAny": [
+        [
+          "10:00",
+          "10 am",
+          "10am",
+          "10 AM",
+          "10 a.m."
+        ]
+      ],
+      "excludes": [
+        "unavailable all day",
+        "busy all day",
+        "fully booked",
+        "no free time"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    },
+    {
+      "text": "And what else is on the calendar that evening?",
+      "contains": [
+        "supper"
+      ],
+      "containsAny": [
+        [
+          "tentative",
+          "unconfirmed"
+        ]
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    }
+  ]
+}

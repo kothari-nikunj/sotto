@@ -584,3 +584,107 @@ def test_calendar_location_reaches_shared_composer_without_guessing():
     assert "<exact location>" in prompt
     rendered = render_local._format_calendar(inputs["google"]["events"])
     assert rendered.count('location:') == 1
+
+
+def test_direct_threads_never_merge_by_display_name_or_person_id():
+    for channel, field in [("imessage", "handle"), ("whatsapp", "contact_jid")]:
+        messages = [
+            {field: "first@example.test", "resolved_name": "Alex Lee", "canonical_id": "same-person",
+             "timestamp": "2026-10-12 10:00:00", "text": "Can you send the contract?"},
+            {field: "second@example.test", "resolved_name": "Alex Lee", "canonical_id": "same-person",
+             "timestamp": "2026-10-12 10:01:00", "text": "Done", "is_from_me": True},
+            {field: "first@example.test", "resolved_name": "Alex Lee",
+             "timestamp": "2026-10-12 10:02:00", "text": "By tomorrow please"},
+        ]
+        threads = render_local._group_messages_into_threads(messages, channel)
+        assert len(threads) == 2
+        assert [len(t["messages"]) for t in threads] == [2, 1]
+        assert threads[0]["identifier"] == "first@example.test"
+        unknown = render_local._group_messages_into_threads([
+            {"resolved_name": "Unknown", "text": "one"},
+            {"resolved_name": "Unknown", "text": "two"},
+        ], channel)
+        assert len(unknown) == 2
+
+
+def test_thread_excerpt_discloses_omissions_and_retains_evidence():
+    thread = {"name": "Alex", "identifier": "alex@example.test", "messages": [
+        {"handle": "alex@example.test", "is_from_me": False, "timestamp": f"2026-10-12 10:{n:02}:00", "text": f"Message {n}"}
+        for n in range(12)
+    ]}
+    text = render_local._format_thread_as_text(thread, "imessage")
+    assert "latest 10 of 12 collected messages; earlier messages omitted" in text
+    assert "[THEY SENT] Message 0\n" not in text
+    assert "[THEY SENT] Message 11" in text
+    assert text.count("source_id:") == 10
+    thread["messages"] = thread["messages"][-10:]
+    assert "earlier messages omitted" not in render_local._format_thread_as_text(thread, "imessage")
+
+
+def test_first_brief_respects_disabled_and_partial_message_sources():
+    line = cb._coverage_line({}, {"imessage": "disabled", "whatsapp": "partial"}, [], [])
+    assert "iMessage" not in line
+    assert "WhatsApp could not be read completely" in line
+    assert "Link WhatsApp" not in line
+    line = cb._coverage_line({"whatsapp": [{"text": "hello"}]}, {"whatsapp": "partial"}, [], [])
+    assert "WhatsApp (partial recent history)" in line
+
+
+def test_partial_outgoing_attachment_cannot_prove_an_ask_was_answered():
+    messages = [{'text': 'Can you send the signed contract?', 'is_from_me': False},
+                {'text': '[attachment — contents not read]', 'content_partial': True, 'is_from_me': True,
+                 'attachments': [{'id': 'a1', 'name': 'signed-contract.pdf', 'mime_type': 'application/pdf', 'size_bytes': 42}]}]
+    assert render_local._compute_last_unreplied_ask(messages)
+    text = render_local._format_thread_as_text({'name': 'Alex', 'messages': messages}, 'imessage')
+    assert 'do not infer them or treat this as proof an ask was answered' in text
+    assert 'signed-contract.pdf' in text and 'file contents were not read' in text
+    text = render_local._format_thread_as_text({'name': 'Alex', 'messages': [
+        {'text': 'Yes', 'reply_to_guid': 'direct-parent', 'thread_originator_guid': 'root'}]}, 'imessage')
+    assert 'reply to GUID: direct-parent' in text and 'thread root GUID: root' in text
+    assert 'may be outside this excerpt' in text
+
+
+def test_attachment_metadata_is_bounded_in_threads_and_deferred_context():
+    message = {'text': '[attachment — contents not read]', 'handle': '+15555550101',
+               'attachment_metadata_partial': True,
+               'attachments': [{'id': str(i), 'name': '/private/files/report.pdf',
+                                'mime_type': 'x' * 1000, 'size_bytes': -1} for i in range(20)]}
+    for rendered in (render_local._format_thread_as_text({'name': 'Dana', 'messages': [message]}, 'imessage'),
+                     render_local._format_deferred_unread({'deferred_unread_imessage': [message]})):
+        assert rendered.count('report.pdf') == 16
+        assert '/private' not in rendered and 'x' * 129 not in rendered
+        assert 'size_bytes' not in rendered
+        assert 'Additional attachment metadata omitted' in rendered
+        assert 'missing fields are unknown' in rendered
+    assert render_local._format_message_attachments({}) == []
+
+
+def test_call_comparisons_prefer_explicit_instants_and_accept_legacy_timestamps(monkeypatch):
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'America/New_York')
+    phone = '+14155552222'
+    early = {'phone': phone, 'timestamp': '2024-11-03 01:30:00', 'is_outgoing': False,
+             'is_answered': False, 'call_type': 'phone', 'timestamp_utc': '2024-11-03T05:30:00Z', 'record_id': '1'}
+    late = {**early, 'timestamp_utc': '2024-11-03T06:30:00Z', 'record_id': '2',
+            'is_answered': True, 'service_provider': 'FaceTime'}
+    lookup = render_local.build_contact_lookup([{'name': 'Dana', 'phones': [phone]}])
+    connected = render_local._build_connected_dict([late], [])
+    assert render_local._process_missed_calls([early], lookup, connected) == []
+    legacy = {key: value for key, value in late.items() if key not in ('timestamp_utc', 'record_id', 'service_provider')}
+    recent = render_local._process_recent_calls([late, legacy], [], lookup)
+    assert len(recent) == 1 and recent[0]['record_id'] == '2'
+    text = render_local._format_recent_calls(recent)
+    assert 'FaceTime' in text and '2024-11-03T06:30:00Z' in text
+    assert 'record ID is scoped to this Mac store' in text
+    # Legacy WhatsApp wall times can be compared with the new explicit Phone timestamps.
+    assert render_local._process_wa_missed_calls([{'jid': '14155552222@s.whatsapp.net',
+        'timestamp': '2024-11-03 00:30:00', 'is_outgoing': False, 'is_missed': True}], lookup, connected) == []
+    assert render_local._call_time({**late, 'timestamp_utc': 'broken'}) is None
+    assert render_local._call_time({**late, 'timestamp_utc': '2024-11-03 01:30:00'}) is None
+
+
+def test_collection_cap_and_content_gaps_reach_brief_prompt():
+    local = {'source_coverage': {'imessage': {'limit_reached': True, 'content_partial': True}},
+             'source_status': {'imessage': 'partial'}}
+    prompt = cb.build_prompt(cb._load_prompt(), {'type': 'morning', 'local': local})
+    assert 'collection limit reached; additional records may be missing' in prompt
+    assert 'some content was not read or was omitted' in prompt

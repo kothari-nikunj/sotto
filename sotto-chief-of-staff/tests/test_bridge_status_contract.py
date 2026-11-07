@@ -20,7 +20,9 @@ def test_python_accepts_exact_rust_bridge_status_vocabulary():
         # The public distribution ships without Bridge source; its CI must still reach the image build.
         pytest.skip("sotto-bridge/ is excluded from the distribution tree")
     source = RUST_MAIN.read_text()
-    production = source.split("#[cfg(test)]", 1)[0]
+    # Test-only hooks may appear inside production functions. Only the dedicated
+    # test module ends the production section; the first cfg attribute does not.
+    production = re.split(r"#\[cfg\(test\)\]\s*mod tests\b", source, maxsplit=1)[0]
 
     # Direct source-map writes in read_local, plus the two helpers that return status strings.
     direct = set()
@@ -37,6 +39,5 @@ def test_python_accepts_exact_rust_bridge_status_vocabulary():
         health)[0])
     emitted = direct | read_statuses | health_statuses
 
-    assert emitted == {"ok", "disabled", "unavailable", "degraded", "needs_fda"}
-    # `partial` is the compatibility spelling accepted from older/non-Rust Bridge producers.
-    assert BRIDGE_STATUSES == emitted | {"partial"}
+    assert emitted == {"ok", "disabled", "unavailable", "degraded", "needs_fda", "partial"}
+    assert BRIDGE_STATUSES == emitted

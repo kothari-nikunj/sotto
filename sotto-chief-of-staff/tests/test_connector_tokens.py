@@ -51,7 +51,8 @@ def test_missing_file_raises_connector_missing(tmp_path, monkeypatch):
 def test_expiring_token_refreshes_and_rewrites_file(tmp_path, monkeypatch):
     # expires within the 120s window → POST token_endpoint with grant_type=refresh_token +
     # client_id and NO client secret; file rewritten atomically, 0600, schema preserved.
-    path, _ = _write_token(tmp_path, monkeypatch, expires_at=NOW + 60)
+    path, _ = _write_token(tmp_path, monkeypatch, expires_at=NOW + 60,
+                           sotto_source_generation='a' * 32)
     calls = []
 
     def http(url, data, headers, **k):
@@ -69,6 +70,7 @@ def test_expiring_token_refreshes_and_rewrites_file(tmp_path, monkeypatch):
     saved = json.loads(path.read_text())
     assert saved["access_token"] == "tok-new"
     assert saved["refresh_token"] == "rt-2"                 # rotation honored
+    assert saved["sotto_source_generation"] == 'a' * 32    # refresh preserves grant identity
     assert saved["expires_at"] == NOW + 3600
     # Full schema preserved (the receiver reads these back).
     for k in ("service", "token_endpoint", "client_id", "resource", "mcp_url", "obtained_at"):

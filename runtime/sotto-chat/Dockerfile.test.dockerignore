@@ -1,0 +1,49 @@
+# This context is restricted to source and locks needed for the isolated test image.
+**
+!runtime/
+!runtime/sotto-chat/
+!runtime/sotto-chat/**
+!adapters/
+!adapters/sotto/
+!adapters/sotto/client.py
+!adapters/sotto/control_vault.py
+!adapters/sotto/crons.json
+!adapters/sotto/managed_exec.py
+!adapters/sotto/model_lease.py
+!adapters/sotto/photon_owner.py
+!adapters/sotto/replacement_epoch.py
+!adapters/sotto/runtime_lock.py
+!adapters/sotto/tenant_lifecycle.py
+!runtime/trigger-receiver/
+!runtime/trigger-receiver/**
+!sotto-chief-of-staff/
+!sotto-chief-of-staff/**
+!requirements.txt
+sotto-chief-of-staff/.pytest_cache/
+**/__pycache__/
+runtime/sotto-chat/node_modules/
+runtime/sotto-chat/dist/
+runtime/sotto-chat/.env*
+runtime/sotto-chat/*.sqlite*
+
+# Private files the root .gitignore / publish CORPUS GUARD keep out of git never enter this context
+# either: a deployer's filled-in env file, signing keys, the Golden Corpus (real user history),
+# its labels and identity maps. Docker reads a context, not git, so ignored files would otherwise
+# ride along (sotto-chief-of-staff/tests/test_build_context_privacy.py checks this list).
+**/.env
+**/.env.*
+!**/.env.template
+**/*signing.key
+**/bridge-access-codes.log
+**/evals/corpus/
+**/corpus-v*
+**/*.map.json
+**/labels*.yaml
+**/evals/baselines/*
+!**/evals/baselines/.gitkeep
+**/.venv/
+**/venv/
+**/node_modules/
+**/dist/
+**/*.pyc
+**/.DS_Store

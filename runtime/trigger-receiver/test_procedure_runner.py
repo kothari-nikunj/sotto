@@ -15,6 +15,41 @@ import procedure_runner
 PACK = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff'
 
 
+def test_declared_ask_answer_uses_readonly_run_without_named_skill_permission(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
+    monkeypatch.syspath_prepend(str(PACK / '_shared/scripts'))
+    monkeypatch.syspath_prepend(str(PACK.parent))
+    import ask_research_pipeline
+    from adapters.sotto import runtime_api
+
+    requests = []
+    class Opener:
+        def open(self, request, timeout):
+            payload = json.loads(request.data)
+            requests.append(payload)
+            # Managed startup deliberately renders allowedSkills: []. The
+            # declared answer needs only the same stateless read-only /run.
+            assert request.full_url == 'http://127.0.0.1:8789/v1/run'
+            assert 'skill' not in payload
+            assert payload['answer_only'] is True
+            return io.BytesIO(json.dumps({'text': 'Grounded answer', 'usage': {}}).encode())
+
+    client = runtime_api._client_module().ChatClient(
+        'http://127.0.0.1:8789', 'synthetic-runtime-bearer-0123456789', opener=Opener())
+    monkeypatch.setattr(runtime_api, '_client', lambda timeout: client)
+    def pipeline(pack, selection, question, command, answer):
+        assert selection == {'mode': 'company', 'company': 'Cedar Labs'}
+        return {**answer('Answer from the completed research only.', 'a' * 32),
+                'sources': [], 'coverage_until': time.time() + 600}
+    monkeypatch.setattr(ask_research_pipeline, 'run', pipeline)
+    assert procedure_runner.run({'kind': 'shared-ask-research', 'pack': str(PACK),
+        'selection': {'mode': 'company', 'company': 'Cedar Labs'},
+        'question': 'Research Cedar Labs'}) == 'Grounded answer'
+    assert requests == [{'prompt': 'Answer from the completed research only.', 'answer_only': True,
+                         'env': {'SOTTO_UNATTENDED': '1', 'SOTTO_DELIVERY_RUN_ID': 'a' * 32}}]
+
+
 @pytest.mark.parametrize('case', ['eligible', 'disabled', 'expired', 'missing', 'guard_only',
                                   'eligibility_only', 'partial', 'duplicate_guard', 'unknown', 'malformed'])
 def test_proactive_consumes_real_scanner_guards_before_composing(case, tmp_path, monkeypatch):
@@ -81,25 +116,27 @@ def test_real_digest_cli_completes_an_empty_window_without_provider_calls(tmp_pa
     assert not list((tmp_path / 'events').glob('delivery-effects-*'))
 
 
-def test_pulse_accepts_successful_gather_diagnostics_then_stages_source_permissions(tmp_path, monkeypatch):
+@pytest.mark.parametrize('kind', ['pulse', 'shared-relationship-pulse'])
+def test_pulse_routes_through_shared_checkpointed_pipeline_and_stages_permissions(tmp_path, monkeypatch, kind):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
     monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'b' * 32)
-    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
-    import source_context
-    monkeypatch.setattr(source_context, 'read_local', lambda hours: {'imessage': [{'text': 'Synthetic'}]})
+    monkeypatch.syspath_prepend(str(PACK / '_shared/scripts'))
+    import relationship_pulse_pipeline
     calls = []
-    def invoke(argv, **kwargs):
-        calls.append(Path(argv[1]).name)
-        if calls[-1] == 'gather_google.py':
-            Path(argv[argv.index('--gmail-out') + 1]).write_text('[]')
-            return SimpleNamespace(returncode=0, stdout='Saved 0 emails and 0 events\n', stderr='')
-        return SimpleNamespace(returncode=0, stdout=json.dumps({'pulse_markdown': 'Your weekly relationships'}), stderr='')
-    monkeypatch.setattr(procedure_runner.subprocess, 'run', invoke)
-    assert procedure_runner.run({'pack': str(PACK), 'kind': 'pulse'}) == 'Your weekly relationships'
-    assert calls == ['gather_google.py', 'relationship_pulse.py']
+    def pipeline(pack, selection, command):
+        calls.append((pack, selection))
+        return {'text': 'Your weekly relationships', 'sources': ['imessage'],
+                'coverage_until': '2026-10-10T12:00:00Z'}
+    monkeypatch.setattr(relationship_pulse_pipeline, 'run', pipeline)
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', lambda *a, **k: pytest.fail('legacy wide gather'))
+    request = {'pack': str(PACK), 'kind': kind}
+    if kind == 'shared-relationship-pulse':
+        request['selection'] = {'mode': 'current'}
+    assert procedure_runner.run(request) == 'Your weekly relationships'
+    assert calls == [(str(PACK), {'mode': 'current'})]
     doc = json.loads((tmp_path / ('events/delivery-effects-' + 'b' * 32 + '.json')).read_text())
-    assert doc['effects'][0]['sources'] == ['imessage']
+    assert doc['effects'] == [{'kind': 'source_permissions', 'sources': ['imessage'],
+                              'coverage_until': '2026-10-10T12:00:00Z'}]
 
 
 @pytest.mark.parametrize('result,expected', [
@@ -181,6 +218,70 @@ def test_procedure_cli_emits_budget_exit_only_for_typed_denial(monkeypatch):
     assert procedure_runner.main() == 1
 
 
+@pytest.mark.parametrize('stage,category', [('research', 'AskResearchUnconfirmed'),
+    ('persistence', 'AskPersistenceUnconfirmed'), ('answer', 'AskAnswerUnconfirmed')])
+def test_ask_failure_category_uses_only_exact_started_stage(tmp_path, monkeypatch, capsys, stage, category):
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a'*32)
+    path = tmp_path / 'events/research-artifacts' / ('ask-' + 'a'*32 + '.json')
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'binding': 'b'*64, 'question': 'PRIVATE QUESTION',
+                                stage: {'status': 'started', 'result': 'PRIVATE RESULT'}}))
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({
+        'kind': 'shared-ask-research', 'pack': str(PACK)})])
+    monkeypatch.setattr(procedure_runner, 'run', lambda _: (_ for _ in ()).throw(RuntimeError('PRIVATE ERROR')))
+    assert procedure_runner.main() == 1
+    stderr = capsys.readouterr().err
+    assert stderr == f'[procedure_runner] {category}\n'
+    assert 'PRIVATE' not in stderr
+    from work_queue import diagnostic_category
+    assert diagnostic_category(stderr) == category
+
+
+def test_ask_category_does_not_guess_missing_or_ambiguous_checkpoint(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a'*32)
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({
+        'kind': 'shared-ask-research', 'pack': str(PACK)})])
+    monkeypatch.setattr(procedure_runner, 'run', lambda _: (_ for _ in ()).throw(RuntimeError('PRIVATE ERROR')))
+    assert procedure_runner.main() == 1
+    assert capsys.readouterr().err == '[procedure_runner] RuntimeError\n'
+    path = tmp_path / 'events/research-artifacts' / ('ask-' + 'a'*32 + '.json')
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'research': {'status': 'started'}, 'answer': {'status': 'started'}}))
+    assert procedure_runner.main() == 1
+    assert capsys.readouterr().err == '[procedure_runner] RuntimeError\n'
+    path.unlink()
+    path.symlink_to(tmp_path / 'outside-private.json')
+    (tmp_path / 'outside-private.json').write_text(json.dumps({'research': {'status': 'started'}}))
+    assert procedure_runner.main() == 1
+    assert capsys.readouterr().err == '[procedure_runner] RuntimeError\n'
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', '../outside-private')
+    assert procedure_runner.main() == 1
+    assert capsys.readouterr().err == '[procedure_runner] RuntimeError\n'
+
+
+@pytest.mark.parametrize('error_type,exit_name', [
+    ('ProcedureModelBudgetError', 'MODEL_BUDGET_EXIT'),
+    ('ProcedureModelAdmissionBusyError', 'MODEL_ADMISSION_BUSY_EXIT')])
+def test_ask_typed_refusal_keeps_exit_before_checkpoint_category(
+        tmp_path, monkeypatch, capsys, error_type, exit_name):
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a'*32)
+    path = tmp_path / 'events/research-artifacts' / ('ask-' + 'a'*32 + '.json')
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'research': {'status': 'started'}}))
+    monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({
+        'kind': 'shared-ask-research', 'pack': str(PACK)})])
+    monkeypatch.setattr(procedure_runner, 'run', lambda _: (_ for _ in ()).throw(
+        getattr(procedure_runner, error_type)('PRIVATE ERROR')))
+    import work_queue
+    assert procedure_runner.main() == getattr(work_queue, exit_name)
+    assert 'AskResearchUnconfirmed' not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('arguments,diagnostic', [([], 'IndexError'), (['{'], 'JSONDecodeError'),
                                                    ([json.dumps({'kind': 'digest'})], 'KeyError')])
 def test_malformed_request_cli_reports_original_error_without_pack_import(arguments, diagnostic):
@@ -229,3 +330,16 @@ def test_proactive_compose_preserves_only_validated_proxy_402(
     monkeypatch.setattr(sys, 'argv', ['procedure_runner.py', json.dumps({'pack': str(PACK), 'kind': 'proactive'})])
     assert procedure_runner.main() == (MODEL_BUDGET_EXIT if terminal else 1)
     assert requests == ['https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent']
+
+
+def test_ask_failure_diagnostic_ignores_a_fifo_checkpoint(tmp_path, monkeypatch):
+    # A FIFO at the checkpoint path must not block the worker's failure diagnostic.
+    run_id = 'f' * 32
+    folder = tmp_path / 'events' / 'research-artifacts'
+    folder.mkdir(parents=True)
+    os.mkfifo(folder / f'ask-{run_id}.json')
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', run_id)
+    started = time.monotonic()
+    assert procedure_runner._ask_unconfirmed_stage() is None
+    assert time.monotonic() - started < 2

@@ -29,6 +29,19 @@ REAL_PHONE = "+15551234567"
 FABRICATED_PHONE = "+19999999999"
 
 
+def test_prepopulated_tap_link_cannot_bypass_source_authority():
+    for identifier, expected in ((REAL_PHONE, 'sms:' + REAL_PHONE),
+                                 (FABRICATED_PHONE, None)):
+        out = {'actions': [{'type': 'reply', 'channel': 'imessage',
+                            'contactIdentifier': identifier,
+                            'tap_link': 'sms:' + FABRICATED_PHONE}]}
+        cb._attach_tap_links(out, allowlist={brief_validate._normalize_identifier(REAL_PHONE)})
+        assert (out['actions'][0].get('tap_link') or None) == expected
+        # Reprocessing a locally derived result remains safe and stable.
+        cb._attach_tap_links(out, allowlist={brief_validate._normalize_identifier(REAL_PHONE)})
+        assert (out['actions'][0].get('tap_link') or None) == expected
+
+
 def _inputs():
     """A payload whose ONLY message counterpart is REAL_PHONE (Sarah)."""
     return {
@@ -216,7 +229,7 @@ def test_fabricated_meeting_marker_is_stripped(tmp_path, monkeypatch):
 
 # ── The allowlist itself ──────────────────────────────────────────────────────────────────────────
 
-def test_allowlist_covers_every_source_channel():
+def test_allowlist_covers_every_source_channel(tmp_path, monkeypatch):
     norm = brief_validate._normalize_identifier
     inputs = {
         "google": {
@@ -238,9 +251,16 @@ def test_allowlist_covers_every_source_channel():
             "stale_threads": [{"threadId": "t-stale", "to": "tomas@vendorco.com"}],
         },
     }
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    folder = tmp_path / 'knowledge/continuity'
+    folder.mkdir(parents=True)
+    row = {'anchor_key': 'source-task', 'status': 'open', 'action_type': 'reply',
+           'source': 'imessage', 'channel': 'imessage', 'contact_identifier': '+19995550000'}
+    (folder / 'source-task.md').write_text('---\n' + json.dumps(row) + '\n---\n')
     allow = cb.build_tap_target_allowlist(inputs, cb._event_link_map(inputs))
+    assert norm('447700900000@lid') == '' and '' not in allow
     for value in ("15551234567", "s@acme.com", "+12069994970", "15558887777@s.whatsapp.net",
-                  "447700900000@lid", "120363111@g.us", "+14155550123", "13035551188",
+                  "120363111@g.us", "+14155550123", "13035551188",
                   "graph@person.com", "+19995550000", "t-stale", "tomas@vendorco.com",
                   "ivy@lumen.vc", "leo@acme.com", "t-board", "evt-acme", "dana@acme.com",
                   "https://meet.google.com/rich-acme-abc"):

@@ -22,7 +22,6 @@ Usage: style_extract.py '{"sent_messages":[{"text":"...","channel":"email|imessa
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -35,8 +34,10 @@ sys.path.insert(0, os.path.join(_HERE, "..", "lib"))             # keys
 import action_links  # noqa: E402  (owns the offered-drafts ledger path)
 from keys import draft_key, sample_hash, sample_key  # noqa: E402,F401  (shared with the Voice card)
 import jsonstore  # noqa: E402
-from textutil import unwrap_tool_result  # noqa: E402  (shared MCP tool-result unwrap)
+from canonical_identity import canonical_id_for_fields  # noqa: E402
+from textutil import unwrap_tool_result, current_message_rows  # noqa: E402  (shared MCP tool-result unwrap)
 from source_context import SOURCE_FIELDS, allowed, project_local  # noqa: E402
+from tzchain import data_root as _root  # noqa: E402
 
 # ── Constants (style-profile.ts:156-182) ─────────────────────────────────────
 MAX_PERSON_SAMPLES = 8
@@ -58,10 +59,6 @@ BACK_CHANNEL = {"ok", "okay", "k", "kk", "yes", "yep", "yup", "no", "nope", "sur
                 "lmao", "haha", "hahaha", "thx", "ty", "thanks", "np", "gotcha", "got it",
                 "cool", "nice", "word", "bet", "sounds good", "sg", "rip"}
 _EMOJI = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF←-⇿⌀-⏿]")
-
-
-def _root():
-    return os.environ.get("SOTTO_DATA", "/data")
 
 
 def _now(now=None):
@@ -287,8 +284,7 @@ def _seed_contact_index(contacts) -> tuple:
             phones = [phones]
         emails = [e.strip().lower() for e in emails if isinstance(e, str) and e.strip()]
         phones = [p.strip() for p in phones if isinstance(p, str) and p.strip()]
-        seed = f"kf:{name}|{emails[0]}" if emails else f"kf:{name}"
-        cid = "c_" + hashlib.sha256(seed.encode()).hexdigest()[:12]
+        cid = canonical_id_for_fields(name, emails[0] if emails else None)
         index.append({"canonical_id": cid, "name": name, "identifiers": emails + phones})
         for e in emails:
             lookup.setdefault(e, (cid, name))
@@ -341,14 +337,14 @@ def _adapt_read_local(payload: dict) -> dict:
         return payload
     index, lookup = _seed_contact_index(payload.get("contacts"))
     sent = []
-    for m in payload.get("imessage") or []:
+    for m in current_message_rows(payload.get("imessage")):
         if not m.get("is_from_me") or m.get("is_group_chat"):
             continue
         cid, name = lookup.get(_handle_key(m.get("handle")), (None, None))
         sent.append({"text": m.get("text"), "channel": "imessage",
                      "recipient": name or (m.get("handle") or "").strip(),
                      "date": m.get("timestamp"), "canonical_id": cid})
-    for m in payload.get("whatsapp") or []:
+    for m in current_message_rows(payload.get("whatsapp")):
         if not m.get("is_from_me") or m.get("is_group_chat"):
             continue
         cid, name = lookup.get(_handle_key(m.get("contact_jid")), (None, None))

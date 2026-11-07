@@ -523,3 +523,18 @@ def test_main_falls_back_to_rest_when_key_present(tmp_path, monkeypatch):
     gg.main()
     assert called == {"key": "grn_test", "days": 7}
     assert json.load(open(out)) == {"meetings": []}
+
+
+def test_initialization_failure_has_one_shared_refresh_budget():
+    import pytest
+    from connector_tokens import ConnectorAuthError
+    class Stale(FakeMcp):
+        def initialize(self):
+            raise ConnectorAuthError("401")
+    made = []
+    def factory(force_refresh=False):
+        made.append(force_refresh)
+        return Stale(GRANOLA_TOOLS, [])
+    with pytest.raises(ConnectorAuthError):
+        gg.gather_mcp_with_retry(days=14, since_hours=36, client_factory=factory, now=NOW)
+    assert made == [False, True]

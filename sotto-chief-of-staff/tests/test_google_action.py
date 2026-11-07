@@ -467,7 +467,7 @@ def test_gmail_draft_still_threads_when_the_thread_cannot_be_read(monkeypatch, c
 def test_gmail_draft_without_google_falls_back_to_the_deep_link(monkeypatch, capsys):
     """No Google on this host → the caller must be told to fall back to the link, not shown a stack
     trace. `fallback:deep_link` is the same contract calendar-rsvp uses."""
-    monkeypatch.setenv("HERMES_HOME", "/nonexistent-hermes-home")
+    monkeypatch.setenv("SOTTO_HOME", "/nonexistent-sotto-home")
     monkeypatch.setattr(ga.os.path, "isfile", lambda p: False)
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-draft", "--to", "a@b.com", "--body", "hi"])
     ga.main()

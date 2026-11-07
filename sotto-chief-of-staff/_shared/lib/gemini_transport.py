@@ -29,6 +29,19 @@ class ModelBudgetUnavailableError(RuntimeError):
     """The authenticated proxy cannot admit another model reservation."""
 
 
+class BriefModelOutcomeUncertainError(RuntimeError):
+    """A paid brief call may still have completed; never retry it automatically."""
+
+
+def proxy_brief_outcome_uncertain(error):
+    """Only our managed native endpoint's fixed signal, not a provider's generic 504."""
+    if (not isinstance(error, urllib.error.HTTPError) or error.code != 504
+            or error.headers.get('X-Sotto-Outcome') != 'uncertain' or not managed()):
+        return False
+    return bool(re.fullmatch(re.escape(_proxy_base()) +
+                            r'/native/v1beta/models/[A-Za-z0-9._-]+:generateContent', error.geturl()))
+
+
 class _NoProxyRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None  # Never forward a tenant bearer to a redirected destination.
@@ -89,7 +102,9 @@ def proxy_budget_exhausted(error):
         result = json.loads(raw)
         return (isinstance(result, dict) and isinstance(result.get('error'), dict)
                 and result['error'].get('code') == 'sotto_budget_exhausted')
-    except (OSError, ValueError, KeyError):
+    except Exception:
+        # A truncated diagnostic must not replace the original HTTP failure.
+        # Without the typed envelope, do not claim this was a budget denial.
         return False
 
 

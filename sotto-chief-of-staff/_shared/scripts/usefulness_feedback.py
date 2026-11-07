@@ -14,29 +14,31 @@ import log_outcome  # noqa: E402
 from personal_context import FEEDBACK_EXCERPT_CHARS, archived_output, item_locator  # noqa: E402
 
 
-def items():
+def items(*, permitted=None, versions=False):
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
     result = []
     for path in sorted((root / 'briefs').glob('*.json'), reverse=True):
         match = re.fullmatch(r'(\d{4}-\d{2}-\d{2})_(morning|evening|welcome)', path.stem)
         if not match or not (root / 'briefs' / f'{match[1]}.{match[2]}.delivered').exists():
             continue
-        text = archived_output(path.stem)
+        text = archived_output(path.stem, permitted=permitted, snapshot=versions)
         if text:
-            result.append({'reference': path.stem, 'text': text})
+            result.append({'reference': path.stem, **text} if versions else {'reference': path.stem, 'text': text})
         if len(result) >= 8:
             break
     return result
 
 
-def record(reference, rating, excerpt='', reason=''):
+def record(reference, rating, excerpt='', reason='', *, permitted=None, archive_version=None):
     if os.environ.get('SOTTO_UNATTENDED'):
         raise ValueError('usefulness feedback requires the owner in chat')
     if rating not in ('useful', 'not_useful'):
         raise ValueError('invalid rating')
-    item = next((item for item in items() if item['reference'] == reference), None)
+    item = next((item for item in items(permitted=permitted, versions=archive_version is not None) if item['reference'] == reference), None)
     if item is None:
         raise ValueError('no eligible delivered brief with that reference')
+    if archive_version is not None and item['archive_version'] != archive_version:
+        raise ValueError('referenced archive changed')
     text = item['text']
     excerpt = excerpt.strip()
     if len(excerpt) > FEEDBACK_EXCERPT_CHARS or len(reason) > 900:

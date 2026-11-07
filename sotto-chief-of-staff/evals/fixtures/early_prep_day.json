@@ -1,0 +1,140 @@
+{
+  "name": "early_prep_day",
+  "description": "Synthetic advance preparation: a source-backed external review 54 hours ahead needs substantive comparison, while a routine external check-in one hour away has no preparation request. Stubbed extraction verifies existing rendering/action/continuity machinery; it does not prove model selection judgment.",
+  "preferences": {
+    "mute_senders": [],
+    "mute_people": [],
+    "mute_sections": [],
+    "tone_notes": []
+  },
+  "signals": {
+    "replied_thread_ids": [],
+    "handled": []
+  },
+  "new_actions": [],
+  "continuity_ledger": [],
+  "inputs": {
+    "type": "morning",
+    "first_run": false,
+    "now": "{{ISO}}",
+    "window_hours": 24,
+    "source_results": {
+      "calendar": {
+        "status": "ok",
+        "complete": true,
+        "coverage": {
+          "since": "{{ISO}}",
+          "until": "{{ISO+72h}}"
+        }
+      }
+    },
+    "google": {
+      "userEmail": "owner@inside.test",
+      "userTimezone": "+00:00",
+      "events": [
+        {
+          "id": "routine-checkin",
+          "summary": "Routine partner check-in",
+          "start": "{{ISO+1h}}",
+          "end": "{{ISO+2h}}",
+          "description": "Our regular status check-in. No materials requested.",
+          "htmlLink": "https://calendar.google.com/calendar/event?eid=routine-checkin",
+          "attendees": [
+            {
+              "email": "owner@inside.test",
+              "self": true
+            },
+            {
+              "email": "sam@partner.test",
+              "displayName": "Sam Green"
+            }
+          ]
+        },
+        {
+          "id": "rollout-review",
+          "summary": "Cedar rollout decision review",
+          "start": "{{ISO+54h}}",
+          "end": "{{ISO+55h}}",
+          "description": "Compare the three rollout plans and prepare questions about migration risks. The meeting will choose a rollout plan; the comparison needs time before we meet.",
+          "htmlLink": "https://calendar.google.com/calendar/event?eid=rollout-review",
+          "attendees": [
+            {
+              "email": "owner@inside.test",
+              "self": true
+            },
+            {
+              "email": "dana@cedar.test",
+              "displayName": "Dana Rivers"
+            }
+          ]
+        }
+      ],
+      "emails": []
+    },
+    "granola": {
+      "meetings": []
+    },
+    "local": {
+      "generated_at": "{{TS}}",
+      "window_hours": 24,
+      "source_status": {
+        "imessage": "ok",
+        "whatsapp": "ok"
+      },
+      "contacts": [],
+      "imessage": [],
+      "whatsapp": [],
+      "reminders": []
+    }
+  },
+  "stub_response": {
+    "brief_markdown": "## Should Handle Today\n- **Dana Rivers**<!--id:rollout-review|ch:calendar--><!--meeting:event_id:rollout-review-->: Compare the three rollout plans and prepare questions about migration risks for the Cedar rollout decision review on {{D+54h}}. The comparison needs time before we meet.\n",
+    "actions": [
+      {
+        "id": "early-prep",
+        "type": "meeting_prep",
+        "channel": "calendar",
+        "contactName": "Dana Rivers",
+        "contactIdentifier": "rollout-review",
+        "contextSummary": "Cedar rollout decision review on {{D+54h}}",
+        "contextAsk": "Compare the three rollout plans and prepare questions about migration risks",
+        "helpKind": "prep",
+        "newObligation": false,
+        "meetingTime": "{{D+54h}} review",
+        "sectionType": "should_handle",
+        "confidence": 0.95,
+        "evidence": [
+          {
+            "sourceType": "calendar",
+            "sourceId": "rollout-review",
+            "snippet": "Compare the three rollout plans and prepare questions about migration risks"
+          }
+        ]
+      },
+      {
+        "id": "routine-preview",
+        "type": "meeting_prep",
+        "channel": "calendar",
+        "contactName": "Sam Green",
+        "contactIdentifier": "routine-checkin",
+        "contextSummary": "Recurring partner call",
+        "contextAsk": "Routine partner check-in",
+        "helpKind": "none",
+        "newObligation": false,
+        "meetingTime": "Today, one hour ahead",
+        "confidence": 0.95,
+        "evidence": [
+          {
+            "sourceType": "calendar",
+            "sourceId": "routine-checkin",
+            "snippet": "Routine partner check-in"
+          }
+        ]
+      }
+    ],
+    "extracted_knowledge": {
+      "person_updates": [],
+      "company_updates": []
+    }
+  }
+}

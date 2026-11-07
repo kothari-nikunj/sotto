@@ -62,26 +62,22 @@ def extract_body(payload: dict) -> str:
     preference level are retained in wire order (ordinary multipart/mixed messages can contain
     more than one textual section).
     """
-    plain, rich = [], []
-
     def walk(part):
         if not isinstance(part, dict) or str(part.get("filename") or "").strip():
-            return
+            return ''
         mime = str(part.get("mimeType") or "").lower()
         if mime in {"text/plain", "text/html"}:
             body = part.get("body") or {}
             value = _decode(body.get("data"), body.get("size"))
-            if value.strip() and mime == "text/plain":
-                plain.append(value.strip())
-            elif value.strip():
-                converted = _html_text(value)
-                if converted:
-                    rich.append(converted)
-        for child in part.get("parts") or []:
-            walk(child)
+            return (value if mime == 'text/plain' else _html_text(value)).strip()
+        children = [p for p in part.get('parts') or [] if isinstance(p, dict)]
+        if mime == 'multipart/alternative':
+            # Prefer plain only among representations of this same section.
+            children.sort(key=lambda p: str(p.get('mimeType') or '').lower() != 'text/plain')
+            return next((text for child in children if (text := walk(child))), '')
+        return "\n\n".join(text for child in children if (text := walk(child)))
 
-    walk(payload)
-    return "\n\n".join(plain or rich)
+    return walk(payload)
 
 
 def message_fields(message: dict) -> dict:
@@ -94,7 +90,8 @@ def message_fields(message: dict) -> dict:
     return {
         "id": message.get("id"), "threadId": message.get("threadId"),
         "from": headers.get("from", ""), "to": headers.get("to", ""),
-        "cc": headers.get("cc", ""), "subject": headers.get("subject", ""),
+        "cc": headers.get("cc", ""), "bcc": headers.get("bcc", ""),
+        "subject": headers.get("subject", ""),
         "date": headers.get("date", "") or message.get("internalDate", ""),
         "internalDate": message.get("internalDate", ""),
         "body": extract_body(payload), "snippet": message.get("snippet", ""),
@@ -104,14 +101,21 @@ def message_fields(message: dict) -> dict:
 
 
 def token_path() -> str:
-    for base in (os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"),
-                 "/root/.hermes"):
-        if base and os.path.isfile(os.path.join(base, "google_token.json")):
-            return os.path.join(base, "google_token.json")
-    return ""
+    """Sotto's Google token under its explicit home; "" means disconnected.
+
+    The fixed procedures and CLI share this reader. An unset, relative or dotted home never
+    revives an ambient grant from another directory, and a missing token under the selected
+    home is a disconnect.
+    """
+    selected = os.environ.get("SOTTO_HOME")
+    if (not selected or not os.path.isabs(selected) or "\x00" in selected
+            or any(part in (".", "..") for part in selected.split("/"))):
+        return ""
+    candidate = os.path.join(selected, "google_token.json")
+    return candidate if os.path.isfile(candidate) else ""
 
 
-def google_service(api: str, version: str):
+def google_service(api: str, version: str, *, timeout=GOOGLE_HTTP_TIMEOUT):
     path = token_path()
     if not path:
         raise RuntimeError("Google isn't connected on this host (no google_token.json)")
@@ -120,12 +124,12 @@ def google_service(api: str, version: str):
     from google_auth_httplib2 import AuthorizedHttp
     import httplib2
     credentials = Credentials.from_authorized_user_file(path)
-    transport = AuthorizedHttp(credentials, http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT))
+    transport = AuthorizedHttp(credentials, http=httplib2.Http(timeout=timeout))
     return build(api, version, http=transport, cache_discovery=False)
 
 
-def gmail_service():
-    return google_service("gmail", "v1")
+def gmail_service(*, timeout=GOOGLE_HTTP_TIMEOUT):
+    return google_service("gmail", "v1", timeout=timeout)
 
 
 def fetch_message(service, message_id: str) -> dict:

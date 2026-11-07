@@ -178,6 +178,33 @@ def test_dropped_urgent_ledger_name_flagged():
     assert not any("Dana Wu" in x for x in v)
 
 
+def test_dropped_open_loop_patch_supplies_exact_saved_task_and_date():
+    row = {'anchor_key': 'intro-call', 'contact_name': 'Alex Stone', 'status': 'open',
+           'created_at': '2026-08-05 17:30:00', 'deadline': '2026-08-09',
+           'summary': 'Alex asked for a Project Cedar call after the investor introduction',
+           'ask': 'Reply to Alex with a time for the Project Cedar call'}
+    violations = bv.validate('## Needs Attention Now\nNo task selected.', [], SRC,
+                             action_ledger=[row], today='2026-08-10')
+    patch = next(v for v in violations if v.startswith('dropped-open-loop:'))
+    assert 'intro-call' in patch and '2026-08-05' in patch
+    assert row['summary'] in patch and row['ask'] in patch
+
+
+def test_dropped_historical_task_warns_first_revision_against_two_dated_field_sentences():
+    row = {'anchor_key': 'group-deck', 'contact_name': 'Research Group', 'status': 'open',
+           'created_at': '2026-08-05', 'deadline': '2026-08-09',
+           'summary': 'Dana shared a trial-project deck and raised a review tomorrow.',
+           'ask': 'Review the deck and ask Dana about the data room tomorrow.'}
+    dropped = bv._check_open_ledger_coverage('## Needs Attention Now\nNo task selected.',
+                                             [row], '2026-08-10')
+    assert len(dropped) == 1
+    assert 'one complete canonical ask' in dropped[0]
+    assert 'not two separately dated task sentences' in dropped[0]
+    current = dict(row, created_at='2026-08-10')
+    assert 'not two separately dated task sentences' not in bv._check_open_ledger_coverage(
+        '## Needs Attention Now\nNo task selected.', [current], '2026-08-10')[0]
+
+
 def test_a_non_urgent_loop_is_never_demanded():
     """The contract change, in one assertion: a quiet open loop the brief didn't name is NOT a
     violation — it belongs to the count line and the proactive lane, not to the brief."""
@@ -206,6 +233,134 @@ def test_named_anywhere_satisfies_the_contract():
           "## Needs Attention Now\n**Dana Wu**<!--id:d@x.com|ch:email--> owes the signed LOI")
     assert not any(x.startswith("dropped-open-loop")
                    for x in bv.validate(md, [], SRC, action_ledger=LEDGER, today=TODAY))
+
+
+def test_marked_open_task_needs_its_saved_summary_ask_and_historical_date():
+    old = {'anchor_key': 'phone-relay', 'contact_name': 'Alex Stone', 'status': 'open',
+           'created_at': '2026-08-05 17:30:00',
+           'summary': 'Alex wants to connect today or tomorrow about Project Cedar.',
+           'ask': 'Tell Alex your availability for a Project Cedar call tomorrow.'}
+    group = {'anchor_key': 'group-deck', 'contact_name': 'Project Group', 'status': 'open',
+             'created_at': '2026-08-10 09:00:00',
+             'summary': 'Dana shared the clinical trial deck and flagged a data room review tomorrow.',
+             'ask': 'Review the deck and coordinate with Dana on data room next steps.'}
+    partial = ('## Needs Attention Now\n**Alex Stone**<!--id:alex@example.test|ch:email-->'
+               '<!--loop:phone-relay-->: Alex wants to connect today or tomorrow about Project Cedar. '
+               'Reply with availability.\n'
+               '**Project Group**<!--loop:group-deck-->: Dana flagged a data room review tomorrow.\n')
+    flagged = [v for v in bv.validate(partial, [], SRC, action_ledger=[old, group],
+                                       today='2026-08-10') if v.startswith('marked-loop-wording:')]
+    assert len(flagged) == 2
+    assert 'phone-relay' in flagged[0] and 'Aug 5' in flagged[0]
+    assert 'group-deck' in flagged[1] and 'clinical trial deck' in flagged[1]
+    complete = ('## Needs Attention Now\n**Alex Stone**<!--id:alex@example.test|ch:email-->'
+                '<!--loop:phone-relay-->: From Aug 5: “Alex wants to connect today or tomorrow '
+                'about Project Cedar. Tell Alex your availability for a Project Cedar call tomorrow.”\n'
+                '**Project Group**<!--loop:group-deck-->: Dana shared the clinical trial deck '
+                'and flagged a data room review tomorrow. Review the deck and coordinate with '
+                'Dana on data room next steps.\n')
+    assert not [v for v in bv.validate(complete, [], SRC, action_ledger=[old, group],
+                                       today='2026-08-10') if v.startswith('marked-loop-wording:')]
+
+
+def test_marked_wording_check_does_not_rewrite_handled_or_backstop_lines():
+    row = {'anchor_key': 'deck', 'contact_name': 'Alex Stone', 'status': 'open',
+           'summary': 'Send the strategy deck', 'ask': 'Reply with the deck link'}
+    markdown = ('## ✅ Already Handled\n**Alex Stone**<!--loop:deck-->: Sent it.\n'
+                '## Still open\n- **Alex Stone**: Send the strategy deck <!--loop:deck-->')
+    assert not [v for v in bv.validate(markdown, [], SRC, action_ledger=[row])
+                if v.startswith('marked-loop-wording:')]
+
+
+def test_one_marked_historical_task_does_not_repeat_its_summary_and_ask_as_two_dated_sentences():
+    row = {'anchor_key': 'group-deck', 'contact_name': 'Research Group', 'status': 'open',
+           'created_at': '2026-08-05 17:30:00',
+           'summary': 'From Aug 5: Dana shared a deck for a trial project and raised a review tomorrow.',
+           'ask': 'Review the deck and ask Dana whether to examine the data room tomorrow.'}
+    doubled = ('## Needs Attention Now\n**Research Group**<!--loop:group-deck--> - '
+               'From Aug 5: “Dana shared a deck for a trial project and raised a review tomorrow.” '
+               'From Aug 5: “Review the deck and ask Dana whether to examine the data room tomorrow.”')
+    violations = bv._check_marked_loop_wording(doubled, [row], '2026-08-10')
+    assert len(violations) == 1
+    assert 'one complete canonical ask' in violations[0]
+    assert 'preserve any separate asks' in violations[0]
+    # A single ask with distinct context, or one quotation carrying both fields, is not a pair.
+    concise = ('## Needs Attention Now\n**Research Group**<!--loop:group-deck--> - '
+               'Dana shared the trial-project deck. From Aug 5: “Review the deck and ask Dana '
+               'whether to examine the data room tomorrow.”')
+    assert bv._check_marked_loop_wording(concise, [row], '2026-08-10') == []
+    combined = doubled.replace('” From Aug 5: “', ' ').replace('tomorrow. Review', 'tomorrow. Review')
+    assert bv._check_marked_loop_wording(combined, [row], '2026-08-10') == []
+    # Two marked obligations keep their independent wording and dates.
+    sibling = dict(row, anchor_key='other-deck', contact_name='Other Person',
+                   created_at='2026-08-06', ask='Send a separate signed budget tomorrow.')
+    separate = doubled + '<!--loop:other-deck--> From Aug 6: “Send a separate signed budget tomorrow.”'
+    assert not [v for v in bv._check_marked_loop_wording(separate, [row, sibling], '2026-08-10')
+                if 'one complete canonical ask' in v]
+
+
+def test_marked_historical_relative_day_requires_year_across_years():
+    row = {'anchor_key': 'old-call', 'contact_name': 'Alex Stone', 'status': 'open',
+           'created_at': '2025-08-05 17:30:00',
+           'summary': 'Alex asked to call tomorrow about Project Cedar',
+           'ask': 'Reply to Alex about Project Cedar tomorrow'}
+    line = ('## Needs Attention Now\n**Alex Stone**<!--loop:old-call-->: From Aug 5: '
+            '“Alex asked to call tomorrow about Project Cedar.” '
+            'Reply to Alex about Project Cedar tomorrow.')
+    flagged = bv._check_marked_loop_wording(line, [row], '2026-08-10')
+    assert len(flagged) == 1 and 'Aug 5, 2025' in flagged[0]
+    dated = line.replace('Aug 5:', 'Aug 5, 2025:').replace(
+        'Project Cedar.” Reply to Alex about Project Cedar tomorrow.',
+        'Project Cedar. Reply to Alex about Project Cedar tomorrow.”')
+    assert bv._check_marked_loop_wording(dated, [row], '2026-08-10') == []
+
+
+def test_historical_relative_ask_outside_dated_quote_is_sent_to_existing_revision():
+    row = {'anchor_key': 'relay', 'status': 'open', 'contact_name': 'Alex Stone',
+           'created_at': '2026-08-05',
+           'summary': 'Alex asked to connect today or tomorrow about Project Cedar.',
+           'ask': 'Tell Alex your availability for a call tomorrow about Project Cedar.'}
+    line = ('## Needs Attention Now\n**Alex Stone**<!--loop:relay-->: From Aug 5: '
+            '“Alex asked to connect today or tomorrow about Project Cedar.” '
+            'Tell Alex your availability for a call tomorrow about Project Cedar.')
+    flagged = bv._check_marked_loop_wording(line, [row], '2026-08-10')
+    assert len(flagged) == 1 and 'outside dated quotation' in flagged[0]
+    sibling = line.replace('<!--loop:relay-->', '<!--loop:relay--><!--loop:current-call-->')
+    assert not [v for v in bv._check_marked_loop_wording(sibling, [row], '2026-08-10')
+                if 'outside dated quotation' in v]
+    # The entire historical summary and ask in one dated single-quoted span is safe.
+    dated_single = ('## Needs Attention Now\n**Alex Stone**<!--loop:relay-->: From Aug 5: '
+                    '‘Alex asked to connect today or tomorrow about Project Cedar. '
+                    'Tell Alex your availability for a call tomorrow about Project Cedar.’')
+    assert bv._check_marked_loop_wording(dated_single, [row], '2026-08-10') == []
+
+
+def test_relay_loop_action_cannot_borrow_email_recipient_from_distinct_current_task():
+    relay = {'anchor_key': 'follow_up:cid:relay', 'status': 'open',
+             'contact_name': 'Alex Stone', 'contact_identifier': '+15550001000',
+             'summary': 'A relay mentioned Alex wanted a call',
+             'ask': 'Ask Alex about the old call'}
+    current = {'anchor_key': 'follow_up:cid:current', 'status': 'open',
+               'contact_name': 'Alex Stone', 'contact_identifier': 'alex@example.test',
+               'summary': 'Alex replied after the introduction',
+               'ask': 'Answer Alex with a call time'}
+    legacy = {'anchor_key': 'thread:original-thread', 'status': 'open',
+              'contact_name': 'Alex Stone', 'contact_identifier': '',
+              'summary': 'Alex asked for a call', 'ask': 'Reply with a time'}
+    action = {'loopId': relay['anchor_key'], 'contactIdentifier': 'alex@example.test'}
+    flagged = bv._check_action_loop_recipients([action], [relay, current, legacy])
+    assert len(flagged) == 1 and 'loop-recipient-mismatch:' in flagged[0]
+    assert relay['summary'] in flagged[0] and relay['ask'] in flagged[0]
+    assert any(v.startswith('loop-recipient-mismatch:') for v in bv.validate(
+        '## Needs Attention Now\n**Alex Stone**<!--id:alex@example.test|ch:email-->'
+        '<!--loop:follow_up:cid:relay-->: old call.', [action],
+        'alex@example.test +15550001000', action_ledger=[relay, current, legacy],
+        allowed_identifiers={'alex@example.test', '5550001000'}))
+    assert bv._check_action_loop_recipients(
+        [{**action, 'loopId': current['anchor_key']}], [relay, current, legacy]) == []
+    assert bv._check_action_loop_recipients(
+        [{**action, 'loopId': legacy['anchor_key'], 'emailThreadId': 'original-thread'}],
+        [relay, current, legacy]) == []  # An exact thread is not proof of its sender.
 
 
 def test_resolved_and_nameless_entries():
@@ -426,3 +581,69 @@ def test_printed_counted_and_surfaced_partition_the_open_rows():
     assert [e["contact_name"] for e in missed] == ["Maya Chen"]
     assert [e["contact_name"] for e in counted] == ["Ron Diaz", "nikunj.k17"]
     assert len(missed) + len(counted) + 1 == len(bv.open_entries(rows))     # +1 = Ana, surfaced
+
+
+def test_coming_up_counts_visible_schedule_rows_only():
+    rows = '\n'.join(f'- 9:0{i} AM — Meeting {i}' for i in range(5))
+    assert bv._check_coming_up_length(f'**Coming Up**\n{rows}\n<!--meeting:event_id:abc-->\n') == []
+    assert bv._check_coming_up_length(f'**Coming Up**\n{rows}\n\n**Already Handled**\n- **A**: done\n- **B**: done\n') == []
+    assert bv._check_coming_up_length(f'**Coming Up**\n{rows}\n\nA newer Sotto is available.\nSay yes to keep that rule.\n') == []
+    assert bv._check_coming_up_length(f'**Coming Up**\n{rows}\n- 3:00 PM — Sixth\n')  # a real overflow
+
+
+def test_coming_up_stops_at_unheaded_marked_tasks_after_calendar():
+    rows = '\n'.join(f'- Wed Oct 14 {hour}:00 AM: Meeting {hour}' for hour in range(8, 13))
+    tasks = '\n'.join(f'- Reply to Person {i} <!--loop:task-{i}-->' for i in range(5))
+    markdown = f'**Coming Up**\n{rows}\n\n<!--meeting:event_id:one|start:2026-10-14-->\n\n{tasks}\n'
+    assert bv._check_coming_up_length(markdown) == []
+    assert bv._check_coming_up_length(f'**Coming Up**\n{rows}\n- Wed Oct 14 1:00 PM: Sixth\n')
+    assert bv._check_coming_up_length(
+        f'**Coming Up**\n{rows}\n\n- Wed Oct 14 1:00 PM: Sixth <!--loop:unexpected-->\n')
+
+
+def test_marked_loop_wording_accepts_a_line_showing_the_whole_ask():
+    row = {'anchor_key': 'deck', 'status': 'open', 'contact_name': 'Alex Stone',
+           'summary': 'Alex asked whether you could review the Q4 board deck', 'ask': 'Review the Q4 board deck',
+           'created_at': '2026-10-09'}
+    shown = '## Needs Attention Now\n- **Alex Stone**: Review the Q4 board deck. <!--loop:deck-->\n'
+    assert bv._check_marked_loop_wording(shown, [row], '2026-10-10') == []
+    partial = '## Needs Attention Now\n- **Alex Stone**: The Q4 deck. <!--loop:deck-->\n'
+    assert bv._check_marked_loop_wording(partial, [row], '2026-10-10')
+
+
+def test_backstop_sections_are_not_model_inventory_or_dropped_loops():
+    row = {'anchor_key': 'memo', 'status': 'open', 'contact_name': 'Priya Raman', 'chased_count': 1,
+           'contact_identifier': 'p@x.com', 'summary': 'Send the diligence memo', 'created_at': '2026-10-08'}
+    other = {**row, 'anchor_key': 'lease', 'contact_identifier': 'd@x.com', 'contact_name': 'Dana Wu',
+             'summary': 'Return the signed lease'}
+    md = ('## Still open\n- **Priya Raman**: Send the diligence memo <!--loop:memo-->\n'
+          '- **Dana Wu**: Return the signed lease <!--loop:lease-->\n- 2 other open loops.\n')
+    flagged = bv.validate(md, [], '', action_ledger=[row, other], today='2026-10-10')
+    assert any(v.startswith('open-loop-inventory') for v in flagged)  # model-written: still flagged
+    final = bv.validate(md, [], '', action_ledger=[row, other], today='2026-10-10',
+                        deterministic_sections=('still open',))
+    assert not [v for v in final if v.startswith(('open-loop-inventory', 'dropped-open-loop'))]
+
+
+def test_coming_up_still_counts_real_overflow_the_composer_did_not_rewrite():
+    rows = '\n'.join(f'- 9:0{i} AM: Meeting {i}' for i in range(7))
+    assert bv._check_coming_up_length(f'**Coming Up**\n**Today**\n{rows}\n')
+    spaced = '- a\n\n' + '\n'.join(f'- {c}' for c in 'bcdef')
+    assert bv._check_coming_up_length(f'**Coming Up**\n{spaced}\n')
+
+
+def test_only_the_composers_last_block_is_exempt_from_the_inventory_rule():
+    model = '## Still open\n- **A Person**: one\n- **B Person**: two\n'
+    composer = '## Still open\n- **C Person**: three <!--loop:c-->\n- **D Person**: four <!--loop:d-->\n'
+    flagged = bv._check_no_open_loop_inventory(model + composer, ('still open',))
+    assert len(flagged) == 1  # the model-written list is still inventory
+    assert bv._check_no_open_loop_inventory(composer, ('still open',)) == []
+
+
+def test_composed_action_prose_may_repeat_its_distinct_summary_and_next_step():
+    action = {'id': 'one', 'contextSummary': 'A partner supplied the clinical dataset deck.',
+              'contextAsk': 'Review the data room and discuss pricing.',
+              'prose': 'A partner supplied the clinical dataset deck. Review the data room and discuss pricing.'}
+    assert not bv._check_action_field_distinctness([action])
+    repeated = dict(action, contextAsk=action['contextSummary'])
+    assert bv._check_action_field_distinctness([repeated])

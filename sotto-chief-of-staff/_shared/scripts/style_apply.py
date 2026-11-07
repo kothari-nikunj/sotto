@@ -19,10 +19,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
 from personal_context import render_feedback  # noqa: E402
 import preferences  # noqa: E402
-
-
-def _root():
-    return os.environ.get("SOTTO_DATA", "/data")
+from tzchain import data_root as _root  # noqa: E402
 
 
 def _bucket(channel: str, person_context: str | None) -> str:
@@ -31,12 +28,13 @@ def _bucket(channel: str, person_context: str | None) -> str:
     return "personal_message" if person_context == "personal" else "work_message"
 
 
-def _quote(samples: list, limit: int, header: str) -> list:
+def _quote(samples: list, limit: int, header: str, seen: set[str]) -> list:
     lines, shown = [], 0
     for s in samples:
         t = (s.get("text") or "").strip()
-        if not t:
+        if not t or t in seen:
             continue
+        seen.add(t)
         lines.append(f"> {t}")
         shown += 1
         if shown >= limit:
@@ -44,19 +42,75 @@ def _quote(samples: list, limit: int, header: str) -> list:
     return ([f"\n### {header}"] + lines) if lines else []
 
 
-def apply(req: dict) -> dict:
+def _project_style(style, permitted):
+    """Read-only admitted view: never reuse aggregates from withheld samples."""
+    import style_extract  # noqa: PLC0415
+    from source_context import allowed  # noqa: PLC0415
+    sources = set(style_extract.NORMALIZED_CHANNEL_SOURCES.values()) | {'contacts', 'calendar'}
+    original = {source: bool(allowed(source)) for source in sources}
+    grants = {source: original[source] and bool(permitted(source)) for source in sources}
+    attribution = grants['contacts'] and grants['calendar']
+    def samples(rows):
+        kept = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            channel = row.get('channel')
+            source = style_extract.NORMALIZED_CHANNEL_SOURCES.get(channel)
+            if not source or not grants[source] or not isinstance(row.get('text'), str):
+                continue
+            email = channel in ('email', 'gmail', 'apple_mail')
+            if not email and not attribution:
+                continue
+            item = {key: row[key] for key in ('text', 'channel', 'quality', 'date', 'added_at',
+                    'confirmed_at', 'source') if key in row}
+            item['context'] = 'work' if email else row.get('context', 'unknown')
+            if attribution:
+                for key in ('canonical_id', 'recipient'):
+                    if isinstance(row.get(key), str):
+                        item[key] = row[key]
+            item['bucket'] = style_extract.bucket_for_sample(item)
+            kept.append(item)
+        return kept
+    canonical = {bucket: [] for bucket in style_extract.ALL_BUCKETS}
+    for rows in (style.get('canonical') or {}).values():
+        for sample in samples(rows):
+            canonical[sample['bucket']].append(sample)
+    recent, confirmed = samples(style.get('recent') or []), samples(style.get('confirmed') or [])
+    pool = [sample for rows in canonical.values() for sample in rows]
+    projected = {'canonical': canonical, 'recent': recent, 'confirmed': confirmed,
+        'per_person': style_extract._rebuild_per_person(pool + recent) if attribution else {},
+        'master_by_context': {bucket: style_extract.analyze_master_style([sample['text'] for sample in rows]) if rows else {}
+                              for bucket, rows in canonical.items()}}
+    def check():
+        if any(bool(allowed(source)) != value for source, value in original.items()):
+            raise ValueError('style permission changed')
+    return projected, check
+
+
+def apply(req: dict, *, permitted=None) -> dict:
     path = os.path.join(_root(), "style.json")
     style = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             style = json.load(f)
 
+    check = None
+    if permitted is not None:
+        style, check = _project_style(style, permitted)
     channel = req.get("channel", "imessage")
     recipient = (req.get("recipient") or "").lower()
     cid = req.get("canonical_id")
     per_person = style.get("per_person") or {}
     person = per_person.get(cid) or per_person.get(f"name:{recipient}") or \
         next((p for p in per_person.values() if (p.get("name") or "").lower() == recipient), None)
+
+    if permitted is not None:
+        if cid:
+            person = per_person.get(cid)
+        else:
+            matches = [p for p in per_person.values() if (p.get("name") or "").lower() == recipient]
+            person = matches[0] if len(matches) == 1 else None
 
     bucket = _bucket(channel, person.get("context") if person else req.get("context"))
     canonical = (style.get("canonical") or {}).get(bucket, [])
@@ -66,11 +120,10 @@ def apply(req: dict) -> dict:
 
     parts = ["## How to write this — match the user's actual voice"]
     source = "bucket"
-    person_texts = set()
+    quoted_texts = set()
     if person and person.get("samples"):
         parts += _quote(person["samples"], 8,
-                        f"How the user actually writes to {person.get('name') or recipient} — match this voice, length, punctuation, and tone exactly")
-        person_texts = {(s.get("text") or "")[:80] for s in person["samples"]}
+                        f"How the user actually writes to {person.get('name') or recipient} — match this voice, length, punctuation, and tone exactly", quoted_texts)
         if person.get("notes"):
             parts.append("(" + "; ".join(person["notes"]) + ")")
         source = "per_person"
@@ -79,20 +132,19 @@ def apply(req: dict) -> dict:
         # Newest first: `confirmed` is appended to, so list order is oldest-first and the four quoted
         # would otherwise freeze on the first four ever confirmed.
         confirmed.sort(key=lambda s: str(s.get("confirmed_at") or ""), reverse=True)
-        parts += _quote(confirmed, 4, "Drafts the user has shipped before (highest signal)")
+        parts += _quote(confirmed, 4, "Past shipped drafts (strong voice examples, not current facts)", quoted_texts)
         if source == "bucket":
             source = "confirmed"
 
     has_person = bool(person and person.get("samples"))
     can_budget, rec_budget = (4, 2) if has_person else (7, 3)
-    canon_fresh = [s for s in sorted(canonical, key=lambda s: s.get("quality", 0), reverse=True)
-                   if (s.get("text") or "")[:80] not in person_texts]
+    canon_fresh = sorted(canonical, key=lambda s: s.get("quality", 0), reverse=True)
     if canon_fresh:
-        parts += _quote(canon_fresh, can_budget, f"How the user writes {bucket.replace('_', ' ')}s")
+        parts += _quote(canon_fresh, can_budget, f"How the user writes {bucket.replace('_', ' ')}s", quoted_texts)
         if source == "bucket":
             source = "canonical"
     if recent:
-        parts += _quote(recent, rec_budget, "Recent messages (freshest voice)")
+        parts += _quote(recent, rec_budget, "Recent messages (freshest voice)", quoted_texts)
         if source == "bucket":
             source = "recent"
 
@@ -126,12 +178,14 @@ def apply(req: dict) -> dict:
     # by the extractor but has NO writer; the edit-diff arc is still open. Nothing is rendered from
     # it here: a prompt section with no producer is dead real estate on the drafter's hottest path.)
 
-    if source == "bucket" and len(parts) == 1:
+    if source == "bucket" and (permitted is not None or len(parts) == 1):
         # Nothing learned yet — give a minimal honest instruction.
         parts.append("(No writing samples yet — write concise and natural; mirror the incoming message's register.)")
-    parts.append(render_feedback())
-    parts.append('\nWrite as if you ARE this person. The samples above are the ground truth — if in doubt, re-read them.')
+    parts.append(render_feedback() if permitted is None else render_feedback(permitted=permitted))
+    parts.append('\nWrite as if you ARE this person. The samples above guide style only, not current facts, recipients, or completed owner actions. Use the actual current thread and explicit owner statements for factual claims, preserving their qualifiers.')
 
+    if check is not None:
+        check()
     return {"guidance": "\n".join(parts), "bucket": bucket, "source": source,
             "master": master, "has_person": has_person, "tone_notes": tone_notes}
 

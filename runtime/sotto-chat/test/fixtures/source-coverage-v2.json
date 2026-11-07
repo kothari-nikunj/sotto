@@ -1,0 +1,276 @@
+{
+  "apple_notes": [
+    {
+      "folder": "Notes",
+      "id": 1,
+      "modified_date": "2026-10-21 04:42:09",
+      "snippet": "Fixture note text",
+      "title": "Fixture note"
+    }
+  ],
+  "calls": [],
+  "chrome_history": [
+    {
+      "domain": "example.test",
+      "top_titles": [
+        "Fixture page"
+      ],
+      "visit_count": 1
+    }
+  ],
+  "contacts": [
+    {
+      "emails": [],
+      "name": "Fixture Person",
+      "notes": "",
+      "phones": [
+        "+15555550101"
+      ]
+    }
+  ],
+  "contacts_total": 1,
+  "deferred_unread_imessage": [],
+  "deferred_unread_whatsapp": [],
+  "generated_at": "2026-10-21T04:42:09Z",
+  "imessage": [
+    {
+      "chat_guid": null,
+      "content_partial": false,
+      "group_name": null,
+      "group_participants": [],
+      "handle": "+15555550101",
+      "is_from_me": false,
+      "is_group_chat": false,
+      "text": "Fixture message",
+      "timestamp": "2026-10-21 04:42:09"
+    }
+  ],
+  "recent_files": [],
+  "reminders": [
+    {
+      "due_date": "2026-10-23 04:42:09",
+      "title": "Fixture reminder"
+    },
+    {
+      "created_date": "2026-10-26 04:42:09",
+      "title": "Fixture future-created reminder"
+    }
+  ],
+  "safari_history": [],
+  "safari_search_queries": [],
+  "screen_time": {
+    "top_apps": [],
+    "total_minutes": 0.0
+  },
+  "search_queries": [],
+  "source_coverage": {
+    "apple_notes": {
+      "bounded": true,
+      "components": {},
+      "content_partial": false,
+      "effective_window": {
+        "basis": "modified",
+        "since": "2026-10-14T04:42:09Z",
+        "until": null
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": 0,
+      "query_row_caps": [
+        30
+      ],
+      "requested_window": {
+        "since": "2026-10-20T04:42:09Z",
+        "until": "2026-10-21T04:42:09Z"
+      },
+      "rows_returned": 1,
+      "rows_scanned": 1,
+      "scan_observed": true,
+      "status": "ok"
+    },
+    "chrome": {
+      "bounded": true,
+      "components": {
+        "search_queries": {
+          "effective_window": {
+            "basis": "sent",
+            "since": "2026-10-20T04:42:09Z",
+            "until": null
+          },
+          "failure_category": "query",
+          "last_successful_read_at": null,
+          "omitted_rows": null,
+          "query_row_caps": [
+            15
+          ],
+          "rows_returned": 0,
+          "status": "failed"
+        }
+      },
+      "content_partial": true,
+      "effective_window": {
+        "basis": "sent",
+        "since": "2026-10-20T04:42:09Z",
+        "until": null
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": null,
+      "query_row_caps": [
+        5000
+      ],
+      "requested_window": {
+        "since": "2026-10-20T04:42:09Z",
+        "until": "2026-10-21T04:42:09Z"
+      },
+      "rows_returned": 1,
+      "rows_scanned": 1,
+      "scan_observed": true,
+      "status": "partial"
+    },
+    "contacts": {
+      "bounded": true,
+      "components": {},
+      "content_partial": false,
+      "effective_window": {
+        "basis": "inventory",
+        "since": null,
+        "until": null
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": 0,
+      "query_row_caps": [],
+      "requested_window": {
+        "since": "2026-10-20T04:42:09Z",
+        "until": "2026-10-21T04:42:09Z"
+      },
+      "rows_returned": 1,
+      "rows_scanned": 0,
+      "scan_observed": false,
+      "status": "ok"
+    },
+    "deferred_unread_imessage": {
+      "attachments": {
+        "body": "not_read",
+        "metadata": "unknown"
+      },
+      "bounded": true,
+      "components": {},
+      "content_partial": false,
+      "effective_window": {
+        "basis": "sent",
+        "since": "2026-09-21T04:42:09Z",
+        "until": "2026-10-20T04:42:09Z"
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": 0,
+      "query_row_caps": [
+        50
+      ],
+      "requested_window": {
+        "since": "2026-09-21T04:42:09Z",
+        "until": "2026-10-20T04:42:09Z"
+      },
+      "rows_returned": 0,
+      "rows_scanned": 0,
+      "scan_observed": true,
+      "status": "empty"
+    },
+    "imessage": {
+      "attachments": {
+        "body": "not_read",
+        "metadata": "unknown"
+      },
+      "bounded": true,
+      "components": {
+        "deferred_unread": {
+          "effective_window": {
+            "basis": "sent",
+            "since": "2026-09-21T04:42:09Z",
+            "until": "2026-10-20T04:42:09Z"
+          },
+          "failure_category": null,
+          "last_successful_read_at": "2026-10-21T04:42:09Z",
+          "query_row_caps": [
+            50
+          ],
+          "requested_window": {
+            "since": "2026-09-21T04:42:09Z",
+            "until": "2026-10-20T04:42:09Z"
+          },
+          "rows_returned": 0,
+          "status": "ok"
+        }
+      },
+      "content_partial": false,
+      "effective_window": {
+        "basis": "sent",
+        "since": "2026-10-20T04:42:09Z",
+        "until": null
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": 0,
+      "query_row_caps": [
+        1000
+      ],
+      "requested_window": {
+        "since": "2026-10-20T04:42:09Z",
+        "until": "2026-10-21T04:42:09Z"
+      },
+      "rows_returned": 1,
+      "rows_scanned": 1,
+      "scan_observed": true,
+      "status": "ok"
+    },
+    "reminders": {
+      "bounded": true,
+      "components": {},
+      "content_partial": false,
+      "effective_window": {
+        "basis": "due_or_created",
+        "since": "2026-10-14T04:42:09Z",
+        "until": null
+      },
+      "failure_category": null,
+      "last_successful_read_at": "2026-10-21T04:42:09Z",
+      "limit_reached": false,
+      "observed_at": "2026-10-21T04:42:09Z",
+      "omitted_rows": 0,
+      "query_row_caps": [
+        50
+      ],
+      "requested_window": {
+        "since": "2026-10-20T04:42:09Z",
+        "until": "2026-10-21T04:42:09Z"
+      },
+      "rows_returned": 2,
+      "rows_scanned": 2,
+      "scan_observed": true,
+      "status": "ok"
+    }
+  },
+  "source_status": {
+    "apple_notes": "ok",
+    "chrome": "partial",
+    "contacts": "ok",
+    "deferred_unread_imessage": "ok",
+    "imessage": "ok",
+    "reminders": "ok"
+  },
+  "whatsapp": [],
+  "whatsapp_calls": [],
+  "window_hours": 24
+}

@@ -1,0 +1,131 @@
+# Standalone experimental runtime image. Build from the sotto-agent context:
+# docker build --platform linux/arm64 -f runtime/sotto-chat/Dockerfile.runtime -t sotto-chat-runtime:local .
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-build
+WORKDIR /build/runtime/sotto-chat
+COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY runtime/sotto-chat/tsconfig.json runtime/sotto-chat/tsconfig.build.json ./
+COPY runtime/sotto-chat/src/ ./src/
+RUN npm run typecheck && npm run build \
+ && node --input-type=module -e 'await import("./dist/bootstrap/main.js"); await import("chat"); await import("@chat-adapter/telegram"); await import("@photon-ai/chat-adapter-imessage"); await import("@spectrum-ts/core");'
+
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-production
+WORKDIR /build/runtime/sotto-chat
+COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime
+ENV NODE_ENV=production \
+    MASTRA_TELEMETRY_DISABLED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libatomic1 libstdc++6 tini \
+ && groupadd --gid 10000 sotto-runtime \
+ && useradd --uid 10000 --gid 10000 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin sotto-runtime \
+ && groupadd --gid 10001 sotto \
+ && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin sotto \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/runtime/sotto-chat
+COPY --from=node-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-build /build/runtime/sotto-chat/dist ./dist
+COPY --from=node-production /build/runtime/sotto-chat/node_modules ./node_modules
+COPY runtime/sotto-chat/package.json ./package.json
+COPY adapters/sotto/ /app/adapters/sotto/
+COPY runtime/trigger-receiver/ /app/trigger-receiver/
+COPY sotto-chief-of-staff/_shared/lib/tzchain.py /app/trigger-receiver/tzchain.py
+COPY sotto-chief-of-staff/_shared/lib/history_coverage.py /app/trigger-receiver/history_coverage.py
+COPY sotto-chief-of-staff/_shared/lib/work_queue.py /app/trigger-receiver/work_queue.py
+COPY sotto-chief-of-staff/_shared/lib/routine_cursor.py /app/trigger-receiver/routine_cursor.py
+COPY sotto-chief-of-staff/_shared/lib/routine_cursor.NOTICE /app/trigger-receiver/routine_cursor.NOTICE
+COPY sotto-chief-of-staff/_shared/lib/calendar_context.py /app/trigger-receiver/calendar_context.py
+COPY sotto-chief-of-staff/_shared/lib/source_catalog.py /app/trigger-receiver/source_catalog.py
+COPY sotto-chief-of-staff/_shared/lib/message_targets.py /app/trigger-receiver/message_targets.py
+COPY sotto-chief-of-staff/ /app/sotto-skills/
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt \
+ && chmod -R go-w /app
+
+# Credential-free offline image checks: resolve the real packaged skill index, validate a private
+# explicit config, confirm config check does not create runtime state, and exercise Python CLI help.
+USER 10000:10000
+RUN <<'SH'
+set -eu
+umask 077
+cat > /tmp/runtime-image-check.json <<'JSON'
+{"version":1,"channel":"telegram","stateDirectory":"/tmp/runtime-image-check-state","mediaRoot":"/tmp/runtime-image-check-media","bearerToken":"offline-config-check-only-not-a-credential-123456789","port":0,"owner":{"accountId":"offline-check-owner","ownerId":"123456789"},"lineKey":"primary","target":"owner","providerThreadId":"telegram:123456789","credentials":{"telegramToken":"offline-check-only","telegramLinkFile":{"bot_token":"offline-check-only","allowed_user":123456789}},"instructions":"Offline package check only.","modelProxy":{"origin":"https://proxy.example","bearer":"offline-check-only","chatModelId":"chat-model","nativeMediaModelId":"media-model"},"skillPackRoot":"/app/sotto-skills"}
+JSON
+node /app/runtime/sotto-chat/dist/bootstrap/main.js --check /tmp/runtime-image-check.json
+test ! -e /tmp/runtime-image-check-state
+node --input-type=module - <<'JS'
+import { resolveAgentSkills } from '@mastra/core/skills';
+import { readSkillIndex } from './dist/tools/skills.js';
+import { loadAgentSkills } from './dist/agent/skill-loader.js';
+const indexed = await readSkillIndex('/app/sotto-skills');
+const skills = resolveAgentSkills(await loadAgentSkills(indexed.map(entry => entry.path)));
+const loaded = await skills.list();
+if (JSON.stringify(loaded.map(skill => skill.name).sort()) !==
+    JSON.stringify(indexed.map(skill => skill.name).sort())) {
+  throw new Error('Packaged skills did not load in the native model runtime');
+}
+console.log(`Native runtime loaded all ${loaded.length} packaged skills`);
+JS
+python3 -I -B /app/adapters/sotto/run.py --help >/dev/null
+python3 -I -B /app/adapters/sotto/google_api.py --help >/dev/null
+python3 -I -B /app/adapters/sotto/google_setup.py --help >/dev/null
+python3 -I -B -c 'import google.auth, googleapiclient.discovery'
+SOTTO_DEPLOYMENT_MODE=managed SOTTO_DATA=/tmp/runtime-image-receiver-check \
+SOTTO_SKILLS_ROOT=/app/sotto-skills \
+python3 -I -B - <<'PY'
+import grp
+import importlib.util
+import pwd
+import subprocess
+import sys
+from pathlib import Path
+for path in ('/app/trigger-receiver', '/app/adapters/sotto'):
+    sys.path.insert(0, path)
+import control_vault, managed_exec, model_lease, photon_owner, runtime_lock, tenant_lifecycle
+for script in ('root_supervisor.py', 'prepare_fresh.py'):
+    result = subprocess.run([sys.executable, '-I', '-B', '/app/adapters/sotto/' + script,
+                             '--invalid'], cwd='/tmp', capture_output=True, text=True)
+    assert result.returncode == 2 and 'Traceback' not in result.stderr, (script, result.stderr)
+import root_supervisor, role_stager, prepare_fresh
+assert all(callable(module.main) for module in (root_supervisor, role_stager, prepare_fresh))
+assert control_vault.get({}) == ''
+account = pwd.getpwnam('sotto')
+assert (account.pw_uid, account.pw_gid) == (10001, 10001)
+assert grp.getgrgid(account.pw_gid).gr_name == 'sotto'
+receiver_path = Path('/app/trigger-receiver/receiver.py')
+spec = importlib.util.spec_from_file_location('receiver_image_check', receiver_path)
+receiver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(receiver)
+assert receiver._runtime_adapter().__name__ == 'sotto_runtime_api'
+expected = {'sotto-morning-brief', 'sotto-evening-brief', 'sotto-relationship-pulse',
+            'sotto-proactive', 'sotto-midday-digest'}
+jobs = receiver._sotto_cron_jobs()
+assert {job[0] for job in jobs} == expected
+brief = str(receiver_path.with_name('brief_runner.py'))
+procedure = str(receiver_path.with_name('procedure_runner.py'))
+receiver._require_sotto_procedure([sys.executable, brief])
+receiver._require_sotto_procedure([sys.executable, procedure])
+memory = receiver._find_sotto_script('_shared', 'scripts', 'memory_cycle.py')
+assert memory
+receiver._require_sotto_procedure([sys.executable, memory])
+try:
+    receiver._require_sotto_procedure(['/bin/sh', '-c', 'true'])
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('undeclared runner was admitted')
+assert not Path('/tmp/runtime-image-receiver-check').exists()
+print('receiver package, fixed manifest, adapters and Sotto runner fence passed')
+PY
+rm -f /tmp/runtime-image-check.json
+SH
+
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "/app/runtime/sotto-chat/dist/bootstrap/main.js"]
+CMD ["--config", "/run/sotto/runtime.json"]

@@ -183,3 +183,13 @@ def test_shared_prose_rule_preserves_destinations_and_machine_text():
     assert cf.prose_punctuation(normalized) == normalized
     assert cf.to_imessage('Ready — reply today.') == 'Ready - reply today.'
     assert cf.to_chat('Ready — reply today.') == 'Ready - reply today.'
+
+
+def test_handled_compaction_stops_before_deterministic_sections():
+    text = ('Already Handled\nAlex: sent the contract.\n\nStill open\n'
+            'Dana: review the proposal.\n\nWeekly review\nKeep it or snooze it?\n\nFiltered\nNothing.')
+    out = cf.compact_handled(text)
+    assert '• Alex: sent the contract.' in out
+    assert '\nStill open\nDana:' in out
+    assert '\nWeekly review\nKeep it' in out
+    assert '• Still open' not in out

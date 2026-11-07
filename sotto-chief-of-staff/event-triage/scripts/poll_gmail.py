@@ -3,7 +3,7 @@
 poll_gmail.py — cloud-side email events for the Phase 2 funnel (no Pub/Sub setup burden).
 
 The receiver's Gmail poll thread runs this every SOTTO_EMAIL_POLL_SECS. One run:
-  1. locate the google-workspace `google_api.py` CLI (same discovery as gather_google.py),
+  1. locate Sotto's packaged `google_api.py` CLI (same discovery as gather_google.py),
   2. page through fixed, at-most-24-hour inbox slices (70 messages/pass), plus a
      smaller sent lane (30/pass):
      the user's OWN outbound mail, marked `is_from_me: true`, which Tier 0 queues as a silent
@@ -20,11 +20,10 @@ The poll command may persist its current page, but never advances beyond it. The
 acknowledges returned message ids with `--ack` only after its event pipeline returns 200; only a
 fully acknowledged page advances the cursor or page token. A failed full read stays on that page.
 
-Env: SOTTO_DATA (state dir), HERMES_HOME (optional install root override).
+Env: SOTTO_DATA (state dir), SOTTO_HOME (Sotto's home: the Google token directory).
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
 import subprocess
@@ -46,6 +45,7 @@ RECOVERY_LOOKBACK_SECONDS = 24 * 3600
 GAP_SLICE_SECONDS = 24 * 3600
 FRESH_GAP_SECONDS = 3600
 
+from textutil import first_nonempty as _pick, format_address as _addr_str  # noqa: E402
 
 def _diag(msg: str) -> None:
     try:
@@ -56,16 +56,12 @@ def _diag(msg: str) -> None:
 
 
 def _find_google_api():
-    """Locate the google-workspace skill's google_api.py (same discovery as gather_google.py)."""
-    bases = [os.environ.get("HERMES_HOME", ""), os.path.expanduser("~/.hermes"),
-             "/root/.hermes", "/usr/local/lib/hermes-agent"]
-    for base in bases:
-        if not base:
-            continue
-        hits = glob.glob(os.path.join(base, "**", "google-workspace", "scripts", "google_api.py"),
-                         recursive=True)
-        if hits:
-            return hits[0]
+    """Locate Sotto's packaged Google CLI (same discovery as gather_google.py)."""
+    source = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "adapters",
+                                          "sotto", "google_api.py"))
+    for candidate in (source, "/app/adapters/sotto/google_api.py"):
+        if os.path.isfile(candidate):
+            return candidate
     return None
 
 
@@ -88,24 +84,8 @@ def _as_list(v):
     return []
 
 
-def _pick(d, *keys):
-    for k in keys:
-        v = d.get(k) if isinstance(d, dict) else None
-        if v not in (None, "", [], {}):
-            return v
-    return None
 
 
-def _addr_str(v):
-    """Coerce a from field to a string (google_api CLI / MCP variants: str, {name,email}, list)."""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        name, email = v.get("name") or "", v.get("email") or v.get("address") or ""
-        return f"{name} <{email}>".strip() if email else (name or "")
-    if isinstance(v, list):
-        return ", ".join(_addr_str(x) for x in v if x)
-    return ""
 
 
 def _seen_path() -> str:
@@ -247,7 +227,7 @@ def _page(service, lane: dict, query: str, maximum: int, now: int, api=None) -> 
 def poll() -> list:
     api = _find_google_api()
     if not api:
-        raise RuntimeError("google_api.py not found — google-workspace skill missing")
+        raise RuntimeError("google_api.py not found — Sotto's packaged Google CLI is missing")
     state = _load_state()
     now = int(time.time())
     service = gmail_service()

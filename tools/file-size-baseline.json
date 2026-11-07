@@ -1,0 +1,504 @@
+{
+  "extensions": [
+    ".bash",
+    ".cjs",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".py",
+    ".rs",
+    ".sh",
+    ".swift",
+    ".ts",
+    ".tsx"
+  ],
+  "files": {
+    "adapters/sotto/fixed_five.py": {
+      "bytes": 38493,
+      "lines": 784
+    },
+    "adapters/sotto/google_api.py": {
+      "bytes": 44536,
+      "lines": 851
+    },
+    "adapters/sotto/runtime_api.py": {
+      "bytes": 35046,
+      "lines": 684
+    },
+    "adapters/sotto/startup_config.py": {
+      "bytes": 40876,
+      "lines": 758
+    },
+    "adapters/sotto/tenant_lifecycle.py": {
+      "bytes": 33450,
+      "lines": 679
+    },
+    "adapters/sotto/test_fixed_five.py": {
+      "bytes": 35688,
+      "lines": 672
+    },
+    "adapters/sotto/test_google_api.py": {
+      "bytes": 51358,
+      "lines": 991
+    },
+    "adapters/sotto/test_sotto_runtime_api.py": {
+      "bytes": 37983,
+      "lines": 749
+    },
+    "cloud/model-proxy/server.py": {
+      "bytes": 57273,
+      "lines": 1003
+    },
+    "cloud/model-proxy/test_server.py": {
+      "bytes": 72040,
+      "lines": 1363
+    },
+    "runtime/sotto-chat/evals/conversation.ts": {
+      "bytes": 38833,
+      "lines": 439
+    },
+    "runtime/sotto-chat/src/agent/runtime.ts": {
+      "bytes": 40963,
+      "lines": 631
+    },
+    "runtime/sotto-chat/src/application.ts": {
+      "bytes": 32338,
+      "lines": 504
+    },
+    "runtime/sotto-chat/src/bootstrap/main.ts": {
+      "bytes": 60062,
+      "lines": 730
+    },
+    "runtime/sotto-chat/src/conversation.ts": {
+      "bytes": 202160,
+      "lines": 3032
+    },
+    "runtime/sotto-chat/src/journal/index.ts": {
+      "bytes": 317643,
+      "lines": 4035
+    },
+    "runtime/sotto-chat/src/tools/knowledge-command.ts": {
+      "bytes": 38239,
+      "lines": 231
+    },
+    "runtime/sotto-chat/src/tools/owner-task-tool-contract.ts": {
+      "bytes": 40459,
+      "lines": 308
+    },
+    "runtime/sotto-chat/test/agent.bridge.test.ts": {
+      "bytes": 32327,
+      "lines": 530
+    },
+    "runtime/sotto-chat/test/bootstrap.test.ts": {
+      "bytes": 83108,
+      "lines": 1240
+    },
+    "runtime/sotto-chat/test/calendar-reschedule.test.ts": {
+      "bytes": 51681,
+      "lines": 395
+    },
+    "runtime/sotto-chat/test/channels-gateway.test.ts": {
+      "bytes": 33835,
+      "lines": 619
+    },
+    "runtime/sotto-chat/test/conversation.test.ts": {
+      "bytes": 85165,
+      "lines": 1458
+    },
+    "runtime/sotto-chat/test/journal.test.ts": {
+      "bytes": 46189,
+      "lines": 748
+    },
+    "runtime/sotto-chat/test/knowledge-command-connected.test.ts": {
+      "bytes": 35304,
+      "lines": 356
+    },
+    "runtime/sotto-chat/test/owner-gmail-draft.test.ts": {
+      "bytes": 60851,
+      "lines": 626
+    },
+    "runtime/sotto-chat/test/owner-loop-connected.test.ts": {
+      "bytes": 39261,
+      "lines": 628
+    },
+    "runtime/sotto-chat/test/owner-loop-receiver-child.py": {
+      "bytes": 58388,
+      "lines": 878
+    },
+    "runtime/sotto-chat/test/owner-meeting-prep.test.ts": {
+      "bytes": 43976,
+      "lines": 595
+    },
+    "runtime/sotto-chat/test/owner-reminder-tool.test.ts": {
+      "bytes": 34709,
+      "lines": 448
+    },
+    "runtime/sotto-chat/test/owner-routine-tool.test.ts": {
+      "bytes": 47063,
+      "lines": 572
+    },
+    "runtime/sotto-chat/test/owner-skill-request.test.ts": {
+      "bytes": 64723,
+      "lines": 678
+    },
+    "runtime/sotto-chat/test/owner-task-tool-connected.test.ts": {
+      "bytes": 47360,
+      "lines": 512
+    },
+    "runtime/sotto-chat/test/owner-task-tool.test.ts": {
+      "bytes": 32411,
+      "lines": 340
+    },
+    "runtime/sotto-chat/test/request-follow-through.test.ts": {
+      "bytes": 39356,
+      "lines": 424
+    },
+    "runtime/sotto-chat/test/shared-skill-handoff-connected.test.ts": {
+      "bytes": 41559,
+      "lines": 356
+    },
+    "runtime/trigger-receiver/brief_runner.py": {
+      "bytes": 43331,
+      "lines": 685
+    },
+    "runtime/trigger-receiver/calcache.py": {
+      "bytes": 65270,
+      "lines": 1231
+    },
+    "runtime/trigger-receiver/dashboard.py": {
+      "bytes": 149058,
+      "lines": 2959
+    },
+    "runtime/trigger-receiver/onboarding.py": {
+      "bytes": 32610,
+      "lines": 653
+    },
+    "runtime/trigger-receiver/outbox.py": {
+      "bytes": 58916,
+      "lines": 1083
+    },
+    "runtime/trigger-receiver/receiver.py": {
+      "bytes": 369650,
+      "lines": 6632
+    },
+    "runtime/trigger-receiver/runtime_owner_calendar_tool.py": {
+      "bytes": 53672,
+      "lines": 1271
+    },
+    "runtime/trigger-receiver/runtime_owner_gmail_draft_tool.py": {
+      "bytes": 74302,
+      "lines": 1273
+    },
+    "runtime/trigger-receiver/runtime_owner_loop_tool.py": {
+      "bytes": 32375,
+      "lines": 465
+    },
+    "runtime/trigger-receiver/static/app.js": {
+      "bytes": 164690,
+      "lines": 3882
+    },
+    "runtime/trigger-receiver/test_brief_runner.py": {
+      "bytes": 69456,
+      "lines": 1319
+    },
+    "runtime/trigger-receiver/test_client_mcp.py": {
+      "bytes": 33349,
+      "lines": 641
+    },
+    "runtime/trigger-receiver/test_connectors.py": {
+      "bytes": 39571,
+      "lines": 836
+    },
+    "runtime/trigger-receiver/test_dashboard.py": {
+      "bytes": 170393,
+      "lines": 3214
+    },
+    "runtime/trigger-receiver/test_durable_work.py": {
+      "bytes": 65481,
+      "lines": 1287
+    },
+    "runtime/trigger-receiver/test_fresh_personal_routines.py": {
+      "bytes": 44078,
+      "lines": 716
+    },
+    "runtime/trigger-receiver/test_onboarding.py": {
+      "bytes": 69955,
+      "lines": 1290
+    },
+    "runtime/trigger-receiver/test_protected_brief_detail.py": {
+      "bytes": 43555,
+      "lines": 727
+    },
+    "runtime/trigger-receiver/test_receiver.py": {
+      "bytes": 269501,
+      "lines": 4982
+    },
+    "runtime/trigger-receiver/test_relationship_pulse_pipeline.py": {
+      "bytes": 38883,
+      "lines": 700
+    },
+    "runtime/trigger-receiver/test_runtime_knowledge_read.py": {
+      "bytes": 52929,
+      "lines": 958
+    },
+    "runtime/trigger-receiver/test_runtime_owner_calendar_tool.py": {
+      "bytes": 34329,
+      "lines": 847
+    },
+    "runtime/trigger-receiver/test_runtime_owner_meeting_prep_request.py": {
+      "bytes": 37174,
+      "lines": 644
+    },
+    "runtime/trigger-receiver/test_runtime_owner_skill_request.py": {
+      "bytes": 52804,
+      "lines": 881
+    },
+    "runtime/trigger-receiver/test_shared_meeting_prep_pipeline.py": {
+      "bytes": 50053,
+      "lines": 916
+    },
+    "runtime/trigger-receiver/test_source_authority.py": {
+      "bytes": 32402,
+      "lines": 586
+    },
+    "sotto-chief-of-staff/_shared/knowledge/knowledge.py": {
+      "bytes": 59051,
+      "lines": 1297
+    },
+    "sotto-chief-of-staff/_shared/knowledge/knowledge_edit.py": {
+      "bytes": 154044,
+      "lines": 2644
+    },
+    "sotto-chief-of-staff/_shared/knowledge/knowledge_query.py": {
+      "bytes": 61190,
+      "lines": 1125
+    },
+    "sotto-chief-of-staff/_shared/knowledge/knowledge_update.py": {
+      "bytes": 88092,
+      "lines": 1623
+    },
+    "sotto-chief-of-staff/_shared/lib/brief_validate.py": {
+      "bytes": 44447,
+      "lines": 802
+    },
+    "sotto-chief-of-staff/_shared/lib/render_local.py": {
+      "bytes": 107366,
+      "lines": 2154
+    },
+    "sotto-chief-of-staff/_shared/lib/source_context.py": {
+      "bytes": 41086,
+      "lines": 804
+    },
+    "sotto-chief-of-staff/_shared/lib/work_queue.py": {
+      "bytes": 75653,
+      "lines": 1270
+    },
+    "sotto-chief-of-staff/_shared/scripts/compose_brief.py": {
+      "bytes": 336080,
+      "lines": 5711
+    },
+    "sotto-chief-of-staff/_shared/scripts/compose_notification.py": {
+      "bytes": 45604,
+      "lines": 784
+    },
+    "sotto-chief-of-staff/_shared/scripts/docsend_fetch.py": {
+      "bytes": 32905,
+      "lines": 658
+    },
+    "sotto-chief-of-staff/_shared/scripts/gather_google.py": {
+      "bytes": 85560,
+      "lines": 1594
+    },
+    "sotto-chief-of-staff/_shared/scripts/gather_granola.py": {
+      "bytes": 33689,
+      "lines": 685
+    },
+    "sotto-chief-of-staff/_shared/scripts/google_action.py": {
+      "bytes": 49129,
+      "lines": 876
+    },
+    "sotto-chief-of-staff/_shared/scripts/preferences.py": {
+      "bytes": 58130,
+      "lines": 1149
+    },
+    "sotto-chief-of-staff/_shared/scripts/research_attendees.py": {
+      "bytes": 67013,
+      "lines": 1255
+    },
+    "sotto-chief-of-staff/_shared/scripts/style_extract.py": {
+      "bytes": 35663,
+      "lines": 757
+    },
+    "sotto-chief-of-staff/_shared/scripts/web_research.py": {
+      "bytes": 33000,
+      "lines": 603
+    },
+    "sotto-chief-of-staff/_shared/scripts/x_connectivity.py": {
+      "bytes": 44785,
+      "lines": 886
+    },
+    "sotto-chief-of-staff/evals/run_evals.py": {
+      "bytes": 32351,
+      "lines": 665
+    },
+    "sotto-chief-of-staff/evals/run_golden.py": {
+      "bytes": 41237,
+      "lines": 771
+    },
+    "sotto-chief-of-staff/event-triage/scripts/triage_event.py": {
+      "bytes": 125647,
+      "lines": 2237
+    },
+    "sotto-chief-of-staff/meeting-prep/scripts/compose_meeting_prep.py": {
+      "bytes": 44715,
+      "lines": 879
+    },
+    "sotto-chief-of-staff/morning-brief/scripts/continuity_resolve.py": {
+      "bytes": 158067,
+      "lines": 2863
+    },
+    "sotto-chief-of-staff/proactive/scripts/proactive_scan.py": {
+      "bytes": 54730,
+      "lines": 959
+    },
+    "sotto-chief-of-staff/relationship-pulse/scripts/relationship_pulse.py": {
+      "bytes": 51134,
+      "lines": 960
+    },
+    "sotto-chief-of-staff/tests/test_brief_help_offers.py": {
+      "bytes": 70560,
+      "lines": 1264
+    },
+    "sotto-chief-of-staff/tests/test_brief_semantic_review.py": {
+      "bytes": 62134,
+      "lines": 1022
+    },
+    "sotto-chief-of-staff/tests/test_brief_validate.py": {
+      "bytes": 39205,
+      "lines": 649
+    },
+    "sotto-chief-of-staff/tests/test_commitment_journey.py": {
+      "bytes": 42364,
+      "lines": 735
+    },
+    "sotto-chief-of-staff/tests/test_compose_brief.py": {
+      "bytes": 293774,
+      "lines": 5089
+    },
+    "sotto-chief-of-staff/tests/test_compose_notification.py": {
+      "bytes": 54552,
+      "lines": 892
+    },
+    "sotto-chief-of-staff/tests/test_compose_wiring.py": {
+      "bytes": 39741,
+      "lines": 690
+    },
+    "sotto-chief-of-staff/tests/test_continuity_evidence.py": {
+      "bytes": 66113,
+      "lines": 1131
+    },
+    "sotto-chief-of-staff/tests/test_continuity_resolve.py": {
+      "bytes": 81573,
+      "lines": 1446
+    },
+    "sotto-chief-of-staff/tests/test_continuous_memory.py": {
+      "bytes": 114697,
+      "lines": 2054
+    },
+    "sotto-chief-of-staff/tests/test_digest_check.py": {
+      "bytes": 37289,
+      "lines": 696
+    },
+    "sotto-chief-of-staff/tests/test_docs_drift.py": {
+      "bytes": 87662,
+      "lines": 1493
+    },
+    "sotto-chief-of-staff/tests/test_event_triage.py": {
+      "bytes": 155921,
+      "lines": 2707
+    },
+    "sotto-chief-of-staff/tests/test_gather_google.py": {
+      "bytes": 92659,
+      "lines": 1765
+    },
+    "sotto-chief-of-staff/tests/test_golden_corpus.py": {
+      "bytes": 33217,
+      "lines": 594
+    },
+    "sotto-chief-of-staff/tests/test_google_action_gate.py": {
+      "bytes": 32644,
+      "lines": 603
+    },
+    "sotto-chief-of-staff/tests/test_identity_unification.py": {
+      "bytes": 32573,
+      "lines": 567
+    },
+    "sotto-chief-of-staff/tests/test_knowledge_edit.py": {
+      "bytes": 34196,
+      "lines": 671
+    },
+    "sotto-chief-of-staff/tests/test_knowledge_query.py": {
+      "bytes": 80071,
+      "lines": 1341
+    },
+    "sotto-chief-of-staff/tests/test_knowledge_update.py": {
+      "bytes": 63546,
+      "lines": 1171
+    },
+    "sotto-chief-of-staff/tests/test_loops_query.py": {
+      "bytes": 32561,
+      "lines": 521
+    },
+    "sotto-chief-of-staff/tests/test_meeting_prep.py": {
+      "bytes": 68058,
+      "lines": 1190
+    },
+    "sotto-chief-of-staff/tests/test_obligation_contract.py": {
+      "bytes": 34347,
+      "lines": 636
+    },
+    "sotto-chief-of-staff/tests/test_proactive_scan.py": {
+      "bytes": 62635,
+      "lines": 1100
+    },
+    "sotto-chief-of-staff/tests/test_relationship_pulse.py": {
+      "bytes": 41497,
+      "lines": 720
+    },
+    "sotto-chief-of-staff/tests/test_research_attendees.py": {
+      "bytes": 54581,
+      "lines": 981
+    },
+    "sotto-chief-of-staff/tests/test_run_golden.py": {
+      "bytes": 48011,
+      "lines": 904
+    },
+    "sotto-chief-of-staff/tests/test_source_observations.py": {
+      "bytes": 37035,
+      "lines": 663
+    },
+    "sotto-chief-of-staff/tests/test_web_research.py": {
+      "bytes": 32074,
+      "lines": 594
+    },
+    "sotto-chief-of-staff/tests/test_x_connectivity.py": {
+      "bytes": 48858,
+      "lines": 886
+    },
+    "sotto-chief-of-staff/tools/build_golden_corpus.py": {
+      "bytes": 64194,
+      "lines": 1242
+    },
+    "tools/setup_selfhost_railway.py": {
+      "bytes": 49398,
+      "lines": 956
+    },
+    "tools/test_setup_selfhost_railway.py": {
+      "bytes": 47419,
+      "lines": 991
+    }
+  },
+  "maxBytes": 32000,
+  "maxLines": 800,
+  "version": 1
+}

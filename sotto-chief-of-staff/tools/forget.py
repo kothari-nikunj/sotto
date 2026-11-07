@@ -43,16 +43,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "_shared", "lib"))
 import jsonstore  # noqa: E402
+from tzchain import data_root as _root  # noqa: E402
 
 # Never a target, whatever a future verb asks for. Checked per path, not per verb, so a typo'd
 # glob can't reach the graph either.
 PROTECTED = ("knowledge/people", "knowledge/companies", "knowledge/continuity")
 
 VERBS = ("snapshot", "caches", "logs", "receipts")
-
-
-def _root() -> str:
-    return os.environ.get("SOTTO_DATA", "/data")
 
 
 def _protected(rel: str) -> bool:

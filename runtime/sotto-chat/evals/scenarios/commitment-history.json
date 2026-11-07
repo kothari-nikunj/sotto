@@ -1,0 +1,108 @@
+{
+  "name": "recorded-cross-channel-commitment-history",
+  "world": {
+    "savedSourceGrants": [
+      "gmail",
+      "google_contacts",
+      "imessage"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}",
+      "knowledge/continuity/follow-up-cid-c-abc193-6e9d9906.md": "---\nanchor_key: follow_up:cid:c_abc193\naction_type: follow_up\nchannel: gmail\ncontact_name: maya.journey@example.test\ncontact_identifier: maya.journey@example.test\ncanonical_id: c_abc193\nstatus: resolved\ncreated_at: '2026-10-18 09:00:00'\nsummary: Promised pricing document delivery\nask: send the pricing document tomorrow\nmeeting_time: null\ndeadline: '2026-10-19'\nsource_thread_id: journey-email-thread\nsource_message_id: journey-promise-mail\ngroup_id: null\nsource: null\nsource_refs:\n- sourceType: gmail\n  sourceId: journey-promise-mail\n  snippet: I will send the pricing document tomorrow.\norigin_key: '[\"follow_up:cid:c_abc193\",[[\"email\",\"journey-promise-mail\"]],[\"I will\n  send the pricing document tomorrow.\"],\"send the pricing document tomorrow\"]'\nresolution_mode: null\nsource_brief_at: '2026-10-18 10:00:00'\nproof_transition:\n  schema: 1\n  outcome: loop_transition\n  source: continuity_ledger\n  ts: '2026-10-19T14:56:04Z'\n  loop_key: 29df50dca20665cd457802ae257929c52e32aa7603443ae3511329ce1b29612e\n  loop_identity: 723519672593535327f087f6dd551da146118a465b3befe6c86c516380a541ea\n  previous_identity: 723519672593535327f087f6dd551da146118a465b3befe6c86c516380a541ea\n  from_status: open\n  to_status: resolved\n  actor: system\n  capture_origin: automatic\n  event_id: 3607acc7df76f630cc4a499cc0db711db975a97449e367432a869cecc60ab4d3\nresolution: replied\nresolved_at: '2026-10-19'\nclosed_at: '2026-10-19T08:00:00+00:00'\nresolution_evidence: 'Outgoing imessage: Here is the pricing document: https://example.test/pricing-final.'\nresolution_source_refs:\n- sourceType: imessage\n  sourceId: journey-pricing-text\n  snippet: 'Here is the pricing document: https://example.test/pricing-final.'\nresolution_loop_version: e4cd96c0a48883f161d21da43ea8e3431a3268cd212d4a977609fdc3b1a2ac01\nresolution_reason: Sent the pricing document link to Maya.\n---\n",
+      "knowledge/continuity/follow-up-cid-c-abc193-origin-7cd4bc10033d34fe-3ee642a2.md": "---\nanchor_key: follow_up:cid:c_abc193:origin:7cd4bc10033d34fe\naction_type: follow_up\nchannel: gmail\ncontact_name: maya.journey@example.test\ncontact_identifier: maya.journey@example.test\ncanonical_id: c_abc193\nstatus: open\ncreated_at: '2026-10-18 09:00:00'\nsummary: Promised launch checklist delivery\nask: send the launch checklist tomorrow\nmeeting_time: null\ndeadline: '2026-10-19'\nsource_thread_id: journey-email-thread\nsource_message_id: journey-promise-mail\ngroup_id: null\nsource: null\nsource_refs:\n- sourceType: gmail\n  sourceId: journey-promise-mail\n  snippet: I will also send the launch checklist tomorrow.\norigin_key: '[\"follow_up:cid:c_abc193\",[[\"email\",\"journey-promise-mail\"]],[\"I will\n  also send the launch checklist tomorrow.\"],\"send the launch checklist tomorrow\"]'\nresolution_mode: null\nsource_brief_at: '2026-10-20 10:00:00'\nproof_transition:\n  schema: 1\n  outcome: loop_transition\n  source: continuity_ledger\n  ts: '2026-10-19T14:55:48Z'\n  loop_key: e6c1b04be8be1270556b732c9763384b9b56f8b7af98296a87216215e8955fb0\n  loop_identity: cd8ab8482f21b70149c00c8b4e618a1960b3955e60a94c450e30f8599febefcb\n  previous_identity: null\n  from_status: absent\n  to_status: open\n  actor: system\n  capture_origin: automatic\n  event_id: 967fd3b807b9a2d92845de67ec3192d21902d9da2059a91a202314afe2baa9d8\n---\n",
+      "knowledge/people/c_abc193.md": "---\nschema: 1\ncanonical_id: c_abc193\nname: Maya Journey\nidentifiers:\n- maya.journey@example.test\n- '+14155550193'\nupdated_at: ''\nupdated_by: ''\nfacts: {}\n---\n"
+    }
+  },
+  "turns": [
+    {
+      "text": "what happened with the pricing document I promised Maya Journey? check what we have saved",
+      "contains": [
+        "pricing"
+      ],
+      "containsAny": [
+        [
+          "sent",
+          "delivered",
+          "shared"
+        ],
+        [
+          "text",
+          "iMessage"
+        ]
+      ],
+      "excludes": [
+        "still owe the pricing",
+        "need to send the pricing",
+        "both were sent",
+        "both were delivered",
+        "the checklist was delivered"
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 0
+    },
+    {
+      "text": "and the other thing I owed her? was it delivered, and when was it originally due?",
+      "contains": [
+        "checklist",
+        "19"
+      ],
+      "containsAny": [
+        [
+          "pending",
+          "open",
+          "still owe",
+          "not yet",
+          "not sent",
+          "not delivered"
+        ]
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 0
+    },
+    {
+      "text": "what shows that the pricing one is done?",
+      "containsAny": [
+        [
+          "text",
+          "iMessage"
+        ],
+        [
+          "19",
+          "October"
+        ]
+      ],
+      "publicReads": 0,
+      "latencyClass": "evidence",
+      "googleReads": 0
+    },
+    {
+      "text": "what did I promise Maya Journey and what actually happened? only use saved evidence",
+      "restartBefore": true,
+      "contains": [
+        "pricing",
+        "checklist"
+      ],
+      "containsAny": [
+        [
+          "pending",
+          "open",
+          "still"
+        ],
+        [
+          "text",
+          "iMessage"
+        ]
+      ],
+      "publicReads": 0,
+      "excludes": [
+        "both were sent",
+        "both were delivered",
+        "the checklist was delivered"
+      ],
+      "latencyClass": "evidence",
+      "googleReads": 0
+    }
+  ]
+}

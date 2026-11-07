@@ -212,6 +212,27 @@ def test_the_send_receipts_are_kept_twice_as_long_as_the_delivery_ones(_volume):
     assert "reply" in open(sends, encoding="utf-8").read()
 
 
+def test_existing_sweep_clock_supplies_distinct_90_and_180_day_node_cutoffs(_volume, monkeypatch):
+    called = []
+    monkeypatch.setitem(ret.HOOKS, 'runtime_prune', lambda cutoffs: (
+        called.append(cutoffs) or {'replies': 1, 'dispatches': 2, 'actions': 0, 'runs': 0, 'events': 0}))
+    out = ret.sweep(now=NOW)
+    assert called == [{
+        'delivery_before': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(NOW - ret.DELIVERY_RECEIPT_DAYS * DAY)),
+        'action_before': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(NOW - ret.SEND_RECEIPT_DAYS * DAY)),
+    }]
+    assert out['swept'] == [{'path': 'sotto-chat/journal', 'policy': 'terminal_rows', 'amount': 3}]
+
+
+def test_node_retention_failure_is_recorded_without_interrupting_file_sweep(_volume, monkeypatch):
+    old = _write(_volume, 'events/delivery.jsonl', _line(400, label='old'))
+    monkeypatch.setitem(ret.HOOKS, 'runtime_prune', lambda _cutoffs: (_ for _ in ()).throw(RuntimeError('private token')))
+    out = ret.sweep(now=NOW)
+    assert open(old, encoding='utf-8').read() == ''
+    assert {'path': 'sotto-chat/journal', 'error': 'RuntimeError'} in out['errors']
+    assert 'private token' not in str(out)
+
+
 def test_an_unreadable_line_is_kept_not_guessed_at(_volume):
     """A parser bug must never become data loss: a line the sweep can't read stays."""
     path = _write(_volume, "events/surfaced.jsonl",
@@ -470,3 +491,85 @@ def test_visual_delivery_artifacts_expire_without_touching_fresh_cards(_volume):
     ret.sweep(now=NOW)
     assert not os.path.exists(stale) and not os.path.exists(manifest)
     assert os.path.exists(fresh)
+
+
+def test_owner_tool_ledgers_are_classified():
+    """The attended Gmail ledger holds reviewed words, so it is swept; the routine store is live config."""
+    gmail = ret.accounts_for("events/owner-gmail-drafts.json")
+    assert isinstance(gmail, ret.Rule) and gmail.policy == ret.COMPACT_OLDER
+    assert gmail.amount == ret.DRAFT_LEDGER_DAYS
+    assert isinstance(ret.accounts_for("runtime/owner-routines.json"), ret.Exempt)
+    for rule in ret.SWEEP:
+        if rule.policy == ret.COMPACT_OLDER:
+            assert os.path.isfile(os.path.join(HERE, ret.COMPACTORS[rule.pattern] + ".py")), rule
+
+
+def test_an_unloadable_compaction_owner_costs_one_error_line(_volume, monkeypatch):
+    _write(_volume, "events/owner-gmail-drafts.json", "{}")
+    monkeypatch.setitem(ret.HOOKS, "compact", lambda *_args: (_ for _ in ()).throw(ImportError("gone")))
+    out = ret.sweep(now=NOW)
+    assert out["errors"] == [{"path": "events/owner-gmail-drafts.json",
+                              "error": "ValueError: compaction unavailable (ImportError)"}]
+
+
+def test_unaccepted_manifest_only_text_artifacts_use_staged_ttl(_volume):
+    stale = _write(_volume, 'cache/visual-briefs/unaccepted-text/manifest.json', '{"full_text":"private prep"}', age_days=8)
+    temporary = _write(_volume, 'cache/visual-briefs/interrupted-text/staged.tmp', 'private partial prep', age_days=8)
+    fresh = _write(_volume, 'cache/visual-briefs/fresh-text/manifest.json', '{}', age_days=1)
+    ret.sweep(now=NOW)
+    assert not os.path.exists(stale) and not os.path.exists(temporary)
+    assert os.path.exists(fresh)
+
+
+def test_idle_chat_prep_proposal_state_ages_out_with_staged_artifacts(_volume):
+    path=_write(_volume,'events/owner-meeting-prep-offers.json','{}',age_days=ret.STAGED_DAYS+1)
+    ret.sweep(now=NOW)
+    assert not os.path.exists(path)
+
+
+def test_retention_does_not_follow_volume_children_through_a_trusted_root_alias(_volume, monkeypatch):
+    root = _volume / 'volume'
+    alias = _volume / 'mounted'
+    root.mkdir()
+    alias.symlink_to(root, target_is_directory=True)
+    monkeypatch.setitem(ret.HOOKS, 'data_root', lambda: str(alias))
+    knowledge = root / 'knowledge'
+    protected_file = _write(root, 'knowledge/saved.json', 'private', age_days=100)
+    control = _write(root, 'events/notification-artifacts/stale.json', '{}', age_days=100)
+    (root / 'events/triage-artifacts').symlink_to(knowledge, target_is_directory=True)
+    (root / 'events/learning-diagnostics').symlink_to(knowledge, target_is_directory=True)
+    result = ret.sweep(now=NOW)
+    assert all('saved.json' not in row['path'] for row in result['errors'])
+    assert not os.path.exists(control)
+    assert os.path.isfile(protected_file)
+    assert sorted(p.name for p in knowledge.iterdir()) == ['saved.json']
+
+
+@pytest.mark.parametrize('hard', [False, True])
+def test_tail_does_not_truncate_linked_memory(_volume, monkeypatch, hard):
+    monkeypatch.setattr(ret, 'SWEEP', (ret.Rule('logs/compose_brief.log', ret.TRUNCATE_TAIL, 8, 'fixture'),))
+    body = 'private record\n' * 4
+    path = _write(_volume, 'knowledge/record.md', body)
+    log = _volume / 'logs/compose_brief.log'
+    log.parent.mkdir()
+    if hard:
+        os.link(path, log)
+    else:
+        log.symlink_to(path)
+    result = ret.sweep(now=NOW)
+    assert not result['swept']
+    assert (_volume / 'knowledge/record.md').read_text() == body
+
+
+@pytest.mark.parametrize(('relative', 'sidecar'), [
+    ('events/delivery.jsonl', 'events/delivery.jsonl.lock'),
+    ('events/learning-diagnostics/stale.json', 'events/learning-diagnostics/.consent.lock'),
+])
+def test_retention_never_opens_linked_lock_sidecars(_volume, relative, sidecar):
+    payload = _write(_volume, relative, _line(200), age_days=200)
+    missing = _volume / 'knowledge/must-not-be-created'
+    missing.parent.mkdir()
+    (_volume / sidecar).symlink_to(missing)
+    ret.sweep(now=NOW)
+    assert not missing.exists()
+    assert os.path.isfile(payload)

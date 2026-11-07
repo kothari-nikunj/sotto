@@ -1,8 +1,10 @@
 """Managed capability gates; absent capability state never implies connected sources."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 
 try:
@@ -16,6 +18,66 @@ except ModuleNotFoundError:  # source checkout; the image copies this shared lea
 
 NOTICE_LABEL = 'status:no-sources'
 NOTICE_TEXT = 'Scheduled briefs start once you connect a context source. You can still chat with Sotto here.'
+_REVISION_RE = re.compile(r'\A[a-f0-9]{32}\Z')
+
+
+def _policy_snapshot(state):
+    """Compare grant semantics, not JSON formatting or the revision itself."""
+    return json.dumps({key: value for key, value in state.items()
+                       if key not in ('authority_revision', 'authority_policy_digest')},
+                      sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def _advance_authority_revision(state, before):
+    revision = state.get('authority_revision')
+    old_digest = state.get('authority_policy_digest')
+    current = _policy_snapshot(state)
+    if (current != before or not isinstance(revision, str)
+            or _REVISION_RE.fullmatch(revision) is None
+            or old_digest != hashlib.sha256(before.encode()).hexdigest()):
+        state['authority_revision'] = secrets.token_hex(16)
+    state['authority_policy_digest'] = hashlib.sha256(current.encode()).hexdigest()
+
+
+def source_authority_state(data):
+    """Read a tenant-bound, versioned transition identity without repairing legacy state."""
+    try:
+        def unique_object(pairs):
+            value = {}
+            for key, row in pairs:
+                if key in value:
+                    raise ValueError('duplicate managed source field')
+                value[key] = row
+            return value
+        tenant = os.environ.get('SOTTO_TENANT_ID')
+        if not isinstance(tenant, str) or not tenant:
+            return None
+        state = json.loads((Path(data) / 'config/managed-capabilities.json').read_text(),
+                           object_pairs_hook=unique_object)
+        if not isinstance(state, dict) or state.get('tenant_id') != tenant:
+            return None
+        revision = state.get('authority_revision')
+        digest = state.get('authority_policy_digest')
+        sources = state.get('sources')
+        if (not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None
+                or digest != hashlib.sha256(_policy_snapshot(state).encode()).hexdigest()
+                or not isinstance(sources, dict) or any(not isinstance(row, dict)
+                or type(row.get('consented')) is not bool or type(row.get('connected')) is not bool
+                for row in sources.values())):
+            return None
+        return {'revision': revision, 'allowed_sources': sorted(
+            source for source in BRIDGE_SOURCE_FIELDS if isinstance(sources.get(source), dict)
+            and sources[source].get('consented') is True and sources[source].get('connected') is True),
+            'google_sources': sorted(source for source in ('gmail', 'calendar', 'google_contacts')
+                if isinstance(sources.get(source), dict)
+                and sources[source].get('consented') is True
+                and sources[source].get('connected') is True),
+            'connector_sources': sorted(source for source in MANAGED_CONNECTOR_SOURCES
+                if isinstance(sources.get(source), dict)
+                and sources[source].get('consented') is True
+                and sources[source].get('connected') is True)}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def enabled():
@@ -52,6 +114,14 @@ def has_sources(data):
         for key, v in sources.items() if eligible_context_source(key))
 
 
+def has_google_context(data):
+    """Cloud sign-up requires usable email or calendar, even with Mac sources."""
+    sources = read_state(data, "managed-capabilities.json").get("sources", {})
+    return isinstance(sources, dict) and any(
+        isinstance(sources.get(key), dict) and sources[key].get('consented') is True
+        and sources[key].get('connected') is True for key in ('gmail', 'calendar'))
+
+
 def connection_status(data):
     """Metadata for the setup UI, read from the existing gates and delivery receipt."""
     import onboarding
@@ -66,6 +136,7 @@ def connection_status(data):
     return {'tenant_id': os.environ.get('SOTTO_TENANT_ID', ''),
             'messaging_number': number if configured else None,
             'messaging_active': messaging_activated(data), 'context_connected': has_sources(data),
+            'google_context_connected': has_google_context(data),
             'first_brief': phase}
 
 
@@ -101,6 +172,7 @@ def record_google_consent(data, scopes):
     path = str(Path(data) / 'config/managed-capabilities.json')
     revoked = False
     with json_transaction(path, default={}) as state:
+        before = _policy_snapshot(state)
         tenant = os.environ['SOTTO_TENANT_ID']
         if state.get('tenant_id') != tenant:
             state.clear()
@@ -108,13 +180,14 @@ def record_google_consent(data, scopes):
         sources = state.setdefault('sources', {})
         grants = {
             'gmail': {'gmail.readonly', 'gmail.modify'},
-            'calendar': {'calendar.readonly', 'calendar', 'calendar.events'},
+            'calendar': {'calendar.readonly', 'calendar', 'calendar.events', 'calendar.events.readonly'},
             'google_contacts': {'contacts.readonly', 'contacts'},
         }
         for source, accepted in grants.items():
             granted = any('https://www.googleapis.com/auth/' + scope in scopes for scope in accepted)
             revoked |= not granted and _newly_disabled(sources, source)
             sources[source] = {'consented': granted, 'connected': granted}
+        _advance_authority_revision(state, before)
     if revoked:
         _purge_learning_diagnostics(data)
 
@@ -137,6 +210,7 @@ def record_connector_consent(data, service, connected):
     path = str(Path(data) / 'config/managed-capabilities.json')
     revoked = False
     with json_transaction(path, default={}) as state:
+        before = _policy_snapshot(state)
         tenant = os.environ['SOTTO_TENANT_ID']
         if state.get('tenant_id') != tenant:
             state.clear()
@@ -145,6 +219,7 @@ def record_connector_consent(data, service, connected):
         revoked = not connected and _newly_disabled(sources, service)
         sources[service] = {
             'consented': connected, 'connected': connected}
+        _advance_authority_revision(state, before)
     if revoked:
         _purge_learning_diagnostics(data)
 
@@ -177,12 +252,14 @@ def reconcile_connector_capabilities(data, statuses):
         if not missing:
             return
         with json_transaction(str(path), default={}) as state:
+            before = _policy_snapshot(state)
             current_sources = state.get('sources')
             if state.get('tenant_id') != tenant or not isinstance(current_sources, dict):
                 return
             for service in missing:
                 if service not in current_sources:
                     current_sources[service] = {'consented': True, 'connected': True}
+            _advance_authority_revision(state, before)
     except (OSError, ValueError, TypeError, AttributeError):
         print('[sotto] managed connector reconciliation skipped: capability state unreadable',
               flush=True)
@@ -209,6 +286,7 @@ def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=F
         raise ValueError('Invalid local source consent')
     revoked = False
     with json_transaction(str(Path(data) / 'config/managed-capabilities.json'), default={}) as state:
+        before = _policy_snapshot(state)
         if state.get('tenant_id') != os.environ['SOTTO_TENANT_ID']:
             state.clear()
         state['tenant_id'] = os.environ['SOTTO_TENANT_ID']
@@ -221,6 +299,7 @@ def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=F
             revoked |= not consented and _newly_disabled(sources, source)
             connected = consented and (source in connected_sources or sources.get(source, {}).get('connected') is True)
             sources[source] = {'consented': consented, 'connected': connected}
+        _advance_authority_revision(state, before)
     if revoked:
         _purge_learning_diagnostics(data)
 
@@ -240,11 +319,18 @@ def validate_local_ingress(data, body, *, events=False):
         rows = body.get('events', [])
         if not isinstance(rows, list) or any(not isinstance(e, dict) or e.get('source') not in allowed for e in rows):
             raise ValueError('Bridge source is not enabled')
+        # Legacy source_retractions are inert metadata; actual events still require consent.
         return
     local = body.get('local_data') or {}
     if not isinstance(local, dict):
         raise ValueError('Invalid local data')
-    permitted = {'generated_at', 'window_hours', 'source_status'}
+    permitted = {'generated_at', 'window_hours', 'source_status', 'source_coverage'}
+    from source_catalog import valid_source_coverage
+    coverage = local.get('source_coverage', {})
+    coverage_sources = allowed | {'deferred_unread_' + source for source in allowed & {'imessage', 'whatsapp'}}
+    if not isinstance(coverage, dict) or any(
+            source not in coverage_sources or not valid_source_coverage(value) for source, value in coverage.items()):
+        raise ValueError('Bridge coverage contains an unconsented source or unexpected fields')
     for source in allowed:
         permitted.update(BRIDGE_SOURCE_FIELDS[source])
     def content(value):
@@ -316,6 +402,13 @@ def _tool_allowed(data, name, arguments):
                 and re.fullmatch(r'[A-Za-z0-9_-]{16,128}', request_id) is not None)
     if name == 'health':
         return True
+    if name == 'search_local':
+        searchable = {'imessage', 'whatsapp', 'apple_notes', 'recent_files'}
+        if probe:
+            return bool(allowed & searchable)
+        requested = arguments.get('sources')
+        return (isinstance(requested, list) and 1 <= len(requested) <= 4
+                and all(isinstance(item, str) and item in allowed & searchable for item in requested))
     if name == 'read_history':
         requested = arguments.get('source')
         return probe or (isinstance(requested, str) and requested in allowed)
@@ -325,6 +418,8 @@ def _tool_allowed(data, name, arguments):
                                           and all(isinstance(item, str) for item in requested)):
             return False
         return not requested or set(requested) <= allowed
+    if name == 'get_note':
+        return 'apple_notes' in allowed
     if name == 'get_messages':
         return 'imessage' in allowed
     if name == 'get_contacts':
@@ -383,6 +478,19 @@ def validate_tool_response(data, request, result):
         return False
     if isinstance(result, dict) and result.get('isError') is True:
         return True
+    if name == 'search_local':
+        requested = set(arguments['sources'])
+        fields = {'status', 'reason', 'results', 'coverage', 'searched_at'}
+        result_fields = {'source', 'source_id', 'title', 'timestamp', 'reference', 'author', 'partial', 'excerpt',
+                         'matched_fields'}
+        coverage_fields = {'status', 'indexed', 'skipped', 'truncated', 'stopped_early', 'newest_at',
+                           'complete', 'since', 'until'}
+        rows, coverage = payload.get('results'), payload.get('coverage')
+        return (set(payload) <= fields and isinstance(rows, list) and len(rows) <= 20
+                and isinstance(coverage, dict) and set(coverage) <= requested
+                and all(isinstance(row, dict) and isinstance(row.get('source'), str)
+                        and row['source'] in requested and set(row) <= result_fields for row in rows)
+                and all(isinstance(item, dict) and set(item) <= coverage_fields for item in coverage.values()))
     if name == 'read_history':
         requested = arguments.get('source')
         if not isinstance(requested, str):
@@ -396,4 +504,4 @@ def validate_tool_response(data, request, result):
             return True
         except (ValueError, TypeError, AttributeError):
             return False
-    return True   # get_messages / get_contacts: consent is the whole decision
+    return True   # get_messages / get_contacts / get_note: consent is the whole decision

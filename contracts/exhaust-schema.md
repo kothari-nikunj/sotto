@@ -156,7 +156,8 @@ The Sotto Bridge's `read_local` MCP tool returns this payload (full JSON Schema 
 app's `extract_local_data` (PORT SOURCE: app/src-tauri/src/commands/brief.rs) and with what the
 consumer reads (`sotto-chief-of-staff/_shared/scripts/compose_brief.py`). Messages are **flat
 per-message arrays** — the consumer groups them into threads. `granola_meetings` is intentionally
-**OUT** of the Bridge: Hermes owns Granola via its own MCP.
+**OUT** of the Bridge: the cloud side gathers Granola through its own connector
+(`_shared/scripts/gather_granola.py`).
 
 ```jsonc
 {
@@ -204,7 +205,7 @@ per-message arrays** — the consumer groups them into threads. `granola_meeting
   "apple_notes": [ { "title": "Plan", "snippet": "…", "modified_date": "2026-06-23 22:10:00", "folder": "Work" } ],
   "recent_files": [
     { "filename": "deck.pdf", "path": "/Users/me/Downloads/deck.pdf", "last_used": null,
-      "date_added": "2026-06-23 18:00:00", "file_type": "pdf", "status": "unopened", "source_url": "https://…" }
+      "date_added": "2026-06-23T18:00:00Z", "file_type": "pdf", "status": "unopened", "source_url": "https://…" }
   ],
   "screen_time": {
     "top_apps": [ { "app_bundle_id": "com.tinyspeck.slackmacgap", "app_name": "slackmacgap", "minutes": 92.0 } ],
@@ -286,9 +287,9 @@ the sole writer. These examples never mutate `preferences.json` or approval tier
 | `events/work.sqlite3` (+ a rollback journal on a fresh store, or `-wal`/`-shm` on one that was already WAL) | `_shared/lib/work_queue.py` | Receiver admission/worker recovery; triage input ownership; health metadata |
 | `events/work-inputs/brief-*/` | `brief_runner.py` | The same procedure and its ancillary learning follow-up; retention sweep |
 | `cache/brief-granola.json` | `brief_runner.py` | Brief preparation and composition; one-day retention sweep |
-| `.sotto-volume.json` | adapter `managed_volume.py` | Managed boot identity verification and recovery |
+| `.sotto-volume.json` | `adapters/sotto/prepare_fresh.py` | Boot identity verification |
 | `.sotto-runtime.lock` | adapter `runtime_lock.py` | Process-lifetime writer exclusion |
-| `.sotto-recovery-hold.json` | adapter `recovery.py` | Restore delivery hold and explicit release |
+| `.sotto-epoch.json` | adapter `tenant_lifecycle.py` (root supervisor) | Fixed-procedure epoch binding (`fixed_five.py`); `runtime_lock.py` refuses a fresh acquisition while it exists |
 | `config/model-lease.json` | adapter `model_lease.py` | Model credential expiry diagnostics and renewal |
 | `config/source-state.json` | `_shared/lib/source_context.py` | Source projection, contextual memory, delivery validity |
 | `events/delivery-effects-<run>.json` | `_shared/lib/delivery_effects.py` (merged transaction) | Receiver result commit and outbox handoff |

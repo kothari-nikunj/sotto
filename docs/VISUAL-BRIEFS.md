@@ -18,8 +18,10 @@ briefs keep **Your day**. Leading bold labels tolerate whitespace inside the emp
 markers, so a padded label does not print literal asterisks in Messages or on a card.
 
 Morning and evening cards cover needs-you, today, and calendar highlights. Every action, calendar event, and follow-up paragraph in the composed brief
-must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent offers,
-and unsupported formats/channels remain text. There is no arbitrary text truncation or font
+must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent or
+procedure offers, and unsupported formats/channels remain text. A brief handoff question may ride
+the gallery only when its exact text is fully rendered in a card block; otherwise the brief stays
+text with reason `offer_not_visible`. There is no arbitrary text truncation or font
 shrinking. Layouts that already fit keep their existing section pages. A crowded brief is repacked
 at complete paragraph boundaries using the same font and height calculation as rendering. Adjacent
 needs-you and today sections can share a labelled card to leave room for follow-ups on two cards;
@@ -41,11 +43,11 @@ Historical previews are labelled on every card. It never sends or updates the le
 
 ## Default iMessage delivery
 
-Galleries are the default for Photon morning/evening briefs and focused meeting backgrounds. Set `SOTTO_VISUAL_BRIEFS=0` to keep all updates as text. Startup applies the
-small gallery addition to the pinned Photon sidecar. If its anchor changed or the endpoint is
-absent, keep normal text. The capability check is read-only. With support available the existing
-receiver sends one native Spectrum group containing the short selectable text summary followed
-by the PNG attachments. One parent receipt covers that multipart message; child IDs are recorded
+Galleries are the default for Photon morning/evening briefs and focused meeting backgrounds
+(`SOTTO_VISUAL_BRIEFS` defaults to `1`; the supervised launch passes no override). The receiver
+hands the four rendered PNGs to Node over the authenticated `POST /v1/send-gallery-bytes`, and Node
+sends one native Spectrum group containing the short selectable text summary followed by the PNG
+attachments. One parent receipt covers that multipart message; child IDs are recorded
 when supplied. This relies on the pinned SDK's native iMessage multipart implementation.
 
 The canonical body remains the outbox identity and validity input. Source validity, expiry,
@@ -55,25 +57,24 @@ or retry exhaustion; it is never blindly resent. A read-only lookup can settle a
 accepted operation receipt and apply completion effects once. Missing or corrupt receipts remain
 unknown. Proven not-attempted/rejected sends retain normal expiry and retry rules. A missing renderer/unsupported layout
 falls back before enqueue. The receiver logs content-free fallback reasons (`gallery_unavailable`,
-`text_layout`, or a fixed layout reason plus card number), so an intentional short update can be
-distinguished from a failed render without recording private prose. The same presentation metadata
+`text_layout`, `offer_not_visible`, or a fixed layout reason plus card number), so an intentional
+short update can be distinguished from a failed render without recording private prose. The same presentation metadata
 rides the existing outbox retry and becomes plain-English detail on the accepted delivery receipt.
 Activity says Sent. Its expandable details name four photos or the text fallback reason and
 connect the send to recorded prior decisions by identity. Missing or later evidence is never
 guessed, and acceptance never claims device display. An ambiguous provider result must not
 trigger a second text send.
 
-The sidecar durably records an operation ID before calling the provider and stores accepted
-message IDs before replying. Its private `events/gallery-receipts/` files contain no message text,
-file paths or recipients. An active or interrupted operation reads in flight; only a failed chat
-lookup proves it unsent. In-flight, unknown, corrupt and active records are retained; terminal
-records have bounded age and capacity. Exhausted unresolved capacity refuses a new dispatch.
-These receipts can reconcile a lost response, but do not resolve a historic unknown send that
+Node's dispatch journal durably records the operation, keyed by the stable outbox ID, before
+calling the provider and stores accepted message IDs before replying; the receiver reads it back
+through `runtime_api.gallery_receipt`. These receipts can reconcile a lost response, but do not resolve a historic unknown send that
 never wrote one or prove device display.
 
-The shared Photon adapter recognizes the focused meeting-prep output before upstream text truncation and uses the same renderer and native gallery transport. It sends one group, records the returned parent/child IDs, and bypasses upstream retries on unknown acceptance. A private delivery receipt beside the card manifest is written before dispatch. The pinned gateway supplies its own durable reply-obligation ID on first send and recovery; only the exact ID, destination and original content can reuse an accepted receipt, even if a later renderer changes the manifest. The same identity keys the provider operation, so identical replies from different obligations cannot collide. Missing identity keeps ordinary text delivery; a legacy matching gallery without its exact obligation ID is held as uncertain. Receipts expire with the seven-day artifact cache, and unreadable unrelated manifests are skipped. Proven unsent media falls back to the original text. Ordinary chat and compact multi-meeting sweeps stay text. Ask Sotto now routes “expand that item” to `brief_detail.py`, a read-only lookup of the original
+Focused meeting-prep backgrounds the receiver delivers use the same renderer and gallery path;
+ordinary chat replies and compact multi-meeting sweeps stay text. Ask Sotto routes “expand that
+item” to `accepted_brief_detail`, a read-only lookup of the original
 composed text. Scheduled acceptance receipts retain the opaque gallery ID and owner-target hash
-before erasing the payload; interactive prep uses its existing adjacent receipt. Only accepted,
+before erasing the payload. Only accepted,
 non-preview owner galleries inside seven days qualify. The manifest records the source-permission
 fingerprint at render time. Changed or absent permission metadata withholds archived content and
 asks for a fresh consented read. Multiple date/topic matches require a choice. Text pages expose

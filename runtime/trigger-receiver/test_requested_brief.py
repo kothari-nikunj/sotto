@@ -81,10 +81,38 @@ def test_ambiguous_prior_gallery_cannot_trigger_replacement(rec, tmp_path):
     assert rec.request_owner_brief(request())[1]['status'] == 'pending_delivery'
 
 
+def test_valid_owner_request_refreshes_activation_before_context_and_queue(rec, monkeypatch):
+    import onboarding
+    order = []
+    monkeypatch.setattr(rec, '_activation_tick', lambda: order.append('activation'))
+    monkeypatch.setattr(onboarding, 'scheduled_hold', lambda _: order.append('context') or False)
+    original_spawn = rec._spawn_and_deliver
+    def spawn(*args, **kwargs):
+        order.append('queue')
+        return original_spawn(*args, **kwargs)
+    monkeypatch.setattr(rec, '_spawn_and_deliver', spawn)
+    assert rec.request_owner_brief(request())[1]['status'] == 'queued'
+    assert order == ['activation', 'context', 'queue']
+    order.clear()
+    for change in ({'owner': 'stranger'}, {'chat_id': 'stranger'}, {'refresh': 'false'}):
+        assert rec.request_owner_brief(request(**change))[0] in (400, 403)
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'telegram')
+    assert rec.request_owner_brief(request())[0] == 409
+    assert order == []
+
+
+def _current_cache_proof(rec, monkeypatch):
+    # The accepted artifact's retained source/route proof is still current (proved separately below).
+    monkeypatch.setattr(rec, '_composition_evidence', lambda _: {'source_revision': 'a' * 64,
+                                                                 'route_digest': 'b' * 64})
+    monkeypatch.setattr(rec, '_requested_cache_current', lambda *_: True)
+
+
 def test_accepted_replay_does_not_compose_or_reapply_actions(rec, tmp_path, monkeypatch):
     seed(tmp_path)
     monkeypatch.setattr(rec, '_source_context', lambda: SimpleNamespace(allowed=lambda _: True))
     monkeypatch.setattr(rec.subprocess, 'Popen', lambda *a, **k: pytest.fail('replay called model runner'))
+    _current_cache_proof(rec, monkeypatch)
     jid = rec.request_owner_brief(request())[1]['request_id']
     result = rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
     assert result['text'].startswith('Needs Attention')
@@ -165,6 +193,7 @@ def test_replay_uses_gallery_outbox_even_with_daily_marker(rec, tmp_path, monkey
             return {'summary': 'Evening brief', 'images': ['1.png', '2.png', '3.png', '4.png']}
         return SimpleNamespace(prepare=prepare)
     monkeypatch.setattr(rec, '_load_shared_lib', visual)
+    _current_cache_proof(rec, monkeypatch)
     jid = rec.request_owner_brief(request())[1]['request_id']
     result = rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
     for _ in range(2):
@@ -184,12 +213,100 @@ def test_malformed_cache_and_transactional_offer_are_not_replayed(rec, tmp_path)
         assert rec.REQUESTED_BRIEF.accepted_artifact(tmp_path, '2026-10-02', 'evening', lambda _: True) is None
 
 
-def test_refresh_does_not_reuse_accepted_artifact(rec, tmp_path, monkeypatch):
+@pytest.mark.parametrize('directed', [False, True])
+def test_refresh_or_owner_direction_does_not_reuse_accepted_artifact(rec, tmp_path, monkeypatch, directed):
     seed(tmp_path)
     def new_composition(*a, **kw):
         raise RuntimeError('fresh composition boundary reached')
     monkeypatch.setattr(rec.subprocess, 'Popen', new_composition)
     monkeypatch.setattr(rec, '_record_delivery', lambda *a, **kw: None)
-    jid = rec.request_owner_brief(request(refresh=True))[1]['request_id']
+    admission = {'event_id': 'a' * 64} if directed else None
+    options = {'composition_direction': 'focusing on the open pricing decision'} if directed else {}
+    jid = rec.request_owner_brief(request(refresh=not directed, **options), admission=admission)[1]['request_id']
     with pytest.raises(RuntimeError, match='fresh composition boundary reached'):
         rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
+
+
+def test_sotto_cached_replay_retains_current_source_route_proof(rec, tmp_path, monkeypatch):
+    import hashlib
+    seed(tmp_path)
+    monkeypatch.setattr(rec, '_source_context', lambda: SimpleNamespace(allowed=lambda _: True))
+    jid = rec.request_owner_brief(request())[1]['request_id']
+    # This regression isolates the cached result boundary; fixed profile admission is tested separately.
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    monkeypatch.setattr(rec.subprocess, 'Popen', lambda *a, **k: pytest.fail('cache replay spawned model'))
+    proof = {'source_revision': 'a' * 64, 'route_digest': 'b' * 64}
+    monkeypatch.setattr(rec, '_composition_evidence', lambda _: proof)
+    monkeypatch.setattr(rec, '_requested_cache_current', lambda *_: True)
+    result = rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
+    assert result['source_revision_at_composition'] == proof['source_revision']
+    assert result['route_digest_at_composition'] == proof['route_digest']
+    assert result['source_text_sha256'] == hashlib.sha256(rec._delivery_body(result['text']).encode()).hexdigest()
+    for observations in ([None, None], [proof, {**proof, 'route_digest': 'c' * 64}]):
+        observed = iter(observations)
+        monkeypatch.setattr(rec, '_composition_evidence', lambda _: next(observed))
+        with pytest.raises(rec._WorkDeferredError):
+            rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
+
+
+def test_sotto_cache_requires_original_accepted_source_route_proof(rec, tmp_path, monkeypatch):
+    artifact = json.loads(seed(tmp_path).read_text())
+    proof = {'source_revision': 'a' * 64, 'route_digest': 'b' * 64}
+    assert rec._requested_cache_current(artifact, proof) is False
+    assert rec._requested_cache_current(artifact, None) is False
+    # A legacy accepted artifact without retained original proof goes to fresh composition.
+    monkeypatch.setattr(rec, '_source_context', lambda: SimpleNamespace(allowed=lambda _: True))
+    jid = rec.request_owner_brief(request())[1]['request_id']
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    monkeypatch.setattr(rec, '_composition_evidence', lambda _: proof)
+    def fresh(*_):
+        raise RuntimeError('fresh composition selected')
+    monkeypatch.setattr(rec, '_runtime_adapter', lambda: SimpleNamespace(run_argv=fresh))
+    with pytest.raises(RuntimeError, match='fresh composition selected'):
+        rec._execute_work(rec.WORK_QUEUE.get(rec.DATA, jid))
+
+
+@pytest.mark.parametrize('label,kind,queued', [
+    ('cron:sotto-morning-brief', 'morning', False),
+    ('cron:sotto-morning-brief', 'evening', True),
+    ('brief:sotto-evening-brief', 'morning', True),
+    ('run-now:sotto-morning-brief', 'evening', True),
+    ('requested:' + 'b' * 32 + ':sotto-morning-brief', 'evening', True),
+    ('unknown:sotto-morning-brief', 'evening', False),
+    ('requested:malformed:sotto-morning-brief', 'evening', False),
+    ('cron:sotto-welcome-brief', 'evening', False),
+    ('cron:sotto-relationship-pulse', 'evening', False),
+    (None, 'evening', False),
+])
+def test_uncertain_delivery_holds_its_edition_but_exact_opposite_can_queue(rec, tmp_path, monkeypatch, label, kind, queued):
+    seed(tmp_path, status='pending')
+    box = tmp_path / 'events/outbox.json'
+    state = json.loads(box.read_text())
+    state['rows'][0]['payload'] = {'label': label} if label is not None else {}
+    state['rows'][0]['acceptance'] = 'unknown'
+    box.write_text(json.dumps(state))
+    before = json.dumps(state['rows'][0], sort_keys=True, separators=(',', ':')).encode()
+    contacts = []
+    original = rec._spawn_and_deliver
+    monkeypatch.setattr(rec, '_spawn_and_deliver', lambda *a, **kw: contacts.append(True) or original(*a, **kw))
+    result = rec.request_owner_brief(request(kind=kind, refresh=True))
+    assert len(contacts) == int(queued)
+    assert result[1]['status'] == ('queued' if queued else 'pending_delivery')
+    after = json.loads(box.read_text())['rows'][0]
+    assert json.dumps(after, sort_keys=True, separators=(',', ':')).encode() == before
+    if queued:
+        assert rec.WORK_QUEUE.get(str(tmp_path), result[1]['request_id']) is not None
+
+
+def test_unverified_composition_direction_is_not_admitted(rec):
+    assert rec.request_owner_brief(request(composition_direction='focus on pricing'))[0] == 400
+
+
+def test_directed_delivered_artifact_is_not_replayed_as_ordinary_brief(rec, tmp_path):
+    path = seed(tmp_path)
+    artifact = json.loads(path.read_text())
+    artifact['_composition_direction'] = True
+    path.write_text(json.dumps(artifact))
+    assert rec.REQUESTED_BRIEF.accepted_artifact(tmp_path, '2026-10-02', 'evening', lambda _: True) is None

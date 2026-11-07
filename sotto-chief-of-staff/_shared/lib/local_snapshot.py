@@ -184,6 +184,15 @@ def _local_fallback(local: dict) -> dict:
     return _merge_local_snapshot(local, snapshot) if snapshot else project_local(local)
 
 
+def merge_local_unsaved(local: dict) -> dict:
+    """A bounded attended read merged with the canonical snapshot in memory only. The snapshot and
+    its day archive stay the brief's full read: a narrower window must never replace them."""
+    import jsonstore
+    from source_context import project_local
+    snapshot = jsonstore.read(_snapshot_path(), default={})
+    return _merge_local_snapshot(local, snapshot) if snapshot else project_local(local)
+
+
 def resolve_effective_local(local: dict) -> dict:
     """Resolve one live read against permitted cached sources, preserving original provenance."""
     return _save_local_snapshot(local) if _live_local_observation(local) else _local_fallback(local)

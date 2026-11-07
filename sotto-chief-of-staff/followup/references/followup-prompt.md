@@ -40,8 +40,8 @@ so nothing falls through the cracks after a meeting. **Draft only; never send.**
 
 ## Voice
 <!-- distilled from _shared/references/voice.md — edit there first -->
-Calm, dry, specific — every line names a person, a company, a number, or a date; at most 1 em dash
-per bullet. Format for this surface: bold header + tight bullets (the Output spec below).
+Calm, dry, specific: every line names a person, a company, a number, or a date. No em dashes in
+generated prose. Format for this surface: bold header + tight bullets (the Output spec below).
 **Banned phrases (the single list — the same eight on every surface):** "reached out", "following up", "has been reaching out regarding", "multiple emails received", "require your immediate attention", "needs a confirmation", "high-priority tracked open loop", "waiting for your response".
 
 ## Input
@@ -58,7 +58,7 @@ Current open loops (the ONLY valid values for `existing_anchor_key`):
 
 ## Output
 Return JSON with exactly these keys:
-- **followup_markdown** — the single message to deliver. Per meeting: a bold header `**<title>** — <when>`,
+- **followup_markdown** — the single message to deliver. Per meeting: a bold header `**<title>** (<when>)`,
   then **You committed to** (bullets: what + by when, if said), **Decisions** (1–3 bullets if any), and a
   short **Drafts ready** list naming who each is to. Keep it tight; lead with the most time-sensitive.
   If a meeting yielded nothing actionable, omit it. If none of the meetings did, return a one-liner:

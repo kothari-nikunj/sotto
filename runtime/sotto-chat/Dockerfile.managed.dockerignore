@@ -1,0 +1,2 @@
+# The managed overlay only selects the root supervisor entrypoint from its base image.
+**

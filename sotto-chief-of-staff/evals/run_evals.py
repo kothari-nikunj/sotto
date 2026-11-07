@@ -5,7 +5,7 @@ run_evals.py — brief-quality eval harness for the sotto-chief-of-staff pack.
 Two modes (see evals/README.md for the full workflow):
 
   --deterministic   (DEFAULT) Fully offline, no network, no wall-clock dependence, <5s.
-                    Loads three golden "day" fixtures, runs the REAL pipeline pieces
+                    Loads golden "day" fixtures, runs the REAL pipeline pieces
                     (normalize → continuity resolve → build_prompt → compose with a stub
                     LLM → tap-link post-processing) into a throwaway $SOTTO_DATA sandbox,
                     then asserts a suite of named INVARIANTS (not exact prose). Prints a
@@ -72,7 +72,7 @@ from gemini import call_gemini as gemini_call  # noqa: E402  (the LLM call's own
 cb = _load_module(os.path.join("_shared", "scripts", "compose_brief.py"), "compose_brief")
 cr = _load_module(os.path.join("morning-brief", "scripts", "continuity_resolve.py"), "continuity_resolve")
 
-FIXTURES = ["rich_day", "quiet_day", "edge_day"]
+FIXTURES = ["rich_day", "quiet_day", "edge_day", "early_prep_day"]
 
 # ── Token substitution — deterministic timestamps parameterized off a FIXED base date ─────────────
 # Fixtures carry relative tokens instead of wall-clock literals. At load we resolve them against a
@@ -192,6 +192,8 @@ def run_pipeline(name: str) -> dict:
         os.environ.pop("SOTTO_LLM_STUB", None)
 
         inputs = fx["inputs"]
+        if name == 'early_prep_day':
+            result['early_prep_start'] = inputs['google']['events'][1]['start']
         stub = fx["stub_response"]
 
         calls = {"critic": False}
@@ -201,8 +203,11 @@ def run_pipeline(name: str) -> dict:
             also observe whether the critic/revise pass fired (the auto-critic invariant)."""
             if in_.get("_critic"):
                 calls["critic"] = True
+                # Script the known positive fixture judgment explicitly. Production still
+                # requires its exact source context and durable approval receipt.
                 return json.dumps({"patches": [], "score": 88, "summary": "ok",
-                    "loop_verdicts": [{"proposal_id": cr.critic_review_receipt(update), "verdict": "approve"}
+                    "loop_verdicts": [{"proposal_id": cr.critic_review_receipt(update),
+                                       "verdict": "approve"}
                                       for update in stub.get("loop_updates", [])]})
             if in_.get("_revise"):
                 return json.dumps({"brief_markdown": stub.get("brief_markdown", ""),
@@ -228,6 +233,7 @@ def run_pipeline(name: str) -> dict:
         # semantic proposal; only its version placeholder is bound to the seeded snapshot.
         from delivery_effects import loop_version
         ledger = cr._load_items()
+        inputs.setdefault("local", {})["action_ledger"] = list(ledger.values())
         for update in stub.get("loop_updates", []):
             if update.get("loopVersion") == "$FIXTURE_LEDGER_VERSION":
                 update["loopVersion"] = loop_version(ledger[update["loopId"]])
@@ -466,7 +472,45 @@ def chk_edge_group_backward_compat(r):
             f"backward_compat_group_rendered={renders} topic_derived_header={topic_header}")
 
 
+def chk_early_prep_visible_and_bound(r):
+    """The source-bound calendar action earns the existing inline offer, not a new task."""
+    actions = {a.get('id'): a for a in _actions(r)}
+    early, routine = actions.get('early-prep', {}), actions.get('routine-preview', {})
+    markdown = r.get('out', {}).get('brief_markdown', '')
+    text = r.get('out', {}).get('brief_text', '')
+    lines = [line for line in markdown.splitlines() if 'Dana Rivers' in line]
+    section, routine_sections = '', set()
+    for line in markdown.splitlines():
+        label = cb._task_section_label(line)
+        if label is not None:
+            section = label
+        if 'Routine partner check-in' in line:
+            routine_sections.add(section)
+    meeting_date = cb._parse_ts(r.get('early_prep_start', ''))
+    ok = (len(lines) == 1 and early.get('type') == 'meeting_prep'
+          and early.get('contactIdentifier') == 'rollout-review'
+          and early.get('helpKind') == 'prep' and early.get('newObligation') is False
+          and early.get('sectionType') == 'should_handle'
+          and meeting_date is not None and meeting_date.date().isoformat() in lines[0]
+          and early.get('contextAsk', '') in lines[0]
+          and '<!--meeting:event_id:rollout-review-->' in lines[0]
+          and 'I can prepare a briefing for Cedar rollout decision review.' in lines[0]
+          and 'I can prepare a briefing for Cedar rollout decision review.' in text
+          and early.get('evidence', [{}])[0].get('sourceId') == 'rollout-review'
+          and early.get('tap_link') == 'https://calendar.google.com/calendar/event?eid=rollout-review'
+          and routine.get('contactIdentifier') == 'routine-checkin'
+          and routine.get('helpKind') == 'none' and routine.get('newObligation') is False
+          and 'sectionType' not in routine and routine_sections == {'coming up'}
+          and 'Routine partner check-in' in markdown and 'Cedar rollout decision review' in markdown
+          and 'Prepare talking points for Sam Green' not in markdown
+          and not cb.brief_validate.validate(markdown, _actions(r), r.get('prompt', ''))
+          and not any(r.get('continuity', {}).get(key) for key in ('active', 'resolved', 'expired')))
+    return ('advance_prep_existing_offer_and_no_new_obligation', ok,
+            '54-hour prep must retain exact source/action and visible offer; routine meeting stays preview-only; no ledger task')
+
+
 CHECKS = {
+    "early_prep_day": [chk_no_exception, chk_early_prep_visible_and_bound, chk_tap_links_wellformed],
     "rich_day": [chk_no_exception, chk_rich_muted_sender, chk_rich_loops, chk_rich_group_no_deeplink,
                  chk_rich_calendar_linked, chk_rich_coverage, chk_rich_critic_ran, chk_tap_links_wellformed,
                  _mk_present("sections_present", ["Series B wire instructions", "Acme <> Sotto Partnership",

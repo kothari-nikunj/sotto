@@ -22,15 +22,12 @@ import knowledge as kg  # noqa: E402
 import master_file  # noqa: E402
 import preferences  # noqa: E402
 from relationship_importance import attention_tiebreak, classify  # noqa: E402
+from tzchain import data_root as _root  # noqa: E402
 
 COOLDOWN_DAYS = 30
 EFFECT_KIND = "review_candidate_offer"
 STATE_REL = ("knowledge", "relationship_state.json")
 OFFER_KEY = "review_candidate_offers"
-
-
-def _root():
-    return os.environ.get("SOTTO_DATA", "/data")
 
 
 def _state_path():

@@ -1,0 +1,95 @@
+{
+  "name": "held-out-company-topic-switch",
+  "world": {
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Cedar Labs",
+          "domain": "cedar.example",
+          "about": "Cedar Labs builds clinic scheduling tools. Its pilot codename is Juniper-47. The pilot covers twelve pediatric clinics. Its public website is https://cedar.example/."
+        },
+        {
+          "company_name": "Harbor Tools",
+          "domain": "harbor.example",
+          "about": "Harbor Tools makes woodworking tools. Its workshop program is called Birch-21 and serves seven schools. Its public website is https://harbor.example/."
+        }
+      ]
+    },
+    "websites": {
+      "https://cedar.example/": "Cedar Labs official website. The new pilot is Juniper-48, expanded to eighteen pediatric clinics. Updated October 18, 2026.",
+      "https://harbor.example/": "Harbor Tools official website. Its new workshop program is Birch-22, now serving nine schools. Updated October 18, 2026."
+    }
+  },
+  "turns": [
+    {
+      "text": "what do we know about Cedar Labs? short pls",
+      "contains": [
+        "clinic"
+      ],
+      "websiteReads": 0
+    },
+    {
+      "text": "and Harbor Tools?",
+      "contains": [
+        "woodworking"
+      ],
+      "websiteReads": 0
+    },
+    {
+      "text": "their website too? what's new?",
+      "contains": [
+        "Birch-22"
+      ],
+      "containsAny": [
+        [
+          "nine",
+          "9"
+        ]
+      ],
+      "excludes": [
+        "Juniper-48"
+      ],
+      "websiteReads": 1
+    },
+    {
+      "text": "back to Cedar Labs. how many clinics were in the saved pilot?",
+      "containsAny": [
+        [
+          "twelve",
+          "12"
+        ]
+      ],
+      "websiteReads": 0
+    },
+    {
+      "text": "check their site now",
+      "contains": [
+        "Juniper-48"
+      ],
+      "websiteReads": 1
+    },
+    {
+      "text": "draft a two sentence note comparing the expansions",
+      "contains": [
+        "Cedar",
+        "Harbor"
+      ],
+      "containsAny": [
+        [
+          "18",
+          "eighteen"
+        ],
+        [
+          "9",
+          "nine"
+        ]
+      ],
+      "websiteReads": 0
+    },
+    {
+      "text": "less formal pls",
+      "maxCharacters": 650,
+      "websiteReads": 0
+    }
+  ]
+}

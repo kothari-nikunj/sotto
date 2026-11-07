@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "lib"))             # keys
 
 import log_outcome  # noqa: E402
 from keys import draft_key, sample_hash  # noqa: E402
+from tzchain import data_root as _root  # noqa: E402
 
 MATCH_WINDOW_HOURS = 24      # observed sends match only within this window; silence stays unknown
 VERBATIM_SIM = 0.95          # ≥ this similarity = sent verbatim → outcome "executed" + style confirm
@@ -47,10 +48,6 @@ OBSERVABLE_CHANNELS = frozenset(("imessage", "sms", "whatsapp", "email", "gmail"
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+[\w.-]*\.[A-Za-z]{2,}")
 _QUOTE_RE = re.compile(r"^\s*(>|On .{0,120} wrote:|-{2,}\s*Forwarded message)", re.M)
-
-
-def _root() -> str:
-    return os.environ.get("SOTTO_DATA", "/data")
 
 
 def _events(name: str) -> str:
@@ -205,7 +202,7 @@ def _legacy_inferred(row: dict) -> bool:
             and all(k in row for k in ("channel", "contact", "action_type")))
 
 
-def _confirm_style_sample(sent_text: str, action_id: str) -> bool:
+def _confirm_style_sample(sent_text: str, action_id: str, *, permitted=None) -> bool:
     """A draft sent verbatim is the user's voice validated by pressing send — find the observed
     style sample carrying that text and move it into style.json's `confirmed` bucket through the
     bucket's ONE writer (style_extract.confirm_sample). Best-effort: malformed or unavailable
@@ -220,15 +217,38 @@ def _confirm_style_sample(sent_text: str, action_id: str) -> bool:
             for bucket in canonical.values():
                 pool += [s for s in (bucket or []) if isinstance(s, dict)]
         pool += [s for s in (style.get("recent") or []) if isinstance(s, dict)]
+        if permitted is not None:
+            from style_extract import NORMALIZED_CHANNEL_SOURCES
+            from source_context import allowed
+            pool = [sample for sample in pool
+                    if sample.get('source') in ('extracted', 'confirmed')
+                    and (source := NORMALIZED_CHANNEL_SOURCES.get(str(sample.get("channel", "")).lower()))
+                    and allowed(source) and permitted(source)]
         want = _norm_text(sent_text)
         hit = next((s for s in pool if _norm_text(s.get("text", "")) == want), None)
         # Even when the capped prompt bucket has rotated this sample out, the action marker lets
         # confirm_sample report that the send was already handled without cycling the bucket.
+        if permitted is not None and hit is None:
+            return False
         result = style_extract.confirm_sample(sample_hash(hit) if hit else "",
                                               action_id=action_id)
         return bool(result.get("ok") and not result.get("already"))
     except Exception:  # noqa: BLE001
         return False
+
+
+def bound_outcome(draft: dict, text: str, *, sent_id: str | None = None) -> dict:
+    """Exact reviewed lineage supplies attribution; original similarity supplies classification."""
+    rec = {"action_id": draft_key(draft), "channel": draft["channel"],
+           "contact": draft["identifier"], "action_type": draft["action_type"], "tier": "review"}
+    if sent_id is None:
+        return {**rec, "outcome": "draft_created"}
+    similarity = _similarity(draft["text"], text)
+    rec.update(outcome="executed" if similarity >= VERBATIM_SIM else "edited_and_sent",
+               source_event_id="email:" + sent_id)
+    if similarity < VERBATIM_SIM:
+        rec["edits"] = f"similarity {similarity:.2f}"
+    return rec
 
 
 def _run_locked(now=None) -> dict:
@@ -264,7 +284,9 @@ def _run_locked(now=None) -> dict:
                     and _similarity(draft.get("text", ""), observed["text"]) >= VERBATIM_SIM
                     and _confirm_style_sample(observed["text"], key)):
                 summary["style_confirmed"] += 1
-        if prior and prior.get("outcome") != "unknown" and not _legacy_inferred(prior):
+        # Saving a draft is not evidence that it was sent. A later observed send
+        # must still be able to grade this same original offered row.
+        if prior and prior.get("outcome") not in ("unknown", "draft_created") and not _legacy_inferred(prior):
             continue
         ts = _parse_ts(draft.get("ts", ""))
         channel = (draft.get("channel") or "").lower()
@@ -300,7 +322,9 @@ def _run_locked(now=None) -> dict:
                "contact": draft.get("identifier", ""), "action_type": draft.get("action_type") or "reply",
                "source_event_id": best["id"], "source_event_ts": best["ts"].strftime("%Y-%m-%dT%H:%M:%SZ")}
         outcome = "executed" if best_sim >= VERBATIM_SIM else "edited_and_sent"
-        rec.update({"outcome": outcome, "tier": "one_tap", "edits": f"similarity {best_sim:.2f}"})
+        rec.update({"outcome": outcome,
+                    "tier": "review" if rec["action_type"] == "decline" else "one_tap",
+                    "edits": f"similarity {best_sim:.2f}"})
         log_outcome.log(rec)
         summary[outcome] += 1
         summary["graded"] += 1

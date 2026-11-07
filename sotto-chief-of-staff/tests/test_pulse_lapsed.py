@@ -68,21 +68,20 @@ def test_email_is_a_relationship_channel_for_people_you_know(tmp_path, monkeypat
     priya = next(p for p in people_seen.values() if p["name"] == "Priya Raman")
     assert priya["cid"] == "c_priya"                       # graph identity, so one row per human
     out = rp.compute(local, NOW)
-    assert {q["display_name"] for q in out["attention_queue"] if q["queue_type"] == "waiting_on_you"} \
-        == {"Dana Roe", "Priya Raman"}                     # they wrote last, 4–5 days ago
+    assert out["attention_queue"] == []  # last inbound without an ask proves no reply obligation
 
 
 def test_no_history_degrades_cleanly(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     out = rp.compute(_local(_msg("Bob", 1, True)), NOW)          # no history arg at all
     assert out["lapsed"] == []
-    assert "lost touch" not in out["pulse_markdown"].lower()
+    assert "**Fully lost touch**" not in out["pulse_markdown"]
 
 
 def test_previously_regular_absent_contact_is_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Maya": _prior()}
-    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history, absence_complete=True)
     assert len(out["lapsed"]) == 1
     e = out["lapsed"][0]
     assert e["display_name"] == "Maya" and e["queue_type"] == "lapsed"
@@ -95,7 +94,7 @@ def test_previously_regular_absent_contact_is_lapsed(tmp_path, monkeypatch):
 def test_contact_in_current_window_is_not_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Bob": {"last_contact": "2026-05-01", "interactions": 12, "trend": "stable"}}
-    out = rp.compute(_local(_msg("Bob", 2, False)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 2, False)), NOW, history=history, absence_complete=True)
     assert out["lapsed"] == []
     assert _hist(out, "Bob")["last_contact"] == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
 
@@ -103,7 +102,7 @@ def test_contact_in_current_window_is_not_lapsed(tmp_path, monkeypatch):
 def test_one_off_past_contact_is_not_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Stranger": {"last_contact": "2026-05-01", "interactions": 2, "trend": "stable"}}
-    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history, absence_complete=True)
     assert out["lapsed"] == []                                    # below the "previously regular" bar
 
 
@@ -112,7 +111,7 @@ def test_lapsed_ranked_below_losing_touch(tmp_path, monkeypatch):
     msgs = [_msg("Sarah", d, i % 2 == 0) for i, d in enumerate([60, 58, 56, 54, 52, 50, 48, 46])]
     msgs.append(_msg("Sarah", 20, False))                         # Sarah = losing_touch
     history = {"Maya": _prior(last="2026-04-01", interactions=30)}
-    out = rp.compute(_local(*msgs), NOW, history=history)
+    out = rp.compute(_local(*msgs), NOW, history=history, absence_complete=True)
     kinds = [q["queue_type"] for q in out["attention_queue"]]
     assert "losing_touch" in kinds and "lapsed" in kinds
     assert kinds.index("lapsed") > kinds.index("losing_touch")    # lapsed always after
@@ -127,7 +126,7 @@ def test_lapsed_carries_graph_context_when_tracked(tmp_path, monkeypatch):
     with open(os.path.join(people, "maya.md"), "w") as f:
         f.write("---\nschema: 1\ncanonical_id: c_m\nname: Maya\ncompany: Acme\nfacts: {}\n---\n")
     history = {"Maya": _prior()}
-    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history, absence_complete=True)
     assert out["lapsed"][0]["graph_context"]["company"] == "Acme"
     assert "(Acme)" in out["pulse_markdown"]                      # grounded hook shown, not invented
 
@@ -136,7 +135,7 @@ def test_history_snapshot_written_and_carried_forward(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Maya": _prior(),
                "Ancient": {"last_contact": "2024-01-01", "interactions": 40, "trend": "stable"}}
-    out = rp.compute(_local(_msg("Bob", 1, True), _msg("Bob", 3, False)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 1, True), _msg("Bob", 3, False)), NOW, history=history, absence_complete=True)
     rp._persist_state(out)
     state = json.load(open(os.path.join(str(tmp_path), "knowledge", "relationship_state.json")))
     assert next(h for h in state["history"].values() if h.get("name") == "Bob")["interactions"] == 2           # current window snapshotted
@@ -209,7 +208,7 @@ def test_persist_state_atomic_no_tmp_left_behind(tmp_path, monkeypatch):
 def test_healthy_message_suppressed_when_only_lapsed(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     history = {"Maya": _prior()}
-    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history)
+    out = rp.compute(_local(_msg("Bob", 1, True)), NOW, history=history, absence_complete=True)
     assert "healthy" not in out["pulse_markdown"].lower()
 
 
@@ -246,3 +245,63 @@ def test_history_records_last_contact_per_channel(tmp_path, monkeypatch):
     ch = _hist(out, "Bob")["channels"]
     assert ch["imessage"] == (NOW - timedelta(days=3)).strftime("%Y-%m-%d")
     assert ch["calls"] == (NOW - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def test_incomplete_default_history_does_not_infer_lapsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    history = {"Maya": _prior()}
+    local = _local(_msg("Bob", 1, True))
+    assert rp.compute(local, NOW, history=history)["lapsed"] == []
+    assert rp.compute(local, NOW, history=history, absence_complete=False)["lapsed"] == []
+    assert rp.compute(local, NOW, history=history, absence_complete=True)["lapsed"]
+
+
+def _run_main(tmp_path, monkeypatch, capsys, local, history, gmail=None):
+    import sys as _sys
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(rp, "_load_history", lambda: history)
+    path = tmp_path / "local.json"
+    path.write_text(json.dumps(local))
+    argv = ["relationship_pulse.py", str(path)]
+    if gmail is not None:
+        (tmp_path / "gmail.json").write_text(json.dumps(gmail))
+        argv += ["--gmail", str(tmp_path / "gmail.json")]
+    monkeypatch.setattr(_sys, "argv", argv)
+    compute = rp.compute
+    monkeypatch.setattr(rp, "compute", lambda *a, **k: compute(*a, **{**k, "now": NOW}))
+    rp.main()
+    return json.loads(capsys.readouterr().out)
+
+
+def test_weekly_main_path_reports_lapsed_like_main(tmp_path, monkeypatch, capsys):
+    """The cron path hard-coded incomplete coverage, so `lapsed` was never produced and every pulse
+    carried the missing-history line. A read with no reported gap restores the original behavior."""
+    out = _run_main(tmp_path, monkeypatch, capsys, _local(_msg("Bob", 1, True)), {"Maya": _prior()})
+    assert [e["display_name"] for e in out["lapsed"]] == ["Maya"]
+    assert rp.LAPSE_DISCLAIMER not in out["pulse_markdown"]
+
+
+def test_main_path_withholds_lapse_only_on_a_channel_not_read_in_full(tmp_path, monkeypatch, capsys):
+    history = {"Maya": {**_prior(), "channels": {"whatsapp": "2026-05-04"}},
+               "Lee": {**_prior("Lee"), "channels": {"imessage": "2026-05-04"}}}
+    local = {**_local(_msg("Bob", 1, True)), "source_status": {"imessage": "ok", "whatsapp": "partial"}}
+    out = _run_main(tmp_path, monkeypatch, capsys, local, history)
+    assert [e["display_name"] for e in out["lapsed"]] == ["Lee"]
+    assert out["pulse_markdown"].endswith(rp.LAPSE_DISCLAIMER)
+
+
+def test_main_path_email_channel_needs_an_untruncated_gmail_read(tmp_path, monkeypatch, capsys):
+    history = {"Maya": {**_prior(), "channels": {"email": "2026-05-04"}}}
+    local = _local(_msg("Bob", 1, True))
+    out = _run_main(tmp_path, monkeypatch, capsys, local, history, gmail={"emails": [], "truncated_at": 300})
+    assert out["lapsed"] == [] and out["pulse_markdown"].endswith(rp.LAPSE_DISCLAIMER)
+    out = _run_main(tmp_path, monkeypatch, capsys, local, history, gmail=[])
+    assert [e["display_name"] for e in out["lapsed"]] == ["Maya"]
+
+
+def test_complete_channels_reads_only_full_reads():
+    assert rp.complete_channels() == ["calls", "imessage", "whatsapp"]          # legacy snapshot
+    assert rp.complete_channels({"imessage": "ok", "whatsapp": "partial", "calls": "unavailable"},
+                                email_complete=True) == ["email", "imessage"]
+    assert rp.complete_channels({"imessage": "ok", "deferred_unread_imessage": "degraded"}) == []
+    assert rp.complete_channels({}) == [] and rp.complete_channels("garbage") == []

@@ -31,6 +31,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import jsonstore  # noqa: E402
+
 REFRESH_WINDOW_SECS = 120   # refresh when the token expires within this window
 
 
@@ -86,8 +88,15 @@ def _write_atomic(service: str, rec: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(rec, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        directory = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -131,8 +140,18 @@ def _refresh(service: str, rec: dict, http, now: float) -> dict:
     expires_in = tok.get("expires_in")
     updated["expires_at"] = (now + float(expires_in)) if isinstance(expires_in, (int, float)) else None
     updated["obtained_at"] = now
-    _write_atomic(service, updated)
-    return updated
+    # The provider call above may have overlapped an owner disconnect or a new
+    # OAuth callback. Commit only if this is still the exact grant we refreshed.
+    # The shared lock also fences the receiver's connect/delete operations.
+    try:
+        with jsonstore.lock(token_path(service)):
+            current = _load(service)
+            if current != rec:
+                return current
+            _write_atomic(service, updated)
+            return updated
+    except TimeoutError:
+        raise ConnectorAuthError('connector credential is busy; retry') from None
 
 
 def get_access_token(service: str, http=None, force_refresh: bool = False, _now=None):

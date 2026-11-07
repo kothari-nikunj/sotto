@@ -1,0 +1,68 @@
+{
+  "name": "background-offer-continuation",
+  "world": {
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Cedar Labs",
+          "domain": "cedar.example",
+          "about": "Cedar Labs builds clinic scheduling tools. Its pilot codename is Juniper-47. The pilot covers twelve pediatric clinics. Its public website is https://cedar.example/."
+        }
+      ]
+    },
+    "websites": {
+      "https://cedar.example/": "Cedar Labs official website. The new pilot is Juniper-48, expanded to eighteen pediatric clinics. Updated October 18, 2026."
+    }
+  },
+  "turns": [
+    {
+      "text": "hi",
+      "excludes": [
+        "queued"
+      ]
+    },
+    {
+      "backgroundBefore": "Dana Reed asked whether Cedar Labs can include her clinic in the Juniper-48 pilot. I can draft a short reply asking which clinic she represents.",
+      "text": "yes pls",
+      "contains": [
+        "Dana",
+        "clinic"
+      ],
+      "excludes": [
+        "clarify",
+        "confirming",
+        "queued",
+        "sent the"
+      ]
+    },
+    {
+      "text": "more casual",
+      "contains": [
+        "clinic"
+      ],
+      "excludes": [
+        "Which draft",
+        "queued"
+      ]
+    },
+    {
+      "text": "make it one sentence",
+      "contains": [
+        "clinic"
+      ],
+      "maxCharacters": 400,
+      "excludes": [
+        "Which draft"
+      ]
+    },
+    {
+      "text": "what was she asking about again?",
+      "contains": [
+        "pilot"
+      ],
+      "excludes": [
+        "not sure"
+      ]
+    }
+  ]
+}

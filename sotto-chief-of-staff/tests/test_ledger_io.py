@@ -43,6 +43,31 @@ def test_load_entries_and_active(tmp_path, monkeypatch):
     assert {e.get("anchor_key") for e in li.load_active()} == {"a", "c"}   # terminal filtered
 
 
+def test_unsourced_brief_birthday_courtesy_is_hidden_but_preserved(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    base = {'status': 'open', 'action_type': 'follow_up',
+            'summary': 'Send Patrick a belated birthday greeting',
+            'source_brief_at': '2026-10-04 08:00:00'}
+    import yaml
+    variants = {
+        'courtesy': base,
+        'plural_greetings': {**base, 'summary': 'Send Patrick birthday greetings'},
+        'bday': {**base, 'summary': 'Send Patrick bday wishes'},
+        'happy_planning': {**base, 'summary': 'Plan the happy birthday dinner for Patrick'},
+        'owner': {**base, 'source': 'user_added'},
+        'requested': {**base, 'source_refs': [{'sourceType': 'imessage', 'sourceId': '7'}]},
+        'proved': {**base, 'content_provenance': {'kind': 'sources', 'sources': ['imessage']}},
+        'planning': {**base, 'summary': 'Plan the birthday party with Patrick'},
+        'dinner_call': {**base, 'summary': 'Call Mom about birthday dinner plans'},
+        'reservation_text': {**base, 'summary': 'Text Dad about birthday party reservation'},
+    }
+    for name, row in variants.items():
+        _write(tmp_path, name + '.md', '---\n' + yaml.safe_dump({'anchor_key': name, **row}) + '---\n')
+    assert {r['anchor_key'] for r in li.load_active()} == {
+        'owner', 'requested', 'proved', 'planning', 'dinner_call', 'reservation_text', 'happy_planning'}
+    assert {r['anchor_key'] for r in li.load_entries()} == set(variants)
+
+
 def test_load_entries_flags_malformed_and_read_views_exclude_them(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _write(tmp_path, "a.md", "---\nanchor_key: a\nstatus: open\n---\n")
@@ -71,6 +96,18 @@ def test_age_days():
     assert li.age_days("2026-06-30", today) == 0                        # future clamps to 0
     assert li.age_days("garbage", today) is None
     assert li.age_days(None, today) is None
+
+
+def test_dated_request_text_does_not_repeat_its_existing_recorded_date():
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    row = {'created_at': '2026-10-10'}
+    wording = 'From Oct 10: Wesley shared a deck and suggested reviewing it tomorrow.'
+    dated = 'From Oct 10: “Wesley shared a deck and suggested reviewing it tomorrow.”'
+    assert li.dated_request_text(wording, [row], now) == dated
+    assert li.dated_request_text(dated, [row], now) == dated
+    # A different saved date is evidence, not a prefix we can silently overwrite.
+    other = 'From Oct 9: Wesley suggested reviewing the deck tomorrow.'
+    assert li.dated_request_text(other, [row], now) == f'From Oct 10: “{other}”'
 
 
 def test_load_active_hides_a_snoozed_loop_from_every_read_view(tmp_path, monkeypatch):

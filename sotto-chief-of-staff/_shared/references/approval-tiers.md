@@ -46,8 +46,8 @@ drafts folder filling itself up while the user sleeps is exactly the busywork th
 staff doesn't do.
 
 **The tiers are policy; every real effect has an enforcement seam.** Everything above is a rule an
-agent honors — and an agent running with approvals auto-bypassed (`hermes -z`, which is how every
-cron, proactive and event-triage run executes) honors nothing by construction. So the acts that
+agent honors — and an unattended run (which is how every scheduled, proactive and event-triage run
+executes, with nobody present to approve) honors nothing by construction. So the acts that
 write the user's account are gated in code rather than in prose: the receiver sets
 `SOTTO_UNATTENDED` in the environment of every skill it spawns, and `google_action.py` refuses
 **`gmail-draft`, `gmail-send`, `gmail-reply`, `calendar-create`, `calendar-delete` and

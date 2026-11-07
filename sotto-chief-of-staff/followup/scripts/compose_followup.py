@@ -32,6 +32,7 @@ sys.path.insert(0, _SHARED)
 if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
 
+from jsonfiles import load, pick_list  # noqa: E402
 from textutil import _arr, _obj, _s, unwrap_tool_result  # noqa: E402
 from timeutil import (  # noqa: E402
     _now_local, _parse_ts, _user_local_date, _user_tz_offset, configured_tz,
@@ -261,23 +262,7 @@ def main():
                     help="debug only: compose without writing the continuity ledger")
     a = ap.parse_args()
 
-    def load(p, d):
-        if not p:
-            return d
-        try:
-            with open(p, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return d
 
-    def pick_list(v, *keys):
-        if isinstance(v, list):
-            return v
-        if isinstance(v, dict):
-            for k in keys:
-                if isinstance(v.get(k), list):
-                    return v[k]
-        return []
 
     inputs = {
         "granola": pick_list(load(a.granola, []), "meetings", "items"),

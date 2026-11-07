@@ -113,6 +113,17 @@ def test_meeting_prep_effect_uses_user_local_day_across_utc_midnight(tmp_path, m
         assert state.get('prep_deliveries', []) == []
 
 
+def test_prebound_brief_meeting_skips_only_legacy_occurrence_attachment(monkeypatch):
+    received = []
+    meeting = {'event_id': 'advance', 'start': '2026-10-28T15:00:00Z'}
+    offer = {'kind': 'meeting_prep', 'meeting': meeting}
+    monkeypatch.setattr(pending_offer, 'activate_offer', lambda offer, receipt: received.append(offer))
+    assert effects.finalize([{'kind': 'pending_offer', 'offer': offer}, {
+        'kind': 'meeting_prep_delivered', 'mode': 'offer', 'calendar_event_id': 'other',
+        'calendar_start': '2026-10-26T10:00:00Z'}], {'accepted_at': 1234})
+    assert received == [offer] and received[0]['meeting'] == meeting
+
+
 def test_calendar_absence_only_means_cancelled_with_fresh_complete_same_day(tmp_path):
     now = datetime.now(timezone.utc)
     start = now + timedelta(minutes=30)
@@ -310,3 +321,39 @@ def test_unselected_bundle_event_does_not_gain_a_closure_gate(monkeypatch):
     legacy = {'kind': 'eligibility', 'source': 'gmail', 'event': {'source': 'gmail', 'id': 'old-message'}}
     assert effects.valid([legacy])
     assert effects.request_reference({'source': 'proactive', 'channel': 'email', 'id': 'old-message'}) is None
+
+
+def test_accepted_meeting_offer_retains_unique_occurrence_and_exact_clear(tmp_path):
+    offer = pending_offer.set_offer('meeting_prep', 'Pull full prep?', 'Dana')
+    receipt = {'message_id': 'provider-offer', 'target': 'photon', 'chat_id': 'owner-chat',
+               'accepted_at': time.time()}
+    bundle = [{'kind': 'pending_offer', 'offer': offer}, {'kind': 'meeting_prep_delivered',
+        'mode': 'offer', 'calendar_event_id': 'event-1',
+        'calendar_start': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}]
+    assert effects.finalize(bundle, receipt)
+    selected = pending_offer.get_offer(message_id='provider-offer', target='photon', chat_id='owner-chat')
+    assert selected['meeting'] == {'event_id': 'event-1', 'start': bundle[1]['calendar_start']}
+    newer = pending_offer.set_offer('meeting_prep', 'Prep another meeting?', 'Jules')
+    effects.finalize([{'kind': 'pending_offer', 'offer': newer}], {**receipt, 'message_id': 'provider-newer'})
+    clear = [{'kind': 'accepted_offer_clear', 'offer': selected}]
+    assert not effects.finalize(clear, {})
+    assert pending_offer.get_offer(offer_id=selected['offer_id'])
+    assert effects.finalize(clear, {**receipt, 'message_id': 'provider-full-prep'})
+    assert not pending_offer.get_offer(offer_id=selected['offer_id'])
+    assert pending_offer.get_offer(offer_id=newer['offer_id'])
+    assert effects.finalize(clear, receipt)
+    assert pending_offer.get_offer(offer_id=newer['offer_id'])
+
+
+def test_completion_claim_is_fenced_again_before_delivery(monkeypatch):
+    row = {'anchor_key': 'task', 'status': 'resolved', 'summary': 'Send the contract',
+           'action_type': 'reply', 'contact_identifier': 'dana@example.com'}
+    candidate = [{'kind': 'eligibility', 'closed_loop': 'task',
+                  'closed_loop_version': effects.closure_version(row)}]
+    monkeypatch.setattr(effects, '_loops', lambda: {'task': row})
+    assert effects.valid(candidate)
+    row['status'] = 'open'
+    assert not effects.valid(candidate)
+    row['status'] = 'resolved'
+    row['summary'] = 'Send the revised contract'
+    assert not effects.valid(candidate)

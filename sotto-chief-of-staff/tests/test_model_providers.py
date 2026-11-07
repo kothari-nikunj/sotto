@@ -1,4 +1,4 @@
-"""test_model_providers.py — the provider seam (docs/plans/model-agnostic-pipeline.md).
+"""test_model_providers.py — the provider seam (docs/archive/plans/model-agnostic-pipeline.md).
 
 One battery, three adapters: the wire fields each provider needs, the same-family fallback
 privacy invariant, the context floor, and the back-compat guarantee that a default install

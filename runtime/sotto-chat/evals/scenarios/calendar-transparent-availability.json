@@ -1,0 +1,64 @@
+{
+  "name": "calendar-transparent-entry-does-not-block-owner",
+  "world": {
+    "savedSourceGrants": [
+      "calendar"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"calendar\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "calendarEvents": [
+      {
+        "id": "cedar-fyi",
+        "summary": "Cedar office hours",
+        "status": "confirmed",
+        "transparency": "transparent",
+        "eventType": "default",
+        "start": {
+          "dateTime": "2026-11-04T15:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "end": {
+          "dateTime": "2026-11-04T16:00:00-08:00",
+          "timeZone": "America/Los_Angeles"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    {
+      "text": "Am I free November 4 from 3 to 4 in the afternoon? Check my calendar, use Los Angeles time, and don't change anything.",
+      "containsAny": [
+        [
+          "free",
+          "available",
+          "does not block",
+          "doesn't block"
+        ]
+      ],
+      "excludes": [
+        "you are busy",
+        "you're busy",
+        "you have a conflict",
+        "you are unavailable",
+        "not free",
+        "aren't free",
+        "not available"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "latencyClass": "evidence"
+    }
+  ]
+}

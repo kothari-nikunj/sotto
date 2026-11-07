@@ -1,0 +1,175 @@
+{
+  "name": "natural-chat-prep-offer-yes-completed-sources",
+  "world": {
+    "meetingPrep": true,
+    "savedSourceGrants": [
+      "calendar"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"calendar\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "calendarEvents": [
+      {
+        "id": "routinecalendar01",
+        "summary": "Routine weekly check-in with Ada",
+        "description": "Our regular status check-in. No materials requested.",
+        "start": {
+          "dateTime": "{{ISO+1h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+2h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "displayName": "Ada Cedar",
+            "responseStatus": "accepted"
+          }
+        ]
+      },
+      {
+        "id": "fixturecalendar01",
+        "summary": "Cedar notebook pickup review with Ada",
+        "description": "Pick up the cedar notebook from Ada at the west entrance. Confirm the handoff details together and review the clinic pilot notes in the notebook.",
+        "start": {
+          "dateTime": "{{ISO+24h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+25h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "displayName": "Ada Cedar",
+            "responseStatus": "accepted"
+          }
+        ]
+      }
+    ],
+    "knowledge": {
+      "company_updates": [
+        {
+          "company_name": "Birch Labs",
+          "domain": "birch.example",
+          "about": "Birch Labs makes synthetic garden planning tools."
+        }
+      ],
+      "person_updates": [
+        {
+          "person_name": "Ada Cedar",
+          "identifier": "ada@example.invalid",
+          "profile_patch": {
+            "company": "Cedar Labs",
+            "title": "Operations lead"
+          },
+          "facts": []
+        }
+      ]
+    },
+    "prepGrounding": {
+      "groundingChunks": [
+        {
+          "web": {
+            "uri": "https://cedar.example/pilot",
+            "title": "Synthetic Cedar pilot"
+          }
+        }
+      ],
+      "groundingSupports": [
+        {
+          "segment": {
+            "startIndex": 0,
+            "endIndex": 40,
+            "text": "Ada coordinates the clinic notebook pilot."
+          },
+          "groundingChunkIndices": [
+            0
+          ]
+        }
+      ]
+    }
+  },
+  "turns": [
+    {
+      "text": "Any of tomorrow\u2019s meetings worth preparing for?",
+      "contains": [
+        "notebook"
+      ],
+      "chatPrepOffer": {
+        "eventId": "fixturecalendar01"
+      },
+      "prepJobCount": 0,
+      "publicReads": 0,
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "Yes.",
+      "contains": [
+        "notebook",
+        "west entrance"
+      ],
+      "minReplies": 2,
+      "meetingPrep": {
+        "eventId": "fixturecalendar01",
+        "newJob": true,
+        "artifactContains": [
+          "notebook",
+          "west entrance"
+        ]
+      },
+      "prepJobCount": 1,
+      "latencyClass": "brief"
+    },
+    {
+      "text": "Make that three questions I can ask her.",
+      "contains": [
+        "clinic",
+        "pilot"
+      ],
+      "prepJobCount": 1,
+      "canonicalUnchanged": true,
+      "googleReads": 0,
+      "publicReads": 0,
+      "maxCharacters": 1200,
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "Where did the prep research come from? Distinguish the invitation, public provider research, and unavailable private history.",
+      "containsAny": [
+        [
+          "provider",
+          "gemini"
+        ],
+        [
+          "calendar",
+          "invitation",
+          "invite"
+        ]
+      ],
+      "prepJobCount": 1,
+      "canonicalUnchanged": true,
+      "googleReads": 0,
+      "publicReads": 0,
+      "maxCharacters": 2400,
+      "latencyClass": "evidence"
+    }
+  ]
+}

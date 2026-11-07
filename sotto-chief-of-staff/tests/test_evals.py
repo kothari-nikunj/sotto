@@ -112,3 +112,20 @@ def test_a_broken_invariant_is_caught():
     cname, ok, _detail = ev.chk_rich_loops(corrupt)
     assert cname == "loop_resolved_and_surfaced"
     assert ok is False, "the loop invariant should fail when the resolved loop is missing"
+
+
+def test_early_prep_fixture_date_follows_the_same_event_offset():
+    import json
+    from datetime import datetime, timedelta
+
+    with open(os.path.join(ev.FIX_DIR, 'early_prep_day.json'), encoding='utf-8') as file:
+        fixture = json.load(file)
+    # The harness fixes noon UTC; also exercise a base across the +54h midnight boundary.
+    assert ev._base_datetime().hour == 12
+    for base in (datetime(2026, 10, 24, 12), datetime(2026, 10, 24, 19)):
+        resolved = ev.resolve_tokens(fixture, base)
+        routine, review = resolved['inputs']['google']['events']
+        assert datetime.fromisoformat(routine['start']).replace(tzinfo=None) == base + timedelta(hours=1)
+        assert datetime.fromisoformat(review['start']).replace(tzinfo=None) == base + timedelta(hours=54)
+        meeting_date = datetime.fromisoformat(review['start']).date().isoformat()
+        assert meeting_date in resolved['stub_response']['brief_markdown']

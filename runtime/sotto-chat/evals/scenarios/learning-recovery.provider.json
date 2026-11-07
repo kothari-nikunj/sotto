@@ -1,0 +1,92 @@
+{
+  "instructions": "Synthetic machinery contract. Tools are selected by a scripted external provider. Use supplied skill and source tools; no writes.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.com",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "History learning failed at extraction because the provider rejected unsupported model settings. Coverage is incomplete; I cannot infer that no earlier facts exist.",
+      "toolResultContains": [
+        "unsupported_model_settings",
+        "memory_extraction"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.com",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "Mira Patel designs coastal flood sensors at Harbor Instruments. This newly learned Gmail evidence is available, but source-wide learning is partial.",
+      "toolResultContains": [
+        "coastal flood sensors",
+        "Harbor Instruments"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.com",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "Mira Patel designs coastal flood sensors at Harbor Instruments. The measured Gmail window is complete; outside-window coverage remains unknown, not complete archive understanding.",
+      "toolResultContains": [
+        "coastal flood sensors",
+        "Harbor Instruments",
+        "outside_window_review",
+        "unknown",
+        "initial_traversal_complete"
+      ]
+    }
+  ]
+}

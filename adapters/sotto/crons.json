@@ -1,0 +1,35 @@
+[
+  {
+    "name": "sotto-morning-brief",
+    "schedule": "30 6 * * *",
+    "prompt": "Run my morning brief",
+    "skill": "sotto-morning-brief"
+  },
+  {
+    "name": "sotto-evening-brief",
+    "schedule": "30 17 * * *",
+    "prompt": "Run my evening brief",
+    "skill": "sotto-evening-brief"
+  },
+  {
+    "name": "sotto-relationship-pulse",
+    "schedule": "0 9 * * 1",
+    "prompt": "Run my relationship pulse",
+    "skill": "sotto-relationship-pulse"
+  },
+  {
+    "name": "sotto-proactive",
+    "schedule": "*/15 * * * *",
+    "schedule_env": "SOTTO_PROACTIVE_CRON",
+    "prompt": "Run my proactive check",
+    "skill": "sotto-proactive",
+    "gate": "SOTTO_PROACTIVE"
+  },
+  {
+    "name": "sotto-midday-digest",
+    "schedule": "30 12 * * *",
+    "prompt": "Run my midday digest",
+    "skill": "sotto-event",
+    "gate": "SOTTO_DIGEST"
+  }
+]

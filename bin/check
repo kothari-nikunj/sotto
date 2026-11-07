@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run the full shared gate with this tree's pinned development environment.
+set -euo pipefail
+root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$root/sotto-agent/sotto-chief-of-staff/tools/verify.py" ]; then
+  active="$root/sotto-agent"
+elif [ -f "$root/sotto-chief-of-staff/tools/verify.py" ]; then
+  active="$root"
+else
+  echo 'bin/check: cannot locate the shared verifier beside this wrapper.' >&2
+  exit 2
+fi
+python="$active/.venv/bin/python"
+if [ "$#" -ne 0 ]; then
+  if [ "$#" -ne 2 ] || [ "$1" != '--python' ]; then
+    echo 'Usage: bin/check [--python /absolute/path/to/qualified/python]' >&2
+    exit 2
+  fi
+  python="$2"
+fi
+if [[ "$python" != /* ]] || [ ! -x "$python" ]; then
+  echo 'bin/check: provide a qualified absolute interpreter with --python, or set up this tree:' >&2
+  printf '  cd %q\n' "$active" >&2
+  echo '  python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt' >&2
+  exit 2
+fi
+cd "$active"
+exec "$python" "$active/sotto-chief-of-staff/tools/verify.py"

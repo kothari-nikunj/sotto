@@ -1,0 +1,7 @@
+# Production root supervisor overlay on the pinned packaged Node/receiver image.
+# Build with --build-arg RUNTIME_IMAGE=<reviewed image digest>.
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+USER 0:0
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "-I", "-B", "/app/adapters/sotto/managed_bootstrap.py", "--run"]

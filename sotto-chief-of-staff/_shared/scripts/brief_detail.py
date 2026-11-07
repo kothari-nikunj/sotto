@@ -16,9 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 from source_context import permission_fingerprint  # noqa: E402
 import tzchain  # noqa: E402
 
-RETENTION_DAYS = 7
+from brief_detail_selection import accepted_day, MAX_MATCHES, RETENTION_DAYS  # noqa: E402, F401
+
 PAGE_CHARS = 12000
-MAX_MATCHES = 20
 
 
 def _read(path):
@@ -80,9 +80,9 @@ def query(*, artifact='', day='', kind='', text='', offset=0, data_root=None, no
                 candidate = r.get('recorded_at')
                 if type(candidate) in (int, float) and (stamp is None or candidate > stamp):
                     stamp = candidate
-        if type(stamp) not in (int, float) or not 0 <= clock - stamp <= RETENTION_DAYS * 86400:
+        date = accepted_day(stamp, clock, zone)
+        if date is None:
             continue
-        date = datetime.fromtimestamp(stamp, timezone.utc).astimezone(zone).date().isoformat()
         if day and date != day:
             continue
         # Old manifests lack a permission receipt. Do not make archived source text a revocation

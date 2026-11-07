@@ -1,0 +1,24 @@
+{
+  "note": "Frozen reply-only contrast for assertion wording. This is offline lexical validation, not a new model evaluation or a change to the recorded run statuses.",
+  "source_reports": {
+    "old_overclaim": {
+      "directory": "sotto-opus-integrated-revoked-oct19",
+      "recorded_status": "passed"
+    },
+    "scoped": {
+      "directory": "sotto-opus-integrated-revoked-oct19-v2",
+      "recorded_status": "failed",
+      "recorded_failure": "Turn 3 omitted the old generic uncertainty wording (can't/cannot/etc.)."
+    }
+  },
+  "old_overclaim": [
+    "I couldn't find that in the sources I checked; there is no recorded obligation or outcome regarding a pricing document for Maya Journey in your saved memory or open tasks. This covers only currently retained records and does not search through underlying source archives where older or unextracted history may live.",
+    "No, it doesn't prove either. The search only measured your currently retained canonical memory and open task ledger, so an unextracted promise in your underlying communications or an obligation outside those specific records could still exist.",
+    "From your saved evidence, the only verified record is Maya Journey's contact entry on file (maya.journey@example.test), with no recorded memories, obligations, or outcomes regarding a pricing document in your retained graph or open loops. That establishes that nothing is tracked in your current canonical ledger, but it cannot determine whether a document was discussed, promised, or sent in your underlying source archives."
+  ],
+  "scoped": [
+    "I couldn't find any matching record of a pricing document or its outcome in your permitted saved obligations for Maya Journey. Because this view only reflects retained records under your current permissions rather than a complete archive of your communications, the absence of a record does not confirm whether a commitment was made or remains outstanding.",
+    "No, it doesn't prove that. It only means no matching record was returned from your permitted saved view, which is not an exhaustive archive and does not establish whether a commitment exists or is still outstanding.",
+    "From your permitted saved evidence, there is a record for Maya Journey (maya.journey@example.test), but no saved commitments, notes, or recorded outcomes regarding a pricing document. Because this permission-filtered view is not an exhaustive archive, this establishes only that no matching records exist in your retained saved view, not whether a promise was made or remains outstanding."
+  ]
+}

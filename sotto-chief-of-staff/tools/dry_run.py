@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dry_run.py — exercise the full brief loop offline (no live LLM / Hermes / Mac).
+dry_run.py — exercise the full brief loop offline (no live LLM / chat runtime / Mac).
 
 Simulates what the morning-brief skill does after extraction: takes a recorded
 "extraction result" fixture (what Gemini would return over {google, granola, local}),

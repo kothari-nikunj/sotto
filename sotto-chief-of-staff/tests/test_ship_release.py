@@ -7,9 +7,9 @@ import subprocess
 import pytest
 
 
-HERMES = Path(__file__).resolve().parents[2]
+AGENT_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(
-    not (HERMES / "tools/ship.sh").exists(), reason="Private release wrapper is not exported."
+    not (AGENT_ROOT / "tools/ship.sh").exists(), reason="Private release wrapper is not exported."
 )
 
 
@@ -24,18 +24,18 @@ def _script(path, body):
 
 def _fixture(tmp_path):
     root = tmp_path / "source"
-    tools = root / "sotto-hermes/tools"
-    app = root / "sotto-hermes/sotto-bridge/app"
+    tools = root / "sotto-agent/tools"
+    app = root / "sotto-agent/sotto-bridge/app"
     tools.mkdir(parents=True)
     app.mkdir(parents=True)
     for name in ("ship.sh", "verify-public-image.sh"):
-        shutil.copy2(HERMES / "tools" / name, tools / name)
+        shutil.copy2(AGENT_ROOT / "tools" / name, tools / name)
     (app / "VERSION").write_text("1.2.19\n")
     _script(app / "build-app.sh", 'echo build >> "$CALLS"\n')
     _script(app / "release.sh", 'echo "release $1" >> "$CALLS"\n')
     _script(tools / "publish-public.sh", '''
 # The version must already be pushed before the long public-image build starts.
-test "$(git -C "$ORIGIN" show main:sotto-hermes/sotto-bridge/app/VERSION)" = 1.2.20
+test "$(git -C "$ORIGIN" show main:sotto-agent/sotto-bridge/app/VERSION)" = 1.2.20
 echo publish >> "$CALLS"
 # Reproduce another contributor landing work during that build.
 git -C "$PEER" pull -q --ff-only origin main
@@ -72,7 +72,7 @@ echo status=pushed > "$SOTTO_PUBLISH_STATUS_FILE"
 
 def _ship(root, env):
     return subprocess.run(
-        ["bash", str(root / "sotto-hermes/tools/ship.sh"), "example/sotto",
+        ["bash", str(root / "sotto-agent/tools/ship.sh"), "example/sotto",
          "--bridge", "v1.2.20", "--no-install", "--skip-tests"],
         cwd=root, env=env, capture_output=True, text=True,
     )
@@ -85,7 +85,7 @@ def test_main_advancing_during_public_build_does_not_strand_bridge(tmp_path):
     assert calls.read_text().splitlines() == ["publish", "build", "release v1.2.20"]
     assert _git(origin, "show", "main:newer.txt") == "newer"
     assert not (root / "newer.txt").exists(), "Never pull unverified source into a release"
-    marker = root / "sotto-hermes/sotto-bridge/.last-ship"
+    marker = root / "sotto-agent/sotto-bridge/.last-ship"
     assert marker.read_text().strip() == _git(root, "rev-parse", "HEAD")
 
 
@@ -97,8 +97,8 @@ def test_rejected_version_push_stops_before_build_or_publication(tmp_path):
     assert "Nothing has been built or published" in proc.stderr
     assert "--bridge v1.2.20" in proc.stderr
     assert not calls.exists()
-    assert _git(root, "show", "HEAD:sotto-hermes/sotto-bridge/app/VERSION") == "1.2.20"
-    assert _git(origin, "show", "main:sotto-hermes/sotto-bridge/app/VERSION") == "1.2.19"
+    assert _git(root, "show", "HEAD:sotto-agent/sotto-bridge/app/VERSION") == "1.2.20"
+    assert _git(origin, "show", "main:sotto-agent/sotto-bridge/app/VERSION") == "1.2.19"
 
 
 def test_missing_buildx_stops_before_version_commit(tmp_path):

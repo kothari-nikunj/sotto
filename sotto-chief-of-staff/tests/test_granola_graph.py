@@ -1,6 +1,7 @@
 """granola_graph.py — the meetings you sat in become dated, sourced facts on the people you sat with."""
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import granola_graph as gg
 import knowledge as kg
@@ -131,7 +132,8 @@ def test_run_persists_held_meeting_evidence_without_rewriting_attention_queue(tm
     state_path.write_text(json.dumps({"attention_queue": queue, "relationship_insights": [
         {"display_name": "Keep Me", "insight_type": "gone_silent"}], "history": {}}))
     meetings = []
-    for index, day in enumerate(("2026-09-02", "2026-09-09", "2026-09-16"), 1):
+    days = [(datetime.now(timezone.utc).date() - timedelta(days=age)).isoformat() for age in (21, 14, 7)]
+    for index, day in enumerate(days, 1):
         meeting = _meeting(["priya@acmecorp.com"], date=day, mid=f"m{index}")
         meeting["end"] = day + "T18:00:00+00:00"
         meetings.append(meeting)
@@ -141,8 +143,7 @@ def test_run_persists_held_meeting_evidence_without_rewriting_attention_queue(tm
     state = json.loads(state_path.read_text())
     priya = next(row for row in state["history"].values() if row["name"] == "Priya")
     assert priya["importance"]["tier"] == "regular"
-    assert priya["importance_evidence"]["held_meeting_days"] == [
-        "2026-09-02", "2026-09-09", "2026-09-16"]
+    assert priya["importance_evidence"]["held_meeting_days"] == days
     assert state["attention_queue"] == queue
     assert state["relationship_insights"] == [
         {"display_name": "Keep Me", "insight_type": "gone_silent"}]

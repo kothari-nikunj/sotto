@@ -97,6 +97,20 @@ def test_only_exact_proxy_budget_envelope_is_terminal(managed_proxy, url, body, 
     assert transport.proxy_budget_exhausted(error) is expected
 
 
+def test_truncated_proxy_diagnostic_preserves_original_http_failure(managed_proxy):
+    from http.client import IncompleteRead
+
+    class TruncatedBody(io.BytesIO):
+        def read(self, *args):
+            raise IncompleteRead(b'partial', 100)
+
+    error = transport.urllib.error.HTTPError(
+        'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
+        402, 'fixture', {}, TruncatedBody())
+    assert transport.proxy_budget_exhausted(error) is False
+    assert gemini.request_failure(error) == 'allowance_exhausted'
+
+
 def test_only_exact_proxy_admission_header_is_unbilled(managed_proxy):
     url = 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent'
     error = transport.urllib.error.HTTPError(

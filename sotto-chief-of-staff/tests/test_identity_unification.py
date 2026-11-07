@@ -92,8 +92,8 @@ def test_push_name_beats_lossy_last10_for_foreign_numbers():
     assert rl.resolve_whatsapp_name("818012345678@s.whatsapp.net", "Kenji Sato", lookup) == "Kenji Sato"
     # Exact-form Contacts matches still beat the push name (Contacts stays authoritative there).
     assert rl.resolve_whatsapp_name("18012345678@s.whatsapp.net", "danny boy", lookup) == "Dan Utah"
-    # No push name → the last-10 fallback still names the number rather than showing bare digits.
-    assert rl.resolve_whatsapp_name("818012345678@s.whatsapp.net", "", lookup) == "Dan Utah"
+    # No push name cannot authorize borrowing a different country's contact.
+    assert rl.resolve_whatsapp_name("818012345678@s.whatsapp.net", "", lookup) == "+818012345678"
 
 
 def test_unknown_lid_senders_do_not_collapse_into_one_thread():
@@ -496,6 +496,44 @@ def test_resolver_adopts_the_graph_cid_on_any_identifier_overlap():
         assert got and got["canonical_id"] == "c_ab12cd34ef56", idv
 
 
+def test_rekey_keeps_cards_with_a_shared_secondary_email_separate():
+    cards = rl.seed_contact_index_from_contacts([
+        {"name": "Dana Reed", "emails": ["a@example.com", "shared@example.com"]},
+        {"name": "Dana Reed", "emails": ["b@example.com", "shared@example.com"]}])
+    original = [card['canonical_id'] for card in cards]
+    graph = [{"canonical_id": "c_abc123", "identifiers": ["shared@example.com"]}]
+    assert [card['canonical_id'] for card in rl.rekey_seed_to_graph(cards, graph)] == original
+
+
+def test_near_duplicate_cards_of_one_seeded_person_still_adopt_the_graph_cid():
+    """iCloud and Google copies of one card share a seeded id; that is not an alias collision."""
+    contacts = [{"name": "Dana Lee", "emails": ["dana@example.com"], "phones": ["+14155550123"]},
+                {"name": "Dana Lee", "emails": ["dana@example.com"]}]
+    graph = [{"canonical_id": "c_aaaabbbbcccc", "display_name": "Dana Lee",
+              "identifiers": ["+14155550123"], "confidence": "medium"}]
+    cards = rl.seed_contact_index_from_contacts(contacts)
+    assert len({card['canonical_id'] for card in cards}) == 1
+    ambiguous = set()
+    rekeyed = rl.rekey_seed_to_graph(cards, graph, ambiguous_names=ambiguous)
+    assert [card['canonical_id'] for card in rekeyed] == ['c_aaaabbbbcccc'] * 2
+    assert ambiguous == set()
+    resolve = rl.build_identity_resolver({"contacts": contacts, "contact_index": graph})
+    for identifier in ("dana@example.com", "+14155550123"):
+        assert resolve(identifier)["canonical_id"] == "c_aaaabbbbcccc", identifier
+
+
+def test_rekey_rejects_multiple_graph_owners_of_any_card_alias():
+    for graph in ([
+        {"canonical_id": "c_abc123", "identifiers": ["a@example.com"]},
+        {"canonical_id": "c_def456", "identifiers": ["a@example.com"]}], [
+        {"canonical_id": "c_abc123", "identifiers": ["a@example.com"]},
+        {"canonical_id": "c_def456", "identifiers": ["b@example.com"]}]):
+        cards = rl.seed_contact_index_from_contacts([
+            {"name": "Dana Reed", "emails": ["a@example.com", "b@example.com"]}])
+        original = cards[0]['canonical_id']
+        assert rl.rekey_seed_to_graph(cards, graph)[0]['canonical_id'] == original
+
+
 def test_style_seed_adopts_the_person_files_cid(tmp_path, monkeypatch):
     """style.json's per_person buckets must key by the graph's id, not a freshly minted one —
     otherwise one human's iMessage voice and email voice live in two buckets forever."""
@@ -516,3 +554,14 @@ def test_style_seed_still_mints_when_the_graph_is_silent(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     index, _lookup = se._seed_contact_index([CONTACT])
     assert index[0]["canonical_id"] == kg.default_canonical_id("Dana Wells", ["dana@acmecorp.test"])
+
+
+def test_display_lookup_never_borrows_cross_country_or_ambiguous_aliases():
+    lookup = rl.build_contact_lookup([
+        {'name': 'US contact', 'phones': ['+1 8012345678']},
+        {'name': 'Japan contact', 'phones': ['+81 8012345678']},
+        {'name': 'First card', 'emails': ['shared@example.com']},
+        {'name': 'Second card', 'emails': ['shared@example.com']}])
+    assert rl.resolve_imessage_name('+81 8012345678', lookup) == 'Japan contact'
+    assert rl.resolve_call_name('+44 8012345678', lookup) is None
+    assert 'shared@example.com' not in lookup

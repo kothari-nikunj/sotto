@@ -18,7 +18,7 @@ def pairing(tmp_path, monkeypatch):
                        'SOTTO_IMESSAGE_NUMBER': '+15555551234'}.items():
         monkeypatch.setenv(key, value)
     installed = []
-    adapter = SimpleNamespace(install_cloud_google=lambda value: installed.append(value) or [])
+    adapter = SimpleNamespace(install_cloud_google=lambda value, **_kw: installed.append(value) or [])
     return cp.Pairing(tmp_path, adapter), installed
 
 
@@ -44,7 +44,7 @@ def test_native_timezone_is_bound_to_device_challenge_before_google_source_insta
         events.append(('zone', zone))
     service.on_timezone = apply
     key, body = handoff()
-    service.adapter.install_cloud_google = lambda value: events.append(('install', value)) or []
+    service.adapter.install_cloud_google = lambda value, **_kw: events.append(('install', value)) or []
     zone = 'America/Los_Angeles'
     signature = base64.b64encode(key.sign(('sotto-cloud-timezone\n' + body['challenge'] + '\n' + zone).encode(),
                                           ec.ECDSA(hashes.SHA256()))).decode()
@@ -65,7 +65,7 @@ def test_browser_timezone_precedes_source_install_and_is_bound_to_handoff(pairin
     service, installed = pairing
     events = []
     service.on_timezone = lambda zone: events.append(('zone', zone))
-    service.adapter.install_cloud_google = lambda value: events.append(('install', value)) or []
+    service.adapter.install_cloud_google = lambda value, **_kw: events.append(('install', value)) or []
     body = {'entry': 'browser', 'tenant_id': 'tenant', 'request_id': 'd' * 64,
             'sub': 'google-sub', 'credentials': None, 'timezone': 'America/Los_Angeles'}
     assert service.bootstrap(body)['account_connected']
@@ -91,7 +91,7 @@ def test_superseded_pending_browser_handoff_cannot_set_older_timezone(pairing):
              'timezone': 'America/Los_Angeles'}
     second = {**first, 'request_id': 'e' * 64, 'credential_generation': 2,
               'timezone': 'Europe/Paris'}
-    service.adapter.install_cloud_google = lambda _: events.append(('install', None)) or []
+    service.adapter.install_cloud_google = lambda _, **_kw: events.append(('install', None)) or []
     with pytest.raises(OSError):
         service.bootstrap(first)
     service.bootstrap(second)
@@ -146,7 +146,8 @@ def test_device_revocation_is_individual_and_old_grants_cannot_reactivate(pairin
     service, _ = pairing
     clock = [1000.0]
     monkeypatch.setattr(cp.time, 'time', lambda: clock[0])
-    assert service.authenticated('fixture-relay')
+    # A fresh tenant has no shared Bridge bearer: only an enrolled device authenticates.
+    assert not service.authenticated('fixture-relay')
     first_key, first = handoff()
     first_grant = service.bootstrap(first)
     first_request = signed(first_key, first_grant['pairing_grant'], first['challenge'])
@@ -220,14 +221,17 @@ def test_readiness_endpoint_accepts_device_or_control_and_reports_receipts_not_a
             headers['Origin'] = origin
         handler = SimpleNamespace(headers=headers, rfile=io.BytesIO(b'{}'), _send=lambda code, body: (code, body),
                                   _authed=lambda expected: token == expected)
-        return cp.handle(handler, path, service.root, service.adapter)
-    assert request('fixture-relay')[0] == 401  # legacy bearer retired after device enrollment
+        return cp.handle(handler, path, service.root, service.adapter, runtime_status=lambda: runtime)
+    runtime = {'name': 'sotto', 'configured': True}
+    assert request('fixture-relay')[0] == 401  # the operator relay bearer is never a device
     assert request('another-device')[0] == 401
     assert request(paired['bridge_token'], 'https://attacker.invalid')[0] == 400
     assert request(paired['bridge_token']) == (200, {
         'tenant_id': 'tenant', 'messaging_number': None,
-        'messaging_active': False, 'context_connected': False, 'first_brief': 'waiting'})
-    assert request('test-control') == request(paired['bridge_token'])
+        'messaging_active': False, 'context_connected': False, 'google_context_connected': False, 'first_brief': 'waiting'})
+    # The control read adds only the runtime readiness projection to the device's view.
+    device_view = request(paired['bridge_token'])
+    assert request('test-control') == (200, {**device_view[1], 'runtime': runtime})
     assert request('test-control', path='/cloud/consent')[0] == 401  # status access cannot consent for the Mac
     monkeypatch.setenv('PHOTON_HOME_CHANNEL', '+15555550000')
     (service.root / 'config/photon-activation.json').write_text(json.dumps({
@@ -246,6 +250,11 @@ def test_contacts_alone_do_not_open_personal_brief_gate(pairing):
     assert not cp.managed.connection_status(service.root)['context_connected']
     cp.managed.record_bridge_consent(service.root, ['contacts', 'imessage'], ['contacts', 'imessage'])
     assert cp.managed.connection_status(service.root)['context_connected']
+    assert not cp.managed.connection_status(service.root)['google_context_connected']
+    cp.managed.record_google_consent(service.root, ['https://www.googleapis.com/auth/calendar.events.readonly'])
+    assert cp.managed.connection_status(service.root)['google_context_connected']
+    cp.managed.record_google_consent(service.root, ['https://www.googleapis.com/auth/contacts'])
+    assert not cp.managed.connection_status(service.root)['google_context_connected']
 
 
 def test_delayed_older_google_grant_cannot_restore_revoked_scopes(pairing):
@@ -314,3 +323,33 @@ def test_setup_number_requires_exact_operator_route(pairing, monkeypatch):
     monkeypatch.setenv('PHOTON_ALLOWED_USERS', '+15555550000')
     monkeypatch.setenv('SOTTO_IMESSAGE_NUMBER', 'https://untrusted.example')
     assert cp.managed.connection_status(service.root)['messaging_number'] is None
+
+
+def test_sotto_control_status_requires_current_runtime_proof(pairing, monkeypatch):
+    service, _ = pairing
+    calls = []
+
+    def request(token='test-control', runtime_status=None):
+        handler = SimpleNamespace(
+            headers={'Authorization': 'Bearer ' + token, 'Content-Length': '2'},
+            rfile=io.BytesIO(b'{}'), _send=lambda code, body: (code, body),
+            _authed=lambda expected: token == expected)
+        return cp.handle(handler, '/cloud/status', service.root,
+                         runtime_status=runtime_status)
+
+    def ready():
+        calls.append(True)
+        return {'name': 'sotto', 'profile': 'managed-photon-fixed-five-v1', 'configured': True}
+
+    assert request(runtime_status=ready)[1]['runtime']['configured'] is True
+    assert calls == [True]
+    assert request(token='foreign', runtime_status=ready)[0] == 401
+    assert calls == [True]
+    assert request()[0] == 400
+
+    def failed():
+        raise RuntimeError('private-token-must-not-be-returned')
+
+    code, body = request(runtime_status=failed)
+    assert code == 400
+    assert 'private-token' not in json.dumps(body)

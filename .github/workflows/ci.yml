@@ -4,11 +4,13 @@
 # hand-edit here survives exactly until the next one. Change it there.
 #
 # It runs the same checks the source repository runs, on the same Python the container ships:
-# the pipeline suite, the skills validator, and the trigger-receiver suite. Tests that exercise
-# release tooling which is not part of this repository skip themselves — a clean clone is green.
+# the pipeline suite, skills validator, trigger-receiver suite, standalone runtime image package
+# smoke, and synthetic native lifecycle contracts. Tests that exercise release tooling which is
+# not part of this repository skip themselves — a clean clone is green.
 #
 # This workflow holds no credentials and needs none: it reads the code and runs the tests. It cannot
-# deploy, publish, or reach any service.
+# deploy or publish. Image/dependency builds use public registries; runtime checks use synthetic
+# state and containers without external networking.
 name: CI
 
 on:
@@ -30,13 +32,63 @@ jobs:
           # Matches the Dockerfile's base image, so a green run says something about the container.
           python-version: "3.12"
 
+      - name: Provide the packaged formatter Python path
+        # The formatter deliberately uses the image's fixed executable, not PATH.
+        # setup-python installs elsewhere on hosted runners; reproduce the image path for tests.
+        run: |
+          if [ ! -e /usr/local/bin/python3 ]; then
+            sudo ln -s "$(command -v python3)" /usr/local/bin/python3
+          fi
+          /usr/local/bin/python3 -I -B -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+
       - name: Install test dependencies
         # Pinned in requirements-dev.txt — a red run means a real regression, never "PyPI shipped
         # something this morning".
         run: python3 -m pip install --no-cache-dir --require-hashes -r requirements-dev.txt
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.3"
+
+      - name: Install chat test dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/sotto-chat
+
       - name: Shared runtime contracts
         run: python3 sotto-chief-of-staff/tools/verify.py
+
+      - name: Standalone local capability contracts
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/local-reader
+          npm run check --prefix runtime/local-reader
+          npm test --prefix runtime/local-reader
+          python3 -m unittest discover -s runtime/local-speech/tests -v
+
+      - name: Build standalone runtime image
+        run: docker build --platform linux/amd64 --file runtime/sotto-chat/Dockerfile.runtime --tag sotto-chat-runtime:ci .
+
+      - name: Verify packaged standalone runtime image
+        run: runtime/sotto-chat/test/fixtures/packaged-image/run-packaged-smoke.sh sotto-chat-runtime:ci linux/amd64
+
+      - name: Native lifecycle start contract (offline)
+        env:
+          LIFECYCLE_IMAGE: sotto-chat-runtime:ci
+          LIFECYCLE_CONTRACT: start
+        run: sh adapters/sotto/test_fixtures/run-lifecycle.sh
+
+      - name: Native runtime replacement contract (offline)
+        env:
+          LIFECYCLE_IMAGE: sotto-chat-runtime:ci
+          LIFECYCLE_CONTRACT: replacement
+        run: sh adapters/sotto/test_fixtures/run-lifecycle.sh
+
+      - name: Build limited-profile process fixture overlay
+        run: docker build --network none --pull=false --build-arg RUNTIME_IMAGE=sotto-chat-runtime:ci --file smoke/fixed-cross/Dockerfile --tag sotto-chat-fixed-cross:ci .
+
+      - name: Limited-profile fixed-five process fixture (offline)
+        run: docker run --rm --pull=never --network none --read-only --user 0:0 --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 --tmpfs /data:rw,nosuid,nodev,size=64m,mode=0755 --entrypoint python3 sotto-chat-fixed-cross:ci /fixture/run.py
+
+      - name: Limited-profile native lifecycle fixture (offline)
+        run: docker run --rm --pull=never --network none --read-only --user 0:0 --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 --tmpfs /data:rw,nosuid,nodev,size=64m,mode=0755 --entrypoint /usr/bin/tini sotto-chat-fixed-cross:ci -- python3 /fixture/run-lifecycle.py
 
       - name: Build the public image
         run: tools/verify-public-image.sh .

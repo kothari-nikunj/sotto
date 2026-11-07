@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 run_golden.py — replay the Golden Corpus through the REAL pipeline and score it against the owner's
-labels (docs/plans/golden-corpus.md, evals/LABELING.md).
+labels (docs/archive/plans/golden-corpus.md, evals/LABELING.md).
 
 The corpus is the owner's own history, pseudonymized and tokenized by
 `tools/build_golden_corpus.py`. A corpus day is a fixture in the exact shape `evals/fixtures/*.json`
@@ -37,11 +37,14 @@ import argparse
 import glob
 import importlib.util
 import json
+import math
 import os
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
@@ -63,6 +66,7 @@ import textutil                              # noqa: E402  — the owners of the
 import timeutil                              # noqa: E402
 import render_local                          # noqa: E402
 from gemini import call_gemini as gemini_call  # noqa: E402
+import gemini_transport                      # noqa: E402
 
 DEFAULT_VERSION = "corpus-v1"
 DEFAULT_SAMPLE = 5
@@ -113,7 +117,8 @@ def sample_days(days: list, n: int) -> list:
 
 def base_for(day: dict, frozen: datetime) -> datetime:
     """The day's own clock: the frozen 'most recent day' walked back by its offset."""
-    return frozen - timedelta(days=int(day.get("offset_days", 0)))
+    base = frozen - timedelta(days=int(day.get("offset_days", 0)))
+    return base.replace(hour=23, minute=59, second=0, microsecond=0) if day.get('replay_clock') == 'day_end' else base
 
 
 def frozen_base(override: str = "") -> datetime:
@@ -192,7 +197,7 @@ def _open_anchors(sandbox: str) -> dict:
             fm = yaml.safe_load(head) if head else None
         except (OSError, ValueError, yaml.YAMLError):
             continue
-        if isinstance(fm, dict) and fm.get("status") == "open" and fm.get("anchor_key"):
+        if isinstance(fm, dict) and fm.get("status") in ("open", "waiting", "blocked", "failed") and fm.get("anchor_key"):
             try:
                 chased = int(fm.get("chased_count") or 0)
             except (TypeError, ValueError):
@@ -250,9 +255,30 @@ def _distinct_entities(inputs: dict) -> int:
     return len(groups)
 
 
+def _project_inputs(inputs: dict) -> dict:
+    """Use the same source boundary for composition, event replay and the independent judge."""
+    from source_context import allowed, project_local, project_emails, project_x
+    inputs = dict(inputs)
+    inputs['local'] = project_local(inputs.get('local') or {})
+    google = dict(inputs.get('google') or {})
+    google['emails'] = project_emails(google.get('emails') or [])
+    if not allowed('gmail'):
+        google.pop('staleThreads', None)
+        google.pop('stale_threads', None)
+    if not allowed('calendar'):
+        google['events'] = []
+        inputs['attendee_research'] = []
+        inputs['x_context'] = {}
+    inputs['google'] = google
+    if not allowed('granola'):
+        inputs['granola'] = {'meetings': []}
+    inputs['x_context'] = project_x(inputs.get('x_context') or {})
+    return inputs
+
+
 def replay_day(day: dict, base: datetime, sandbox: str, live: bool) -> dict:
-    """One corpus day through the real pipeline: re-base its tokens onto `base`, compose, resolve
-    continuity, then push every inbound item through the event funnel one at a time."""
+    """One corpus day through the real pipeline. Chronological days replay inbound events before
+    day-end composition/learning; snapshot comparisons retain their historical ordering."""
     fx = ev.resolve_tokens(day, base)
     inputs = fx["inputs"]
     # The brief reasons about the day being REPLAYED, not the wall clock: without this every ledger
@@ -261,36 +287,104 @@ def replay_day(day: dict, base: datetime, sandbox: str, live: bool) -> dict:
     result = {"name": day["name"], "exception": None, "brief": "", "actions": [],
               "verdicts": {}, "open_loops": set(), "chases": {}, "entities": 0}
     try:
-        out = cb.compose(inputs, llm=(gemini_call if live else _stub_llm), critic=False)
+        # Match the production file-input boundary before composing or resolving. The
+        # composer itself loads the current protected ledger from this same sandbox.
+        from source_context import allowed, record_bridge_status, used_sources
+        record_bridge_status(inputs.get('local') or {}, data_root=sandbox)
+        inputs.update(_project_inputs(inputs))
+        google = inputs['google']
+        permissions = set(used_sources(inputs['local'], google, google.get('events', []),
+            inputs.get('granola'), inputs.get('x_context'), already_projected=True))
+        chronological = day.get('replay_clock') == 'day_end'
+        if chronological:
+            # Morning events cannot read the snapshot/knowledge written by tonight's composer.
+            result['verdicts'] = _replay_funnel(fx, base, live=live)
+            if any(str(v).startswith('error:') for v in result['verdicts'].values()):
+                raise RuntimeError('funnel execution failed')
+        continuity = {'today': base.strftime('%Y-%m-%d'), 'signals': fx.get('signals', {}),
+                      'local': inputs['local'], 'emails': google['emails'],
+                      'events': google.get('events', [])}
+        # Production resolves observed deterministic signals before the model sees the ledger.
+        cr.resolve(continuity, base, merge=False)
+        out = cb.compose(inputs, llm=(gemini_call if live else _stub_llm), critic=live)
+        permissions.update(out.get('_loop_source_permissions') or [])
+        if any(not allowed(source) for source in permissions):
+            raise RuntimeError('source permission changed while composing')
+        result['_source_permissions'] = sorted(permissions)
+        result['_judge_inputs'] = inputs
         result["brief"] = out.get("brief_markdown", "")
         result["actions"] = [a for a in (out.get("actions") or []) if isinstance(a, dict)]
-        cr.resolve({"today": base.strftime("%Y-%m-%d"),
-                    "signals": fx.get("signals", {}),
-                    "local": inputs.get("local", {}),
-                    "events": inputs.get("google", {}).get("events", []),
-                    "new_actions": result["actions"] or fx.get("new_actions", [])}, base)
+        continuity.update(new_actions=result['actions'] or fx.get('new_actions', []),
+                          loop_updates=out.get('loop_updates') or [])
+        cr.resolve(continuity, base, resolve_existing=False)
         anchors = _open_anchors(sandbox)
         result["open_loops"] = set(anchors)
         result["chases"] = {k: v["chased_count"] for k, v in anchors.items() if v["chased_count"]}
         result["entities"] = _distinct_entities(inputs)
-        result["verdicts"] = _replay_funnel(fx, base)
+        if not chronological:
+            result["verdicts"] = _replay_funnel(fx, base, live=live)
+        if any(str(verdict).startswith('error:') for verdict in result['verdicts'].values()):
+            raise RuntimeError('funnel execution failed')
     except Exception as e:  # noqa: BLE001 — one bad day must not abort a 42-day replay
         result["exception"] = f"{type(e).__name__}: {e}"
     return result
 
 
-def _replay_funnel(fx: dict, base: datetime) -> dict:
+def _replay_funnel(fx: dict, base: datetime, *, live: bool = False) -> dict:
     """Each inbound item triaged AS IF IT HAD JUST ARRIVED — its own timestamp is the clock, so
     quiet hours, cooldowns and the daily interrupt budget all land where they really would."""
     te = importlib.import_module("triage_event")
+    import personal_context
+    chronological = fx.get('replay_clock') == 'day_end'
+    events = funnel_events(fx)
+    def observed(event):
+        stamp = timeutil._parse_ts(textutil._s(event.get('timestamp')) or textutil._s(event.get('date')))
+        if stamp is None:
+            if chronological:
+                raise ValueError('chronological event requires an observed timestamp')
+            stamp = base
+        return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+    candidates = []
+    if chronological:
+        events.sort(key=observed)
+        local, google = fx['inputs'].get('local') or {}, fx['inputs'].get('google') or {}
+        candidates = personal_context.conversation_snapshot()
+        for source, rows in (('imessage', local.get('imessage')), ('whatsapp', local.get('whatsapp')),
+                             ('gmail', google.get('emails'))):
+            candidates.extend(({**row, 'source': source,
+                                'is_from_me': bool(row.get('is_from_me') or row.get('isSent'))}, '', '')
+                              for row in rows or [] if isinstance(row, dict))
     verdicts = {}
-    for e in funnel_events(fx):
-        ts = timeutil._parse_ts(textutil._s(e.get("timestamp")) or textutil._s(e.get("date"))) or base
-        if ts.tzinfo is not None:
-            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    for e in events:
+        event_clock = observed(e)
+        ts = event_clock.replace(tzinfo=None)
         now = ts + timedelta(minutes=1)
         try:
-            out = te.triage({"events": [e]}, now_local=now, now_utc=now.replace(tzinfo=timezone.utc))
+            # A dry replay remains offline even on an operator machine with provider keys.
+            classifier = te._classify_tier1
+            failures = []
+            def classify(*args, **kwargs):
+                if not live:
+                    raise RuntimeError('offline replay: Tier-1 not executed')
+                try:
+                    return classifier(*args, **kwargs)
+                except Exception as error:
+                    failures.append(error)
+                    raise
+            # Keep production selection/formatting, but evaluate its window at this event, not
+            # the machine's wall clock. Later outbound messages become visible only later.
+            conversation = personal_context.current_conversation
+            def as_of(event, now=None, candidates=None):
+                return conversation(event, now=event_clock, candidates=candidates)
+            with (patch.object(te, '_classify_tier1', side_effect=classify),
+                  patch.object(personal_context, 'conversation_snapshot', return_value=candidates)
+                  if chronological else nullcontext(),
+                  patch.object(personal_context, 'current_conversation', side_effect=as_of)
+                  if chronological else nullcontext()):
+                out = te.triage({"events": [e]}, now_local=now, now_utc=now.replace(tzinfo=timezone.utc))
+            # Production queues a failed classifier safely. It is not a completed eval verdict.
+            if failures:
+                raise failures[0]
             verdicts[e.get("_gid", "?")] = {"agent": "nudge"}.get(out.get("verdict"), out.get("verdict"))
         except Exception as exc:  # noqa: BLE001 — the funnel's own posture: fail toward silence
             verdicts[e.get("_gid", "?")] = f"error:{type(exc).__name__}"
@@ -386,9 +480,16 @@ def judge_day(res: dict, day: dict, base: datetime) -> dict:
     """One judge call per day on a PINNED model — a judge that drifts is not a baseline."""
     if not res["brief"]:
         return {}
-    manifest = cb.build_data_manifest(ev.resolve_tokens(day, base)["inputs"])
-    saved = os.environ.get("SOTTO_GEMINI_MODEL")
-    os.environ["SOTTO_GEMINI_MODEL"] = os.environ.get("SOTTO_JUDGE_MODEL", JUDGE_MODEL)
+    from source_context import allowed
+    if any(not allowed(source) for source in res.get('_source_permissions', [])):
+        return {'error': 'source permission changed before judging'}
+    manifest = cb.build_data_manifest(_project_inputs(
+        res.get('_judge_inputs', ev.resolve_tokens(day, base)['inputs'])))
+    # SOTTO_BRIEF_MODEL outranks SOTTO_GEMINI_MODEL in model resolution, and a fallback could
+    # swap the model mid-run: clear both, or the brief model could end up judging its own brief.
+    pins = {"SOTTO_BRIEF_MODEL": "", "SOTTO_FALLBACK_MODEL": "", "SOTTO_GEMINI_MODEL": judge_model()}
+    saved = {name: os.environ.get(name) for name in pins}
+    os.environ.update(pins)
     try:
         raw = gemini_call(_JUDGE_PROMPT % (json.dumps(manifest, ensure_ascii=False)[:20000],
                                               res["brief"][:20000]), {})
@@ -396,23 +497,50 @@ def judge_day(res: dict, day: dict, base: datetime) -> dict:
     except Exception as e:  # noqa: BLE001 — an unavailable judge costs a dimension, not the run
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
-        if saved is None:
-            os.environ.pop("SOTTO_GEMINI_MODEL", None)
-        else:
-            os.environ["SOTTO_GEMINI_MODEL"] = saved
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def judge_model() -> str:
+    return (os.environ.get("SOTTO_JUDGE_MODEL") or "").strip() or JUDGE_MODEL
+
+
+def run_signature(live: bool, judge: bool, sample: int, critic_policy: str) -> dict:
+    """What a baseline was measured with. A run on another compose or judge model is a different
+    measurement, so it is reported as a mismatch rather than compared silently."""
+    signature = {"mode": ("live+judge" if live and judge else "live" if live else "dry"),
+                 "sample": sample, "critic_policy": critic_policy,
+                 "metric_policy": "active-states-and-absolute-entity-error-v2",
+                 "chronological_funnel_policy": "event-time-before-day-end-compose-v1"}
+    if live:
+        signature["compose_model"] = "/".join(gemini_transport.effective_compose_model())
+    if live and judge:
+        signature["judge_model"] = judge_model()
+    return signature
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────────────────────────
 
 def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bool,
         update: bool, threshold: float, root: str = "", base_override: str = "") -> int:
+    if not _valid_threshold(threshold):
+        print('Invalid regression threshold: choose a finite number from 0 to 1.')
+        return 2
     try:
         corpus = load_corpus(version, root)
     except FileNotFoundError as e:
         print(str(e))
         return 2
     labels = corpus["labels"]
-    if not labels.get("reviewed") and not allow_unreviewed:
+    if corpus['manifest'].get('replay_policy', {}).get('mode') == 'chronological':
+        if (0 < sample < len(corpus['days']) or corpus['manifest'].get('seed_ledger')
+                or corpus['manifest'].get('preferences')):
+            print('Chronological replay requires every retained day and no current-state seeds.')
+            return 2
+    if not labels.get("reviewed") and (not allow_unreviewed or update):
         print(f"labels.yaml for {version} is still `reviewed: false` — an unreviewed draft is not a "
               f"baseline.\nRun the labeling session (evals/LABELING.md), or pass --allow-unreviewed "
               f"to see the numbers anyway.")
@@ -421,27 +549,45 @@ def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bo
         print("--live requires GOOGLE_AI_API_KEY. Aborting.")
         return 2
 
+    # Live replay uses compose_brief's production normalization. Dry replay passes critic=False,
+    # so ambient SOTTO_CRITIC cannot change its work or its baseline signature.
+    critic_policy = cb._critic_mode() if live else "disabled"
+
     days = sample_days(corpus["days"], sample)
     frozen = frozen_base(base_override)
     sandbox = _seed_sandbox(corpus, oldest_base(corpus, frozen))
     saved = {k: os.environ.get(k) for k in ("SOTTO_DATA", "SOTTO_TIMEZONE", "SOTTO_CRITIC",
-                                            "SOTTO_LLM_STUB")}
+                                            "SOTTO_LLM_STUB", "SOTTO_FALLBACK_MODEL")}
     rows, scores = [], {}
-    tier1 = "on" if os.environ.get("GOOGLE_AI_API_KEY") else "OFF (funnel scores are Tier-0 only)"
+    coverage = {'expected': [day['name'] for day in days], 'executed': [], 'failed': [],
+                'unlabeled': [], 'scored': {}}
+    tier1 = "on" if live and os.environ.get("GOOGLE_AI_API_KEY") else "OFF (funnel scores are Tier-0 only)"
     print(f"\nSotto GOLDEN evals — {version} · {len(days)}/{len(corpus['days'])} days · "
           f"{'LIVE' if live else 'DRY'} · clock {frozen:%Y-%m-%d} · funnel Tier-1 {tier1}\n" + "=" * 72)
+    if corpus['manifest'].get('replay_policy', {}).get('mode') != 'chronological':
+        print('Snapshot replay: current retained state may be seeded. This is not chronological learning acceptance.')
     try:
         os.environ["SOTTO_DATA"] = sandbox
         os.environ["SOTTO_TIMEZONE"] = corpus["manifest"].get("timezone") or "+00:00"
-        os.environ.pop("SOTTO_CRITIC", None)
         os.environ.pop("SOTTO_LLM_STUB", None)
+        # The signature names ONE compose model: a fallback would score another model's briefs
+        # against it, so a quota blip fails the day instead.
+        os.environ["SOTTO_FALLBACK_MODEL"] = ""
         for day in days:
             base = base_for(day, frozen)
-            res = replay_day(day, base, sandbox, live)
+            try:
+                res = replay_day(day, base, sandbox, live)
+            except Exception as error:
+                res = {'exception': f'{type(error).__name__}: {error}', 'brief': ''}
             day_rows = score_day(day, res, labels, live)
-            if live and judge:
+            if live and judge and not res["exception"]:
                 j = judge_day(res, day, base)
-                if j and "error" not in j:
+                if (not isinstance(j, dict) or 'error' in j
+                        or any(not _finite_number(j.get(k)) or not 0 <= j[k] <= 10
+                               for k in ('fabrication', 'voice', 'triage'))):
+                    res['exception'] = 'judge execution failed'
+                    day_rows.append(('judge', None, 'judge execution failed'))
+                else:
                     # One SCALAR row per dimension, normalized 0-1 so --threshold means the same
                     # thing on every metric. (These were once a nested dict that aggregate()
                     # silently dropped — a scored dimension that never reached the baseline.)
@@ -450,6 +596,15 @@ def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bo
                             day_rows.append((f"judge_{k}", round(float(j[k]) / 10, 3),
                                              textutil._s(j.get("notes")) if k == "fabrication"
                                              else f"judge's {k} score, 0-1"))
+            if res['exception']:
+                coverage['failed'].append(day['name'])
+            else:
+                coverage['executed'].append(day['name'])
+                scored = [m for m, value, _ in day_rows if value is not None]
+                if not scored:
+                    coverage['unlabeled'].append(day['name'])
+                for metric in scored:
+                    coverage['scored'].setdefault(metric, []).append(day['name'])
             print(f"\n{day['name']}  ({day.get('description', '')})")
             for metric, value, detail in day_rows:
                 print(f"  {metric:<18} {json.dumps(value)}   — {detail}")
@@ -465,9 +620,31 @@ def run(version: str, sample: int, live: bool, judge: bool, allow_unreviewed: bo
     scores = aggregate(rows)
     print("\n" + "=" * 72)
     print("AGGREGATE: " + json.dumps(scores, sort_keys=True))
-    run_sig = {"mode": ("live+judge" if live and judge else "live" if live else "dry"),
-               "sample": sample}
-    return _baseline_gate(version, scores, update, threshold, run_sig)
+    run_sig = run_signature(live, judge, sample, critic_policy)
+    print('COVERAGE: ' + json.dumps(coverage, sort_keys=True))
+    if not labels.get('reviewed'):
+        print('RESULT: NO BASELINE (unreviewed labels; numbers only)')
+        return 2
+    return _baseline_gate(version, scores, update, threshold, run_sig, coverage)
+
+
+def _finite_number(value) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _valid_threshold(value) -> bool:
+    return _finite_number(value) and 0 <= value <= 1
+
+
+def _valid_scores(scores: dict) -> bool:
+    return isinstance(scores, dict) and bool(scores) and all(
+        _finite_number(value) and (not metric.startswith('judge_') or 0 <= value <= 1)
+        for metric, value in scores.items())
 
 
 def aggregate(rows: list) -> dict:
@@ -484,12 +661,16 @@ def aggregate(rows: list) -> dict:
             raise ValueError(f"unaggregatable metric {metric!r}: a dict without 'f1' — "
                              f"emit one scalar row per dimension instead")
         elif isinstance(value, (int, float)):
-            out.setdefault(metric, []).append(float(value))
+            if not _valid_scores({metric: value}):
+                raise ValueError(f"invalid score for metric {metric!r}")
+            out.setdefault(metric, []).append(abs(float(value)) if metric == 'entity_dedup' else float(value))
     agg = {m: round(sum(v) / len(v), 3) for m, v in out.items() if v}
     for metric, a in prf.items():
         p = a["tp"] / a["actual"] if a["actual"] else (1.0 if not a["expected"] else 0.0)
         r = a["tp"] / a["expected"] if a["expected"] else 1.0
         agg[metric] = round(2 * p * r / (p + r), 3) if (p + r) else 0.0
+    if agg and not _valid_scores(agg):
+        raise ValueError("invalid aggregate scores")
     return agg
 
 
@@ -498,16 +679,32 @@ def _baseline_path(version: str) -> str:
 
 
 def _baseline_gate(version: str, scores: dict, update: bool, threshold: float,
-                   run_sig: dict) -> int:
+                   run_sig: dict, coverage: dict | None = None) -> int:
     """PASS only against a recorded baseline. No baseline is NO BASELINE (exit 2, the same family
     as a missing corpus) — a gate that passes because it has nothing to compare against is unarmed.
     The comparison walks the BASELINE's metrics, so a metric that vanishes from the current run
     (the exact shape of the judge-dict bug) fails instead of slipping out of the comparison."""
+    if not _valid_threshold(threshold):
+        print('RESULT: FAIL (invalid regression threshold; baseline unchanged)')
+        return 1
     path = _baseline_path(version)
+    expected = (coverage or {}).get('expected', [])
+    executed = (coverage or {}).get('executed', [])
+    failed = (coverage or {}).get('failed', [])
+    if (not expected or len(set(expected)) != len(expected) or failed
+            or executed != expected or not scores):
+        print('INCOMPLETE — failed or unexecuted cases: ' + ', '.join(
+            failed or [case for case in expected if case not in executed])
+            + ('; no scored metrics' if not scores else ''))
+        print('RESULT: FAIL (incomplete execution; baseline unchanged)')
+        return 1
+    if not _valid_scores(scores):
+        print('RESULT: FAIL (invalid scores; baseline unchanged)')
+        return 1
     if update:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"scores": scores, "run": run_sig,
+            json.dump({"scores": scores, "run": run_sig, "coverage": coverage,
                        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
                       f, indent=2, sort_keys=True)
         print(f"Baseline rewritten → {path}")
@@ -519,19 +716,28 @@ def _baseline_gate(version: str, scores: dict, update: bool, threshold: float,
     with open(path, encoding="utf-8") as f:
         doc = json.load(f) or {}
     prev, prev_run = doc.get("scores") or {}, doc.get("run") or {}
+    if not _valid_scores(prev):
+        print('RESULT: FAIL (invalid recorded baseline scores; baseline unchanged)')
+        return 1
+    coverage_changed = doc.get('coverage') != coverage or prev_run != run_sig
+    if coverage_changed:
+        print('COVERAGE MISMATCH — expected/executed/scored cases or run mode differ; '
+              'complete and review a new baseline explicitly.')
+        for key in sorted(set(prev_run) | set(run_sig)):
+            if prev_run.get(key) != run_sig.get(key):
+                print(f"  - {key}: {json.dumps(prev_run.get(key))} → {json.dumps(run_sig.get(key))}")
     missing = sorted(m for m in prev if m not in scores)
+    # entity_dedup is a signed distance from 0 (+ split identities, - over-merged): drift either way regresses.
     regressions = [(m, prev[m], scores[m]) for m in sorted(prev)
-                   if m in scores and (prev[m] - scores[m]) > threshold]
+                   if m in scores and ((abs(scores[m]) - abs(prev[m])) if m == 'entity_dedup'
+                                       else (prev[m] - scores[m])) > threshold]
     if missing:
         print(f"MISSING — in the baseline but absent from this run: {', '.join(missing)}")
-        if prev_run and prev_run != run_sig:
-            print(f"  baseline was recorded as {json.dumps(prev_run, sort_keys=True)}; this run is "
-                  f"{json.dumps(run_sig, sort_keys=True)} — match it, or --update-baseline")
     if regressions:
         print(f"REGRESSIONS beyond {threshold}:")
         for m, a, b in regressions:
             print(f"  - {m}: {a} → {b}")
-    if missing or regressions:
+    if missing or regressions or coverage_changed:
         print("RESULT: FAIL")
         return 1
     print("RESULT: PASS")

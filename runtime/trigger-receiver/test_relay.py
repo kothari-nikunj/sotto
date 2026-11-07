@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import time
+
+import pytest
 from datetime import datetime
 
 HERE = os.path.dirname(__file__)
@@ -290,6 +292,32 @@ def test_forward_uses_unique_internal_ids_and_restores_the_external_id():
     assert {v["result"]["n"] for v in results} == {1, 2}
 
 
+def test_forwarded_requests_advertise_accepted_fields_without_touching_the_callers_request():
+    r = relay.Relay()
+    seen = []
+
+    def bridge():
+        for _ in range(2):
+            req = r.poll(timeout=5)
+            seen.append(req)
+            r.respond({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+
+    r._touch()
+    bt = threading.Thread(target=bridge)
+    bt.start()
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "read_local", "arguments": {"since_hours": 24},
+                       "_meta": {"progressToken": "p", relay.BRIDGE_ACCEPTS_META: ["forged"]}}}
+    original = json.loads(json.dumps(call))
+    r.mcp_call(call, timeout=5)
+    r.mcp_call({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}, timeout=5)
+    bt.join()
+    assert call == original
+    assert seen[0]["params"]["_meta"] == {"progressToken": "p", relay.BRIDGE_ACCEPTS_META: ["source_coverage", "source_coverage_v2", "search_metadata_v1"]}
+    assert seen[0]["params"]["arguments"] == {"since_hours": 24}
+    assert seen[1]["params"] == {"_meta": {relay.BRIDGE_ACCEPTS_META: ["source_coverage", "source_coverage_v2", "search_metadata_v1"]}}
+
+
 def test_expired_forward_is_never_delivered_after_reconnect():
     r = relay.Relay()
     r._touch()
@@ -434,3 +462,232 @@ def test_response_hooks_run_outside_the_relay_lock():
     assert r.respond({'id': req['id'], 'result': {'ok': True}}) is True
     t.join()
     assert held_during == [False, False] and result[0]['result'] == {'ok': True}
+
+
+def test_connected_tools_list_uses_primed_cache_without_waiting_for_mac(monkeypatch):
+    r = relay.Relay()
+    r._touch()
+    catalog = {'tools': [{'name': 'read_local'}, {'name': 'get_contacts'}]}
+    r._store_tools(catalog)
+    forwarded = []
+    monkeypatch.setattr(r, '_forward',
+                        lambda request, timeout: forwarded.append((request['method'], timeout)))
+    allowed = {'read_local', 'get_contacts'}
+    r.filter_tools = lambda value: {**value, 'tools': [tool for tool in value['tools']
+                                                     if tool['name'] in allowed]}
+
+    first = r.mcp_call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
+    allowed.remove('get_contacts')
+    second = r.mcp_call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
+
+    assert forwarded == [], 'warm discovery must not wait through the live 20-second forward'
+    assert first['result']['tools'] == catalog['tools']
+    assert second['result']['tools'] == [{'name': 'read_local'}]
+    assert r._tools_cache == catalog, 'cache schemas, never a consent-filtered grant'
+    # A cached advertised schema cannot authorize a later revoked tool call.
+    r.validate_request = lambda request: False
+    denied = r.mcp_call({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+                         'params': {'name': 'get_contacts', 'arguments': {}}})
+    assert denied['error']['code'] == -32002
+    assert forwarded == []
+
+
+def test_connected_empty_catalog_is_cached_without_fallback_or_probe(monkeypatch):
+    r = relay.Relay()
+    r._touch()
+    r._store_tools({'tools': []})
+    forwarded = []
+    monkeypatch.setattr(r, '_forward',
+                        lambda request, timeout: forwarded.append((request['method'], timeout)))
+    result = r.mcp_call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
+    assert result['result'] == {'tools': []}
+    assert forwarded == []
+
+
+def _join_refresh(r):
+    if r._tools_refresh is not None:
+        r._tools_refresh.join(5)
+
+
+def test_bridge_reconnect_relists_in_background_and_keeps_the_last_catalog(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(relay.time, 'monotonic', lambda: clock[0])
+    r = relay.Relay(bridge_timeout=40.0)
+    r.poll(timeout=0.001)
+    old = {'tools': [{'name': 'old_schema'}]}
+    r._store_tools(old)
+    clock[0] = 11.0
+    r.poll(timeout=0.001)
+    assert r._tools_listed_at == 10.0, 'an active poll is not a reconnect'
+
+    clock[0] = 51.0
+    request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}
+    assert r.mcp_call(request)['result'] == old, 'sleeping Mac retains its last catalog'
+    assert r._tools_refresh is None, 'an offline Mac is never asked to re-list'
+    r.poll(timeout=0.001)
+    assert r._tools_cache == old, 'a reconnect keeps the last schemas'
+    new = {'tools': [{'name': 'upgraded_schema'}]}
+    forwarded = []
+
+    def forward(request, timeout):
+        forwarded.append((request['method'], timeout))
+        return {'result': new}
+
+    monkeypatch.setattr(r, '_forward', forward)
+    assert r.mcp_call(request)['result'] == old, 'the stale catalog answers without waiting'
+    _join_refresh(r)
+    assert r.mcp_call({**request, 'id': 2})['result'] == new
+    assert r.mcp_call({**request, 'id': 3})['result'] == new
+    assert forwarded == [('tools/list', 20.0)], 'one background re-list per stale catalog'
+
+
+def test_a_long_tool_response_is_not_a_reconnect(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(relay.time, 'monotonic', lambda: clock[0])
+    r = relay.Relay(bridge_timeout=40.0)
+    r.poll(timeout=0.001)
+    r._store_tools({'tools': [{'name': 'read_history'}]})
+    clock[0] = 55.0  # a 45-second tools/call returning through respond()
+    r._touch(polling=False)
+    assert r._tools_listed_at == 10.0 and r._tools_cache == {'tools': [{'name': 'read_history'}]}
+
+
+def test_failed_background_relist_keeps_the_last_catalog_not_the_fallback(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(relay.time, 'monotonic', lambda: clock[0])
+    r = relay.Relay(bridge_timeout=40.0)
+    r.poll(timeout=0.001)
+    last = {'tools': [{'name': 'read_history'}, {'name': 'send_message'}]}
+    r._store_tools(last)
+    clock[0] = 60.0
+    r.poll(timeout=0.001)
+    monkeypatch.setattr(r, '_forward', lambda request, timeout: None)
+    request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}
+    assert r.mcp_call(request)['result'] == last
+    _join_refresh(r)
+    assert r.mcp_call({**request, 'id': 2})['result'] == last
+
+
+def test_connected_catalog_relists_after_the_relist_interval_once_at_a_time(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(relay.time, 'monotonic', lambda: clock[0])
+    r = relay.Relay(bridge_timeout=40.0)
+    r.poll(timeout=0.001)
+    r._store_tools({'tools': [{'name': 'read_local'}]})
+    release = threading.Event()
+    forwarded = []
+
+    def forward(request, timeout):
+        forwarded.append(request['method'])
+        release.wait(5)
+        return {'result': {'tools': [{'name': 'read_local'}, {'name': 'send_message'}]}}
+
+    monkeypatch.setattr(r, '_forward', forward)
+    request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}
+    while clock[0] + 30 < 10.0 + relay.TOOLS_RELIST_SECONDS:  # a live Bridge polls continuously
+        clock[0] += 30
+        r._touch()
+    r.mcp_call(request)
+    assert r._tools_refresh is None, 'a fresh catalog is not re-listed'
+    clock[0] = 10.0 + relay.TOOLS_RELIST_SECONDS
+    r._touch()
+    for index in range(3):
+        assert r.mcp_call({**request, 'id': index})['result'] == {'tools': [{'name': 'read_local'}]}
+    release.set()
+    _join_refresh(r)
+    assert forwarded == ['tools/list'], 'at most one background re-list is in flight'
+    assert r.mcp_call(request)['result']['tools'][-1] == {'name': 'send_message'}
+
+
+def test_lost_ack_retry_is_content_free_bounded_and_observed_once(monkeypatch):
+    r = relay.Relay()
+    seen = []
+    r.on_response = lambda request, result: seen.append(result.copy())
+    replies = []
+    t = threading.Thread(target=lambda: replies.append(r._forward({'id': 9}, timeout=2)))
+    t.start()
+    req = r.poll(timeout=1)
+    response = {'id': req['id'], 'result': {'private': 'unique-secret'}}
+    assert r.respond(response)
+    t.join(timeout=1)
+    assert len(replies) == 1
+    # Receiver accepted, but the HTTP acknowledgement was lost. Retry after waiter removal.
+    assert r.respond(response)
+    assert len(seen) == 1
+    assert 'unique-secret' not in repr(r._completed)
+    assert not r.respond(dict(response, result={'private': 'different'}))
+    restarted = relay.Relay()
+    assert not restarted.respond(response)  # no waiter/receipt after restart, never execute a tool
+    expiry = r._completed[req['id']][1]
+    monkeypatch.setattr(relay.time, 'monotonic', lambda: expiry + 1)
+    assert not r.respond(response)
+    assert not r._completed
+
+
+def test_concurrent_response_retries_do_not_repeat_slow_observation():
+    r = relay.Relay()
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+    def observe(request, result):
+        seen.append(result)
+        entered.set()
+        assert release.wait(2)
+    r.on_response = observe
+    caller = threading.Thread(target=lambda: r._forward({'id': 1}, timeout=3))
+    caller.start()
+    req = r.poll(timeout=1)
+    response = {'id': req['id'], 'result': {'ok': True}}
+    accepted = []
+    first = threading.Thread(target=lambda: accepted.append(r.respond(response)))
+    second = threading.Thread(target=lambda: accepted.append(r.respond(response)))
+    first.start()
+    assert entered.wait(1)
+    second.start()
+    release.set()
+    first.join(2); second.join(2); caller.join(2)
+    assert accepted == [True, True] and len(seen) == 1
+
+
+def test_expired_result_is_not_observed_and_receipt_cache_has_a_hard_cap():
+    r = relay.Relay()
+    r.on_response = lambda *_: (_ for _ in ()).throw(AssertionError('expired observation'))
+    caller = threading.Thread(target=lambda: r._forward({'id': 1}, timeout=.1))
+    caller.start()
+    req = r.poll(timeout=1)
+    with r._lock:
+        r._waiters[req['id']]['deadline'] = 0
+    assert not r.respond({'id': req['id'], 'result': {}})
+    caller.join(1)
+    r.on_response = lambda *_: None
+    for n in range(256):
+        r._completed[str(n)] = ('hash', time.monotonic()+120)
+    caller = threading.Thread(target=lambda: r._forward({'id': 2}, timeout=2))
+    caller.start()
+    req = r.poll(timeout=1)
+    assert r.respond({'id': req['id'], 'result': {}})
+    caller.join(1)
+    assert len(r._completed) == 256 and '0' not in r._completed
+
+
+@pytest.mark.parametrize('name,accepted,expected', [
+    ('get_note', ['note_page_v1'], True),
+    ('get_note', [], False),
+    ('read_local', ['note_page_v1'], False),
+])
+def test_note_page_negotiation_is_per_request(name, accepted, expected):
+    r = relay.Relay()
+    seen = []
+    def bridge():
+        req = r.poll(timeout=5)
+        seen.append(req)
+        r.respond({'jsonrpc': '2.0', 'id': req['id'], 'result': {}})
+    r._touch()
+    worker = threading.Thread(target=bridge)
+    worker.start()
+    r.mcp_call({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                'params': {'name': name, 'arguments': {'id': 1},
+                           '_meta': {'sotto/accepts': accepted, 'sotto/note_cursor': 'first'}}}, timeout=5)
+    worker.join()
+    meta = seen[0]['params']['_meta']
+    assert ('note_page_v1' in meta['sotto/accepts']) is expected
+    assert meta['sotto/note_cursor'] == 'first'

@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Sotto trigger receiver (SPEC §4.1). Host-neutral endpoint beside the agent (Hermes or OpenClaw).
+Sotto trigger receiver (SPEC §4.1). The endpoint beside Sotto's chat runtime.
 
 The Bridge POSTs `{type:"morning_ready"|"evening_ready", date, local_data}` here when the Mac comes
 up. The receiver (1) authenticates the bearer (constant-time), (2) dedupes against the per-day
 delivered flag — and against the cron's own compose window, so a wake minutes behind the scheduled
 brief folds into the snapshot instead of racing it, (3) stages local_data, (4) enqueues the brief
-skill run on Hermes. Whatever still gets spawned is gated once more at the send seam: the outbox
+run. Whatever still gets spawned is gated once more at the send seam: the outbox
 claims the day's deliver-once marker itself, so only one brief per day ever leaves the box.
 
 Security: binds 0.0.0.0 on Railway behind its TLS proxy (127.0.0.1 locally), caps body size, strictly
 validates `date` before using it in any path, and only writes the delivered flag AFTER the skill
 is successfully enqueued.
 
-It also owns the brief SCHEDULE: crons.json rows marked `"runner": "receiver"` fire on this
-process's own heartbeat (_cron_tick) rather than on Hermes' scheduler, so a morning or evening
-brief has exactly one delivery lane — spawn, outbox, deliver-once gate — however it was started. /mcp and /bridge/* take the MCP bearer; /sotto/trigger takes the trigger
-token; the setup/pairing/debug-status pages (which surface the pairing link = the bearer, and the
-WhatsApp QR) take a per-deploy setup code printed to the boot log. /health is open. Every response
+It also owns the SCHEDULE: every crons.json row fires on this process's own heartbeat
+(_cron_tick), so a morning or evening brief has exactly one delivery lane — spawn, outbox,
+deliver-once gate — however it was started. /mcp and /bridge/* take the MCP bearer; /sotto/trigger
+takes the trigger token; the setup/pairing/debug-status pages (which surface the pairing link = the
+bearer) take a per-deploy setup code printed to the boot log. /health is open. Every response
 leaves through _write/_redirect, which stamp the dashboard's security headers (nosniff, no-referrer,
 frame-deny, no-store, plus SETUP_CSP on HTML) and set the wizard cookie with the dashboard's exact
 attributes (Secure; HttpOnly; SameSite=Lax). Stdlib only.
@@ -32,9 +32,10 @@ import os
 import re
 import secrets
 import signal
-import shlex
 import shutil
 import subprocess
+import socket
+import select
 import sys
 import threading
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -44,30 +45,22 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from functools import lru_cache, partial
 
 
 DATA = os.environ.get("SOTTO_DATA", "/data")
 # Captured before any child can inherit it. Managed execution makes this process
 # nondumpable before importing us; the attended gateway holds its own private copy.
 CHAT_SEND_TOKEN = os.environ.pop('SOTTO_CHAT_SEND_TOKEN', '')
-_HERMES_ADAPTERS = {}
+_SOTTO_ADAPTERS = {}
+_SOTTO_ADAPTERS_LOCK = threading.RLock()
 
 
-def _load_shared_lib(name):
-    """Import the single shared implementation in the image or source checkout."""
-    here = Path(__file__).resolve().parent
-    # Image code is /app/trigger-receiver beside /app/sotto-skills. The checkout
-    # uses runtime/trigger-receiver beside ../../sotto-chief-of-staff instead.
-    # Never fall back to the writable Hermes home for receiver implementation.
-    for root in (here, here.parent / 'sotto-skills' / '_shared' / 'lib',
-                 here.parent.parent / 'sotto-chief-of-staff' / '_shared' / 'lib'):
-        candidate = root / (name + '.py')
-        if candidate.is_file():
-            spec = importlib.util.spec_from_file_location(name, candidate)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-    raise RuntimeError(f'{name}.py is missing from the runtime')
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from shared_lib import load_shared_lib  # noqa: E402
+
+_load_shared_lib = partial(load_shared_lib, anchor=__file__)
 
 
 def _load_tzchain():
@@ -75,26 +68,67 @@ def _load_tzchain():
 
 
 TZCHAIN = _load_tzchain()
+SETUP_MARKUP = _load_shared_lib('setup_markup')
+_FAVICON = SETUP_MARKUP._FAVICON
+_page_head = SETUP_MARKUP._page_head
+_nav = SETUP_MARKUP._nav
+_narrow_page = SETUP_MARKUP._narrow_page
+_connect_page = SETUP_MARKUP._connect_page
+_connect_error_page = SETUP_MARKUP._connect_error_page
+_humanize_ago = SETUP_MARKUP._humanize_ago
+_tile = SETUP_MARKUP._tile
+_plain_tile = SETUP_MARKUP._plain_tile
 WORK_QUEUE = _load_shared_lib('work_queue')
 REQUESTED_BRIEF = _load_shared_lib('requested_brief')
-def _hermes_adapter(name):
-    for directory in (Path(__file__).resolve().parents[2] / 'adapters' / 'hermes',
-                      Path('/app/adapters/hermes')):
+RUNTIME_OWNER_BRIEF_REQUEST = _load_shared_lib('runtime_owner_brief_request')
+RUNTIME_OWNER_MEETING_PREP_REQUEST = _load_shared_lib('runtime_owner_meeting_prep_request')
+RUNTIME_OWNER_SKILL_REQUEST = _load_shared_lib('runtime_owner_skill_request')
+RUNTIME_OWNER_WEB_READ = _load_shared_lib('runtime_owner_web_read')
+RUNTIME_WEB_READER = _load_shared_lib('attended_web_read')
+RUNTIME_KNOWLEDGE_READ = _load_shared_lib('runtime_knowledge_read')
+CLIENT_MCP = _load_shared_lib('client_mcp')
+CLIENT_OAUTH = _load_shared_lib('client_oauth')
+CLIENT_MCP_BACKEND = _load_shared_lib('client_mcp_backend')
+RUNTIME_OWNER_OFFER_REPLY = _load_shared_lib('runtime_owner_offer_reply')
+RUNTIME_ACTIVATION = _load_shared_lib('runtime_activation')
+OWNER_LOOP_CAPABILITY = _load_shared_lib('owner_loop_capability')
+RUNTIME_OWNER_LOOP = _load_shared_lib('runtime_owner_loop')
+RUNTIME_OWNER_REMINDER = _load_shared_lib('runtime_owner_reminder')
+RUNTIME_OWNER_REMINDER_TOOL = _load_shared_lib('runtime_owner_reminder_tool')
+RUNTIME_OWNER_LOOP_TOOL = _load_shared_lib('runtime_owner_loop_tool')
+RUNTIME_OWNER_PREFERENCE_TOOL = _load_shared_lib('runtime_owner_preference_tool')
+FRESH_ROUTINES = _load_shared_lib('fresh_routines')
+RUNTIME_OWNER_ROUTINE_TOOL = _load_shared_lib('runtime_owner_routine_tool')
+RUNTIME_OWNER_GMAIL_DRAFT_TOOL = _load_shared_lib('runtime_owner_gmail_draft_tool')
+RUNTIME_OWNER_CALENDAR_TOOL = _load_shared_lib('runtime_owner_calendar_tool')
+RUNTIME_OWNER_BRIDGE_SEND_TOOL = _load_shared_lib('runtime_owner_bridge_send_tool')
+RUNTIME_OWNER_CONTACTS_TOOL = _load_shared_lib('runtime_owner_contacts_tool')
+RUNTIME_OWNER_QUIET = _load_shared_lib('runtime_owner_quiet')
+SELFHOST_SOURCE_AUTHORITY = _load_shared_lib('selfhost_source_authority')
+OWNER_ENDPOINT_HTTP = _load_shared_lib('owner_endpoint_http')
+
+
+def _sotto_adapter(name):
+    """Load one Sotto adapter module (runtime API, Photon owner policy, model lease) from the image
+    or the source checkout."""
+    for directory in (Path(__file__).resolve().parents[2] / 'adapters' / 'sotto',
+                      Path('/app/adapters/sotto')):
         path = directory / (name + '.py')
-        if not path.is_file():
-            path = directory / name / '__init__.py'
         if path.is_file():
             key = (name, str(path.resolve()))
-            if key in _HERMES_ADAPTERS:
-                return _HERMES_ADAPTERS[key]
-            spec = importlib.util.spec_from_file_location(
-                'sotto_hermes_' + name, path,
-                submodule_search_locations=[str(path.parent)] if path.name == '__init__.py' else None)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            _HERMES_ADAPTERS[key] = module
-            return module
-    raise RuntimeError(f'Hermes adapter {name} is missing')
+            with _SOTTO_ADAPTERS_LOCK:
+                if key not in _SOTTO_ADAPTERS:
+                    spec = importlib.util.spec_from_file_location('sotto_' + name, path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    _SOTTO_ADAPTERS[key] = module
+                return _SOTTO_ADAPTERS[key]
+    raise RuntimeError(f'Sotto adapter {name} is missing')
+
+
+def _runtime_adapter():
+    """Sotto's runtime boundary: the loopback chat service and its packaged tools."""
+    return _sotto_adapter('runtime_api')
 
 
 # One shared SECRET by default: the Bridge's wake-push sends the same token it dials in with
@@ -109,14 +143,17 @@ TOKEN = _TRIGGER_TOKEN or _MCP_TOKEN_ENV
 RELAY_TOKEN = _MCP_TOKEN_ENV or _TRIGGER_TOKEN
 
 
+GOOGLE_READ_DIAGNOSTICS = _sotto_adapter('google_read_contract')
+
+
 def derive_mcp_token(secret: str) -> str:
-    """The bearer Hermes presents on /mcp: HMAC-SHA256(root, "sotto-mcp"), hex. Hermes is the most
-    exposed principal in the image — it converses with prompt-injectable content — so it must never
-    hold the root: with only the derived token, a compromised agent cannot ingest fake Bridge
-    events, dial the relay, or open the setup page (which renders the pairing link, i.e. the root).
-    One-way on purpose; the Bridge and operator keep the root and pay nothing.
-    The SAME derivation lives in adapters/hermes/configure_mcp.py (--derive-mcp), which is what
-    hands Hermes its bearer — a parity test pins the two."""
+    """The bearer the chat runtime presents on /mcp: HMAC-SHA256(root, "sotto-mcp"), hex. The chat
+    runtime is the most exposed principal in the image — it converses with prompt-injectable
+    content — so it must never hold the root: with only the derived token, a compromised agent
+    cannot ingest fake Bridge events, dial the relay, or open the setup page (which renders the
+    pairing link, i.e. the root). One-way on purpose; the Bridge and operator keep the root and pay
+    nothing. adapters/sotto/startup_config.py renders the runtime's `bridge.readBearer` with the
+    SAME derivation — a parity test pins the two."""
     return hmac.new(secret.encode(), b"sotto-mcp", hashlib.sha256).hexdigest() if secret else ""
 
 
@@ -128,13 +165,13 @@ MAX_BYTES = 8 * 1024 * 1024  # 8 MB — a LocalData snapshot is KBs; reject anyt
 DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 # A `.claim` this old with no `.delivered` marker means the enqueued run died silently (Popen
 # succeeded, the skill never delivered). A fresh trigger may then reclaim and retry.
-CLAIM_STALE_SECS = 30 * 60
+CLAIM_STALE_SECS = _load_shared_lib("funnel_policy").CLAIM_STALE_SECS
 
 # The setup code that gates the setup/pairing/debug-status surface (/setup, /pair, /google/*,
-# /whatsapp/qr, /debug/google). Those pages leak the MCP bearer (the pairing link) and the live
-# WhatsApp QR, so "the Railway URL is the secret" is not enough. Resolved lazily: env override →
-# persisted file on the volume → generated once and persisted (0600). Printed to stdout at boot as a
-# full setup URL, so the user grabs it from the deploy logs.
+# /debug/google). Those pages leak the MCP bearer (the pairing link), so "the Railway URL is the
+# secret" is not enough. Resolved lazily: env override → persisted file on the volume → generated
+# once and persisted (0600). Printed to stdout at boot as a full setup URL, so the user grabs it
+# from the deploy logs.
 SETUP_CODE = None
 
 
@@ -163,7 +200,7 @@ def resolve_setup_code() -> str:
     SETUP_CODE = code  # noqa: N806 — assignment to the process-global setup credential
     return code
 
-# Reverse-MCP relay: the Mac dials OUT to /bridge/poll|respond; Hermes calls /mcp locally. No tunnel.
+# Reverse-MCP relay: the Mac dials OUT to /bridge/poll|respond; the chat runtime calls /mcp locally.
 _relay_spec = importlib.util.spec_from_file_location(
     "relay", os.path.join(os.path.dirname(__file__), "relay.py"))
 _relay_mod = importlib.util.module_from_spec(_relay_spec)
@@ -184,6 +221,201 @@ def _source_context():
     module = importlib.import_module('source_context')
     _source_context._module = module
     return module
+
+
+
+def _source_corrections():
+    _source_context()  # install the existing shared library path
+    return importlib.import_module('source_corrections')
+
+
+def _knowledge_module(name):
+    script = _find_sotto_script('_shared', 'knowledge', name + '.py')
+    if not script:
+        raise RuntimeError('knowledge helper missing')
+    _source_context()
+    directory = os.path.dirname(script)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    return importlib.import_module(name)
+
+
+def _project_dashboard_person(content):
+    if not _source_corrections().enabled():
+        return content
+    return _knowledge_module('knowledge').project_person_content(content, DATA)
+
+
+def _admit_source_corrections(body):
+    # Compatibility response for old native payloads; never admit new repair work.
+    return {'source_corrections': {'status': 'disabled', 'accepted': 0}} if 'source_corrections' in body else {}
+
+
+def _owner_continuity():
+    """Load the Python-owned bounded projection from the selected packaged skills tree."""
+    module = getattr(_owner_continuity, '_module', None)
+    if module is not None:
+        return module
+    expected = {
+        name: _find_sotto_script('_shared', subdir, name + '.py')
+        for name, subdir in (('owner_continuity', 'lib'), ('protected_ledger_io', 'lib'),
+                             ('ledger_provenance', 'lib'), ('ledger_io', 'scripts'),
+                             ('loops_query', 'scripts'), ('retune_scan', 'scripts'))
+    }
+    if any(path is None for path in expected.values()):
+        raise RuntimeError('owner continuity helper missing')
+    for directory in {os.path.dirname(path) for path in expected.values()}:
+        if directory not in sys.path:
+            sys.path.insert(0, directory)
+    # Python's flat module cache can retain a same-named module from another
+    # skills tree. Refuse it before any protected read instead of trusting the
+    # ambient search path or invoking a CLI.
+    for name, expected_path in expected.items():
+        loaded = importlib.import_module(name)
+        if Path(loaded.__file__).resolve() != Path(expected_path).resolve():
+            raise RuntimeError('owner continuity helper path mismatch')
+    module = sys.modules['owner_continuity']
+    _owner_continuity._module = module
+    return module
+
+
+def _dashboard_loop_rows():
+    """Project the protected ledger under one unchanged current source authority."""
+    before = _runtime_source_authority()
+    if before.get('complete') is not True or not before.get('revision'):
+        raise RuntimeError('loop source authority unavailable')
+    grants = (before.get('bridge_sources', []) + before.get('google_sources', [])
+              + before.get('connector_sources', []))
+    # Reuse the existing packaged-helper path checks; never import a writable skills copy.
+    _owner_continuity()
+    from loops_query import permitted_rows
+    rows = permitted_rows(DATA, grants)
+    after = _runtime_source_authority()
+    if after.get('complete') is not True or after.get('revision') != before['revision']:
+        raise RuntimeError('loop source authority changed')
+    return rows
+
+
+# Last live Bridge consent tokens seen by this process, keyed by data root, mode and tenant.
+# They keep the revision about consent, not Mac availability; they never grant a Bridge source.
+_BRIDGE_CONSENT_SEEN = {}
+
+
+def _runtime_source_authority(*, include_search_policy=False) -> dict:
+    """Bind independent Bridge, Google and connector evidence to current consent generations.
+
+    `bridge_sources` is live availability; the revision binds Bridge *consent* tokens. A sleeping
+    Mac or a timed-out probe empties `bridge_sources` but keeps the revision, so a Google-only
+    approval survives it, while any Bridge, cloud, ledger, Google or connector consent change still
+    changes the revision.
+    """
+    unavailable = {'version': 2, 'revision': None, 'complete': False,
+                   'bridge_sources': [], 'google_sources': [], 'connector_sources': []}
+    import managed
+    import google_source_authority
+    managed_mode = managed.enabled()
+    ledger_before = managed.source_authority_state(DATA) if managed_mode else None
+    if managed_mode and ledger_before is None:
+        return unavailable
+    try:
+        corrections_before = _source_corrections().revision(DATA)
+        granola_path = Path(DATA) / 'connectors/granola.json'
+        granola_before = SELFHOST_SOURCE_AUTHORITY.granola_generation(granola_path)
+        explicit_google_root = os.environ.get('SOTTO_HOME', '').strip()
+        # Bridge authority does not require a Google credential home. Sotto's
+        # home_path correctly refuses an absent home, so resolve it only when
+        # Google could contribute an independently authorized source.
+        google_path = (_runtime_adapter().home_path('google_token.json')
+            if explicit_google_root else None)
+        google_before = (google_source_authority.state(DATA, google_path, managed_mode=managed_mode,
+            tenant=os.environ.get('SOTTO_TENANT_ID', ''), managed_ledger=ledger_before)
+            if explicit_google_root else None)
+        if explicit_google_root and google_before is None:
+            return unavailable
+        calendar_before = _load_shared_lib('google_calendar_read').authority_selection(DATA, generation=google_before['generation'] if google_before else 'unavailable')
+        selfhost_before = (None if managed_mode or google_path is None else SELFHOST_SOURCE_AUTHORITY.generations(
+            google_path,
+            Path(DATA) / 'connectors/granola.json'))
+        policy = None
+        local_search = {'status': 'unknown'}
+        if RELAY.bridge_connected():
+            try:
+                request = {'jsonrpc': '2.0', 'id': 'source-authority', 'method': 'tools/call',
+                           'params': {'name': 'health', 'arguments': {}}}
+                response = RELAY.mcp_call(request, timeout=2.0)
+                result = response.get('result') if isinstance(response, dict) else None
+                if (isinstance(result, dict) and not response.get('error')
+                        and result.get('isError') is not True):
+                    source = _source_context()
+                    health = source.unwrap_tool_result(result)
+                    policy = source.bridge_source_policy(health, managed_mode)
+                    local_search = source.bridge_search_policy(health)
+            except Exception:  # noqa: BLE001 - a failed Mac probe never erases independent Google consent
+                pass
+        ledger_after = managed.source_authority_state(DATA) if managed_mode else None
+        if managed_mode and (ledger_after is None or ledger_after != ledger_before):
+            return unavailable
+        selfhost_after = (None if managed_mode or google_path is None else SELFHOST_SOURCE_AUTHORITY.generations(
+            google_path,
+            Path(DATA) / 'connectors/granola.json'))
+        if not managed_mode and selfhost_after != selfhost_before:
+            return unavailable
+        google_after = (google_source_authority.state(DATA, google_path, managed_mode=managed_mode,
+            tenant=os.environ.get('SOTTO_TENANT_ID', ''), managed_ledger=ledger_after)
+            if explicit_google_root and os.environ.get('SOTTO_HOME', '').strip() == explicit_google_root else None)
+        if explicit_google_root and google_after is None:
+            return unavailable
+        calendar_after = _load_shared_lib('google_calendar_read').authority_selection(DATA, generation=google_after['generation'] if google_after else 'unavailable')
+        if calendar_after != calendar_before:
+            return unavailable
+        # Refreshing only the access token/expiry does not change consent. Other
+        # credential-state consumers retain the full body digest; compare grants here.
+        grant_before = {key: value for key, value in google_before.items() if key != 'body_digest'} if google_before else None
+        grant_after = {key: value for key, value in google_after.items() if key != 'body_digest'} if google_after else None
+        if grant_after != grant_before:
+            return unavailable
+        granola_after = SELFHOST_SOURCE_AUTHORITY.granola_generation(granola_path)
+        if granola_after != granola_before:
+            return unavailable
+        corrections_after = _source_corrections().revision(DATA)
+        if corrections_after != corrections_before:
+            return unavailable
+        bridge_usable = managed_mode or selfhost_before is not None
+        seen_key = (str(DATA), managed_mode, os.environ.get('SOTTO_TENANT_ID', '') if managed_mode else '')
+        if policy and bridge_usable:
+            _BRIDGE_CONSENT_SEEN[seen_key] = policy
+        consent = policy or _BRIDGE_CONSENT_SEEN.get(seen_key)
+        permitted = set(policy['allowed_sources']) if policy and bridge_usable else set()
+        consented = set(consent['allowed_sources']) if consent and bridge_usable else set()
+        if managed_mode:
+            permitted &= set(ledger_after['allowed_sources'])
+            consented &= set(ledger_after['allowed_sources'])
+        allowed = sorted(permitted)
+        consented = sorted(consented)
+        google_allowed = list(google_after['sources']) if google_after else []
+        if calendar_after.get('needs_reselection'):
+            google_allowed = [source for source in google_allowed if source != 'calendar']
+        connector_allowed = (['granola'] if granola_after not in (None, SELFHOST_SOURCE_AUTHORITY.DISCONNECTED)
+            and (not managed_mode or 'granola' in ledger_after['connector_sources']) else [])
+        basis = ['sotto-source-authority-v2', managed_mode,
+                 consent['bridge_revision'] if consent and consented else None,
+                 consent['cloud_revision'] if consent and consented else None,
+                 ledger_after['revision'] if managed_mode else None, consented,
+                 google_after['generation'] if google_after else 'unknown', google_allowed,
+                 granola_after, connector_allowed, calendar_after]
+        if not managed_mode:
+            basis.append(list(selfhost_after) if selfhost_after is not None else 'unknown')
+        if corrections_after:
+            basis.append(['source_corrections', corrections_after])
+        revision = hashlib.sha256(json.dumps(basis, separators=(',', ':')).encode()).hexdigest()
+        result = {'version': 2, 'revision': revision, 'complete': True,
+                  'bridge_sources': allowed, 'google_sources': google_allowed, 'connector_sources': connector_allowed}
+        if include_search_policy:
+            # MCP status needs capability metadata; the chat authority wire contract is strict.
+            result['local_search'] = local_search if policy and bridge_usable else {'status': 'unknown'}
+        return result
+    except Exception:  # noqa: BLE001 - unavailable policy is never an access grant
+        return unavailable
 
 
 def _record_source_response(request, result):
@@ -250,19 +482,26 @@ DASHBOARD = importlib.util.module_from_spec(_dash_spec)
 _dash_spec.loader.exec_module(DASHBOARD)
 DASHBOARD.HOOKS.update({
     "data_root": lambda: DATA,
+    "project_person": lambda raw: _project_dashboard_person(raw),
     "setup_code": lambda: resolve_setup_code(),
     "bridge_connected": lambda: RELAY.bridge_connected(),
     "last_event_at": lambda: _last_event_at(),
     "google_ok": lambda: google_connected()[0],
+    "calendar_settings": lambda value=None: _google_calendar_settings(value),
     "connector_status": lambda: CONNECTORS.service_status(),
     "connector_error": lambda s: _connector_error(s),
     "connector_has_refresh": lambda s: _connector_has_refresh(s),
     "source_allowed": lambda s: _source_context().allowed(s),
     "source_health": lambda: _source_context().source_health(DATA),
+    "runtime_observation": lambda: _runtime_adapter().runtime_observation(),
+    "client_mcp_diagnostics": lambda: CLIENT_MCP.diagnostics(),
+    "feedback": lambda: _runtime_adapter().feedback_status(),
+    "personal_routines_supported": lambda: _runtime_adapter().personal_routines_supported(),
     # M2 writes: dashboard.py shells out to the skills tree's knowledge_edit.py, located with the
     # same discovery run_triage uses (late-bound so test monkeypatches on _find_sotto_script land).
     "find_script": lambda *rel: _find_sotto_script(*rel),
     "delivery_effects": lambda: _shared_effects(),
+    "permitted_loop_rows": lambda: _dashboard_loop_rows(),
     "relationship_importance": lambda contact, history, now: _load_shared_lib(
         "relationship_importance").for_contact(contact, history, [], now),
     # THE atomic JSON write (connectors.write_json). dashboard.py/calcache.py don't import
@@ -308,11 +547,12 @@ CALCACHE.HOOKS.update({
     "meeting_tap": lambda ev: _dispatch_meeting_tap(ev),
 })
 DASHBOARD.HOOKS["calendar_snapshot"] = lambda: CALCACHE.snapshot()
+CALCACHE.HOOKS["source_revision"] = lambda: _runtime_source_authority().get("revision")
 
 # The durable delivery outbox (ROADMAP § Reliability P0 item 2): nothing Sotto says is marked
 # delivered until the channel says so; what fails waits its turn instead of dying. It owns
 # events/outbox.json and every constant about retrying — this module owns only the CHANNEL
-# (`_send_via_channel`) and the receipt (`_record_delivery`), handed over as hooks.
+# (`_send_with_identity`) and the receipt (`_record_delivery`), handed over as hooks.
 _outbox_spec = importlib.util.spec_from_file_location(
     "outbox", os.path.join(os.path.dirname(__file__), "outbox.py"))
 OUTBOX = importlib.util.module_from_spec(_outbox_spec)
@@ -322,17 +562,21 @@ OUTBOX.HOOKS.update({
     "json_transaction": lambda p, **kw: CONNECTORS.json_transaction(p, **kw),
     # The ONE call that touches the channel. When a channel offers a real receipt (a gateway send
     # API returning an id), this is the single function that gets stronger and every lane inherits it.
-    "send": lambda body, target: _send_via_channel(body, target),
-    "send_gallery": lambda presentation, target, dispatch_id: _hermes_adapter('runtime_api').send_gallery(
-        presentation, target, dispatch_id, SEND_TIMEOUT_SECS),
-    "gallery_receipt": lambda dispatch_id: _hermes_adapter('runtime_api').gallery_receipt(dispatch_id),
+    "send": lambda body, target, dispatch_id, attempt, **context: _send_with_identity(
+        body, target, dispatch_id, attempt, **context),
+    "send_gallery": lambda presentation, target, dispatch_id: _send_gallery_with_current_route(
+        presentation, target, dispatch_id),
+    "gallery_receipt": lambda dispatch_id: _runtime_adapter().gallery_receipt(dispatch_id),
     "record": lambda label, status, detail="", usage=None, decision_ids=None, run_id="": _record_delivery(
         label, status, detail, usage=usage, decision_ids=decision_ids, run_id=run_id),
     # A chase is only counted once the message that chased actually landed — wherever it landed,
     # first try or fifth. The ack is what finalizes effects, so this rides the ack.
     "on_delivered": lambda payload: _on_delivered(payload),
+    "offer_route": lambda payload: _capture_offer_route(payload),
     "valid": lambda payload: _delivery_valid(payload),
+    "delivery_ready": lambda payload: _history_discovery_delivery_ready(payload),
     "on_invalid": lambda payload: _invalid_delivery(payload),
+    "on_terminal": lambda row: _owner_timer_terminal(row),
     # A run that exited 0 with a non-brief body is a run that died, as far as the day is concerned:
     # the same one bounded re-fire a crash gets (review, Sep 3 — without it the cron lane on a
     # no-Mac deploy had a nicer receipt and still no brief).
@@ -341,6 +585,8 @@ OUTBOX.HOOKS.update({
     # The deliver-once gate as machinery: the send seam itself claims the day's brief marker, so a
     # run that forgot its own claim can no longer double-deliver. This side owns the marker path.
     "brief_gate": lambda label, day, run_id: _brief_delivery_gate(label, day, run_id),
+    "routine_authorized": lambda payload: _routine_outbox_authorized(payload),
+    "retained_proof_current": lambda proof: _retained_proof_current(proof),
 })
 DASHBOARD.HOOKS["outbox_counts"] = lambda: OUTBOX.counts()
 
@@ -351,16 +597,22 @@ _ret_spec = importlib.util.spec_from_file_location(
     "retention", os.path.join(os.path.dirname(__file__), "retention.py"))
 RETENTION = importlib.util.module_from_spec(_ret_spec)
 _ret_spec.loader.exec_module(RETENTION)
-# The session archive — ONE implementation for the boot path and the nightly tick (sessions.py).
-_sess_spec = importlib.util.spec_from_file_location(
-    "sessions", os.path.join(os.path.dirname(__file__), "sessions.py"))
-SESSIONS = importlib.util.module_from_spec(_sess_spec)
-_sess_spec.loader.exec_module(SESSIONS)
+_runtime_ret_spec = importlib.util.spec_from_file_location(
+    "runtime_retention", os.path.join(os.path.dirname(__file__), "runtime_retention.py"))
+RUNTIME_RETENTION = importlib.util.module_from_spec(_runtime_ret_spec)
+_runtime_ret_spec.loader.exec_module(RUNTIME_RETENTION)
 RETENTION.HOOKS.update({
     "data_root": lambda: DATA,
     "write_text": lambda p, t, mode=0o600: CONNECTORS.write_text(p, t, mode),
     "jsonl_lock": lambda p: CONNECTORS.file_lock(p),
+    "runtime_prune": lambda cutoffs: _runtime_retention_prune(cutoffs),
 })
+
+
+def _runtime_retention_prune(cutoffs: dict):
+    return RUNTIME_RETENTION.prune(
+        os.environ.get('SOTTO_CHAT_RUNTIME_URL', ''),
+        os.environ.get('SOTTO_CHAT_RUNTIME_TOKEN', ''), cutoffs)
 
 
 def delivered_flag(date: str, kind: str) -> str:
@@ -487,8 +739,22 @@ def _on_delivered(payload: dict) -> bool:
     ledger, the rules and the voice all rest on that step, and a run that skipped it used to leave
     every page green while the memory went a day colder."""
     effects = payload.get('effects') or []
+    receipt = payload.get('receipt') or {}
+    if _requires_offer_route(payload):
+        captured = payload.get('offer_route_at_contact')
+        if (not isinstance(captured, dict)
+                or not isinstance(captured.get('chat_id'), str) or not captured['chat_id']
+                or not isinstance(captured.get('route_digest'), str)
+                or re.fullmatch(r'[a-f0-9]{64}', captured['route_digest']) is None
+                or type(receipt.get('route_proof_version')) is not int
+                or receipt['route_proof_version'] != 1
+                or receipt.get('route_digest') != captured['route_digest']):
+            return False
+        # Only the protected route captured BEFORE contact may bind this accepted offer.
+        # Provider fields and a newly selected route after delivery are not authority.
+        receipt = {**receipt, 'chat_id': captured['chat_id']}
     finalized = _finalize_delivery_effects(effects)
-    finalized = (not effects or _shared_effects().finalize(effects, payload.get('receipt') or {})) and finalized
+    finalized = (not effects or _shared_effects().finalize(effects, receipt)) and finalized
     for effect in effects:
         if effect.get('kind') == 'digest_stamp':
             finalized = _advance_digest_stamp(effect.get('coverage_until')) and finalized
@@ -506,7 +772,10 @@ def _on_delivered(payload: dict) -> bool:
     if kind and not REQUESTED_BRIEF.LABEL.fullmatch(label):
         if kind == 'welcome':
             import onboarding
-            onboarding.delivered(DATA)
+            if label == onboarding.DISCOVERY_LABEL:
+                onboarding.discovery_delivered(DATA)
+            else:
+                onboarding.delivered(DATA)
         else:
             finalized = _advance_digest_stamp(payload.get('coverage_until')) and finalized
         day = _local_now().strftime("%Y-%m-%d")
@@ -525,12 +794,66 @@ def _on_delivered(payload: dict) -> bool:
     return bool(finalized)
 
 
+@lru_cache(maxsize=1)
+def _discovery_interruption_policy():
+    path = _find_sotto_script('event-triage', 'scripts', 'triage_event.py')
+    if not path:
+        raise RuntimeError('interruption policy unavailable')
+    spec = importlib.util.spec_from_file_location('discovery_triage_policy', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _history_discovery_delivery_ready(payload):
+    import onboarding
+    reminder_notice = payload.get('label', '').startswith('owner-reminder-status:')
+    if payload.get('label') != onboarding.DISCOVERY_LABEL and not reminder_notice:
+        return True
+    policy = _discovery_interruption_policy()
+    now = _local_now()
+    explicit = policy._prefs.load_explicit()
+    if (policy._in_quiet_hours(now)
+            or policy._prefs.snooze_active(now_local=now, explicit=explicit)
+            or policy._prefs.effective_nudge_budget(explicit) <= 0):
+        return False
+    if reminder_notice:
+        return True  # status of an explicitly requested timer; quiet hours still apply
+    # The same daily interrupt budget as every proactive send. The admission check only asks;
+    # the send seam spends one unit under the run's stable reservation, so retries ride it free.
+    day = policy._local_day(now)
+    run_id = str(payload.get('run_id') or '')
+    if not run_id:
+        return policy._budget_left(day) > 0
+    return policy._budget_try_spend(day, 1, reservation='history-discovery:' + run_id)
+
+
 def _brief_delivery_gate(label: str, day: str, run_id: str) -> str:
+    """The marker gate below; a history discovery also records its lifetime send claim.
+
+    The discovery's day marker only fences one day. Before any provider contact the claim is
+    written to the onboarding record (never pruned), so an accepted send whose delivery callback
+    failed still blocks every later discovery after the outbox row ages out. Failing to record it
+    holds the row rather than sending unrecorded.
+    """
+    verdict = _brief_marker_gate(label, day, run_id)
+    import onboarding
+    if label != onboarding.DISCOVERY_LABEL or verdict != OUTBOX.GATE_SEND:
+        return verdict
+    try:
+        claimed = onboarding.discovery_claimed(DATA, run_id or '', day or DASHBOARD._local_today())
+    except Exception as error:  # noqa: BLE001 — an unrecorded claim must not reach the provider
+        print(f'[sotto] discovery claim not recorded ({type(error).__name__})', flush=True)
+        return OUTBOX.GATE_RETRY
+    return OUTBOX.GATE_SEND if claimed else OUTBOX.GATE_SUPERSEDED
+
+
+def _brief_marker_gate(label: str, day: str, run_id: str) -> str:
     """"send" | "superseded" | "not_a_brief" — does THIS run still own today's brief, at the
     moment of sending, and is what it is about to send a brief at all?
 
     THE BUG THIS EXISTS FOR (Aug 30, 2026, fourth instruction-adherence failure of the week): the
-    17:30 cron run claimed `briefs/<day>.evening.delivered` at 17:34 and delivered in-Hermes; the
+    17:30 cron run claimed `briefs/<day>.evening.delivered` at 17:34 and delivered itself; the
     wake-push run spawned at 17:31 sent its own composition at 17:35 anyway, because the claim was
     an INSTRUCTION in the skill's step 6 and the run skipped it. Deliver-once must therefore be
     machinery at the seam where words actually leave the box, never a prompt.
@@ -547,7 +870,8 @@ def _brief_delivery_gate(label: str, day: str, run_id: str) -> str:
     if REQUESTED_BRIEF.LABEL.fullmatch(label or ""):
         return OUTBOX.GATE_SEND  # Explicit owner request; outbox run identity still deduplicates.
     today = day or DASHBOARD._local_today()
-    marker = delivered_marker(today, kind)
+    import onboarding
+    marker = delivered_marker(today, 'history-discovery' if label == onboarding.DISCOVERY_LABEL else kind)
     try:
         os.makedirs(os.path.dirname(marker), exist_ok=True)
     except OSError:
@@ -557,7 +881,8 @@ def _brief_delivery_gate(label: str, day: str, run_id: str) -> str:
     # improvised recap, or the run's one-line "I could not run the composer". Sep 2: exactly that
     # claimed the day (calls=0, no archive) and the lane that would have sent the real brief stood
     # down. Refuse to claim, receipt it failed, leave the day open for the next lane.
-    if not _composed_brief_recently(kind, today):
+    archive_kind = 'history-discovery' if label == onboarding.DISCOVERY_LABEL else kind
+    if not _composed_brief_recently(archive_kind, today):
         return OUTBOX.GATE_NOT_A_BRIEF
     try:
         with CONNECTORS.file_lock(marker):
@@ -595,22 +920,15 @@ def _claim_brief_marker(marker, run_id):
     return OUTBOX.GATE_SEND if owner and owner == (run_id or "") else OUTBOX.GATE_SUPERSEDED
 
 
-# ── Spawning a skill, and actually DELIVERING what it says ──────────────────────────────────────
-# THE BUG THIS EXISTS FOR (Aug 2026, found from a real Record): every lane but the crons spawned
-# `hermes -z "<prompt>"` fire-and-forget. `-z` is documented as "print ONLY the final response text
-# to stdout" — and the stdout of a detached Popen goes nowhere. Crons were fine because
-# `hermes cron create --deliver <platform>` gives them a channel; nothing else had one. So the funnel
-# would classify an email as a real ask, record "Nudged you" in The Record, spawn the skill — and the
-# user would never receive it. Five of the six nudge producers were writing to a sink: Bridge events,
-# the Gmail poll, the release valve, the post-meeting tap, and the dashboard's run-now.
-#
-# `hermes send` is the counterpart to `-z`: "pipe text from any shell script to any messaging
-# platform Hermes is already configured for", targeting `platform` (the home channel) — the same
-# channel SOTTO_CRON_DELIVER names for the crons. So: capture the one-shot's text, send it, and
-# RECORD WHETHER IT LANDED. The receipt is the point as much as the fix — The Record said "Nudged
-# you" for weeks about messages that went to /dev/null, because deciding to nudge and delivering a
-# nudge were the same fact. They are now two.
-SEND_TIMEOUT_SECS = 60           # `hermes send` is one HTTP POST to a platform, not an agent turn
+# ── Spawning a procedure, and actually DELIVERING what it says ──────────────────────────────────
+# THE BUG THIS EXISTS FOR (Aug 2026, found from a real Record): spawned runs used to be
+# fire-and-forget, and the stdout of a detached Popen goes nowhere. So the funnel would classify an
+# email as a real ask, record "Nudged you" in The Record, spawn the skill — and the user would never
+# receive it. Now every run's final text is captured and handed to the runtime adapter's send for
+# the home channel SOTTO_CRON_DELIVER names, and the receiver RECORDS WHETHER IT LANDED. The receipt
+# is the point as much as the fix — The Record said "Nudged you" for weeks about messages that went
+# to /dev/null, because deciding to nudge and delivering a nudge were the same fact. They are now two.
+SEND_TIMEOUT_SECS = 60           # one loopback send to the chat runtime, not an agent turn
 ONESHOT_TIMEOUT_SECS = 15 * 60   # a brief runs the whole pipeline; generous, but never unbounded
 
 # The silence sentinel. "Say nothing and end the turn" is an instruction models reliably ignore —
@@ -630,23 +948,14 @@ def _is_silence(body: str) -> bool:
 
 
 def _deliver_target() -> str:
-    """The platform `hermes send --to` addresses, i.e. the home channel — the SAME variable the
-    crons are registered with, so a nudge and a brief can never land in different places.
-
-    Unset (a local Hermes, or any host that isn't start.sh) resolves by start.sh's own rule, in the
-    same one sentence: Telegram, unless this volume already holds a paired WhatsApp session and no
-    bot token is set. A cloud boot exports the resolved value before this process starts, so the
-    fallback is what keeps a laptop install and its installer agreeing about the channel."""
-    channel = (os.environ.get("SOTTO_CRON_DELIVER") or "").strip()
-    if channel:
-        return channel
-    paired = any(os.path.exists(p) for p in _wa_creds_paths())
-    return "whatsapp" if paired and not (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip() \
-        else "telegram"
+    """The home channel every lane delivers to, so a nudge and a brief can never land in different
+    places. The supervisor always exports SOTTO_CRON_DELIVER (photon or telegram); a process started
+    without it reads as Telegram, whose own link probe then holds delivery until it is linked."""
+    return (os.environ.get("SOTTO_CRON_DELIVER") or "").strip() or "telegram"
 
 
 def _record_delivery(label: str, status: str, detail: str = "", usage: dict | None = None,
-                     decision_ids: list | None = None, run_id: str = "") -> None:
+                     decision_ids: list | None = None, run_id: str = "", once: bool = False) -> None:
     """One line per spawned skill, in $SOTTO_DATA/events/delivery.jsonl — the receiver is its ONLY
     writer, and the dashboard's Record reads it beside the triage verdicts. `status` is one of
     spawned / delivered / empty / failed / skipped (nothing spawned — e.g. a wake trigger after the
@@ -679,6 +988,22 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
             row["decision_ids"] = ids[:20]
         path = os.path.join(_events_dir(), "delivery.jsonl")
         with CONNECTORS.file_lock(path):   # the retention sweep rewrites this ledger under the same lock
+            if once:
+                # A withheld legacy notice keeps its original queue evidence. Repeated
+                # reconciliations (including restart) need only one bounded journal note.
+                key = ('label', 'status', 'detail', 'run_id')
+                try:
+                    with open(path, encoding='utf-8') as prior:
+                        for line in prior:
+                            try:
+                                saved = json.loads(line)
+                            except ValueError:
+                                continue
+                            if (isinstance(saved, dict)
+                                    and all(saved.get(field) == row.get(field) for field in key)):
+                                return
+                except FileNotFoundError:
+                    pass
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
     except Exception:  # noqa: BLE001
@@ -687,7 +1012,7 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
 
 # Machine markers (<!--id:…-->, <!--meeting:…-->) are dashboard/tap-link plumbing the composer
 # strips when it renders the chat artifact (chatfmt.to_chat) — but the spawned run CHOOSES which
-# artifact it prints, and one Hermes upgrade was enough for a run to print the marker-laden
+# artifact it prints, and one runtime upgrade was enough for a run to print the marker-laden
 # markdown instead (Aug 28: an evening brief arrived with every id inline). The send seam now
 # enforces what the composer intends: nothing shaped like a comment marker ever leaves the box,
 # whichever artifact a run printed. Vendored from chatfmt._MARKER_RE, its owner — test_docs_drift
@@ -730,9 +1055,21 @@ def _strip_mailto(text: str) -> str:
     return "\n".join(kept)
 
 
-def _send_via_channel(body: str, target: str):
+def _send_with_identity(body: str, target: str, dispatch_id: str, attempt: int, *, source_revision=None):
     """Transport acceptance comes from the same adapter in Cloud and self-host."""
-    return _hermes_adapter('runtime_api').send_receipt(body, target, SEND_TIMEOUT_SECS)
+    if (os.environ.get('SOTTO_RUNTIME_PROFILE') in (
+            'self-host-telegram-fixed-five-v1', 'self-host-photon-fixed-five-v1')
+            and _candidate_retained_route_digest() is None):
+        return False, 'Owner route unavailable', {'acceptance': 'not_attempted'}
+    return _runtime_adapter().send_receipt(body, target, SEND_TIMEOUT_SECS, dispatch_id, attempt, **({'source_revision': source_revision} if source_revision is not None else {}))
+
+
+def _send_gallery_with_current_route(presentation, target: str, dispatch_id: str):
+    if (os.environ.get('SOTTO_RUNTIME_PROFILE') in (
+            'self-host-telegram-fixed-five-v1', 'self-host-photon-fixed-five-v1')
+            and _candidate_retained_route_digest() is None):
+        return False, 'Owner route unavailable', {'acceptance': 'not_attempted'}
+    return _runtime_adapter().send_gallery(presentation, target, dispatch_id, SEND_TIMEOUT_SECS)
 
 
 def _release_invalid_brief_claim(payload):
@@ -743,7 +1080,8 @@ def _release_invalid_brief_claim(payload):
     run_id, day = payload.get('run_id'), payload.get('day')
     if not kind or not run_id or not day:
         return 'open'  # old pre-claim invalidation payloads carry no reservation to release
-    marker = delivered_marker(day, kind)
+    import onboarding
+    marker = delivered_marker(day, 'history-discovery' if label == onboarding.DISCOVERY_LABEL else kind)
     with CONNECTORS.file_lock(marker):
         try:
             owner = Path(marker).read_text().strip()
@@ -783,7 +1121,8 @@ def _invalid_delivery(payload):
             return False
         try:
             if _validated_invalid_brief_recovery(payload, label):
-                return _fire_cron_job(name, label, _invalid_recovery=True).get('ok') is True
+                return _fire_cron_job(name, label, _invalid_recovery=True,
+                                      _fixed_recovery_from=payload.get('run_id')).get('ok') is True
             return _fire_cron_job(name, label).get('ok') is True
         except RuntimeError as error:
             if _is_terminal_work(error):
@@ -805,14 +1144,266 @@ def _validated_invalid_brief_recovery(payload, label):
     return bool(job and job['kind'] == 'run' and job['status'] == 'done')
 
 
+def _owner_timer_authority():
+    """Reconstruct the existing nonsecret capability identity, never an ambient send grant."""
+    loader = _load_shared_lib('runtime_channel_proof')._startup_module()
+    path = Path(DATA) / 'runtime' / 'expected-channel.json'
+    expected = loader.read_receiver_channel_expectation(path)
+    proof = _candidate_retained_route_proof()
+    if not proof or loader.read_receiver_channel_expectation(path) != expected:
+        raise ValueError('timer route unavailable')
+    route = expected['route']
+    identity = {'tenant_id': expected['tenantId'], 'channel': expected['channel'],
+        'account_id': expected['owner']['accountId'], 'owner_id': expected['owner']['ownerId'],
+        'line_key': expected['lineKey'], 'target': expected['target'],
+        'route_mode': route['mode'],
+        'route_id': (route['providerThreadId'] if route['mode'] == 'fixed' else
+                     route['expectedProviderLine'] if route['mode'] == 'first_contact' else 'shared_project')}
+    fingerprint = 'bot' if expected['channel'] == 'telegram' else 'project'
+    identity[fingerprint + '_fingerprint'] = expected[fingerprint + 'Fingerprint']
+    identity = OWNER_LOOP_CAPABILITY.validate_identity(identity)
+    if any(proof.get(key) != identity[key] for key in
+           ('tenant_id', 'account_id', 'owner_id', 'line_key', fingerprint + '_fingerprint')):
+        raise ValueError('timer identity changed')
+    RUNTIME_OWNER_REMINDER.validate_authority(identity, os.environ, DATA)
+    return identity, proof['provider_thread_id']
+
+
+def _owner_timer_reserved(reminder_id):
+    # A pre-upgrade proactive run may have contacted the provider already. Its old
+    # reservation remains the owner, even if its clock expiry has passed. Never replay it
+    # under a new delivery id. New scans exclude this class entirely.
+    key = 'intention:' + reminder_id
+    for path in (Path(DATA) / 'proactive').glob('*.json'):
+        with path.open() as stream:
+            state = json.load(stream)
+        if key in state.get('pending', {}) or key in state.get('nudged', []):
+            return True
+        if any(any(n.get('key') == key for n in run.get('nudges', []))
+               for run in state.get('runs', {}).values()):
+            return True
+    with OUTBOX.HOOKS['json_transaction'](OUTBOX.path(), default={'rows': []}) as doc:
+        return any(any(e.get('kind') == 'intention' and e.get('id') == reminder_id
+                       for e in (row.get('payload', {}).get('effects') or []))
+                   and row.get('payload', {}).get('label') != 'owner-reminder:' + reminder_id
+                   for row in OUTBOX._rows(doc))
+
+
+# An explicit timer loses its purpose quickly; retry from its requested time, not enqueue time.
+OWNER_REMINDER_GRACE_SECS = 15 * 60
+OWNER_REMINDER_NOTICE_MAX_AGE_SECS = 24 * 60 * 60
+_OWNER_REMINDER_NOTICE_LOCK = threading.Lock()
+
+
+def _owner_timer_deadline(row):
+    return datetime.fromisoformat(row['due'].replace('Z', '+00:00')).timestamp() + OWNER_REMINDER_GRACE_SECS
+
+
+def _owner_timer_notice_deadline(row):
+    return datetime.fromisoformat(row['due'].replace('Z', '+00:00')).timestamp() + OWNER_REMINDER_NOTICE_MAX_AGE_SECS
+
+
+def _owner_timer_notice_ids(label):
+    if not label.startswith('owner-reminder-status:'):
+        return []
+    ids = label.split(':', 1)[1].split(',')
+    return ids if 1 <= len(ids) <= 5 and len(set(ids)) == len(ids) and all(
+        re.fullmatch(r'int_[a-f0-9]{32}', ident) for ident in ids) else []
+
+
+def _owner_timer_notice(row, zone=None):
+    scheduled = datetime.fromisoformat(row['due'].replace('Z', '+00:00')).astimezone(zone or _local_now().tzinfo or timezone.utc)
+    return f"{row['action']} (scheduled for {scheduled.strftime('%b %-d at %-I:%M %p %Z')})"
+
+
+def _owner_timer_zone_name(zone):
+    """A name tzchain resolves back to `zone`: its IANA key, else its fixed `+HH:MM` offset."""
+    if getattr(zone, 'key', None):
+        return zone.key
+    minutes = int(zone.utcoffset(None).total_seconds()) // 60
+    return f"{'-' if minutes < 0 else '+'}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+def _owner_timer_notice_body(rows, zone=None):
+    if len(rows) == 1:
+        return ("I couldn't deliver your reminder on time: " + _owner_timer_notice(rows[0], zone)
+                + ". It has been canceled; I won't send it late.")
+    return ("I couldn't deliver these reminders on time:\n"
+            + '\n'.join('• ' + _owner_timer_notice(row, zone) for row in rows)
+            + "\nThey have been canceled; I won't send them late.")
+
+
+def _owner_timer_notices(store, identity, thread, notice_ids):
+    # One receiver owns this outbox. Serialize selection with enqueue so overlapping ticks
+    # cannot put a reminder in two different batches. Restart recovery uses the saved outbox.
+    with _OWNER_REMINDER_NOTICE_LOCK:
+        with OUTBOX.HOOKS['json_transaction'](OUTBOX.path(), default={'rows': []}) as doc:
+            reserved = {ident for delivery in OUTBOX._rows(doc)
+                        if not (delivery.get('status') == OUTBOX.STATUS_EXPIRED
+                                and delivery.get('acceptance') in ('not_attempted', 'rejected')
+                                and not delivery.get('acceptance_uncertain'))
+                        for ident in _owner_timer_notice_ids(delivery.get('payload', {}).get('label', ''))}
+        candidates = []
+        for row in store.current(strict=True):
+            if (row.get('id') not in notice_ids or row.get('id') in reserved or row.get('status') != 'canceled'
+                    or not row.get('delivery_outcome') or row.get('delivery_notice_outcome')
+                    or row.get('owner_cancel') or not store.owner_timer(row)):
+                continue
+            if time.time() >= _owner_timer_notice_deadline(row):
+                store.mark_delivery_notice(row['id'], 'expired')
+            elif identity is not None and RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread, delivery_notice=True):
+                candidates.append(row)
+        rows = sorted(candidates, key=lambda row: (row['due'], row['id']))[:5]
+        if rows:
+            label = 'owner-reminder-status:' + ','.join(row['id'] for row in rows)
+            zone_name = _owner_timer_zone_name(_local_now().tzinfo or timezone.utc)
+            _deliver_text(_owner_timer_notice_body(rows, TZCHAIN.resolve(zone_name)), label, run_id=label,
+                          valid_until=min(_owner_timer_notice_deadline(row) for row in rows),
+                          reminder_timezone=zone_name)
+
+
+def _owner_timer_terminal(delivery):
+    label = (delivery.get('payload') or {}).get('label', '')
+    notice = label.startswith('owner-reminder-status:')
+    if not notice and not label.startswith('owner-reminder:'):
+        return True
+    if (delivery.get('acceptance') in ('unknown', 'in_flight')
+            or delivery.get('acceptance_uncertain') and delivery.get('acceptance') != 'accepted'):
+        return False
+    ident = label.split(':', 1)[1]
+    store = RUNTIME_OWNER_REMINDER._writer()
+    if notice:
+        if delivery.get('status') == OUTBOX.STATUS_DELIVERED and not (delivery.get('receipt') or {}).get('accepted_at'):
+            return False
+        rows = {row['id']: row for row in store.current(strict=True)}
+        for notice_id in _owner_timer_notice_ids(label):
+            # Only the expired members end here; a definitely unaccepted batch can be
+            # replaced by its still-useful subset on the next heartbeat. Unknowns never can.
+            if (delivery['status'] == OUTBOX.STATUS_EXPIRED
+                    and delivery.get('acceptance') in ('not_attempted', 'rejected')
+                    and notice_id in rows and time.time() < _owner_timer_notice_deadline(rows[notice_id])):
+                continue
+            store.mark_delivery_notice(notice_id, delivery['status'])
+        return True
+    if delivery.get('status') == OUTBOX.STATUS_DELIVERED:
+        accepted_at = (delivery.get('receipt') or {}).get('accepted_at')
+        if not accepted_at:
+            return False
+        store.mark_accepted(ident, accepted_at)
+    else:
+        store.mark_undelivered(ident, delivery['status'])
+    return True
+
+
+def _owner_reminder_tick():
+    """Explicit owner timers use this existing 60-second heartbeat and sole delivery outbox."""
+    OUTBOX.reconcile_terminal()
+    store = RUNTIME_OWNER_REMINDER._writer()
+    due = [row for row in store.due() if store.owner_timer(row)]
+    notices = [row for row in store.current(strict=True) if row.get('status') == 'canceled'
+               and row.get('delivery_outcome') and not row.get('delivery_notice_outcome')
+               and not row.get('owner_cancel') and store.owner_timer(row)]
+    if not due and not notices:
+        return
+    # Retire only unreserved expired notices even while the owner route is unavailable.
+    # The no-authority pass cannot enqueue; uncertain outbox reservations remain held.
+    _owner_timer_notices(store, None, None, {row['id'] for row in notices})
+    if not due and not any(time.time() < _owner_timer_notice_deadline(row) for row in notices):
+        return
+    identity, thread = _owner_timer_authority()
+    for row in due:
+        if (RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread)
+                and not _owner_timer_reserved(row['id'])):
+            label = 'owner-reminder:' + row['id']
+            deadline = _owner_timer_deadline(row)
+            _deliver_text(row['action'], label, run_id=label, valid_until=deadline, effects=[
+                {'kind': 'eligibility', 'intention_id': row['id']},
+                {'kind': 'intention', 'id': row['id']}])
+        OUTBOX.reconcile_terminal()
+    # Never enqueue inside the terminal hook: it runs under the outbox transaction.
+    _owner_timer_notices(store, identity, thread, {row["id"] for row in notices})
+    OUTBOX.reconcile_terminal()
+
+
+def _owner_timer_delivery_valid(payload):
+    store = RUNTIME_OWNER_REMINDER._writer()
+    label = payload.get('label', '')
+    ids = [e.get('id') for e in (payload.get('effects') or []) if e.get('kind') == 'intention']
+    rows = {r.get('id'): r for r in store.current(strict=True)}
+    notice = label.startswith('owner-reminder-status:')
+    if notice:
+        notice_ids = _owner_timer_notice_ids(label)
+        selected = [rows.get(ident) for ident in notice_ids]
+        if ids or not selected or any(row is None or time.time() >= _owner_timer_notice_deadline(row) for row in selected):
+            return False
+        identity, thread = _owner_timer_authority()
+        return (payload.get('target') == identity['target']
+                and payload.get('body') == _delivery_body(_owner_timer_notice_body(selected,
+                    TZCHAIN.resolve(payload['reminder_timezone']) if payload.get('reminder_timezone') else None))
+                and all(RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread, delivery_notice=True)
+                        for row in selected))
+    if label.startswith('owner-reminder:'):
+        reminder_id = label.split(':', 1)[1]
+        row = rows.get(reminder_id)
+        if ids != [reminder_id] or row is None or time.time() >= _owner_timer_deadline(row):
+            return False
+        identity, thread = _owner_timer_authority()
+        return (payload.get('target') == identity['target']
+                and payload.get('body') == _delivery_body(row.get('action', ''))
+                and RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread))
+    # Also stop cached old proactive results before contact. Unknown outcomes still
+    # reconcile in the outbox before this validity check and can finalize acceptance.
+    return not any(store.owner_timer(rows.get(key)) for key in ids)
+
+
 def _delivery_valid(payload):
+    if payload.get('label', '').startswith(('owner-reminder:', 'owner-reminder-status:')):
+        # Only definitive staleness may supersede the row (its terminal effect cancels the
+        # reminder). A check that cannot run, e.g. the route proof is briefly unreadable,
+        # raises into the outbox, which holds the row for the next pass.
+        if not _owner_timer_delivery_valid(payload):
+            return False
+    elif any(e.get('kind') == 'intention' for e in (payload.get('effects') or [])):
+        try:
+            if not _owner_timer_delivery_valid(payload):
+                return False
+        except Exception:
+            return False
+    requested_job_id = payload.get('feedback_for') or payload.get('run_id')
+    requested_label = payload.get('label', '')
+    if (REQUESTED_BRIEF.LABEL.fullmatch(requested_label) or payload.get('feedback_for')):
+        requested_job = WORK_QUEUE.get(DATA, requested_job_id) if requested_job_id else None
+        if (payload.get('feedback_for') and payload.get('target') == 'telegram'
+                and not _requested_telegram_job(requested_job)):
+            return False  # a pruned/legacy job cannot borrow ambient Photon owner settings
+        if not _requested_telegram_job_current(requested_job, label=requested_label,
+                                               target=payload.get('target')):
+            return False
+    if (_scheduled_pulse_label(payload.get('label')) or payload.get('label') == 'onboarding:history-discovery:sotto-welcome-brief' or payload.get('label', '').startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', payload.get('label', ''))) and not _retained_proof_current({
+            'source_revision': payload.get('prep_source_revision'),
+            'route_digest': payload.get('prep_route_digest')}):
+        return False
     if payload.get('feedback_for'):
         owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
-        if (payload.get('feedback_owner') != owner or payload.get('target') != _deliver_target()
+        if _skill_notice_payload(payload):
+            if not _skill_notice_current({'owner': payload.get('feedback_owner'),
+                    'chat_id': payload.get('feedback_chat_id'), 'target': payload.get('target'),
+                    'route_digest': payload.get('feedback_route_digest')}):
+                return False
+        elif _requested_telegram_job(requested_job):
+            binding = _requested_telegram_job(requested_job)
+            if (payload.get('feedback_owner') != binding['owner_id']
+                    or payload.get('feedback_chat_id') != binding['owner_id']):
+                return False
+        elif (payload.get('feedback_owner') != owner or payload.get('target') != _deliver_target()
                 or not REQUESTED_BRIEF.owner_destination(
                     DATA, owner, payload.get('feedback_chat_id'), os.environ.get('SOTTO_TENANT_ID'))):
             return False
     effects = payload.get('effects') or []
+    for effect in effects:
+        if (effect.get('kind') == 'prep_location_update'
+                and (effect.get('baseline') or {}).get('route_digest') != _candidate_retained_route_digest()):
+            return False
     return not effects or _shared_effects().valid(effects, time.time())
 
 
@@ -834,10 +1425,209 @@ def _shared_effects():
     return module
 
 
+def _delivery_body(text: str) -> str:
+    body = _strip_mailto(_MARKER_RE.sub('', text or ''))
+    return re.sub(r'\n{3,}', '\n\n', body).strip()
+
+
+def _candidate_retained_route_proof():
+    """Current selected channel route from the receiver-owned, private projection.
+
+    Photon requires its current ACK and receipt. Linked self-host Telegram instead
+    requires its protected owner/bot link and loaded Node channel identity.
+    """
+    try:
+        zone = _configured_tz_name()
+        profile = os.environ.get('SOTTO_RUNTIME_PROFILE')
+        if profile == 'self-host-photon-fixed-five-v1' and (
+                os.environ.get('SOTTO_DEPLOYMENT_MODE') != 'self_host'
+                or os.environ.get('SOTTO_CRON_DELIVER') != 'photon'):
+            return None
+        if profile == 'self-host-telegram-fixed-five-v1':
+            import telegram_channel_proof
+            verifier = telegram_channel_proof.check_current_channel
+        else:
+            verifier = _load_shared_lib('runtime_channel_proof').check_current_channel
+        proof = verifier(
+            chat_client=_runtime_adapter()._client(timeout=5),
+            expected_channel_path=Path(DATA) / 'runtime' / 'expected-channel.json',
+            receiver_data_root=DATA, receiver_policy=os.environ,
+            configured_zone_name=_configured_tz_name, expected_zone=zone)
+        if (proof.get('version') != 1 or proof.get('status') != 'current_channel_proved'
+                or proof.get('action_authorized') is not False):
+            return None
+        route = proof.get('route_digest')
+        return proof if isinstance(route, str) and re.fullmatch(r'[a-f0-9]{64}', route) else None
+    except Exception:
+        return None
+
+
+def _candidate_retained_route_digest():
+    proof = _candidate_retained_route_proof()
+    return proof['route_digest'] if proof else None
+
+
+def _requested_telegram_job(job):
+    """Only receiver-owned immutable work admission identifies the Telegram brief lane."""
+    try:
+        admission = json.loads(job['admission']) if job and job.get('admission') else {}
+        binding = admission.get('telegram_binding') if isinstance(admission, dict) else None
+        return binding if isinstance(binding, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _requested_telegram_job_current(job, *, label=None, target=None):
+    binding = _requested_telegram_job(job)
+    stored_label = ((job or {}).get('payload') or {}).get('label', '')
+    feedback = (job or {}).get('feedback') or {}
+    if isinstance(feedback, str):
+        try:
+            feedback = json.loads(feedback)
+        except ValueError:
+            feedback = {}
+    if not isinstance(feedback, dict):
+        feedback = {}
+    label = label if label and REQUESTED_BRIEF.LABEL.fullmatch(label) else stored_label or feedback.get('label', '')
+    # Legacy Telegram jobs have no original binding; do not grant today's route.
+    required = binding is not None or (REQUESTED_BRIEF.LABEL.fullmatch(label)
+        and (target == 'telegram' or feedback.get('target') == 'telegram' or _deliver_target() == 'telegram'))
+    if not required:
+        return True
+    try:
+        return bool(binding and _deliver_target() == 'telegram'
+                    and target in (None, 'telegram')
+                    and binding == REQUESTED_BRIEF.telegram_binding(
+                        _candidate_retained_route_proof(), _runtime_source_authority()))
+    except (ValueError, TypeError):
+        return False
+
+
+def _skill_notice_binding(identity, thread_id, evidence):
+    """Bind content-free skill feedback to the admitted owner's independently proved route."""
+    proof = _candidate_retained_route_proof()
+    route = proof.get('owner_route') if proof else None
+    if (not isinstance(identity, dict) or identity.get('channel') != 'photon'
+            or _deliver_target() != 'photon' or not isinstance(route, dict)
+            or route.get('platform') != 'imessage' or not isinstance(route.get('chat_id'), str)
+            or not route['chat_id'] or identity.get('owner_id') != os.environ.get('PHOTON_HOME_CHANNEL')
+            or proof.get('provider_thread_id') != thread_id
+            or any(proof.get(key) != identity.get(key) for key in
+                   ('tenant_id', 'project_fingerprint', 'owner_id', 'account_id', 'line_key'))
+            or proof.get('route_digest') != evidence.get('route_digest')):
+        return None
+    return {'owner': identity['owner_id'], 'chat_id': route['chat_id'], 'target': 'photon',
+            'route_digest': proof['route_digest']}
+
+
+def _skill_notice_bound(meta):
+    """True when skill feedback carries the route digest captured at admission."""
+    digest = meta.get('route_digest')
+    return isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest) is not None
+
+
+def _skill_notice_current(meta, proof=None):
+    """Source consent can change; only the original verified owner route may get a failure notice."""
+    digest = meta.get('route_digest')
+    if (meta.get('owner') != os.environ.get('PHOTON_HOME_CHANNEL')
+            or meta.get('target') != _deliver_target() or meta.get('target') != 'photon'
+            or not _skill_notice_bound(meta)):
+        return False
+    if proof is None:
+        proof = _candidate_retained_route_proof()
+    route = proof.get('owner_route') if proof else None
+    return bool(isinstance(route, dict) and route.get('platform') == 'imessage'
+                and proof.get('owner_id') == meta['owner']
+                and route.get('chat_id') == meta.get('chat_id')
+                and proof.get('route_digest') == digest)
+
+
+def _skill_notice_payload(payload):
+    if 'feedback_route_digest' in payload:
+        return True
+    # Before route binding, enqueued skill feedback lost its label when work feedback cleared.
+    # Its immutable admission still identifies the lane. Never bless that legacy owner alias
+    # with today's route; accepted/unknown sends keep their existing receipt fences.
+    job = WORK_QUEUE.get(DATA, payload['feedback_for'])
+    try:
+        admission = json.loads(job['admission']) if job else {}
+        return admission['receipt']['outcome'].get('skill') in (
+            'meeting-prep', 'ask-research', 'followup', 'relationship-pulse', 'proactive')
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _requires_offer_route(payload):
+    return (os.environ.get('SOTTO_CRON_DELIVER') == 'photon'
+            and any(isinstance(effect, dict) and effect.get('kind') == 'pending_offer'
+                    for effect in (payload.get('effects') or [])))
+
+
+def _capture_offer_route(payload):
+    if not _requires_offer_route(payload):
+        return {}
+    proof = _candidate_retained_route_proof()
+    route = proof.get('owner_route') if proof else None
+    chat_id = route.get('chat_id') if isinstance(route, dict) else None
+    if not isinstance(chat_id, str) or not chat_id:
+        return None  # no provider contact without a trustworthy offer destination
+    for field in ('prep_route_digest', 'routine_route_digest'):
+        if payload.get(field) is not None and payload[field] != proof['route_digest']:
+            return None
+    return {'route_digest': proof['route_digest'], 'chat_id': chat_id}
+
+
+def _retained_proof_current(proof):
+    if (not isinstance(proof, dict) or not isinstance(proof.get('source_revision'), str)
+            or not isinstance(proof.get('route_digest'), str)):
+        return False
+    try:
+        route_before = _candidate_retained_route_digest()
+        current = _runtime_source_authority()
+        route_after = _candidate_retained_route_digest()
+    except Exception:
+        return False
+    return (current.get('complete') is True
+            and current.get('revision') == proof['source_revision']
+            and route_before == route_after == proof['route_digest'])
+
+
+def _scheduled_pulse_label(label):
+    return label in ('cron:sotto-relationship-pulse', 'run-now:sotto-relationship-pulse')
+
+
+def _composition_evidence(label):
+    if (label.startswith('preview:')
+            or not (_scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('routine:fresh:') or 'prep' in label or re.fullmatch(r'skill:[a-f0-9]{64}:(?:ask-research|followup|relationship-pulse|proactive)', label) or label.split(':')[-1] in (
+                'sotto-morning-brief', 'sotto-evening-brief', 'morning-brief', 'evening-brief'))):
+        return None
+    try:
+        target = _deliver_target()
+        if target != 'photon' and not (target == 'telegram' and (_scheduled_pulse_label(label) or label.startswith('routine:fresh:') or REQUESTED_BRIEF.LABEL.fullmatch(label) or label == 'onboarding:history-discovery:sotto-welcome-brief')):
+            return None
+        route_before = _candidate_retained_route_digest()
+        if not isinstance(route_before, str) or re.fullmatch(r'[a-f0-9]{64}', route_before) is None:
+            return None  # unmounted route proof never slows or changes ordinary delivery
+        authority = _runtime_source_authority()
+        route_after = _candidate_retained_route_digest()
+    except Exception:
+        return None
+    revision = authority.get('revision')
+    if (authority.get('complete') is not True or not isinstance(revision, str)
+            or re.fullmatch(r'[a-f0-9]{64}', revision) is None or route_before != route_after):
+        return None
+    return {'source_revision': revision, 'route_digest': route_before}
+
+
 def _deliver_text(text: str, label: str, usage: dict | None = None,
                   decision_ids: list | None = None, effects: list | None = None,
                   run_id: str = "", valid_until: float | None = None, not_before: float | None = None,
-                  coverage_until: str | None = None) -> bool:
+                  coverage_until: str | None = None, *, routine_proof: bool = False,
+                  source_revision_at_composition: str | None = None,
+                  route_digest_at_composition: str | None = None,
+                  source_text_sha256: str | None = None,
+                  research_evidence: dict | None = None,
+                  reminder_timezone: str | None = None) -> bool | dict:
     """Hand one skill's final text to the channel, THROUGH THE OUTBOX. Silence is a legitimate
     outcome for every one of these skills ("if there's nothing, say nothing"), so an empty run is
     recorded and never enqueued — an empty message would be the busywork theater the standing bars
@@ -852,41 +1642,88 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
     # Strip BEFORE the empty check: a text that was nothing but markers is an empty run, and the
     # honest receipt for it is "empty", not a delivered blank. Removed marker lines leave doubled
     # blank lines behind — collapse those too, so the reader never sees the surgery.
-    body = _strip_mailto(_MARKER_RE.sub("", text or ""))
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    body = _delivery_body(text)
     if not body:
         _record_delivery(label, "empty", usage=usage, decision_ids=decision_ids, run_id=run_id)
-        return False
+        return {'kind': 'silent'} if routine_proof else False
     if _is_silence(body):
         _record_delivery(label, "empty", f"{SILENCE_SENTINEL} sentinel — nothing to deliver",
                          usage=usage, decision_ids=decision_ids, run_id=run_id)
-        return False
+        return {'kind': 'silent'} if routine_proof else False
     # An offer is actionable only if its exact question is present in the text being handed off.
     effects = [effect for effect in (effects or []) if effect.get('kind') != 'pending_offer'
                or (str(effect.get('offer', {}).get('question') or '').strip()
                    and str(effect['offer']['question']).strip() in body)]
     target = _deliver_target()
+    requested_telegram = bool(REQUESTED_BRIEF.LABEL.fullmatch(label) and
+        (target == 'telegram' or _requested_telegram_job(WORK_QUEUE.get(DATA, run_id))))
+    if requested_telegram and not _requested_telegram_job_current(
+            WORK_QUEUE.get(DATA, run_id), label=label, target=target):
+        raise _WorkDeferredError('requested brief authority unavailable')
     presentation = None
     presentation_status = {}
-    if not any(e.get('kind') == 'pending_offer' for e in effects):
-        # Consent offers/effects stay in their existing exact-text delivery contract.
+    try:
+        text_digest_matches = (isinstance(source_text_sha256, str)
+            and re.fullmatch(r'[a-f0-9]{64}', source_text_sha256) is not None
+            and hashlib.sha256(body.encode('utf-8')).hexdigest() == source_text_sha256)
+    except UnicodeError:
+        text_digest_matches = False
+    evidence = (_composition_evidence(label)
+                if source_revision_at_composition is not None and text_digest_matches else None)
+    candidate_route = (evidence['route_digest'] if evidence
+        and evidence['source_revision'] == source_revision_at_composition
+        and evidence['route_digest'] == route_digest_at_composition else None)
+    offers = [e.get('offer', {}) for e in effects if e.get('kind') == 'pending_offer']
+    if all(offer.get('kind') == 'handoff' for offer in offers):
+        # Consent/procedure offers keep their exact-text contract. Brief handoffs may
+        # use photos only when the exact question is visibly rendered in full.
         prepare = _load_shared_lib('visual_delivery').prepare
         def load_visual():
             _shared_effects()  # establish the installed shared library search path
             import visual_brief
             return visual_brief
         presentation = prepare(body, label, target, load_visual,
-                               _hermes_adapter('runtime_api').gallery_available, diagnostics=presentation_status)
-    return OUTBOX.deliver({"label": label, "body": body, "target": target,
+                               _runtime_adapter().gallery_available, diagnostics=presentation_status,
+                               retained_source_revision=(source_revision_at_composition
+                                                         if candidate_route else None),
+                               candidate_route_digest=candidate_route,
+                               **({'research_evidence': research_evidence} if research_evidence is not None and candidate_route else {}),
+                               **({'required_questions': tuple(o['question'] for o in offers)} if offers else {}))
+    if (requested_telegram or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)) and not candidate_route:
+        raise _WorkDeferredError('meeting prep composition authority changed')
+    payload = {"label": label, "body": body, "target": target,
                            "presentation": presentation, "presentation_status": presentation_status,
                            "usage": usage, "decision_ids": decision_ids,
                            "effects": effects or [], "run_id": run_id, "valid_until": valid_until,
-                           "not_before": not_before, "coverage_until": coverage_until})
+                           "not_before": not_before, "coverage_until": coverage_until}
+    if presentation is None and research_evidence is not None and candidate_route:
+        try:
+            payload['retained_text_artifact'] = _load_shared_lib('visual_delivery').retain_text(
+                body, research_evidence, source_revision_at_composition, candidate_route,
+                stamp=_load_shared_lib('retained_brief_proof').stamp)
+        except Exception as error:  # optional retention follows the same fail-open rule as presentation
+            print(f'text_retention_fallback error={type(error).__name__}', file=sys.stderr)
+    if reminder_timezone is not None and _owner_timer_notice_ids(label):
+        payload["reminder_timezone"] = reminder_timezone
+    if (requested_telegram or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)):
+        payload['prep_source_revision'] = source_revision_at_composition
+        payload['prep_route_digest'] = route_digest_at_composition
+    if routine_proof:
+        if not run_id:
+            raise RuntimeError('routine delivery requires a work identity')
+        if label.startswith('routine:fresh:'):
+            if not candidate_route:
+                raise _WorkDeferredError('routine composition authority changed')
+            payload['routine_source_revision'] = source_revision_at_composition
+            payload['routine_route_digest'] = route_digest_at_composition
+        payload['routine_handoff_digest'] = OUTBOX.routine_payload_digest(payload)
+    accepted = OUTBOX.deliver(payload)
+    return {'kind': 'outbox', 'digest': payload['routine_handoff_digest']} if routine_proof else accepted
 
 
 def _read_usage(path: str | None) -> dict | None:
     """Optional accounting normalized by the pinned runtime adapter."""
-    return _hermes_adapter('runtime_api').read_usage(path)
+    return _runtime_adapter().read_usage(path)
 
 
 def _spawn_env(run_id: str = "") -> dict:
@@ -985,8 +1822,15 @@ def _brief_revision(kind=None):
 
 
 def _job_key(label, prompt):
+    if re.fullmatch(r'meeting-prep:[a-f0-9]{32}(?:[a-f0-9]{32})?', label):
+        return label
     if REQUESTED_BRIEF.LABEL.fullmatch(label):
         return 'requested:' + REQUESTED_BRIEF.LABEL.fullmatch(label).group(1)
+    if re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label):
+        return label.rsplit(':', 1)[0]
+    import onboarding
+    if label == onboarding.DISCOVERY_LABEL:
+        return onboarding.DISCOVERY_KEY + ':' + str(_local_now().date())
     now = _local_now()
     name = label.rsplit(':', 1)[-1].strip()
     if name in MARKED_BRIEF_KINDS and not label.startswith('run-now:'):
@@ -999,12 +1843,81 @@ def _job_key(label, prompt):
     return None
 
 
+def _require_sotto_procedure(runner: list, kind: str = 'run') -> None:
+    """The receiver may execute only its declared Python procedures.
+
+    This validates a receiver-owned command, not a model-provided script path. The same
+    check runs at admission and again immediately before execution.
+    """
+    if kind not in ('run', 'event'):
+        raise RuntimeError('Sotto unattended skill procedure is unsupported')
+    local = Path(__file__).resolve().parent
+    expected = [local / 'brief_runner.py', local / 'procedure_runner.py'] if kind == 'run' else []
+    packaged = ('memory_cycle.py',) if kind == 'run' else ('compose_notification.py',)
+    for script in packaged:
+        found = _find_sotto_script('_shared', 'scripts', script)
+        if found:
+            expected.append(Path(found))
+    if (len(runner) != 2 or runner[0] != sys.executable
+            or not any(Path(runner[1]).resolve() == path.resolve() for path in expected)):
+        raise RuntimeError('Sotto unattended skill procedure is unsupported')
+
+
+def _validate_fixed_work(kind: str, request: dict) -> None:
+    _runtime_adapter().validate_fixed_work(kind, request)
+
+
+def _selected_fixed_profile() -> bool:
+    return os.environ.get('SOTTO_RUNTIME_PROFILE') in (
+        'managed-photon-fixed-five-v1', 'self-host-telegram-fixed-five-v1',
+        'self-host-photon-fixed-five-v1')
+
+
+def _fixed_schedule_authority() -> str:
+    """The tenant/profile identity that owns fixed slot history, never a restart authorization.
+
+    Zone, crons.json and owner route are configuration, not identity: they live in
+    `_fixed_schedule_digest`, which the WorkQueue rebinds in place (keeping slot history)
+    instead of refusing, so an owner timezone change or a crons release cannot stop the
+    five procedures. A fixed wall slot remains the same occurrence across epochs.
+    """
+    tenant = os.environ.get('SOTTO_TENANT_ID', '')
+    profile = os.environ.get('SOTTO_RUNTIME_PROFILE')
+    if not tenant or not profile:
+        raise RuntimeError('fixed schedule authority is unavailable')
+    return hashlib.sha256(json.dumps(['sotto-fixed-schedule-identity-v2', tenant, profile],
+                                     ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+
+
+def _fixed_schedule_digest() -> str:
+    """The current fixed schedule configuration; this v1 transcript is also the legacy authority."""
+    route = _candidate_retained_route_digest()
+    tenant = os.environ.get('SOTTO_TENANT_ID', '')
+    zone = _configured_tz_name()
+    jobs = [(name, schedule, prompt, skill)
+            for name, schedule, prompt, skill in _sotto_cron_jobs()]
+    if (not route or not tenant or not zone or len(jobs) != 5
+            or len({name for name, *_ in jobs}) != 5):
+        raise RuntimeError('fixed schedule authority is unavailable')
+    transcript = ['sotto-fixed-schedule-v1', tenant,
+                  os.environ.get('SOTTO_RUNTIME_PROFILE'),
+                  route, zone, sorted(jobs)]
+    return hashlib.sha256(json.dumps(transcript, ensure_ascii=False,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
 def _spawn_and_deliver(runner: list, prompt: str, label: str,
                        decision_ids: list | None = None, work_not_before: float | None = None,
-                       retry_terminal: bool = False, feedback: dict | None = None) -> str:
+                       retry_terminal: bool = False,
+                       fixed_recovery_from: str | None = None, feedback: dict | None = None, admission: dict | None = None) -> str:
     """Commit accepted work before returning; the bounded worker owns retries and recovery."""
-    if not runner or not shutil.which(runner[0]):
-        raise FileNotFoundError('skill runner not found on PATH (SOTTO_RUN_SKILL)')
+    _require_sotto_procedure(runner)
+    _validate_fixed_work('run', {
+        'runner': runner, 'prompt': prompt, 'label': label,
+        'decision_ids': decision_ids or []})
+    executable = _runtime_adapter().run_argv(runner, '')[0]
+    if not shutil.which(executable):
+        raise FileNotFoundError('procedure runner not found')
     now = _local_now()
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     validity = tomorrow.timestamp() if OUTBOX.kind_for(label) != OUTBOX.KIND_NUDGE else time.time() + 4 * 3600
@@ -1015,12 +1928,60 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
             due = now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)
             validity = min(validity, due.timestamp() + DAILY_CATCHUP_SECONDS)
     priority = 60 if label.startswith('background:') else 10 if 'brief' in label else 20
-    job_id = WORK_QUEUE.enqueue(DATA, 'run',
-        {'runner': runner, 'prompt': prompt, 'label': label, 'decision_ids': decision_ids or []},
-        key=_job_key(label, prompt), not_before=work_not_before, valid_until=validity,
-        priority=priority, retry_terminal=retry_terminal, feedback=feedback)
+    payload = {'runner': runner, 'prompt': prompt, 'label': label,
+               'decision_ids': decision_ids or []}
+    key = _job_key(label, prompt)
+    if _selected_fixed_profile() and label.startswith('cron:'):
+        name = label[5:]
+        schedule = next((job[1] for job in _sotto_cron_jobs() if job[0] == name), '')
+        # Preparation is ten minutes before the scheduled daily fire. Both preparation and
+        # the actual tick own the same local-date slot, including the second DST fold.
+        wall_slot = (str(now.date()) if name in MARKED_BRIEF_KINDS
+                     else _scheduled_slot(schedule))
+        if wall_slot is None:
+            raise RuntimeError('fixed schedule is outside its firing window')
+        job_id = WORK_QUEUE.enqueue_fixed_slot(
+            DATA, payload, key=key, authority_digest=_fixed_schedule_authority(),
+            schedule_digest=_fixed_schedule_digest(),
+            name=name, wall_slot=wall_slot, not_before=work_not_before,
+            valid_until=validity, priority=priority, retry_terminal=retry_terminal,
+            replace_pending=name in MARKED_BRIEF_KINDS,
+            recovery_from=fixed_recovery_from)
+        if job_id is None:
+            raise RuntimeError('fixed schedule slot was deliberately skipped')
+    else:
+        job_id = WORK_QUEUE.enqueue(DATA, 'run', payload, key=key,
+            not_before=work_not_before, valid_until=validity,
+            priority=priority, retry_terminal=retry_terminal, feedback=feedback, admission=admission,
+            shared_fixed_brief_wake=(
+                _selected_fixed_profile() and label.startswith('brief:')
+                and label[6:] in MARKED_BRIEF_KINDS))
     _WORK_WAKE.set()
     return job_id
+
+
+def _requested_cache_current(cached, evidence):
+    """Reuse only exact accepted text whose original retained source/route proof is current."""
+    if evidence is None:
+        return False
+    try:
+        with CONNECTORS.json_transaction(OUTBOX.path(), default={'rows': []}) as state:
+            artifacts = [row.get('receipt', {}).get('visual_artifact_id') for row in state.get('rows', [])
+                         if row.get('id') in cached.get('_delivery_run_ids', [])]
+        reader = _load_shared_lib('protected_brief_detail')
+        rendered = _load_shared_lib('chatfmt').to_imessage(
+            _delivery_body(cached['brief_text']), normalize_style=False).strip()
+        for artifact in artifacts:
+            if not artifact:
+                continue
+            detail = reader.read(DATA, {'artifact_id': artifact, 'offset': 0, 'limit': reader.MAX_PAGE},
+                                 source_revision=evidence['source_revision'], route_digest=evidence['route_digest'])
+            if (detail.get('status') == 'found' and detail.get('next_offset') is None
+                    and detail.get('text') == rendered):
+                return True
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return False
 
 
 def _execute_work(job):
@@ -1032,6 +1993,9 @@ def _execute_work(job):
     usage_path = None
     inflight = False
     try:
+        if not _requested_telegram_job_current(job):
+            raise _WorkDeferredError('requested brief authority unavailable')
+        _validate_fixed_work(job['kind'], request)
         eligibility = {'effects': [], 'valid_until': None}
         coverage_until = datetime.now(timezone.utc).isoformat()
         if job['kind'] == 'event':
@@ -1040,35 +2004,60 @@ def _execute_work(job):
                 return {'text': 'NO_NUDGES', 'label': 'event', 'effects': []}
             staged = _stage_bundle(request.get('bundle') or {})
             request = _event_request(staged)
+            _validate_fixed_work('run', request)
         label = str(request.get('label') or job['kind'])
         runner = list(request['runner'])
+        _require_sotto_procedure(runner, job['kind'])
+        composition_before = _composition_evidence(label)
+        if (_requested_telegram_job(job) or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith(('routine:fresh:', 'meeting-prep:')) or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)) and composition_before is None:
+            # A new owner event renews the existing activation ACK. Wait for that
+            # current proof before composing an otherwise undeliverable result.
+            raise _WorkDeferredError('routine composition authority unavailable')
         usage_path = os.path.join(_events_dir(), f"usage-{job['id']}.json")
         prompt = request.get('prompt') or ''
         try:
             procedure = json.loads(prompt)
         except (ValueError, TypeError):
             procedure = {}
-        if REQUESTED_BRIEF.LABEL.fullmatch(label) and not procedure.get('refresh'):
+        if (REQUESTED_BRIEF.LABEL.fullmatch(label) and not procedure.get('refresh')
+                and not procedure.get('composition_direction')):
             cached = REQUESTED_BRIEF.accepted_artifact(
                 DATA, procedure['day'], procedure['kind'], _source_context().allowed)
-            if cached:
+            if cached and _requested_cache_current(cached, composition_before):
+                evidence = _composition_evidence(label)
+                if composition_before is None or evidence != composition_before:
+                    raise _WorkDeferredError('requested brief composition authority unavailable')
                 return {'text': cached['brief_text'], 'label': label,
+                        'source_revision_at_composition': (evidence['source_revision'] if evidence else None),
+                        'route_digest_at_composition': (evidence['route_digest'] if evidence else None),
+                        'source_text_sha256': (hashlib.sha256(_delivery_body(cached['brief_text']).encode()).hexdigest()
+                                               if evidence else None),
                         'effects': [{'kind': 'source_permissions', 'sources': cached['_source_permissions']}],
                         'valid_until': job.get('valid_until'),
                         'coverage_until': cached.get('_source_cutoff')}
-        # Adapter API owns Hermes flags; a foreign runner receives only its declared arguments.
-        argv = _hermes_adapter('runtime_api').run_argv(runner, prompt, usage_path,
-                                                  os.environ.get('SOTTO_SPAWN_TOOLSETS', '').strip())
+        # The declared procedure receives only its own arguments.
+        argv = _runtime_adapter().run_argv(runner, prompt)
         _record_delivery(label, 'spawned', decision_ids=request.get('decision_ids'), run_id=job['id'])
         # Child creation and registration share the signal handler's lock. Thus shutdown either
         # wins before Popen (and no child is created) or snapshots the new child after registration.
+        child_env = _spawn_env(job['id'])
+        if _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label):
+            child_env['SOTTO_SKILL_COMPOSITION_PROOF'] = json.dumps(composition_before)
+        if re.fullmatch(r'skill:[a-f0-9]{64}:proactive', label):
+            captured = _runtime_source_authority()
+            if (captured.get('complete') is not True
+                    or captured.get('revision') != composition_before['source_revision']):
+                raise RuntimeError('proactive source authority changed')
+            child_env['SOTTO_PROACTIVE_CAPTURED_SOURCES'] = json.dumps(sorted(set(
+                captured.get('bridge_sources', []) + captured.get('google_sources', [])
+                + captured.get('connector_sources', []))))
         with _WORK_LOCK:
             if _WORK_STOP.is_set():
                 raise _WorkInterruptedError('work interrupted by shutdown')
             _RUNS_INFLIGHT[label] = _RUNS_INFLIGHT.get(label, 0) + 1
             inflight = True
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True, env=_spawn_env(job['id']), start_new_session=True)
+                                       text=True, env=child_env, start_new_session=True)
             _WORK_PROCESSES[process_key] = process
         deadline = time.monotonic() + ONESHOT_TIMEOUT_SECS
         while True:
@@ -1101,17 +2090,42 @@ def _execute_work(job):
                 job['kind'] == 'run' and process.returncode == WORK_QUEUE.MODEL_BUDGET_EXIT
                 and runner in ([sys.executable, str(Path(__file__).with_name('brief_runner.py'))],
                                [sys.executable, str(Path(__file__).with_name('procedure_runner.py'))]))
+            error.model_outcome_uncertain = (
+                job['kind'] == 'run' and process.returncode == WORK_QUEUE.MODEL_OUTCOME_UNCERTAIN_EXIT
+                and runner == [sys.executable, str(Path(__file__).with_name('brief_runner.py'))])
             error.retry_provider = (job['kind'] == 'event'
                                     and process.returncode == WORK_QUEUE.PROVIDER_RETRY_EXIT
                                     and runner == [sys.executable, _find_sotto_script('_shared', 'scripts', 'compose_notification.py')])
             error.usage = _read_usage(usage_path)
             raise error
+        if (runner == [sys.executable, str(Path(__file__).with_name('procedure_runner.py'))]
+                and (label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:meeting-prep', label))
+                and '[meeting-prep] research persistence failed; prep remains available' in _stderr):
+            _record_delivery(label, 'research_persistence_failed', run_id=job['id'])
         kind = MARKED_BRIEF_KINDS.get(label.rsplit(':', 1)[-1])
-        if kind and not _is_silence(stdout.strip()) and not _composed_brief_recently(kind, str(_local_now().date())):
+        import onboarding
+        archive_kind = 'history-discovery' if label == onboarding.DISCOVERY_LABEL else kind
+        if kind and not _is_silence(stdout.strip()) and not _composed_brief_recently(archive_kind, str(_local_now().date())):
             raise RuntimeError('brief runner produced no archived composition')
         effect_doc = _read_delivery_effects(job['id'])
+        composition_after = (_composition_evidence(label)
+                             if composition_before is not None else None)
+        matched_evidence = (composition_before
+                            if composition_before == composition_after else None)
+        try:
+            source_text_sha256 = (hashlib.sha256(_delivery_body(stdout).encode('utf-8')).hexdigest()
+                                  if matched_evidence else None)
+        except UnicodeError:
+            source_text_sha256 = None
         deadlines = [d for d in (job.get('valid_until'), eligibility.get('valid_until')) if d is not None]
         return {'text': stdout, 'label': label, 'usage': _read_usage(usage_path),
+                'source_revision_at_composition': (matched_evidence['source_revision']
+                                                   if matched_evidence else None),
+                'route_digest_at_composition': (matched_evidence['route_digest']
+                                                if matched_evidence else None),
+                'source_text_sha256': source_text_sha256,
+                **({'research_evidence': effect_doc['research_evidence']}
+                   if effect_doc.get('research_evidence') is not None else {}),
                 'decision_ids': effect_doc.get('notification_decision_ids', list(dict.fromkeys([
                     *(request.get('decision_ids') or []), *(effect_doc.get('decision_ids') or [])]))),
                 'effects': [*(effect_doc.get('effects') or []), *eligibility['effects']],
@@ -1156,6 +2170,128 @@ class _WorkDeferredError(RuntimeError):
     """The deterministic runner could not acquire its input lock before doing any work."""
 
 
+def _routine_outbox_authorized(payload: dict) -> bool:
+    job_id = payload.get('run_id')
+    digest = payload.get('routine_handoff_digest')
+    if not isinstance(job_id, str) or not isinstance(digest, str):
+        return False
+    if payload.get('label', '').startswith('routine:fresh:') and not _retained_proof_current({
+            'source_revision': payload.get('routine_source_revision'),
+            'route_digest': payload.get('routine_route_digest')}):
+        return False
+    slot = WORK_QUEUE.routine_slot_for_job(DATA, job_id)
+    if slot is None or (slot['handoff_digest'] is not None and
+                        slot['handoff_digest'] != digest):
+        return False
+    try:
+        return _fresh_routine_authority(job_id, payload.get('target')) is not None
+    except Exception:
+        return False
+
+
+def _reconcile_routine_job(job_id: str) -> bool:
+    authority = _fresh_routine_authority(job_id, _deliver_target())
+    if authority is None:
+        return False
+    slot = WORK_QUEUE.routine_slot_for_job(DATA, job_id)
+    if not slot or slot['completion_utc'] is None:
+        return False
+    if slot['handoff_kind'] == 'silent':
+        evidence = {'kind': 'silent'}
+    elif slot['handoff_kind'] == 'outbox':
+        evidence = OUTBOX.receipt_for_run(job_id, slot['handoff_digest'])
+        if evidence is None:
+            return False
+    else:
+        return False
+    WORK_QUEUE.reconcile_routine_cursor(DATA, pending_job_id=job_id,
+        evidence=evidence, successor_after_completion=FRESH_ROUTINES.successor_after_completion,
+        **authority)
+    return True
+
+
+def _reconcile_pending_routines() -> None:
+    if not _fresh_routines_supported():
+        return
+    for job_id in WORK_QUEUE.pending_routine_job_ids(DATA):
+        try:
+            _reconcile_routine_job(job_id)
+        except Exception as error:
+            print(f'[sotto] routine reconciliation held ({type(error).__name__})', flush=True)
+
+
+def _fresh_routines_supported():
+    return (os.environ.get('SOTTO_RUNTIME_PROFILE') in
+            ('managed-photon-fixed-five-v1', 'self-host-photon-fixed-five-v1', 'self-host-telegram-fixed-five-v1')
+            and re.fullmatch('[a-f0-9]{32}', os.environ.get('SOTTO_ROUTINE_EPOCH', '')) is not None)
+
+
+def _fresh_row_current(row):
+    return row['status'] == 'active' and row['binding'] == RUNTIME_OWNER_ROUTINE_TOOL.current_binding(
+        row['binding']['identity'], dict(os.environ, _configured_tz_name=_configured_tz_name),
+        DATA, RUNTIME_ACTIVATION,
+        **({'telegram_verifier': _load_shared_lib('telegram_channel_proof'),
+            'chat_client': _runtime_adapter()._client(timeout=5)}
+           if row['binding']['identity']['channel'] == 'telegram' else
+           {'chat_client': _runtime_adapter()._client(timeout=5)}
+           if row['binding']['identity']['route_mode'] == 'first_contact_shared_project' else {}))
+
+
+def _fresh_routine_authority(job_id, target):
+    if target not in ('photon', 'telegram') or target != _deliver_target() or not _fresh_routines_supported():
+        return None
+    try:
+        cursors = FRESH_ROUTINES.cursors(DATA)
+        for row in FRESH_ROUTINES.load(DATA)['routines'].values():
+            binding = FRESH_ROUTINES.cursor_binding(row)
+            key = WORK_QUEUE._routine_hash(binding['owner_scope'], binding['profile_id'], binding['legacy_id'])
+            cursor = cursors.get(key)
+            if not cursor or cursor['pending_job_id'] != job_id or not _fresh_row_current(row):
+                continue
+            proof = {**binding, 'schedule_expr': FRESH_ROUTINES.expression(row['definition']),
+                     'schedule_zone': row['definition']['zone'], 'expected_generation': cursor['generation']}
+            if WORK_QUEUE.routine_job_matches_authority(DATA, pending_job_id=job_id, **proof):
+                return proof
+    except Exception:
+        return None
+    return None
+
+
+def _fresh_routine_tick():
+    if not _fresh_routines_supported():
+        return
+    try:
+        doc = FRESH_ROUTINES.load(DATA)
+    except FileNotFoundError:
+        return
+    for row in doc['routines'].values():
+        try:
+            if not _fresh_row_current(row):
+                continue
+            definition = row['definition']
+            binding = FRESH_ROUTINES.cursor_binding(row)
+            cursor = WORK_QUEUE.bind_routine_cursor(DATA, **binding, recorded_at_utc=datetime.fromisoformat(row['initial_utc'].replace('Z', '+00:00')),
+                schedule_expr=FRESH_ROUTINES.expression(definition), schedule_zone=definition['zone'],
+                completed_count=0, last_run_at=None)
+            if cursor['pending_job_id'] is not None:
+                continue
+            due = datetime.fromisoformat(cursor['current_utc'].replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            if due > now:
+                continue
+            next_at = FRESH_ROUTINES.successor_after_completion(
+                expr=FRESH_ROUTINES.expression(definition), completed_at=now, zone=definition['zone'])
+            payload = {'runner': [sys.executable, str(Path(__file__).with_name('procedure_runner.py'))],
+                       'prompt': json.dumps({'pack': str(Path(_find_sotto_script('_shared', 'scripts', 'memory_cycle.py')).parents[2]), 'kind': 'personal-routine',
+                           'routine_id': row['routine_id'], 'definition_hash': row['definition_hash'],
+                           'prompt': definition['prompt']}),
+                       'label': 'routine:fresh:' + row['routine_id'], 'decision_ids': []}
+            WORK_QUEUE.admit_routine_cursor_slot(DATA, **binding, expected_recorded_at_utc=due,
+                next_provisional_at_utc=datetime.fromisoformat(next_at), payload=payload)
+        except Exception as error:
+            print(f'[sotto] fresh routine held ({type(error).__name__})', flush=True)
+
+
 class _WorkAdmissionBusyError(RuntimeError):
     """The proxy rejected an unbilled call; the original work deadline still applies."""
 
@@ -1171,18 +2307,53 @@ def _work_one(job):
 
     threading.Thread(target=keep_lease, name='sotto-work-lease', daemon=True).start()
     try:
+        if job['kind'] == 'source_correction':
+            WORK_QUEUE.fail(DATA, job['id'], owner, 'automatic source corrections retired')
+            return
+        routine_slot = WORK_QUEUE.routine_slot_for_job(DATA, job['id'])
+        if routine_slot:
+            if _fresh_routine_authority(job['id'], _deliver_target()) is None:
+                raise _WorkDeferredError('routine authority unavailable')
+            if job.get('result') is None:
+                request = job.get('payload') or {}
+                _require_sotto_procedure(list(request['runner']), job['kind'])
         result = job.get('result')
+        if not _requested_telegram_job_current(job):
+            raise _WorkDeferredError('requested brief authority unavailable')
         if result is None:
             result = _execute_work(job)
+            if routine_slot:
+                # Capture execution completion BEFORE any outbox wait/retry. A
+                # saved result keeps this exact instant across worker restart.
+                result = {**result, '_routine_completed_at': datetime.now(timezone.utc).isoformat()}
             WORK_QUEUE.save_result(DATA, job['id'], owner, result)
         if not WORK_QUEUE.renew(DATA, job['id'], owner):
             raise RuntimeError('work lease lost before delivery handoff')
+        if not _requested_telegram_job_current(job):
+            raise _WorkDeferredError('requested brief authority unavailable')
+        if routine_slot and _fresh_routine_authority(job['id'], _deliver_target()) is None:
+            raise _WorkDeferredError('routine authority unavailable')
         # An already-composed result retries only this handoff; the outbox dedupes its stable ID.
-        _deliver_text(result['text'], result['label'], usage=result.get('usage'),
+        handoff = _deliver_text(result['text'], result['label'], usage=result.get('usage'),
                       decision_ids=result.get('decision_ids'), effects=result.get('effects'),
                       run_id=job['id'], valid_until=result.get('valid_until'),
-                      not_before=result.get('not_before'), coverage_until=result.get('coverage_until'))
-        WORK_QUEUE.finish(DATA, job['id'], owner)
+                      not_before=result.get('not_before'), coverage_until=result.get('coverage_until'),
+                      routine_proof=bool(routine_slot),
+                      source_revision_at_composition=result.get('source_revision_at_composition'),
+                      route_digest_at_composition=result.get('route_digest_at_composition'),
+                      source_text_sha256=result.get('source_text_sha256'),
+                      **({'research_evidence': result['research_evidence']}
+                         if result.get('research_evidence') is not None else {}))
+        if not WORK_QUEUE.finish(DATA, job['id'], owner,
+                                 routine_handoff=handoff if routine_slot else None):
+            raise RuntimeError('work lease lost before finish')
+        if routine_slot:
+            try:
+                _reconcile_routine_job(job['id'])
+            except Exception as error:
+                # A missing or ambiguous receipt holds its pending cursor. The
+                # ordinary work/outbox settlement already committed.
+                print(f'[sotto] routine reconciliation held ({type(error).__name__})', flush=True)
         try:
             os.unlink(_delivery_effects_path(job['id']))
         except OSError:
@@ -1213,9 +2384,10 @@ def _work_one(job):
     except Exception as error:
         diagnostic = error.diagnostic if isinstance(error, _WorkerError) else type(error).__name__
         budget_denied = getattr(error, 'model_budget_exhausted', False) and job.get('result') is None
+        outcome_uncertain = getattr(error, 'model_outcome_uncertain', False) and job.get('result') is None
         disposition = WORK_QUEUE.fail(DATA, job['id'], owner, diagnostic,
                                       retry_provider=getattr(error, 'retry_provider', False),
-                                      model_budget_exhausted=budget_denied)
+                                      model_budget_exhausted=budget_denied, model_outcome_uncertain=outcome_uncertain)
         if disposition is None:
             return  # a newer lease owns both the retry and its receipt
         if budget_denied and disposition == 'failed':
@@ -1223,7 +2395,8 @@ def _work_one(job):
             diagnostic = WORK_QUEUE.MODEL_BUDGET_EXHAUSTED
             if job['payload'].get('label') == onboarding.LABEL:
                 onboarding.model_budget_held(DATA)
-        detail = ('model allowance reached; no retry queued' if budget_denied and disposition == 'failed' else
+        detail = ('model outcome uncertain; no retry queued' if outcome_uncertain and disposition == 'failed' else
+                  'model allowance reached; no retry queued' if budget_denied and disposition == 'failed' else
                   'retry queued' if disposition in ('pending', 'ready') else
                   'relevance deadline reached; no retry queued' if disposition == 'expired' else
                   'attempt limit reached; no retry queued')
@@ -1261,13 +2434,57 @@ def _drain_work():
                 raise
 
 
+# Legacy skill jobs whose withheld note this process already recorded (the ledger keeps it across
+# restarts); avoids rescanning delivery.jsonl on every reconcile tick.
+_WITHHELD_SKILL_NOTICES: set = set()
+
+
 def _requested_brief_feedback():
-    """Reconcile terminal work even when expiry happened before a worker could claim it."""
+    """Reconcile requested work even when expiry happened before a worker could claim it."""
     owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+    proof = []  # one route-proof read per pass, shared by every bound skill job
     for job in WORK_QUEUE.feedback_jobs(DATA):
         meta = job['feedback']
-        if (not isinstance(meta, dict) or not REQUESTED_BRIEF.LABEL.fullmatch(meta.get('label', ''))
-                or meta.get('owner') != owner or meta.get('target') != _deliver_target()
+        label = meta.get('label', '') if isinstance(meta, dict) else ''
+        if (not isinstance(label, str)
+                or not (REQUESTED_BRIEF.LABEL.fullmatch(label) or OUTBOX.feedback_skill(label))):
+            continue
+        full_job = WORK_QUEUE.get(DATA, job['id']) if REQUESTED_BRIEF.LABEL.fullmatch(label) else None
+        if full_job and (_requested_telegram_job(full_job) or meta.get('target') == 'telegram'):
+            binding = _requested_telegram_job(full_job)
+            if (not _requested_telegram_job_current(full_job, label=label, target=meta.get('target'))
+                    or not binding or meta.get('owner') != binding['owner_id']
+                    or meta.get('chat_id') != binding['owner_id']):
+                if OUTBOX.enqueue_work_feedback(job, enqueue=False) is True:
+                    WORK_QUEUE.clear_feedback(DATA, job['id'])
+                continue
+            if OUTBOX.enqueue_work_feedback(job):
+                WORK_QUEUE.clear_feedback(DATA, job['id'])
+            continue
+        if OUTBOX.feedback_skill(label):
+            if not _skill_notice_bound(meta):
+                # A legacy job has no admission route to bind, so it never gets a notice. Note the
+                # withholding only when a notice was actually owed; the four-hour notice window
+                # (or a delivered original) then clears the job's feedback.
+                decision = OUTBOX.enqueue_work_feedback(job, enqueue=False)
+                if decision is True:
+                    WORK_QUEUE.clear_feedback(DATA, job['id'])
+                elif decision == 'notice' and job['id'] not in _WITHHELD_SKILL_NOTICES:
+                    _record_delivery(label, 'skipped',
+                        'Terminal skill notice withheld: original verified owner route proof is unavailable.',
+                        run_id=job['id'], once=True)
+                    if len(_WITHHELD_SKILL_NOTICES) >= 1024:
+                        _WITHHELD_SKILL_NOTICES.clear()
+                    _WITHHELD_SKILL_NOTICES.add(job['id'])
+                continue
+            if not proof:
+                proof.append(_candidate_retained_route_proof())
+            if proof[0] is None or not _skill_notice_current(meta, proof[0]):
+                # The route changed after admission: no notice, and none is owed once the window ends.
+                if OUTBOX.enqueue_work_feedback(job, enqueue=False) is True:
+                    WORK_QUEUE.clear_feedback(DATA, job['id'])
+                continue
+        elif (meta.get('owner') != owner or meta.get('target') != _deliver_target()
                 or not REQUESTED_BRIEF.owner_destination(
                     DATA, owner, meta.get('chat_id'), os.environ.get('SOTTO_TENANT_ID'))):
             continue
@@ -1279,7 +2496,9 @@ def start_work_thread():
     def loop():
         while not _WORK_STOP.is_set():
             try:
+                _fresh_routine_tick()
                 _drain_work()
+                _reconcile_pending_routines()
                 _requested_brief_feedback()
             except Exception as error:
                 print(f'[sotto] work queue: {type(error).__name__}', flush=True)
@@ -1360,30 +2579,128 @@ def _brief_model_ready() -> bool:
         return False
 
 
-def request_owner_brief(body):
+def _pending_offers():
+    _shared_effects()  # establishes the fixed installed shared script roots
+    import pending_offer
+    return pending_offer
+
+
+def request_owner_meeting_prep(offer, *, admission, feedback_identity, feedback_thread_id):
+    """Only the scoped authenticated owner route can admit this exact offered occurrence."""
+    _activation_tick()
+    evidence = _composition_evidence('meeting-prep:')
+    if _deliver_target() != 'photon' or evidence is None:
+        return 503, {'status': 'unavailable'}
+    if not _source_context().allowed('calendar'):
+        return 409, {'status': 'needs_context'}
+    composer = _find_sotto_script('meeting-prep', 'scripts', 'compose_meeting_prep.py')
+    if not composer:
+        return 503, {'status': 'unavailable'}
+    label = 'meeting-prep:' + offer['offer_id']
+    binding = _skill_notice_binding(feedback_identity, feedback_thread_id, evidence)
+    if binding is None:
+        return 503, {'status': 'unavailable'}
+    request = {'kind': 'focused-meeting-prep', 'pack': str(Path(composer).parents[2]),
+               'offer': offer, 'work_key': label}
+    job_id = _spawn_and_deliver([sys.executable, str(Path(__file__).with_name('procedure_runner.py'))],
+                                json.dumps(request), label, admission=admission,
+                                feedback={'label': label, **binding})
+    return 200, {'status': 'queued', 'request_id': job_id}
+
+
+def request_owner_skill(selection, *, work_key, admission, skill='meeting-prep', question=None,
+                        feedback_identity=None, feedback_thread_id=None):
+    """One declared shared pipeline, never a model-supplied executable or destination."""
+    _activation_tick()
+    label = work_key + ':' + skill
+    evidence = _composition_evidence(label)
+    if _deliver_target() != 'photon' or evidence is None:
+        return 503, {'status': 'unavailable'}
+    if admission and admission.get('source_revision') is not None and admission['source_revision'] != evidence['source_revision']:
+        return 409, {'status': 'source_unavailable'}
+    if skill == 'meeting-prep' and not _source_context().allowed('calendar'):
+        return 409, {'status': 'source_unavailable'}
+    if skill in ('relationship-pulse','proactive') and not _runtime_source_authority().get('complete'):
+        return 409, {'status': 'source_unavailable'}
+    if skill == 'followup':
+        authority = _runtime_source_authority()
+        if not authority.get('complete'):
+            return 409, {'status': 'source_unavailable'}
+        if 'granola' not in authority.get('connector_sources', []):
+            # A missing credential is a known disconnected state. Malformed/unknown credentials
+            # and withheld grants remain the ordinary source-unavailable refusal.
+            if SELFHOST_SOURCE_AUTHORITY.granola_generation(Path(DATA) / 'connectors/granola.json') == SELFHOST_SOURCE_AUTHORITY.DISCONNECTED:
+                return 409, {'status': 'meeting_notes_not_connected'}
+            return 409, {'status': 'source_unavailable'}
+    composer = (_find_sotto_script('proactive', 'scripts', 'proactive_scan.py') if skill == 'proactive'
+                else _find_sotto_script('relationship-pulse', 'scripts', 'relationship_pulse.py') if skill == 'relationship-pulse'
+                else _find_sotto_script('followup', 'scripts', 'compose_followup.py') if skill == 'followup'
+                else _find_sotto_script('meeting-prep', 'scripts', 'compose_meeting_prep.py'))
+    if not composer:
+        return 503, {'status': 'unavailable'}
+    request = {'kind': 'shared-meeting-prep', 'pack': str(Path(composer).parents[2]),
+               'selection': selection, 'work_key': work_key}
+    if skill == 'ask-research':
+        request.update(kind='shared-ask-research', question=question)
+    elif skill == 'followup':
+        request.update(kind='shared-followup')
+    elif skill == 'relationship-pulse':
+        request.update(kind='shared-relationship-pulse')
+    elif skill == 'proactive':
+        request.update(kind='proactive')
+    feedback = None
+    if feedback_identity is not None:
+        binding = _skill_notice_binding(feedback_identity, feedback_thread_id, evidence)
+        if binding is None:
+            return 503, {'status': 'unavailable'}
+        feedback = {'label': label, **binding}
+    job_id = _spawn_and_deliver([sys.executable, str(Path(__file__).with_name('procedure_runner.py'))],
+                                json.dumps(request), label, admission=admission, feedback=feedback)
+    return 200, {'status': 'queued', 'request_id': job_id}
+
+
+def request_owner_brief(body, *, admitted_when=None, admission=None):
     """Called only after bearer + gateway capability authentication; never accepts a destination."""
     if (body.get('kind') not in ('morning', 'evening', 'auto')
             or type(body.get('refresh')) is not bool
             or any(not isinstance(body.get(k), str) or not 0 < len(body[k]) <= 512
                    for k in ('owner', 'chat_id', 'message_id'))):
         return 400, {'error': 'invalid brief request'}
-    owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
-    if body['owner'] != owner or not REQUESTED_BRIEF.owner_destination(
-            DATA, owner, body['chat_id'], os.environ.get('SOTTO_TENANT_ID')):
-        return 403, {'error': 'owner conversation required'}
-    if _deliver_target() not in ('photon', 'photon:' + owner, 'photon:' + body['chat_id']):
-        return 409, {'error': 'owner messaging is unavailable'}
-    now = _local_now()
+    if 'composition_direction' in body and (not admission
+            or not isinstance(body['composition_direction'], str)
+            or not 0 < len(body['composition_direction']) <= 16_000):
+        return 400, {'error': 'invalid composition direction'}
+    telegram = os.environ.get('SOTTO_RUNTIME_PROFILE') == 'self-host-telegram-fixed-five-v1'
+    if telegram:
+        candidate = {'admission': json.dumps(admission) if admission else None}
+        binding = _requested_telegram_job(candidate)
+        if (not binding or body['owner'] != binding.get('owner_id')
+                or body['chat_id'] != binding.get('owner_id')
+                or not _requested_telegram_job_current(candidate, target='telegram')):
+            return 403, {'error': 'owner conversation required'}
+        owner = binding['owner_id']
+    else:
+        owner = os.environ.get('PHOTON_HOME_CHANNEL', '')
+        if body['owner'] != owner or not REQUESTED_BRIEF.owner_destination(
+                DATA, owner, body['chat_id'], os.environ.get('SOTTO_TENANT_ID')):
+            return 403, {'error': 'owner conversation required'}
+        if _deliver_target() not in ('photon', 'photon:' + owner, 'photon:' + body['chat_id']):
+            return 409, {'error': 'owner messaging is unavailable'}
+        # New Photon owner DMs renew activation; Telegram uses its fixed pairing proof.
+        _activation_tick()
+    now = admitted_when or _local_now()
     kind = body['kind'] if body['kind'] != 'auto' else ('morning' if now.hour < 12 else 'evening')
     ident = REQUESTED_BRIEF.identity(owner, body['chat_id'], body['message_id'])
     label = f'requested:{ident}:sotto-{kind}-brief'
     prior = WORK_QUEUE.get(DATA, WORK_QUEUE.job_id_for('run', 'requested:' + ident))
     if prior is not None:
         return 200, {'status': 'known_request', 'request_id': prior['id']}
-    # A prior uncertain gallery stays uncertain. A repeated request must not send a replacement.
+    # Same-edition or ambiguous uncertainty stays held; an exact opposite edition is unrelated.
     with CONNECTORS.json_transaction(OUTBOX.path(), default={}) as state:
         if any(row.get('day') == str(now.date()) and row.get('status') == 'pending'
                and row.get('kind') == 'brief'
+               and REQUESTED_BRIEF.known_brief_kind(row.get('payload')) not in
+                   ({'morning', 'evening'} - {kind})
                and (row.get('acceptance_uncertain') or row.get('acceptance') in ('unknown', 'in_flight'))
                for row in state.get('rows', [])):
             return 200, {'status': 'pending_delivery'}
@@ -1393,18 +2710,25 @@ def request_owner_brief(body):
     composer = _find_sotto_script('_shared', 'scripts', 'compose_brief.py')
     if not composer:
         return 503, {'error': 'brief composer unavailable'}
+    if telegram and not _requested_telegram_job_current(candidate, target='telegram'):
+        return 503, {'error': 'owner conversation changed'}
     request = {'kind': kind, 'pack': str(Path(composer).parents[2]), 'day': str(now.date()),
                'work_key': label, 'refresh': body['refresh']}
+    if body.get('composition_direction'):
+        request['composition_direction'] = body['composition_direction']
     job_id = _spawn_and_deliver([sys.executable, str(Path(__file__).with_name('brief_runner.py'))],
                                 json.dumps(request), label, feedback={
                                     'label': label, 'owner': owner, 'chat_id': body['chat_id'],
-                                    'target': _deliver_target()})
+                                    'target': _deliver_target()}, admission=admission)
     return 200, {'status': 'queued', 'request_id': job_id}
 
 
+
+
 def _managed_brief(skill: str, label: str, payload_path: str = "",
-                   work_not_before: float | None = None, retry_terminal: bool = False) -> bool:
-    if skill not in MARKED_BRIEF_KINDS or os.environ.get('SOTTO_RUN_SKILL', 'hermes -z') != 'hermes -z':
+                   work_not_before: float | None = None, retry_terminal: bool = False,
+                   fixed_recovery_from: str | None = None) -> bool:
+    if skill not in MARKED_BRIEF_KINDS:
         return False
     composer = _find_sotto_script("_shared", "scripts", "compose_brief.py")
     if not composer:
@@ -1415,11 +2739,16 @@ def _managed_brief(skill: str, label: str, payload_path: str = "",
     work_key = f'{day}:{kind}:{_brief_revision(kind)}' if not label.startswith('run-now:') else secrets.token_hex(12)
     request = {'kind': kind, 'pack': pack, 'payload_path': payload_path,
                'day': day, 'work_key': work_key}
+    import onboarding
+    if label == onboarding.DISCOVERY_LABEL:
+        request.update(history_discovery=True, work_key=_job_key(label, ''))
     queue_key = _job_key(label, '')
     prior = WORK_QUEUE.get(DATA, WORK_QUEUE.job_id_for('run', queue_key)) if queue_key is not None else None
     if prior and prior['status'] == 'failed' and prior.get('error') == WORK_QUEUE.MODEL_BUDGET_EXHAUSTED:
         if not _brief_model_ready():
             import onboarding
+            if label == onboarding.DISCOVERY_LABEL:
+                return False
             if label == onboarding.LABEL:
                 onboarding.model_budget_held(DATA)
                 return False  # Do not claim a welcome was admitted when nothing was queued.
@@ -1435,30 +2764,22 @@ def _managed_brief(skill: str, label: str, payload_path: str = "",
         # full duplicate gather+compose for the send seam to supersede. An admitted job nobody
         # has started is replaced; one already composing (or composed) is left to deliver, and
         # if its context really is stale the outbox supersedes it and recomposes from here.
-        active = WORK_QUEUE.active_job(DATA, 'run', label)
-        if active is not None and active['id'] != WORK_QUEUE.job_id_for('run', _job_key(label, '')):
-            if active['status'] != 'pending' or not WORK_QUEUE.discard_pending(DATA, active['id']):
-                return True
+        if not _selected_fixed_profile():
+            active = WORK_QUEUE.active_job(DATA, 'run', label)
+            if active is not None and active['id'] != WORK_QUEUE.job_id_for('run', _job_key(label, '')):
+                if active['status'] != 'pending' or not WORK_QUEUE.discard_pending(DATA, active['id']):
+                    return True
     _spawn_and_deliver([sys.executable, os.path.join(os.path.dirname(__file__), "brief_runner.py")],
                        json.dumps(request), label, work_not_before=work_not_before,
-                       retry_terminal=retry_terminal)
+                       retry_terminal=retry_terminal, fixed_recovery_from=fixed_recovery_from)
     return True
 
 
 def run_skill(skill: str, payload_path: str) -> None:
     # A Bridge wake carries a newly staged source snapshot. It is explicit new ingress, so a prior
     # terminal admission for this deterministic day/revision may receive one fresh bounded budget.
-    if _managed_brief(skill, f"brief:{skill}", payload_path, retry_terminal=True):
-        return
-    # HOST-NEUTRAL one-shot. Hermes/OpenClaw have NO `run <skill> --input` command — the scriptable
-    # entry point is a single PROMPT in, final text out (`hermes -z "<prompt>"`, the documented
-    # one-shot for shell scripts/cron). So we hand the agent a prompt that names the skill and points
-    # it at the staged payload; the brief SKILL loads local_data from that path instead of calling
-    # read_local. Override the runner with SOTTO_RUN_SKILL (e.g. "hermes chat -q", an OpenClaw cmd).
-    # shell=False (list args) — no shell is invoked; shlex.split tolerates spaces in the path.
-    runner = shlex.split(os.environ.get("SOTTO_RUN_SKILL", "hermes -z"))
-    _spawn_and_deliver(runner, _spawn_prompt(skill, payload_path), f"brief:{skill}",
-                       retry_terminal=True)
+    if not _managed_brief(skill, f"brief:{skill}", payload_path, retry_terminal=True):
+        raise RuntimeError('Sotto unattended skill procedure is unsupported')
 
 
 def _claim_is_stale(flag: str, date: str, kind_short: str) -> bool:
@@ -1887,8 +3208,8 @@ def _handle_trigger(body: dict) -> tuple[int, dict]:
 # ── Event ingestion (Phase 2): POST /bridge/events → dedupe → triage → maybe agent ────────────────
 # The Bridge watcher (and the Gmail poll thread below) push raw events here; the deterministic
 # triage funnel (sotto-chief-of-staff/event-triage/scripts/triage_event.py) runs SYNCHRONOUSLY and
-# its verdict is the 200 body. Verdict "agent" additionally stages a bundle and spawns the
-# sotto-event one-shot from a background thread (same SOTTO_RUN_SKILL pattern as run_skill).
+# its verdict is the 200 body. Verdict "agent" additionally stages a bundle and queues the
+# notification composer as durable event work.
 
 EVENTS_SEEN_MAX = 2000            # ring size for (source,rowid) idempotency keys
 TRIAGE_TIMEOUT_SECS = 30          # Tier 0 is sub-second; Tier 1 is one Flash-Lite call
@@ -1954,29 +3275,29 @@ def _event_key(e: dict):
     src, rowid = e.get("source"), e.get("rowid")
     if not src or rowid in (None, ""):
         return None
+    generation = e.get("store_generation")
+    if src in ("imessage", "whatsapp", "calls") and isinstance(generation, str) and re.fullmatch(r"[a-f0-9]{64}", generation):
+        return f"{src}:{generation}:{rowid}"
     return f"{src}:{rowid}"
 
 
 # Where the skills tree lives, resolved ONCE per script name. The recursive glob below is not cheap
 # and the answer only changes on a redeploy (which restarts this process), so a plain dict is the
-# whole cache — there is nothing to invalidate. SOTTO_SKILLS_ROOT is the host-neutral knob: a
-# non-Hermes host points it at wherever ITS installer copied sotto-chief-of-staff, and everything
-# that shells out to the skills tree (triage, the Gmail poll, the calendar gather, dashboard fact
-# edits) works there too.
+# whole cache — there is nothing to invalidate. SOTTO_SKILLS_ROOT names the packaged skills tree
+# (the supervisor sets /app/sotto-skills), and everything that shells out to it (triage, the Gmail
+# poll, the calendar gather, dashboard fact edits) reads from there.
 _SCRIPT_CACHE: dict = {}
 
 
 def _find_sotto_script(*rel):
     """Locate a sotto chief-of-staff skill script: SOTTO_SKILLS_ROOT (when set) first, then the
-    Hermes install trees (same discovery as _google_setup_py), then the repo-relative source tree
-    (tests / source checkouts). Memoized per script name — see _SCRIPT_CACHE."""
+    repo-relative source tree (tests / source checkouts). Memoized per script name — see
+    _SCRIPT_CACHE."""
     import glob
     key = tuple(rel)
     if key in _SCRIPT_CACHE:
         return _SCRIPT_CACHE[key]
     bases = [b for b in (os.environ.get("SOTTO_SKILLS_ROOT") or "").strip().split(os.pathsep) if b]
-    if os.environ.get('SOTTO_DEPLOYMENT_MODE') != 'managed':
-        bases += _hermes_adapter('runtime_api').discovery_roots()
     found = None
     for base in bases:
         hits = glob.glob(os.path.join(base, "**", *rel), recursive=True)
@@ -2079,6 +3400,12 @@ def handle_events(body: dict) -> tuple[int, dict]:
     events = body.get("events")
     if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
         return 400, {"error": "bad events"}
+    # Historical withdrawal is disabled: v1 refs change with timezone/alias display and
+    # cannot prove a deletion across store resets. Acknowledge old queued metadata without
+    # loading the graph so a mixed-version Bridge can still deliver ordinary events.
+    retraction_status = ({'source_retractions': {'status': 'disabled', 'applied': 0}}
+                         if 'source_retractions' in body else {})
+    retraction_status.update(_admit_source_corrections(body))
     # Synthetic sources are minted ONLY inside this process (calcache's meeting tap + calendar
     # diff, the proactive watcher's in-process tick) and carry gate exemptions plus field-trust —
     # the funnel reads a synthetic event's own kind/class as truth. An event arriving over HTTP
@@ -2100,7 +3427,7 @@ def handle_events(body: dict) -> tuple[int, dict]:
                 keys.append(k)
         _EVENTS_INFLIGHT.update(keys)
     if not fresh:
-        return 200, {"verdict": "drop", "reason": "duplicate events (seen or in flight)", "bundle": {}}
+        return 200, {"verdict": "drop", "reason": "duplicate events (seen or in flight)", "bundle": {}, **retraction_status}
     try:
         try:
             verdict = run_triage(fresh, bool(body.get("catchup")))
@@ -2120,7 +3447,7 @@ def handle_events(body: dict) -> tuple[int, dict]:
             except OSError:
                 pass  # dedupe is best-effort; a lost ring write only risks a re-triage, never a loss
         _touch_event_stamp()   # fresh events made it through the pipeline — /setup can say so
-        return 200, verdict
+        return 200, {**verdict, **retraction_status}
     finally:
         with _EVENTS_LOCK:
             _EVENTS_INFLIGHT.difference_update(keys)
@@ -2242,32 +3569,24 @@ def start_gmail_poll_thread():
 # Gmail poll — a timer, not per-batch, because the defining failure is "the hold lifted and no fresh
 # event arrived to trigger reconsideration") and the CHANNEL-HEALTH gate: a promotion is only spent
 # when the DELIVERY channel is healthy (_delivery_channel_ready — the ROADMAP amendment, never burn
-# budget on an undeliverable nudge; for a SOTTO_CRON_DELIVER with no probe there is nothing to check,
-# so the valve just runs). An agent verdict from the valve rides the IDENTICAL stage-bundle → spawn path
-# a fresh agent verdict takes.
+# budget on an undeliverable nudge). An agent verdict from the valve rides the IDENTICAL
+# stage-bundle → spawn path a fresh agent verdict takes.
 
 VALVE_INTERVAL_SECS_DEFAULT = 900   # the same */15 cadence as the proactive heartbeat
 
-# One sentence: a nudge waits for the ACTIVE channel to be linked, and a channel with no probe counts
-# as linked. SOTTO_CRON_DELIVER (the same var start.sh resolves and passes to `hermes cron create
-# --deliver`) names the channel, so a Discord/Slack/local user is never silently denied the valve and
-# the post-meeting tap — while a WhatsApp or Telegram deploy that has not finished linking is held
-# rather than spending a nudge on nothing.
+# One sentence: a nudge waits for the ACTIVE channel (SOTTO_CRON_DELIVER) to be linked, so a Photon or
+# Telegram deploy that has not finished linking is held rather than spending a nudge on nothing.
 _DELIVERY_GATE_STATE: dict = {}     # label → last logged state, so a shut gate logs once, not per tick
 
 
 def _delivery_ready(status: str | None = None) -> bool:
-    """THE delivery rule, in one sentence: a channel Sotto CAN probe must be linked, and a channel
-    with no probe at all counts as linked. WhatsApp, Telegram, and Photon have setup probes
-    (session credentials, a bot recipient, and an authenticated owner DM respectively), so
-    anything but "linked" holds. Discord, Slack, Signal, BlueBubbles and local have no probe and
-    may not be denied for a setup this process cannot see. Silent — callers that
-    run on a timer use _delivery_channel_ready below; the setup wizard's completion gate calls this
-    directly, passing the channel state it already rendered from rather than re-probing."""
+    """THE delivery rule, in one sentence: the active channel must be one Sotto delivers to (Photon
+    or Telegram) and its setup probe (an authenticated owner DM, or a bot recipient) must read
+    "linked"; anything else holds. Silent — callers that run on a timer use
+    _delivery_channel_ready below; the setup wizard's completion gate calls this directly, passing
+    the channel state it already rendered from rather than re-probing."""
     channel = _deliver_target()
-    if channel in ("whatsapp", "telegram", "photon"):
-        return (status or _channel_status(channel)) == "linked"
-    return True
+    return channel in ("telegram", "photon") and (status or _channel_status(channel)) == "linked"
 
 
 def _delivery_channel_ready(label: str) -> bool:
@@ -2276,8 +3595,6 @@ def _delivery_channel_ready(label: str) -> bool:
     channel = _deliver_target()
     state = _channel_status(channel)
     ok = _delivery_ready(state)
-    if ok and state == "unknown":
-        return True   # nothing to probe, and nothing worth logging every tick
     if _DELIVERY_GATE_STATE.get(label) != ok:
         _DELIVERY_GATE_STATE[label] = ok
         print(f"[sotto] {label}: {channel} linked — dispatching" if ok else
@@ -2352,7 +3669,7 @@ def _promote_queued(key: str) -> dict:
     calls this through HOOKS and renders whatever comes back; it never decides anything itself.
 
     The channel gate is checked FIRST and reported rather than swallowed: spending a nudge on an
-    unlinked WhatsApp is exactly the silent loss _delivery_channel_ready exists to prevent, and a
+    unlinked channel is exactly the silent loss _delivery_channel_ready exists to prevent, and a
     user who just tapped a button deserves the reason, not a shrug.
     Returns {"ok": True, "reason"} or {"ok": False, "error": <code>, "reason": <sentence>}."""
     if not _delivery_ready():
@@ -2380,57 +3697,14 @@ def _promote_queued(key: str) -> dict:
 
 
 # ── Firing a scheduled job: the clock's lane and the dashboard's button ───────────────────────────
-# The cron IS the definition of these runs, and adapters/hermes/crons.json is the ONE source for the
+# The cron IS the definition of these runs, and adapters/sotto/crons.json is the ONE source for the
 # crons. So "run my morning brief" — whether the clock says so or you tapped the button — is
-# literally: take that job's prompt, fire it through the same SOTTO_RUN_SKILL runner run_skill uses.
-# No second prompt, no second skill mapping — and a job the deploy has gated off (SOTTO_DIGEST=0)
-# simply isn't in the list, so neither caller can offer what the box won't run. No staged payload:
-# the brief skill falls back to its own snapshot when the Bridge hasn't pushed one.
+# literally: take that job's row and fire its declared procedure. No second schedule, no second skill
+# mapping — and a job the deploy has gated off (SOTTO_DIGEST=0) simply isn't in the list, so neither
+# caller can offer what the box won't run.
 
-def _spawn_prompt(skill: str, payload_path: str = "", job_prompt: str = "") -> str:
-    """The ONE prompt every spawned skill run gets, from either lane.
-
-    Imperative + fail-loud. A friendly one-liner — crons.json's "Run my morning brief" — lets the
-    agent IMPROVISE a freehand calendar/inbox recap (wrong names, fake group deep links,
-    sms-instead-of-whatsapp) instead of running the deterministic composer, and an improvised brief
-    still CLAIMS the day: the deliver-once marker then suppresses the lane that would have sent the
-    real one. That is a brief lost, not a brief degraded (it happened Sep 2, the first morning the
-    receiver owned the schedule — `calls=0`, an `unlabeled` claim, and nothing delivered).
-
-    The wake-push lane had this prompt and the cron lane had the one-liner: one job, two prompts,
-    and only one of them safe. `payload_path` is the only real difference between the two — a
-    Bridge-triggered run reads the staged local_data instead of gathering it. `job_prompt` is the
-    crons.json row's own words, quoted as the job's NAME (never as the instruction): it is what
-    tells a multi-mode skill which mode this is — `sotto-event`'s "Run my midday digest" is how
-    that skill knows to run its digest procedure rather than wait for a bundle.
-
-    A skill that can legitimately end with nothing (a scan, a digest, a pulse) is told the silence
-    sentinel: the seam can only swallow what the prompt teaches, and Hermes' own scheduler proved
-    on Sep 4 that an untaught lane delivers the literal token."""
-    staged = (f"The Sotto Bridge just delivered its trigger; use the staged local_data payload at "
-              f"{payload_path} as the brief's local context (do NOT call read_local). "
-              if payload_path else "")
-    named = f"This is the scheduled job \"{job_prompt}\". " if job_prompt else ""
-    composer = ("You MUST generate the brief by running the skill's compose_brief.py via "
-                "execute_code and delivering its brief_markdown VERBATIM. Do NOT write the brief "
-                "yourself and do NOT hand-summarize the calendar/inbox. "
-                if skill in MARKED_BRIEF_KINDS else
-                "You MUST produce its output by running the skill's own scripts via execute_code "
-                "and delivering what they return VERBATIM — never hand-written in their place. "
-                f"If the procedure ends with nothing to deliver, your ENTIRE reply must be the "
-                f"single token {SILENCE_SENTINEL} — the delivery seam turns that into silence; "
-                "never send 'all clear', 'scan complete', or any nothing-to-report message. ")
-    return (
-        f"Run the {skill} skill now, following its SKILL.md procedure EXACTLY. {named}{staged}"
-        f"{composer}"
-        f"Use each action's tap_link verbatim — never invent sms:/wa.me links or deep-link a group "
-        f"chat. If you cannot run the skill's scripts (e.g. execute_code is unavailable or "
-        f"unapproved), STOP and report that you could not — do NOT improvise the output. Deliver as "
-        f"Sotto, never as 'Hermes Agent'."
-    )
-
-
-def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False) -> dict:
+def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False,
+                   _fixed_recovery_from: str | None = None) -> dict:
     """Fire one crons.json job by name, now. {"ok": True, "skill": …} or {"ok": False, "error"}."""
     job = next((j for j in _sotto_cron_jobs() if j[0] == name), None)
     if job is None:
@@ -2446,18 +3720,16 @@ def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False) ->
         if name in MARKED_BRIEF_KINDS and not _invalid_recovery and _fresh_selfhost_brief_hold():
             return {"ok": False, "error": "capability",
                     "reason": "Connect a context source and delivery channel for your first brief"}
-    _, _, prompt, skill = job
+    skill = job[3]
     try:
         if label.startswith('cron:') and skill in MARKED_BRIEF_KINDS:
             import onboarding
             with _CLAIM_LOCK:
                 if _welcome_admission_active():
                     return {"ok": False, "error": "onboarding", "reason": "first useful look is arriving"}
-                if _managed_brief(skill, label):
+                if _managed_brief(skill, label, fixed_recovery_from=_fixed_recovery_from):
                     return {"ok": True, "skill": skill}
-                runner = shlex.split(os.environ.get("SOTTO_RUN_SKILL", "hermes -z"))
-                _spawn_and_deliver(runner, _spawn_prompt(skill, job_prompt=prompt), label)
-                return {"ok": True, "skill": skill}
+                raise RuntimeError('Sotto unattended skill procedure is unsupported')
         elif _managed_brief(skill, label):
             return {"ok": True, "skill": skill}
         if name == 'sotto-proactive':
@@ -2472,11 +3744,7 @@ def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False) ->
             _spawn_and_deliver([sys.executable, str(Path(__file__).with_name('procedure_runner.py'))],
                                json.dumps(request), label)
             return {'ok': True, 'skill': skill}
-        runner = shlex.split(os.environ.get("SOTTO_RUN_SKILL", "hermes -z"))
-        # crons.json's `prompt` is what HERMES registers for the jobs it runs. A run spawned HERE
-        # gets the one imperative prompt instead, with the row's words quoted only as the job's
-        # name — see _spawn_prompt for why a friendly one-liner on its own loses briefs.
-        _spawn_and_deliver(runner, _spawn_prompt(skill, job_prompt=prompt), label)
+        raise RuntimeError('Sotto unattended skill procedure is unsupported')
     except RuntimeError as e:
         if _is_terminal_work(e):
             # Not a spawn failure: this slot's work already ran out its bounded attempts (or its
@@ -2488,7 +3756,6 @@ def _fire_cron_job(name: str, label: str, *, _invalid_recovery: bool = False) ->
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] {label} spawn failed: {e}", flush=True)
         return {"ok": False, "error": "spawn", "reason": "that run couldn't be started"}
-    return {"ok": True, "skill": skill}
 
 
 def _is_terminal_work(error: BaseException) -> bool:
@@ -2511,15 +3778,13 @@ def _run_dashboard_job(name: str) -> dict:
 
 
 # ── The receiver's own cron: a scheduled run is scheduled AND delivered here ──────────────────────
-# ONE delivery lane for everything scheduled. Hermes' scheduler used to fire "Run my morning brief"
-# itself and deliver in-Hermes — outside the outbox, so a channel that was down at 6:30 lost the
-# brief with no retry and no receipt, and the deliver-once gate had a second lane to referee. Then
-# the proactive watcher, still on Hermes' clock, delivered the literal `NO_NUDGES` token at 7:02
-# one morning (Sep 4, 2026): the silence seam lives in _deliver_text, and a run Hermes delivers never
-# passes through it. crons.json rows marked `"runner": "receiver"` are therefore never registered
-# with Hermes; this heartbeat fires them down the same path the dashboard's button uses, so a
-# scheduled run inherits the outbox's retries, its receipt, the silence seam, and — for a brief —
-# the deliver-once gate that already governs these labels.
+# ONE delivery lane for everything scheduled. A scheduler that delivers on its own sits outside the
+# outbox: a channel that was down at 6:30 loses the brief with no retry and no receipt, the
+# deliver-once gate has a second lane to referee, and a no-nudge run can deliver the literal
+# `NO_NUDGES` token (Sep 4, 2026) because the silence seam lives in _deliver_text. So this heartbeat
+# fires every crons.json row down the same path the dashboard's button uses, and a scheduled run
+# inherits the outbox's retries, its receipt, the silence seam, and — for a brief — the
+# deliver-once gate that already governs these labels.
 #
 # Dedupe is two layers, deliberately: the in-memory map stops the ticks inside one window from firing
 # the same job ten times, and the brief claim plus the deliver-once marker are what actually
@@ -2561,12 +3826,14 @@ def _welcome_admission_active() -> bool:
 def _context_sources_ready() -> bool:
     """Use the same source gate for first-use welcome and scheduled work."""
     import managed
-    return (managed.has_sources(DATA) if managed.enabled() else
-            _local_source_ready() or Path(_hermes_adapter('runtime_api').home_path('google_token.json')).exists()
+    if managed.enabled():
+        return managed.has_sources(DATA)
+    google_token = _google_home_path_or_none('google_token.json')
+    return (_local_source_ready() or bool(google_token and Path(google_token).exists())
             or any(s.get('connected') and s.get('service') in managed.MANAGED_CONNECTOR_SOURCES
                    and not _connector_error(s['service'])
                    and (not s.get('expires_at') or s['expires_at'] >= time.time()
-                        or _connector_has_refresh(s['service']))
+                   or _connector_has_refresh(s['service']))
                    for s in CONNECTORS.service_status()))
 
 
@@ -2721,6 +3988,17 @@ def _background_context_tick() -> None:
                 _CONTEXT_LAST_STARTED = now - now % MEMORY_INTERVAL_SECONDS
                 return
             _CONTEXT_LAST_STARTED = now
+        # Inspect saved history only at the existing memory cadence, never on every poll.
+        with _CLAIM_LOCK:
+            composer = _find_sotto_script('_shared', 'scripts', 'compose_brief.py')
+            pack = Path(composer).parent.parent.parent if composer else None
+            onboarding.discovery_tick(DATA, lambda: has_sources and pack is not None
+                and (not managed.enabled() or managed.messaging_activated(DATA))
+                and _delivery_channel_ready(onboarding.DISCOVERY_LABEL)
+                and _history_discovery_delivery_ready({'label': onboarding.DISCOVERY_LABEL})
+                and not _scheduled_brief_work_active() and not onboarding.scheduled_inflight(DATA)
+                and onboarding.discovery_context(DATA, pack, _source_context().allowed) is not None,
+                lambda: _managed_brief('sotto-welcome-brief', onboarding.DISCOVERY_LABEL, retry_terminal=True))
     except Exception as error:  # a background failure cannot stop briefs or the scheduler
         print(f'[sotto] context learning: {type(error).__name__}', flush=True)
 
@@ -2729,6 +4007,14 @@ def _cron_tick() -> None:
     """One heartbeat: fire every receiver-run job whose slot has arrived and that hasn't fired in
     it. Best-effort per job — an unreadable schedule or a failed spawn is one log line."""
     import managed
+    _activation_tick()  # before this tick's first-brief delivery gate
+    if (_selected_fixed_profile() and _candidate_retained_route_digest() is None):
+        # Wait for the selected channel's current owner route before spending a slot.
+        return
+    try:
+        _owner_reminder_tick()
+    except Exception as error:
+        print(f'[sotto] owner reminder tick: {type(error).__name__}', flush=True)
     if managed.notice_pending(DATA):
         _deliver_text(managed.NOTICE_TEXT, managed.NOTICE_LABEL)
     _background_context_tick()
@@ -2736,11 +4022,8 @@ def _cron_tick() -> None:
         _prepare_briefs()
     except Exception as error:
         print(f'[sotto] brief preparation: {type(error).__name__}', flush=True)
-    reconciler = _cron_reconciler()
-    if reconciler is None:
-        return   # no adapter tree on this box; _sotto_cron_jobs has already said so
     today = _local_now().strftime("%Y-%m-%d")
-    for name, schedule, _prompt, _skill in _sotto_cron_jobs(reconciler.RECEIVER_RUNNER):
+    for name, schedule, _prompt, _skill in _sotto_cron_jobs():
         if (_fixed_daily_minute(schedule) is None and _fixed_weekly_minute(schedule) is None
                 and _interval_minutes(schedule) is None):
             if name not in _CRON_UNPARSED:
@@ -2752,6 +4035,17 @@ def _cron_tick() -> None:
         slot = _scheduled_slot(schedule)
         if slot is None or _CRON_FIRED.get(name) == slot:
             continue
+        if _selected_fixed_profile():
+            try:
+                prior_slot = WORK_QUEUE.fixed_slot(
+                    DATA, authority_digest=_fixed_schedule_authority(),
+                    name=name, wall_slot=slot)
+            except Exception as error:
+                print(f'[sotto] cron {name}: fixed authority {type(error).__name__}', flush=True)
+                continue
+            if prior_slot and prior_slot['last_work_status'] == 'skipped_unlinked':
+                _CRON_FIRED[name] = slot
+                continue
         # A restart inside the window forgets it fired; the durable marker remembers whether the
         # day DELIVERED. Composing a second brief the send seam would only supersede costs minutes
         # and real tokens for words nobody reads (Day-15 simulation, Sep 2026).
@@ -2775,6 +4069,15 @@ def _cron_tick() -> None:
         # stamped the moment a spawn starts.
         if not kind and not _delivery_channel_ready(f"cron:{name}"):
             if _interval_minutes(schedule) is not None:
+                if _selected_fixed_profile():
+                    try:
+                        WORK_QUEUE.skip_fixed_slot(
+                            DATA, authority_digest=_fixed_schedule_authority(),
+                            schedule_digest=_fixed_schedule_digest(),
+                            name=name, wall_slot=slot)
+                    except Exception as error:
+                        print(f'[sotto] cron {name}: skip evidence {type(error).__name__}', flush=True)
+                        continue
                 _CRON_FIRED[name] = slot
             continue
         try:
@@ -2819,16 +4122,14 @@ def _retention_tick() -> None:
         print(f"[sotto] retention: {err['path']}: {err['error']}", flush=True)
 
 
-def archive_gateway_sessions() -> int | None:
-    """Archive every Hermes chat session through sessions.py — the same call the boot path runs.
-    Returns how many were archived, or None when the sessions CLI isn't available here. The
-    hex/uuid regex that used to live here matched none of Hermes' real ids (`20260903_033026_65967d`)
-    and archived nothing, nightly and at boot alike (Sep 3, 2026)."""
-    return SESSIONS.archive_all()
+def rotate_chat_sessions() -> int | None:
+    """Rotate the chat runtime's sessions through its private loopback API. Returns how many were
+    reset, or None when the runtime's session interface is unavailable."""
+    return _runtime_adapter().archive_sessions()
 
 
 def _session_archive_tick() -> None:
-    """A gateway session lasts a day or a deploy, whichever comes first.
+    """A chat session lasts a day or a deploy, whichever comes first.
 
     Sessions used to reset on a clock; Aug 26 tied the reset to deploys instead, because the clock
     reset broadcast a "◐ Session automatically reset" banner nobody could silence. The cost showed
@@ -2838,10 +4139,9 @@ def _session_archive_tick() -> None:
     own (1/2)(2/2) split markers included (Sep 2, three times in one day). That is not a rule the
     model breaks; it is material sitting in context with the same authority as the rule.
 
-    So the day boundary comes back, done the way the boot already does it: `sessions archive` is
-    silent — no reset event fires, nothing is broadcast. It rides the nightly housekeeping slot
-    (retention.SWEEP_LOCAL) so the day's first message starts clean. A same-day copy is still
-    possible; a week-old one is not."""
+    So the day boundary comes back as a silent rotation — no reset event fires, nothing is
+    broadcast. It rides the nightly housekeeping slot (retention.SWEEP_LOCAL) so the day's first
+    message starts clean. A same-day copy is still possible; a week-old one is not."""
     today = _local_now().strftime("%Y-%m-%d")
     if _RETENTION_FIRED.get("sessions") == today:
         return
@@ -2851,16 +4151,16 @@ def _session_archive_tick() -> None:
     _RETENTION_FIRED["sessions"] = today
 
     def _run():
-        n = archive_gateway_sessions()
+        n = rotate_chat_sessions()
         if n is None:
-            print("[sotto] daily session archive: sessions CLI unavailable — the transcript keeps "
-                  "growing until the next deploy or /new", flush=True)
+            print("[sotto] daily session rotation: runtime session interface unavailable — the "
+                  "transcript keeps growing until the next deploy or /new", flush=True)
         else:
-            print(f"[sotto] daily session archive: {n} session(s) archived — the next message "
-                  "starts fresh (silently; /resume can reopen the transcript)", flush=True)
+            print(f"[sotto] daily session rotation: reset {n} chat session(s) — the next message "
+                  "starts fresh", flush=True)
 
-    # Its own thread: this is one external CLI call per session, 30 s each at worst, and the
-    # thread it would otherwise run on is the one that fires the briefs inside a 10-minute window.
+    # Its own thread: the loopback call can take up to 30 s, and the thread it would otherwise run
+    # on is the one that fires the briefs inside a 10-minute window.
     threading.Thread(target=_run, name="sotto-session-archive", daemon=True).start()
 
 
@@ -2876,7 +4176,7 @@ def start_cron_thread():
             except Exception as e:  # noqa: BLE001 — the heartbeat must never die
                 print(f"[sotto] cron tick error: {e}", flush=True)
             try:
-                _hermes_adapter('model_lease').tick(DATA)
+                _sotto_adapter('model_lease').tick(DATA)
             except Exception as error:
                 print(f'[sotto] model lease: {type(error).__name__}', flush=True)
             time.sleep(CRON_TICK_SECS)
@@ -2997,8 +4297,6 @@ def _dispatch_meeting_tap(event: dict) -> bool:
     return _dispatch_synthetic(event, "meeting tap")
 
 
-QR_FILE = os.path.join(DATA, "whatsapp-pairing.txt")
-
 # Shared <head> for every HTML page this receiver serves. The whole web surface is ONE product:
 # every page links the dashboard's stylesheet first (/static/app.css — the paper/ink/gold tokens,
 # Newsreader + JetBrains Mono) and then /static/setup.css (the Connections-surface layer, built
@@ -3006,53 +4304,6 @@ QR_FILE = os.path.join(DATA, "whatsapp-pairing.txt")
 # so /setup and its satellite pages read as views of the same site, never a second app. No inline
 # <style> blocks here: the styling contract lives entirely in those two files. (/favicon.ico still
 # answers 204 for clients that ignore the link.)
-_FAVICON = ("<link rel='icon' href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
-            "viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23221c12'/%3E%3Ctext "
-            "x='16' y='23' font-family='Georgia,serif' font-style='italic' font-size='20' "
-            "font-weight='600' fill='%2352b087' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E\">")
-
-
-def _page_head(title: str, head_extra: str = "", body_class: str = "") -> str:
-    cls = f" class='{body_class}'" if body_class else ""
-    return ("<!doctype html><html><head><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<meta name='color-scheme' content='light dark'>"
-            f"{_FAVICON}"
-            "<link rel='stylesheet' href='/static/app.css'>"
-            "<link rel='stylesheet' href='/static/setup.css'>"
-            f"{head_extra}<title>{title}</title></head><body{cls}>")
-
-
-def _nav() -> str:
-    """The shared site navigation — same destinations as the /app dashboard's own nav, with
-    Integrations (this surface) marked current. Rendered on /setup; the transient satellite pages
-    (QR, Google auth, connector results) use the narrow shell instead."""
-    return ("<header class='sidebar'><a class='wordmark' href='/app'>Sotto</a>"
-            "<nav class='nav'>"
-            "<a href='/app#today'>Today</a>"
-            "<a href='/app#cadence'>Cadence</a>"
-            "<a href='/app#loops'>Loops</a>"
-            "<a href='/app#briefs'>Briefs</a>"
-            "<a href='/app#people'>People</a>"
-            "<a href='/app#learned'>Learned</a>"
-            "<a href='/app#record'>Record</a>"
-            "<a href='/setup' class='active' aria-current='page'>Integrations</a>"
-            "</nav></header>")
-
-
-def _narrow_page(title: str, inner: str, head_extra: str = "", back_href: str = "/setup") -> str:
-    """Minimal shared shell for the transient setup satellites (WhatsApp QR, Google auth/exchange,
-    connector success/error): same fonts/palette via the two stylesheets, no sidebar, one quiet way
-    back to the wizard."""
-    return (_page_head(title, head_extra=head_extra)
-            + "<div class='site'><main class='content narrow'>"
-            + inner
-            + f"<p><a class='btn-quiet' href='{back_href}'>← Integrations</a></p>"
-            "</main></div></body></html>")
-
-
-GAUTH_FILE = os.path.join(DATA, "google-auth-url.txt")
-
 # Public Railway domain (set by the platform). Used to build the one-click pairing link for the Mac app.
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 
@@ -3089,28 +4340,20 @@ def connect_redirect_uri() -> str:
 CONNECT_START_RE = re.compile(r"\A/connect/([A-Za-z0-9_-]{1,64})/start\Z")
 
 
-def _connect_page(heading: str, body_html: str) -> str:
-    return _narrow_page(
-        "Sotto — connect a service",
-        f"<section class='tile'><div class='tile-head'><h2 class='tile-title'>{heading}</h2></div>"
-        f"<div class='tile-body'>{body_html}</div></section>")
-
-
-def _connect_error_page(step: str, detail: str) -> str:
-    """Every connector failure page NAMES the failing step (discovery / registration (DCR) / state /
-    exchange / …) and quotes the truncated upstream error — the first click IS the validation, so
-    the page has to say exactly which leg of the flow broke."""
-    import html as _html
-    return _connect_page(
-        "Connection failed",
-        f"<p>Step that failed: <b>{_html.escape(step)}</b>"
-        f"{' (DCR)' if step == 'registration' else ''}</p>"
-        f"<p class='tile-hint'>{_html.escape(detail)}</p>")
-
-
 def _google_setup_py():
     import managed
-    return _hermes_adapter('runtime_api').google_setup_path(managed=managed.enabled())
+    return _runtime_adapter().google_setup_path(managed=managed.enabled())
+
+
+def _cloud_google_adapter():
+    """Load the same packaged credential writer used by /cloud/bootstrap."""
+    adapter_path = _google_setup_py()
+    if not adapter_path:
+        return None
+    spec = importlib.util.spec_from_file_location('cloud_google_adapter', adapter_path)
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    return adapter
 
 
 # Memoized google_connected(): every /setup GET otherwise forks a `setup.py --check` subprocess
@@ -3118,6 +4361,8 @@ def _google_setup_py():
 # live exchange so "Connected ✓" shows immediately.
 _GOOGLE_CHECK_TTL_SECS = 20.0
 _GOOGLE_CHECK_CACHE = (0.0, None)   # (monotonic ts, (ok, msg))
+_NATIVE_GOOGLE_CHECK_LOCK = threading.Lock()
+_GOOGLE_HOME_UNAVAILABLE = "Google credential home is unavailable. Configure SOTTO_HOME before connecting."
 
 
 def google_connected() -> tuple[bool, str]:
@@ -3126,6 +4371,9 @@ def google_connected() -> tuple[bool, str]:
     source of truth for 'why is Gmail/Calendar missing from my brief'. Never raises. Memoized for
     _GOOGLE_CHECK_TTL_SECS (the check forks a subprocess)."""
     global _GOOGLE_CHECK_CACHE
+    if _google_home_path_or_none('google_client_secret.json') is None:
+        _GOOGLE_CHECK_CACHE = (0.0, None)
+        return False, _GOOGLE_HOME_UNAVAILABLE
     ts, cached = _GOOGLE_CHECK_CACHE
     if cached is not None and (time.monotonic() - ts) < _GOOGLE_CHECK_TTL_SECS:
         return cached
@@ -3134,15 +4382,54 @@ def google_connected() -> tuple[bool, str]:
     return result
 
 
-def _google_connected_uncached() -> tuple[bool, str]:
+
+def native_google_connected() -> tuple[bool, str]:
+    """Bound optional OAuth work inside native readiness; concurrent polls never wait.
+
+    Reuse the setup cache, but do not inherit its 30-second interactive check. No
+    worker threads are spawned: one request checks for at most three seconds,
+    while overlapping requests can still report core model/channel readiness.
+    """
+    global _GOOGLE_CHECK_CACHE
+    if _google_home_path_or_none('google_client_secret.json') is None:
+        _GOOGLE_CHECK_CACHE = (0.0, None)
+        return False, _GOOGLE_HOME_UNAVAILABLE
+    ts, cached = _GOOGLE_CHECK_CACHE
+    if cached is not None and time.monotonic() - ts < _GOOGLE_CHECK_TTL_SECS:
+        return cached
+    if not _NATIVE_GOOGLE_CHECK_LOCK.acquire(blocking=False):
+        return False, "Google connection check is in progress."
+    try:
+        ts, cached = _GOOGLE_CHECK_CACHE
+        if cached is not None and time.monotonic() - ts < _GOOGLE_CHECK_TTL_SECS:
+            return cached
+        result = _google_connected_uncached(timeout=3)
+        _GOOGLE_CHECK_CACHE = (time.monotonic(), result)
+        return result
+    finally:
+        _NATIVE_GOOGLE_CHECK_LOCK.release()
+
+
+def _google_home_path_or_none(name: str) -> str | None:
+    """Selected Sotto never substitutes the process home for a missing credential root."""
+    try:
+        return _runtime_adapter().home_path(name)
+    except ValueError:
+        return None
+
+
+def _google_connected_uncached(*, timeout: float = 30) -> tuple[bool, str]:
     setup = _google_setup_py()
     if not setup:
         return False, "google-workspace skill not found in this image."
-    if not os.path.exists(_hermes_adapter('runtime_api').home_path('google_client_secret.json')):
+    secret = _google_home_path_or_none('google_client_secret.json')
+    if secret is None:
+        return False, _GOOGLE_HOME_UNAVAILABLE
+    if not os.path.exists(secret):
         return False, "no OAuth client — set GOOGLE_OAUTH_CLIENT_JSON in Railway, then authorize at /google/auth."
     py = shutil.which("python") or shutil.which("python3") or "python3"
     try:
-        r = subprocess.run([py, setup, "--check"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([py, setup, "--check"], capture_output=True, text=True, timeout=timeout)
     except Exception as e:  # noqa: BLE001
         return False, f"check failed to run: {e}"
     if r.returncode == 0:
@@ -3150,8 +4437,18 @@ def _google_connected_uncached() -> tuple[bool, str]:
     return False, "not connected — authorize at /google/auth (no redeploy needed)."
 
 
+def _read_prep_offer_calendar(operation, arguments):
+    path = _google_api_py()
+    if not path:
+        raise RuntimeError('Calendar reader unavailable')
+    spec = importlib.util.spec_from_file_location('sotto_prep_offer_calendar_read', path)
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    return api.read_owner(operation, arguments)
+
+
 def _google_api_py():
-    return _hermes_adapter('runtime_api').google_api_path()
+    return _runtime_adapter().google_api_path()
 
 
 _EMAIL_RE = re.compile(r"[^\s<>@,;\"]+@[^\s<>@,;\"]+\.[^\s<>@,;\".]+")
@@ -3164,6 +4461,8 @@ def _derive_google_account_email() -> str:
     it. Tolerates the same From variants normalize_email does ("Name <addr>", a bare addr, a
     {name,email} object). Returns "" on ANY failure and never raises — this is a nicety layered on
     SOTTO_USER_EMAIL, never a reason to fail a connect."""
+    if _google_home_path_or_none('google_token.json') is None:
+        return ''
     api = _google_api_py()
     if not api:
         return ""
@@ -3247,7 +4546,9 @@ def exchange_google_code(code: str, browser_binding: str = "") -> tuple[bool, st
     setup = _google_setup_py()
     if not setup:
         return False, "Google setup tool not found in this image (is the google-workspace skill installed?)."
-    secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+    secret = _google_home_path_or_none('google_client_secret.json')
+    if secret is None:
+        return False, _GOOGLE_HOME_UNAVAILABLE
     if not os.path.exists(secret):
         return False, "Google client not set up yet — set GOOGLE_OAUTH_CLIENT_JSON in Railway and redeploy, then authorize."
     py = shutil.which("python") or shutil.which("python3") or "python3"
@@ -3258,17 +4559,19 @@ def exchange_google_code(code: str, browser_binding: str = "") -> tuple[bool, st
     except Exception:  # noqa: BLE001
         return False, "Google could not finish connecting. Please try again."
     if r.returncode == 0:
-        try:
-            os.remove(GAUTH_FILE)
-        except OSError:
-            pass
         global _GOOGLE_CHECK_CACHE
         _GOOGLE_CHECK_CACHE = (0.0, None)   # drop the memo so /setup flips to Connected right away
         # The connect moment IS when Sotto learns who you are (ROADMAP: "don't we already have email
         # with Gmail auth?"). Best-effort, never blocks the success this function just earned.
         capture_google_account_email()
         if managed.enabled():
-            token = json.loads(Path(_hermes_adapter('runtime_api').home_path('google_token.json')).read_text())
+            token_path = _google_home_path_or_none('google_token.json')
+            if token_path is None:
+                return False, _GOOGLE_HOME_UNAVAILABLE
+            try:
+                token = json.loads(Path(token_path).read_text())
+            except (OSError, ValueError, TypeError):
+                return False, "Google connection could not be verified. Please try again."
             managed.record_google_consent(DATA, token.get("scopes", []))
         return True, "Connected ✓"
     return False, "Google could not finish connecting. Please try again."
@@ -3283,6 +4586,30 @@ def read_settings() -> dict:
             return json.load(f) or {}
     except (OSError, json.JSONDecodeError, ValueError):
         return {}
+
+
+def _google_calendar_settings(value=None):
+    """Authenticated dashboard callers edit only read selection, under current Google consent."""
+    import google_source_authority
+    import managed
+    library = _load_shared_lib('google_calendar_read')
+    mode = managed.enabled()
+    def current():
+        return google_source_authority.state(DATA, _runtime_adapter().home_path('google_token.json'),
+            managed_mode=mode, tenant=os.environ.get('SOTTO_TENANT_ID', ''),
+            managed_ledger=managed.source_authority_state(DATA) if mode else None)
+    before = current()
+    if before is None or 'calendar' not in before['sources']:
+        raise ValueError('Connect Google Calendar before changing calendar selection')
+    if value is not None:
+        selected = library.validate_selection(value)
+        if current() != before:
+            raise ValueError('Google consent changed')
+        write_setting('google_calendar_selection', {**selected, 'generation': before['generation']})
+    try:
+        return {**library.selection(DATA, generation=before['generation']), 'needs_reselection': False}
+    except ValueError:
+        return {'mode': 'selected', 'calendar_ids': [], 'needs_reselection': True}
 
 
 def write_setting(key: str, value) -> None:
@@ -3303,15 +4630,20 @@ def _configured_tz_name() -> str:
     return TZCHAIN.configured_tz_name(os.path.dirname(os.path.dirname(SETTINGS_FILE)))
 
 
+def _configured_tz_source() -> tuple[str, str]:
+    """(zone, source) from the one timezone chain; an env source fixes the zone for this launch."""
+    return TZCHAIN.configured_tz_source(os.path.dirname(os.path.dirname(SETTINGS_FILE)))
+
+
 def _crons_file() -> str:
-    """adapters/hermes/crons.json — the container copy first (/app/adapters/hermes/, where the
+    """adapters/sotto/crons.json — the container copy first (/app/adapters/sotto/, where the
     Dockerfile puts it), then the repo-relative source tree (tests / source checkouts)."""
     override = (os.environ.get("SOTTO_CRONS_JSON") or "").strip()
     if override:
         return override
-    for p in ("/app/adapters/hermes/crons.json",
+    for p in ("/app/adapters/sotto/crons.json",
               os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                           "adapters", "hermes", "crons.json")):
+                           "adapters", "sotto", "crons.json")):
         if os.path.exists(p):
             return p
     return ""
@@ -3320,71 +4652,41 @@ def _crons_file() -> str:
 USER_ROUTINE_PREFIX = "user-"   # personal routines (sotto-routines skill) — never a SYSTEM job
 
 
-def _cron_reconciler():
-    """Load the one boot/timezone cron reconciler from the adapter tree."""
-    for path in ("/app/adapters/hermes/reconcile_crons.py",
-                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                              "adapters", "hermes", "reconcile_crons.py")):
-        if not os.path.exists(path):
-            continue
-        spec = importlib.util.spec_from_file_location("sotto_reconcile_crons", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    return None
+def _sotto_cron_jobs() -> list:
+    """The enabled system jobs as (name, schedule, prompt, skill), read straight from
+    adapters/sotto/crons.json — the ONE schedule this process fires on its own clock, so no second
+    copy can drift. A row's `gate` env key turns it off unless it reads "1" (default on), and its
+    `schedule_env` key, when set, replaces the schedule. Empty list when the file is missing or
+    unreadable.
 
-
-def _sotto_cron_jobs(runner: str | None = None) -> list:
-    """The sotto cron jobs, as (name, schedule, prompt, skill). Read straight from
-    adapters/hermes/crons.json — the ONE source every registrar shares, so a re-registration here
-    lands exactly the jobs the next boot's dedup recognizes. Honors the same `gate` / `schedule_env`
-    env keys start.sh does. Empty list when the file is missing or unreadable (a boot registration
-    then simply stands until the next redeploy).
-
-    `runner` narrows the list the way the reconciler does: None = every job (the run-now list, the
-    brief-cron window), RECEIVER_RUNNER = the jobs this process fires on its own clock.
-
-    THE USER-ROUTINE FENCE, enforced at the one place every consumer reads (the timezone
-    re-registration below, and /brief's run-now job list): a `user-`-prefixed name is a PERSONAL
-    routine created by the `sotto-routines` skill and is never a system job — it is dropped here, so
-    no consumer of this function can remove, recreate or fire one. crons.json should never contain
-    such a name; this is the belt to start.sh's braces (same fence, same prefix)."""
+    THE USER-ROUTINE FENCE, enforced at the one place every consumer reads (the tick, the
+    dashboard's run-now list): a `user-`-prefixed name is a PERSONAL routine and is never a system
+    job — it is dropped here, so no consumer of this function can fire one as a system job.
+    crons.json should never contain such a name."""
     path = _crons_file()
-    reconciler = _cron_reconciler()
-    if reconciler is None:
-        print("[sotto] cron reconciler not found", flush=True)
-        return []
     try:
-        return reconciler.active_jobs(path, runner)
-    except (OSError, json.JSONDecodeError, ValueError) as e:
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            raise ValueError("cron spec must be a JSON array")
+        jobs = []
+        for row in rows:
+            name = str(row.get("name") or "") if isinstance(row, dict) else ""
+            if not name or name.startswith(USER_ROUTINE_PREFIX):
+                continue
+            gate = row.get("gate")
+            if gate and os.environ.get(str(gate), "1") != "1":
+                continue
+            schedule = os.environ.get(str(row.get("schedule_env") or ""), "") or row["schedule"]
+            jobs.append((name, schedule, row["prompt"], row["skill"]))
+        return jobs
+    except (OSError, json.JSONDecodeError, ValueError, KeyError) as e:
         print(f"[sotto] cron spec unreadable ({path or 'not found'}): {e}", flush=True)
         return []
 
 
 def _personal_routines() -> list[dict]:
-    return _hermes_adapter('runtime_api').personal_routines(run=subprocess.run)
-
-
-def _reregister_sotto_crons(tz: str) -> None:
-    """Root fix for first-night UTC briefs: start.sh registers the crons at BOOT under the boot-time
-    zone (UTC on a fresh deploy — the wizard hasn't run yet), and Hermes cron captures the zone at
-    creation, so without this the 6:30/17:30 briefs fire in UTC until the next redeploy. Called after
-    `hermes config set timezone` succeeded with a CHANGED zone: remove each job by its stable --name
-    and recreate it with the exact schedule/skill/deliver start.sh uses, now under the user's zone.
-    Best-effort throughout (mirrors start.sh's `|| true` posture): any failure leaves the boot
-    registration standing, and the next boot's dedup+recreate self-heals. Never raises.
-
-    SYSTEM JOBS ONLY: this walks _sotto_cron_jobs() by exact `--name`, and that function drops every
-    `user-` name, so a personal routine is never removed or recreated here. Honest v1 limitation
-    (stated in the sotto-routines skill): a personal routine therefore keeps the zone it was created
-    under until the user recreates it — a timezone change moves Sotto's five jobs, not theirs."""
-    reconciler = _cron_reconciler()
-    if reconciler is None:
-        print("[sotto] cron reconciler not found; timezone cron refresh skipped", flush=True)
-        return
-    ok = reconciler.reconcile(_crons_file(), _deliver_target())
-    state = "re-registered" if ok else "could not re-register"
-    print(f"[sotto] {state} sotto crons for timezone {tz}", flush=True)
+    return _runtime_adapter().personal_routines()
 
 
 def set_timezone(tz: str) -> tuple[bool, str]:
@@ -3393,11 +4695,10 @@ def set_timezone(tz: str) -> tuple[bool, str]:
 
 
 def _set_timezone_locked(tz: str) -> tuple[bool, str]:
-    """Persist the browser-detected IANA zone to the volume so compose_brief/brief_marker pick it up
-    (the Railway SOTTO_TIMEZONE var becomes OPTIONAL — this kills the UTC-briefs footgun). Also nudge
-    the host's cron/system-prompt zone live, and — when that lands AND the zone actually changed —
-    re-register the sotto crons so the very first night's briefs fire at the local 6:30/17:30 instead
-    of UTC (see _reregister_sotto_crons). Never raises."""
+    """Persist an IANA zone unless the launch already fixes a different zone.
+
+    The receiver's tick reads the zone every minute; no schedule re-registration is needed.
+    """
     tz = (tz or "").strip()
     if not tz or ("/" not in tz and tz not in ("UTC", "GMT")) or not _IANA_RE.match(tz):
         return False, "That doesn't look like an IANA timezone (e.g. America/Los_Angeles)."
@@ -3405,20 +4706,13 @@ def _set_timezone_locked(tz: str) -> tuple[bool, str]:
         ZoneInfo(tz)
     except (ZoneInfoNotFoundError, ValueError):
         return False, "That doesn't look like an IANA timezone (e.g. America/Los_Angeles)."
-    # The zone the boot-time cron registration ran under (start.sh: SOTTO_TIMEZONE env, else the
-    # wizard zone persisted by a PREVIOUS boot, else UTC) — read BEFORE persisting the new one.
+    fixed, source = _configured_tz_source()
+    if source.startswith('env:') and tz != fixed:
+        return False, "Timezone is fixed by this installation's configuration."
+    # The zone in effect so far (SOTTO_TIMEZONE env, else the wizard zone persisted earlier, else
+    # UTC) — read BEFORE persisting the new one.
     prev = _configured_tz_name() or "UTC"
     write_setting("timezone", tz)
-    # Best-effort: align the host agent's clock/cron tz too. Harmless if the CLI/flag differs.
-    cfg_ok = False
-    try:
-        cfg_ok = _hermes_adapter('runtime_api').set_timezone(tz, run=subprocess.run)
-    except Exception:  # noqa: BLE001
-        pass
-    # Only re-register when the live config set SUCCEEDED (a recreate under the old config zone
-    # would change nothing) and the zone differs from what boot registered under (no-op otherwise).
-    if cfg_ok and tz != prev:
-        _reregister_sotto_crons(tz)
     if tz != prev:
         # The receiver's own fired-today stamps are keyed by the LOCAL date, and the zone just
         # moved. A deploy at 22:00 PDT fired the 06:30 brief at 06:30 UTC (23:30 PDT) and stamped
@@ -3483,14 +4777,17 @@ def setup_google_client(client_json: str) -> tuple[bool, str]:
                        if isinstance(exc, json.JSONDecodeError) else str(exc))
     if not _google_setup_py():
         return False, "Google setup tool not found in this image."
+    secret = _google_home_path_or_none('google_client_secret.json')
+    pending = [_google_home_path_or_none(name) for name in (
+        'google_oauth_pending.json', 'google_oauth_last_url.txt')]
+    if secret is None or any(path is None for path in pending):
+        return False, _GOOGLE_HOME_UNAVAILABLE
     try:
         with _GOOGLE_FLOW_LOCK:
-            secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
             CONNECTORS.write_json(secret, obj, mode=0o600)
             # A client change invalidates consent in flight, never an existing grant.
-            for name in ('google_oauth_pending.json', 'google_oauth_last_url.txt'):
-                Path(_hermes_adapter('runtime_api').home_path(name)).unlink(missing_ok=True)
-            Path(GAUTH_FILE).unlink(missing_ok=True)
+            for path in pending:
+                Path(path).unlink(missing_ok=True)
     except OSError:
         return False, "Your client could not be saved. Please try again."
     return True, "Client saved — now connect Google below."
@@ -3499,7 +4796,9 @@ def setup_google_client(client_json: str) -> tuple[bool, str]:
 def start_google_authorization(browser_binding: str) -> str:
     """Return this browser's unexpired consent URL, else a fresh one, without logging it."""
     with _GOOGLE_FLOW_LOCK:
-        secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+        secret = _google_home_path_or_none('google_client_secret.json')
+        if secret is None:
+            raise ValueError(_GOOGLE_HOME_UNAVAILABLE)
         redirect = _validate_google_web_client(json.loads(Path(secret).read_text()))
         setup = _google_setup_py()
         if not setup:
@@ -3511,14 +4810,17 @@ def start_google_authorization(browser_binding: str) -> str:
                            capture_output=True, text=True, timeout=60)
         if r.returncode:
             raise ValueError("Google sign-in could not start. Please try again.")
-        url = Path(_hermes_adapter('runtime_api').home_path('google_oauth_last_url.txt')).read_text().strip()
+        url_path = _google_home_path_or_none('google_oauth_last_url.txt')
+        if url_path is None:
+            raise ValueError(_GOOGLE_HOME_UNAVAILABLE)
+        url = Path(url_path).read_text().strip()
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != 'https' or parsed.netloc != 'accounts.google.com':
             raise ValueError("Google sign-in could not start. Please try again.")
         return url
 
 
-def _google_client_form(qs: str = "") -> str:
+def _google_client_form(qs: str = "", csrf: str = "") -> str:
     import html
     try:
         redirect = google_redirect_uri()
@@ -3532,23 +4834,24 @@ def _google_client_form(qs: str = "") -> str:
         f"<li>Add this <b>Authorized redirect URI</b>: <code>{html.escape(redirect)}</code></li>"
         "<li>Choose Download JSON and paste the file below.</li></ol>"
         f"<form action='/setup/google-client{qs}' method='post'>"
+        f"<input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'>"
         "<textarea name='client_json' rows='4' class='field' aria-label='Google client JSON' "
         "placeholder='{&quot;web&quot;:{...}}'></textarea>"
         "<p><button class='btn-primary'>Save client</button></p></form>")
 
 
-def _google_replace_client(qs: str = "", expanded: bool = False) -> str:
+def _google_replace_client(qs: str = "", expanded: bool = False, csrf: str = "") -> str:
     """The saved client can be structurally valid yet unusable (rotated or deleted secret, another
     project, unregistered callback). Replacing it clears only consent in flight, never a grant."""
     return (f"<details{' open' if expanded else ''}><summary>Use a different Google client</summary>"
             "<p class='tile-hint'>Use this if the saved client's secret was rotated or deleted, it belongs "
             "to another Google Cloud project, or this page's redirect URI isn't registered on it. Any "
             "existing Google connection keeps working until the new client connects.</p>"
-            + _google_client_form(qs) + "</details>")
+            + _google_client_form(qs, csrf) + "</details>")
 
 
 def _google_authorization_page(qs: str = "", csrf: str = "", reconnect: bool = False,
-                               replace_client: bool = False) -> str:
+                               replace_client: bool = False, setup_csrf: str = "") -> str:
     import html
     if google_connected()[0] and not (reconnect or replace_client):
         body = ("<p>Gmail and Calendar are connected. You can return to Sotto.</p>"
@@ -3557,32 +4860,19 @@ def _google_authorization_page(qs: str = "", csrf: str = "", reconnect: bool = F
     else:
         title = "Connect Google to Sotto"
         try:
-            secret = _hermes_adapter('runtime_api').home_path('google_client_secret.json')
+            secret = _runtime_adapter().home_path('google_client_secret.json')
             _validate_google_web_client(json.loads(Path(secret).read_text()))
             body = ("<p>Choose your Google account and allow Gmail and Calendar access. "
                     "Google will bring you back here automatically.</p>"
                     f"<form action='/google/start{qs}' method='post'>"
                     f"<input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'>"
                     "<button class='btn-primary'>Continue with Google</button></form>"
-                    + _google_replace_client(qs, replace_client))
+                    + _google_replace_client(qs, replace_client, setup_csrf))
         except (OSError, ValueError, TypeError):
             body = ("<p>Finish the one-time Google client setup below. If you previously used a Desktop "
                     "client, choose Web application instead so sign-in returns directly to Sotto.</p>"
-                    + _google_client_form(qs))
-    return _narrow_page(title, f"<section class='tile'><div class='tile-head'>"
-                       f"<h2 class='tile-title'>{html.escape(title)}</h2></div>"
-                       f"<div class='tile-body'>{body}</div></section>", back_href=f"/setup{qs}")
-
-
-def _humanize_ago(secs: float) -> str:
-    m = int(secs // 60)
-    if m < 1:
-        return "just now"
-    if m < 60:
-        return f"{m} min ago"
-    if m < 24 * 60:
-        return f"{m // 60} h ago"
-    return f"{m // (24 * 60)} d ago"
+                    + _google_client_form(qs, setup_csrf))
+    return _narrow_page(title, _plain_tile(html.escape(title), body), back_href=f"/setup{qs}")
 
 
 def _connector_error(service: str):
@@ -3607,15 +4897,10 @@ def _connector_has_refresh(service: str) -> bool:
         return True
 
 
-def _wa_creds_paths() -> list:
-    """Use the adapter's volume-first session lookup, including the local home fallback."""
-    return _hermes_adapter('runtime_api').whatsapp_credentials_paths(DATA)
-
-
 def _telegram_link(token: str = "") -> dict:
     """What telegram_link.py captured on this volume FOR THIS BOT TOKEN: {"user_id", "bot"} or {}.
-    That file is the ONE record of the Telegram handshake — start.sh writes it at boot and forwards
-    the id to Hermes; this is a read of the same fact, never a second capture.
+    That file is the ONE record of the Telegram handshake; this is a read of the same fact, never a
+    second capture.
 
     The token binding is the point: a rotated bot must RE-LINK, and a record captured by the old one
     is not evidence that the new one can reach anybody (external review, Sep 1 — a stale record read
@@ -3636,19 +4921,17 @@ def _telegram_link(token: str = "") -> dict:
 
 
 def _telegram_bot_token() -> str:
-    """The configured token, including a local gateway's persisted configuration."""
-    return _hermes_adapter('runtime_api').telegram_bot_token()
+    """The bot token bound to this volume's captured owner link (see the runtime adapter)."""
+    return _runtime_adapter().telegram_bot_token()
 
 
 def _telegram_status() -> str:
     """Telegram linked-state, and a bot token is the price of admission to any of it: "linked" when
     a token is configured AND you named the recipient yourself (TELEGRAM_ALLOWED_USERS) or this
     volume holds a capture BY THAT SAME TOKEN; "pairing" while a token is set
-    and no such capture exists; "unknown" when this process can see no token at all — which is also
-    how a gateway configured outside our env (a local `hermes gateway setup`) reads, and why unknown
-    never gates delivery. A capture by a previous token is not a link: rotating the bot means
-    re-linking, and reading the stale record as linked is what let a gateway start and swallow the
-    next pairing message."""
+    and no such capture exists; "unknown" when this process can see no token at all. A capture by a
+    previous token is not a link: rotating the bot means re-linking, and reading the stale record as
+    linked is what let a gateway start and swallow the next pairing message."""
     token = _telegram_bot_token()
     if not token:
         # A recipient with no bot is half a configuration that delivers nothing (external review,
@@ -3661,10 +4944,8 @@ def _telegram_status() -> str:
 
 def _channel_status(channel: str | None = None) -> str:
     """The ACTIVE delivery channel's link state — "linked" | "pairing" | "unknown" — from the one
-    probe that channel has. A channel with no probe (local, BlueBubbles, Discord…) is "unknown"."""
+    probe that channel has. Sotto delivers only to Photon and Telegram; any other name is "unknown"."""
     channel = channel or _deliver_target()
-    if channel == "whatsapp":
-        return _whatsapp_status()
     if channel == "telegram":
         return _telegram_status()
     if channel == "photon":
@@ -3674,7 +4955,7 @@ def _channel_status(channel: str | None = None) -> str:
 
 def _photon_status() -> str:
     """Configuration is pairing; only an authenticated owner DM is linked."""
-    photon = _hermes_adapter('sotto_photon')
+    photon = _sotto_adapter('photon_owner')
     owner = (os.environ.get('PHOTON_HOME_CHANNEL') or '').strip()
     allowed = (os.environ.get('PHOTON_ALLOWED_USERS') or '').strip()
     managed_mode = os.environ.get('SOTTO_DEPLOYMENT_MODE') == 'managed'
@@ -3688,38 +4969,45 @@ def _photon_status() -> str:
     try:
         with open(os.path.join(DATA, 'config/photon-activation.json'), encoding='utf-8') as stream:
             receipt = json.load(stream)
-    except FileNotFoundError:
-        if not managed_mode:
-            # Self-host Photon installs made before owner receipts existed never wrote one.
-            # An accepted brief already proves this channel delivers; do not hold its nudges.
-            import onboarding
-            if onboarding.status(DATA) in ('existing', 'delivered'):
-                return 'linked'
-        return 'pairing'
     except (OSError, ValueError):
         return 'pairing'
     return ('linked' if isinstance(receipt, dict) and receipt.get('activated') is True
             and receipt.get('owner') == owner
             and receipt.get('tenant_id') == os.environ.get('SOTTO_TENANT_ID', '')
             and isinstance(receipt.get('chat_id'), str) and receipt['chat_id']
-            and (receipt.get('project_fingerprint') == fingerprint
-                 or (managed_mode and 'project_fingerprint' not in receipt))
+            and receipt.get('project_fingerprint') == fingerprint
             else 'pairing')
 
 
-def _whatsapp_status() -> str:
-    """WhatsApp linked-state, honestly scoped: "linked" means session creds exist on disk, i.e. this
-    volume was EVER linked — NOT that the gateway is up and the channel is currently deliverable
-    (creds.json survives a revoked device, a dead gateway and an unpaired phone). It is a positive
-    on-disk probe, which is enough for the tile and the completion gate to stop celebrating over a
-    never-scanned channel; a real liveness probe is a separate piece of work (ROADMAP, batch-later).
-    Else a live QR mirror file → "pairing" (mid-flight); else "unknown" (never linked on this
-    volume). creds win over a lingering QR file: the mirror is removed by wa_pair.py within seconds
-    of the scan, and start.sh itself treats creds-present as paired while pairing is still open."""
-    for p in _wa_creds_paths():
-        if os.path.exists(p):
-            return "linked"
-    return "pairing" if os.path.exists(QR_FILE) else "unknown"
+def _activation_tick() -> None:
+    """Pull durable owner-DM proof; the existing Photon adapter remains the only writer."""
+    if (os.environ.get('SOTTO_CRON_DELIVER') or '').strip() != 'photon':
+        return
+    try:
+        photon = _sotto_adapter('photon_owner')
+        owner = (os.environ.get('PHOTON_HOME_CHANNEL') or '').strip()
+        tenant = os.environ.get('SOTTO_TENANT_ID', '')
+        managed_mode = os.environ.get('SOTTO_DEPLOYMENT_MODE') == 'managed'
+        project = os.environ.get('PHOTON_PROJECT_ID', '')
+        if ((managed_mode and (not owner or not tenant))
+                or (not managed_mode and not re.fullmatch(r'\+[1-9][0-9]{7,14}', owner))
+                or os.environ.get('PHOTON_ALLOWED_USERS') != owner
+                or not photon.restricted_allowlist()
+                or not project or not os.environ.get('PHOTON_PROJECT_SECRET')):
+            return
+        fingerprint = photon.project_fingerprint(project)
+        if not fingerprint:
+            return
+        runtime = _runtime_adapter()
+        pending = runtime.activation_evidence(timeout=3)
+        if pending is None:
+            return
+        RUNTIME_ACTIVATION.consume(
+            pending, tenant_id=tenant, owner_id=owner,
+            project_fingerprint=fingerprint, writer=photon.record_owner_activation,
+            ack=lambda event_id: runtime.activation_ack(event_id, timeout=3))
+    except Exception as error:  # next tick retries; no identity or bearer in logs
+        print(f'[sotto] Photon activation retry: {type(error).__name__}', flush=True)
 
 
 # ── "Is this server out of date?" (a flag, never an update pipe) ─────────────────────────────────
@@ -3747,7 +5035,6 @@ UPDATE_CHECK_SECS = 24 * 3600               # at most one GitHub GET per day, bo
 UPDATE_NOTICE_STALE_SECS = 48 * 3600        # two missed daily checks and the /app banner goes quiet
 UPDATE_FETCH_TIMEOUT = 5                    # seconds; a slow GitHub must not hold a thread open
 UPDATE_CACHE_FILENAME = "update_check.json"
-HERMES_VERSION_FILENAME = "hermes-version.json"   # written by start.sh on every boot
 
 
 def _cache_file(name: str) -> str:
@@ -3856,23 +5143,6 @@ def update_notice() -> dict:
             "url": UPDATE_DOC_URL}
 
 
-def hermes_versions() -> dict:
-    """{running, image} exactly as start.sh's boot line reports them — it writes the pair to the
-    cache on every boot. Empty strings when the file isn't there (a run without start.sh)."""
-    out = {"running": "", "image": ""}
-    try:
-        with open(_cache_file(HERMES_VERSION_FILENAME), encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return out
-    if isinstance(raw, dict):
-        for k in out:
-            v = raw.get(k)
-            if isinstance(v, str):
-                out[k] = v.strip()
-    return out
-
-
 def start_update_check_thread():
     """Daily "is a newer Sotto published?" check — same daemon-thread pattern as the Gmail poll and
     the release valve. An unstamped (dev) build never starts it, so a dev box makes no outbound
@@ -3896,7 +5166,8 @@ def start_update_check_thread():
 def setup_status() -> dict:
     import onboarding
     gok, gmsg = google_connected()
-    client_present = os.path.exists(_hermes_adapter('runtime_api').home_path('google_client_secret.json'))
+    client_path = _google_home_path_or_none('google_client_secret.json')
+    client_present = bool(client_path and os.path.exists(client_path))
     tz = _configured_tz_name()   # tzchain: SOTTO_TIMEZONE → TZ → settings.json (→ UTC)
     return {
         "bridge_connected": RELAY.bridge_connected(),
@@ -3908,30 +5179,33 @@ def setup_status() -> dict:
         "google_client_present": client_present,
         "timezone": tz,
         # The channel Sotto delivers to and ITS link state — the wizard, the dashboard and the
-        # completion gate all read these. `whatsapp` stays beside them because the WhatsApp tile and
-        # the QR page are about WhatsApp whatever the active channel is.
+        # completion gate all read these.
         "channel": _deliver_target(),
         "channel_status": _channel_status(),
-        "whatsapp": _whatsapp_status(),
         "connectors": CONNECTORS.service_status(),
         "last_event_at": _last_event_at(),
         "update": update_status(),
-        "hermes": hermes_versions(),
     }
 
 
-def _tile(num: int, title: str, state: str, body: str) -> str:
-    """One wizard tile in the shared markup contract (styled by /static/setup.css): data-state is
-    done|todo|optional; the visible state label spells 'to do' out."""
-    label = {"done": "done", "todo": "to do", "optional": "optional"}[state]
-    return (f"<section class='tile' data-state='{state}'>"
-            f"<div class='tile-head'><span class='tile-num'>{num}</span>"
-            f"<h2 class='tile-title'>{title}</h2>"
-            f"<span class='tile-state'>{label}</span></div>"
-            f"<div class='tile-body'>{body}</div></section>")
+def selfhost_bridge_status() -> dict:
+    """Native setup projection: current channel proof, no secret-bearing setup HTML."""
+    import onboarding
+    import selfhost_status
+    runtime = _runtime_adapter().selfhost_provisioning_status()
+    channel = runtime['channel']
+    google_ok, _detail = native_google_connected()
+    bot = (_telegram_link(_telegram_bot_token()).get('bot', '')
+           if channel == 'telegram' else '')
+    return selfhost_status.response(
+        runtime=runtime, google_connected=google_ok,
+        context_connected=_context_sources_ready(),
+        messaging_active=_channel_status(channel) == 'linked',
+        first_brief=onboarding.status(DATA),
+        number=os.environ.get('SOTTO_IMESSAGE_NUMBER', ''), telegram_bot=bot)
 
 
-def _setup_page(code: str = "") -> str:
+def _setup_page(code: str = "", csrf: str = "") -> str:
     """The Connections view of the site — same shell/nav as the /app dashboard, so the bookmarked
     /setup entry point IS the product. Renders live status for each step (Mac · Google · your
     delivery channel · Timezone) and only the next action you need — no jumping between four URLs or
@@ -3939,11 +5213,12 @@ def _setup_page(code: str = "") -> str:
     Railway vars and zero redeploys. Timezone auto-detects from the browser. Once steps 1–4 are all
     done, a hero CTA hands you to /app (the wizard's job is over). Gated behind the setup code (the
     pairing link on this page carries the MCP bearer); internal links re-carry `?code=` so one
-    authentication covers the whole wizard even if the `sotto_setup` cookie is blocked."""
+    authentication covers the whole wizard even if the `sotto_setup` cookie is blocked.
+    Dashboard sessions instead use their existing CSRF token and never render bootstrap credentials."""
     import html as _html
     qs = f"?code={urllib.parse.quote(code)}" if code else ""
     st = setup_status()
-    link = pairing_link()
+    link = "" if csrf else pairing_link()
     el = _html.escape(link)
     host = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else "(no public domain yet — generate one in Railway → Networking)"
 
@@ -3963,17 +5238,21 @@ def _setup_page(code: str = "") -> str:
                + ("<p class='tile-hint'>Sotto hasn't read a Mac source besides "
                   "Contacts yet — turn one on in the Bridge, or connect Google.</p>" if waiting else "")
                + ev_line)
+    elif csrf:
+        mac = ("<p class='tile-status'>Your Mac is not linked.</p>"
+               "<p class='tile-hint'>Use your original setup link to pair Sotto Bridge. "
+               "You can connect the other services below with this sign-in.</p>")
     elif not RAILWAY_DOMAIN or not RELAY_TOKEN:
         # An empty host or token would render a dead sotto-bridge://pair?host=&token= link — name
         # what's missing instead of handing out a pairing code that can't pair.
         missing = " and ".join(
             m for m, absent in (
-                ("a bearer token — set <code>BRIDGE_TOKEN</code> in Railway", not RELAY_TOKEN),
+                ("a Bridge bearer token from its launch configuration", not RELAY_TOKEN),
                 ("a public domain — Railway → Networking → Generate Domain", not RAILWAY_DOMAIN),
             ) if absent)
         mac = (f"<p class='tile-status'>Pairing isn't ready yet — this deploy still needs "
                f"{missing}.</p>"
-               "<p class='tile-hint'>See RAILWAY.md for the full setup, then reload this page.</p>")
+               "<p class='tile-hint'>Rerun the setup helper (see RAILWAY.md), then reload this page.</p>")
     else:
         mac = (f"<p><a class='btn-primary' href='{el}'>Open in Sotto Bridge →</a></p>"
                "<p class='tile-hint'>Not on this Mac? Copy this and paste it into the app's "
@@ -3988,15 +5267,13 @@ def _setup_page(code: str = "") -> str:
                   f"<p class='tile-hint'><a href='/google/auth{qs}{'&' if qs else '?'}replace=1'>"
                   "Use a different Google client</a></p>")
     elif not st["google_client_present"]:
-        google = _google_client_form(qs)
+        google = _google_client_form(qs, csrf)
     else:
         google = (f"<p><a class='btn-primary' href='/google/auth{qs}'>Connect Gmail + Calendar →</a></p>"
-                  + _google_replace_client(qs))
+                  + _google_replace_client(qs, csrf=csrf))
 
-    # 3 · Your channel — the tile follows SOTTO_CRON_DELIVER, because a Telegram deploy asking for a
-    # WhatsApp QR is a lie the wizard used to tell. Telegram links itself at boot (start.sh runs
-    # telegram_link.py), so the tile REPORTS that handshake; WhatsApp keeps its QR button, and it
-    # turns "done" only on the POSITIVE probe (session creds on disk, see _whatsapp_status).
+    # 3 · Your channel — the tile follows SOTTO_CRON_DELIVER and REPORTS that channel's own probe; it
+    # turns "done" only when _delivery_ready says the channel is linked.
     channel = st.get("channel") or _deliver_target()
     ch_state = st.get("channel_status") or _channel_status(channel)
     if channel == "telegram":
@@ -4019,17 +5296,6 @@ def _setup_page(code: str = "") -> str:
                        "(from <a href='https://t.me/BotFather'>@BotFather</a>) in your host's "
                        "variables and tap the pairing link boot prints — it captures your chat "
                        "id.</p>")
-    elif channel == "whatsapp":
-        ch_title = "Link WhatsApp"
-        if ch_state == "linked":
-            ch_body = "<p class='tile-status'>WhatsApp is linked — briefs deliver to your number.</p>"
-        elif ch_state == "pairing":
-            ch_body = ("<p class='tile-status'>Pairing in progress — "
-                       f"<a href='/whatsapp/qr{qs}'>open the QR</a> and scan with your phone.</p>")
-        else:
-            ch_body = (f"<p><a class='btn-primary' href='/whatsapp/qr{qs}'>Show WhatsApp QR →</a> "
-                       "<span class='tile-hint'>(WhatsApp ▸ Linked Devices ▸ Link a Device — scan "
-                       "with your phone)</span></p>")
     elif channel == "photon":
         ch_title = "Connect iMessage"
         owner = (os.environ.get('PHOTON_HOME_CHANNEL') or '').strip()
@@ -4049,19 +5315,21 @@ def _setup_page(code: str = "") -> str:
                        "then reload this page.</p>")
     else:
         ch_title = "Your channel"
-        ch_body = (f"<p class='tile-status'>Briefs and nudges deliver to <b>{_html.escape(channel)}</b> "
-                   "— nothing to link here.</p>")
+        ch_body = (f"<p class='tile-status'><b>{_html.escape(channel)}</b> is not a channel Sotto "
+                   "delivers to. Set up Photon iMessage or Telegram.</p>")
     # "done" requires an authenticated owner DM for Photon, as for the other probed channels.
     ch_done = _delivery_ready(ch_state)
 
     # 4 · Timezone (auto-detected by the browser; posted once)
     tzv = _html.escape(st["timezone"])
-    tz_block = (f"<p class='tile-status'>Timezone set to <b>{tzv}</b> — your briefs will fire at your local 6:30 am / 5:30 pm.</p>"
+    tz_fixed = " (fixed by this installation)" if _configured_tz_source()[1].startswith("env:") else ""
+    tz_block = (f"<p class='tile-status'>Timezone set to <b>{tzv}</b>{tz_fixed} — your briefs will fire at your local 6:30 am / 5:30 pm.</p>"
                 if st["timezone"] else
                 "<p class='tile-status' id='tzmsg'>Detecting your timezone…</p>")
+    write_headers = json.dumps({'Content-Type': 'application/json', **({'X-Sotto-CSRF': csrf} if csrf else {})})
     tz_js = "" if st["timezone"] else (
         "<script>(function(){try{var tz=Intl.DateTimeFormat().resolvedOptions().timeZone;"
-        f"if(!tz){{return;}}fetch('/setup/timezone{qs}',{{method:'POST',headers:{{'Content-Type':'application/json'}},"
+        f"if(!tz){{return;}}fetch('/setup/timezone{qs}',{{method:'POST',headers:{write_headers},"
         "body:JSON.stringify({timezone:tz})}).then(function(r){return r.json();}).then(function(j){"
         "var m=document.getElementById('tzmsg');if(j.ok){m.innerHTML='Timezone set to <b>'+tz+'</b>';"
         "setTimeout(function(){location.reload();},700);}else{m.textContent=j.detail||'Could not set timezone automatically.';}"
@@ -4136,14 +5404,13 @@ def _setup_page(code: str = "") -> str:
                 + "<script>function sdisc(s){if(!confirm('Disconnect '+s+'? Its token is deleted "
                   "from your volume. You can reconnect anytime.'))return false;"
                   f"fetch('/setup/disconnect{qs}',{{method:'POST',"
-                  "headers:{'Content-Type':'application/json'},body:JSON.stringify({service:s})})"
+                  f"headers:{write_headers},body:JSON.stringify({{service:s}})}})"
                   ".then(function(){location.reload();});return false;}</script>")
 
     # Mac and Google are independent; before the first brief a source counts once it was read.
     # Setup can open the dashboard while showing the first brief's actual progress. The delivery step uses the SAME
     # rule the valve and the meeting tap use (_delivery_ready): the active channel must be linked —
-    # a never-scanned WhatsApp or an un-texted Telegram bot must not celebrate over a dead delivery
-    # channel — while a channel with no probe never blocks the wizard from finishing.
+    # an un-messaged Photon line or Telegram bot must not celebrate over a dead delivery channel.
     context_connected = not waiting and (st["bridge_connected"] or st["google_connected"] or svc_connected)
     done = (context_connected and bool(st["timezone"]) and ch_done)
     hero = "<a class='hero-cta' href='/app'>Open your dashboard →</a>" if done else ""
@@ -4172,18 +5439,6 @@ def _setup_page(code: str = "") -> str:
             f"<p class='tile-meta'>Sotto {_html.escape(str(upd.get('latest') or ''))} is available — "
             f"you're on {_html.escape(str(upd.get('current') or ''))}. One redeploy updates everything: "
             f"<a href='{UPDATE_DOC_URL}'>how to update</a>.</p>")
-    hv = st.get("hermes") or {}
-    hermes_line = ""
-    if hv.get("running") or hv.get("image"):
-        run_v = _html.escape(str(hv.get("running") or "unknown"))
-        img_v = _html.escape(str(hv.get("image") or "unknown"))
-        # Same drift the boot log warns about: the volume's seeded Hermes shadowing a newer image.
-        drift = ("" if run_v == img_v else
-                 " Your volume is behind this image — set <code>SOTTO_REFRESH_HERMES=1</code> and "
-                 f"redeploy once to adopt it (<a href='{UPDATE_DOC_URL}'>details</a>).")
-        # Worded as the boot log words it — one fact, two places to read it.
-        hermes_line = (f"<p class='tile-meta'>Hermes running: {run_v} · image built with: "
-                       f"{img_v}.{drift}</p>")
 
     return (
         _page_head("Sotto — integrations", body_class="setup")
@@ -4199,9 +5454,13 @@ def _setup_page(code: str = "") -> str:
         + _tile(3, ch_title, "done" if ch_done else "todo", ch_body)
         + _tile(4, "Timezone", "done" if st["timezone"] else "todo", tz_block + tz_js)
         + _tile(5, "Connected services", "done" if svc_connected else "optional", services)
+        + (_tile(6, "Use Sotto with other assistants?", "optional",
+            "<p>Connect an assistant to your selected sources. Read-only; nothing is shared until you approve.</p>"
+            "<p><a href='/client-oauth/connections'>Connect or manage assistants →</a></p>"
+            "<p>You can skip this and return later.</p>") if CLIENT_OAUTH.origin() else "")
         + f"{footer}"
         f"<p class='tile-meta'>Host: <code>{_html.escape(host)}</code></p>"
-        f"{update_line}{hermes_line}"
+        f"{update_line}"
         "</main></div></body></html>"
     )
 
@@ -4209,11 +5468,14 @@ def _setup_page(code: str = "") -> str:
 # (/pair is a legacy path: it 302-redirects to /setup in do_GET — the old standalone pair page
 # is gone; the deep link + copyable pairing code live in _setup_page.)
 
-# Setup/pairing/debug-status surface — everything here can leak the MCP bearer (pairing link), the
-# live WhatsApp QR, or accept config writes, so it's gated behind the setup code (see resolve_setup_code).
+# Setup/pairing/debug-status surface — everything here can leak the MCP bearer (pairing link) or
+# accept config writes, so it's gated behind the setup code (see resolve_setup_code).
 SETUP_GET_PATHS = frozenset({"/setup", "/pair", "/google/auth", "/google/connected", "/google/submit-code",
-                             "/whatsapp/qr", "/debug/google"})
+                             "/debug/google"})
 SETUP_POST_PATHS = frozenset({"/setup/timezone", "/setup/google-client", "/setup/disconnect", "/google/start"})
+DASHBOARD_SETUP_PATHS = frozenset({"/setup", "/google/auth", "/google/connected",
+    "/google/submit-code", "/debug/google", "/setup/timezone", "/setup/google-client",
+    "/setup/disconnect", "/google/start"})
 
 # The wizard cookie carries the SAME attribute set as the dashboard's session cookie
 # (dashboard._login_redirect): Secure so it never rides a plaintext hop, HttpOnly so no script can
@@ -4232,6 +5494,112 @@ SETUP_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src '
              "img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
+def _owner_intents_enabled(policy) -> bool:
+    if policy.get('SOTTO_DEPLOYMENT_MODE') == 'managed':
+        return True
+    if (policy.get('SOTTO_DEPLOYMENT_MODE') != 'self_host'
+            or not policy.get('GOOGLE_AI_API_KEY')
+            or 'SOTTO_MODEL_PROXY_URL' in policy
+            or 'SOTTO_MODEL_PROXY_TOKEN' in policy):
+        return False
+    return ((policy.get('SOTTO_RUNTIME_PROFILE') == 'self-host-photon-fixed-five-v1'
+             and policy.get('SOTTO_CRON_DELIVER') == 'photon')
+            or (policy.get('SOTTO_RUNTIME_PROFILE') == 'self-host-telegram-fixed-five-v1'
+                and policy.get('SOTTO_CRON_DELIVER') == 'telegram'))
+
+
+def _owner_endpoint(handler, path):
+    endpoint = OWNER_ENDPOINT_HTTP.OwnerEndpoint
+    table = {
+        '/runtime/owner-quiet-intent': endpoint(RUNTIME_OWNER_QUIET.perform,
+            RUNTIME_OWNER_QUIET.UnavailableError, 8192, 2048, 'quiet'),
+        '/runtime/owner-loop-intent': endpoint(RUNTIME_OWNER_LOOP.perform,
+            RUNTIME_OWNER_LOOP.UnavailableError, 8192, 2048, 'command'),
+        '/runtime/owner-reminder-intent': endpoint(RUNTIME_OWNER_REMINDER.perform,
+            RUNTIME_OWNER_REMINDER.UnavailableError, 8192),
+        '/runtime/owner-reminder-tool': endpoint(RUNTIME_OWNER_REMINDER_TOOL.perform,
+            RUNTIME_OWNER_REMINDER_TOOL.UnavailableError),
+        '/runtime/owner-loop-tool': endpoint(RUNTIME_OWNER_LOOP_TOOL.perform,
+            RUNTIME_OWNER_LOOP_TOOL.UnavailableError),
+        '/runtime/owner-preference-tool': endpoint(RUNTIME_OWNER_PREFERENCE_TOOL.perform,
+            RUNTIME_OWNER_PREFERENCE_TOOL.UnavailableError),
+        '/runtime/owner-routine-tool': endpoint(RUNTIME_OWNER_ROUTINE_TOOL.perform,
+            RUNTIME_OWNER_ROUTINE_TOOL.UnavailableError),
+        '/runtime/owner-gmail-draft-tool': endpoint(RUNTIME_OWNER_GMAIL_DRAFT_TOOL.perform,
+            RUNTIME_OWNER_GMAIL_DRAFT_TOOL.UnavailableError),
+        '/runtime/owner-calendar-tool': endpoint(RUNTIME_OWNER_CALENDAR_TOOL.perform,
+            RUNTIME_OWNER_CALENDAR_TOOL.UnavailableError),
+        '/runtime/owner-contacts-tool': endpoint(RUNTIME_OWNER_CONTACTS_TOOL.perform,
+            RUNTIME_OWNER_CONTACTS_TOOL.UnavailableError, 262144, 256 * 1024),
+        '/runtime/owner-bridge-send-tool': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_BRIDGE_SEND_TOOL.perform(body, relay=RELAY, **kw),
+            RUNTIME_OWNER_BRIDGE_SEND_TOOL.UnavailableError),
+        '/runtime/owner-brief-request': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_BRIEF_REQUEST.perform(
+                body, queue=WORK_QUEUE, admit=request_owner_brief, **kw),
+            RUNTIME_OWNER_BRIEF_REQUEST.UnavailableError),
+        '/runtime/owner-skill-request': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_SKILL_REQUEST.perform(
+                body, queue=WORK_QUEUE, admit=request_owner_skill, **kw),
+            RUNTIME_OWNER_SKILL_REQUEST.UnavailableError),
+        '/runtime/owner-meeting-prep-request': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_MEETING_PREP_REQUEST.perform(
+                body, queue=WORK_QUEUE, admit=request_owner_meeting_prep,
+                offers=_pending_offers(), calendar_reader=_read_prep_offer_calendar, **kw),
+            RUNTIME_OWNER_MEETING_PREP_REQUEST.UnavailableError),
+        '/runtime/owner-offer-reply': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_OFFER_REPLY.perform(
+                body, offers=_pending_offers(), writer=RUNTIME_OWNER_LOOP._load_writer(), **kw),
+            RUNTIME_OWNER_OFFER_REPLY.UnavailableError),
+        '/runtime/owner-web-read': endpoint(
+            lambda body, **kw: RUNTIME_OWNER_WEB_READ.perform(
+                body, reader=RUNTIME_WEB_READER,
+                cancelled=lambda: bool(select.select([handler.connection], [], [], 0)[0])
+                and not handler.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT), **kw),
+            RUNTIME_OWNER_WEB_READ.UnavailableError),
+    }
+    return table.get(path)
+
+def _handle_owner_endpoint(handler, path, endpoint):
+    if handler.client_address[0] not in ('127.0.0.1', '::1'):
+        return handler._send(401, {'error': 'unauthorized'})
+    if handler.path != path or not _owner_intents_enabled(os.environ):
+        return handler._send(404, {'error': 'not found'})
+    try:
+        body = OWNER_ENDPOINT_HTTP.read_body(handler, endpoint.request_limit)
+        root = os.environ.get('SOTTO_MCP_TOKEN', '')
+        expected = OWNER_LOOP_CAPABILITY.derive(root, body.get('identity'))
+    except (OSError, ValueError, TypeError, UnicodeError, AttributeError):
+        return handler._send(400, {'error': f'invalid owner {endpoint.error_name} request'})
+    if not handler._authed(expected):
+        return handler._send(401, {'error': 'unauthorized'})
+    stage = 'receiver_perform'
+    try:
+        policy = dict(os.environ, _configured_tz_name=_configured_tz_name, _tz_resolve=TZCHAIN.resolve,
+                      _source_authority=_runtime_source_authority,
+                      _retained_route_digest=_candidate_retained_route_digest)
+        telegram = policy.get('SOTTO_RUNTIME_PROFILE') == 'self-host-telegram-fixed-five-v1'
+        shared_project = body['identity']['route_mode'] == 'first_contact_shared_project'
+        if shared_project:
+            _activation_tick()
+        result = endpoint.perform(body, bearer=expected, root=root, policy=policy, data_root=DATA,
+            capability=OWNER_LOOP_CAPABILITY, activation=RUNTIME_ACTIVATION,
+            telegram_verifier=_load_shared_lib('telegram_channel_proof') if telegram else None,
+            chat_client=_runtime_adapter()._client(timeout=5) if telegram or shared_project else None)
+        stage = 'receiver_serialize'
+        response_bound = (RUNTIME_OWNER_PREFERENCE_TOOL.http_response_bound(body, result)
+                          if path == '/runtime/owner-preference-tool' else endpoint.response_limit)
+        if len(json.dumps(result, allow_nan=False).encode('utf-8')) > response_bound:
+            raise endpoint.unavailable('response exceeds bound')
+        return handler._send(409 if result['status'] == 'rejected' else 200, result)
+    except ValueError:
+        return handler._send(400, {'error': f'invalid owner {endpoint.error_name} request'})
+    except Exception as error:  # noqa: BLE001 -- only closed diagnostics leave the private route
+        failure = (RUNTIME_OWNER_LOOP_TOOL.http_failure(body, error, stage)
+                   if path == '/runtime/owner-loop-tool' else {'error': f'owner {endpoint.error_name} unavailable'})
+        return handler._send(503, failure)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _bridge_authed(self):
         import managed
@@ -4247,9 +5615,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _setup_authed(self) -> bool:
         """Auth for the setup surface: valid `?code=`/`?setup_code=` query param, OR the `sotto_setup`
-        cookie (set after the first valid code, so the wizard is authenticate-once), OR the MCP bearer.
+        cookie (set after the first valid code), MCP bearer, or a non-Cloud owner dashboard session.
         All comparisons constant-time. (`setup_code` exists because on /google/submit-code the `code`
         param is Google's auth code — a GET form replaces the action's query string.)"""
+        self._setup_session = None
         code = resolve_setup_code()
         if not code:
             return False
@@ -4267,6 +5636,14 @@ class Handler(BaseHTTPRequestHandler):
             k, _, v = part.strip().partition("=")
             if k == "sotto_setup" and v and hmac.compare_digest(v.encode(), want):
                 return True
+        path = self.path.split('?', 1)[0]
+        if ((os.environ.get('SOTTO_DASHBOARD') or '').strip() != '0'
+                and (path in DASHBOARD_SETUP_PATHS or CONNECT_START_RE.fullmatch(path))):
+            session = DASHBOARD._session_record(self)
+            if (session and 'cloud' not in session and isinstance(session.get('csrf'), str)
+                    and session['csrf']):
+                self._setup_session = session
+                return True
         return False
 
     def _forbid_setup(self):
@@ -4282,7 +5659,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         # Unconditional: this server has NO cacheable route. Every path is the pairing link (= the
-        # bearer), an OAuth code exchange, the live WhatsApp QR, brief diagnostics, or health —
+        # bearer), an OAuth code exchange, brief diagnostics, or health —
         # none of it may sit in a browser's disk cache or a shared proxy. (/static/* is the one
         # cacheable surface in the image and it belongs to dashboard.py, which sets its own.)
         self.send_header("Cache-Control", "no-store")
@@ -4317,7 +5694,7 @@ class Handler(BaseHTTPRequestHandler):
                 and len(q['code']) == len(q['state']) == 1):
             try:
                 binding = hashlib.sha256(cookie.encode()).hexdigest()
-                pending = json.loads(Path(_hermes_adapter('runtime_api').home_path(
+                pending = json.loads(Path(_runtime_adapter().home_path(
                     'google_oauth_pending.json')).read_text())
                 # Only this browser's pending flow may spawn the exchange; google_setup owns expiry.
                 if hmac.compare_digest(pending['browser_binding'], binding):
@@ -4329,7 +5706,6 @@ class Handler(BaseHTTPRequestHandler):
         self._google_cookie_header = (f'{GOOGLE_BROWSER_COOKIE}=; Path=/google; Max-Age=0; '
                                       'Secure; HttpOnly; SameSite=Lax')
         if ok:
-            self._grant_cookie = resolve_setup_code()
             return self._redirect('/google/connected')
         # Fixed clean URL: no authorization code, provider error text, or state in
         # the landing page, referrers, logs, or links.
@@ -4373,7 +5749,7 @@ class Handler(BaseHTTPRequestHandler):
         code_ = (q.get("code") or [""])[0]
         err = (q.get("error") or [""])[0]
         if err:
-            CONNECTORS.consume_pending(state)   # burn the state; a denied flow must not linger
+            CONNECTORS.cancel_auth(state)       # serialized with callback and explicit disconnect
             desc = (q.get("error_description") or [""])[0]
             return self._html(400, _connect_error_page(
                 "authorization", f"the provider returned '{err}'" + (f": {desc}" if desc else "")))
@@ -4381,18 +5757,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._html(400, _connect_error_page(
                 "state", "missing code/state in the callback — restart from /setup"))
         try:
-            record = CONNECTORS.finish_auth(state, code_, connect_redirect_uri())
+            def enable_consent(record):
+                try:
+                    __import__('managed').record_connector_consent(
+                        DATA, record["service"], True)
+                except Exception:  # noqa: BLE001 — keep the credential for safe reconciliation
+                    print('[sotto] connector linked but managed capability write failed', flush=True)
+                    raise CONNECTORS.ConnectorError(
+                        "capability", "the connection was saved but access could not be enabled; "
+                        "retry or contact support") from None
+
+            record = CONNECTORS.finish_auth(
+                state, code_, connect_redirect_uri(), on_connected=enable_consent)
         except CONNECTORS.ConnectorError as e:
-            code = 400 if e.step == "state" else 502
+            code = 400 if e.step == "state" else (500 if e.step == "capability" else 502)
             return self._html(code, _connect_error_page(e.step, str(e)))
         except Exception as e:  # noqa: BLE001
             return self._html(500, _connect_error_page("exchange", f"unexpected error: {e}"))
-        try:
-            __import__('managed').record_connector_consent(DATA, record["service"], True)
-        except Exception:  # noqa: BLE001 — keep the credential for a safe retry/reconciliation
-            print('[sotto] connector linked but managed capability write failed', flush=True)
-            return self._html(500, _connect_error_page(
-                "capability", "the connection was saved but access could not be enabled; retry or contact support"))
         label = CONNECTORS.SERVICES.get(record["service"], {}).get("label", record["service"])
         import html as _html2
         return self._html(200, _connect_page(
@@ -4402,12 +5783,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path in CLIENT_OAUTH.PATHS:
+            return CLIENT_OAUTH.handle(self, self.command, DATA, DASHBOARD)
+        if path == CLIENT_MCP.PATH:
+            return self._client_mcp('GET')
         # Healthcheck for the platform (Railway healthcheckPath=/health → restart on failure).
         if path == "/health":
             return self._send(200, {'status': 'ok', 'bridge_connected': RELAY.bridge_connected(),
                                     'work': WORK_QUEUE.status(DATA),
                                     'delivery': OUTBOX.counts(),
-                                    'model_lease': {k: v for k, v in _hermes_adapter('model_lease').status(DATA).items()
+                                    'model_lease': {k: v for k, v in _sotto_adapter('model_lease').status(DATA).items()
                                                     if k in ('expires_at', 'last_success_at', 'error')}})
         # A human hitting the bare service URL (Railway shows it prominently). Point at the setup
         # flow WITHOUT the code or link itself — this page is unauthenticated. Other unknown paths
@@ -4415,12 +5800,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self._html(200, _page_head("Sotto")
                 + "<div class='site'><main class='content narrow'>"
-                "<section class='tile'><div class='tile-head'><h2 class='tile-title'>Sotto is running</h2></div>"
-                "<div class='tile-body'>"
-                "<p>To finish setup, open the <code>[sotto] Setup link</code> line from your Railway "
-                "deploy logs — it carries the one-time setup code this page can't show.</p>"
-                "<p class='tile-hint'>Have a session already? <a href='/app'>Open your dashboard →</a></p>"
-                "</div></section></main></div></body></html>")
+                + _plain_tile("Sotto is running",
+                    "<p>To finish setup, open the <code>[sotto] Setup link</code> line from your Railway "
+                    "deploy logs — it carries the one-time setup code this page can't show.</p>"
+                    "<p class='tile-hint'>Have a session already? <a href='/app'>Open your dashboard →</a></p>")
+                + "</main></div></body></html>")
         if path == "/favicon.ico":   # browsers request it on every page load; 204 beats a JSON 404
             return self._write(204, None, None)
         # The Window (read-only dashboard): sessions, static assets, JSON API — all in dashboard.py.
@@ -4437,8 +5821,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200 if req else 204, req or {})
         # (No /bridge/status: it was an unauthenticated leak of Mac presence with zero clients —
         # /health already carries `bridge_connected`.)
-        # Brief diagnostics. compose_brief runs in Hermes' execute_code sandbox, so its logs go to the
-        # agent, NOT Railway's container logs — it appends them here instead. Bearer-protected (the
+        # Brief diagnostics. compose_brief runs as a spawned procedure whose stderr the worker does not
+        # forward to the container logs — it appends them here instead. Bearer-protected (the
         # lines can carry contact identifiers). `?n=` tails N lines (default 200).
         if path == "/debug/brief-log":
             if not self._authed(RELAY_TOKEN):
@@ -4477,12 +5861,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._connect_callback()
         connect_start = CONNECT_START_RE.match(path)
         # Everything below is the setup/pairing/debug-status surface: it can expose the MCP bearer
-        # (pairing link) or the live WhatsApp QR, so it requires the setup code / cookie / bearer.
+        # (pairing link), so bootstrap access requires the setup code / cookie / bearer.
+        # Owner dashboard sessions omit the root-bearing pairing action and setup-code links.
         # /connect/<service>/start is gated too (it spends discovery/DCR effort and mints flow state).
         if (path in SETUP_GET_PATHS or connect_start) and not self._setup_authed():
             return self._forbid_setup()
         qs = (f"?code={urllib.parse.quote(resolve_setup_code())}"
-              if (path in SETUP_GET_PATHS or connect_start) else "")
+              if (path in SETUP_GET_PATHS or connect_start) and not self._setup_session else "")
         # Kick off a connector OAuth flow: discovery → DCR → pending state → 302 to the consent page.
         if connect_start:
             return self._connect_start(connect_start.group(1))
@@ -4492,9 +5877,11 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = google_connected()
             return self._send(200 if ok else 503, {"google_connected": ok, "detail": msg,
                                                     "authorize": "/google/auth"})
-        # The unified setup wizard: live status for Mac · Google · WhatsApp · Timezone, next action inline.
+        # The unified setup wizard: live status for Mac · Google · channel · Timezone, next action inline.
         if path == "/setup":
-            return self._html(200, _setup_page(resolve_setup_code()))
+            session = self._setup_session
+            return self._html(200, _setup_page('' if session else resolve_setup_code(),
+                                               session['csrf'] if session else ''))
         # (No /setup/status: it was a JSON twin of /setup with no caller. setup_status() itself
         # stays — it is what _setup_page renders from.)
         # Legacy /pair → the wizard (keeps old links/QRs working; the deep link itself is in the page).
@@ -4509,40 +5896,17 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             return self._html(200, _google_authorization_page(
                 qs, hashlib.sha256(cookie.encode()).hexdigest(), query.get('reconnect') == ['1'],
-                query.get('replace') == ['1']))
+                query.get('replace') == ['1'],
+                setup_csrf=self._setup_session['csrf'] if self._setup_session else ''))
         if path == '/google/submit-code':
             # Old bookmarks should recover into the new flow, never exchange a
             # credential carried in a GET query or redisplay a broken-loopback link.
             return self._redirect('/google/auth')
-        # Serve the live WhatsApp pairing output (incl. the QR) with tight line-height so it scans in a
-        # browser — Railway's log viewer distorts the terminal QR. Only available during pairing.
-        if path != "/whatsapp/qr":
-            return self._send(404, {"error": "not found"})
-        try:
-            # utf-8 explicitly: the QR is block characters, and a container with no LANG set would
-            # otherwise read them through an ASCII locale and fail (or mangle) the whole page.
-            with open(QR_FILE, encoding="utf-8") as f:
-                content = f.read()
-        except OSError:
-            return self._html(200, _narrow_page(
-                "Link WhatsApp",
-                "<section class='tile'><div class='tile-body'>"
-                "<p>No pairing in progress (already linked, or not started yet).</p>"
-                "</div></section>",
-                back_href=f"/setup{qs}"))
-        import html as _html
-        self._html(200, _narrow_page(
-            "Scan to link WhatsApp",
-            "<section class='tile'><div class='tile-body'>"
-            "<p>Open WhatsApp ▸ Linked Devices ▸ Link a Device, then scan. Page auto-refreshes.</p>"
-            f"<pre class='qr'>{_html.escape(content)}</pre>"
-            "</div></section>",
-            head_extra="<meta http-equiv='refresh' content='6'>",
-            back_href=f"/setup{qs}"))
+        return self._send(404, {"error": "not found"})
 
     def _handle_setup_post(self, path: str):
-        """Setup-wizard writes — gated by the setup code in do_POST (same posture as the GET setup
-        pages). Each handler additionally validates its own input."""
+        """Setup writes require bootstrap auth or owner session plus CSRF in do_POST/this handler.
+        Each operation additionally validates its own input."""
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -4551,6 +5915,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"ok": False, "detail": "empty or too-large body"})
         raw = self.rfile.read(n)
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        session = getattr(self, '_setup_session', None)
+        if session:
+            supplied = self.headers.get('X-Sotto-CSRF', '')
+            if not supplied and ctype == 'application/x-www-form-urlencoded':
+                fields = urllib.parse.parse_qs(raw.decode('utf-8', 'replace'))
+                values = fields.get('csrf', [])
+                supplied = values[0] if len(values) == 1 else ''
+            if not supplied or not hmac.compare_digest(supplied.encode(), session['csrf'].encode()):
+                return self._send(403, {'ok': False, 'detail': 'bad csrf'})
         if path == "/setup/timezone":
             try:
                 tz = (json.loads(raw or b"{}") or {}).get("timezone", "")
@@ -4568,16 +5941,21 @@ class Handler(BaseHTTPRequestHandler):
             if service not in CONNECTORS.SERVICES:
                 return self._send(400, {"ok": False, "detail": f"unknown service '{service}' — "
                                         "known: " + ", ".join(sorted(CONNECTORS.SERVICES))})
+            def revoke_consent():
+                # Revoke first while holding the connector token lock. If capability storage fails,
+                # retain token and pending state rather than reporting a partial disconnect.
+                try:
+                    __import__('managed').record_connector_consent(DATA, service, False)
+                except Exception:  # noqa: BLE001
+                    print('[sotto] connector disconnect blocked: capability revocation failed', flush=True)
+                    raise CONNECTORS.ConnectorError(
+                        "capability", "could not record revocation") from None
             try:
-                # Revoke first. If the capability store cannot record the user's decision, retain
-                # the token and report failure instead of leaving cached data authorized after a
-                # superficially successful disconnect.
-                __import__('managed').record_connector_consent(DATA, service, False)
-            except Exception:  # noqa: BLE001
-                print('[sotto] connector disconnect blocked: capability revocation failed', flush=True)
-                return self._send(500, {"ok": False, "detail": "could not record revocation"})
-            try:
-                res = CONNECTORS.disconnect(service)
+                res = CONNECTORS.disconnect(service, revoke_consent)
+            except CONNECTORS.ConnectorError as e:
+                if e.step == "capability":
+                    return self._send(500, {"ok": False, "detail": str(e)})
+                raise
             except OSError:
                 print('[sotto] connector disconnect failed: credential removal failed', flush=True)
                 return self._send(500, {"ok": False, "detail": "credential removal failed"})
@@ -4594,30 +5972,254 @@ class Handler(BaseHTTPRequestHandler):
         if ctype == "application/json":
             return self._send(200 if ok else 400, {"ok": ok, "detail": msg})
         import html as _html
-        qs = f"?code={urllib.parse.quote(resolve_setup_code())}"
-        more = (f"<p><a class='btn-primary' href='/google/auth{qs}&reconnect=1'>Connect Google →</a></p>"
+        qs = '' if session else f"?code={urllib.parse.quote(resolve_setup_code())}"
+        more = (f"<p><a class='btn-primary' href='/google/auth{qs}{'&' if qs else '?'}reconnect=1'>Connect Google →</a></p>"
                 if ok else "")
         return self._html(200 if ok else 400, _narrow_page(
             "Sotto — Google client",
-            f"<section class='tile'><div class='tile-head'><h2 class='tile-title'>"
-            f"{_html.escape(msg)}</h2></div>"
-            f"<div class='tile-body'>{more}</div></section>",
+            _plain_tile(_html.escape(msg), more),
             back_href=f"/setup{qs}"))
 
     def do_POST(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path in CLIENT_OAUTH.PATHS:
+            return CLIENT_OAUTH.handle(self, self.command, DATA, DASHBOARD)
+        if path == CLIENT_MCP.PATH:
+            return self._client_mcp('POST')
+        if path.startswith('/selfhost/'):
+            import selfhost_status
+            return selfhost_status.handle(self, status=selfhost_bridge_status,
+                                          setup_code=resolve_setup_code)
+        endpoint = _owner_endpoint(self, path)
+        if endpoint is not None:
+            return _handle_owner_endpoint(self, path, endpoint)
+        if path == '/runtime/brief-detail':
+            # Receiver-owned, bounded read of accepted text only. No script
+            # execution or model-selected filesystem path crosses this route.
+            if self.client_address[0] not in ('127.0.0.1', '::1') or not self._authed(MCP_TOKEN):
+                return self._send(401, {'error': 'unauthorized'})
+            if self.path != path:
+                return self._send(404, {'error': 'not found'})
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if (not 0 < size <= 4096 or self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+                        != 'application/json'):
+                    raise ValueError('invalid protected read')
+                def unique_object(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate JSON key')
+                        result[key] = value
+                    return result
+                body = json.loads(self.rfile.read(size), object_pairs_hook=unique_object,
+                                  parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite')))
+                _load_shared_lib('protected_brief_detail').validate_selector(body)
+            except (OSError, ValueError, TypeError, UnicodeError):
+                return self._send(400, {'error': 'invalid brief detail request'})
+            try:
+                # A fresh admitted owner DM re-arms Node's activation obligation.
+                # Repair it through the sole receipt writer before requiring the
+                # live ACK below; the next cron heartbeat must not gate a read.
+                _activation_tick()
+                before = _runtime_source_authority()
+                route_before = _candidate_retained_route_digest()
+                if (before.get('complete') is not True or not isinstance(before.get('revision'), str)
+                        or re.fullmatch(r'[a-f0-9]{64}', before['revision']) is None
+                        or not isinstance(route_before, str)
+                        or re.fullmatch(r'[a-f0-9]{64}', route_before) is None):
+                    raise RuntimeError('source or route unavailable')
+                projection = _load_shared_lib('protected_brief_detail').read(
+                    DATA, body, source_revision=before['revision'], route_digest=route_before,
+                    **({'zone': TZCHAIN.resolve(_configured_tz_name()) or timezone.utc}
+                       if any(key in body for key in ('date', 'query', 'kind')) else {}))
+                after = _runtime_source_authority()
+                route_after = _candidate_retained_route_digest()
+                if (after != before or route_after != route_before
+                        or projection.get('status') not in ('found', 'ambiguous', 'withheld', 'not_found')
+                        or len(json.dumps(projection, allow_nan=False).encode('utf-8')) > 64 * 1024):
+                    raise RuntimeError('protected read authority changed')
+                return self._send(200, projection)
+            except Exception:  # noqa: BLE001 - never expose private proof/IO details
+                return self._send(503, {'error': 'brief detail unavailable'})
+        if path == '/runtime/knowledge-read':
+            if self.client_address[0] not in ('127.0.0.1', '::1') or not self._authed(MCP_TOKEN):
+                return self._send(401, {'error': 'unauthorized'})
+            if self.path != path:
+                return self._send(404, {'error': 'not found'})
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 8192 or self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+                    raise ValueError('invalid knowledge request')
+                def unique_object(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate JSON key')
+                        result[key] = value
+                    return result
+                body = json.loads(self.rfile.read(n), object_pairs_hook=unique_object)
+                RUNTIME_KNOWLEDGE_READ.validate(body)
+            except (OSError, ValueError, TypeError):
+                return self._send(400, {'error': 'invalid knowledge request'})
+            try:
+                result = RUNTIME_KNOWLEDGE_READ.perform(body,
+                    script=_find_sotto_script('_shared',
+                        'lib' if body['operation'] in ('relationship_importance','relationship_attention') else
+                        'scripts' if body['operation'] in ('loops_query', 'granola_history', 'triage_queue', 'style_apply', 'retune_scan') else 'knowledge',
+                        {'master_file': 'master_file.py', 'loops_query': 'loops_query.py',
+                         'knowledge_query': 'knowledge_query.py', 'granola_history': 'granola_history.py',
+                         'triage_queue': 'triage_read.py', 'style_apply': 'style_apply.py', 'retune_scan': 'retune_scan.py',
+                         'relationship_importance': 'relationship_importance.py',
+                         'relationship_attention': 'relationship_importance.py'}[body['operation']]),
+                    executable=sys.executable, env=_spawn_env(''), authority=_runtime_source_authority,
+                    **({'disconnected': lambda: bool(select.select([self.connection], [], [], 0)[0])
+                        and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)}
+                       if body['operation'] in ('granola_history', 'triage_queue') else {}))
+                return self._send(200, result)
+            except Exception:
+                return self._send(503, {'error': 'knowledge read unavailable'})
+        if path in ('/runtime/owner-loops', '/runtime/owner-retune'):
+            if self.client_address[0] not in ('127.0.0.1', '::1') or not self._authed(MCP_TOKEN):
+                return self._send(401, {'error': 'unauthorized'})
+            if self.path != path:
+                return self._send(404, {'error': 'not found'})
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 64 or self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+                    raise ValueError('invalid owner continuity request')
+                def unique_object(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate JSON key')
+                        result[key] = value
+                    return result
+
+                body = json.loads(self.rfile.read(n), object_pairs_hook=unique_object)
+            except (OSError, ValueError, TypeError):
+                body = None
+            if (type(body) is not dict or
+                    (path == '/runtime/owner-loops' and
+                     (set(body) != {'include_parked'} or type(body['include_parked']) is not bool)) or
+                    (path == '/runtime/owner-retune' and body != {})):
+                return self._send(400, {'error': 'invalid owner continuity request'})
+            try:
+                instant = _local_now()
+                if instant.tzinfo is None or instant.utcoffset() is None:
+                    instant = instant.replace(tzinfo=timezone.utc)
+                result = _owner_continuity().read_owner_continuity(
+                    DATA, now=instant, view='retune' if path == '/runtime/owner-retune' else 'loops',
+                    include_parked=body['include_parked'] if path == '/runtime/owner-loops' else False)
+                if (result.get('coverage') != 'owner_authored_only'
+                        or len(json.dumps(result, allow_nan=False).encode('utf-8')) > 64 * 1024):
+                    raise RuntimeError('protected read shape or bound is invalid')
+                return self._send(200, result)
+            except Exception:
+                return self._send(503, {'error': 'owner continuity unavailable'})
+        if path == '/runtime/source-authority':
+            # Private read-only projection. The derived MCP bearer cannot grant
+            # consent, invoke a send, or make a cached tools/list authoritative.
+            if self.client_address[0] not in ('127.0.0.1', '::1') or not self._authed(MCP_TOKEN):
+                return self._send(401, {'error': 'unauthorized'})
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                body = json.loads(self.rfile.read(n)) if 0 < n <= 32 else None
+            except (OSError, ValueError, TypeError):
+                body = None
+            if body != {}:
+                return self._send(400, {'error': 'body must be an empty JSON object'})
+            authority = _runtime_source_authority()
+            return self._send(200 if authority['complete'] else 503, authority)
+        if path == '/runtime/google-read':
+            # Receiver owns the OAuth token and source consent. This bearer is
+            # read-only; no Google write verb or general runner is reachable.
+            if self.client_address[0] not in ('127.0.0.1', '::1') or not self._authed(MCP_TOKEN):
+                return self._send(401, {'error': 'unauthorized'})
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 2048:
+                    raise ValueError('invalid request length')
+                def unique_object(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate request field')
+                        result[key] = value
+                    return result
+                body = json.loads(self.rfile.read(n), object_pairs_hook=unique_object)
+                if (not isinstance(body, dict) or set(body) != {'operation', 'arguments', 'source_revision'}
+                        or body['operation'] not in ('gmail_search', 'gmail_get', 'gmail_thread_get', 'calendar_list', 'calendar_get', 'contacts_search', 'contacts_get', 'capabilities')
+                        or not isinstance(body['arguments'], dict)
+                        or body['operation'] == 'capabilities' and body['arguments'] != {}
+                        or not isinstance(body['source_revision'], str)
+                        or re.fullmatch(r'[a-f0-9]{64}', body['source_revision']) is None):
+                    raise ValueError('invalid request')
+            except (OSError, ValueError, TypeError):
+                return self._send(400, {'error': 'invalid Google read request'})
+            stage = 'authority_before'
+            try:
+                # Shared Gmail/Calendar builders must use the exact token root
+                # checked by authority; their legacy implicit-home fallback is
+                # not an authorization path for this typed route.
+                if not os.environ.get('SOTTO_HOME', '').strip():
+                    raise RuntimeError('Google token root is not explicit')
+                before = _runtime_source_authority()
+                source = ('google' if body['operation'] == 'capabilities' else
+                          'gmail' if body['operation'].startswith('gmail_') else
+                          'google_contacts' if body['operation'].startswith('contacts_') else 'calendar')
+                if (not before['complete'] or before['revision'] != body['source_revision']
+                        or source != 'google' and source not in before['google_sources']):
+                    raise RuntimeError('Google source is not authorized')
+                if source == 'google':
+                    # Original saved grants, restricted to current effective source
+                    # consent. This is metadata only and performs no provider call.
+                    grants = RUNTIME_OWNER_GMAIL_DRAFT_TOOL._google().capabilities()
+                    flags = {key: grants.get(key) is True and permission in before['google_sources']
+                             for permission, keys in (
+                                 ('gmail', ('gmail_read', 'gmail_draft', 'gmail_write', 'gmail_send')),
+                                 ('calendar', ('calendar_read', 'calendar_write')),
+                                 ('google_contacts', ('contacts_read', 'contacts_write')))
+                             for key in keys}
+                    result = {'version': 1, 'source': 'google', 'operation': 'capabilities',
+                              'item': {'status': 'ok', 'connected': grants.get('connected') is True and any(flags.values()),
+                                       **flags},
+                              'observation': {'status': 'ok', 'complete': True,
+                                              'observed_at': datetime.now(timezone.utc).isoformat(),
+                                              'coverage': {'since': None, 'until': None}}}
+                else:
+                    stage = 'reader_load'
+                    api_path = _google_api_py()
+                    if not api_path:
+                        raise RuntimeError('Google reader unavailable')
+                    spec = importlib.util.spec_from_file_location('sotto_owner_google_read', api_path)
+                    api = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(api)
+                    stage = 'reader_call'
+                    result = api.read_owner(body['operation'], body['arguments'])
+                stage = 'authority_after'
+                after = _runtime_source_authority()
+                if after != before:
+                    raise RuntimeError('Google source changed or result invalid')
+                stage = 'result_contract'
+                if (result.get('source') != source
+                        or len(json.dumps(result, allow_nan=False).encode()) > 64 * 1024):
+                    raise RuntimeError('Google source changed or result invalid')
+                return self._send(200, result)
+            except Exception as error:  # noqa: BLE001 - provider errors may contain private source data
+                diagnostic = GOOGLE_READ_DIAGNOSTICS.receiver_failure(error, stage, body['operation'])
+                category = diagnostic['read_stage']
+                try:
+                    print(json.dumps({'event': 'google_read_unavailable', 'operation': body['operation'],
+                                      'stage': category}), file=sys.stderr, flush=True)
+                except Exception:  # noqa: BLE001 - logging must never replace the failure response
+                    pass  # Diagnostics cannot change the fail-closed result.
+                return self._send(503, diagnostic)
         if path.startswith('/cloud/'):
             import cloud_pairing
-            def load_adapter():
-                adapter_path = _google_setup_py()
-                if not adapter_path:
-                    return None
-                spec = importlib.util.spec_from_file_location('cloud_google_adapter', adapter_path)
-                adapter = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(adapter)
-                return adapter
-            return cloud_pairing.handle(self, path, DATA, adapter_factory=load_adapter,
-                                        on_timezone=accept_cloud_timezone)
+            return cloud_pairing.handle(self, path, DATA, adapter_factory=_cloud_google_adapter,
+                                        on_timezone=accept_cloud_timezone,
+                                        runtime_status=lambda: _runtime_adapter().provisioning_status())
         # Dashboard POSTs (login + the M2 write API) — dashboard.py owns auth/CSRF/lockout.
         if DASHBOARD.owns(path):
             return DASHBOARD.handle(self, "POST", path)
@@ -4690,7 +6292,7 @@ class Handler(BaseHTTPRequestHandler):
                 managed.validate_local_ingress(DATA, body, events=path == "/bridge/events")
             except ValueError:
                 return self._send(403, {"error": "Bridge source is not enabled"})
-        # Reverse-MCP: Hermes' JSON-RPC in → relay to the Bridge → JSON-RPC out.
+        # Reverse-MCP: the chat runtime's JSON-RPC in → relay to the Bridge → JSON-RPC out.
         if path == "/mcp":
             # The read bearer cannot authorize sends. Only the gateway's private,
             # per-boot capability can; claiming an interactive run lane does nothing.
@@ -4721,6 +6323,17 @@ class Handler(BaseHTTPRequestHandler):
         code, resp = handle_trigger(body)
         self._send(code, resp)
 
+    def _client_mcp(self, method):
+        # No grant file means disabled. Never accept the internal root/read bearer here.
+        from types import SimpleNamespace
+        reader = SimpleNamespace(**{key: globals()[key] for key in (
+            '_runtime_source_authority', 'RELAY', 'DATA', '_load_shared_lib', 'RUNTIME_KNOWLEDGE_READ',
+            '_find_sotto_script', '_spawn_env', '_source_context', '_sotto_adapter')})
+        return CLIENT_MCP.handle(self, method, DATA,
+            lambda name, arguments: CLIENT_MCP_BACKEND.read(reader, name, arguments),
+            oauth_authenticate=lambda token: CLIENT_OAUTH.authenticate(DATA, token, DASHBOARD.session_by_digest),
+            oauth_challenge=CLIENT_OAUTH.challenge)
+
     def _send(self, code: int, obj: dict):
         # 204 means "no content" — it must NOT carry a body. Sending one makes strict HTTP/2 clients
         # (curl over Railway's edge) reject the response. The empty long-poll returns 204.
@@ -4733,7 +6346,7 @@ class Handler(BaseHTTPRequestHandler):
         self._write(code, "text/html; charset=utf-8", markup.encode())
 
     def _write(self, code: int, ctype, data):
-        # A client that timed out and hung up (Hermes' keepalive does this on a slow/offline tool call)
+        # A client that timed out and hung up (a keepalive client does this on a slow/offline tool call)
         # closes the socket before we reply → BrokenPipe/ConnectionReset on write. That's expected, not
         # an error: swallow it so it doesn't dump a traceback per disconnect into the logs.
         try:
@@ -4754,6 +6367,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _print_setup_link(base, code):
+    line = f"[sotto] Setup link (open in a browser): {base}/setup?code={urllib.parse.quote(code)}\n"
+    descriptor = os.environ.pop('SOTTO_SETUP_LOG_FD', None)
+    if descriptor is None:
+        print(line, end='', flush=True)
+        return
+    # The supervisor passes one descriptor for this line, while suppressing general output.
+    fd = int(descriptor)
+    if fd < 3:
+        raise ValueError('invalid setup log descriptor')
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
+
+
 def main():
     # Upgrade managed installations linked before connector consent joined the capability file.
     # The reconciler is tenant-bound, allowlisted, and never overrides an explicit revocation.
@@ -4764,8 +6393,8 @@ def main():
     # default to loopback. Security in both cases: the bearer token + TLS at the proxy.
     port = int(os.environ.get("PORT", os.environ.get("SOTTO_TRIGGER_PORT", "8787")))
     bind = os.environ.get("SOTTO_TRIGGER_BIND", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
-    capable, guidance = _hermes_adapter('runtime_api').send_capability()
-    if not capable:
+    ready, guidance = _runtime_adapter().runtime_readiness()
+    if not ready:
         raise SystemExit(guidance)
     # Delivery eligibility is mandatory. A packaged import failure must stop
     # startup before /health advertises a service that cannot deliver anything.
@@ -4774,13 +6403,13 @@ def main():
     # deploy logs (Railway → Deployments → View logs). Everything else about the code is persisted.
     code = resolve_setup_code()
     base = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else f"http://localhost:{port}"
-    print(f"[sotto] Setup link (open in a browser): {base}/setup?code={urllib.parse.quote(code)}", flush=True)
+    _print_setup_link(base, code)
     # Email events (Phase 2): daemon poll thread, gated on google-configured inside the thread.
     start_gmail_poll_thread()
     # Deferred-queue release valve (Step 2 item 3): heartbeat thread, channel-health gated per tick.
     start_valve_thread()
-    # The receiver's own scheduler: crons.json's `runner: receiver` jobs (the two briefs) fire here,
-    # so a scheduled brief is delivered through the outbox like everything else Sotto says.
+    # The receiver's own scheduler: every crons.json job fires here, so a scheduled run is
+    # delivered through the outbox like everything else Sotto says.
     signal.signal(signal.SIGTERM, _stop_work)
     signal.signal(signal.SIGINT, _stop_work)
     start_work_thread()

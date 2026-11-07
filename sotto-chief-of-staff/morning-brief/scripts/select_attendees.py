@@ -3,11 +3,7 @@
 select_attendees.py — deterministically pick the EXTERNAL attendees of today's meetings who
 warrant research, so the agent researches the right people (and only them) before composing.
 
-PORT SOURCE: gemini-flex.ts::processCalendarEvents (the `_needs_research = !isKnown` filter) +
-gemini-research.ts (MAX_ATTENDEES_TO_RESEARCH=25). An attendee needs research unless they are the
-user, share the user's email domain, or are already a known contact / in the knowledge graph. Only
-meetings within the next 72h are considered. The actual research is host-native (the agent's web
-search, per references/research-prompt.md) — this script just decides WHO.
+Only external attendees lacking useful known profiles are selected within the next 72h.
 
 Usage (execute_code): pipe the SAME inputs dict the brief uses (or at least {google, local}):
     select_attendees.py < inputs.json
@@ -19,8 +15,8 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "scripts"))
-from compose_brief import select_attendees_for_research  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "lib"))
+from prep_selection import select_attendees_for_research  # noqa: E402
 
 
 def main():

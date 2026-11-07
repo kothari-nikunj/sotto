@@ -28,9 +28,9 @@ class Policy:
 POLICIES = {
     'notification': Policy(2, 4096), 'triage': Policy(2, 2048), 'digest': Policy(2, 4096),
     'memory_extract': Policy(2, 16384), 'memory_curate': Policy(2, 8192),
-    'brief': Policy(12, 65536, None),
-    'brief_extract': Policy(6, 65536, None), 'brief_critic': Policy(3, 65536, None),
-    'brief_revise': Policy(3, 65536, None), 'followup': Policy(3, 8192),
+    'brief': Policy(12, 65536),
+    'brief_extract': Policy(6, 65536), 'brief_critic': Policy(3, 65536),
+    'brief_revise': Policy(3, 65536), 'followup': Policy(3, 8192),
     'meeting_prep': Policy(3, 65536, None), 'research': Policy(4, 8192),
     'web_search': Policy(2, 65536, None), 'web_fetch': Policy(2, 8192, None),
     'deck_read': Policy(2, 32768, None),
@@ -63,6 +63,17 @@ def implementation_revision():
     root = Path(__file__).resolve().parent
     return revision([(root / name).read_text() for name in
                      ('model_work.py', 'gemini.py', 'gemini_transport.py')])
+
+
+def learning_request_revision(task, system, schema, implementation):
+    """One request contract for both learning latches; credentials never enter its identity."""
+    import gemini_transport
+    return revision([schema, gemini_transport.writing_system(system), implementation,
+                     implementation_revision(), vars(POLICIES[task]),
+                     gemini_transport.effective_compose_model(),
+                     'proxy' if gemini_transport.managed() or gemini_transport.background_proxy_required() else 'direct',
+                     *[os.environ.get(key) for key in ('SOTTO_FALLBACK_MODEL', 'SOTTO_MODEL_PROXY_URL',
+                                                       'SOTTO_OPENAI_BASE_URL', 'SOTTO_DEPLOYMENT_MODE')]])
 
 
 @contextmanager
@@ -104,7 +115,7 @@ def _db():
         with db:
             db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, revision TEXT, '
                        'attempts INTEGER NOT NULL, parked INTEGER NOT NULL, updated REAL NOT NULL)')
-            # parked is a legacy column; parked_requests is the only request-shape latch.
+            # Keep the five-column layout for previous workers during overlap and rollback.
             db.execute('CREATE INDEX IF NOT EXISTS operations_updated ON operations(updated)')
             db.execute('CREATE TABLE IF NOT EXISTS attempts (operation TEXT, attempt INTEGER, metadata TEXT, '
                        'status TEXT, usage TEXT, created REAL, PRIMARY KEY(operation,attempt))')
@@ -150,6 +161,11 @@ def attempt(provider, model, prompt, system=None, schema=None):
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT revision,attempts FROM operations WHERE id=?', (value['id'],)).fetchone()
         attempts = row[1] if row else 0
+        if value['task'] in ('brief_extract', 'brief_critic', 'brief_revise') and db.execute(
+                "SELECT 1 FROM attempts WHERE operation=? AND status='BriefModelOutcomeUncertainError'",
+                (value['id'],)).fetchone():
+            from gemini_transport import BriefModelOutcomeUncertainError
+            raise BriefModelOutcomeUncertainError('brief model outcome uncertain; no automatic retry')
         # A dead worker may have paid for its request: retain it as unknown, never refund usage.
         # Allow only two replacement claims after the provider/worker timeout, then hold visibly.
         recovered = db.execute("SELECT COUNT(*) FROM attempts WHERE operation=? AND status='interrupted_unknown'",
@@ -180,10 +196,11 @@ def attempt(provider, model, prompt, system=None, schema=None):
         admission_refusals = db.execute(
             "SELECT COUNT(*) FROM attempts WHERE operation=? AND status='admission_busy'",
             (value['id'],)).fetchone()[0]
+        # A raw authorization status does not prove proxy non-admission or release its allowance.
         if attempts - recovered - provider_recoveries - admission_refusals >= POLICIES[value['task']].attempts or parked:
             raise ModelWorkHeldError('unchanged model operation exhausted')
         value['attempt'] = attempts + 1
-        db.execute('INSERT OR REPLACE INTO operations VALUES(?,?,?,?,?)',
+        db.execute('INSERT OR REPLACE INTO operations (id,revision,attempts,parked,updated) VALUES(?,?,?,?,?)',
                    (value['id'], request_revision, attempts + 1, 0, time.time()))
         metadata = {k: value[k] for k in ('task', 'id', 'parent', 'run_id')}
         metadata.update(worker_pid=os.getpid(), provider=provider, model=model, request_revision=request_revision,
@@ -230,6 +247,7 @@ def generation_config(model):
     if not value:
         return {}
     policy = POLICIES[value['task']]
+    # Gemini counts thinking and structured answer tokens against this same ceiling.
     config = {'maxOutputTokens': policy.output}
     if policy.thinking and model in LOW_THINKING_MODELS:
         config['thinkingConfig'] = {'thinkingLevel': policy.thinking}

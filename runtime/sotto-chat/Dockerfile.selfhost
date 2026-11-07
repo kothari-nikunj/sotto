@@ -1,0 +1,8 @@
+# Root supervisor overlay on the pinned packaged Node/receiver image.
+# Build with --build-arg RUNTIME_IMAGE=<reviewed image digest>.
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+USER 0:0
+RUN mkdir -p /run/sotto && chmod 0700 /run/sotto
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "-I", "-B", "/app/adapters/sotto/selfhost_bootstrap.py", "--run", "--operator-file", "/run/sotto/selfhost-operator.json"]

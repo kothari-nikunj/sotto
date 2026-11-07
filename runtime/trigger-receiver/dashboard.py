@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dashboard.py — The Window, M1–M3 (docs/plans/web-dashboard-the-window.md): security rails, the
+dashboard.py — The Window, M1–M3 (docs/archive/plans/web-dashboard-the-window.md): security rails, the
 read-only JSON API, the M2 write endpoints, and the M3 live views (calendar via an on-demand
 gather, persisted research cards, the action-ledger timeline) behind the /app web dashboard.
 Stdlib only, same posture as receiver.py.
@@ -65,7 +65,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import date as calendar_date, datetime, timedelta, timezone
 
 # The ids this process must compute IDENTICALLY to the skills tree (queue lines, style samples).
 # keys.py is a byte-identical vendored copy of sotto-chief-of-staff/_shared/lib/keys.py — the
@@ -73,6 +73,9 @@ from datetime import datetime, timedelta, timezone
 # so it cannot import that one. tests/test_docs_drift.py fails if the two files diverge.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keys import queue_key as _queue_key, sample_hash as _style_hash  # noqa: E402
+from shared_lib import load_shared_lib  # noqa: E402
+
+_FUNNEL_POLICY = load_shared_lib("funnel_policy", anchor=__file__)
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -84,16 +87,22 @@ HOOKS = {
     "data_root": lambda: os.environ.get("SOTTO_DATA", "/data"),
     "setup_code": lambda: "",
     "bridge_connected": lambda: False,
+    "client_mcp_diagnostics": lambda: {"retention": "unavailable", "requests": []},
     "last_event_at": lambda: None,
     "google_ok": lambda: False,
+    "calendar_settings": lambda value=None: {"mode": "all", "calendar_ids": [], "needs_reselection": False},
     "connector_status": lambda: [],
     "connector_error": lambda service: None,
     "connector_has_refresh": lambda service: True,
     "source_allowed": lambda service: False,
     "source_health": lambda: {"status": "unavailable", "sources": []},
+    "feedback": lambda: {"available": False},
     # Locates a skills-tree script (receiver wires _find_sotto_script). None → the skills tree is
     # not on this box and every write that needs it answers 503.
     "find_script": lambda *rel: None,
+    # The receiver wires the canonical pending-correction view. Automatic correction activation
+    # remains disabled; the standalone dashboard's legacy default does not inspect a ledger.
+    "project_person": lambda content: content,
     "delivery_effects": lambda: None,
     "relationship_importance": lambda contact, history, now: None,
     # THE atomic JSON write for the image — connectors.write_json, wired by the receiver
@@ -105,16 +114,17 @@ HOOKS = {
     # valve does — this module never spawns anything. Unwired → the control is simply unavailable.
     "promote_queued": lambda key: {"ok": False, "error": "unavailable",
                                    "reason": "promotion isn't available on this box"},
-    # "Run it now": fire one adapters/hermes/crons.json job by name, through the same runner cron
+    # "Run it now": fire one adapters/sotto/crons.json job by name, through the same runner cron
     # uses. `job_names` is the registered list (a gated-off job isn't in it, so the button can't
     # offer what the box won't run).
     "run_job": lambda name: {"ok": False, "error": "unavailable",
                              "reason": "runs aren't available on this box"},
     "job_names": lambda: [],
     "personal_routines": lambda: [],
+    "personal_routines_supported": lambda: True,
     # Delivery honesty for the Cadence panel — which channel briefs and nudges leave by, and
-    # whether it is live right now (the channel's own probe: WhatsApp's "linked (ever)" session
-    # creds, Telegram's captured chat id).
+    # whether it is live right now (the channel's own probe: Photon's authenticated owner DM,
+    # Telegram's captured chat id).
     "delivery_channel": lambda: "telegram",
     "delivery_ready": lambda: False,
     "channel_status": lambda: "unknown",
@@ -143,6 +153,7 @@ STATIC_FILES = {
     # The Connections surface (/setup and its satellite pages in receiver.py) layers this on top of
     # app.css — one product, one set of design tokens across /app and /setup.
     "setup.css": "text/css; charset=utf-8",
+    "client-oauth.css": "text/css; charset=utf-8",
     # Self-hosted typefaces (the CSP forbids Google Fonts). The "fonts/" prefix is part of the
     # whitelist KEY — still an exact-match lookup, so traversal stays structurally impossible.
     # Besley (reading serif) + Martian Mono (label layer) — variable, latin subset, OFL.
@@ -185,26 +196,17 @@ LEDGER_MAX_ROWS = 240                  # /api/ledger row cap after the merge
 # In one sentence: no single source can flood the Record.
 LEDGER_MAX_PER_SOURCE = {"triage": 120, "outcome": 40, "dashboard": 40, "delivery": 40}
 
-# ── Cadence panel bounds + the constants it MIRRORS from the funnel ──────────────────────────────
-# The receiver image cannot import the skills tree (it may not be on the box at all), so the three
-# values below are copies of triage_event.py's. They are read-only display/enable logic — every
-# actual promotion is decided by triage_event.py --promote, which owns the rule. Change one, change
-# both (the same discipline _local_today already carries for the timezone chain).
+# ── Cadence panel bounds ───────────────────────────────────────────────────────────────────────
 QUEUE_TAIL_LINES = 50            # how much of queue.jsonl the waiting room reads (newest N lines)
 QUEUE_SHOWN = 15                 # …and how many of those it renders
 PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting_hold"})
-BUDGET_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "post_meeting", "calendar_change",
-                                   "meeting_prep"})   # mirrors triage_event.BUDGET_EXEMPT_CLASSES
-VALVE_MAX_AGE_MIN_DEFAULT = 240  # mirrors triage_event.VALVE_MAX_AGE_MIN — a real ask from 3h ago
-#                                  still deserves a nudge, a 2-day-old one doesn't; "meeting_hold"
-#                                  entries ignore it (a long meeting must not expire an ask).
-VALVE_MAX_PER_HOUR_DEFAULT = 2   # mirrors triage_event.VALVE_MAX_PER_HOUR — the valve is a trickle,
-#                                  not a flood; promotions spend the daily budget like any nudge.
+BUDGET_EXEMPT_CLASSES = _FUNNEL_POLICY.BUDGET_EXEMPT_CLASSES
+VALVE_MAX_AGE_MIN_DEFAULT = _FUNNEL_POLICY.VALVE_MAX_AGE_MIN
+VALVE_MAX_PER_HOUR_DEFAULT = _FUNNEL_POLICY.VALVE_MAX_PER_HOUR
 # Sotto's own held nudges are never offerable here: the event skill has no branch for one, so
-# "nudge me now" on a queued birthday would ask it to draft a reply to a birthday. Mirrors
-# triage_event.PROACTIVE_SOURCE, which refuses the same rows for real in _valve_candidate.
-PROACTIVE_SOURCE = "proactive"
-CHASE_MAX_DEFAULT = 2            # mirrors continuity_resolve.CHASE_MAX — after two, it's your call
+# "nudge me now" on a queued birthday would ask it to draft a reply to a birthday.
+PROACTIVE_SOURCE = _FUNNEL_POLICY.PROACTIVE_SOURCE
+CHASE_MAX_DEFAULT = _FUNNEL_POLICY.CHASE_MAX
 # Voice card: how many observed samples the Confirm control may offer, and how much of each is
 # rendered. Style samples are VERBATIM messages the user sent, so the card shows a bounded, recent
 # slice rather than the whole fingerprint.
@@ -221,7 +223,7 @@ STYLE_KEY_RE = re.compile(r"\A[0-9a-f]{16}\Z")
 RUN_JOBS = (("sotto-morning-brief", "morning"),
             ("sotto-evening-brief", "evening"),
             ("sotto-midday-digest", "digest"))
-CLAIM_STALE_SECS = 30 * 60       # mirrors receiver.CLAIM_STALE_SECS — a claim older than this died
+CLAIM_STALE_SECS = _FUNNEL_POLICY.CLAIM_STALE_SECS
 
 SLUG_RE = re.compile(r"\A[a-z0-9_-]{1,128}\Z")
 DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
@@ -290,8 +292,7 @@ def _root() -> str:
     return HOOKS["data_root"]()
 
 
-def _iso(ts: float | None = None) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if ts is None else ts))
+_iso = load_shared_lib("utc_time", anchor=__file__).iso_utc
 
 
 def _from_iso(s):
@@ -506,7 +507,13 @@ def _session_record(h):
     token = _cookie(h, "sotto_session")
     if not token:
         return None
-    digest = hashlib.sha256(token.encode()).hexdigest()
+    return session_by_digest(hashlib.sha256(token.encode()).hexdigest(), touch=True)
+
+
+def session_by_digest(digest, *, touch=False):
+    """Validate an existing owner session, including its managed-account lease."""
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        return None
     now = time.time()
     with _SESS_LOCK:
         sess = _load_sessions()
@@ -521,7 +528,7 @@ def _session_record(h):
             except OSError:
                 pass
             return None
-        if now - last >= LAST_SEEN_BUMP_SECS:
+        if touch and now - last >= LAST_SEEN_BUMP_SECS:
             rec["last_seen"] = _iso(now)
             try:
                 _write_sessions(sess)
@@ -692,11 +699,16 @@ def _page(h, code: int, markup: str, login: bool = False):
     _respond(h, code, "text/html; charset=utf-8", markup.encode(), _headers(login=login))
 
 
+def _login_destination(h):
+    import client_oauth
+    return client_oauth.login_return(h) if client_oauth.origin() else "/app"
+
+
 def _login_redirect(h, token: str):
     """302 → clean /app carrying the freshly minted session cookie. The setup code NEVER appears
     in a dashboard URL — this redirect is what scrubs it after ?code=/cookie auto-login."""
     _respond(h, 302, None, None,
-             _headers() + [("Location", "/app"),
+             _headers() + [("Location", _login_destination(h)),
                            ("Set-Cookie", f"sotto_session={token}; Path=/; HttpOnly; Secure; "
                                           "SameSite=Lax")])
 
@@ -849,7 +861,7 @@ def _cloud_consume(h):
                         _headers() + [clear])
     token = mint_session(cloud=cloud)
     _audit("login_ok")
-    return _respond(h, 302, None, None, _headers() + [clear, ("Location", "/app"),
+    return _respond(h, 302, None, None, _headers() + [clear, ("Location", _login_destination(h)),
                     ("Set-Cookie", f"sotto_session={token}; Path=/; HttpOnly; Secure; SameSite=Lax")])
 
 
@@ -944,6 +956,8 @@ def _handle_api(h, path: str):
     try:
         if path == "/api/session":
             return _json(h, 200, {"csrf": _s(rec.get("csrf"))})
+        if path == "/api/client-mcp":
+            return _json(h, 200, HOOKS["client_mcp_diagnostics"]())
         if path == "/api/overview":
             return _json(h, 200, api_overview())
         if path == "/api/loops":
@@ -980,6 +994,8 @@ def _handle_api(h, path: str):
             return _json(h, 200, api_voice())
         if path == "/api/runs":
             return _json(h, 200, api_runs())
+        if path == "/api/calendar-settings":
+            return _json(h, 200, HOOKS["calendar_settings"]())
         if path == "/api/calendar":
             return _json(h, 200, api_calendar())
         if path == "/api/research":
@@ -1020,7 +1036,10 @@ def _list_md(dirname: str):
             continue
         try:
             with open(os.path.join(d, n), encoding="utf-8") as f:
-                meta, _ = parse_frontmatter(f.read())
+                content = f.read()
+            if dirname == 'people':
+                content = HOOKS['project_person'](content)
+            meta, _ = parse_frontmatter(content)
         except OSError:
             continue
         out.append((n[:-3], meta))
@@ -1113,6 +1132,90 @@ def _update_notice() -> dict:
     return {"available": True, "version": version, "current": current, "url": url}
 
 
+_HISTORY_ERROR_CODES = frozenset({
+    'source_not_allowed', 'source_consent_changed', 'bridge_not_configured',
+    'bridge_offline', 'bridge_timeout', 'bridge_not_permitted', 'bridge_rpc_error',
+    'bridge_tool_error', 'provider_request_rejected', 'history_protocol_rejected',
+    'invalid_history_page', 'invalid_history_window', 'history_cursor_did_not_advance',
+    'expired_continuation_token',
+    'continuation_restart_exhausted', 'invalid_continuation_reset', 'rate_limited',
+    'background_budget_exhausted', 'background_budget_not_configured',
+    'background_budget_unavailable', 'model_admission_busy', 'empty_response',
+    'invalid_response', 'invalid_json', 'invalid_schema', 'missing_evidence',
+    'ambiguous_source_reference', 'invalid_shape', 'invalid_person', 'unknown_subject',
+    'repeated_subject', 'invalid_entries', 'invalid_entry', 'empty_text', 'text_length',
+    'reference_count', 'unknown_reference', 'cross_subject_reference',
+})
+
+
+def _history_coverage():
+    # Same packaging seam as tzchain: one source file, copied into receiver-only images.
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, 'history_coverage.py'),
+                      os.path.join(here, '..', '..', 'sotto-chief-of-staff', '_shared', 'lib', 'history_coverage.py')):
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location('history_coverage', candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise RuntimeError('history_coverage.py is missing from receiver package')
+
+
+def _history_window_coverage(window: dict) -> dict:
+    return _history_coverage().window_coverage(window)
+
+
+def _history_learning() -> dict:
+    """Authenticated, consent-filtered checkpoint metadata; never echo diagnostic text."""
+    status, sources = _history_coverage().read_state(_root())
+    rows = []
+    for source in ('imessage', 'whatsapp', 'gmail'):
+        row = {'source': source}
+        try:
+            permitted = HOOKS['source_allowed'](source) is True
+        except Exception:  # A failed authority read cannot expose retained source progress.
+            permitted = False
+        if not permitted:
+            rows.append({**row, 'checkpoint': 'withheld'})
+            continue
+        window = sources.get(source)
+        checkpoint = ('unknown' if status == 'unknown' or source in sources and not isinstance(window, dict)
+                      else 'present' if isinstance(window, dict) else 'absent')
+        row['checkpoint'] = checkpoint
+        if checkpoint == 'present':
+            last = window.get('last_success')
+            try:
+                parsed = datetime.fromisoformat(last.replace('Z', '+00:00')) if isinstance(last, str) and len(last) <= 64 else None
+                row['last_success'] = (parsed.replace(tzinfo=parsed.tzinfo or timezone.utc)
+                                       .astimezone(timezone.utc).isoformat()) if parsed is not None else None
+            except (ValueError, OverflowError):
+                row['last_success'] = None
+            row['complete'] = window.get('complete') if type(window.get('complete')) is bool else None
+            for key in ('pages', 'reviewed'):
+                value = window.get(key)
+                row[key] = value if type(value) is int and 0 <= value <= 1_000_000_000 else None
+            code = window.get('error_code')
+            row['error_code'] = (code if isinstance(code, str) and code in _HISTORY_ERROR_CODES else
+                                 'other' if code or window.get('error') else None)
+            stage = window.get('error_stage')
+            row['error_stage'] = stage if stage in ('fetch', 'memory_extraction', 'local_learning') else 'other' if stage else None
+            row['rejected_request'] = bool(window.get('rejected_request_revision'))
+            row['coverage'] = _history_window_coverage(window)
+        rows.append(row)
+    return {'status': status, 'sources': rows}
+
+
+def _knowledge_repair_status() -> str:
+    try:
+        with os.scandir(os.path.join(_root(), "knowledge", ".journal-repair")) as records:
+            return "needs_repair" if next(records, None) is not None else "clear"
+    except FileNotFoundError:
+        return "clear"
+    except OSError:
+        return "unavailable"
+
+
 def api_overview() -> dict:
     today = _local_today()
     try:
@@ -1123,14 +1226,33 @@ def api_overview() -> dict:
         source_health = HOOKS["source_health"]()
     except Exception:  # noqa: BLE001  # Diagnostics cannot withhold the dashboard.
         source_health = {"status": "unavailable", "sources": []}
+    runtime_health = None
+    try:
+        observation = HOOKS.get("runtime_observation", lambda: None)()
+        if observation is None:
+            feedback = HOOKS["feedback"]()
+        else:
+            feedback = observation['feedback']
+            runtime_health = observation['runtime_health']
+    except Exception:  # Diagnostics cannot withhold the dashboard.
+        feedback = {"available": False}
+        runtime_health = {"status": "read_failed"}
+    try:
+        loops_active = len(api_loops()["loops"])
+    except Exception:  # /api/loops fails closed; an uncertain count cannot withhold the overview.
+        loops_active = None
     return {
         "date": today,
         "briefs_today": _brief_delivery_states(today),
-        "loops_active": len(api_loops()["loops"]),
+        "loops_active": loops_active,
         "last_event_at": last_event,
         "bridge_connected": _hook_bool("bridge_connected"),
         # Authenticated overview only. Public /health never exposes per-source activity counts.
         "source_health": source_health,
+        "history_learning": _history_learning(),
+        "knowledge_repair": _knowledge_repair_status(),
+        "feedback": feedback,
+        **({"runtime_health": runtime_health} if runtime_health is not None else {}),
         # One row per thing that can be disconnected. The delivery channel is named, not assumed:
         # "WhatsApp isn't linked" was a lie on a Telegram deploy.
         "services": {
@@ -1212,20 +1334,14 @@ def api_loops() -> dict:
             surface_count = helper.delivered_surface_count
     except (AttributeError, ImportError, OSError, RuntimeError, SyntaxError, KeyError):
         pass
-    d = os.path.join(_root(), "knowledge", "continuity")
-    try:
-        names = sorted(os.listdir(d))
-    except OSError:
-        names = []
+    # The receiver captures/rechecks authority and reuses the protected source-union
+    # projection. Missing helpers or uncertain grants fail closed through the API's 503.
+    rows = HOOKS["permitted_loop_rows"]()
+    # The protected YAML parser preserves date types; the dashboard schema uses strings.
+    def date_text(value):
+        return value.isoformat() if isinstance(value, (calendar_date, datetime)) else _s(value)
     loops, parked = [], []
-    for n in names:
-        if not n.endswith(".md"):
-            continue
-        try:
-            with open(os.path.join(d, n), encoding="utf-8") as f:
-                meta, _ = parse_frontmatter(f.read())
-        except OSError:
-            continue
+    for meta in rows:
         status = _s(meta.get("status")).lower()
         if status not in ACTIVE_LOOP_STATUSES and status != PARKED_LOOP_STATUS:
             continue
@@ -1240,22 +1356,25 @@ def api_loops() -> dict:
             "action_type": action_type,
             "channel": _s(meta.get("channel")),
             "contact_name": _s(meta.get("contact_name")),
+            "contact_identifier": _s(meta.get("contact_identifier")),
+            "canonical_id": _s(meta.get("canonical_id")),
             "status": status,
-            "created_at": _s(meta.get("created_at")),
+            "created_at": date_text(meta.get("created_at")),
             "times_surfaced": surfaced,
             "summary": _s(meta.get("summary")),
-            "meeting_time": _s(meta.get("meeting_time")) or None,
+            "ask": _s(meta.get("ask")),
+            "meeting_time": date_text(meta.get("meeting_time")) or None,
             # The one editable field. A deadline never expires a loop (nothing does): it orders the
             # brief and marks the row overdue. "Later" is a snooze or a park, not a date.
-            "deadline": _s(meta.get("deadline"))[:10] or None,
+            "deadline": date_text(meta.get("deadline"))[:10] or None,
             "source": _s(meta.get("source")) or None,
             # Chase state — written ONLY by continuity_resolve. The dashboard is positioned as a
             # complete alternative to chat, and chat can already say "chased once, Tuesday"; without
             # these four fields this page could not. `chased_out` is the hand-off: chased its two
             # times with no answer, so it is the user's call now (nudge again, or let it go).
             "chased_count": chased,
-            "last_chased_at": _s(meta.get("last_chased_at"))[:10] or None,
-            "chase_after": _s(meta.get("chase_after"))[:10] or None,
+            "last_chased_at": date_text(meta.get("last_chased_at"))[:10] or None,
+            "chase_after": date_text(meta.get("chase_after"))[:10] or None,
             "chased_out": chased >= CHASE_MAX_DEFAULT,
         })
     loops.sort(key=lambda x: x["created_at"], reverse=True)
@@ -1411,7 +1530,10 @@ def api_person(slug: str):
         path = os.path.join(_root(), "knowledge", dirname, slug + ".md")
         try:
             with open(path, encoding="utf-8") as f:
-                meta, body = parse_frontmatter(f.read())
+                content = f.read()
+            if typ == 'person':
+                content = HOOKS['project_person'](content)
+            meta, body = parse_frontmatter(content)
         except OSError:
             continue
         raw_facts = meta.pop("facts", None)
@@ -1420,6 +1542,8 @@ def api_person(slug: str):
         if isinstance(raw_facts, dict):
             for fid, fv in raw_facts.items():
                 if not isinstance(fv, dict):
+                    continue
+                if fv.get('archived_reason') == 'source_withdrawn':
                     continue
                 conf = fv.get("conf")
                 facts.append({
@@ -1617,8 +1741,6 @@ def _snooze_state(ex: dict) -> dict:
         target = datetime.fromisoformat(stamp.replace("Z", "+00:00")).replace(tzinfo=None)
     except (TypeError, ValueError):
         return {"until": until, "active": False}   # a broken stamp never silences Sotto
-    # The FIFTH copy of the timezone chain lived here, found by the guard test the day the other
-    # four were collapsed (Sep 3, 2026). tzchain answers; its last rung is UTC, never the server.
     now_local = _tzchain().local_now(_root()).replace(tzinfo=None)
     return {"until": until, "active": now_local < target}
 
@@ -1634,7 +1756,7 @@ def _meeting_hold_hint() -> str:
     now = datetime.now().astimezone()
     latest = None
     for ev in snap.get("events") or []:
-        if not isinstance(ev, dict) or ev.get("all_day"):
+        if not isinstance(ev, dict) or ev.get("all_day") or ev.get("busy") is False:
             continue
         atts = ev.get("attendees")
         if not isinstance(atts, list) or not atts:
@@ -1757,6 +1879,7 @@ def api_cadence() -> dict:
         "waiting_total": waiting_total,
         "intentions": intentions[:20],
         "routines": routines[:10] if isinstance(routines, list) else [],
+        "routines_supported": bool(HOOKS['personal_routines_supported']()),
     }
 
 
@@ -1958,10 +2081,6 @@ def _date_shift(date: str, days: int) -> str:
         return ""
 
 
-# The calendar gather + its 10-minute cache used to live here. It moved to calcache.py (reached
-# through HOOKS["calendar_snapshot"]) so the dashboard endpoint and the triage in-meeting hold
-# consume ONE cache — see that module's header. What stays here is the serve-time knowledge-graph
-# join below: the cache is raw by design, and only the docket wants attendees to carry identities.
 
 # The knowledge-graph join for the docket: email → {name, title, company, slug} from
 # knowledge/people frontmatter (`identifiers` carries the emails). Cached ~10 min alongside the
@@ -2035,7 +2154,7 @@ def api_calendar() -> dict:
     snap = HOOKS["calendar_snapshot"]()
     if not isinstance(snap, dict):      # None = skills tree absent (or the hook is unwired)
         return {"events": [], "unavailable": True}   # cheap check — nothing worth caching
-    events = [{key: value for key, value in event.items() if key != "_id"}
+    events = [{key: value for key, value in event.items() if not key.startswith("_")}
               for event in (snap.get("events") or [])]
     return {"events": _enrich_calendar_events(events),
             "generated_at": _s(snap.get("generated_at")),
@@ -2502,6 +2621,10 @@ def _handle_api_post(h, path: str):
             return _post_person_relations(h, m.group(1), body)
         if path == "/api/loops":
             return _post_loops(h, body)
+        if path == "/api/calendar-settings":
+            result = HOOKS["calendar_settings"](body)
+            _audit("write", endpoint=path, target="calendar selection", op="select")
+            return _json(h, 200, result)
         if path == "/api/prefs":
             return _post_prefs(h, body)
         if path == "/api/master":

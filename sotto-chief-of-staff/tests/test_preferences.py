@@ -3,6 +3,8 @@ import importlib.util
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
+import stat
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, "..")
@@ -52,8 +54,7 @@ def test_load_explicit_shape_when_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     ex = pr.load_explicit()
     assert ex == {"mute_senders": [], "mute_people": [], "mute_sections": [], "tone_notes": [],
-                  "vip_people": [], "nudge_snooze_until": "", "brief_audio": "",
-                  "nudge_budget": ""}
+                  "vip_people": [], "nudge_snooze_until": "", "nudge_budget": ""}
 
 
 def test_nudge_budget_controls_halves_zero_restores_and_clamps(tmp_path, monkeypatch):
@@ -166,6 +167,83 @@ def test_snooze_verbs_write_and_clear_through_the_cli(tmp_path, monkeypatch, cap
     assert "error" in json.loads(capsys.readouterr().out)
 
 
+def test_admitted_owner_quiet_receipt_survives_lost_response_and_later_cli_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    proof = {'action_id': 'a' * 64, 'event_id': 'b' * 64, 'payload_hash': 'c' * 64,
+             'text_hash': 'd' * 64, 'identity_digest': 'e' * 64,
+             'command': '/quiet for 2h', 'admitted_at_ms': 1791178200000,
+             'provider_thread_id': 'telegram:123', 'zone': 'America/Los_Angeles'}
+    pr.add('mute_people', 'Bob Smith')
+    first = pr.admitted_owner_quiet(proof, '2026-10-05T09:00')
+    assert first['snooze_until'] == '2026-10-05T09:00'
+    assert pr.admitted_owner_quiet(proof, '2026-10-05T09:00', inspect=True) == first
+    pr.set_scalar('nudge_snooze_until', '')
+    assert pr.admitted_owner_quiet(proof, '2026-10-05T09:00') == first
+    saved = json.loads((tmp_path / 'preferences.json').read_text())
+    assert saved['explicit']['nudge_snooze_until'] == ''
+    assert saved['explicit']['mute_people'] == ['Bob Smith']
+    assert saved['owner_quiet_receipts'][proof['action_id']] == first
+    changed = dict(proof, payload_hash='f' * 64)
+    import pytest
+    with pytest.raises(pr.OwnerQuietConflictError):
+        pr.admitted_owner_quiet(changed, '2026-10-05T09:00', inspect=True)
+    saved['owner_quiet_receipts'][proof['action_id']] = None
+    (tmp_path / 'preferences.json').write_text(json.dumps(saved))
+    with pytest.raises(pr.OwnerQuietConflictError):
+        pr.admitted_owner_quiet(proof, '2026-10-05T09:00')
+
+
+def test_admitted_quiet_and_cli_mutation_share_lock_and_preserve_neighbors(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    proof = {'action_id': '1' * 64, 'event_id': '2' * 64, 'payload_hash': '3' * 64,
+             'text_hash': '4' * 64, 'identity_digest': '5' * 64,
+             'command': '/quiet off', 'admitted_at_ms': 1791178200000,
+             'provider_thread_id': 'telegram:123', 'zone': 'UTC'}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tasks = [pool.submit(pr.admitted_owner_quiet, proof, ''),
+                 pool.submit(pr.add, 'vip_people', 'Sarah Chen')]
+        for task in tasks:
+            task.result()
+    saved = json.loads((tmp_path / 'preferences.json').read_text())
+    assert saved['explicit']['nudge_snooze_until'] == ''
+    assert saved['explicit']['vip_people'] == ['Sarah Chen']
+    assert saved['owner_quiet_receipts'][proof['action_id']]['event_id'] == proof['event_id']
+
+
+def test_admitted_quiet_inspect_syncs_uncertain_rename_before_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    proof = {'action_id': '1' * 64, 'event_id': '2' * 64, 'payload_hash': '3' * 64,
+             'text_hash': '4' * 64, 'identity_digest': '5' * 64,
+             'command': '/quiet for 1h', 'admitted_at_ms': 1791178200000,
+             'provider_thread_id': 'telegram:123', 'zone': 'UTC'}
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_directory_once(fd):
+        nonlocal failed
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not failed:
+            failed = True
+            raise OSError('synthetic directory barrier loss')
+        return original_fsync(fd)
+
+    monkeypatch.setattr(pr.os, 'fsync', fail_directory_once)
+    import pytest
+    with pytest.raises(OSError):
+        pr.admitted_owner_quiet(proof, '2026-10-05T10:00')
+    assert failed
+    sync_types = []
+
+    def recording_fsync(fd):
+        sync_types.append('directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+        return original_fsync(fd)
+
+    monkeypatch.setattr(pr.os, 'fsync', recording_fsync)
+    recovered = pr.admitted_owner_quiet(proof, '2026-10-05T10:00', inspect=True)
+    assert recovered['snooze_until'] == '2026-10-05T10:00'
+    assert sync_types[-2:] == ['file', 'directory']
+    assert json.loads((tmp_path / 'preferences.json').read_text())['explicit']['nudge_snooze_until'] == '2026-10-05T10:00'
+
+
 
 
 # ── VIP: the user's stated list (the dashboard's toggle and chat write the same file) ────────────
@@ -198,24 +276,6 @@ def test_explicit_vip_list_is_persisted(tmp_path, monkeypatch):
     data = json.load(open(os.path.join(str(tmp_path), "preferences.json")))
     assert data["explicit"]["vip_people"] == ["Sarah Chen"]
     assert "vip_people" in pr.LISTS and "vip_people" in pr.empty_explicit()
-
-
-def test_brief_audio_is_a_validated_scalar(tmp_path, monkeypatch, capsys):
-    """One sentence: your briefs arrive as voice notes too, whenever you say so — off|morning|
-    evening|both, 'off' clears, junk is refused, and the learner's scalar protection applies."""
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    import sys as _sys
-    monkeypatch.setattr(_sys, "argv", ["preferences.py", "brief-audio", "both"])
-    pr.main(); assert json.loads(capsys.readouterr().out)["brief_audio"] == "both"
-    monkeypatch.setattr(_sys, "argv", ["preferences.py", "brief-audio", "off"])
-    pr.main(); assert json.loads(capsys.readouterr().out)["brief_audio"] == ""
-    monkeypatch.setattr(_sys, "argv", ["preferences.py", "brief-audio", "loud"])
-    try:
-        pr.main(); raised = False
-    except SystemExit as e:
-        raised = e.code == 2
-    assert raised and "off|morning|evening|both" in capsys.readouterr().out
-    assert "brief_audio" in pr.SCALARS   # the learner carries scalars forward untouched
 
 
 # ── concurrency: the write that used to vanish ───────────────────────────────────────────────────
@@ -256,3 +316,84 @@ def test_draft_grading_does_not_rewrite_corrupt_preferences(tmp_path):
     result = _spawn(script, [], tmp_path)
     assert result.returncode == 0, result.stderr
     assert p.read_text() == "{not json"
+
+
+def test_offset_snooze_with_naive_clock_uses_configured_zone(monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'America/Los_Angeles')
+    ex = {'nudge_snooze_until': '2026-10-08T08:20:12.345+00:00'}
+    assert pr.snooze_active(datetime(2026, 10, 8, 1, 20, 12, 344000), ex)
+    assert not pr.snooze_active(datetime(2026, 10, 8, 1, 20, 12, 345000), ex)
+    local = datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/Los_Angeles'))
+    assert pr.resolve_snooze_spec('1h', now_local=local) == '2026-03-08T02:30'
+    assert pr.parse_snooze('2026-10-08T08:20:12.345+00:00') == datetime(2026, 10, 8, 8, 20, 12, 345000)
+    assert pr.snooze_active(local, {'nudge_snooze_until': '2026-03-08T02:30'})
+    assert pr.snooze_active(datetime(2026, 10, 7, 23, 59), {'nudge_snooze_until': '2026-10-08'})
+
+
+def _preference_proof(i, operation='clear-tone'):
+    return {'domain': 'sotto.owner-preference-tool.v1', 'event_id': f'e{i}', 'action_id': f'a{i}',
+            'payload_hash': 'a' * 64, 'text_hash': 'b' * 64, 'identity_digest': 'c' * 64,
+            'args_hash': 'd' * 64, 'args': {'operation': operation}, 'admitted_at_ms': 1,
+            'provider_thread_id': 't'}
+
+
+def test_owner_command_receipts_are_bounded_newest_first(tmp_path, monkeypatch):
+    """Every owner command left a receipt forever (500 commands → 365 KB, read on every scan and
+    brief). Receipts only answer a retry with its original outcome, so the newest are kept."""
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    for i in range(pr.RECEIPTS_KEPT + 50):
+        pr.admitted_owner_preference(_preference_proof(i))
+    receipts = json.load(open(pr._path()))['owner_preference_receipts']
+    assert list(receipts) == [f'e{i}' for i in range(50, pr.RECEIPTS_KEPT + 50)]
+    newest = _preference_proof(pr.RECEIPTS_KEPT + 49)
+    assert pr.admitted_owner_preference(newest) == {'operation': 'clear-tone', 'count': 0}   # still a replay
+    assert len(json.load(open(pr._path()))['owner_preference_receipts']) == pr.RECEIPTS_KEPT
+
+
+def test_receipt_bound_never_drops_in_flight_or_just_written_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    receipts = {'old-settling': {'tag': 'x', 'proof': {}, 'status': 'contacting'},
+                'old-contacting': {'tag': 'x', 'proof': {}, 'status': 'contacting'},
+                'old-cleanup': {'tag': 'loop_cleanup', 'proof': {}, 'progress': []}}
+    receipts.update({f'e{i}': {'proof': {}, 'outcome': {}} for i in range(pr.RECEIPTS_KEPT)})
+    data = {'explicit': {}, 'owner_preference_receipts': receipts}
+    pr._durable_preferences_replace(pr._path(), data)
+    # An old in-flight receipt settles in place; one-shot records do not use the scalar cap.
+    receipts['old-settling'] = {'tag': 'x', 'proof': {}, 'status': 'committed'}
+    pr._durable_preferences_replace(pr._path(), data)
+    saved = json.load(open(pr._path()))['owner_preference_receipts']
+    assert {'old-contacting', 'old-cleanup', 'old-settling'} <= set(saved)
+    assert len(saved) == pr.RECEIPTS_KEPT + 3 and 'e0' in saved and 'e99' in saved
+    assert len(receipts) == pr.RECEIPTS_KEPT + 3
+    # Another file written through the same durable replace is never pruned.
+    other = tmp_path / 'routines.json'
+    pr._durable_preferences_replace(str(other), {'owner_preference_receipts': {f'x{i}': {'outcome': 1}
+                                                                              for i in range(300)}})
+    assert len(json.load(open(other))['owner_preference_receipts']) == 300
+
+
+def test_scalar_bound_keeps_existing_one_shot_effect_fences(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    protected = {
+        'offer': {'proof': {}, 'offer': {'kind': 'procedure', 'offer_id': 'one', 'detail': 'Rule.'},
+                  'status': 'committed', 'outcome': {}},
+        'priority': {'tag': 'owner_priorities', 'proof': {}, 'proposal': {'action_id': 'two'},
+                     'status': 'committed', 'outcome': {}},
+        'context': {'tag': 'owner_context', 'proof': {}, 'proposal': {'action_id': 'three'},
+                    'status': 'committed', 'outcome': {}},
+        'correction': {'tag': 'person_fact_correct', 'proof': {}, 'status': 'committed',
+                       'receipt': {}},
+        'cleanup': {'tag': 'loop_cleanup', 'proof': {}, 'args': {'proposal': {'action_id': 'four'}},
+                    'progress': [], 'receipt': {}},
+        'calendar': {'tag': 'owner_calendar', 'proof': {}, 'status': 'unknown'},
+    }
+    pr._durable_preferences_replace(pr._path(),
+                                    {'explicit': {}, 'owner_preference_receipts': protected.copy()})
+    for i in range(pr.RECEIPTS_KEPT + 50):
+        pr.admitted_owner_preference(_preference_proof(i))
+    saved = json.load(open(pr._path()))['owner_preference_receipts']
+    assert {key: saved[key] for key in protected} == protected
+    assert len(saved) == len(protected) + pr.RECEIPTS_KEPT
+    assert list(saved)[-pr.RECEIPTS_KEPT:] == [f'e{i}' for i in range(50, pr.RECEIPTS_KEPT + 50)]

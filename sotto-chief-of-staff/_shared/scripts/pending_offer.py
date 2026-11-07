@@ -4,14 +4,13 @@ pending_offer.py — the one question Sotto is currently waiting on an answer to
 
 THE BUG THIS EXISTS FOR (real WhatsApp transcript, Aug 2026): the 11:15 proactive tick sent
 "You're meeting Shivani in ~44 min at Sightglass — want me to pull full prep on her?". At 11:44
-the user replied "Sure". The gateway session that received "Sure" had never seen the question —
-the nudge was composed and delivered by a DETACHED run (the cron lane today, `hermes send`
-tomorrow) — so it resolved the bare affirmative against the last thing in its own history, a
+the user replied "Sure". The chat session that received "Sure" had never seen the question —
+the nudge was composed and delivered by a DETACHED run (the receiver's cron lane) — so it resolved the bare affirmative against the last thing in its own history, a
 group-chat item from the morning brief, and answered about that. The user had to retype "Give me
 full prep on Shivani".
 
 No prompt can fix a session that does not contain the question. So the question is written down
-where the other process can read it: the lane that ASKS calls `set`, the gateway that receives the
+where the other process can read it: the lane that ASKS calls `set`, the reply path that receives the
 bare "sure" calls `get`, acts on what comes back, and calls `clear`.
 
     pending_offer.py set --kind meeting_prep --person "Shivani" \
@@ -61,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import jsonstore  # noqa: E402
 
-KINDS = ("meeting_prep", "commitment", "chase", "handoff", "procedure", "intention")
+KINDS = ("meeting_prep", "commitment", "chase", "handoff", "procedure", "intention", "followup_draft")
 DEFAULT_TTL_MIN = 180   # a question goes stale in three hours; a named constant, not a knob
 
 # Declining an offer is not cancelling its obligation. Only explicit completion/cancellation
@@ -71,7 +70,7 @@ DISMISS_DROPPED = ("let it go", "drop it", "stop tracking this", "drop this loop
 DECLINE_OFFER = ("no", "nah", "nope", "no thanks", "no thank you", "not now", "not yet",
                  "skip", "skip it", "leave it", "forget it")
 LOOP_KINDS = frozenset(("chase", "commitment", "handoff"))
-# accepted_at is the receiver's clock after `hermes send` returns; the reply timestamp is the
+# accepted_at is the receiver's clock after the runtime send returns; the reply timestamp is the
 # provider's. A question accepted within this window of the reply may be what it answers.
 ACCEPT_SKEW_SECONDS = 5
 
@@ -102,7 +101,8 @@ def payload_hash(payload: bytes) -> str:
 
 def set_offer(kind: str, question: str, person: str = "", detail: str = "",
               ttl_min: int = DEFAULT_TTL_MIN, payload_sha256: str = "", anchor_key: str = "",
-              action: str = "") -> dict:
+              action: str = "", source_loop_snapshot: dict | None = None, meeting: dict | None = None,
+              ambiguous: bool = False, prepare_only: bool = False) -> dict:
     """Stage a detached question, or record the visible direct interactive question.
 
     `payload_sha256` is set only when the yes causes a real effect; the payload itself is never
@@ -122,19 +122,42 @@ def set_offer(kind: str, question: str, person: str = "", detail: str = "",
         "action": action or "",
         "expires_at": (now + timedelta(minutes=ttl_min)).isoformat(),
     }
+    if type(ambiguous) is not bool or type(prepare_only) is not bool:
+        raise ValueError('offer preparation invalid')
+    if ambiguous:
+        offer['ambiguous'] = True
+    if meeting is not None:
+        from timeutil import _parse_ts
+        start = _parse_ts(meeting.get('start')) if isinstance(meeting, dict) else None
+        if (kind != 'meeting_prep' or not isinstance(meeting, dict)
+                or set(meeting) != {'event_id', 'start'}
+                or not isinstance(meeting['event_id'], str) or not meeting['event_id']
+                or not isinstance(meeting['start'], str) or start is None or start.tzinfo is None):
+            raise ValueError('meeting occurrence invalid')
+        offer['meeting'] = dict(meeting)
+    if kind in LOOP_KINDS and anchor_key:
+        snapshot = source_loop_snapshot
+        if snapshot is not None:
+            offer['loop_snapshot'] = snapshot
     import delivery_effects
     ident = delivery_effects.run_id()
     if ident:
         # The reply gateway must never discover an offer whose question failed to send.
-        offer['offer_id'] = payload_hash((ident + json.dumps({k: offer[k] for k in
-            ('kind', 'question', 'anchor_key', 'payload_sha256', 'action')}, sort_keys=True)).encode())
+        identity = {k: offer[k] for k in ('kind', 'question', 'anchor_key', 'payload_sha256', 'action')}
+        if meeting is not None:
+            identity['meeting'] = offer['meeting']
+        if ambiguous:
+            identity['ambiguous'] = True
+        offer['offer_id'] = payload_hash((ident + json.dumps(identity, sort_keys=True)).encode())
         if os.environ.get('SOTTO_CRON_DELIVER') == 'photon':
             offer['chat_id'] = os.environ.get('PHOTON_HOME_CHANNEL', '')
-        delivery_effects.stage([{'kind': 'pending_offer', 'offer': offer}])
-    else:
+        if not prepare_only:
+            delivery_effects.stage([{'kind': 'pending_offer', 'offer': offer}])
+    elif not prepare_only:
         path = _path()
         with jsonstore.lock(path):
-            jsonstore.write_atomic(path, offer)
+            accepted = _accepted_records(jsonstore.read(path, {}))
+            jsonstore.write_atomic(path, {'offers': [offer], 'accepted': accepted} if accepted else offer)
     return offer
 
 
@@ -145,8 +168,7 @@ def activate_offer(offer, receipt):
     with jsonstore.lock(_path()):
         state = jsonstore.read(_path(), {})
         offers = _retained_offers(state)
-        accepted = {key: expiry for key, expiry in state.get('accepted', {}).items()
-                    if (_parse(expiry) or _now()) > _now()}
+        accepted = _accepted_records(state)
         if offer['offer_id'] in accepted:
             return
         accepted[offer['offer_id']] = offer['expires_at']
@@ -390,6 +412,83 @@ def main() -> None:
     else:
         expected = get_offer(a.offer_id, a.message_id) if a.offer_id or a.message_id else None
         print('cleared' if (expected is None or expected) and clear_offer(expected=expected) else 'none')
+
+
+
+
+def _accepted_records(state):
+    return {key: value for key, value in state.get('accepted', {}).items()
+            if (_parse(value.get('expires_at') if isinstance(value, dict) else value) or _now()) > _now()}
+
+
+def inspect_reply(event_id, proof_hash):
+    with jsonstore.lock(_path()):
+        state = jsonstore.read(_path(), {})
+        matches = [value['reply'] for value in _accepted_records(state).values()
+                   if isinstance(value, dict) and isinstance(value.get('reply'), dict)
+                   and value['reply'].get('event_id') == event_id]
+    if not matches:
+        return None
+    if len(matches) != 1 or matches[0].get('proof_hash') != proof_hash:
+        raise ValueError('offer reply event conflict')
+    return matches[0]['receipt']
+
+
+def settle_reply(offer, saved, apply=None):
+    """Atomically retain the original receipt and clear only this delivered snapshot."""
+    with jsonstore.lock(_path()):
+        state = jsonstore.read(_path(), {})
+        accepted = _accepted_records(state)
+        old = accepted.get(offer['offer_id'])
+        if isinstance(old, dict) and old.get('reply') not in (None, saved):
+            raise ValueError('offer reply event conflict')
+        if isinstance(old, dict) and old.get('reply') == saved:
+            return saved['receipt']
+        items = state.get('offers', [state])
+        if offer not in items or not _fresh_offer(offer):
+            raise ValueError('offer reply target changed')
+        if apply is not None:
+            apply()
+        accepted[offer['offer_id']] = {'expires_at': offer['expires_at'], 'reply': saved}
+        items = state.get('offers', [state])
+        offers = [_delivery_anchor(item) if item == offer else item for item in items]
+        jsonstore.write_atomic(_path(), {**state, 'offers': offers, 'accepted': accepted})
+        return saved['receipt']
+
+
+def loop_snapshot(anchor, row=None):
+    """Bind a producer-selected current source obligation, never a model-supplied row.
+
+    Without a supplied row the read is scoped to `anchor`; an unavailable read binds nothing.
+    """
+    import delivery_effects
+    from ledger_provenance import source_loop_sources
+    from protected_ledger_io import ProtectedLedgerUnavailableError, load_protected_scope
+    if row is not None:
+        rows = [row]
+    else:
+        try:
+            rows = load_protected_scope(os.environ.get('SOTTO_DATA', '/data'), [anchor])[0]
+        except ProtectedLedgerUnavailableError:
+            return None
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    try:
+        sources = set(source_loop_sources(row))
+    except ValueError:
+        return None
+    ident = delivery_effects.run_id()
+    if ident:
+        doc = jsonstore.read(str(delivery_effects._path(ident)), {})
+        for effect in doc.get('effects', []):
+            if effect.get('kind') == 'source_permissions':
+                sources.update(effect.get('sources', []))
+    from ledger_provenance import CANONICAL_SOURCES
+    if not sources or not sources <= set(CANONICAL_SOURCES):
+        return None
+    return {'anchor_key': anchor, 'version': delivery_effects.loop_version(row),
+            'identity': delivery_effects.loop_identity(row), 'sources': sorted(sources)}
 
 
 if __name__ == "__main__":

@@ -166,8 +166,7 @@ def test_proactive_worker_uses_direct_procedure_and_run_identity(rec, tmp_path, 
     assert not rec._WORK_PROCESSES
 
 
-def test_proactive_does_not_require_hermes(rec, monkeypatch):
-    monkeypatch.setenv('SOTTO_RUN_SKILL', 'missing-hermes')
+def test_proactive_queues_its_declared_procedure_without_another_runner(rec, monkeypatch):
     monkeypatch.setattr(rec.shutil, 'which', lambda command: None)
     monkeypatch.setattr(rec, '_delivery_channel_ready', lambda label: True)
     calls = []
@@ -179,7 +178,7 @@ def test_proactive_does_not_require_hermes(rec, monkeypatch):
 @pytest.mark.parametrize('failure_at', ['adapter', 'receipt'])
 def test_pre_spawn_failure_cleans_private_event_staging(rec, tmp_path, monkeypatch, failure_at):
     job = {'id': 'b' * 32, 'kind': 'event', 'payload': {'bundle': {'events': []}}}
-    real_adapter = rec._hermes_adapter('runtime_api')
+    real_adapter = rec._runtime_adapter()
     staged_paths = []
     def adapter(runner, prompt, *args):
         path = Path(json.loads(prompt)['bundle_path'])
@@ -187,10 +186,11 @@ def test_pre_spawn_failure_cleans_private_event_staging(rec, tmp_path, monkeypat
         staged_paths.append(path)
         if failure_at == 'adapter':
             raise RuntimeError('adapter failed')
-        return real_adapter.run_argv(runner, prompt, *args)
+        return real_adapter.run_argv(runner, prompt)
     def receipt(*args, **kwargs):
         raise RuntimeError('receipt failed')
-    monkeypatch.setattr(rec, '_hermes_adapter', lambda _: SimpleNamespace(run_argv=adapter))
+    monkeypatch.setattr(rec, '_runtime_adapter', lambda: SimpleNamespace(
+        run_argv=adapter, validate_fixed_work=lambda *_args: None))
     monkeypatch.setattr(rec, '_record_delivery', receipt)
     monkeypatch.setattr(rec.subprocess, 'Popen', lambda *a, **k: pytest.fail('child started'))
     with pytest.raises(RuntimeError, match=f'{failure_at} failed'):
@@ -223,6 +223,8 @@ def test_worker_timeout_stops_nested_composer(rec, tmp_path, monkeypatch):
 
     monkeypatch.setattr(rec.subprocess, 'Popen', start)
     monkeypatch.setattr(rec, 'ONESHOT_TIMEOUT_SECS', 0)
+    # An inline parent/grandchild pair stands in for the composer; the fence is tested elsewhere.
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_args: None)
     try:
         with pytest.raises(TimeoutError, match='work timed out'):
             rec._execute_work(job)
@@ -287,3 +289,146 @@ def test_transient_memory_admission_failure_still_retries(rec, monkeypatch):
     rec._background_context_tick()
     rec._background_context_tick()
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize('quiet',[False,True])
+def test_attended_actual_intention_scanner_and_composer_overlap(quiet,tmp_path,monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA',str(tmp_path))
+    monkeypatch.setenv('SOTTO_TIMEZONE','UTC')
+    monkeypatch.setenv('SOTTO_QUIET_START','0');monkeypatch.setenv('SOTTO_QUIET_END','0')
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID','a'*32)
+    monkeypatch.setenv('SOTTO_PROACTIVE_CAPTURED_SOURCES','[]')
+    monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF',json.dumps({'source_revision':'a'*64,'route_digest':'b'*64}))
+    monkeypatch.syspath_prepend(str(PACK/'_shared/lib'));monkeypatch.syspath_prepend(str(PACK/'_shared/scripts'))
+    import ask_research_pipeline
+    import schedule_wakeup
+    from datetime import datetime,timedelta,timezone
+    monkeypatch.setattr(ask_research_pipeline,'current_authority',lambda:{'complete':True,'revision':'a'*64})
+    row=schedule_wakeup.create((datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat(),'Review the Cedar deck')
+    if quiet:
+        import preferences
+        preferences.set_scalar('nudge_snooze_until',preferences.resolve_snooze_spec('tomorrow'))
+    request={'pack':str(PACK),'kind':'proactive','selection':{'mode':'current'},'work_key':'skill:'+'d'*64}
+    output=procedure_runner.run(request)
+    assert (output=='NO_NUDGES')==quiet
+    if not quiet:
+        assert 'Cedar deck' in output
+        # A different scheduled run shares the original pending candidate reservation.
+        monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID','b'*32)
+        assert procedure_runner.run(request)=='NO_NUDGES'
+    assert schedule_wakeup.current()[0]['id']==row['id']
+
+
+def test_attended_revoked_authority_stops_before_scan(tmp_path,monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA',str(tmp_path))
+    monkeypatch.setenv('SOTTO_PROACTIVE_CAPTURED_SOURCES','[]')
+    monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF',json.dumps({'source_revision':'a'*64,'route_digest':'b'*64}))
+    monkeypatch.syspath_prepend(str(PACK/'_shared/lib'));monkeypatch.syspath_prepend(str(PACK/'_shared/scripts'))
+    import ask_research_pipeline
+    monkeypatch.setattr(ask_research_pipeline,'current_authority',lambda:{'complete':False})
+    monkeypatch.setattr(procedure_runner.subprocess,'run',lambda *a,**k:pytest.fail('revoked scanner'))
+    with pytest.raises(RuntimeError,match='source authority changed'):
+        procedure_runner.run({'pack':str(PACK),'kind':'proactive','work_key':'skill:'+'d'*64})
+
+
+@pytest.mark.parametrize('mode',['eligible','quiet','off','empty'])
+def test_attended_calendar_actual_pipeline_and_shared_outbox(mode,tmp_path,monkeypatch):
+    from datetime import datetime,timedelta,timezone
+    monkeypatch.setenv('SOTTO_DATA',str(tmp_path));monkeypatch.setenv('SOTTO_TIMEZONE','UTC')
+    monkeypatch.setenv('SOTTO_QUIET_START','0');monkeypatch.setenv('SOTTO_QUIET_END','0')
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID','a'*32)
+    monkeypatch.setenv('SOTTO_PROACTIVE_CAPTURED_SOURCES','["calendar"]')
+    monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF',json.dumps({'source_revision':'a'*64,'route_digest':'b'*64}))
+    monkeypatch.syspath_prepend(str(PACK/'_shared/lib'));monkeypatch.syspath_prepend(str(PACK/'_shared/scripts'))
+    import ask_research_pipeline, source_context, preferences, delivery_effects
+    monkeypatch.setattr(ask_research_pipeline,'current_authority',lambda:{'complete':True,'revision':'a'*64})
+    monkeypatch.setattr(source_context,'read_local',lambda:pytest.fail('ungranted local read'))
+    if mode=='quiet':
+        preferences.set_scalar('nudge_snooze_until',preferences.resolve_snooze_spec('tomorrow'))
+    if mode=='off':
+        preferences.set_scalar('nudge_budget','0')
+    now=datetime.now(timezone.utc)
+    events=[] if mode=='empty' else [{'id':'cedar-occurrence','summary':'Cedar review',
+        'start':(now+timedelta(minutes=10)).isoformat(),'end':(now+timedelta(minutes=40)).isoformat(),
+        'attendees':[{'email':'dana@example.com','displayName':'Dana','responseStatus':'accepted'}]}]
+    actual=procedure_runner.subprocess.run
+    def transport(argv,**kwargs):
+        if Path(argv[1]).name=='gather_google.py':
+            Path(argv[argv.index('--cal-out')+1]).write_text(json.dumps(events))
+            return SimpleNamespace(returncode=0,stdout='Saved events')
+        return actual(argv,**kwargs)
+    monkeypatch.setattr(procedure_runner.subprocess,'run',transport)
+    request={'pack':str(PACK),'kind':'proactive','work_key':'skill:'+'d'*64,'selection':{'mode':'current'}}
+    output=procedure_runner.run(request)
+    if mode!='eligible':
+        assert output=='NO_NUDGES'
+        return
+    assert 'Dana' in output
+    doc=json.loads((tmp_path/('events/delivery-effects-'+'a'*32+'.json')).read_text())
+    assert any(e['kind']=='unsolicited_nudge' for e in doc['effects'])
+    assert any(e.get('calendar_event_id')=='cedar-occurrence' for e in doc['effects'])
+    # Concurrent cron uses the same scanner state and cannot reserve the same occurrence.
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID','b'*32)
+    monkeypatch.delenv('SOTTO_PROACTIVE_CAPTURED_SOURCES')
+    monkeypatch.setattr(source_context,'read_local',lambda:{})
+    assert procedure_runner.run({'pack':str(PACK),'kind':'proactive'})=='NO_NUDGES'
+    from test_outbox import _load_outbox,_transaction
+    box=_load_outbox('attended_calendar_box');sends=[]
+    box.HOOKS.update(data_root=lambda:str(tmp_path),json_transaction=_transaction,
+        local_today=lambda:now.date().isoformat(),valid=lambda payload:delivery_effects.valid(payload['effects'],time.time()),
+        send=lambda *a:(sends.append(a) or (True,'',{'acceptance':'accepted','message_id':'synthetic-accepted'})),
+        on_delivered=lambda payload:delivery_effects.finalize(payload['effects'],payload.get('receipt') or {}),
+        record=lambda *a,**k:None)
+    box._enqueue('a'*32,box.KIND_NUDGE,{'label':'skill:'+'d'*64+':proactive','body':output,
+        'target':'owner','effects':doc['effects']},time.time(),now.date().isoformat())
+    assert box._attempt('a'*32)
+    assert len(sends)==1
+    box._attempt('a'*32)
+    assert len(sends)==1
+
+
+def test_real_scheduled_location_update_uses_prior_cache_observation(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    clock = datetime.now(timezone.utc)
+    zone = ZoneInfo("Pacific/Honolulu" if clock.hour in (0, 23) else "UTC")
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', 'a' * 32)
+    monkeypatch.setenv('SOTTO_TIMEZONE', zone.key)
+    monkeypatch.setenv('SOTTO_QUIET_START', '0')
+    monkeypatch.setenv('SOTTO_QUIET_END', '0')
+    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
+    monkeypatch.syspath_prepend(str(PACK / '_shared/lib'))
+    import delivery_effects
+    import source_context
+    monkeypatch.setattr(source_context, 'read_local', lambda: {})
+    now = clock.astimezone(zone)
+    start = (now + timedelta(minutes=20)).isoformat()
+    assert all((now + delta).date() == now.date() for delta in
+               (timedelta(minutes=20), timedelta(minutes=-5), timedelta(seconds=-60)))
+    observed = (now - timedelta(seconds=60)).isoformat()
+    event = {'id': 'cal:location', 'start': start, 'summary': 'Design review', 'location': 'Room B',
+             'attendees': [{'email': 'guest@outside.test', 'displayName': 'Guest'}]}
+    delivery_effects.finalize([{'kind': 'meeting_prep_delivered', 'mode': 'full',
+        'calendar_event_id': event['id'], 'calendar_start': start,
+        'prep_location': 'Room A', 'prep_route_digest': 'b' * 64}],
+        {'accepted_at': (now - timedelta(minutes=5)).timestamp(), 'route_proof_version': 1, 'route_digest': 'b' * 64})
+    cache = tmp_path / 'cache/calendar_today.json'; cache.parent.mkdir()
+    cache.write_text(json.dumps({'status': 'ok', 'complete': True, 'projection': 'day',
+        'date': now.date().isoformat(), 'generated_at': observed, 'refresh_secs': 120,
+        'events': [{'id': event['id'], 'start': start, 'prep_location': 'Room B'}]}))
+    actual = procedure_runner.subprocess.run
+    calls = []
+    def invoke(argv, **kwargs):
+        calls.append(Path(argv[1]).name)
+        if calls[-1] == 'gather_google.py':
+            Path(argv[argv.index('--cal-out') + 1]).write_text(json.dumps([event]))
+            return SimpleNamespace(returncode=0, stdout='Synthetic calendar\n')
+        return actual(argv, **kwargs)
+    monkeypatch.setattr(procedure_runner.subprocess, 'run', invoke)
+    assert procedure_runner.run({'pack': str(PACK), 'kind': 'proactive'}) == 'Design review location changed to Room B.'
+    staged = json.loads((tmp_path / 'events' / ('delivery-effects-' + 'a' * 32 + '.json')).read_text())
+    update = next(row for row in staged['effects'] if row['kind'] == 'prep_location_update')
+    assert update['calendar_observed_at'] == observed
+    assert delivery_effects.valid(staged['effects'], now.timestamp())
+    assert calls == ['gather_google.py', 'proactive_scan.py']

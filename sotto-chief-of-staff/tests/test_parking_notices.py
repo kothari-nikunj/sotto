@@ -87,6 +87,27 @@ def test_direct_receipt_names_small_notice_without_em_dash(monkeypatch):
     assert "—" not in lines[0] and "/app#loops" not in lines[0]
 
 
+def test_parking_notice_truncates_summary_at_a_word_boundary():
+    row = _row("long", summary="Please review the comprehensive parking arrangement for Friday morning")
+
+    line, represented = cb._parking_notice([row])
+
+    assert line == ("Parks tomorrow unless you say *keep*: Maya Chen: "
+                    "Please review the comprehensive parking arrangement for…")
+    assert represented == [row]
+
+
+def test_parking_notice_uses_any_whitespace_boundary_and_bounds_one_long_token():
+    whitespace_row = _row("tab", summary="a" * 55 + "\tFriday morning")
+    token_row = _row("token", summary="x" * 70)
+
+    whitespace_line, _ = cb._parking_notice([whitespace_row])
+    token_line, _ = cb._parking_notice([token_row])
+
+    assert whitespace_line.endswith("a" * 55 + "…")
+    assert token_line.endswith("x" * cb.RECEIPT_WHAT_MAX + "…")
+
+
 def test_weekly_parked_count_excludes_muted_rows_and_uses_natural_keep_copy(monkeypatch):
     retune_scan = importlib.import_module("retune_scan")
     rows = [{**_row("visible"), "status": "parked"},
@@ -150,3 +171,10 @@ def test_delivery_rejects_changed_or_muted_parking_notice(monkeypatch):
     prefs["mute_senders"] = []
     prefs["mute_sections"] = ["what moved today"]
     assert not de.parking_notice_valid(effect, at)
+
+
+def test_parking_preview_keeps_context_when_first_word_precedes_a_long_url():
+    summary = "Send https://docs.example.test/very-long-document-name-final-redlined-v3.pdf"
+    line, represented = cb._parking_notice([_row("url", summary=summary)])
+    assert summary[:cb.RECEIPT_WHAT_MAX] + "…" in line
+    assert len(represented) == 1

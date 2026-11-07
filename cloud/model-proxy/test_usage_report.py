@@ -96,13 +96,16 @@ def test_usage_migration_preserves_old_calls(tmp_path, monkeypatch):
         db.execute('ALTER TABLE calls DROP COLUMN usage_json')
         db.execute('ALTER TABLE calls DROP COLUMN metadata_json')
     ledger = server.Ledger(path)
-    ledger.finish(call, 200, {'prompt_tokens': 100, 'completion_tokens': 30,
+    ledger.finish(call, 200, {'prompt_tokens': 100, 'completion_tokens': 30, 'total_tokens': 150,
                              'prompt_tokens_details': {'cached_tokens': 80},
                              'completion_tokens_details': {'reasoning_tokens': 20}})
     with sqlite3.connect(path) as db:
-        usage = json.loads(db.execute('SELECT usage_json FROM calls WHERE id=?', (call,)).fetchone()[0])
-    assert usage['billed_output_tokens'] == 30 and usage['visible_output_tokens'] == 10
-    assert usage['estimated_token_cost'] == pytest.approx(.0001335)
+        allowance, usage_json = db.execute('SELECT allowance,usage_json FROM calls WHERE id=?', (call,)).fetchone()
+        usage = json.loads(usage_json)
+    assert allowance == 200  # an old schema does not turn missing total-token proof into a refund
+    assert usage['billed_output_tokens'] == 50 and usage['visible_output_tokens'] == 30
+    assert usage['reasoning_tokens'] == 20 and usage['reported_total_tokens'] == 150
+    assert usage['estimated_token_cost'] == pytest.approx(.0002085)
 
 
 def test_chat_cost_bounds_and_authenticated_owner_are_reported(tmp_path, monkeypatch):
@@ -113,14 +116,15 @@ def test_chat_cost_bounds_and_authenticated_owner_are_reported(tmp_path, monkeyp
                                        {'application': 'sotto', 'deployment': 'pilot'})
     for owner in ('owner-one', 'owner-two'):
         call = ledger.reserve(owner, None, 'chat', 'gemini-3.8-flash', metadata=metadata)
-        ledger.finish(call, 200, {'prompt_tokens': 1000, 'completion_tokens': 300})
+        ledger.finish(call, 200, {'prompt_tokens': 1000, 'completion_tokens': 300,
+                                  'total_tokens': 1400})
     result = report.report(path, 2, now=datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc))
     assert result['timezone'] == 'UTC'
     assert {g['owner'] for g in result['groups']} == {'owner-one', 'owner-two'}
     for group in result['groups']:
         assert group['deployment'] == 'pilot'
         assert group['known_token_cost'] is None
-        assert group['bounded_token_cost'] == {'lower': .0012, 'upper': .001875}
+        assert group['bounded_token_cost'] == {'lower': .001575, 'upper': .00225}
         assert group['unbounded_cost_requests'] == 0
 
 
@@ -136,14 +140,15 @@ def test_legacy_rows_report_their_proxy_id_and_bounded_totals_never_double_count
     chat = ledger.reserve('owner', None, 'chat', 'gemini-3.8-flash',
                           metadata=server.request_metadata({}, {'messages': []}, 'chat',
                                                            {'application': 'sotto', 'deployment': 'pilot'}))
-    ledger.finish(chat, 200, {'prompt_tokens': 1000, 'completion_tokens': 300})
+    ledger.finish(chat, 200, {'prompt_tokens': 1000, 'completion_tokens': 300,
+                              'total_tokens': 1400})
     result = report.report(path, 2, now=datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc), billed_total=.01)
     old = next(g for g in result['groups'] if g['workload'] == 'brief')
     assert old['deployment'] == 'unknown' and old['proxy_deployment'] == 'railway-abc'
     assert old['known_token_cost'] is not None and old['bounded_token_cost'] is None
     assert old['unbounded_cost_requests'] == 0
     new = next(g for g in result['groups'] if g['route'] == 'chat')
-    assert new['known_token_cost'] is None and new['bounded_token_cost']['upper'] == .001875
-    assert result['bounded_token_cost'] == {'lower': .0012, 'upper': .001875}
+    assert new['known_token_cost'] is None and new['bounded_token_cost']['upper'] == .00225
+    assert result['bounded_token_cost'] == {'lower': .001575, 'upper': .00225}
     assert result['billing_reconciliation']['residual_to_upper_bound'] == round(
-        .01 - result['known_token_cost'] - .001875, 6)
+        .01 - result['known_token_cost'] - .00225, 6)

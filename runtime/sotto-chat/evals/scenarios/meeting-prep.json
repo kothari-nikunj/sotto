@@ -1,0 +1,106 @@
+{
+  "name": "natural-exact-prep-and-contextual-followup",
+  "world": {
+    "meetingPrep": true,
+    "savedSourceGrants": [
+      "calendar"
+    ],
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"calendar\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "calendarEvents": [
+      {
+        "id": "routinecalendar01",
+        "summary": "Routine weekly check-in with Ada",
+        "description": "Our regular status check-in. No materials requested.",
+        "start": {
+          "dateTime": "{{ISO+1h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+2h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "displayName": "Ada",
+            "responseStatus": "accepted"
+          }
+        ]
+      },
+      {
+        "id": "fixturecalendar01",
+        "summary": "Cedar notebook pickup review with Ada",
+        "description": "Pick up the cedar notebook from Ada at the west entrance. Confirm the handoff details together and review the clinic pilot notes in the notebook.",
+        "start": {
+          "dateTime": "{{ISO+54h}}"
+        },
+        "end": {
+          "dateTime": "{{ISO+55h}}"
+        },
+        "organizer": {
+          "email": "owner@inside.test",
+          "self": true
+        },
+        "attendees": [
+          {
+            "email": "owner@inside.test",
+            "self": true,
+            "responseStatus": "accepted"
+          },
+          {
+            "email": "ada@example.invalid",
+            "displayName": "Ada",
+            "responseStatus": "accepted"
+          }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    {
+      "text": "Give me full prep for the Cedar notebook pickup review with Ada.",
+      "contains": [
+        "notebook",
+        "west entrance"
+      ],
+      "minReplies": 2,
+      "meetingPrep": {
+        "eventId": "fixturecalendar01",
+        "newJob": true,
+        "artifactContains": [
+          "notebook",
+          "west entrance"
+        ]
+      },
+      "latencyClass": "brief"
+    },
+    {
+      "text": "Make that three questions I can ask her.",
+      "contains": [
+        "notebook"
+      ],
+      "meetingPrep": {
+        "eventId": "fixturecalendar01",
+        "newJob": false,
+        "artifactContains": [
+          "notebook",
+          "west entrance"
+        ]
+      },
+      "canonicalUnchanged": true,
+      "googleReads": 0,
+      "publicReads": 0,
+      "maxCharacters": 1000,
+      "latencyClass": "ordinary"
+    }
+  ]
+}

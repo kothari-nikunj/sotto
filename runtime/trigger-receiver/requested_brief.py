@@ -8,6 +8,36 @@ import re
 LABEL = re.compile(r'^requested:([a-f0-9]{32}):sotto-(morning|evening)-brief$')
 
 
+def telegram_binding(proof, authority):
+    """Retain the exact independently proved owner route, including the bot identity."""
+    fields = ('route_digest', 'bot_fingerprint', 'provider_thread_id', 'tenant_id',
+              'owner_id', 'account_id', 'line_key')
+    if (not isinstance(proof, dict) or proof.get('version') != 1
+            or proof.get('status') != 'current_channel_proved'
+            or proof.get('action_authorized') is not False
+            or any(not isinstance(proof.get(key), str) or not proof[key] for key in fields)
+            or any(re.fullmatch('[a-f0-9]{64}', proof[key]) is None
+                   for key in ('route_digest', 'bot_fingerprint'))
+            or not proof['owner_id'].isascii() or not proof['owner_id'].isdigit()
+            or proof['provider_thread_id'] != 'telegram:' + proof['owner_id']):
+        raise ValueError('requested Telegram route unavailable')
+    if (not isinstance(authority, dict) or authority.get('complete') is not True
+            or not isinstance(authority.get('revision'), str)
+            or re.fullmatch('[a-f0-9]{64}', authority['revision']) is None):
+        raise ValueError('requested Telegram source authority unavailable')
+    return {**{key: proof[key] for key in fields}, 'source_revision': authority['revision']}
+
+
+def known_brief_kind(payload):
+    """Only canonical named morning/evening lanes prove an unrelated edition."""
+    label = payload.get('label') if isinstance(payload, dict) else None
+    if not isinstance(label, str):
+        return None
+    match = LABEL.fullmatch(label) or re.fullmatch(
+        r'(?:brief|cron|run-now):sotto-(morning|evening)-brief', label)
+    return match.groups()[-1] if match else None
+
+
 def owner_destination(root, owner, chat_id, tenant_id):
     """Verify the normalized owner route independently of the agent backend."""
     if not owner:
@@ -49,6 +79,8 @@ def accepted_artifact(root, day, kind, allowed):
             if (not accepted.intersection(artifact.get('_delivery_run_ids', []))
                     or not isinstance(artifact.get('brief_text'), str)
                     or not artifact['brief_text'].strip()):
+                continue
+            if artifact.get('_composition_direction'):
                 continue
             sources = artifact.get('_source_permissions')
             if not isinstance(sources, list) or not all(isinstance(s, str) and allowed(s) for s in sources):

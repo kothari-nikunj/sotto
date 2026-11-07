@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
@@ -30,16 +31,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "lib"))
 import jsonstore  # noqa: E402
 import ledger_io  # noqa: E402
+from ledger_provenance import classify_ledger_sources, digest_frontmatter  # noqa: E402
 import log_outcome  # noqa: E402
 from brief_validate import is_name_shaped  # noqa: E402  (one owner for "is this a person's name")
 from textutil import _is_likely_automated, unwrap_tool_result  # noqa: E402
-from timeutil import _env_tz, _now_local, _resolve_tz, configured_tz  # noqa: E402
+from timeutil import _calendar_day, _env_tz, _now_local, _resolve_tz, configured_tz  # noqa: E402
 
 TERMINAL_RETENTION_DAYS = 30          # continuity.rs:13
 DEADLINE_GRACE_DAYS = 2              # legacy undated meeting-shadow retirement grace
 CHASE_AFTER_DAYS = 3                 # default for SOTTO_CHASE_AFTER_DAYS (deadline-less waiting_ons)
 CHASE_MAX = ledger_io.CHASE_MAX      # after two chases, stop nudging and hand it to sotto-loops
-# A loop-update quote shorter than this is a fragment, not evidence ("T", "done", "sent").
+# Short evidence must quote the whole observed message, never a selected fragment.
 MIN_EVIDENCE_QUOTE_CHARS = 12
 # The direction eligible for reminder chases — defined once in ledger_io so the resolver,
 # loops_query and retune_scan cannot disagree about which way an obligation points.
@@ -97,7 +99,8 @@ def _normalize_action(a: dict) -> dict:
         "summary": g("summary") or g("contextSummary") or g("prose") or "",
         "ask": g("ask") or g("contextAsk"),
         "meeting_time": g("meeting_time") or g("meetingTime"),
-        "deadline": g("deadline") or g("deadlineDate") or g("contextDeadline"),
+        "deadline": (_calendar_day(g("deadline")) or _calendar_day(g("deadlineDate"))
+                     or _calendar_day(g("contextDeadline"))),
         "created_at": g("created_at"),
         "source": g("source"),
         "source_refs": g("source_refs") or g("evidence"),
@@ -170,7 +173,8 @@ def _normalize_identifier_for_anchor(value: str):
     if re.fullmatch(r"\+?[\d\s().-]+", trimmed):
         digits = re.sub(r"\D", "", trimmed)
         if len(digits) >= 10:
-            return digits[-10:]
+            from textutil import normalize_phone_for_comparison
+            return normalize_phone_for_comparison(trimmed)
     return trimmed.lower()
 
 
@@ -255,7 +259,7 @@ def _same_counterpart(a: dict, b: dict) -> bool:
     return _counterpart_key(a) == _counterpart_key(b)
 
 
-def _same_verified_counterpart(a: dict, b: dict) -> bool:
+def _same_verified_counterpart(a: dict, b: dict, person_index: dict | None = None) -> bool:
     """An explicit loopId may target a row only through a verified counterpart identity.
 
     A shared display name is too weak to let a model-supplied ID rewrite another obligation.
@@ -264,20 +268,65 @@ def _same_verified_counterpart(a: dict, b: dict) -> bool:
     """
     anchor = contact_anchor(a.get("canonical_id"), a.get("contact_identifier"),
                             a.get("contact_name", ""), a.get("group_id"))
-    return _is_strong_anchor(anchor) and _same_counterpart(a, b)
+    if _is_strong_anchor(anchor) and _same_counterpart(a, b):
+        return True
+    if (not person_index or a.get('group_id') or b.get('group_id')
+            or action_family(a.get('action_type', '')) != action_family(b.get('action_type', ''))):
+        return False
+    identifiers = [alias_identifier(row.get('contact_identifier') or '') for row in (a, b)]
+    unique = person_index.get('unique_identifiers') or {}
+    cids = [unique.get(identifier) for identifier in identifiers]
+    return bool(all(identifiers) and cids[0] and cids[0] == cids[1]
+                and all(not row.get('canonical_id') or row['canonical_id'] == cids[0] for row in (a, b)))
 
 
-def _obligation_key(a: dict, items: dict, origin_key: str = "") -> str:
+def _obligation_key(a: dict, items: dict, origin_key: str = "", person_index: dict | None = None, existing_keys: set | None = None) -> str | None:
     named = _s(a.get("loop_id"))
     if named:
         row = items.get(named)
-        if row and _same_verified_counterpart(a, row):
+        birthday_dates = {_s(ref.get('sourceId'))[-10:] for ref in a.get('source_refs') or []
+                          if isinstance(ref, dict) and ref.get('sourceType') == 'contacts'}
+        if (row and _same_verified_counterpart(a, row, person_index)
+                and (a.get('resolution_mode') != 'birthday_greeting'
+                     or (row.get('resolution_mode') == 'birthday_greeting'
+                         and named.rsplit(':birthday:', 1)[-1] in birthday_dates))):
             return named
     base = compute_anchor_key(a)
+    if a.get('resolution_mode') == 'birthday_greeting':
+        dates = {_s(ref.get('sourceId'))[-10:] for ref in a.get('source_refs') or []
+                 if isinstance(ref, dict) and ref.get('sourceType') == 'contacts'}
+        if len(dates) != 1:
+            return None
+        return base + ':birthday:' + next(iter(dates))
     if origin_key:
+        exact, candidates = [], []
+        current = json.loads(origin_key)
         for key, row in items.items():
-            if _s(row.get("origin_key")) == origin_key and _same_counterpart(a, row):
-                return key
+            if not (_same_counterpart(a, row) or _same_verified_counterpart(a, row, person_index)):
+                continue
+            stored = _s(row.get('origin_key'))
+            try:
+                prior = json.loads(stored)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(prior, list) or len(prior) not in (3, 4):
+                continue
+            clauses = prior[2] if isinstance(prior[2], list) else sorted({
+                " ".join(_s(r.get('snippet')).split()) for r in row.get('source_refs') or []
+                if isinstance(r, dict) and _s(r.get('snippet')).strip()})
+            if current[1:3] != [prior[1], clauses]:
+                continue
+            if len(prior) == 4 and current[3] == prior[3]:
+                exact.append(key)
+            elif existing_keys is None or key in existing_keys:
+                candidates.append(key)
+        # Prose only distinguishes the first capture of sibling asks sharing one clause.
+        # Later paraphrases may reuse a unique origin, but never pick a sibling by position.
+        matches = exact or candidates
+        if len(matches) > 1:
+            return None  # conflicting retained task origins cannot authorize a new row
+        if len(matches) == 1:
+            return matches[0]
         # The first observed obligation for a counterpart owns the stable base while retaining its
         # origin identity. That lets an ordinary paraphrase and a later flagged replay converge on
         # the same row; only explicit siblings need origin-suffixed keys.
@@ -291,7 +340,10 @@ def _obligation_key(a: dict, items: dict, origin_key: str = "") -> str:
     refs = _request_evidence(a)
     if refs:
         matches = [key for key, row in items.items()
-                   if _same_counterpart(a, row) and refs & _request_evidence(row)]
+                   if (_same_counterpart(a, row) or _same_verified_counterpart(a, row, person_index))
+                   and refs & _request_evidence(row)]
+        if len(matches) > 1 and any(not _same_counterpart(a, items[key]) for key in matches):
+            return None  # alias identity does not choose among several evidence-bound asks
         if len(matches) == 1:
             return matches[0]
     # Ordinary extraction is deliberately stable across prose changes. A second obligation must
@@ -317,7 +369,24 @@ def _prior_anchor_keys(a: dict) -> set:
     tid = _s(a.get("source_thread_id")).strip()
     if tid and not _s(a.get("group_id")).strip():
         keys.add(_thread_key(a, tid))
+    # Legacy: a phone anchor was once the LAST TEN digits, which cut an international number's
+    # country code. Derived only from this identity's own number, so a row moves onto its full
+    # number and never onto another person's by name or by a shared suffix.
+    legacy_phone = _legacy_phone_anchor_identifier(a.get("contact_identifier"))
+    if legacy_phone:
+        keys |= _prior_anchor_keys({**a, "contact_identifier": legacy_phone})
     return keys
+
+
+def _legacy_phone_anchor_identifier(value) -> str | None:
+    """The last-ten-digit identifier the old phone rule anchored on, when it differs from today's."""
+    trimmed = _s(value).strip()
+    if not re.fullmatch(r"\+?[\d\s().-]+", trimmed):
+        return None
+    digits = re.sub(r"\D", "", trimmed)
+    if len(digits) <= 10 or _normalize_identifier_for_anchor(trimmed) == digits[-10:]:
+        return None
+    return digits[-10:]
 
 
 def _legacy_group_phone_keys(a: dict, group_index: dict) -> set:
@@ -418,14 +487,52 @@ except Exception:  # noqa: BLE001  # pragma: no cover — the graph is always im
     _kg = _kgu = None
 
 
+def alias_identifier(value) -> str:
+    """The key `unique_identifiers` is built and looked up with: the graph's own normalizer, the
+    one `build_people_index`/`resolve_canonical_id` use, so a WhatsApp JID and the same phone meet
+    (and a rotating `@lid` never does). Anchor composition keeps `_normalize_identifier_for_anchor`."""
+    return _kg.normalize_identifier(_s(value)) if _kg else ""
+
+
 def person_identity() -> dict:
     """The knowledge graph's people index plus a path→canonical_id reverse map, or {} when there is
-    no graph to resolve against. Built ONCE per resolve — one directory scan, not one per action."""
+    no graph to resolve against. Built ONCE per resolve; exact alias uniqueness is checked locally, not per action."""
     if not (_kg and _kgu):
         return {}
     try:
         idx = _kg.build_people_index()
-        return {"index": idx,
+        identifiers, names, people = {}, {}, {}
+        scan_complete = True
+        unreadable_files = 0
+        # The original index keeps one path per identifier; retain collisions locally so an
+        # alias match cannot silently choose the last of two different canonical people.
+        import glob
+        for path in glob.glob(os.path.join(_kg.people_dir(), '*.md')):
+            try:
+                with open(path, encoding='utf-8') as handle:
+                    person = _kg.parse_person_file(handle.read())
+            except Exception:  # unreadable graph cannot prove unique alias ownership
+                scan_complete = False
+                unreadable_files += 1
+                continue
+            for identifier in person.identifiers:
+                normalized = alias_identifier(identifier)
+                if normalized:
+                    identifiers.setdefault(normalized, set()).add(person.canonical_id)
+            name = _kg.safe_slug(person.name or '')
+            if name:
+                names.setdefault(name, set()).add(person.canonical_id)
+            people[person.canonical_id] = person
+        unique = {identifier: next(iter(cids)) for identifier, cids in identifiers.items()
+                  if scan_complete and len(cids) == 1 and _kg.valid_canonical_id(next(iter(cids)))}
+        if unreadable_files:
+            print(f"[continuity_resolve] identity read incomplete: {unreadable_files} person files; "
+                  "new unbound captures held", file=sys.stderr)
+        return {"index": idx, "unique_identifiers": unique, "identity_scan_complete": scan_complete,
+                "ambiguous_identifiers": set(identifiers) - set(unique),
+                "conflicting_identifiers": {identifier for identifier, cids in identifiers.items() if len(cids) > 1},
+                "ambiguous_names": {name for name, cids in names.items() if len(cids) > 1},
+                "people_by_cid": people,
                 "cid_by_path": {os.path.realpath(p): cid for cid, p in (idx.get("by_cid") or {}).items()}}
     except Exception:  # noqa: BLE001
         return {}
@@ -449,14 +556,22 @@ def resolve_canonical_id(name, identifier, person_index: dict) -> str:
     debt, so this asks the graph's exact index (`find_person_file` — the same lookup
     `resolve_relation_target` opens with) and stops there. A machine label ("Board sync", an email
     prefix) is never a person at all."""
-    if not (person_index and _kg):
+    if not (person_index and _kg) or person_index.get('identity_scan_complete') is False:
         return ""
     name, identifier = _s(name).strip(), _s(identifier).strip()
     index = person_index.get("index") or {}
     try:
         if identifier:
+            # The general people index retains one path per handle. A contested handle
+            # cannot choose that arbitrary owner when anchoring or migrating a debt.
+            if alias_identifier(identifier) in (person_index.get('conflicting_identifiers') or set()):
+                return ""
             path = _kg.find_person_file(identifier=identifier, index=index)
         elif name and is_name_shaped(name):
+            # The graph's display-name index chooses the most recently touched person.
+            # That display fallback cannot establish ownership of a commitment.
+            if _kg.safe_slug(name) in (person_index.get('ambiguous_names') or set()):
+                return ""
             path = _kg.find_person_file(name=name, index=index)
         else:
             path = None
@@ -533,8 +648,8 @@ def _identifiers_match(a: str, b: str) -> bool:
 # ── Source-bound cross-channel evidence ────────────────────────────────────────────
 # The brief may propose completion only for a named loop revision and a cited source message. The
 # validator below confirms direction, timestamp, verbatim text and counterpart identity across
-# email, iMessage and WhatsApp. Mere contact, any generic reply, a call or a calendar event closes
-# nothing.
+# email, iMessage and WhatsApp, or a verified connected outgoing call for a callback obligation.
+# Mere contact, any generic reply, a dial attempt or a calendar event closes nothing.
 
 def _digits(s: str) -> str:
     return "".join(c for c in (s or "") if c.isdigit())
@@ -551,11 +666,14 @@ def _phone_matches(a: str, b: str) -> bool:
     da, db = _digits(a), _digits(b)
     if len(da) < 7 or len(db) < 7:
         return False
-    return (da[-10:] if len(da) > 10 else da) == (db[-10:] if len(db) > 10 else db)
+    from textutil import normalize_phone_for_comparison
+    return normalize_phone_for_comparison(a) == normalize_phone_for_comparison(b)
 
 
 def _handle_matches(handle: str, ident: str) -> bool:
     if handle == ident:
+        return True
+    if _jid_matches_phone(handle, ident) or _jid_matches_phone(ident, handle):
         return True
     if "@" in handle and "@" in ident:
         return handle.lower() == ident.lower()
@@ -570,12 +688,14 @@ def _jid_matches_phone(jid: str, phone: str) -> bool:
 
 
 def _collect_all_identifiers(primary: str, contact_name: str, local: dict) -> list:
-    """Expand only a contact card containing the primary identifier; a shared name proves nothing."""
+    """Expand one uniquely matching card, and never borrow an alias shared with another card."""
     ids = [primary] if primary else []
-    for contact in local.get("contacts") or []:
-        values = [*(contact.get("emails") or []), *(contact.get("phones") or [])]
-        if primary and any(_handle_matches(primary, _s(value)) for value in values):
-            ids.extend(_s(value) for value in values if value)
+    cards = [[_s(value) for value in [*(contact.get('emails') or []), *(contact.get('phones') or [])]
+              if value] for contact in local.get('contacts') or [] if isinstance(contact, dict)]
+    matches = [values for values in cards if primary and any(_handle_matches(primary, value) for value in values)]
+    if len(matches) == 1:
+        ids.extend(value for value in matches[0]
+                   if sum(any(_handle_matches(value, other) for other in card) for card in cards) == 1)
     return list(dict.fromkeys(ids))
 
 
@@ -590,22 +710,34 @@ def _verified_identifiers(row: dict, local: dict, person_index: dict) -> list:
     if not (primary and person_index and _kg):
         return ids
     index = person_index.get("index") or {}
+    normalized = alias_identifier(primary)
+    ambiguous = person_index.get('ambiguous_identifiers') or set()
+    if normalized in ambiguous:
+        return [primary]
     key = _kg.normalize_identifier(primary)
     path = (index.get("by_identifier") or {}).get(key)
     if not path:
         return ids
     cid = _s(row.get("canonical_id"))
     if cid and os.path.realpath(_s((index.get("by_cid") or {}).get(cid))) != os.path.realpath(path):
-        return ids
+        return [primary]
     real_path = os.path.realpath(path)
+    unique = person_index.get('unique_identifiers') or {}
+    # The collision-aware index, not the last-wins by_identifier view, proves alias ownership.
+    owner_cid = unique.get(normalized)
+    if not owner_cid:
+        return ids
+    ids = [value for value in ids if alias_identifier(value) not in ambiguous
+           and unique.get(alias_identifier(value), owner_cid) == owner_cid]
     for alias, owner in (index.get("by_identifier") or {}).items():
-        if os.path.realpath(owner) == real_path:
+        if (os.path.realpath(owner) == real_path
+                and unique.get(alias_identifier(alias)) == owner_cid):
             ids.append(alias)
     return list(dict.fromkeys(ids))
 
 
 def _group_email_matches(group_id: str, handles: list, local: dict,
-                         person_index: dict) -> bool:
+                         person_index: dict, sender: str = "") -> bool:
     """An email pays a group obligation only when it is addressed to the group's whole roster.
 
     The roster is the `group_participants` list the group's own source messages carry, never an
@@ -620,11 +752,20 @@ def _group_email_matches(group_id: str, handles: list, local: dict,
         for message in local.get(field) or []:
             observed = _observed_group_id(message, field)
             if observed and _render_local.group_id_key(observed) == wanted:
+                roster = message.get('group_participants') or []
+                # Legacy readers cap rosters at 100 without a completeness receipt. A capped
+                # or explicitly partial roster cannot prove delivery to the whole group.
+                if len(roster) >= 100 or message.get('group_participants_partial'):
+                    return False
                 participants.update(value for value in (message.get("group_participants") or [])
                                     if isinstance(value, str) and value.strip())
     if not participants:
         return False
     recipients = {handle.lower() for handle in handles}
+    if sender and not any(sender.lower() in {alias.lower() for alias in
+            _verified_identifiers({'contact_identifier': participant}, local, person_index)}
+            for participant in participants):
+        return False  # a non-member mailing the roster cannot speak for the group
     for participant in participants:
         if not (re.fullmatch(r"\+?[\d\s().-]{7,}", participant)
                 or ("@" in participant and not participant.lower().endswith("@g.us"))):
@@ -637,14 +778,25 @@ def _group_email_matches(group_id: str, handles: list, local: dict,
 
 def _is_sent_email(m: dict) -> bool:
     labels = m.get("labelIds") or m.get("labels") or []
-    return bool(m.get("isSent")) or (isinstance(labels, list)
+    return m.get("isSent") is True or (isinstance(labels, list)
                                      and "SENT" in {str(v).upper() for v in labels})
 
 
+def _email_direction_known(m: dict) -> bool:
+    """Drafts prove neither direction; otherwise a native SENT label is authoritative."""
+    for field in ('labelIds', 'labels'):
+        labels = m.get(field)
+        if labels is not None and (not isinstance(labels, list)
+                                   or any(not isinstance(value, str) for value in labels)
+                                   or 'DRAFT' in {value.upper() for value in labels}):
+            return False
+    return 'isSent' not in m or type(m['isSent']) is bool or _is_sent_email(m)
+
+
 def _email_recipients(m: dict) -> list:
-    """Lowercased addresses in To/Cc — a string ("A <a@x>, b@y") or a list of either."""
+    """Native recipient addresses; Bcc is evidence only on the owner's sent copy."""
     raw = []
-    for field in ("to", "cc"):
+    for field in (("to", "cc", "bcc") if _is_sent_email(m) else ("to", "cc")):
         v = m.get(field)
         raw += [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
     return [addr.lower() for _name, addr in getaddresses(raw) if addr]
@@ -669,8 +821,10 @@ def _is_answer(text: str) -> bool:
 
 
 def _inbound_cutoff(created_at) -> str:
-    """The instant a delivery has to beat — the cutoff BOTH directions use. New items carry a full
-    local timestamp, which IS the cutoff. A LEGACY date-only `created_at` could have been recorded
+    """The instant a delivery has to beat — the cutoff BOTH directions use. Source-backed captures
+    retain precision and an offset only when the source supplied a timezone. Unknown naive wall
+    clocks stay naive; Mac timezone travel and repeated-hour ambiguity remain unresolved.
+    A LEGACY date-only `created_at` could have been recorded
     at any hour of that day, so nothing from that day counts — otherwise the 09:00 chat that
     preceded the 16:00 promise closes the debt on the day it was recorded, behind the user's back."""
     c = _s(created_at).strip()
@@ -690,13 +844,16 @@ def _message_is_after(value, after: str) -> bool:
             return False
     if cutoff is None:
         return True
-    return _to_user_zone(observed) > _to_user_zone(cutoff)
+    # Compare instants: Python comparisons in the same zone ignore the repeated-hour fold.
+    return _to_user_zone(observed).astimezone(timezone.utc) > _to_user_zone(cutoff).astimezone(timezone.utc)
 
 
 def _request_evidence(action: dict) -> set:
     refs = action.get("source_refs") or []
     if isinstance(refs, dict):
         refs = [refs]
+    if not isinstance(refs, list):
+        return set()
     result = {(normalize_channel(_s(ref.get("sourceType") or ref.get("source_type") or ref.get("source"))),
                _s(ref.get("sourceId") or ref.get("source_id") or ref.get("id")))
               for ref in refs if isinstance(ref, dict)}
@@ -705,13 +862,75 @@ def _request_evidence(action: dict) -> set:
     return {(source, ident) for source, ident in result if source and ident}
 
 
+def _supplemental_message_refs(local):
+    """Only historical-only refs are evidence for existing obligations, never new capture."""
+    historical, current = set(), set()
+    for source in ('imessage', 'whatsapp'):
+        for message in local.get(source) or []:
+            ids = {_s(message.get(key)) for key in
+                   ('source_id', 'id', 'messageId', 'message_id', 'guid', 'rowid')}
+            if _render_local:
+                ids.add(_render_local.message_evidence_id(message, source))
+            target = historical if message.get('_loop_context') is True else current
+            target.update((source, ident) for ident in ids if ident)
+    return historical - current
+
+
+def _assistant_source_action(action: dict, local: dict) -> bool:
+    """Only an exact observed source citation can establish assistant authorship."""
+    from relevance import is_automated_assistant
+    refs = _request_evidence(action)
+    for source, field in (('email', 'emails'), ('imessage', 'imessage'), ('whatsapp', 'whatsapp')):
+        for message in local.get(field) or []:
+            if not is_automated_assistant(message):
+                continue
+            ids = {_s(message.get(k)) for k in
+                   ('source_id', 'id', 'messageId', 'message_id', 'guid', 'rowid')}
+            if source != 'email' and _render_local:
+                ids.add(_render_local.message_evidence_id(message, source))
+            if any((source, ident) in refs for ident in ids if ident):
+                return True
+    return False
+
+
+def _birthday_greeting_evidence(text: str) -> bool:
+    # Evidence may include dinner/party plans; those words distinguish task capture, not whether
+    # a greeting actually occurred. This predicate never resolves an ordinary birthday task.
+    return bool(re.search(r'\bhappy\s+(?:belated\s+)?(?:birthday|bday)\b', text, re.I))
+
+
+def _birthday_already_greeted(row: dict, local: dict, person_index: dict) -> bool:
+    """Withhold an optional capture using the existing identity/time/source proof, without closure."""
+    from source_context import email_evidence_parts
+    for source, field in (('email', 'emails'), ('imessage', 'imessage'), ('whatsapp', 'whatsapp')):
+        for message in local.get(field) or []:
+            texts = (email_evidence_parts(message, include_attachments=True) if source == 'email' else
+                     [_s(message.get('body') or message.get('text') or message.get('snippet'))])
+            source_id = next((_s(message.get(k)) for k in
+                              ('source_id', 'id', 'messageId', 'message_id', 'guid', 'rowid')
+                              if _s(message.get(k))), '')
+            if source != 'email' and _render_local:
+                source_id = _render_local.message_evidence_id(message, source) or source_id
+            for text in texts:
+                if not _birthday_greeting_evidence(text):
+                    continue
+                proposal = {'status': 'evidence_only', 'evidence': [
+                    {'sourceType': source, 'sourceId': source_id, 'snippet': text}]}
+                if _completion_evidence_result(row, proposal, local, person_index)[0]:
+                    return True
+    return False
+
+
 def _observed_action_source(action: dict, local: dict,
-                            observed_before: str) -> tuple[tuple[tuple[str, str], ...], str] | None:
+                            observed_before: str, *, inbound_only: bool = False,
+                            person_index: dict | None = None
+                            ) -> tuple[tuple[tuple[str, str], ...], str] | None:
     """Bind an explicitly separate obligation to messages that were actually in the snapshot.
 
     Identity, verbatim quotation when supplied, and an observed timestamp are mandatory. The
     timestamp becomes the obligation's chronology; extraction time and rewritten prose cannot mint
-    a second row or make an old request look new.
+    a second row or make an old request look new. On success, source_refs retain the observed
+    quote's typography rather than extraction formatting substitutions.
     """
     refs = action.get("source_refs") or []
     if isinstance(refs, dict):
@@ -719,50 +938,77 @@ def _observed_action_source(action: dict, local: dict,
     if not isinstance(refs, list) or not refs:
         return None
     primary = _s(action.get("contact_identifier"))
-    identifiers = _collect_all_identifiers(primary, "", local)
-    bound, observed_times = [], []
+    try:
+        identifiers = _verified_identifiers(action, local,
+            person_identity() if person_index is None else person_index)
+    except Exception:
+        identifiers = [primary] if primary else []  # optional aliases cannot invent identity
+    bound, observed_times, canonical_refs = [], [], []
     for ref in refs:
         if not isinstance(ref, dict):
             return None
         source = normalize_channel(_s(ref.get("sourceType") or ref.get("source_type") or ref.get("source")))
         source_id = _s(ref.get("sourceId") or ref.get("source_id") or ref.get("id"))
-        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp"}.get(source)
+        is_call = source in ('calls', 'whatsapp_calls')
+        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp",
+                 "calls": "calls", "whatsapp_calls": "whatsapp_calls"}.get(source)
         quote = " ".join(_s(ref.get("snippet")).split())
-        if not field or not source_id:
+        if (not field or not source_id or (is_call and (
+                _normalize_action_type(action.get('action_type')) != 'call_back' or not quote))):
             return None
         found = None
-        for message in local.get(field) or []:
+        from textutil import current_message_rows
+        for message in (local.get(field) or [] if source == 'email' else
+                        current_message_rows(local.get(field))):
             ids = {_s(message.get(k)) for k in
                    ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
-            if source != "email" and _render_local:
+            if is_call:
+                call_id, call_text = _render_local.call_evidence(message, source) if _render_local else ('', '')
+                ids = {call_id} if call_id else set()
+            elif source != "email" and _render_local:
                 ids.add(_render_local.message_evidence_id(message, source))
             if source_id not in ids:
                 continue
-            timestamp = message.get("date") or message.get("timestamp")
+            timestamp = (message.get("timestamp_utc") if is_call else None) or message.get("date") or message.get("timestamp")
             observed = _parse_dt(timestamp)
             if observed is None:
                 try:
                     observed = parsedate_to_datetime(_s(timestamp))
                 except (TypeError, ValueError, OverflowError):
                     observed = None
-            from source_context import email_evidence_text, email_quote_found
-            text = (email_evidence_text(message) if source == "email" else
+            from source_context import email_evidence_text, email_evidence_parts, observed_capture_quote
+            text = (call_text if is_call else email_evidence_text(message, include_attachments=True) if source == "email" else
                     _s(message.get("body") or message.get("text") or message.get("snippet")))
             if (observed is None or not _is_answer(text)
                     or _message_is_after(timestamp, observed_before)):
                 continue
-            # Email: the quote must sit inside one verbatim part, never across the joining label.
-            if quote and not (email_quote_found(message, quote) if source == "email" else
-                              quote in " ".join(text.split())):
+            if is_call and (message.get('is_outgoing') is not False
+                            or (message.get('is_answered') is not False if source == 'calls'
+                                else message.get('is_missed') is not True)
+                            or quote != ' '.join(text.split())):
+                continue
+            # Bind within one observed part and retain its actual typography. No
+            # fallback may create an obligation from an unobserved/paraphrased quote.
+            actual_quote = (observed_capture_quote(email_evidence_parts(message, include_attachments=True)
+                            if source == 'email' else [text], quote) if quote else None)
+            if quote and actual_quote is None:
                 continue
             if source == "email":
+                if not _email_direction_known(message):
+                    continue
                 outgoing = _is_sent_email(message)
                 handles = (_email_recipients(message) if outgoing else
                            [parseaddr(_s(message.get("from") or message.get("sender")))[1]])
                 group = ""
+            elif is_call:
+                handles = [_s(message.get('phone') if source == 'calls' else message.get('jid'))]
+                group = ''
             else:
                 handles = [_s(message.get("handle") or message.get("contact_jid"))]
                 group = _observed_group_id(message, source)
+            if inbound_only and (_is_sent_email(message) if source == 'email' else
+                                 message.get('is_outgoing') if is_call else message.get('is_from_me')):
+                continue
             if action.get("group_id"):
                 matches = bool(_render_local and group and
                     _render_local.group_id_key(group) == _render_local.group_id_key(action["group_id"]))
@@ -772,13 +1018,20 @@ def _observed_action_source(action: dict, local: dict,
                      _handle_matches(handle, ident) or _jid_matches_phone(handle, ident))
                     for handle in handles for ident in identifiers if source != "email" or "@" in ident)
             if matches:
-                found = _to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S")
+                canonical_refs.append({**ref, **({'snippet': actual_quote} if quote else {})})
+                # Store an offset only when the source supplies a zone; retain precision.
+                # Bridge wall clocks have no observed zone: do not invent a durable instant.
+                found = (_to_user_zone(observed).isoformat() if observed.tzinfo else
+                         observed.isoformat(sep=' '))
                 break
         if not found:
             return None
         bound.append((source, source_id))
         observed_times.append(found)
-    return tuple(sorted(set(bound))), min(observed_times)
+    # Canonicalize only after every cited source passed time, quote and identity checks.
+    action['source_refs'] = canonical_refs
+    return tuple(sorted(set(bound))), min(observed_times,
+        key=lambda value: _to_user_zone(_parse_dt(value)).astimezone(timezone.utc))
 
 
 def critic_review_receipt(update: dict) -> str:
@@ -827,13 +1080,28 @@ def _has_critic_approval(update: dict) -> bool:
 
 
 def _completion_evidence_result(row: dict, update: dict, local: dict,
-                                person_index: dict | None = None):
+                                person_index: dict | None = None, *,
+                                observed_before: datetime | None = None):
     """Validate identity, direction, time and a verbatim quotation; the existing brief judges meaning.
 
     Raw text is data, never a request to change the ledger. An unsupported/missing proposal leaves
     the obligation open. One proposal names one row; meeting attendees and thread IDs alone prove
     nothing. Alias expansion requires the primary identifier on a contact card or graph person.
     """
+    from ledger_provenance import source_loop_sources, ALIASES
+    from source_context import allowed
+    try:
+        origins = source_loop_sources(row)
+    except (ValueError, TypeError, KeyError):
+        # Bare legacy rows retain the historical channel check; a malformed or stale
+        # source-bearing record must never be repaired by a later completion proposal.
+        if (row.get('content_provenance') is not None or row.get('source')
+                or row.get('source_refs') or row.get('resolution_source_refs')):
+            return None, 'invalid_origin_provenance'
+        source = ALIASES.get(normalize_channel(_s(row.get('channel'))))
+        origins = {source} if source else set()
+    if any(not allowed(source) for source in origins):
+        return None, 'origin_source_disabled'
     if person_index is None:
         person_index = person_identity()
     identifiers = _verified_identifiers(row, local, person_index)
@@ -846,45 +1114,83 @@ def _completion_evidence_result(row: dict, update: dict, local: dict,
     if (update.get("status") == "resolved"
             and not _has_critic_approval(update)):
         return None, "unreviewed_resolution"
+    latest = None
+    latest_at = None
     for evidence in refs:
         if not isinstance(evidence, dict):
             return None, "malformed_shape"
         source = normalize_channel(_s(evidence.get("sourceType")))
-        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp"}.get(source)
+        is_call = source in ('calls', 'whatsapp_calls')
+        field = {"email": "emails", "imessage": "imessage", "whatsapp": "whatsapp",
+                 "calls": "calls", "whatsapp_calls": "whatsapp_calls"}.get(source)
         quote = " ".join(_s(evidence.get("snippet")).split())
         source_id = _s(evidence.get("sourceId"))
         if not field or not source_id or not quote:
             return None, "malformed_shape"
-        if len(quote) < MIN_EVIDENCE_QUOTE_CHARS:
-            return None, "quote_too_short"
+        if not allowed(ALIASES.get(source, source)):
+            return None, 'completion_source_disabled'
+        if is_call and (update.get('status') != 'resolved' or row.get('group_id')
+                        or _normalize_action_type(row.get('action_type')) != 'call_back'):
+            return None, 'unsupported_call_obligation'
+        if source == 'whatsapp_calls':
+            return None, 'call_connection_unproved'
         found = None
         reason = "missing_source"
         for message in local.get(field) or []:
             ids = {_s(message.get(k)) for k in ("source_id", "id", "messageId", "message_id", "guid", "rowid")}
-            if source != "email" and _render_local:
+            if is_call:
+                call_id, call_text = _render_local.call_evidence(message, source) if _render_local else ('', '')
+                ids = {call_id} if call_id else set()
+                if (message.get('is_answered') is not True if source == 'calls'
+                        else message.get('is_missed') is not False):
+                    continue
+            elif source != "email" and _render_local:
                 ids.add(_render_local.message_evidence_id(message, source))
             if source_id not in ids:
                 continue
             reason = "direction_mismatch"
-            outgoing = _is_sent_email(message) if source == "email" else bool(message.get("is_from_me"))
-            if outgoing == wanted_inbound:
+            # Native message readers supply a boolean. Missing or malformed direction
+            # proves neither an outgoing fulfillment nor an inbound reply.
+            if source in ('imessage', 'whatsapp') and type(message.get('is_from_me')) is not bool:
+                continue
+            # An invalid supplied flag is unknown, not proof of an inbound reply.
+            # Gmail's native SENT label still independently proves outgoing mail.
+            if source == 'email' and not _email_direction_known(message):
+                continue
+            outgoing = (message.get('is_outgoing') is True if is_call else
+                        _is_sent_email(message) if source == "email" else message.get("is_from_me"))
+            # A reviewed callback can be fulfilled by connecting in either direction.
+            # The call-only kind/connection checks above still exclude arbitrary reply tasks.
+            if not is_call and outgoing == wanted_inbound:
                 continue
             reason = "time_mismatch"
-            timestamp = message.get("date") or message.get("timestamp")
+            timestamp = (message.get("timestamp_utc") if is_call else None) or message.get("date") or message.get("timestamp")
             if not _message_is_after(timestamp, _inbound_cutoff(row.get("created_at"))):
                 continue
             reason = "quote_mismatch"
-            from source_context import email_evidence_text, email_quote_found
-            text = (email_evidence_text(message) if source == "email" else
+            from source_context import email_evidence_text, email_evidence_parts, email_quote_found
+            text = (call_text if is_call else email_evidence_text(message, include_attachments=True) if source == "email" else
                     _s(message.get("body") or message.get("text") or message.get("snippet")))
             # Email: the quote must sit inside one verbatim part, never across the joining label.
             if not (email_quote_found(message, quote) if source == "email" else
                     quote in " ".join(text.split())):
                 continue
+            parts = email_evidence_parts(message, include_attachments=True) if source == 'email' else [text]
+            if ((is_call or len(quote) < MIN_EVIDENCE_QUOTE_CHARS)
+                    and not any(quote == ' '.join(part.split()) for part in parts)):
+                reason = 'quote_too_short' if not is_call else 'quote_mismatch'
+                continue
+            if (row.get('resolution_mode') == 'birthday_greeting'
+                    and not _birthday_greeting_evidence(text)):
+                reason = 'unrelated_birthday_response'
+                continue
             reason = "identity_mismatch"
             if source == "email":
                 handles = _email_recipients(message) if outgoing else [parseaddr(_s(message.get("from") or message.get("sender")))[1]]
                 group = ""
+            elif is_call:
+                handles = [_s(message.get('phone') if source == 'calls' else message.get('jid'))]
+                group = ''
             else:
                 handles = [_s(message.get("handle") or message.get("contact_jid"))]
                 # A direct iMessage also has a chat GUID. Only a group flag or group JID makes
@@ -894,18 +1200,31 @@ def _completion_evidence_result(row: dict, update: dict, local: dict,
                 matches = (bool(_render_local and group and
                     _render_local.group_id_key(group) == _render_local.group_id_key(row["group_id"]))
                     if source != "email" else _group_email_matches(
-                        _s(row["group_id"]), handles, local, person_index))
+                        _s(row["group_id"]), handles + (_email_recipients(message) if not outgoing else []),
+                        local, person_index, sender=handles[0] if not outgoing and handles else ""))
             else:
                 matches = not (group or message.get("is_group_chat")) and any(
                     _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
                     for handle in handles for ident in identifiers)
             if matches:
                 found = {"timestamp": _s(timestamp), "text": text,
-                         "description": f"{'Inbound' if wanted_inbound else 'Outgoing'} {source}: {quote}"}
+                         "quote": quote,
+                         "description": f"{'Outgoing' if outgoing else 'Inbound'} {source}: {quote}"}
                 break
         if not found:
             return None, reason
-    return found, "evidence_verified"
+        observed = _parse_dt(found['timestamp'])
+        if observed is None:
+            observed = parsedate_to_datetime(found['timestamp'])
+        observed = _to_user_zone(observed).astimezone(timezone.utc)
+        if latest_at is None or observed > latest_at:
+            latest, latest_at = found, observed
+    # Preview and persistence share this upper bound; every required source must
+    # precede the pass, independent of reference order.
+    if observed_before is not None and _message_is_after(
+            latest['timestamp'], _to_user_zone(observed_before).isoformat()):
+        return None, 'future_evidence'
+    return latest, "evidence_verified"
 
 
 def _completion_evidence(row: dict, update: dict, local: dict):
@@ -915,7 +1234,8 @@ def _completion_evidence(row: dict, update: dict, local: dict):
 
 def _new_request_since_closure(action: dict, closed: dict, local: dict,
                                person_index: dict | None = None) -> str:
-    """A person is not a dismissed request. Reopen only for a newly sourced incoming message
+    """A person is not a dismissed request. Reopen only for a newly sourced incoming request
+    or an explicitly separate outgoing commitment
     after the user's closure, never a new extraction timestamp or a paraphrase of old evidence.
     Existing evidence fields bind local messages; a new email thread can bind without message ID.
     Legacy date-only closures conservatively cover that entire day.
@@ -930,9 +1250,15 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict,
     new_thread = bool(thread and thread != _s(closed.get("source_thread_id"))
                       and not _is_synthetic_thread(thread))
     for source, field in (("email", "emails"), ("imessage", "imessage"), ("whatsapp", "whatsapp")):
-        for message in local.get(field) or []:
+        from textutil import current_message_rows
+        for message in (local.get(field) or [] if source == 'email' else
+                        current_message_rows(local.get(field))):
+            if source == 'email' and not _email_direction_known(message):
+                continue
             outgoing = _is_sent_email(message) if source == "email" else message.get("is_from_me")
-            if outgoing:
+            # A new, explicitly sourced owner commitment is as real as a new incoming ask.
+            # Ordinary outgoing chatter cannot reopen an earlier task.
+            if outgoing and not action.get('new_obligation'):
                 continue
             timestamp = message.get("date") or message.get("timestamp")
             if not _message_is_after(timestamp, cutoff):
@@ -943,9 +1269,10 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict,
             bound = any(src == source and ident in ids for src, ident in fresh_refs)
             if source == "email":
                 bound = bound or (new_thread and thread == _s(message.get("threadId") or message.get("thread_id")))
-                handle = parseaddr(_s(message.get("from") or message.get("sender")))[1].lower()
+                handles = (_email_recipients(message) if outgoing else
+                           [parseaddr(_s(message.get("from") or message.get("sender")))[1].lower()])
             else:
-                handle = _s(message.get("handle") or message.get("contact_jid"))
+                handles = [_s(message.get("handle") or message.get("contact_jid"))]
             group = _s(action.get("group_id"))
             message_group = _observed_group_id(message, source)
             if group:
@@ -954,17 +1281,19 @@ def _new_request_since_closure(action: dict, closed: dict, local: dict,
             else:
                 # Group messages name an individual sender, not a one-to-one conversation.
                 counterpart_matches = not (message_group or message.get("is_group_chat")) and any(
-                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident) for ident in identifiers)
+                    _handle_matches(handle, ident) or _jid_matches_phone(handle, ident)
+                    for handle in handles for ident in identifiers)
             if not bound or not counterpart_matches:
                 continue
             from source_context import email_evidence_text
-            if not _is_answer(email_evidence_text(message) if source == "email" else
+            if not _is_answer(email_evidence_text(message, include_attachments=True) if source == "email" else
                               message.get("body") or message.get("text") or message.get("snippet")):
                 continue
             observed = _parse_dt(timestamp)
             if observed is None:
                 observed = parsedate_to_datetime(_s(timestamp))
-            return _to_user_zone(observed).strftime("%Y-%m-%d %H:%M:%S")
+            return (_to_user_zone(observed).isoformat() if observed.tzinfo else
+                    observed.isoformat(sep=' '))
     return ""
 
 
@@ -1110,7 +1439,7 @@ def _learned_chase_after(it: dict, default_at: datetime, evaluation_now: datetim
         learned = _to_user_zone(learned) if isinstance(learned, datetime) else default_at
     except (OSError, ValueError, TypeError, AttributeError):
         learned = default_at
-    deadline = _s(it.get("deadline"))[:10]
+    deadline = _calendar_day(it.get("deadline"))
     if deadline:
         try:
             deadline_at = datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=learned.tzinfo)
@@ -1133,7 +1462,7 @@ def chase_due(it: dict, today: str, ref: datetime, history: dict | None = None) 
     after = _s(it.get("chase_after"))[:10]
     if after:
         return after <= today
-    deadline = _s(it.get("deadline"))[:10]
+    deadline = _calendar_day(it.get("deadline"))
     if deadline:
         return deadline < today          # post-deadline → escalate now, no ripening wait
     try:
@@ -1159,7 +1488,7 @@ def _clear_stale_pending(active: list, today: str):
             # a snooze, a dead channel) rotates to the back instead of holding the whole chase
             # lane every morning (Day-7 simulation, Sep 2026).
             it["chase_stalls"] = int(it.get("chase_stalls") or 0) + 1
-            _persist(it)
+            _persist(it, owner_chase=True)
 
 
 def _stamp_chase(active: list, today: str, ref: datetime):
@@ -1171,7 +1500,7 @@ def _stamp_chase(active: list, today: str, ref: datetime):
     if any(_s(it.get("last_chased_at"))[:10] == today or _s(it.get("chase_pending"))[:10] == today
            for it in active):
         return                            # already chased (or proposed a chase) today
-    overdue = lambda it: bool(_s(it.get("deadline"))[:10] and _s(it.get("deadline"))[:10] < today)
+    overdue = lambda it: bool((deadline := _calendar_day(it.get("deadline"))) and deadline < today)
     ranked = sorted(active, key=lambda it: (int(it.get("chase_stalls") or 0),
                                             not overdue(it),
                                             -(_days_old(it.get("created_at"), ref) or 0)))
@@ -1179,7 +1508,7 @@ def _stamp_chase(active: list, today: str, ref: datetime):
     for it in ranked:
         if chase_due(it, today, ref, history):
             it["chase_pending"] = today
-            _persist(it)
+            _persist(it, owner_chase=True)
             return
 
 
@@ -1240,7 +1569,7 @@ def _finalize_chase_unlocked(anchor_key: str, now: datetime | None = None) -> di
     # A delivered chase ends the stall penalty: the stall was a property of the days the lane was
     # down, not of this loop, and a row must not stay demoted after a chase actually landed.
     it.pop("chase_stalls", None)
-    _persist(it)
+    _persist(it, owner_chase=True)
     return {"ok": True, "anchor_key": _s(it.get("anchor_key")) or key,
             "chased_count": it["chased_count"],
             "last_chased_at": today, "chase_after": it["chase_after"], "detail": "chase delivered"}
@@ -1279,7 +1608,7 @@ def _finalize_handoff_unlocked(anchor_key: str, now: datetime | None = None) -> 
         return {"ok": True, "anchor_key": _s(it.get("anchor_key")) or key,
                 "handoff_asked_at": already, "detail": "already asked"}
     it["handoff_asked_at"] = today
-    _persist(it)
+    _persist(it, owner_chase=True)
     return {"ok": True, "anchor_key": _s(it.get("anchor_key")) or key,
             "handoff_asked_at": today, "detail": "hand-off question delivered"}
 
@@ -1404,8 +1733,15 @@ def _fold_duplicate(keeper: dict, loser: dict, today: str):
     actually delivered to a human, so no fold may un-send one — copying an older twin's blank chase
     state over the keeper's spent two is what let Sotto nudge somebody a third and a fourth time,
     and adopting the older twin's staler `chase_after` re-armed the clock the day after a chase."""
-    keeper_created = _s(keeper.get("created_at")) or "9999"
-    loser_created = _s(loser.get("created_at")) or "9999"
+    # Mixed legacy/local and offset timestamps must order by instant, not their
+    # separator or UTC offset. Date-only age keeps its legacy local-midnight order;
+    # its completion cutoff remains conservatively end-of-day in _inbound_cutoff.
+    def created(value):
+        stamp = _parse_dt(value)
+        return (_to_user_zone(stamp).astimezone(timezone.utc) if stamp is not None
+                else datetime.max.replace(tzinfo=timezone.utc))
+    keeper_created = created(keeper.get("created_at"))
+    loser_created = created(loser.get("created_at"))
     if loser_created < keeper_created:
         keeper["created_at"] = loser.get("created_at")     # the older row IS the debt's real age
     newer = loser if loser_created >= keeper_created else keeper
@@ -1494,14 +1830,18 @@ def _migrate_identity(items: dict, group_index: dict, today: str,
     of prose. Explicit distinct obligations already carry custom, task or origin keys and remain
     separate because those keys are outside `_prior_anchor_keys`.
 
-    Two rows are never touched: a TERMINAL one (a loop the user closed stays closed), and one whose
+    Three rows are never touched: a TERMINAL one (a loop the user closed stays closed), one whose
     stored anchor this file did not mint (`_prior_anchor_keys`) — a content-hashed commitment anchor
-    means something the migration cannot see, so it is left exactly as it is."""
+    means something the migration cannot see, so it is left exactly as it is — and one whose content
+    provenance is valid: an owner's own task names the person the owner named, and a graph-adopted
+    identity would silently withdraw it from every provenance-checked view."""
     folded = []
     for old_key in list(items):
         it = items.get(old_key)
         if it is None or it.get("status", "open") in TERMINAL:
             continue
+        if _valid_provenance(it) is not None:
+            continue                      # proved content keeps the identity it was proved with
         identity = _row_identity(it)
         stored_key = _s(it.get("anchor_key")) or old_key
         legacy_group_phone = stored_key in _legacy_group_phone_keys(identity, group_index)
@@ -1620,14 +1960,35 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     #    camelCase actionItems OR snake_case via _normalize_action.
     merged = []
     rejected = []
+    capture_outcomes = {'source_verified': 0, 'source_rejected': 0, 'quotes_normalized': 0}
     skipped_user_terminal = []
-    origin_ordinals = {}
+    existing_keys = set(items)
     for raw in (payload.get("new_actions", []) if merge else []):
         candidate = _normalize_action(raw)
         # A model may copy a canonical ID, but only the graph can attest that it belongs to this
         # identifier. Existing stored rows keep their historical identity during migration.
         candidate["canonical_id"] = None
         a = canonicalize_counterpart(candidate, group_index, person_index)
+        if (not has_counterpart(a) and _kg
+                and _kg.safe_slug(_s(a.get('contact_name'))) in (person_index.get('ambiguous_names') or set())):
+            rejected.append(f"{_s(a.get('contact_name'))}: ambiguous counterpart name; capture held")
+            continue
+        if person_index.get('identity_scan_complete') is False and not a.get('group_id'):
+            # A partial graph cannot establish new aliases. Retain only an existing
+            # ledger binding for this exact handle; never let a failed scan fork its debt.
+            identifier = alias_identifier(a.get('contact_identifier'))
+            bound = [row for row in items.values() if identifier and not row.get('group_id')
+                     and alias_identifier(row.get('contact_identifier')) == identifier]
+            cids = {_s(row.get('canonical_id')) for row in bound}
+            if (not bound or len(cids) != 1
+                    or any(cid and not _kg.valid_canonical_id(cid) for cid in cids)
+                    or identifier in (person_index.get('conflicting_identifiers') or set())):
+                rejected.append(f"{_s(a.get('contact_name'))}: identity read incomplete; capture held")
+                continue
+            a['canonical_id'] = next(iter(cids)) or None
+        if _assistant_source_action(a, local_data):
+            rejected.append(f"{_s(a.get('contact_name'))}: observed assistant source is not a human debt")
+            continue
         if candidate.get("group_id") and not a.get("group_id") and not a.get("contact_identifier"):
             rejected.append(f"{_s(a.get('contact_name'))}: unverified group identity")
             continue
@@ -1649,6 +2010,19 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if why:
             rejected.append(f"{_s(a.get('contact_name')) or '(unnamed)'}: {why}")
             continue
+        if ledger_io.is_routine_birthday_greeting(a):
+            if _observed_action_source(a, local_data, created_stamp, inbound_only=True,
+                                       person_index=person_index) is not None:
+                a['resolution_mode'] = 'explicit_birthday_request'
+            else:
+                birthday = ledger_io.birthday_courtesy_context(a, local_data, now, person_index)
+                if birthday is None:
+                    rejected.append(f"{_s(a.get('contact_name')) or '(unnamed)'}: "
+                                    "birthday greeting has no observed request or relationship context")
+                    continue
+                a.update(birthday)
+                if _birthday_already_greeted(a, local_data, person_index):
+                    continue
         named = _s(a.get("loop_id"))
         named_row = items.get(named) if named else None
         copied_group = _render_local.group_id_key(_s(candidate.get("group_id"))) if _render_local else ""
@@ -1656,7 +2030,7 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         copied_identity = bool(candidate.get("contact_identifier") or
                                (copied_group and copied_group in (group_index.get("by_id") or {})))
         if named and (not named_row or not copied_identity
-                      or not _same_verified_counterpart(a, named_row)):
+                      or not _same_verified_counterpart(a, named_row, person_index)):
             # A hallucinated or unverifiable ID may neither discard a real extraction nor edit
             # another person's row. Record the bad reference, then apply the counterpart default.
             rejected.append(f"{_s(a.get('contact_name'))}: unknown or mismatched loopId; used counterpart base")
@@ -1666,32 +2040,60 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
             # One response cannot redefine an obligation and claim to have fulfilled that revision.
             continue
 
+        if _request_evidence(a) & _supplemental_message_refs(local_data):
+            rejected.append(f"{_s(a.get('contact_name'))}: supplemental history is existing-loop evidence only")
+            continue
         origin_key = ""
+        if _normalize_action_type(a.get('action_type')) == 'call_back' and a.get('source_refs'):
+            observed = _observed_action_source(a, local_data, created_stamp, person_index=person_index)
+            if observed is None:
+                rejected.append(f"{_s(a.get('contact_name'))}: callback source not observed")
+                continue
+            a['created_at'] = observed[1]
+            call_sources = {source for source, _ident in observed[0] if source in ('calls', 'whatsapp_calls')}
+            if len(call_sources) == 1:
+                a['source'] = next(iter(call_sources))
         if a.get("new_obligation"):
-            observed = _observed_action_source(a, local_data, created_stamp)
+            original_refs = a.get('source_refs') or []
+            original_snippets = [_s(ref.get('snippet')) for ref in
+                ([original_refs] if isinstance(original_refs, dict) else
+                 original_refs if isinstance(original_refs, list) else []) if isinstance(ref, dict)]
+            observed = _observed_action_source(a, local_data, created_stamp, person_index=person_index)
             if observed is None:
                 # Unsupported separation neither forks nor rewrites the existing task. The log is
                 # the receipt; the next extraction can retry with evidence from the real snapshot.
                 rejected.append(f"{_s(a.get('contact_name'))}: newObligation evidence not observed")
+                capture_outcomes['source_rejected'] += 1
                 continue
             else:
+                capture_outcomes['source_verified'] += 1
+                if original_snippets != [_s(ref.get('snippet')) for ref in a.get('source_refs') or []]:
+                    capture_outcomes['quotes_normalized'] += 1
                 refs, observed_at = observed
                 base = compute_anchor_key(a)
-                ordinal_group = (base, refs)
-                ordinal = origin_ordinals.get(ordinal_group, 0) + 1
-                origin_ordinals[ordinal_group] = ordinal
-                origin_key = json.dumps([base, refs, ordinal], separators=(",", ":"))
+                # Source clauses distinguish siblings; extraction order never identifies a task.
+                clauses = sorted({" ".join(_s(r.get('snippet')).split())
+                                  for r in a.get('source_refs') or [] if isinstance(r, dict)
+                                  and _s(r.get('snippet')).strip()})
+                origin_key = json.dumps([base, refs, clauses, " ".join(
+                    _s(a.get("ask") or a.get("summary")).casefold().split())], separators=(",", ":"))
                 a["origin_key"] = origin_key
                 a["created_at"] = observed_at
-        ak = _obligation_key(a, items, origin_key)
+        ak = _obligation_key(a, items, origin_key, person_index, existing_keys)
+        if ak is None:
+            rejected.append(f"{_s(a.get('contact_name'))}: ambiguous retained obligation identity")
+            continue
         if ak in update_ids:
             continue
         if ak not in items:
             closed = [it for it in items.values() if it.get("status") in TERMINAL
-                      and _same_counterpart(a, it)]
-            if closed:
-                observed = max((_new_request_since_closure(a, it, local_data, person_index)
-                                for it in closed), default="")
+                      and (_same_counterpart(a, it) or _same_verified_counterpart(a, it, person_index))]
+            if closed and not (origin_key and not any(
+                    _request_evidence(a) & _request_evidence(it) for it in closed)):
+                observed = max((stamp for it in closed
+                                if (stamp := _new_request_since_closure(a, it, local_data, person_index))),
+                               key=lambda stamp: _to_user_zone(_parse_dt(stamp)).astimezone(timezone.utc),
+                               default="")
                 if not observed:
                     skipped_user_terminal.append(_s(a.get("contact_name")) or "(unnamed)")
                     continue
@@ -1711,12 +2113,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 # was Sotto's silence, not the user's closure.
                 unpark(it, today)
             if it.get("status") not in TERMINAL:
-                # A live anchor re-captured: the ASK is today's, not the day it was first seen.
-                # `action_type` stays put — direction now has its own anchor family, so a genuine
-                # change of direction forks a new item instead of silently inverting this one.
-                for k in ("summary", "ask", "deadline"):
-                    if a.get(k):
-                        it[k] = a[k]
+                # A daily presentation of the same obligation is not a correction of
+                # what was promised. Preserve the original task and deadline with their
+                # original source timestamp; today's prose can include sibling events
+                # or relative dates that would become false under that older timestamp.
+                # Explicit owner corrections and evidenced fresh requests have separate
+                # writers/reopen paths. Recapture still revives and touches this row.
+                if a.get('birthday_importance_sources') is not None:
+                    it['birthday_importance_sources'] = a['birthday_importance_sources']
             if not a.get("source"):
                 # This brief carried the loop (see the new-row branch below) — the evening's
                 # accountability block is about what THIS morning flagged, carried or new.
@@ -1734,6 +2138,7 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 it.pop("resolution_reason", None)
                 it.pop("resolution_evidence", None)
                 it.pop("resolution_source_refs", None)
+                it.pop("resolution_loop_version", None)
                 for field in ("source_thread_id", "source_message_id", "source_refs"):
                     it[field] = a.get(field)
                 it["status"] = "open"
@@ -1745,6 +2150,13 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                     if a.get(k):
                         it[k] = a[k]
         else:
+            # Capture time is not request time. Reuse the exact source proof already used
+            # for callbacks/separate obligations, so an answer between the ask and this
+            # brief can fulfill a newly captured ordinary task on a subsequent review.
+            # Unproved/legacy captures keep their existing cutoff; old rows are not rebased.
+            observed = _observed_action_source(a, local_data, created_stamp, person_index=person_index)
+            if observed is not None:
+                a['created_at'] = observed[1]
             items[ak] = {
                 "anchor_key": ak, "action_type": a.get("action_type"), "channel": a.get("channel"),
                 "contact_name": a.get("contact_name"), "contact_identifier": a.get("contact_identifier"),
@@ -1758,6 +2170,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 "source": a.get("source"), "source_refs": a.get("source_refs"),
                 "origin_key": a.get("origin_key"),
                 "resolution_mode": a.get("resolution_mode"),
+                **({'birthday_importance_sources': a['birthday_importance_sources']}
+                   if 'birthday_importance_sources' in a else {}),
             }
             if not a.get("source"):
                 # A brief's own action (a sourced one — a Granola commitment — names its source).
@@ -1776,6 +2190,10 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         # re-opened and the user's own closure kept shut.
         print("[continuity_resolve] left closed, the user closed it: "
               + "; ".join(skipped_user_terminal), file=sys.stderr)
+
+    if capture_outcomes['source_verified'] or capture_outcomes['source_rejected']:
+        print('[continuity_resolve] action capture outcomes: '
+              + json.dumps(capture_outcomes, sort_keys=True), file=sys.stderr)
 
     rejected_updates = {}
     update_items = {"accepted": [], "rejected": [], "truncated": 0}
@@ -1818,14 +2236,20 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         if update.get("status") not in ("resolved", "waiting"):
             reject_update("malformed_shape" if "status" not in update else "unsupported_status")
             continue
-        proof, evidence_reason = _completion_evidence_result(row, update, local_data, person_index)
+        proof, evidence_reason = _completion_evidence_result(row, update, local_data, person_index,
+                                                             observed_before=now)
         if not proof:
             reject_update(evidence_reason)
             continue
         if update.get("status") == "resolved":
-            _terminate(row, "resolved", "delivered" if is_waiting_on(row.get("action_type")) else "replied", today)
+            completed_at = _parse_dt(proof['timestamp'])
+            if completed_at is None:
+                completed_at = parsedate_to_datetime(proof['timestamp'])
+            _terminate(row, "resolved", "delivered" if is_waiting_on(row.get("action_type")) else "replied", today, now=now)
+            row['closed_at'] = _to_user_zone(completed_at).isoformat()
             row["resolution_evidence"] = proof["description"]
             row["resolution_source_refs"] = update["evidence"]
+            row["resolution_loop_version"] = update["loopVersion"]
             explanation = " ".join(_s(update.get("reason")).split())[:240]
             if explanation:
                 row["resolution_reason"] = explanation
@@ -1842,7 +2266,7 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                 except (TypeError, ValueError, OverflowError):
                     promise_ref = ref
             promise_ref = _to_user_zone(promise_ref)
-            named = promised_date(proof["text"], promise_ref)
+            named = promised_date(proof["quote"], promise_ref)
             row["last_heard_at"] = proof["timestamp"]
             if not named and reply_history is None:
                 reply_history = _relationship_history()
@@ -1858,7 +2282,10 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         else:
             reject_update("unsupported_status")
             continue
-        _persist(row)
+        _persist(row, source_resolution={
+            'update': update, 'local': local_data, 'person_index': person_index,
+            'now': now, 'today': today,
+        } if update.get('status') == 'resolved' and _valid_provenance(proposal_row) is not None else None)
         log_outcome.record_loop_proposal(update, proposal_row, "accepted", "evidence_verified",
                                         proposal_observed_at)
         if update_index < max_item_receipts:
@@ -1890,7 +2317,8 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
                     if it.get("status", "open") not in TERMINAL
                     and it.get("status") not in PARKED
                     and not (_s(it.get("snoozed_until"))[:10] > today)]
-        return {"resolved": _strip(resolved), "expired": [], "active": _strip(open_now)}
+        return {"resolved": _strip(resolved), "expired": [], "active": _strip(open_now),
+                'capture_outcomes': capture_outcomes}
 
     # 2) Maintain legacy meeting shadows and snoozes. Ordinary task completion was already handled
     # above through revision-bound, source-bound loopUpdates; no generic contact signal closes it.
@@ -1899,7 +2327,10 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         # _s() everywhere we slice: yaml.safe_load yields datetime.date for unquoted dates and
         # None for explicit nulls — a raw [:10] on those is a TypeError that kills the whole step.
         if status in TERMINAL:
-            if (_s(it.get("resolved_at")) or "9999")[:10] < retention_cutoff:   # prune past retention
+            if ((_s(it.get("resolved_at")) or "9999")[:10] < retention_cutoff
+                    and not it.get("owner_loop_tool_create") and not it.get("owner_loop_tool_close")
+                    and not _retained_source_correction(it)):
+                # Tool event receipts remain canonical lifetime idempotency fences.
                 _remove(it)
             continue
         created = (_s(it.get("created_at")) or today)[:10]
@@ -1914,6 +2345,11 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
         # g) user-snoozed (via sotto-loops): keep the file, but don't surface until the date passes.
         if _s(it.get("snoozed_until"))[:10] > today:
             _persist(it); continue
+        # An optional birthday greeting (never an owner or ordinary task) expires once the
+        # birthday has left the same window that admitted its capture.
+        if status not in PARKED and ledger_io.birthday_greeting_retired(it, today):
+            _terminate(it, "expired", "birthday_window_passed", today)
+            expired.append(it); _persist(it); continue
         # i) parked: kept, out of every view, until a touch above revives it. Something you OWE
         #    that nothing touched for PARK_AFTER_DAYS parks now — unless its deadline is still
         #    ahead (a date is a reason to keep showing it) or the user confirmed it themselves
@@ -1935,14 +2371,14 @@ def _resolve_unlocked(payload: dict, now: datetime | None = None, *,
     _stamp_chase(active, today, ref)
 
     return {"resolved": _strip(resolved), "expired": _strip(expired), "active": _strip(active),
-            "parked": _strip(parked)}
+            "parked": _strip(parked), 'capture_outcomes': capture_outcomes}
 
 
 def resolve(payload: dict, now: datetime | None = None, *,
             merge: bool = True, resolve_existing: bool = True) -> dict:
     """Serialize the full ledger transaction; readers remain lock-free because each file replace is
-    atomic."""
-    with _ledger_lock():
+    atomic. Every replacement in the pass is durable before the result returns."""
+    with _ledger_lock(), _directory_sync_per_pass():
         return _resolve_unlocked(payload, now, merge=merge, resolve_existing=resolve_existing)
 
 
@@ -2028,14 +2464,125 @@ def acknowledge_loop_surfaced(effect: dict, receipt: dict) -> bool:
     return True
 
 
-def _terminate(it: dict, status: str, resolution: str, today: str):
+def _terminate(it: dict, status: str, resolution: str, today: str, *, now: datetime | None = None):
     it["status"], it["resolution"], it["resolved_at"] = status, resolution, today
-    if resolution.startswith("user_"):
-        instant = _to_user_zone(datetime.now(timezone.utc))
-        it["closed_at"] = instant.isoformat() if str(instant.date()) == today else _inbound_cutoff(today)
+    instant = _to_user_zone(now if now is not None else datetime.now(timezone.utc))
+    it["closed_at"] = instant.isoformat() if str(instant.date()) == today else _inbound_cutoff(today)
 
 
-def _persist(it: dict):
+def _fsync_ledger_directory_tree():
+    """Persist a replacement entry and any just-created ledger directory names."""
+    directory = _dir()
+    for path in (directory, os.path.dirname(directory), _data_root()):
+        # Preserve the existing generic writer's configured-root symlink behavior.
+        # The separate protected owner path rejects symlinks before claiming owner proof.
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+# One locked pass rewrites every live row. Each row's file is fsynced as it is replaced; the
+# directory names are made durable ONCE, before the pass returns its result (the pass's receipt),
+# instead of three directory fsyncs per row. Thread-local: only the thread running resolve()
+# defers; every other write is durable on return, row by row, exactly as before.
+_PASS = threading.local()
+
+
+@contextmanager
+def _directory_sync_per_pass():
+    if getattr(_PASS, "events", None) is not None:
+        yield                                     # nested: the outer pass syncs once
+        return
+    _PASS.events = []
+    finished = False
+    try:
+        yield
+        finished = True
+    finally:
+        events, _PASS.events = _PASS.events, None
+        if events:
+            try:
+                _fsync_ledger_directory_tree()
+            except OSError:
+                if finished:
+                    raise                         # a durability failure fails the pass
+                # Otherwise the pass already failed, and its own error is the one that propagates.
+            for event in events:
+                log_outcome.record_loop_event(event)
+
+
+# Sotto's own bookkeeping on a row: accepted-delivery receipts, the chase, park and snooze clocks,
+# and the transition record. Deadlines are obligation content, even when formatted as dates.
+# None of the bookkeeping says what the task is, who it is with
+# or where it came from, so a write that changes only these keeps the row's content provenance
+# (re-digested by `_bookkeeping_provenance`). Any other change - wording, counterpart, source
+# evidence, a closure - keeps the old digest, and the row drops out of protected reads.
+_BOOKKEEPING_FIELDS = frozenset(ledger_io.CHASE_STATE_FIELDS) | {
+    "proof_transition", "delivery_surface", "source_brief_at",
+    "parking_notice_at", "parking_notice_touch", "parking_notice_version",
+    "status", "parked_at", "reopened_at", "snoozed_until",
+}
+_ABSENT = object()
+
+
+def _valid_provenance(row):
+    """(kind, sources) of a row's fresh content provenance, or None (absent, stale or invalid)."""
+    if row is None or row.get("content_provenance") is None:
+        return None
+    try:
+        return classify_ledger_sources(row)
+    except (ValueError, TypeError, KeyError):     # UnknownProvenanceError is a ValueError
+        return None
+
+
+def _changed_fields(previous: dict, it: dict) -> set:
+    ignored = {"_path", "content_provenance"}
+    return {key for key in (set(previous) | set(it)) - ignored
+            if previous.get(key, _ABSENT) != it.get(key, _ABSENT)}
+
+
+def _bookkeeping_provenance(previous: dict | None, it: dict):
+    """The provenance `it` carries after a bookkeeping-only write, or None to leave it as is."""
+    proved = _valid_provenance(previous)
+    if proved is None or it.get("content_provenance") != previous["content_provenance"]:
+        return None
+    if not _changed_fields(previous, it) <= _BOOKKEEPING_FIELDS:
+        return None
+    for row in (previous, it):
+        if row.get("status", "open") not in ACTIVE | PARKED:
+            return None                           # closing a task is a decision, not bookkeeping
+    try:
+        proof = {**previous["content_provenance"], "digest": digest_frontmatter(it)}
+        if classify_ledger_sources({**it, "content_provenance": proof}) != proved:
+            return None
+    except (ValueError, TypeError, KeyError):
+        return None
+    return proof
+
+
+def _retained_source_correction(row):
+    record = row.get('source_loop_correction')
+    proof = record.get('proof') if isinstance(record, dict) else None
+    return (isinstance(proof, dict) and proof.get('domain') == 'sotto.owner-loop-tool.v1'
+            and record.get('status') in ('started', 'committed')
+            and re.fullmatch(r'[a-f0-9]{64}', str(proof.get('event_id') or '')) is not None
+            and isinstance(proof.get('args'), dict)
+            and proof['args'].get('operation') in ('correct', 'retarget')
+            and proof['args'].get('anchor') == row.get('anchor_key'))
+
+
+def _persist(it: dict, *, new_owner_content: bool = False,
+             owner_close_previous_digest: str | None = None,
+             owner_close_tool_proof: dict | None = None,
+             source_offer_reply: dict | None = None,
+             source_loop_correction: dict | None = None,
+             source_resolution: dict | None = None,
+             loop_snooze: dict | None = None,
+             loop_keep: dict | None = None, loop_dismiss: dict | None = None,
+             loop_resolve: dict | None = None,
+             owner_chase: bool = False):
     os.makedirs(_dir(), exist_ok=True)
     path = it.get("_path") or os.path.join(_dir(), f"{_safe(it['anchor_key'])}.md")
     previous = None
@@ -2044,11 +2591,210 @@ def _persist(it: dict):
             previous = ledger_io.parse_frontmatter(handle.read())
     except FileNotFoundError:
         pass
+    if owner_chase and _valid_provenance(previous) == ('owner', frozenset()):
+        # The chase writers' own contract: a chase write moves chase state and nothing else. The
+        # provenance itself is carried below by the one bookkeeping rule every write shares. A
+        # row whose provenance is already stale is simply not re-stamped; it never fails a pass.
+        allowed = set(ledger_io.CHASE_STATE_FIELDS) | {'_path'}
+        if ({k:v for k,v in previous.items() if k not in allowed}
+                != {k:v for k,v in it.items() if k not in allowed}):
+            raise ValueError('owner chase changed unrelated content')
+    if owner_close_previous_digest is not None:
+        # The trusted close writer refreshes existing-owner provenance only after
+        # checking the strict ledger under this same lock;
+        # recheck the actual file before producing a transition.
+        if previous is None or new_owner_content or not isinstance(owner_close_previous_digest, str):
+            raise ValueError("owner close requires an existing owner row")
+        kind, sources = classify_ledger_sources(previous)
+        if (kind != "owner" or sources
+                or previous["content_provenance"]["digest"] != owner_close_previous_digest
+                or previous.get("status", "open") not in ACTIVE
+                or it.get("status") != "resolved" or it.get("resolution") != "user_resolved"
+                or not isinstance(it.get("owner_close_event_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9:_-]{1,200}", it["owner_close_event_id"])
+                or not isinstance(it.get("owner_close_text_hash"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", it["owner_close_text_hash"])
+                or it.get("owner_close_previous_digest") != owner_close_previous_digest):
+            raise ValueError("owner close transition is invalid")
+        allowed = {"status", "resolution", "resolved_at", "closed_at", "owner_close_event_id",
+                   "owner_close_text_hash", "owner_close_previous_digest", "_path"}
+        if owner_close_tool_proof is not None:
+            if not isinstance(owner_close_tool_proof, dict) or it.get("owner_loop_tool_close") != owner_close_tool_proof:
+                raise ValueError("owner close tool proof is invalid")
+            allowed.add("owner_loop_tool_close")
+        if ({key: value for key, value in previous.items() if key not in allowed}
+                != {key: value for key, value in it.items() if key not in allowed}):
+            raise ValueError("owner close changed unrelated content")
+    source_provenance = None
+    if source_resolution is not None:
+        from delivery_effects import loop_version
+        from ledger_provenance import source_loop_sources
+        if previous is None or new_owner_content or owner_close_previous_digest is not None:
+            raise ValueError('source resolution requires existing source row')
+        kind, _sources = classify_ledger_sources(previous)
+        update = source_resolution['update']
+        if (kind != 'sources' or previous.get('status', 'open') not in ACTIVE | PARKED
+                or previous.get('resolution_mode') == 'explicit'
+                or update.get('status') != 'resolved' or update.get('loopId') != previous.get('anchor_key')
+                or update.get('loopVersion') != loop_version(previous)):
+            raise ValueError('source resolution revision is invalid')
+        proof, _reason = _completion_evidence_result(previous, update, source_resolution['local'],
+                                                    source_resolution['person_index'],
+                                                    observed_before=source_resolution['now'])
+        if proof is None:
+            raise ValueError('source resolution evidence is invalid')
+        expected = dict(previous)
+        _terminate(expected, 'resolved', 'delivered' if is_waiting_on(previous.get('action_type'))
+                   else 'replied', source_resolution['today'], now=source_resolution['now'])
+        completed_at = _parse_dt(proof['timestamp'])
+        if completed_at is None:
+            completed_at = parsedate_to_datetime(proof['timestamp'])
+        expected.update(closed_at=_to_user_zone(completed_at).isoformat(),
+                        resolution_evidence=proof['description'],
+                        resolution_source_refs=update['evidence'],
+                        resolution_loop_version=update['loopVersion'])
+        explanation = ' '.join(_s(update.get('reason')).split())[:240]
+        if explanation:
+            expected['resolution_reason'] = explanation
+        if ({k: v for k, v in expected.items() if k != '_path'}
+                != {k: v for k, v in it.items() if k != '_path'}):
+            raise ValueError('source resolution changed unrelated content')
+        union = source_loop_sources({k: v for k, v in it.items() if k != 'content_provenance'})
+        source_provenance = {**previous['content_provenance'], 'sources': sorted(union)}
+    if source_offer_reply is not None:
+        from ledger_provenance import source_loop_sources
+        if previous is None or it.get('source_offer_reply') != source_offer_reply:
+            raise ValueError('source reply requires existing canonical row')
+        source_loop_sources(previous)
+        allowed = {'status', 'resolution', 'resolved_at', 'closed_at', 'source_offer_reply', '_path'}
+        if ({key: value for key, value in previous.items() if key not in allowed}
+                != {key: value for key, value in it.items() if key not in allowed}):
+            raise ValueError('source reply changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
+    if source_loop_correction is not None:
+        from ledger_provenance import source_loop_sources
+        if previous is None or it.get('source_loop_correction') != source_loop_correction:
+            raise ValueError('source correction requires existing canonical row')
+        try:
+            source_loop_sources(previous)
+        except ValueError:
+            kind, sources = classify_ledger_sources(previous)
+            if kind != 'owner' or sources:
+                raise ValueError('source correction prior provenance unavailable')
+        allowed = {'status', 'resolution', 'resolved_at', 'closed_at', 'retargeted_to',
+                   'source_loop_correction', '_path', 'proof_transition'}
+        if ({key: value for key, value in previous.items() if key not in allowed}
+                != {key: value for key, value in it.items() if key not in allowed}):
+            raise ValueError('source correction changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
     # Save the transition with the row, then project it through the existing outcome writer.
     # A retry can re-append the same identity safely; no second store or scheduling loop.
+    if loop_snooze is not None:
+        from ledger_provenance import source_loop_sources
+        import retune_apply
+        if previous is None:
+            raise ValueError('snooze requires existing canonical row')
+        try:
+            source_loop_sources(previous)
+        except ValueError:
+            kind, sources = classify_ledger_sources(previous)
+            if kind != 'owner' or sources:
+                raise ValueError('snooze prior provenance unavailable')
+        expected = dict(previous)
+        retune_apply.snooze_row(expected, loop_snooze['days'], loop_snooze['today'])
+        if ({k:v for k,v in expected.items() if k != '_path'}
+                != {k:v for k,v in it.items() if k != '_path'}):
+            raise ValueError('snooze changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
+    if loop_keep is not None:
+        from ledger_provenance import source_loop_sources
+        import retune_apply
+        if previous is None:
+            raise ValueError('keep requires existing canonical row')
+        try:
+            source_loop_sources(previous)
+        except ValueError:
+            kind, sources = classify_ledger_sources(previous)
+            if kind != 'owner' or sources:
+                raise ValueError('keep prior provenance unavailable')
+        expected = dict(previous)
+        retune_apply.keep_row(expected, loop_keep['today'])
+        if ({k:v for k,v in expected.items() if k != '_path'}
+                != {k:v for k,v in it.items() if k != '_path'}):
+            raise ValueError('keep changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
+    if loop_dismiss is not None:
+        from ledger_provenance import source_loop_sources
+        if previous is None:
+            raise ValueError('dismiss requires existing canonical row')
+        try:
+            source_loop_sources(previous)
+        except ValueError:
+            kind, sources = classify_ledger_sources(previous)
+            if kind != 'owner' or sources:
+                raise ValueError('dismiss prior provenance unavailable')
+        expected = dict(previous)
+        _terminate(expected, 'dismissed', 'user_dismissed', loop_dismiss['today'], now=datetime.fromisoformat(loop_dismiss['now']))
+        if ({k:v for k,v in expected.items() if k != '_path'}
+                != {k:v for k,v in it.items() if k != '_path'}):
+            raise ValueError('dismiss changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
+    if loop_resolve is not None:
+        from ledger_provenance import source_loop_sources
+        if previous is None:
+            raise ValueError('resolve requires existing canonical row')
+        try:
+            source_loop_sources(previous)
+        except ValueError:
+            kind, sources = classify_ledger_sources(previous)
+            if kind != 'owner' or sources:
+                raise ValueError('resolve prior provenance unavailable')
+        expected = dict(previous)
+        _terminate(expected, 'resolved', 'user_resolved', loop_resolve['today'], now=datetime.fromisoformat(loop_resolve['now']))
+        if ({k:v for k,v in expected.items() if k != '_path'}
+                != {k:v for k,v in it.items() if k != '_path'}):
+            raise ValueError('resolve changed unrelated content')
+        if previous.get('content_provenance') is not None:
+            source_provenance = dict(previous['content_provenance'])
     event = log_outcome.loop_transition(previous, it)
     if event:
         it["proof_transition"] = event
+    if new_owner_content:
+        # Only an audited explicit user operation may request this on a NEW manual
+        # row. An existing row, including one corrected from source content, is
+        # never converted into an owner-only row by a routine save.
+        if (os.path.lexists(path) or previous is not None
+                or it.get("source") not in ("user_added", "user_correction")
+                or it.get("channel") != "manual" or not str(it.get("source_thread_id") or "").startswith("manual:")
+                or not isinstance(it.get("owner_event_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9:_-]{1,200}", it["owner_event_id"])
+                or it.get("source_refs") or it.get("resolution_source_refs") or it.get("source_brief_at")):
+            raise ValueError("owner content provenance requires a new isolated manual row")
+        it["content_provenance"] = {"version": 1, "kind": "owner", "sources": [],
+                                    "digest": digest_frontmatter(it)}
+    if owner_close_previous_digest is not None:
+        it["content_provenance"] = {"version": 1, "kind": "owner", "sources": [],
+                                    "digest": digest_frontmatter(it)}
+    if source_provenance is not None:
+        it['content_provenance'] = {**source_provenance, 'digest': digest_frontmatter(it)}
+        if source_resolution is not None:
+            classify_ledger_sources(it)
+    if not new_owner_content and owner_close_previous_digest is None and source_provenance is None:
+        carried = _bookkeeping_provenance(previous, it)
+        if carried is not None:
+            it['content_provenance'] = carried
+        elif (_valid_provenance(previous) is not None
+              and it.get('content_provenance') == previous['content_provenance']
+              and _changed_fields(previous, it)):
+            # Not bookkeeping: the old digest stays, so protected reads withhold the row from now
+            # on. Said once, at the write that did it, without the row's content.
+            print("[continuity_resolve] a non-bookkeeping write withdrew one row from "
+                  "provenance-checked views", file=sys.stderr)
     fm = {k: v for k, v in it.items() if k != "_path"}
     body = f"---\n{yaml.safe_dump(fm, sort_keys=False, allow_unicode=True)}---\n"
     fd, tmp = tempfile.mkstemp(prefix=".loop-", suffix=".tmp", dir=_dir())
@@ -2058,7 +2804,15 @@ def _persist(it: dict):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        log_outcome.record_loop_event(event)
+        # File fsync alone does not make the replacement name (or fresh ledger
+        # directory ancestry) durable. Failure must propagate before a receipt; inside a
+        # resolve() pass the receipt is the pass's result, synced once before it returns.
+        pending = getattr(_PASS, "events", None)
+        if pending is None:
+            _fsync_ledger_directory_tree()
+            log_outcome.record_loop_event(event)
+        else:
+            pending.append(event)
     finally:
         try:
             os.unlink(tmp)

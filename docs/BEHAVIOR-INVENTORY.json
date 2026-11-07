@@ -1,0 +1,678 @@
+{
+  "version": 1,
+  "scope": "Selected current Sotto runtime contracts and next parity gaps. A local test is not live provider evidence.",
+  "behaviors": [
+    {
+      "id": "photon_owner_admission",
+      "surface": "current_photon",
+      "claim": "An owner direct message is durably admitted once before chat processing; duplicates are inert.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "owner direct-message admission precedes persistence and activation; duplicate is inert"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_scoped_prep",
+      "surface": "current_photon",
+      "claim": "A short company blurb does not queue a meeting-prep sweep or focused prep.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/owner-skill-request.test.ts",
+        "name": "a narrow company blurb does not admit broad or focused meeting prep"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_explicit_prep",
+      "surface": "current_photon",
+      "claim": "Explicit meeting prep can select a complete sweep or one meeting without widening a focused request.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/owner-skill-request.test.ts",
+        "name": "explicit meeting prep remains available for a sweep or one meeting"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "calendar_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Calendar unknown effects have bounded notices and inspection; a validated late committed or rejected proof produces one distinct final confirmation without rerunning the effect.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-outcomes.test.ts",
+        "name": "calendar lost committed receipt settles once after an unknown notice"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "contacts_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Contacts unknown effects have bounded notices and inspection; a validated late committed or rejected proof produces one distinct final confirmation without rerunning the effect.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-outcomes.test.ts",
+        "name": "contacts lost committed receipt settles once after an unknown notice"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "gmail_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Gmail unknown effects have bounded notices and inspection; a validated late committed or rejected proof produces one distinct final confirmation without rerunning the effect.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-outcomes.test.ts",
+        "name": "gmail lost committed receipt settles once after an unknown notice"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "owner_task_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Unknown owner task effects have bounded notices and inspection; an exact late committed receipt or supported task proposal preview produces one distinct confirmation without repeating the effect. Late rejection remains held.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-basic-actions.test.ts",
+        "name": "task unknown notice and late committed proof have distinct sends"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "owner_multi_loop_resolution",
+      "surface": "current_photon",
+      "claim": "One explicit owner message can mark several uniquely identified current loops done through one admitted action with separate durable per-item outcomes; an ambiguous target changes none before contact, and the permitted remaining list is read back. This local contract is not a live provider result.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/owner-task-tool-connected.test.ts",
+        "name": "one explicit three-person closure uses one admitted action and three exact per-item receipts"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "owner_reminder_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Unknown owner reminder effects have bounded notices and inspection; an exact late committed receipt produces one distinct confirmation without repeating the effect. Late rejection remains held.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-basic-actions.test.ts",
+        "name": "reminder unknown notice and late committed proof have distinct sends"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "owner_preference_delayed_outcome",
+      "surface": "current_photon",
+      "claim": "Unknown owner preference effects have bounded notices and inspection; an exact late committed receipt produces one distinct confirmation without repeating the effect. Late rejection remains held.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delayed-basic-actions.test.ts",
+        "name": "preference unknown notice and late committed proof have distinct sends"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "other_delayed_outcome_policy",
+      "surface": "current_photon",
+      "claim": "The M1.3 bounded notice policy is deferred for literal owner loop, reminder, and quiet commands, plus skill request, routine, web read, requested brief, meeting prep, and offered reply actions; their existing individual recovery rules remain in force.",
+      "implementation": "deferred",
+      "local_evidence": "current_boundary_only",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "prepared unknown-effect notice resumes once after restart without retrying the effect"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "managed_proxy_outage",
+      "surface": "current_photon",
+      "claim": "A classified managed-model 502, 503, or 504 gets a fixed failure reply after action-uncertainty checks; an accepted reply prevents activation recovery from repeating the model call.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "managed upstream outage posts one fixed failure reply and activation recovery does not rerun the model"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "managed_unknown_effect_hold",
+      "surface": "current_photon",
+      "claim": "A model outage does not turn an unknown owner action into a success or a second provider contact.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "unknown owner action remains held when the model reports managed upstream outage"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_fixed_route",
+      "surface": "self_host_telegram_limited",
+      "claim": "The linked Telegram bot's protected pairing record and loaded Node identity prove one fixed private owner route.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_telegram_channel_proof.py",
+        "name": "test_exact_protected_link_and_node_identity_prove_fixed_route"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_durable_polling",
+      "surface": "self_host_telegram_limited",
+      "claim": "The pinned Telegram polling contract commits owner admission or retry state before offset advancement across restart.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/telegram-polling-contract.test.ts",
+        "name": "pinned Telegram polling commits admission or retry state before offset advancement and survives restart"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_private_owner_tools",
+      "surface": "self_host_telegram_limited",
+      "claim": "The private Telegram owner capability mounts routine tools only in attended chat, never unattended execution.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "effective_capability_guidance",
+      "surface": "self_host_telegram_limited",
+      "claim": "The model receives in-memory guidance corrected for mounted owner tools and admitted script commands; the rendered startup configuration remains unchanged. This does not grant deferred attended capabilities.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_full_attended_route_profile",
+      "surface": "self_host_telegram_limited",
+      "claim": "The fixed Telegram owner route is proved, but its proof is not yet reused for the full attended Photon delivery profile.",
+      "implementation": "deferred",
+      "local_evidence": "current_boundary_only",
+      "test": {
+        "file": "runtime/trigger-receiver/test_telegram_channel_proof.py",
+        "name": "test_exact_protected_link_and_node_identity_prove_fixed_route"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_meeting_prep",
+      "surface": "self_host_telegram_limited",
+      "claim": "Attended meeting-prep is currently gated to Photon and is deferred on Telegram.",
+      "implementation": "deferred",
+      "local_evidence": "current_boundary_only",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_owner_skill_requests",
+      "surface": "self_host_telegram_limited",
+      "claim": "Owner skill requests are currently gated to Photon and are deferred on Telegram.",
+      "implementation": "deferred",
+      "local_evidence": "current_boundary_only",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_requested_briefs",
+      "surface": "self_host_telegram_limited",
+      "claim": "Explicit Telegram owner morning/evening briefs use scoped admission and the existing durable queue and outbox. Original pairing/runtime/source authority persists through restart, saved result handoff and feedback; unknown delivery never triggers a replacement send.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_telegram_requested_brief.py",
+        "name": "test_saved_brief_handoff_unknown_receipt_survives_restart_without_resend"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_offered_replies",
+      "surface": "self_host_telegram_limited",
+      "claim": "Attended offered replies are currently gated to Photon and are deferred on Telegram.",
+      "implementation": "deferred",
+      "local_evidence": "current_boundary_only",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_brief_detail",
+      "surface": "self_host_telegram_limited",
+      "claim": "Telegram mounts protected accepted-brief readback in attended chat only; the receiver requires current source and exact paired runtime route proof.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/bootstrap.test.ts",
+        "name": "Telegram bootstrap mounts routines, requested briefs and protected readback while other attended mutations stay gated"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_chat_entity_chunking",
+      "surface": "self_host_telegram_limited",
+      "claim": "Telegram long chat replies split on grapheme boundaries into bounded plain-text posts without parse-mode entities; every accepted chunk has an ordered root receipt and uncertainty stops later chunks.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/transport-receipts.test.ts",
+        "name": "Telegram chunks preserve literal formatting and graphemes within the receipt budget"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "telegram_scheduled_entity_chunking",
+      "surface": "self_host_telegram_limited",
+      "claim": "Scheduled Telegram long text uses the same bounded plain-text chunking transport. Its complete ordered receipts survive journal reopen without another provider post; partial acceptance remains unknown.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/delivery.test.ts",
+        "name": "accepted Telegram chunks recover all receipts after reopen without another provider post"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "model_failure_fixed_replies",
+      "surface": "current_photon",
+      "claim": "Busy, oversized, and generic model failures produce one safe fixed owner reply without a second model attempt when delivery is accepted.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "busy, oversized, and plain model failures send one safe fixed reply without retrying the model"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "model_deadline_uncertain_action",
+      "surface": "current_photon",
+      "claim": "A model deadline after an uncertain owner action remains held, and cancellation before a fallback suppresses delivery.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "model deadline after an uncertain action stays held while stopped work sends no fallback"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "model_deadline_no_action",
+      "surface": "current_photon",
+      "claim": "A model deadline without an owner action produces one durable fixed reply when delivery is accepted.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "own model deadline without an action gives one durable fixed reply"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_routine_weekday_set",
+      "surface": "current_photon",
+      "claim": "A canonical exact weekday set is shown in the full routine review and uses the existing distinct confirmation, receiver cron, cursor, and receipt path; old scalar schedules retain their hashes.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_fresh_personal_routines.py",
+        "name": "test_actual_queue_outbox_successor_restart_and_cancel_fence"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_routine_swipe_confirmation",
+      "surface": "current_photon",
+      "claim": "An exact accepted reply to a personal-routine proposal invokes the existing authoritative confirmation tool without model discretion; an old target cannot repeat its effect.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/owner-routine-tool.test.ts",
+        "name": "exact routine swipe confirms through the mounted tool without asking the model; old and declined targets have no effect"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_stop_control_ack",
+      "surface": "current_photon",
+      "claim": "An exact /stop cancels earlier work immediately and gives one fixed durable acknowledgement; a prepared acknowledgement resumes once after restart without replaying the cancelled turn.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "prepared stop acknowledgement posts once after restart while the cancelled turn stays cancelled"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_stop_contacted_reply",
+      "surface": "current_photon",
+      "claim": "Stopping a hung contacted reply records its attempt as unknown without replay, then allows one control acknowledgement and a later safe chat reply; late provider completion cannot rewrite the unknown record.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "/stop releases a hung contacted reply, acknowledges once, and resumes safe chat without late rewrite"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_new_control_ack",
+      "surface": "current_photon",
+      "claim": "An exact /new rotates conversation memory and gives one fixed durable acknowledgement; recovery of its prepared reply does not rotate or send twice.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "prepared new-conversation acknowledgement resumes after restart without rotating or sending twice"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "model_failure_delivery_uncertain",
+      "surface": "current_photon",
+      "claim": "A failed provider delivery does not become a second model-failure reply.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/conversation.test.ts",
+        "name": "provider delivery failure never becomes a second model-failure reply"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_owner_skill_terminal_feedback",
+      "surface": "current_photon",
+      "claim": "A newly admitted owner skill request has a queued admission receipt; terminal failure or expiry queues one content-free outbox notice while accepted or uncertain original delivery is reconciled without replay. An intentionally quiet completed proactive scan sends no notice. Older jobs without feedback metadata are not backfilled.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_runtime_owner_skill_request.py",
+        "name": "test_research_terminal_work_notifies_once_without_private_failure_or_recontact"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "ask_unconfirmed_stage_diagnostic",
+      "surface": "current_photon",
+      "claim": "A future Ask worker failure emits only a fixed unconfirmed research, persistence, or answer stage label when one exact private checkpoint stage is started; this does not identify the cause or change replay holds.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_procedure_runner.py",
+        "name": "test_ask_failure_category_uses_only_exact_started_stage"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_original_action_uncertainty_notice",
+      "surface": "current_photon",
+      "claim": "All 16 supported owner-action kinds give one honest pending-outcome notice on the original uncertain request without requiring another owner turn. Existing per-kind receipt validation remains authoritative.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/request-follow-through.test.ts",
+        "name": "all supported original action kinds send one notice without another owner turn"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_autonomous_exact_proof_recovery",
+      "surface": "current_photon",
+      "claim": "One bounded due-proof wakeup uses the existing thread queue to inspect uncertain actions without another owner input, waits behind safe active chat, and never repeats the effect.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/request-follow-through.test.ts",
+        "name": "due-proof wakeup queues behind a fresh active model run and never reexecutes the old action"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_late_final_reply_redelivery",
+      "surface": "current_photon",
+      "claim": "After a settled delayed action, the wakeup retries its final reply only after definite non-delivery, at most the policy attempt bound; an accepted, unknown or dispatching final reply is never resent.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/sotto-chat/test/request-follow-through.test.ts",
+        "name": "timer retries only a definitely undelivered late final reply"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "photon_skill_notice_verified_route",
+      "surface": "current_photon",
+      "claim": "Content-free owner skill notices bind to the admitted current verified route, recheck that route before contact, and preserve accepted-send deduplication across reopen and original-input replay. Legacy owner aliases are not upgraded.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_skill_notice_route.py",
+        "name": "test_verified_notice_sends_once_after_reopen_and_original_replay"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "weekly_canonical_memory_pruning",
+      "surface": "current_photon",
+      "claim": "The existing memory heartbeat applies the canonical stale-fact archival rule to untouched people weekly, preserving owner corrections, Contacts-card notes and corroborated facts without model work or continuity changes.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuous_memory.py",
+        "name": "test_weekly_pruning_reaches_untouched_people_without_erasing_owner_words"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "weekly_pruning_skips_unreadable_person",
+      "surface": "current_photon",
+      "claim": "One unreadable person file is skipped and counted; the weekly archival still completes for everyone else and is not rerun inside the week.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuous_memory.py",
+        "name": "test_weekly_pruning_skips_an_unreadable_person_file_and_completes"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "optional_important_birthday_followup",
+      "surface": "current_photon",
+      "claim": "Birthdays remain visible; only proven VIP or reciprocal contacts admit optional non-urgent greetings, without repeated capture or overwriting real work.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_birthday_courtesy_policy.py",
+        "name": "test_important_birthday_capture_query_pulse_is_optional_and_idempotent"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "birthday_already_greeted_before_capture",
+      "surface": "current_photon",
+      "claim": "An observed greeting after the actual birthday prevents a later automatic optional birthday obligation.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_birthday_courtesy_policy.py",
+        "name": "test_known_greeting_on_birthday_prevents_later_optional_capture"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "optional_birthday_greeting_expires",
+      "surface": "current_photon",
+      "claim": "An optional birthday greeting expires once the birthday is past the same window that admitted it; owner and ordinary tasks never retire by this rule.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_birthday_courtesy_policy.py",
+        "name": "test_optional_greeting_expires_after_the_capture_window"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "legacy_birthday_request_visible_everywhere",
+      "surface": "current_photon",
+      "claim": "A stored source-backed birthday request without the optional-greeting mode stays an ordinary task in the brief, sotto-loops and the pulse alike.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_birthday_courtesy_policy.py",
+        "name": "test_legacy_source_backed_wish_is_an_ordinary_task_in_every_view"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "one_birthday_visibility_rule",
+      "surface": "current_photon",
+      "claim": "The brief and the pulse share one birthday visibility predicate: legacy source-backed rows stay visible and an optional greeting that lost importance hides in both.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_birthday_courtesy_policy.py",
+        "name": "test_brief_and_pulse_share_one_birthday_visibility_rule"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "duplicate_contact_card_copies_one_person",
+      "surface": "current_photon",
+      "claim": "Duplicate copies of one Contacts card adopt the graph identity instead of being treated as an alias collision.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_identity_unification.py",
+        "name": "test_near_duplicate_cards_of_one_seeded_person_still_adopt_the_graph_cid"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "missed_callback_original_chronology",
+      "surface": "current_photon",
+      "claim": "A missed-call request retains the observed event time so a reviewed specific answer before brief capture can settle it.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuity_evidence.py",
+        "name": "test_callback_capture_uses_missed_call_time_before_brief_and_later_answer"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "connected_callback_evidence",
+      "surface": "current_photon",
+      "claim": "A reviewed native outgoing connected phone call can settle only its named callback, with current source authority; the current WhatsApp call schema cannot prove completion. Open risk: CallHistory's answered flag is not known to distinguish a voicemail pickup from the person answering.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuity_evidence.py",
+        "name": "test_rendered_connected_call_review_closes_only_named_callback"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "short_complete_answer",
+      "surface": "current_photon",
+      "claim": "A short answer is eligible only as the entire observed message and with task-specific review.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuity_evidence.py",
+        "name": "test_short_entire_answer_requires_real_message_and_review"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "assistant_relay_not_new_debt",
+      "surface": "current_photon",
+      "claim": "An explicitly identified automated-assistant relay cannot mint a new debt; the original observed human request remains eligible.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "sotto-chief-of-staff/tests/test_continuity_evidence.py",
+        "name": "test_assistant_source_cannot_mint_debt_but_original_human_email_can"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "grounded_initial_history_discovery",
+      "surface": "current_photon",
+      "claim": "Initial history discovery gives the existing composer up to six grounded canonical observations from eligible completed source windows, with one per person before a second, to choose one useful opportunity against current tasks and later replies. Existing importance rules order candidates; incomplete or revoked sources cannot supply observations, and total coverage is disclosed.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_onboarding.py",
+        "name": "test_discovery_selects_grounded_reciprocal_person_and_holds_incomplete_or_revoked"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "history_discovery_delivery_recovery",
+      "surface": "current_photon",
+      "claim": "The one-time discovery preserves pending and unknown delivery across restart and never repeats an accepted send.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_onboarding.py",
+        "name": "test_discovery_restart_pending_unknown_and_accepted_never_repeat"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "history_discovery_lifetime_claim",
+      "surface": "current_photon",
+      "claim": "Each discovery send claim is recorded permanently at the send seam; an accepted send whose delivery callback failed blocks every later discovery after outbox pruning, and only a definite non-send releases a claim.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_onboarding.py",
+        "name": "test_accepted_discovery_with_failed_callback_never_repeats_after_outbox_pruning"
+      },
+      "live_evidence": "not_recorded_here"
+    },
+    {
+      "id": "history_discovery_interrupt_budget",
+      "surface": "current_photon",
+      "claim": "The discovery send honors and spends the shared daily interrupt budget once per run.",
+      "implementation": "present",
+      "local_evidence": "contract_test",
+      "test": {
+        "file": "runtime/trigger-receiver/test_onboarding.py",
+        "name": "test_discovery_spends_the_shared_daily_interrupt_budget_once_per_run"
+      },
+      "live_evidence": "not_recorded_here"
+    }
+  ]
+}

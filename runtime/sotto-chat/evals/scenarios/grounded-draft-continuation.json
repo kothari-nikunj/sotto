@@ -1,0 +1,128 @@
+{
+  "name": "single-brief-offer-grounded-inline-draft-and-shorter",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "gmailMessages": {
+      "cedar-call": {
+        "id": "cedar-call",
+        "threadId": "cedar-call-thread",
+        "internalDate": "1792429200000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Could we have a call in the second half of this week to discuss the Cedar proposal?",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Dana Reed <dana@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar proposal"
+            },
+            {
+              "name": "Date",
+              "value": "Mon, 19 Oct 2026 10:00:00 -0700"
+            }
+          ],
+          "body": {
+            "data": "Q291bGQgd2UgaGF2ZSBhIGNhbGwgaW4gdGhlIHNlY29uZCBoYWxmIG9mIHRoaXMgd2VlayB0byBkaXNjdXNzIHRoZSBDZWRhciBwcm9wb3NhbD8="
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "Yes",
+      "backgroundBefore": "Saturday October 24, 2026 evening brief. Dana Reed (dana@example.test) asked in a message dated Monday October 19, 2026: \u201cCould we have a call in the second half of this week to discuss the Cedar proposal?\u201d I can draft a reply.",
+      "excludes": [
+        "Accept:",
+        "Decline:",
+        "Thursday afternoon",
+        "schedule is packed",
+        "slammed",
+        "last week",
+        "missed your",
+        "miss your",
+        "window has passed",
+        "window for this past week has passed",
+        "will follow up",
+        "Hi Dana",
+        "Hey Dana",
+        "Dear Dana",
+        "Here is a draft",
+        "Here's a draft",
+        "received your note",
+        "Thanks Dana",
+        "Thanks, Dana"
+      ],
+      "maxCharacters": 700,
+      "containsAny": [
+        [
+          "Would you like",
+          "Do you want",
+          "Would you prefer",
+          "Should I",
+          "want to take",
+          "want to accept",
+          "like to take",
+          "accept or decline"
+        ]
+      ]
+    },
+    {
+      "text": "Yes, I want the call, ask what times work.",
+      "contains": [
+        "Cedar"
+      ],
+      "excludes": [
+        "Accept:",
+        "Decline:",
+        "last week",
+        "Thursday",
+        "Friday",
+        "schedule is packed",
+        "missed your",
+        "miss your"
+      ],
+      "maxCharacters": 700
+    },
+    {
+      "text": "shorter pls",
+      "excludes": [
+        "Accept:",
+        "Decline:",
+        "Thursday afternoon",
+        "schedule is packed",
+        "slammed",
+        "last week",
+        "missed your",
+        "miss your",
+        "window has passed",
+        "window for this past week has passed"
+      ],
+      "maxCharacters": 300,
+      "contains": [
+        "Cedar"
+      ],
+      "containsAny": [
+        [
+          "times",
+          "availability",
+          "when works",
+          "when would work",
+          "what works for you"
+        ]
+      ]
+    }
+  ]
+}

@@ -8,7 +8,7 @@ module is the half a person never has to ask for: a daily sweep, fired from the 
 thread, that ages out the exhaust nobody would otherwise remember to delete.
 
 It is MACHINERY, deliberately. Retention written as a skill instruction is retention that stops
-happening the first time a model has a better idea — four Hermes prompt-adherence failures in Aug
+happening the first time a model has a better idea — four prompt-adherence failures in Aug
 2026 settled that. Nothing here asks anyone to remember anything.
 
 WHAT IT SWEEPS: exhaust — receipts, staged intermediates, dated markers, diagnostics.
@@ -16,7 +16,7 @@ WHAT IT NEVER SWEEPS: the graph (`knowledge/`), the continuity ledger, the golde
 settings, your credentials, and the decks you asked Sotto to read. `NEVER` below enforces that per
 path, not per rule, so a typo'd glob cannot reach the memory either.
 
-Three policies, because three cover every family:
+Four policies, because four cover every family:
 
   * `DELETE_OLDER` — the file goes when it is older than N days. A filename carrying a
     `YYYY-MM-DD` is read as the file's own age claim; everything else falls back to mtime. A
@@ -26,6 +26,8 @@ Three policies, because three cover every family:
   * `TRUNCATE_TAIL` — a log is cut to its last N bytes IN PLACE. In place, not unlinked: a brief
     mid-flight holds it open, and unlinking it under that writer sends every later line to a file
     nobody can read (the reason `forget.py --logs` truncates too).
+  * `COMPACT_OLDER` — a JSON receipt ledger whose aged records are reduced, by the module that
+    owns the ledger's format, to content-free receipts (ids and hashes) that idempotency still needs.
 
 A family that some other module already ages is listed in `EXEMPT` with the owner named, not
 re-implemented here — one rule, one writer. `EXEMPT` is not a leftovers bin: it is the other half of
@@ -33,7 +35,8 @@ the table, and `accounts_for()` reads both, which is what lets the drift guard p
 `forget.py` verb has an answer here.
 
 Loaded by receiver.py via importlib (the outbox/connectors/calcache pattern); the receiver wires
-HOOKS — late-bound lambdas over ITS globals — so this module never imports the receiver. Stdlib only.
+HOOKS — late-bound lambdas over ITS globals — so this module never imports the receiver. Stdlib
+only; a `COMPACT_OLDER` ledger's owner module is loaded only when that rule finds its file.
 
 Named constants, not knobs (defaults matter — see CLAUDE.md): every TTL below. There is no
 `SOTTO_RETENTION_*` env var, because "how long do you keep receipts" is not a choice a default
@@ -41,12 +44,17 @@ can't serve.
 """
 from __future__ import annotations
 
-import glob as _glob
+import importlib.util
 import json
 import os
 import re
 import tempfile
 import time
+
+# Also loaded by absolute file path outside the receiver's import context.
+_paths_spec = importlib.util.spec_from_file_location("retention_paths", os.path.join(os.path.dirname(__file__), "retention_paths.py"))
+_paths = importlib.util.module_from_spec(_paths_spec)
+_paths_spec.loader.exec_module(_paths)
 
 # ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
@@ -58,6 +66,9 @@ HOOKS = {
     # The advisory flock every appender of these ledgers also takes (connectors.file_lock): without
     # it, a line appended between this sweep's read and its replace simply vanished.
     "jsonl_lock": lambda path: _fallback_file_lock(path),
+    # The receiver's one clock asks the chat runtime to prune terminal journal
+    # rows. The unwired default touches no Node database.
+    "runtime_prune": lambda _cutoffs: None,
 }
 
 
@@ -146,6 +157,7 @@ OUTCOME_DAYS = 90
 DELETE_OLDER = "delete_older_than_days"
 DROP_LINES_OLDER = "drop_lines_older_than_days"
 TRUNCATE_TAIL = "truncate_to_last_bytes"
+COMPACT_OLDER = "compact_records_older_than_days"
 
 # Never a sweep target, whatever a rule asks for — checked per path, below every glob. The graph,
 # the ledger, the corpus, your settings, your credentials, and the artifacts you asked Sotto to
@@ -178,6 +190,8 @@ class Exempt:
 
 
 SWEEP = (
+    Rule("events/owner-meeting-prep-offers.json", DELETE_OLDER, STAGED_DAYS,
+         "detached chat prep questions expire in three hours; idle proposal state ages out with staged artifacts"),
     Rule("events/triage-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
          "validated classifications reuse the same admitted event revision for seven days"),
     Rule("events/notification-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
@@ -202,6 +216,10 @@ SWEEP = (
     Rule("events/drafts.jsonl", DROP_LINES_OLDER, DRAFT_LEDGER_DAYS,
          f"a draft's words are kept {DRAFT_LEDGER_DAYS} days — long enough to learn from, short "
          "enough not to be an archive of things you didn't say"),
+    Rule("events/owner-gmail-drafts.json", COMPACT_OLDER, DRAFT_LEDGER_DAYS,
+         f"a reviewed Gmail draft's words are kept {DRAFT_LEDGER_DAYS} days like any offered draft, "
+         "then only its content-free receipt stays to keep replays idempotent; committed "
+         "typed results with unfinished local learning retain their bounded words until repair"),
     Rule("dashboard_audit.jsonl", DROP_LINES_OLDER, DASHBOARD_AUDIT_DAYS,
          f"one line per dashboard write, on the delivery receipts' {DASHBOARD_AUDIT_DAYS}-day clock"),
     Rule("outcomes.jsonl", DROP_LINES_OLDER, OUTCOME_DAYS,
@@ -247,10 +265,10 @@ EXEMPT = (
     Exempt("events/triage-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
     Exempt("events/model-work.sqlite3*", "model_work prunes opaque attempt records after 90 days on use"),
     Exempt("events/notification-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
-    Exempt("events/research-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
-    Exempt(".sotto-volume.json", "adapter managed_volume owns the tenant/volume identity receipt"),
+    Exempt("events/research-artifacts/lock-*", "at most 256 content-free lock shards per lock kind (five kinds plus the DocSend lock, 1,281 in all)"),
+    Exempt(".sotto-volume.json", "prepare_fresh writes the tenant/volume identity receipt"),
     Exempt(".sotto-runtime.lock", "adapter runtime_lock owns the process-lifetime writer lock"),
-    Exempt(".sotto-recovery-hold.json", "adapter recovery owns the restore hold and its release"),
+    Exempt(".sotto-epoch.json", "adapter tenant_lifecycle owns the replacement epoch fresh routines bind to"),
     Exempt("config/model-lease.json", "adapter model_lease owns model credential expiry metadata"),
     Exempt("events/work.sqlite3*", "work_queue owns terminal metadata/alias pruning after seven days"),
     Exempt("config/source-state.json", "bounded metadata for current source permissions and observations"),
@@ -268,6 +286,9 @@ EXEMPT = (
            "connectors.sweep_pending drops abandoned authorize legs at PENDING_TTL_SECS"),
     Exempt("proactive/pending_offer.json",
            "pending_offer.py expires the one standing offer at read; a stale file is already inert"),
+    Exempt("runtime/owner-routines.json",
+           "live owner-approved routine definitions plus the receipts and proposal fence that keep "
+           "each approval single-use; only an owner-approved create, adjust or cancel adds to it"),
     Exempt("dashboard_sessions.json",
            "dashboard.py prunes expired sessions on the way through every read"),
     Exempt("knowledge/last_local_snapshot.json",
@@ -280,7 +301,6 @@ EXEMPT = (
            "one bounded calendar-window baseline, atomically overwritten by calcache"),
     Exempt("cache/update_check.json", "one file, overwritten by the daily update check"),
     Exempt("cache/update_notice.json", "one file, overwritten per version"),
-    Exempt("cache/hermes-version.json", "one file, written by start.sh at boot"),
     Exempt("events/seen.json", "a bounded idempotency ring, rewritten in place"),
     Exempt("events/gmail_seen.json", "one cursor file, rewritten in place"),
     Exempt("events/digest_accepted.json", "durable digest completion receipt, rewritten in place"),
@@ -308,13 +328,9 @@ EXEMPT = (
            "style_extract.py caps every bucket it writes (30/25/25 canonical, 30 recent, 500 keys, "
            "and `confirmed` at its newest 20 per register — the bucket the draft→outcome matcher "
            "feeds on every verbatim send, so it is capped where it grows)"),
-    Exempt("hermes/**",
-           "the Hermes gateway's own state, including the WhatsApp session — not ours. KNOWN GAP: "
-           "hermes/sessions/ gains one archived chat transcript per day (the nightly session "
-           "archive keeps transcripts; /resume reopens them) and nothing here bounds it — whether "
-           "Hermes bounds its own store is not knowable from this repo. Order 10–100 KB/day"),
-    Exempt("whatsapp-pairing.txt", "one pairing artifact, rewritten by the pairing run"),
-    Exempt("google-auth-url.txt", "one setup artifact, rewritten by start.sh"),
+    Exempt("sotto-home/**",
+           "the Google credential home (SOTTO_HOME): the OAuth token and client secret are "
+           "credentials, kept until you disconnect"),
     Exempt("telegram-link.json", "the Telegram bot token: a credential"),
 )
 
@@ -438,24 +454,55 @@ def _apply_truncate(path: str, max_bytes: int, _now: float) -> int:
     # size/read/rewrite transaction prevents an append between the tail read and truncation from
     # disappearing. The receiver supplies connectors.file_lock through this hook.
     with HOOKS["jsonl_lock"](path):
-        size = os.path.getsize(path)
-        if size <= max_bytes:
-            return 0
-        with open(path, "rb") as f:
+        with _paths.open_log_for_truncate(path) as (f, size):
+            if size <= max_bytes:
+                return 0
             f.seek(size - max_bytes)
             tail = f.read()
-        cut = tail.find(b"\n")
-        tail = tail[cut + 1:] if cut != -1 else tail
-        with open(path, "r+b") as f:
+            cut = tail.find(b"\n")
+            tail = tail[cut + 1:] if cut != -1 else tail
+            f.seek(0)
             f.write(tail)
-            f.truncate(len(tail))
-        return size - len(tail)
+            f.truncate()
+            return size - len(tail)
+
+
+# The one module that owns each compacted ledger's format; the sweep owns only the clock.
+COMPACTORS = {"events/owner-gmail-drafts.json": "runtime_owner_gmail_draft_tool"}
+
+
+def _owner_compact(rel: str, path: str, days: int, now: float) -> int:
+    import importlib.util as _importlib_util
+    import sys as _sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in _sys.path:
+        _sys.path.insert(0, here)   # the owner's sibling imports, as the receiver's loader does
+    name = COMPACTORS[rel]
+    spec = _importlib_util.spec_from_file_location(name + "_retention", os.path.join(here, name + ".py"))
+    module = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.compact(path, now=now, days=days)
+
+
+HOOKS.setdefault("compact", _owner_compact)
+
+
+def _apply_compact(path: str, days: int, now: float) -> int:
+    """Hand an aged JSON ledger to its owner's compaction. Returns how many records lost content."""
+    rel = os.path.relpath(path, _root()).replace(os.sep, "/")
+    try:
+        return HOOKS["compact"](rel, path, days, now)
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise
+    except Exception as error:  # noqa: BLE001 -- an unloadable owner costs one error line, not the sweep
+        raise ValueError(f"compaction unavailable ({type(error).__name__})") from error
 
 
 _APPLY = {
     DELETE_OLDER: _apply_delete,
     DROP_LINES_OLDER: _apply_drop_lines,
     TRUNCATE_TAIL: _apply_truncate,
+    COMPACT_OLDER: _apply_compact,
 }
 
 
@@ -472,23 +519,23 @@ def sweep(now: float | None = None) -> dict:
     root = _root()
     now = time.time() if now is None else now
     swept, errors = [], []
-    diagnostic_dir = os.path.join(root, "events", "learning-diagnostics")
     for rule in SWEEP:
         # A diagnostic writer takes this gate before its per-file lock and final consent check.
         # Include glob enumeration: an in-flight writer can create the file while the sweep waits.
         diagnostic = rule.pattern.startswith("events/learning-diagnostics/")
-        gate = (HOOKS["jsonl_lock"](os.path.join(diagnostic_dir, ".consent"))
-                if diagnostic and os.path.isdir(diagnostic_dir) else _contextlib.nullcontext())
         try:
-            with gate:
-                for path in sorted(_glob.glob(os.path.join(root, *rule.pattern.split("/")))):
-                    if not os.path.isfile(path):
-                        continue
+            with _paths.diagnostic_gate(root, diagnostic, HOOKS["jsonl_lock"]):
+                for path in sorted(_paths.matches(root, rule.pattern, errors)):
                     rel = os.path.relpath(path, root).replace(os.sep, "/")
                     if protected(rel):   # unreachable by construction; the guard is the point
                         errors.append({"path": rel, "error": "protected: this is memory, not exhaust"})
                         continue
                     try:
+                        _paths.guard_path(root, path)
+                        if not os.path.isfile(path):
+                            continue
+                        if rule.policy != DELETE_OLDER:
+                            _paths.guard_lock(root, path + ".lock")
                         n = _APPLY[rule.policy](path, rule.amount, now)
                     except (OSError, ValueError, UnicodeDecodeError) as e:
                         errors.append({"path": rel, "error": f"{type(e).__name__}: {e}"})
@@ -499,4 +546,18 @@ def sweep(now: float | None = None) -> dict:
             errors.append({"path": ("events/learning-diagnostics/.consent.lock"
                                     if diagnostic else rule.pattern),
                            "error": f"{type(e).__name__}: {e}"})
+    # Canonical cutoffs live beside the JSONL rules. Unresolved Node dispatches,
+    # actions and inbound obligations are never deleted by its terminal pruner.
+    cutoffs = {
+        "delivery_before": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - DELIVERY_RECEIPT_DAYS * 86400)),
+        "action_before": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - SEND_RECEIPT_DAYS * 86400)),
+    }
+    try:
+        journal = HOOKS["runtime_prune"](cutoffs)
+        if journal is not None:
+            removed = sum(journal.values())
+            if removed:
+                swept.append({"path": "sotto-chat/journal", "policy": "terminal_rows", "amount": removed})
+    except (OSError, ValueError, RuntimeError, TypeError) as error:
+        errors.append({"path": "sotto-chat/journal", "error": type(error).__name__})
     return {"data_root": root, "swept": swept, "count": len(swept), "errors": errors}

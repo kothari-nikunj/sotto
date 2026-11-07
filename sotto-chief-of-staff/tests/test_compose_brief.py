@@ -168,7 +168,16 @@ def test_gemini_once_sends_system_instruction_and_schema(tmp_path, monkeypatch):
 
 def test_brief_response_schema_shape():
     s = cb.BRIEF_RESPONSE_SCHEMA
-    assert s["required"] == ["markdown", "actionItems", "extractedKnowledge"]
+    assert s["required"] == ["markdown", "actionItems", "loopUpdates", "extractedKnowledge"]
+    assert s["properties"]["loopUpdates"]["type"] == "array"
+    assert cb._normalize_output({"markdown": "Quiet day."})["loop_updates"] == []
+    # Metadata copies the visible clause, so the provider must generate that clause first.
+    assert s["propertyOrdering"][:2] == ["markdown", "actionItems"]
+    assert cb.BRIEF_REVISION_SCHEMA["propertyOrdering"][:2] == ["brief_markdown", "actions"]
+    assert "contextAsk" in s["properties"]["actionItems"]["items"]["required"]
+    for action_schema in (s['properties']['actionItems']['items'],
+                          cb.BRIEF_REVISION_SCHEMA['properties']['actions']['items']):
+        assert {'contextDeadline', 'deadlineDate'} <= set(action_schema['required'])
     item = s["properties"]["actionItems"]["items"]["properties"]
     for f in ("contextSummary", "contextAsk", "prose", "channel", "contactIdentifier",
               "threadSnippet", "emailThreadId", "meetingLink"):
@@ -214,9 +223,95 @@ def test_critic_policy_falls_back_when_the_headings_move():
     assert cb._extract_prompt_sections("## Triage Discipline\nbody\n", cb._CRITIC_POLICY_SECTIONS) == ""
     assert cb._extract_prompt_sections("## Triage Discipline\n\n## Priority Levels\nx",
                                        cb._CRITIC_POLICY_SECTIONS) == ""   # empty section
-    two = cb._extract_prompt_sections("## Triage Discipline\na\n\n## Priority Levels\nb\n\n## Next\nc",
-                                      cb._CRITIC_POLICY_SECTIONS)
-    assert two == "## Triage Discipline\na\n\n## Priority Levels\nb"
+    sections = "\n\n".join(f"{heading}\nbody-{i}" for i, heading in enumerate(cb._CRITIC_POLICY_SECTIONS))
+    assert cb._extract_prompt_sections(sections + "\n\n## Next\nd", cb._CRITIC_POLICY_SECTIONS) == sections
+
+
+def test_extraction_critic_and_revision_share_canonical_open_task_wording(monkeypatch):
+    template = cb._load_prompt()
+    system, _ = cb._split_prompt(template)
+    policy = cb._extract_prompt_sections(template, cb._CANONICAL_TASK_POLICY_SECTION)
+    assert policy and "## Canonical Open-Task Wording" in system
+    assert "same visible next step" in system
+    assert "same visible next step" in policy
+    assert "one complete action clause" in policy
+    assert "do not make two dated task sentences" in policy
+    assert "From Oct 5" in policy
+    assert "Do not restate that task as a later update" in policy
+    assert "Coming Up ends with its schedule preview" in policy
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    seen = []
+    def llm(prompt, inputs, **kwargs):
+        if inputs.get('_critic'):
+            seen.append(('critic', prompt))
+            return json.dumps({'patches': [{'type': 'remove_item', 'severity': 'critical',
+                                            'detail': 'Remove a duplicate'}], 'score': 50})
+        seen.append(('revise', prompt))
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nKept task.',
+                           'actions': [], 'loop_updates': []})
+    cb.critique_and_revise({'brief_markdown': '## Needs Attention Now\nDuplicate.',
+                            'actions': [], 'loop_updates': []}, {}, llm=llm)
+    assert [stage for stage, _ in seen] == ['critic', 'revise']
+    for _, prompt in seen:
+        assert policy in prompt
+        assert prompt.count('## Canonical Open-Task Wording') == 1
+        assert 'A complete saved summary also suffices.' in prompt
+        assert 'do not repeat the same obligation as a summary followed by an instruction' in prompt
+    assert 'When restoring a missing marked task, render its complete ask once' in seen[-1][1]
+    assert 'Keep each different ask, its marker, priority and recipient.' in seen[-1][1]
+
+
+def test_help_prompt_does_not_offer_drafting_for_owner_only_work():
+    system, _ = cb._split_prompt(cb._load_prompt())
+    assert 'coding expenses' in system
+    assert 'not made draftable by a possible status reply' in system
+    assert 'Fewer than three supported items is an honest partial brief' in ' '.join(system.split())
+
+
+def test_saved_task_violations_reach_existing_revision_without_new_stage(monkeypatch):
+    import brief_validate
+    row = {'anchor_key': 'group-deck', 'contact_name': 'Project Group', 'status': 'open',
+           'created_at': '2026-08-10 09:00:00', 'deadline': '2026-08-10',
+           'summary': 'Dana shared the clinical trial deck and flagged a data room review tomorrow',
+           'ask': 'Review the deck and coordinate with Dana on data room next steps'}
+    draft = {'brief_markdown': '## Needs Attention Now\n**Project Group**<!--loop:group-deck-->: '
+             'Dana flagged a data room review tomorrow.', 'actions': [], 'loop_updates': []}
+    violations = brief_validate.validate(draft['brief_markdown'], [], '',
+                                         action_ledger=[row], today='2026-08-10')
+    assert any(v.startswith('marked-loop-wording:') for v in violations)
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    calls = []
+    def llm(prompt, options, **kwargs):
+        calls.append((options, prompt))
+        if options.get('_critic'):
+            return json.dumps({'patches': [{'type': 'add_item', 'severity': 'moderate', 'detail': '\n'.join(violations)}], 'score': 80, 'summary': 'Task needs correction'})
+        return json.dumps({**draft, 'brief_markdown':
+                           '## Needs Attention Now\n**Project Group**<!--loop:group-deck-->: '
+                           + row['summary'] + '. ' + row['ask'] + '.'})
+    result = cb.critique_and_revise(draft, {'local': {'action_ledger': [row]}}, llm=llm,
+                                    violations=violations, source_prompt='full source fixture')
+    assert len(calls) == 2  # the existing critic and revision only
+    assert row['summary'] in calls[0][1] and row['ask'] in calls[1][1]
+    assert result['_critic']['revision_reasons']['validator']['categories']['marked-loop-wording'] == 1
+    assert not [v for v in brief_validate.validate(result['brief_markdown'], [], '',
+                                                    action_ledger=[row], today='2026-08-10')
+                if v.startswith('marked-loop-wording:')]
+
+
+def test_saved_task_detail_is_not_written_to_diagnostics(monkeypatch):
+    secret = 'Project Lavender private data room clause'
+    row = {'anchor_key': 'private-loop', 'contact_name': 'Dana Reed', 'status': 'open',
+           'deadline': '2026-08-09', 'summary': secret, 'ask': 'Reply to Dana Reed'}
+    logs = []
+    monkeypatch.setattr(cb, '_diag', logs.append)
+    monkeypatch.delenv('SOTTO_DATA', raising=False)
+    cb.compose({'type': 'morning', 'now': '2026-08-10T16:00:00Z',
+                'google': {'userTimezone': 'America/Los_Angeles'},
+                'local': {'action_ledger': [row]}},
+               llm=lambda prompt, inputs, **kwargs: json.dumps({
+                   'brief_markdown': '## Needs Attention Now\nNo task selected.', 'actions': []}))
+    assert any('dropped-open-loop' in line for line in logs)
+    assert all(secret not in line and row['ask'] not in line for line in logs)
 
 
 # --- email-window honesty (Sprint 0 #5) ----------------------------------------
@@ -324,7 +419,6 @@ def _research_inputs():
 
 
 def test_select_attendees_filters_user_domain_known_and_horizon(monkeypatch):
-    # Freeze "now" near the meetings so the 72h horizon is deterministic.
     import datetime as _dt
 
     class _FixedDateTime(_dt.datetime):
@@ -332,7 +426,7 @@ def test_select_attendees_filters_user_domain_known_and_horizon(monkeypatch):
         def now(cls, tz=None):
             return cls(2026, 6, 24, 12, 0, 0, tzinfo=tz)
 
-    monkeypatch.setattr(cb, "datetime", _FixedDateTime)
+    monkeypatch.setattr(__import__("prep_selection"), "datetime", _FixedDateTime)
     picked = cb.select_attendees_for_research(_research_inputs())
     emails = [p["email"] for p in picked]
     assert emails == ["taylor@startup.com"]  # user, same-domain, known, and far-horizon all excluded
@@ -597,6 +691,83 @@ def test_build_data_manifest_shape():
     assert m["calendar_event_count"] == 1 and m["action_ledger_open"] == 1
 
 
+def test_critic_receives_the_same_task_context_as_the_writer(monkeypatch):
+    rows = [
+        {"anchor_key": "lease-a", "status": "open", "contact_name": "Alex Stone",
+         "contact_identifier": "alex-a@example.com", "channel": "gmail", "action_type": "reply",
+         "created_at": "2026-10-13T08:00:00Z", "summary": "Lease decision",
+         "ask": "Send the revised lease tomorrow, after checking the guarantor clause"},
+        {"anchor_key": "deck-b", "status": "waiting", "contact_name": "Alex Stone",
+         "contact_identifier": "alex-b@example.com", "channel": "gmail", "action_type": "waiting_on",
+         "created_at": "2026-10-12T08:00:00Z", "summary": "Waiting for deck",
+         "ask": "Alex owes the revised deck; do not chase before Friday"},
+    ]
+    inputs = {"now": "2026-10-14T08:00:00Z", "local": {"action_ledger": rows}}
+    manifest = cb.build_data_manifest(inputs)
+    assert manifest['open_commitments'] == cb._format_action_ledger(
+        cb._normalize_local(inputs), cb._brief_now(inputs))
+    # Same-name tasks and their qualifications must reach the actual critic request,
+    # not just the extraction prompt or a count of open rows.
+    prompts = []
+    def critic(prompt, _inputs):
+        prompts.append(prompt)
+        return json.dumps({"patches": [], "score": 90})
+    cb.run_critic('Brief', [], manifest, llm=critic)
+    for row in rows:
+        assert row['ask'] in prompts[0]
+        assert row['contact_identifier'] in prompts[0]
+        assert row['created_at'] in prompts[0]
+
+
+def test_critic_knows_email_excerpt_is_partial_and_which_direction_it_came_from():
+    manifest = cb.build_data_manifest({'google': {'emails': [{
+        'id': 'm-actual', 'threadId': 't-actual', 'from': 'owner@example.com',
+        'date': '2026-10-14T08:00:00Z', 'isSent': True,
+        'body': 'Context ' * 30 + 'I cannot commit to Friday yet.',
+    }]}})
+    thread = manifest['email_threads'][0]
+    assert thread['message_id'] == 'm-actual'
+    assert thread['sent_by_owner'] is True
+    assert thread['date'] == '2026-10-14T08:00:00Z'
+    assert thread['snippet_truncated'] is True
+
+
+def test_critic_receives_action_identity_and_complete_ask_instead_of_summary_alone():
+    action = {'id': 'a', 'contactName': 'Alex Stone', 'contactIdentifier': 'alex@example.com',
+              'loopId': 'lease-a', 'contextSummary': 'Context ' * 30,
+              'contextAsk': 'Send the lease only after legal approval', 'prose': ''}
+    prompts = []
+    cb.run_critic('Brief', [action], {}, llm=lambda prompt, _inputs:
+                  prompts.append(prompt) or '{"patches": [], "score": 90}')
+    for key in ('contactIdentifier', 'loopId', 'contextSummary', 'contextAsk'):
+        assert action[key] in prompts[0]
+
+
+@pytest.mark.parametrize('deadline_text,deadline_date', [
+    ('tomorrow', '2026-10-19'), ('when legal approves', ''), ('', ''),
+])
+def test_critic_receives_deadline_fields_and_original_source_date(monkeypatch, deadline_text, deadline_date):
+    monkeypatch.setattr('source_context.allowed', lambda source: True)
+    quote = 'I will send the pricing document tomorrow.'
+    action = {'type': 'follow_up', 'channel': 'gmail', 'contactName': 'Maya Journey',
+              'contactIdentifier': 'maya.journey@example.test', 'contextAsk': quote,
+              'contextDeadline': deadline_text, 'deadlineDate': deadline_date,
+              'evidence': [{'sourceType': 'email', 'sourceId': 'promise-mail', 'snippet': quote}]}
+    mail = {'id': 'promise-mail', 'from': 'owner@example.test', 'to': 'maya.journey@example.test',
+            'isSent': True, 'date': '2026-10-18T08:00:00Z', 'body': quote}
+    prompts = []
+    cb.run_critic('Brief', [action], {}, llm=lambda prompt, _inputs:
+                  prompts.append(prompt) or '{"patches": [], "score": 90}',
+                  source_index={'email': [mail]})
+    reviewed = json.loads(prompts[0].split('## ACTION ITEMS (1 shown of 1 total)\n')[1]
+                          .split('\n\nAnalyze the brief')[0])[0]
+    assert reviewed['contextDeadline'] == deadline_text
+    assert reviewed['deadlineDate'] == deadline_date
+    observed = reviewed['evidence'][0]['observed_source']
+    assert observed['date'] == '2026-10-18T08:00:00Z'
+    assert observed['original_context'] == quote
+
+
 def test_critic_and_revise_fixes_brief(monkeypatch):
     # First llm call = extraction; second = critic (returns a moderate patch); third = revise.
     monkeypatch.setenv("SOTTO_CRITIC", "always")   # tiny test inputs would otherwise auto-skip
@@ -633,6 +804,8 @@ def test_critic_passes_clean_brief_unchanged(monkeypatch):
 
 def test_critic_receives_task_and_original_clause_for_loop_proposal(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    import loops_query
+    monkeypatch.setattr(loops_query, 'permitted_rows', lambda _root, _sources: inputs['local']['action_ledger'])
     seen = []
     def critic_stub(prompt, _options):
         seen.append(prompt)
@@ -766,8 +939,8 @@ def test_a_validator_violation_runs_the_critic_on_an_otherwise_quiet_brief(monke
     quiet = {"type": "morning", "google": {}, "local": {}}
     out = cb.compose(quiet, llm=fake_llm, critic=True)
     assert seen["violation_reached_the_critic"] is True
-    # …and it is merged as a patch, so the revise pass is actually asked to fix it
-    assert "skipped" not in out["_critic"] and out["_critic"]["actionable"] == 1
+    # An advisory coverage hint reaches review but does not force a paid rewrite.
+    assert "skipped" not in out["_critic"] and out["_critic"]["actionable"] == 0
     monkeypatch.setenv("SOTTO_CRITIC", "off")
     fake, calls = _one_call_llm()
     out = cb.compose(quiet, llm=fake, critic=True)
@@ -796,7 +969,6 @@ def test_critic_failure_never_blocks_delivery(monkeypatch):
 
 
 def test_research_quality_gate_rereseaches_thin_graph_profile(monkeypatch):
-    # A graph person with only a thin profile must be re-researched (not skipped as "known").
     import datetime as _dt
 
     class _FixedDateTime(_dt.datetime):
@@ -804,7 +976,7 @@ def test_research_quality_gate_rereseaches_thin_graph_profile(monkeypatch):
         def now(cls, tz=None):
             return cls(2026, 6, 24, 12, 0, 0, tzinfo=tz)
 
-    monkeypatch.setattr(cb, "datetime", _FixedDateTime)
+    monkeypatch.setattr(__import__("prep_selection"), "datetime", _FixedDateTime)
     inputs = {"google": {"userEmail": "me@mycorp.com", "events": [
         {"id": "ev1", "summary": "Pitch", "start": "2026-06-24T22:00:00+00:00", "attendees": [
             {"email": "thin@startup.com", "displayName": "Thin Person"},
@@ -826,7 +998,7 @@ def test_select_attendees_caps_at_max(monkeypatch):
         def now(cls, tz=None):
             return cls(2026, 6, 24, 12, 0, 0, tzinfo=tz)
 
-    monkeypatch.setattr(cb, "datetime", _FixedDateTime)
+    monkeypatch.setattr(__import__("prep_selection"), "datetime", _FixedDateTime)
     attendees = [{"email": f"p{i}@ext.com", "displayName": f"P{i}"} for i in range(40)]
     inputs = {"google": {"userEmail": "me@mycorp.com",
                          "events": [{"id": "e", "summary": "Big", "start": "2026-06-24T22:00:00+00:00",
@@ -1913,7 +2085,7 @@ def test_dropped_loop_goes_to_the_critic_first(monkeypatch):
     def fake_llm(prompt, inputs, system=None, schema=None):
         if inputs.get("_critic"):
             seen["critic_prompt"] = prompt
-            return json.dumps({"patches": [], "score": 90, "summary": "ok"})
+            return json.dumps({"patches": [{"type": "add_item", "severity": "moderate", "detail": "Priya still needs the diligence memo; show that specific ask."}], "score": 80, "summary": "Unfulfilled task"})
         if inputs.get("_revise"):
             return json.dumps({"brief_markdown": fixed, "actions": []})
         return json.dumps({"brief_markdown": "## Filtered\n\n12 promotional emails\n", "actions": []})
@@ -1952,12 +2124,15 @@ def test_continuity_ledger_populates_action_ledger(tmp_path, monkeypatch):
     # Nothing else fills local["action_ledger"], so Open Commitments / Evening Accountability /
     # TRACKED OPEN LOOPS rendered empty every day until _normalize_local merged the ledger in.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'calls')
     d = tmp_path / "knowledge" / "continuity"
     d.mkdir(parents=True)
     (d / "a.md").write_text(
         "---\nanchor_key: k1\nstatus: open\naction_type: reply\ncontact_name: Sarah Chen\n"
         "channel: email\ncreated_at: '2026-06-20'\nsummary: Send the deck\n"
-        "source_brief_at: '2026-06-23T07:00:00Z'\n---\n")
+        "source_brief_at: '2026-06-23T07:00:00Z'\n"
+        "source_refs:\n  - sourceType: calls\n    sourceId: call-1\n---\n")
     (d / "b.md").write_text(
         "---\nanchor_key: k2\nstatus: resolved\ncontact_name: Done Person\n---\n")
     local = cb._normalize_local({"local": {}})
@@ -1968,22 +2143,107 @@ def test_continuity_ledger_populates_action_ledger(tmp_path, monkeypatch):
     # the evening block is THIS morning's actions: a `today` narrows it to rows stamped that day
     assert "Sarah Chen" in cb._format_reconciliation(local, "evening", "2026-06-23")
     assert cb._format_reconciliation(local, "evening", "2026-06-24") == ""
-    # an explicitly-supplied action_ledger still wins
+    # A carried ledger cannot replace the source-authorized canonical row.
     local2 = cb._normalize_local({"local": {"action_ledger": [{"status": "open", "contact_name": "X"}]}})
-    assert [a["contact_name"] for a in local2["action_ledger"]] == ["X"]
+    assert [a["contact_name"] for a in local2["action_ledger"]] == ["Sarah Chen"]
+
+
+def test_brief_ledger_uses_protected_source_projection(tmp_path, monkeypatch):
+    """A raw legacy row cannot escape the owner-facing protected loop view via the brief."""
+    import yaml
+    import ledger_provenance
+    import source_context
+
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'calls')
+    directory = tmp_path / 'knowledge' / 'continuity'
+    directory.mkdir(parents=True)
+
+    def write(name, row):
+        (directory / f'{name}.md').write_text('---\n' + yaml.safe_dump(row, sort_keys=False) + '---\n')
+
+    def row(anchor, **extra):
+        return {'anchor_key': anchor, 'status': 'open', 'action_type': 'reply',
+                'channel': 'phone', 'contact_name': anchor, 'created_at': '2026-10-10',
+                'summary': f'Call {anchor}', **extra}
+
+    allowed = row('permitted', source_refs=[{'sourceType': 'calls', 'sourceId': 'call-1'}])
+    denied = row('denied', source_refs=[{'sourceType': 'imessage', 'sourceId': 'message-1'}])
+    union = row('union', source_refs=[{'sourceType': 'calls', 'sourceId': 'call-2'},
+                                    {'sourceType': 'imessage', 'sourceId': 'message-2'}])
+    unknown = row('unknown')
+    owner = row('owner', channel='manual', source='user_added',
+                source_thread_id='manual:owner-1')
+    owner['content_provenance'] = {
+        'version': 1, 'kind': 'owner', 'sources': [],
+        'digest': ledger_provenance.digest_frontmatter(owner),
+    }
+    for item in (allowed, denied, union, unknown, owner):
+        write(item['anchor_key'], item)
+
+    injected = row('injected')
+    local = cb._normalize_local({'local': {'action_ledger': [injected]}})
+    assert {item['anchor_key'] for item in local['action_ledger']} == {'permitted', 'owner'}
+    seen = []
+    def model(prompt, *_args, **_kwargs):
+        seen.append(prompt)
+        return json.dumps({'brief_markdown': '## Filtered\nNo noise.', 'actions': []})
+    out = cb.compose({'type': 'morning', 'google': {},
+                      'local': {'action_ledger': [injected]}}, llm=model, critic=False)
+    assert len(seen) == 1
+    assert 'Call permitted' in seen[0] and 'Call owner' in seen[0]
+    assert all(f'Call {name}' not in seen[0] for name in ('denied', 'union', 'unknown'))
+    assert 'Call injected' not in seen[0]
+    assert out['_loop_source_permissions'] == ['calls']
+
+
+def test_brief_protected_ledger_failure_never_uses_carried_rows(tmp_path, monkeypatch):
+    import loops_query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    def unavailable(*_args):
+        raise RuntimeError('protected read unavailable')
+    monkeypatch.setattr(loops_query, 'permitted_rows', unavailable)
+    with pytest.raises(RuntimeError, match='protected read unavailable'):
+        cb._normalize_local({'local': {'action_ledger': [{'status': 'open',
+                                                          'summary': 'Unsafe carried row'}]}})
+
+
+def test_brief_one_protected_ledger_snapshot_binds_prompt_to_delivery_sources(tmp_path, monkeypatch):
+    import loops_query
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    row = {'anchor_key': 'call-one', 'status': 'open', 'action_type': 'reply',
+           'contact_name': 'Alex Stone', 'channel': 'phone',
+           'summary': 'Return the missed call', 'created_at': '2026-10-10',
+           'source_refs': [{'sourceType': 'calls', 'sourceId': 'call-1'}]}
+    reads = []
+    def changing_rows(_root, _sources):
+        reads.append(1)
+        return [row] if len(reads) == 1 else []
+    monkeypatch.setattr(loops_query, 'permitted_rows', changing_rows)
+    seen = []
+    def model(prompt, *_args, **_kwargs):
+        seen.append(prompt)
+        return json.dumps({'brief_markdown': '## Filtered\nNo noise.', 'actions': []})
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=model, critic=False)
+    assert len(reads) == 1
+    assert 'Return the missed call' in seen[0]
+    assert out['_loop_source_permissions'] == ['calls']
 
 
 def test_action_ledger_excludes_meeting_entries(tmp_path, monkeypatch):
     """Meeting-prep/meeting-info loops are calendar shadows — the docket is their surface. The
     brief drops them exactly like /api/loops does, legacy hyphen spelling included."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'calls')
     d = tmp_path / "knowledge" / "continuity"
     d.mkdir(parents=True)
     for i, atype in enumerate(("meeting_prep", "meeting-prep", "Meeting_Info", "reply")):
         (d / f"{i}.md").write_text(
             f"---\nanchor_key: k{i}\nstatus: open\naction_type: {atype}\n"
             f"contact_name: Person {i}\nchannel: email\ncreated_at: '2026-06-20'\n"
-            f"summary: item {i}\nsource_brief_at: '2026-06-23T07:00:00Z'\n---\n")
+            f"summary: item {i}\nsource_brief_at: '2026-06-23T07:00:00Z'\n"
+            f"source_refs:\n  - sourceType: calls\n    sourceId: call-{i}\n---\n")
     local = cb._normalize_local({"local": {}})
     assert [a["action_type"] for a in local["action_ledger"]] == ["reply"]
 
@@ -2115,7 +2375,6 @@ def test_seed_snapshot_tolerates_a_raw_tool_wrapper_and_refuses_an_empty_seed(tm
 # ── freemail user domain: same-domain attendees still get researched ────────────
 
 def test_automatic_research_excludes_personal_addresses_for_every_owner(tmp_path, monkeypatch):
-    # Automatic prep is for work addresses even when the owner uses a personal account.
     import datetime as _dt
 
     class _FixedDateTime(_dt.datetime):
@@ -2123,7 +2382,7 @@ def test_automatic_research_excludes_personal_addresses_for_every_owner(tmp_path
         def now(cls, tz=None):
             return cls(2026, 6, 24, 12, 0, 0, tzinfo=tz)
 
-    monkeypatch.setattr(cb, "datetime", _FixedDateTime)
+    monkeypatch.setattr(__import__("prep_selection"), "datetime", _FixedDateTime)
     inputs = {"google": {"userEmail": "me@yahoo.com", "events": [
         {"id": "e", "summary": "Coffee", "start": "2026-06-24T22:00:00+00:00", "attendees": [
             {"email": "me@yahoo.com", "displayName": "Me"},
@@ -2156,8 +2415,8 @@ def test_automatic_research_excludes_personal_addresses_for_every_owner(tmp_path
 # Both ride {{knowledge_section}} as prompt CONTEXT: prevention (the company names the graph already
 # uses) and the unconfirmed-duplicate line. Context can't break a brief — that's why it lives here.
 
-def _dedup_data(tmp_path, companies=(), suggestions=None):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def _dedup_data(tmp_path, monkeypatch, companies=(), suggestions=None):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     kn = tmp_path / "knowledge"
     (kn / "companies").mkdir(parents=True, exist_ok=True)
     for slug, alias in companies:
@@ -2170,24 +2429,24 @@ def _dedup_data(tmp_path, companies=(), suggestions=None):
     return {"type": "morning", "google": {"events": []}, "local": {}}
 
 
-def test_known_company_names_ride_into_the_extraction_prompt(tmp_path):
+def test_known_company_names_ride_into_the_extraction_prompt(tmp_path, monkeypatch):
     """The model free-forms "YC" one day and "Y Combinator" the next; each spelling mints a file.
     Feeding back the names the graph already uses is the cheap half of the fix."""
-    inputs = _dedup_data(tmp_path, companies=[("y-combinator", "Y Combinator"),
+    inputs = _dedup_data(tmp_path, monkeypatch, companies=[("y-combinator", "Y Combinator"),
                                               ("signal-house", "Signal House")])
     prompt = cb.build_prompt(cb._load_prompt(), inputs)
     assert "Companies Already in the Knowledge Graph" in prompt
     assert "- Y Combinator" in prompt and "- Signal House" in prompt
 
 
-def test_no_company_files_means_no_company_block(tmp_path):
+def test_no_company_files_means_no_company_block(tmp_path, monkeypatch):
     """Silence gate: an empty graph adds nothing to the prompt."""
-    inputs = _dedup_data(tmp_path)
+    inputs = _dedup_data(tmp_path, monkeypatch)
     assert "Companies Already in the Knowledge Graph" not in cb.build_prompt(cb._load_prompt(), inputs)
 
 
-def test_merge_suggestions_surface_as_one_optional_brief_line(tmp_path):
-    inputs = _dedup_data(tmp_path, suggestions=[
+def test_merge_suggestions_surface_as_one_optional_brief_line(tmp_path, monkeypatch):
+    inputs = _dedup_data(tmp_path, monkeypatch, suggestions=[
         {"from": "c_aaa", "into": "c_bbb", "from_name": "Ben", "into_name": "Ben Butler",
          "reason": "name containment: ben ⊂ ben-butler", "first_seen": "2026-08-06"}])
     prompt = cb.build_prompt(cb._load_prompt(), inputs)
@@ -2196,8 +2455,8 @@ def test_merge_suggestions_surface_as_one_optional_brief_line(tmp_path):
     assert "AT MOST ONE short closing line" in prompt
 
 
-def test_no_suggestions_means_no_maintenance_block(tmp_path):
-    inputs = _dedup_data(tmp_path, suggestions=[])
+def test_no_suggestions_means_no_maintenance_block(tmp_path, monkeypatch):
+    inputs = _dedup_data(tmp_path, monkeypatch, suggestions=[])
     assert "Memory Maintenance" not in cb.build_prompt(cb._load_prompt(), inputs)
     # …and an unreadable file is silence too, never a crash.
     (tmp_path / "knowledge" / "merge_suggestions.json").write_text("{not json")
@@ -2219,6 +2478,16 @@ def test_the_ledger_block_names_the_chases_that_already_happened():
     assert "Sotto reminded YOU" in block
 
 
+def test_ledger_block_exposes_recorded_relay_identifier_without_claiming_named_person_owns_it():
+    row = {'anchor_key': 'follow_up:cid:relay', 'status': 'open', 'action_type': 'reply',
+           'contact_name': 'Alex Stone', 'contact_identifier': '+15550001000',
+           'channel': 'imessage', 'summary': 'A relay mentioned a call',
+           'ask': 'Reply about the call', 'created_at': '2026-08-05'}
+    block = cb._format_action_ledger({'action_ledger': [row]})
+    assert '[recorded identifier: +15550001000]' in block
+    assert 'may belong to a relay' in block
+
+
 def test_ledger_ages_follow_an_injected_clock():
     """A replayed day is six weeks old; wall-clock ages would inflate every number in its prompt."""
     from datetime import datetime, timezone
@@ -2227,6 +2496,17 @@ def test_ledger_ages_follow_an_injected_clock():
                                 "created_at": "2026-06-20 09:00:00"}]}
     now = datetime(2026, 6, 22, 9, 0, 0, tzinfo=timezone.utc)
     assert "(2d)" in cb._format_action_ledger(local, now)
+    assert cb.build_prompt("{{action_ledger}}", {"local": local, "now": "2026-06-22 09:00:00"}).count("(2d)") == 1
+
+
+def test_a_host_data_directory_never_replaces_an_injected_ledger(monkeypatch):
+    """Only a named volume switches to the protected ledger; a stray /data on the host does not."""
+    real_isdir = os.path.isdir
+    monkeypatch.setattr(os.path, "isdir", lambda p: str(p) == "/data" or real_isdir(p))
+    monkeypatch.delenv("SOTTO_DATA", raising=False)
+    local = {"action_ledger": [{"status": "open", "action_type": "reply", "contact_name": "Sarah",
+                                "channel": "email", "summary": "the deck",
+                                "created_at": "2026-06-20 09:00:00"}]}
     assert cb.build_prompt("{{action_ledger}}", {"local": local, "now": "2026-06-22 09:00:00"}).count("(2d)") == 1
 
 
@@ -2334,6 +2614,11 @@ def test_evening_receipts_report_what_moved(monkeypatch, tmp_path):
                   summary="the deck", resolution="delivered", resolved_at=today)
     _ledger_entry(tmp_path, "rsvp", status="resolved", action_type="reply", summary="the RSVP",
                   resolved_at=today)
+    import ledger_io
+    import loops_query
+    import ledger_provenance
+    monkeypatch.setattr(loops_query, 'permitted_rows', lambda _root, _sources: ledger_io.load_entries())
+    monkeypatch.setattr(ledger_provenance, 'source_loop_sources', lambda _row: frozenset({'calls'}))
     _surfaced(tmp_path, [
         _row(_today_at("09:10"), verdict="queue", cls="meeting_hold"),
         _row(_today_at("11:00"), verdict="queue", cls="cooldown"),
@@ -2401,6 +2686,16 @@ def test_closures_are_named_up_to_three_then_grouped_by_what_happened(monkeypatc
                       resolution=res, resolved_at=today)
     assert cb._receipt_lines(_evening(), today, "+00:00") == [
         "Closed 4 loops — 2 they delivered, 1 closed out, 1 you answered."]
+
+
+def test_grouped_reminders_never_claim_counterpart_contact(monkeypatch, tmp_path):
+    today = _receipt_env(monkeypatch, tmp_path)
+    for index in range(cb.RECEIPT_NAMES_MAX + 1):
+        _ledger_entry(tmp_path, f'reminder-{index}', status='open', action_type='waiting_on',
+                      contact_name='Maya', summary=f'outstanding request {index}',
+                      created_at=today, chased_count=1, last_chased_at=today)
+    assert cb._receipt_lines(_evening(), today, '+00:00') == [
+        f'Reminded you about {cb.RECEIPT_NAMES_MAX + 1} outstanding requests.']
 
 
 def test_yesterdays_record_is_not_todays_receipt(monkeypatch, tmp_path):
@@ -2611,6 +2906,14 @@ def test_the_brief_records_which_loops_it_named(monkeypatch, tmp_path):
     quiet = {"anchor_key": "loop:ron", "contact_name": "Ron Diaz", "status": "open",
              "action_type": "reply", "channel": "email", "contact_identifier": "ron@x.com",
              "summary": "his intro request", "created_at": _iso_hours_ago(30)}
+    # Keep this count-vs-named contract meaningful now that short text briefs can show quiet
+    # tasks: a complete long ask cannot fit the existing readable expansion budget.
+    import visual_brief
+    quiet['summary'] += ' with supporting context' * visual_brief.MAX_WORDS
+    import loops_query
+    import ledger_provenance
+    monkeypatch.setattr(loops_query, 'permitted_rows', lambda _root, _sources: [named, quiet])
+    monkeypatch.setattr(ledger_provenance, 'source_loop_sources', lambda _row: frozenset({'calls'}))
 
     def fake_llm(prompt, inputs, system=None, schema=None):
         return json.dumps({"brief_markdown": "## Needs Attention Now\nQuiet.\n", "actions": []})
@@ -2747,9 +3050,18 @@ def test_calendar_formatter_flags_meetings_with_nowhere_to_go():
     assert FLAG not in rl._format_calendar([dict(base, start="2026-08-26")])
 
 
-def test_snapshot_archive_accumulates_dated_copies_and_prunes(tmp_path):
+def test_snapshot_archive_accumulates_dated_copies_and_prunes(tmp_path, monkeypatch):
     """The live snapshot answers "now"; the dated archive is the Golden Corpus's message history.
     One file per day (last write wins), pruned past SNAPSHOT_ARCHIVE_DAYS."""
+    from datetime import datetime, timezone
+    import local_snapshot
+
+    class ArchiveClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 26, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(local_snapshot, 'datetime', ArchiveClock)
     os.environ["SOTTO_DATA"] = str(tmp_path)
     try:
         arch = tmp_path / "knowledge" / "snapshots"
@@ -2781,7 +3093,7 @@ def test_empty_extraction_retries_full_sources_before_critic(tmp_path, monkeypat
     out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
     assert len(calls) == 2 and calls[0] == calls[1]
     assert 'Nothing needs your attention today.' in out['brief_markdown']
-    assert set(calls[0][2]['required']) == {'markdown', 'actionItems', 'extractedKnowledge'}
+    assert set(calls[0][2]['required']) == {'markdown', 'actionItems', 'loopUpdates', 'extractedKnowledge'}
 
 
 def test_repeated_empty_extraction_fails_without_critic_or_memory_writes(tmp_path, monkeypatch):
@@ -2901,6 +3213,10 @@ def test_gallery_space_names_active_loops_before_delivery_attribution(tmp_path, 
                 ("Casey Brooks", "workshop"), ("Morgan White", "strategy")])]
     excluded = [{**rows[0], "anchor_key": "closed", "contact_name": "Closed Person", "status": "resolved"},
                 {**rows[0], "anchor_key": "parked", "contact_name": "Parked Person", "status": "parked"}]
+    import loops_query
+    import ledger_provenance
+    monkeypatch.setattr(loops_query, 'permitted_rows', lambda _root, _sources: rows + excluded)
+    monkeypatch.setattr(ledger_provenance, 'source_loop_sources', lambda _row: frozenset({'calls'}))
     inputs = {"type": "morning", "google": {}, "local": {"action_ledger": rows + excluded}}
     def model(*args, **kwargs):
         return json.dumps({"brief_markdown": BRIEF.split('\n', 1)[1], "actions": []})
@@ -2943,7 +3259,10 @@ def test_optional_loop_details_never_repeat_an_evening_receipt_or_break_fallback
     out = cb._append_still_open({'brief_markdown': BRIEF}, [row], today='2026-09-20')
     original = out['brief_markdown']
     cb._expand_quiet_loops(out, [row], today='2026-09-20', reported={'already-reported'})
-    assert out['brief_markdown'] == original
+    assert 'Robin Green' not in out['brief_markdown']
+    assert 'other open loop' not in out['brief_markdown'], 'a reported task is not part of the remaining count'
+    assert '## Still open' not in out['brief_markdown'], 'remove the now-empty section too'
+    out['brief_markdown'] = original
     monkeypatch.setattr(visual_brief, 'fits', lambda deck, **kwargs: False)
     cb._expand_quiet_loops(out, [row], today='2026-09-20')
     assert out['brief_markdown'] == original
@@ -3351,6 +3670,10 @@ def test_paraphrased_anchored_task_without_marker_is_not_repeated_and_is_recorde
     row = {"anchor_key": "memo", "contact_name": "Priya Raman", "status": "open",
            "action_type": "follow_up", "channel": "email", "summary": "Send the diligence memo",
            "chased_count": 1, "created_at": _iso_hours_ago(30)}
+    import loops_query
+    import ledger_provenance
+    monkeypatch.setattr(loops_query, 'permitted_rows', lambda _root, _sources: [row])
+    monkeypatch.setattr(ledger_provenance, 'source_loop_sources', lambda _row: frozenset({'calls'}))
     md = ("## Should Handle Today\n**Priya Raman**<!--id:p@x.com|ch:email--> is still waiting on "
           "the diligence memo you promised; send it today.\n")
     out = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [row]}},
@@ -3506,8 +3829,8 @@ def test_schedule_uses_local_day_birthdays_and_single_line_source_fields(tmp_pat
         local={'contacts': [{'name': 'Sam', 'birthday': '09-21'}, {'name': 'Lee', 'birthday': '09-22'}]})
     rows = cb._schedule_lines(inputs, {})
     assert len(rows) == 5
-    assert 'Mon Sep 21 All day: Offsite' in rows[0]
     assert 'Mon Sep 21 5:00 PM: Design Still Open review | Location: 14 Main St' in rows[1]
+    assert 'Mon Sep 21 All day: Offsite' in rows[0]
     import visual_brief
     assert visual_brief._birthday_parts(next(line[2:] for line in rows if 'Sam' in line)) == ('Sam', 'Birthdays today')
     assert any('Lee' in line and 'birthday tomorrow' in line for line in rows)
@@ -3517,6 +3840,16 @@ def test_schedule_uses_local_day_birthdays_and_single_line_source_fields(tmp_pat
     assert 'birthday TODAY' in prompt
 
 
+def test_busy_schedule_keeps_five_meetings_ahead_of_birthday(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    events = [_meeting(hour) for hour in (9, 10, 11, 12, 13)]
+    inputs = _calendar_inputs(events, local={'contacts': [{'name': 'Ashish', 'birthday': '09-21'}]})
+    rows = cb._schedule_lines(inputs, {})
+    assert len(rows) == 5 and all('Planning' in row for row in rows)
+    assert 'Ashish' in '\n'.join(cb._schedule_lines(_calendar_inputs(events[:2], local={
+        'contacts': [{'name': 'Ashish', 'birthday': '09-21'}]}), {}))
+
+
 def test_schedule_keeps_first_brief_closing_offer_and_welcome_untouched(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     original = {'brief_markdown': '**Coming Up**\n- 9:00 AM: Old meeting\n\n'
@@ -3524,6 +3857,193 @@ def test_schedule_keeps_first_brief_closing_offer_and_welcome_untouched(tmp_path
     out = cb._ensure_schedule(original, _calendar_inputs([_meeting()], first_run=True))
     assert 'Ask me to draft 3 replies today.\n- You can ask about tomorrow too.' in out['brief_markdown']
     assert cb._ensure_schedule(original, _calendar_inputs([_meeting()], type='welcome')) == original
+
+
+def test_schedule_preserves_unheaded_tasks_after_calendar_block(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    original = {'brief_markdown': ('## Coming Up\n'
+        '- Ashish · birthday today\n\n'
+        '- Charley: Send the signed contract. <!--loop:contract-->\n'
+        '## ✅ Already Handled\n- A sourced item.')}
+    out = cb._ensure_schedule(original, _calendar_inputs([_meeting()], local={
+        'contacts': [{'name': 'Ashish', 'birthday': '09-21'}]}))
+    assert 'Ashish' in out['brief_markdown']
+    assert 'Planning 9' in out['brief_markdown']
+    assert 'Charley: Send the signed contract.' in out['brief_markdown']
+    assert 'A sourced item.' in out['brief_markdown']
+
+
+def test_injected_ledger_hides_only_unsourced_brief_birthday_courtesy():
+    courtesy = {'anchor_key': 'patrick', 'status': 'open', 'contact_name': 'Patrick',
+                'summary': 'Send Patrick a belated birthday greeting',
+                'source_brief_at': '2026-10-04 08:00:00'}
+    owner = {**courtesy, 'anchor_key': 'owner', 'source': 'user_added'}
+    requested = {**courtesy, 'anchor_key': 'requested',
+                 'source_refs': [{'sourceType': 'imessage', 'sourceId': '7'}]}
+    inputs = {'type': 'morning', 'local': {'action_ledger': [courtesy, owner, requested]}}
+    rows = cb._normalize_local(inputs)['action_ledger']
+    assert [row['anchor_key'] for row in rows] == ['owner', 'requested']
+    assert 'patrick' not in cb._format_action_ledger({'action_ledger': [courtesy]}, cb._brief_now(inputs))
+
+
+def test_same_person_and_topic_do_not_hide_a_distinct_future_call():
+    row = {'anchor_key': 'november-call', 'status': 'open', 'contact_name': 'Dana',
+           'contact_identifier': 'dana@example.com',
+           'summary': 'Schedule November planning call regarding Project Cedar',
+           'created_at': '2026-10-05', 'deadline': '2026-10-06'}
+    md = ('## Should Handle Today\n- Dana: Call now regarding Project Cedar. '
+          '<!--id:dana@example.com-->\n')
+    assert cb._visible_open_task_keys(md, [row]) == set()
+
+
+def test_screenshot_paraphrases_appear_once_before_canonical_followups_are_appended():
+    rows = [
+        {'anchor_key': 'nika', 'contact_name': 'Austin Park', 'canonical_id': 'person-austin',
+         'contact_identifier': 'austin@example.com', 'status': 'open', 'chased_count': 1,
+         'summary': 'Reply to Austin about the new startup Project Cedar and share your thoughts',
+         'created_at': '2026-10-01'},
+        {'anchor_key': 'telecom', 'contact_name': 'Jordan Lake', 'canonical_id': 'person-jackson',
+         'contact_identifier': 'jackson@example.com', 'status': 'open', 'chased_count': 1,
+         'summary': 'Jordan Lake asked if your team has US telecom contacts for LineForge '
+                    'after sending the Orbit CIO details.', 'created_at': '2026-10-01'},
+        {'anchor_key': 'contract', 'contact_name': 'Austin Park', 'canonical_id': 'person-austin',
+         'contact_identifier': 'austin@example.com', 'status': 'open', 'chased_count': 1,
+         'summary': 'Sign the services contract', 'created_at': '2026-10-02'}]
+    md = ('## Needs you\n'
+          '- **Austin Park**: Your thoughts on Project Cedar are still owed. <!--loop:nika-->\n'
+          '- **Jordan Lake**: Nudged you at 7:00 AM and 9:00 AM about Jordan’s request for '
+          'US telecom contacts; still open unless you handled it. <!--loop:telecom-->\n'
+          '## Follow-ups\n'
+          '- **Austin Park**: Reply about Project Cedar. <!--loop:nika-->\n'
+          '- **Jordan Lake**: Jordan Lake’s request for US telecom contacts remains open '
+          'after this morning’s nudges. <!--loop:telecom-->\n'
+          '- **Austin Park**: Reply to Austin about the new startup Project Cedar and share your '
+          'thoughts. <!--loop:nika-->\n'
+          '- **Jordan Lake**: Jordan Lake asked if your team has US telecom contacts for '
+          'LineForge after sending the Orbit CIO details. <!--loop:telecom-->\n'
+          '## Filtered\nPromotions\n')
+    original = json.loads(json.dumps(rows))
+    out = cb._append_still_open({'brief_markdown': md}, rows, today='2026-10-10')
+    text = out['brief_markdown']
+    # Earlier partial mentions keep their section and place; lines that add anything (here,
+    # when it was nudged) stay. Only bare repeats after a full appearance go.
+    assert text.count('Reply to Austin about the new startup Project Cedar') == 1
+    assert text.count('US telecom contacts for LineForge') == 1
+    assert 'Sign the services contract' in text
+    assert cb._visible_open_task_keys(text, rows) == {'nika', 'telecom', 'contract'}
+    assert rows == original  # Presentation never resolves or edits a canonical obligation.
+
+
+def test_duplicate_followup_is_removed_without_removing_separate_ask_for_same_person():
+    first = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'canonical_id': 'person-robin',
+             'status': 'open', 'summary': 'Send the strategy deck'}
+    second = {**first, 'anchor_key': 'contract', 'summary': 'Sign the partnership contract'}
+    md = ('## Follow-ups\n- **Robin Green**: The strategy deck is still owed.\n'
+          '- **Robin Green**: Send the strategy deck.\n'
+          '- **Robin Green**: Sign the partnership contract.\n')
+    text = cb._dedupe_open_task_lines(md, [first, second])
+    assert text.count('strategy deck') == 1
+    assert 'Sign the partnership contract' in text
+
+
+def test_ambiguous_same_person_topics_and_same_name_identities_are_not_deduped():
+    first = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'canonical_id': 'person-robin',
+             'contact_identifier': 'robin@example.com', 'status': 'open',
+             'summary': 'Send the Project Cedar strategy deck'}
+    second = {**first, 'anchor_key': 'contract', 'summary': 'Sign the Project Cedar contract'}
+    md = ('## Needs you\n- **Robin Green**: Project Cedar needs a decision.\n'
+          '## Follow-ups\n- **Robin Green**: Project Cedar needs a decision.\n')
+    assert cb._dedupe_open_task_lines(md, [first, second]) == md
+    assert cb._visible_open_task_keys(md, [first, second]) == set()
+    collision = {**first, 'anchor_key': 'another-deck', 'canonical_id': 'another-robin',
+                 'contact_identifier': 'other-robin@example.com'}
+    same_name = md.replace('Project Cedar needs a decision', 'The Project Cedar strategy deck is owed')
+    assert cb._dedupe_open_task_lines(same_name, [first, collision]) == same_name
+    assert cb._visible_open_task_keys(same_name, [first, collision]) == set()
+
+
+def test_exact_contact_marker_disambiguates_names_but_multitask_lines_stay_intact():
+    first = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'canonical_id': 'person-robin',
+             'contact_identifier': 'robin@example.com', 'status': 'open',
+             'summary': 'Send the strategy deck'}
+    other = {**first, 'anchor_key': 'other-deck', 'canonical_id': 'other-robin',
+             'contact_identifier': 'other@example.com'}
+    line = '- **Robin Green**<!--id:robin@example.com-->: The strategy deck is still owed.\n'
+    md = '## Needs you\n' + line + '## Follow-ups\n' + line
+    assert cb._dedupe_open_task_lines(md, [first, other]).count('strategy deck') == 1
+    contract = {**first, 'anchor_key': 'contract', 'summary': 'Sign the partnership contract'}
+    combined = '- **Robin Green**: Send the strategy deck and sign the partnership contract.\n'
+    mixed = ('## Needs you\n- **Robin Green**: Send the strategy deck. <!--loop:deck-->\n'
+             '## Follow-ups\n' + combined)
+    assert combined in cb._dedupe_open_task_lines(mixed, [first, contract])
+
+
+def test_shared_contract_words_cannot_remove_a_different_unmarked_obligation():
+    row = {'anchor_key': 'acquisition', 'contact_name': 'Dana Wu', 'canonical_id': 'person-dana',
+           'contact_identifier': 'dana@example.com', 'status': 'open',
+           'summary': 'Send the signed acquisition contract'}
+    first = '- **Dana Wu**<!--id:dana@example.com-->: Send the signed acquisition contract.\n'
+    rental = '- **Dana Wu**<!--id:dana@example.com-->: Send the signed rental contract.\n'
+    md = '## Needs you\n' + first + '## Follow-ups\n' + rental
+    assert cb._dedupe_open_task_lines(md, [row]) == md
+    assert cb._line_open_task_keys(rental, [row]) == set()
+
+
+def test_unreviewed_precise_ask_cannot_hide_broader_saved_summary():
+    import copy
+    row = {'anchor_key': 'market-map', 'contact_name': 'Robin Green', 'canonical_id': 'c_abc123',
+           'contact_identifier': 'robin@example.test', 'status': 'open', 'deadline': '2026-09-20',
+           'summary': 'Robin discussed the acquisition pipeline on August 6, 2026 and requested materials',
+           'ask': 'Send the updated market map'}
+    original = copy.deepcopy(row)
+    first = 'Robin Green<!--id:robin@example.test-->: Send the updated market map. <!--loop:market-map-->\n'
+    main = '## Needs Attention Now\n' + first
+    duplicate = '## Still open\nRobin Green: ' + row['summary'] + '. <!--loop:market-map-->\n'
+    assert cb._line_open_task_keys(first, [row]) == set()
+    assert cb._dedupe_open_task_lines(main + duplicate, [row]) == main + duplicate
+    # A precise ask alone cannot prove whether the saved summary's extra scope is stale.
+    out = {'brief_markdown': main}
+    cb._append_still_open(out, [row], today='2026-09-21')
+    assert row['summary'] in out['brief_markdown'] and '## Still open' in out['brief_markdown']
+    assert row == original
+
+
+@pytest.mark.parametrize('boundary', ['unmarked', 'wrong_topic', 'wrong_date', 'ambiguous_identity'])
+def test_precise_ask_fallback_requires_exact_task_and_identity(boundary):
+    row = {'anchor_key': 'market-map', 'contact_name': 'Robin Green', 'canonical_id': 'c_abc123',
+           'contact_identifier': 'robin@example.test', 'status': 'open',
+           'summary': 'Robin discussed the acquisition pipeline on August 6, 2026 and requested materials',
+           'ask': 'Send the updated market map'}
+    rows = [row]
+    line = 'Robin Green<!--id:robin@example.test-->: Send the updated market map. <!--loop:market-map-->'
+    if boundary == 'unmarked':
+        line = line.replace('<!--loop:market-map-->', '')
+    elif boundary == 'wrong_topic':
+        line = line.replace('updated market map', 'signed rental contract')
+    elif boundary == 'wrong_date':
+        row['ask'] += ' for October 12, 2026'
+        line = line.replace('market map.', 'market map for October 13, 2026.')
+    else:
+        rows.append({**row, 'anchor_key': 'other-market-map', 'canonical_id': 'c_def456'})
+    assert cb._line_open_task_keys(line, rows) == set()
+
+
+@pytest.mark.parametrize('heading', ['## Still Pending', '**Still Pending**',
+                                     '## Follow-ups', '**Follow-ups**', '## Still open'])
+def test_only_duplicate_pruned_empty_followup_headers_are_removed(heading):
+    row = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'status': 'open',
+           'summary': 'Send the strategy deck'}
+    line = '- **Robin Green**: Send the strategy deck. <!--loop:deck-->\n'
+    main = '## Needs you\n' + line + '\n'
+    suffix = '## Notes\n\n## Already Handled\n\n'
+    md = main + heading + '\n\n' + line + '\n' + suffix
+    assert cb._dedupe_open_task_lines(md, [row]) == main + suffix
+    # Empty input sections and sections with any remaining content keep their heading.
+    empty = main + heading + '\n\n' + suffix
+    assert cb._dedupe_open_task_lines(empty, [row]) == empty
+    retained = main + heading + '\n' + line + 'A separate unbound request remains.\n'
+    assert heading in cb._dedupe_open_task_lines(retained, [row])
+    assert cb._dedupe_open_task_lines(main + heading + '\n' + line, [row]) == main
 
 
 @pytest.mark.parametrize('verdict', [None, 'reject', 'duplicate', 'unknown'])
@@ -3555,6 +4075,82 @@ def test_critic_verdict_is_bound_to_exact_proposal(tmp_path, monkeypatch):
     cb._stamp_loop_reviews(out, approved)
     assert out['loop_updates'][0].get('criticReceipt') == ident
     assert not out['loop_updates'][1].get('criticReceipt')
+
+
+@pytest.mark.parametrize('original_decision', ['none', 'approve', 'reject'])
+@pytest.mark.parametrize('decision', ['approve', 'reject', 'missing', 'old_proof', 'unbound', 'error', 'held', 'source_failure'])
+def test_revision_closure_gets_one_exact_source_bound_review(
+        tmp_path, monkeypatch, original_decision, decision):
+    """A prose mark_handled repair cannot approve its newly structured closure."""
+    from copy import deepcopy
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch, n=2)
+    inputs['google']['emails'][0]['body'] = 'I sent the deck. Delivery is complete.'
+    original = deepcopy(updates[0])
+    revised = deepcopy(original)
+    revised['evidence'][0]['snippet'] = 'I sent the deck.'
+    if decision == 'unbound':
+        revised['evidence'][0]['sourceId'] = 'missing-source'
+    old_id = cb._continuity().critic_review_receipt(original)
+    revised_id = cb._continuity().critic_review_receipt(revised)
+    original_proposal = original_decision != 'none'
+    prior_summary = 'Previous proof rejected as incomplete.' if original_decision == 'reject' else 'First source review.'
+    calls = []
+
+    def llm(prompt, data, **kwargs):
+        if data.get('_critic'):
+            calls.append('critic')
+            manifest = json.loads(prompt.split('## DATA MANIFEST\n', 1)[1].split(
+                '\n\n## GENERATED BRIEF', 1)[0])
+            if calls.count('critic') == 1:
+                return json.dumps({'patches': [{'type': 'mark_handled', 'severity': 'moderate',
+                    'detail': 'The deck was sent. Move it to Already Handled.'}], 'score': 60,
+                    'summary': prior_summary,
+                    'loop_verdicts': [{'proposal_id': old_id, 'verdict': original_decision}]
+                        if original_proposal else []})
+            assert manifest['loop_update_review'][0]['proposal_id'] == revised_id
+            assert manifest['loop_update_review'][0]['evidence'][0]['original_context'] == inputs['google']['emails'][0]['body']
+            prior = manifest['prior_loop_update_review']
+            assert prior['summary'] == prior_summary
+            assert prior['verdicts'] == ([{'proposal_id': old_id, 'verdict': original_decision}]
+                                        if original_proposal else [])
+            assert [r['proposal_id'] for r in prior['proposals']] == ([old_id] if original_proposal else [])
+            if decision == 'error':
+                raise RuntimeError('offline reviewer unavailable')
+            if decision == 'held':
+                raise cb.model_work.ModelWorkHeldError('attempts exhausted')
+            # An actionable response must not trigger another revision/review cycle.
+            return json.dumps({'patches': [{'type': 'mark_handled', 'severity': 'moderate',
+                'detail': 'No recursive repair.'}], 'score': 90,
+                'loop_verdicts': [] if decision == 'missing' else [{
+                    'proposal_id': old_id if decision == 'old_proof' else revised_id,
+                    'verdict': 'reject' if decision == 'reject' else 'approve'}]})
+        if data.get('_revise'):
+            calls.append('revise')
+            if decision == 'source_failure':
+                def unavailable(_):
+                    raise RuntimeError('offline source index unavailable')
+                monkeypatch.setattr(cb, '_review_message_sources', unavailable)
+            return json.dumps({'markdown': '## Already Handled\n- Dana: Deck sent. <!--loop:deck-0-->',
+                              'actionItems': [], 'loopUpdates': [revised]})
+        calls.append('extract')
+        return json.dumps({'markdown': '## Should Handle Today\n- Dana: Send the deck. <!--loop:deck-0-->',
+                          'actionItems': [], 'loopUpdates': [original] if original_proposal else []})
+
+    out = cb.compose(inputs, llm=llm, critic=True)
+    assert calls == ['extract', 'critic', 'revise'] + ([] if decision in ('unbound', 'source_failure') else ['critic'])
+    approved = decision == 'approve'
+    assert out['_loop_projection']['resolved'] == (['deck-0'] if approved else [])
+    assert bool(out['loop_updates'][0].get('criticReceipt')) is approved
+    assert out['_critic']['revision_closure_review']['approved'] == int(approved)
+    if not approved:
+        assert 'Deck sent' not in out['brief_markdown']
+        assert 'deck-0' in out['_held_loop_ids']
+    # The projection consumes a receipt only for this proof and leaves its sibling open.
+    if approved:
+        changed = deepcopy(out['loop_updates'][0])
+        changed['evidence'][0]['snippet'] = 'Delivery is complete.'
+        projected = cb._project_loop_updates({'loop_updates': [changed]}, inputs, inputs['local']['action_ledger'])
+        assert {row['anchor_key'] for row in projected} == {'deck-0', 'deck-1'}
 
 
 def test_supplemental_email_completion_is_shared_by_critic_and_resolver(tmp_path, monkeypatch):
@@ -3665,3 +4261,826 @@ def test_held_completion_omits_unbound_continuations_but_keeps_verified_task():
     cb._reconcile_task_sections(out, ledger, ledger[:1])
     assert 'deck' not in out['brief_markdown'] and 'Everyone' not in out['brief_markdown']
     assert 'Different verified task' in out['brief_markdown'] and 'Keep this' in out['brief_markdown']
+
+
+def test_retained_relative_loop_is_attributed_on_october_six_without_rewriting_october_four():
+    from datetime import datetime, timezone
+    from copy import deepcopy
+    now = datetime(2026, 10, 6, 20, tzinfo=timezone.utc)
+    row = {'anchor_key': 'birthday-old', 'status': 'open', 'contact_name': 'Alex Chen',
+           'summary': 'Wish Alex a happy birthday yesterday on October 4',
+           'created_at': '2026-10-05', 'action_type': 'followup'}
+    before = deepcopy(row)
+    line = cb._open_loop_line([row], now)
+    assert 'From Oct 5: “Wish Alex a happy birthday yesterday on October 4”' in line
+    assert 'Saved wording' not in line
+    assert row == before
+    prompt = cb.build_prompt(cb._load_prompt(), {'type': 'evening', 'now': now.isoformat(),
+                                               'local': {'action_ledger': [row]}})
+    assert "User's today: 2026-10-06" in prompt
+    assert 'birthday on October 4' in prompt
+    assert 'creation date is not proof of its event date' in prompt
+    assert row['summary'] in prompt
+
+
+def test_late_brief_prompt_has_local_clock_for_passed_same_day_times():
+    from datetime import datetime, timezone
+
+    prompt = cb.build_prompt(cb._load_prompt(), {
+        'type': 'evening',
+        'now': datetime(2026, 10, 14, 5, 48, tzinfo=timezone.utc).isoformat(),
+        'google': {'userTimezone': 'America/Los_Angeles'},
+        'local': {},
+    })
+    assert "User's today: 2026-10-13" in prompt
+    assert "User's local time: 10:48 PM" in prompt
+    assert 'do not present that time as an upcoming' in prompt
+    assert 'do not shorten a marked ledger task into a second, partial version' in prompt
+
+
+def test_undated_quoted_and_ambiguous_loop_dates_are_not_rebased():
+    from datetime import datetime, timezone
+    now = datetime(2026, 10, 6, 20, tzinfo=timezone.utc)
+    for created in ['', 'October 4', '2026-99-04']:
+        text = 'Alex said “send it today”; date 04/10 is ambiguous'
+        row = {'status': 'open', 'contact_name': 'Alex Chen', 'summary': text,
+               'created_at': created, 'action_type': 'reply'}
+        line = cb._open_loop_line([row], now)
+        assert 'Earlier request (date unknown)' in line
+        assert text in line
+        assert row['summary'] == text
+        assert '2026-10-04' not in line
+    current = {'summary': 'Send it today', 'created_at': '2026-10-06'}
+    assert 'From Oct 6: “Send it today”' in cb._open_loop_line([current], now)
+    for created in ['2026-10-06', '2026-10-07']:
+        stale = {'summary': 'Birthday yesterday on October 4', 'created_at': created}
+        line = cb._open_loop_line([stale], now)
+        assert stale['summary'] in line and ('From Oct 6' in line or 'Earlier request (date unknown)' in line)
+        if created > '2026-10-06':
+            assert 'date unknown' in line and created not in line.split('“')[0]
+
+
+def test_history_discovery_purpose_overrides_first_run_without_inventing_obligation():
+    discovery = {'observations': [{'person': 'Invented Alex', 'fact': 'Developing a community garden',
+                 'source_refs': ['gmail:invented'], 'importance': {'tier': 'vip',
+                 'reason': 'regular two-way activity across several weeks'}}], 'sources': ['gmail']}
+    note = cb._first_run_note({'type': 'welcome', 'first_run': False,
+                              'history_discovery': discovery}, {}, {}, [], [])
+    assert 'HISTORY DISCOVERY HANDOFF' in note
+    assert 'community garden' in note and 'gmail:invented' in note
+    assert 'frequency alone is not importance' in note
+    assert 'do not invent urgency' in note.lower()
+    assert 'bounded initial history review' in note
+    assert 'FIRST USEFUL LOOK' not in note
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+def test_truncated_extraction_reuses_full_context_without_queue_wait(tmp_path, monkeypatch, persistent):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    calls = []
+    def llm(prompt, inputs, system=None, schema=None):
+        calls.append((prompt, system, schema))
+        assert not inputs.get('_critic') and not inputs.get('_revise')
+        if len(calls) == 1 or persistent:
+            raise cb.ModelResponseError('model_output_limit', 'MAX_TOKENS')
+        return json.dumps({'markdown': 'Nothing needs your attention today.'})
+    if persistent:
+        with pytest.raises(cb.ModelResponseError):
+            cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
+        assert not (tmp_path / 'briefs').exists()
+    else:
+        out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
+        assert 'Nothing needs your attention today.' in out['brief_markdown']
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+def test_blocked_extraction_is_not_retried_as_truncation(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    calls = []
+    def llm(*args, **kwargs):
+        calls.append(1)
+        raise cb.ModelResponseError('model_no_candidates', 'SAFETY')
+    with pytest.raises(cb.ModelResponseError):
+        cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
+    assert len(calls) == 1
+
+
+def test_real_gemini_path_recovers_truncation_in_same_compose(tmp_path, monkeypatch):
+    import io
+    import sqlite3
+    import gemini
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_GEMINI_MODEL', 'gemini-3.8-flash')
+    monkeypatch.setenv('GOOGLE_AI_API_KEY', 'test')
+    monkeypatch.setenv('SOTTO_FALLBACK_MODEL', '')
+    monkeypatch.setenv('SOTTO_CRITIC', 'off')
+    monkeypatch.delenv('SOTTO_BRIEF_MODEL', raising=False)
+    monkeypatch.delenv('SOTTO_LLM_STUB', raising=False)
+    requests = []
+    def respond(request, **kwargs):
+        requests.append(json.loads(request.data))
+        result = {'candidates': [{'finishReason': 'MAX_TOKENS',
+                                 'content': {'parts': [{'text': '{"markdown": "unfinished'}]}}]}
+        if len(requests) == 2:
+            result = {'candidates': [{'finishReason': 'STOP', 'content': {'parts': [
+                {'text': json.dumps({'markdown': 'Nothing needs your attention today.'})}]}}]}
+        return io.BytesIO(json.dumps(result).encode())
+    monkeypatch.setattr(gemini.urllib.request, 'urlopen', respond)
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=gemini.call_gemini)
+    assert len(requests) == 2 and requests[0] == requests[1]
+    assert requests[0]['generationConfig']['maxOutputTokens'] == 65536
+    assert 'Nothing needs your attention today.' in out['brief_markdown']
+    with sqlite3.connect(tmp_path / 'events/model-work.sqlite3') as db:
+        assert [r[0] for r in db.execute('SELECT status FROM attempts ORDER BY created')] == [
+            'ModelResponseError', 'succeeded']
+
+def test_dedupe_never_removes_a_line_carrying_another_task_or_person():
+    deck = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'contact_identifier': 'robin@example.com',
+            'status': 'open', 'summary': 'Send the strategy deck'}
+    contract = {**deck, 'anchor_key': 'contract', 'summary': 'Sign the partnership contract'}
+    head = ('## Needs Attention Now\n- **Robin Green**<!--id:robin@example.com-->: Send the strategy '
+            'deck. <!--loop:deck-->\n## Should Handle Today\n')
+    for later in ('- **Robin Green**<!--id:robin@example.com-->: She asked you to confirm Thursday '
+                  'dinner with her investors; the strategy deck is still owed too. <!--loop:deck-->\n',
+                  '- **Robin Green**: Send the strategy deck. <!--loop:deck--> And **Pat Lee**'
+                  '<!--id:pat@example.com--> asked you to approve the Q4 budget.\n',
+                  '- **Robin Green**: Send the strategy deck and sign the partnership contract. '
+                  '<!--loop:deck-->\n'):
+        assert cb._dedupe_open_task_lines(head + later, [deck, contract]) == head + later
+    repeat = head + '- **Robin Green**: The strategy deck is still owed. <!--loop:deck-->\n'
+    # The emptied section goes with its last repeat.
+    assert cb._dedupe_open_task_lines(repeat, [deck, contract]) == head.removesuffix('## Should Handle Today\n')
+
+
+def test_dedupe_never_demotes_an_earlier_partial_mention():
+    deck = {'anchor_key': 'deck', 'contact_name': 'Robin Green', 'contact_identifier': 'robin@example.com',
+            'status': 'open', 'chased_count': 2, 'summary': 'Send the updated strategy deck'}
+    md = ('## Needs Attention Now\n- **Robin Green**<!--id:robin@example.com|ch:email-->: Strategy deck '
+          'still owed. <!--loop:deck-->\n## Still Pending\n- **Robin Green**: Send the updated strategy '
+          'deck. <!--loop:deck-->\n')
+    assert cb._dedupe_open_task_lines(md, [deck]) == md
+
+
+def test_partial_mention_is_neither_shown_nor_lets_the_full_ask_be_removed():
+    lease = {'anchor_key': 'lease', 'contact_name': 'Alex Chen', 'status': 'open', 'chased_count': 2,
+             'summary': 'Wire the deposit and countersign the lease agreement'}
+    md = ('## Needs Attention Now\n- **Alex Chen**: Lease agreement thread has gone quiet. <!--loop:lease-->\n'
+          '## Still Pending\n- **Alex Chen**: Wire the deposit and countersign the lease agreement. '
+          '<!--loop:lease-->\n')
+    assert cb._dedupe_open_task_lines(md, [lease]) == md
+    call = {'anchor_key': 'call', 'contact_name': 'Dana Wu', 'status': 'open', 'chased_count': 2,
+            'summary': 'Call Dana Wu back about the Cedar lease', 'created_at': '2026-10-01'}
+    signed = '## Needs Attention Now\n- **Dana Wu**: Sign the Cedar lease today.\n'
+    assert cb._visible_open_task_keys(signed, [call]) == set()
+    out = cb._append_still_open({'brief_markdown': signed}, [call], today='2026-10-10')
+    assert 'Call Dana Wu back about the Cedar lease' in out['brief_markdown']
+
+
+def test_final_validation_reads_the_backstop_as_coverage_not_model_inventory(monkeypatch):
+    monkeypatch.setenv("SOTTO_CRITIC", "off")
+    second = {"contact_name": "Dana Wu", "status": "open", "action_type": "follow_up",
+              "channel": "email", "summary": "Return the signed lease", "chased_count": 1,
+              "created_at": _iso_hours_ago(30)}
+
+    def fake_llm(prompt, inputs, system=None, schema=None):
+        return json.dumps({"brief_markdown": "## Needs Attention Now\nQuiet.\n", "actions": []})
+
+    out = cb.compose(_open_ledger_inputs(extra=[second]), llm=fake_llm, critic=True)
+    assert "## Still open" in out["brief_markdown"]
+    final = out["_final_validation"]
+    assert "unavailable" not in final
+    assert not {"open-loop-inventory", "dropped-open-loop"} & set(final["categories"])
+
+
+def test_final_validation_never_exempts_model_inventory_after_filtered(monkeypatch):
+    monkeypatch.setenv("SOTTO_CRITIC", "off")
+    model = ("## Needs Attention Now\nQuiet.\n## Filtered\nNothing else.\n"
+             "## Still open\n- **Alex Stone**: Review the budget.\n"
+             "- **Dana Wu**: Return the contract.\n")
+
+    def fake_llm(prompt, inputs, system=None, schema=None):
+        return json.dumps({"brief_markdown": model, "actions": []})
+
+    out = cb.compose(_open_ledger_inputs(anchor_key="memo"), llm=fake_llm, critic=True)
+    body = out["brief_markdown"]
+    assert body.index("<!--loop:memo-->") < body.index("## Filtered")
+    assert body.rindex("## Still open") > body.index("## Filtered")
+    assert "open-loop-inventory" in out["_final_validation"]["categories"]
+    assert "_deterministic_sections" not in out
+
+
+@pytest.mark.parametrize("section", ["still open", "weekly review"])
+@pytest.mark.parametrize("model_tail", ["", "## Filtered\nNothing else.\n"])
+def test_owned_section_append_exempts_only_the_inserted_block(section, model_tail):
+    # A same-name model heading before the insertion is still model inventory.
+    model = f"## {section.title()}\n- **Alex Stone**: Budget.\n- **Dana Wu**: Contract.\n"
+    out = {"brief_markdown": model + model_tail}
+    block = f"## {section.title()}\n- **Priya Raman**: Send the memo. <!--loop:memo-->\n\n"
+    cb._insert_deterministic_section(out, section, block)
+    owned = out["_deterministic_sections"]
+    assert owned == [section]
+    lines = cb.brief_validate._deterministic_lines(out["brief_markdown"], owned)
+    assert not any(mine for line, _, mine in lines if "Alex Stone" in line)
+    assert any(mine for line, _, mine in lines if "<!--loop:memo-->" in line)
+
+
+@pytest.mark.parametrize("section", ["still open", "weekly review"])
+def test_owned_section_withholds_exemption_for_a_later_model_heading(section):
+    out = {"brief_markdown": f"## Filtered\nNothing else.\n## {section.title()}\n"
+                            "- **Alex Stone**: Budget.\n- **Dana Wu**: Contract.\n"}
+    cb._insert_deterministic_section(out, section,
+        f"## {section.title()}\n- **Priya Raman**: Send the memo. <!--loop:memo-->\n\n")
+    assert out["_deterministic_sections"] == []
+    assert not any(mine for _, _, mine in cb.brief_validate._deterministic_lines(
+        out["brief_markdown"], out["_deterministic_sections"]))
+
+
+def test_thread_sender_proof_skips_owner_sent_aliases(monkeypatch):
+    monkeypatch.setattr(cb, 'configured_user_email', lambda: 'owner@example.com')
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    sent = {'threadId': 't1', 'from': 'Owner Alias <alias@example.com>', 'labelIds': ['SENT']}
+    received = {'threadId': 't2', 'from': 'Dana Reed <dana@example.com>'}
+    assert cb._source_thread_senders({'google': {'emails': [sent, received]}}) == {
+        'thread:t2': {'dana reed': 'dana@example.com'}}
+
+
+def test_word_matching_hint_does_not_override_review_or_force_paid_revision(monkeypatch):
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    calls = []
+    def llm(prompt, options, **kwargs):
+        calls.append(prompt)
+        if options.get('_critic'):
+            return json.dumps({'patches': [], 'score': 80, 'summary': 'reviewed'})
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nFixed.', 'actions': [], 'loop_updates': []})
+    violation = ('marked-loop-wording: loop deck (missing ask words board). Saved summary: Share the '
+                 'board deck. Saved ask: Share the board deck. Recorded Aug 9')
+    result = cb.critique_and_revise({'brief_markdown': '## Needs Attention Now\nDeck.', 'actions': [],
+                                     'loop_updates': []}, {}, llm=llm, violations=[violation],
+                                    source_prompt='full source fixture')
+    assert len(calls) == 1
+    assert 'revision_source_scope' not in result['_critic']
+    assert result['brief_markdown'].endswith('Deck.')
+    assert violation in calls[0]
+
+
+def test_separately_dated_summary_and_ask_use_existing_revision_and_remain_invalid_if_unchanged(monkeypatch):
+    import brief_validate
+    row = {'anchor_key': 'group-deck', 'contact_name': 'Research Group', 'status': 'open',
+           'created_at': '2026-08-05', 'summary':
+           'From Aug 5: Dana shared a trial-project deck and raised a review tomorrow.',
+           'ask': 'Review the deck and ask Dana about the data room tomorrow.'}
+    doubled = ('## Needs Attention Now\n**Research Group**<!--loop:group-deck--> - '
+               'From Aug 5: “Dana shared a trial-project deck and raised a review tomorrow.” '
+               'From Aug 5: “Review the deck and ask Dana about the data room tomorrow.”')
+    violations = brief_validate.validate(doubled, [], '', action_ledger=[row], today='2026-08-10')
+    assert any('one complete canonical ask' in v for v in violations)
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    calls = []
+    def llm(prompt, options, **kwargs):
+        calls.append(prompt)
+        if options.get('_critic'):
+            return json.dumps({'patches': [{'type': 'add_item', 'severity': 'moderate', 'detail': '\n'.join(violations)}], 'score': 80, 'summary': 'Task needs correction'})
+        return json.dumps({'brief_markdown': doubled, 'actions': [], 'loop_updates': []})
+    result = cb.critique_and_revise({'brief_markdown': doubled, 'actions': [], 'loop_updates': []},
+                                    {'local': {'action_ledger': [row]}}, llm=llm,
+                                    violations=violations, source_prompt='full source fixture')
+    assert len(calls) == 2
+    assert 'one complete canonical ask' in calls[-1]
+    assert result['_critic']['revision_reasons']['validator']['categories']['marked-loop-wording'] == 1
+    assert any('one complete canonical ask' in v for v in brief_validate.validate(
+        result['brief_markdown'], [], '', action_ledger=[row], today='2026-08-10'))
+
+
+def test_dropped_historical_group_task_gets_one_ask_rule_before_its_only_revision(monkeypatch):
+    import brief_validate
+    row = {'anchor_key': 'group-deck', 'contact_name': 'Research Group', 'status': 'open',
+           'created_at': '2026-08-05', 'deadline': '2026-08-09',
+           'summary': 'From Aug 5: Dana shared a trial-project deck and raised a review tomorrow.',
+           'ask': 'Review the deck and ask Dana about the data room tomorrow.'}
+    initial = '## Needs Attention Now\nNo task selected.'
+    corrected = ('## Needs Attention Now\n**Research Group**<!--loop:group-deck--> - '
+                 'From Aug 5: “Review the trial-project deck Dana shared, following the review '
+                 'she raised; ask Dana about the data room tomorrow.”')
+    violations = brief_validate.validate(initial, [], '', action_ledger=[row], today='2026-08-10')
+    assert any(v.startswith('dropped-open-loop:') for v in violations)
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    calls = []
+    def llm(prompt, options, **kwargs):
+        calls.append(prompt)
+        if options.get('_critic'):
+            return json.dumps({'patches': [{'type': 'add_item', 'severity': 'moderate', 'detail': '\n'.join(violations)}], 'score': 80, 'summary': 'Task needs correction'})
+        assert 'one complete canonical ask' in prompt
+        assert 'not two separately dated task sentences' in prompt
+        return json.dumps({'brief_markdown': corrected, 'actions': [], 'loop_updates': []})
+    result = cb.critique_and_revise({'brief_markdown': initial, 'actions': [], 'loop_updates': []},
+                                    {'local': {'action_ledger': [row]}}, llm=llm,
+                                    violations=violations, source_prompt='full source fixture')
+    assert len(calls) == 2, 'the existing critic and revision are the only model calls'
+    assert not [v for v in brief_validate.validate(result['brief_markdown'], [], '',
+                 action_ledger=[row], today='2026-08-10')
+                if v.startswith(('dropped-open-loop:', 'marked-loop-wording:'))]
+
+
+def test_model_output_cannot_claim_composer_sections():
+    assert '_deterministic_sections' not in cb._normalize_output(
+        {'brief_markdown': 'x', '_deterministic_sections': ['needs attention now']})
+
+
+def test_historical_date_repair_does_not_splice_provenance_into_narrative():
+    from datetime import datetime, timezone
+    import copy
+    row = {'anchor_key': 'task:one', 'summary': 'A partner shared a deck yesterday',
+           'ask': 'Review the data room tomorrow.', 'created_at': '2026-10-10',
+           'deadline': '2026-10-12', 'status': 'open'}
+    original = copy.deepcopy(row)
+    out = {'brief_markdown': '**Partner**<!--loop:task:one--> - From Oct 10: A partner shared a deck yesterday. Review the data room tomorrow.',
+           'actions': [{'loopId': 'task:one', 'deadlineDate': '2026-10-12'}]}
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    fixed = cb._date_marked_historical_requests(copy.deepcopy(out), [row], now)
+    assert fixed['brief_markdown'] == out['brief_markdown']
+    assert fixed['actions'] == out['actions'] and row == original
+    assert cb._date_marked_historical_requests(copy.deepcopy(fixed), [row], now) == fixed
+    unchanged = '<!--loop:task:one--> A different appointment tomorrow.'
+    assert cb._date_marked_historical_requests({'brief_markdown': unchanged}, [row], now)['brief_markdown'] == unchanged
+    current = dict(row, created_at='2026-10-12')
+    assert cb._date_marked_historical_requests(copy.deepcopy(out), [current], now) == out
+    for line in ('Review the data room tomorrow.',
+                 '<!--loop:task:one--><!--loop:task:two--> Review the data room tomorrow.'):
+        assert cb._date_marked_historical_requests({'brief_markdown': line}, [row], now)['brief_markdown'] == line
+
+
+def test_historical_repair_overlapping_saved_phrases_is_single_pass_and_quote_safe():
+    from datetime import datetime, timezone
+    import copy
+    row = {'anchor_key': 'task:overlap', 'summary': 'Please review the deck tomorrow.',
+           'ask': 'review the deck tomorrow.', 'created_at': '2026-10-10'}
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    out = {'brief_markdown': '<!--loop:task:overlap--> Please review the deck tomorrow.'}
+    fixed = cb._date_marked_historical_requests(copy.deepcopy(out), [row], now)
+    assert fixed['brief_markdown'] == '<!--loop:task:overlap--> From Oct 10: “Please review the deck tomorrow.”'
+    assert cb._date_marked_historical_requests(copy.deepcopy(fixed), [row], now) == fixed
+    quoted = {'brief_markdown': '<!--loop:task:overlap--> From Oct 10: “Please review the deck tomorrow.”'}
+    assert cb._date_marked_historical_requests(copy.deepcopy(quoted), [row], now) == quoted
+
+
+def test_historical_repair_does_not_nest_an_existing_saved_date():
+    from datetime import datetime, timezone
+    import copy
+    row = {'anchor_key': 'task:deck', 'status': 'open', 'created_at': '2026-10-10',
+           'summary': 'From Oct 10: A partner shared a deck for review tomorrow.',
+           'ask': 'Review the deck tomorrow.'}
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    out = {'brief_markdown': '<!--loop:task:deck--> From Oct 10: A partner shared a deck for review tomorrow. '
+                             'Review the deck tomorrow.'}
+    fixed = cb._date_marked_historical_requests(copy.deepcopy(out), [row], now)
+    assert fixed['brief_markdown'] == out['brief_markdown']
+    assert '“From Oct 10:' not in fixed['brief_markdown']
+    assert cb._date_marked_historical_requests(copy.deepcopy(fixed), [row], now) == fixed
+
+
+def test_schedule_prioritizes_owner_timed_meetings_over_old_all_day_context(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    old_context = [{'id': f'ooo-{i}', 'calendar_id': 'team', 'summary': f'Team OOO {i}',
+                    'start': '2026-09-01', 'end': '2026-10-01'} for i in range(6)]
+    timed_context = _meeting(7, calendar_id='team', summary='Other person meeting')
+    owner = [_meeting(h, calendar_id='primary') for h in range(8, 13)]
+    inputs = _calendar_inputs([*old_context, timed_context, *owner])
+    lines = cb._schedule_lines(inputs, {})
+    assert len(lines) == 5
+    assert all(f'Planning {h}' in lines[h-8] for h in range(8, 13))
+    assert not any('OOO' in line or 'Other person' in line for line in lines)
+    # Context remains visible when space permits, explicitly labeled; ongoing dates are today.
+    spare = cb._schedule_lines(_calendar_inputs([old_context[0], timed_context, owner[0]]), {})
+    assert 'Planning 8' in spare[0]
+    assert any('Other person meeting (shared context)' in line for line in spare)
+    assert any('Mon Sep 21 All day: Team OOO 0 (shared context)' in line for line in spare)
+
+
+def test_schedule_all_day_dedupe_requires_exact_provider_copy_proof(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    base = {'id': 'original', 'calendar_id': 'primary', 'iCalUID': 'same-invite',
+            'summary': 'Team in office', 'start': '2026-09-21', 'end': '2026-09-22'}
+    # Two copies coalesce. A same-title separate event or next-day occurrence must survive.
+    copy = {**base, 'id': 'copy', 'calendar_id': 'team'}
+    unrelated = {**base, 'id': 'other', 'iCalUID': 'different-invite'}
+    following = {**base, 'id': 'tomorrow', 'start': '2026-09-22', 'end': '2026-09-23'}
+    lines = cb._schedule_lines(_calendar_inputs([base, copy, unrelated, following]), {})
+    assert len(lines) == 3
+    assert sum('Mon Sep 21' in line for line in lines) == 2
+    assert sum('Tue Sep 22' in line for line in lines) == 1
+
+
+def test_cli_uncertain_brief_has_fixed_terminal_signal(monkeypatch, capsys):
+    from gemini_transport import BriefModelOutcomeUncertainError
+    from work_queue import MODEL_OUTCOME_UNCERTAIN_EXIT
+    def fail():
+        raise BriefModelOutcomeUncertainError('private provider details')
+    monkeypatch.setattr(cb, 'main', fail)
+    assert cb.cli() == MODEL_OUTCOME_UNCERTAIN_EXIT
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'no automatic retry' in captured.err
+    assert 'private' not in captured.err
+
+
+def test_internal_loop_marker_and_mixed_context_are_left_for_semantic_review():
+    from datetime import datetime, timezone
+    import copy
+    row = {'anchor_key': 'task:deck', 'status': 'open', 'created_at': '2026-10-10',
+           'contact_name': 'Dana Reed', 'contact_identifier': 'dana@example.test',
+           'summary': 'Dana shared a deck for review tomorrow.',
+           'ask': 'Review the deck tomorrow.'}
+    marker = '<!--loop:task:deck-->'
+    original = ('## Needs Attention Now\n**Dana Reed**<!--id:dana@example.test|ch:email-->: '
+                'From Oct 10: Dana shared a deck for review tomorrow' + marker + '. '
+                'The current meeting is confirmed for Oct 14. I can draft a reply.\n')
+    out = {'brief_markdown': original, 'actions': [{'loopId': 'task:deck'}]}
+    now = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    fixed = cb._date_marked_historical_requests(copy.deepcopy(out), [row], now)
+    assert fixed['brief_markdown'] == original
+    assert fixed['brief_markdown'].count(marker) == 1
+    assert '<!--id:dana@example.test|ch:email-->' in fixed['brief_markdown']
+    assert 'The current meeting is confirmed for Oct 14. I can draft a reply.' in fixed['brief_markdown']
+    assert fixed['actions'] == out['actions']
+    assert cb.brief_validate._check_marked_loop_wording(fixed['brief_markdown'], [row], '2026-10-14')
+    assert cb._date_marked_historical_requests(copy.deepcopy(fixed), [row], now) == fixed
+    # Never choose one task when a paragraph binds multiple obligations.
+    ambiguous = dict(out, brief_markdown=original.replace(marker, marker + '<!--loop:other-->'))
+    assert cb._date_marked_historical_requests(copy.deepcopy(ambiguous), [row], now) == ambiguous
+
+
+def test_one_complete_marked_ask_needs_no_repeated_summary_sentence():
+    from datetime import datetime, timezone
+    row = {'anchor_key': 'task:call', 'status': 'open', 'created_at': '2026-10-10',
+           'contact_name': 'Dana Reed', 'contact_identifier': 'dana@example.test',
+           'summary': 'Dana offered a choice of two times to discuss the lease tomorrow.',
+           'ask': 'Confirm whether 9 PM tomorrow works or propose another time.'}
+    markdown = ('## Needs Attention Now\n**Dana Reed**<!--id:dana@example.test|ch:email--> '
+                '<!--loop:task:call-->: From Oct 10: “Confirm whether 9 PM tomorrow works '
+                'or propose another time.” The meeting is now confirmed for Oct 14.\n')
+    assert cb.brief_validate._check_marked_loop_wording(markdown, [row], '2026-10-14') == []
+    # Wording can be complete without proving the broader summary's lease context stale.
+    # That distinction requires the existing source-bound semantic review.
+    assert cb._line_open_task_keys(markdown.splitlines()[1], [row], '2026-10-14') == set()
+    out = {'brief_markdown': markdown}
+    assert cb._date_marked_historical_requests(dict(out), [row], datetime(2026, 10, 14, tzinfo=timezone.utc)) == out
+
+
+def test_calendar_model_prompt_and_critic_manifest_label_nonparticipating_context(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    shared = _meeting(9, calendar_id='colleague', summary='Colleague only',
+                      attendees=[{'email': 'colleague@example.com', 'self': True}],
+                      my_response='needsAction')
+    own = _meeting(10, calendar_id='primary', summary='Owner meeting')
+    inputs = _calendar_inputs([shared, own])
+    prompt = cb.build_prompt('{{calendar}}', inputs)
+    assert 'Colleague only** [shared calendar context; owner is not participating, not their meeting or RSVP]' in prompt
+    assert 'Owner meeting** [shared calendar' not in prompt
+    assert "you haven't answered this invite" not in prompt
+    manifest = cb.build_data_manifest(inputs)
+    assert {event['title']: event['owner_participates'] for event in manifest['calendar_events']} == {
+        'Colleague only': False, 'Owner meeting': True}
+    assert '_owner_participates' not in shared  # source rows stay immutable
+    assert cb._rsvp_actions(inputs, now=cb.datetime.fromisoformat(inputs['now'])) == []
+
+
+def test_schedule_keeps_current_owner_all_day_block_before_five_timed_events(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.com')
+    block = {'id': 'travel', 'calendar_id': 'primary', 'summary': 'Owner travel',
+             'start': '2026-09-20', 'end': '2026-09-22'}
+    lines = cb._schedule_lines(_calendar_inputs([*[_meeting(h, calendar_id='primary') for h in range(8, 13)], block]), {})
+    assert len(lines) == 5
+    assert 'Mon Sep 21 All day: Owner travel' in lines[0]
+    assert all(f'Planning {hour}' in lines[hour-7] for hour in range(8, 12))
+
+
+@pytest.mark.parametrize('proof', ['exact', 'missing', 'wrong_thread', 'wrong_address', 'different_ask'])
+def test_legacy_thread_row_display_uses_exact_source_sender_without_mutation(proof):
+    import copy
+    row = {'anchor_key': 'thread:invite', 'status': 'open', 'channel': 'gmail',
+           'contact_name': '', 'contact_identifier': '', 'created_at': '2026-10-14',
+           'summary': 'Dana Reed invited you to meet Thursday at 11 AM at the office',
+           'ask': 'Accept or decline the office invitation', 'deadline': '2026-10-15'}
+    before = copy.deepcopy(row)
+    line = ('**Dana Reed**<!--id:dana@example.com|ch:email--> - '
+            'Dana Reed invited you to meet Thursday at 11 AM at the office'
+            '<!--loop:thread:invite-->. Accept or decline the office invitation.')
+    source = {'thread:invite': {'dana reed': 'dana@example.com'}}
+    if proof == 'missing':
+        source = {}
+    elif proof == 'wrong_thread':
+        source = {'thread:other': source['thread:invite']}
+    elif proof == 'wrong_address':
+        source = {'thread:invite': {'dana reed': 'other@example.com'}}
+    elif proof == 'different_ask':
+        line = '**Dana Reed**<!--id:dana@example.com|ch:email--> - Send the budget.<!--loop:thread:invite-->'
+    out = {'brief_markdown': '## Should Handle Today\n' + line + '\n'}
+    cb._append_still_open(out, [row], today='2026-10-14', source_thread_senders=source)
+    assert ('## Still open' not in out['brief_markdown']) is (proof == 'exact')
+    assert row == before
+
+
+def test_source_schedule_replaces_model_timezone_rows_without_false_paid_revision(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    inputs = _calendar_inputs([_meeting(h) for h in range(8, 13)])
+    original = {'brief_markdown': '**Coming Up**\n- Thu Oct 15 8:30 AM EDT: Old timezone row\n\n'
+                '<!--meeting:event_id:source-->\n## Still open\nReply to Dana about the lease.'}
+    result = cb._ensure_schedule(original, inputs)
+    assert 'Old timezone row' not in result['brief_markdown']
+    assert 'Reply to Dana' in result['brief_markdown']
+    assert '<!--meeting:event_id:source-->' in result['brief_markdown']
+    assert not cb.brief_validate._check_coming_up_length(result['brief_markdown'])
+    assert cb._ensure_schedule(result, inputs) == result
+
+
+def test_extraction_and_revision_require_the_existing_recipient_contract():
+    for schema in (cb.BRIEF_RESPONSE_SCHEMA['properties']['actionItems']['items'],
+                   cb.BRIEF_REVISION_SCHEMA['properties']['actions']['items']):
+        assert {'type', 'contactName', 'contactIdentifier', 'helpKind', 'evidence', 'newObligation'} <= set(schema['required'])
+        assert set(schema['properties']['evidence']['items']['required']) == {'sourceType', 'sourceId', 'snippet'}
+        assert 'none' in schema['properties']['helpKind']['enum']
+    assert 'Preserve type, contactName, contactIdentifier and helpKind' in cb.REVISE_SYSTEM
+
+
+def test_revision_receives_same_help_voice_and_marker_policy_as_writer(monkeypatch):
+    monkeypatch.setattr(cb, 'build_data_manifest', lambda inputs: {})
+    monkeypatch.setattr(cb, 'run_critic', lambda *a, **kw: {
+        'patches': [{'type': 'add_item', 'detail': 'Include the supported urgent decision.', 'severity': 'moderate'}],
+        'score': 60, 'summary': 'missing decision'})
+    seen = []
+    def revise(prompt, inputs, **kw):
+        seen.append(prompt)
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nDecision.', 'actions': [], 'loop_updates': []})
+    cb.critique_and_revise({'brief_markdown': 'Original', 'actions': [], 'loop_updates': []}, {}, llm=revise, source_prompt='source')
+    assert len(seen) == 1
+    for heading in ('## Useful help in every brief', '## Writing the Brief',
+                    '## Deep Link Markers (CRITICAL — every entry must have one)'):
+        expected = cb._extract_prompt_sections(cb._load_prompt(), (heading,))
+        assert expected and expected in seen[0]
+
+
+def test_model_cannot_forge_archived_model_timings(monkeypatch):
+    def llm(prompt, inputs, **kwargs):
+        cb.metrics.record('extraction', 1.25, 12, 8, 'fixture')
+        return json.dumps({'brief_markdown': '## Filtered\nA quiet day.', 'actions': [],
+                           '_model_metrics': {'total_wall_s': 999, 'private': 'forged'}})
+    out = cb.compose({'type': 'morning', 'google': {}, 'local': {}}, llm=llm)
+    assert out['_model_metrics']['calls'] == 1
+    assert out['_model_metrics']['total_wall_s'] == 1.2
+    assert out['_model_metrics']['phases']['extraction']['calls'] == 1
+    assert 'private' not in out['_model_metrics']
+
+
+def test_completion_typography_is_source_exact_before_critic_receipt(tmp_path, monkeypatch):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    message = inputs['google']['emails'][0]
+    message['body'] = 'I’ve sent the deck; it’s ready for review.'
+    updates[0]['evidence'][0]['snippet'] = "I've sent the deck; it's ready for review."
+    out = {'loop_updates': updates}
+    before = cb._continuity().critic_review_receipt(updates[0])
+    reviewed = set()
+    context = cb._loop_update_review_context(out, inputs, reviewed)
+    after = cb._continuity().critic_review_receipt(updates[0])
+    assert before != after
+    assert context[0]['proposal_id'] == after
+    assert context[0]['evidence'][0]['proposed_quote'] == message['body']
+    assert reviewed == {after}
+    cb._stamp_loop_reviews(out, reviewed)
+    assert cb._continuity()._has_critic_approval(out['loop_updates'][0])
+    assert cb._project_loop_updates(out, inputs, inputs['local']['action_ledger']) == []
+    # A later material rewrite cannot borrow that approval, even when it is in the source.
+    out['loop_updates'][0]['evidence'][0]['snippet'] = 'it’s ready for review.'
+    assert not cb._continuity()._has_critic_approval(out['loop_updates'][0])
+
+
+def test_completion_quote_recovery_does_not_remove_negation(tmp_path, monkeypatch):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch)
+    inputs['google']['emails'][0]['body'] = 'I haven’t sent the deck.'
+    updates[0]['evidence'][0]['snippet'] = "I have sent the deck."
+    cb._loop_update_review_context({'loop_updates': updates}, inputs)
+    assert updates[0]['evidence'][0]['snippet'] == 'I have sent the deck.'
+    assert not cb._continuity()._has_critic_approval(updates[0])
+
+
+@pytest.mark.parametrize('same_title', [False, True])
+def test_source_schedule_replaces_natural_revision_at_rows_once(tmp_path, monkeypatch, same_title):
+    """Replay the October 28 natural early-prep revision's mixed schedule formats."""
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    first = 'Pilot pricing review' if same_title else 'Weekly team sync'
+    events = [
+        {'id': 'routine-team-sync', 'summary': first, 'start': '2026-10-27T09:00:00Z'},
+        {'id': 'pricing-decision-meeting', 'summary': 'Pilot pricing review',
+         'start': '2026-10-29T14:00:00Z'}]
+    inputs = _calendar_inputs(events, now='2026-10-27T08:00:00Z')
+    inputs['google']['userTimezone'] = 'UTC'
+    original = {'brief_markdown': (
+        '## Should Handle Today\n**Maya Chen**<!--id:pricing-decision-meeting|ch:calendar--> '
+        'Compare annual and monthly pricing against your team budget before Thursday.\n\n'
+        f'**Coming Up**\n- Tue Oct 27 9:00 AM: {first}\n'
+        '- Thu Oct 29 2:00 PM: Pilot pricing review\n\n'
+        f'- **Today at 9:00 AM** — {first} (Sam Patel) — ⚠ no link or address yet\n'
+        '- **Thu Oct 29 at 2:00 PM** — Pilot pricing review (Maya Chen) — ⚠ no link or address yet\n\n'
+        '<!--meeting:event_id:routine-team-sync-->\n'
+        '<!--meeting:event_id:pricing-decision-meeting-->\n'
+        'Unheaded source context remains.\n## Filtered\n0 promotional emails')}
+    result = cb._ensure_schedule(original, inputs)
+    markdown = result['brief_markdown']
+    assert markdown.count('- Tue Oct 27 9:00 AM: ' + first) == 1
+    assert markdown.count('- Thu Oct 29 2:00 PM: Pilot pricing review') == 1
+    assert 'Today at' not in markdown and 'Oct 29 at' not in markdown
+    assert '(Sam Patel)' not in markdown and '(Maya Chen)' not in markdown
+    for text in ('Compare annual and monthly pricing', '<!--meeting:event_id:routine-team-sync-->',
+                 '<!--meeting:event_id:pricing-decision-meeting-->', 'Unheaded source context remains.',
+                 '0 promotional emails'):
+        assert text in markdown
+    assert cb._ensure_schedule(result, inputs) == result
+
+
+@pytest.mark.parametrize('heading', ['## Already Handled', '## ✅ Already Handled'])
+@pytest.mark.parametrize('subheading', ['', '### Dana Reed\n'])
+def test_reconciliation_keeps_completed_section_with_unbulleted_person(heading, subheading):
+    reply = {'anchor_key': 'reply', 'status': 'open', 'summary': 'Reply with feedback'}
+    deck = {'anchor_key': 'deck', 'status': 'open', 'summary': 'Send the deck'}
+    completed = subheading + '**Dana Reed**<!--id:dana@example.test|ch:email--> - Shared the feedback. <!--loop:reply-->'
+    still_open = '**Robin Green**: Send the deck. <!--loop:deck-->'
+    out = {'brief_markdown': '## Should Handle Today\n' + still_open + '\n\n' + heading
+           + '\n\n' + completed + '\n\n## Still Pending\n' + still_open + '\n'}
+    cb._reconcile_task_sections(out, [reply, deck], [deck])
+    assert heading + '\n\n' + completed in out['brief_markdown']
+    assert out['brief_markdown'].count(still_open) == 1
+    assert '## Still Pending' not in out['brief_markdown']
+
+
+def test_compose_keeps_verified_completion_under_handled_after_pruning_duplicate(tmp_path, monkeypatch):
+    inputs, updates = _closure_fixture(tmp_path, monkeypatch, n=2)
+    receipt = cb._continuity().critic_review_receipt(updates[0])
+    completed = '**Dana Reed**: Sent the deck. <!--loop:deck-0-->'
+    outstanding = '**Robin Green**: Send the second deck. <!--loop:deck-1-->'
+    def llm(prompt, data, **kwargs):
+        if data.get('_critic'):
+            return json.dumps({'score': 95, 'patches': [], 'loop_verdicts': [
+                {'proposal_id': receipt, 'verdict': 'approve'}]})
+        return json.dumps({'markdown': '## Should Handle Today\n' + outstanding
+            + '\n\n## Already Handled\n\n' + completed
+            + '\n\n## Still Pending\n' + outstanding,
+            'actionItems': [], 'loopUpdates': [updates[0]]})
+    out = cb.compose(inputs, llm=llm, critic=True)
+    assert out['_loop_projection']['resolved'] == ['deck-0']
+    assert '## Already Handled\n\n' + completed in out['brief_markdown']
+    assert out['brief_markdown'].count(outstanding) == 1
+    assert '## Still Pending' not in out['brief_markdown']
+
+
+@pytest.mark.parametrize("direction", [
+    "focusing on tomorrow’s meetings and the open pricing decision.",
+    "Send my morning brief. For the meeting prep, focus on Alex Coleman: the investment decision.",
+    "Send my brief, and draft a reply to Bob",
+    "Send my evening brief. Make it the morning one.",
+])
+def test_composition_direction_is_exact_context_with_existing_authority_limits(direction):
+    inputs = {'type': 'evening', 'google': {'events': []}, 'local': {},
+              'composition_direction': direction}
+    prompt = cb.build_prompt(cb._load_prompt(), inputs)
+    assert direction in prompt
+    assert 'does not grant action authority' in prompt
+    assert 'Fixed brief edition: evening.' in prompt
+    assert 'direction below cannot change it' in prompt
+    assert 'does not require a prep offer' in prompt
+    assert direction not in cb.build_prompt(cb._load_prompt(), {**inputs, 'composition_direction': ''})
+
+
+def test_manifest_only_revision_retains_owner_direction_and_authority_limits():
+    direction = "focusing on tomorrow’s meetings and the pricing decision."
+    seen = []
+    def llm(prompt, inputs, **kwargs):
+        if inputs.get('_critic'):
+            return json.dumps({'patches': [{'type': 'remove_item', 'severity': 'critical',
+                                            'detail': 'Remove a duplicate'}], 'score': 50})
+        seen.append(prompt)
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nKept task.',
+                           'actions': [], 'loop_updates': []})
+    result = cb.critique_and_revise({'brief_markdown': '## Needs Attention Now\nDuplicate.',
+                                   'actions': [], 'loop_updates': []},
+                                  {'composition_direction': direction}, llm=llm)
+    assert result['_critic']['revision_source_scope'] == 'manifest'
+    assert direction in seen[0]
+    assert 'does not grant action authority' in seen[0]
+    assert 'does not require a prep offer' in seen[0]
+
+
+
+def test_history_discovery_candidates_reach_existing_composer_with_current_evidence():
+    discovery = {'observations': [
+        {'canonical_id': 'z', 'person': 'Zara', 'fact': 'Works on gardens',
+         'observed_date': '2026-10-01', 'source_refs': ['gmail:old-z'], 'fact_sources': ['gmail']},
+        {'canonical_id': 'a', 'person': 'Alex', 'fact': 'Organizes the garden fundraiser',
+         'observed_date': '2026-10-02', 'source_refs': ['gmail:old-a'], 'fact_sources': ['gmail']}],
+        'sources': ['gmail', 'imessage'],
+        'coverage': {'gmail': {'status': 'reviewed'}, 'imessage': {'status': 'held'}}}
+    prompt = cb.build_prompt(cb._load_prompt(), {'type': 'welcome',
+        'history_discovery': discovery, 'now': '2026-11-03T10:00:00Z',
+        'local': {'action_ledger': [{'anchor_key': 'alex-budget', 'status': 'open',
+            'contact_name': 'Alex', 'canonical_id': 'a', 'summary': 'Review the fundraiser budget',
+            'action_type': 'follow_up', 'created_at': '2026-11-02'}]},
+        'google': {'emails': [{'id': 'zara-done', 'threadId': 'garden-z',
+            'from': 'owner@example.test', 'to': 'zara@example.test', 'isSent': True,
+            'date': '2026-11-02T10:00:00Z', 'body': 'The garden plan is complete and attached.'}]}})
+    assert 'HISTORY DISCOVERY HANDOFF' in prompt
+    assert 'gmail:old-z' in prompt and 'gmail:old-a' in prompt
+    assert 'Review the fundraiser budget' in prompt
+    assert 'The garden plan is complete and attached.' in prompt
+    assert 'current action ledger' in prompt and 'later replies' in prompt
+    assert 'held' in prompt
+
+
+def test_history_discovery_reads_protected_ledger_and_rejects_carried_override(tmp_path, monkeypatch):
+    import yaml
+    import source_context
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'gmail')
+    directory = tmp_path / 'knowledge/continuity'
+    directory.mkdir(parents=True)
+    row = {'anchor_key': 'garden-budget', 'status': 'open', 'action_type': 'reply',
+           'channel': 'email', 'contact_name': 'Alex', 'canonical_id': 'garden-alex',
+           'created_at': '2026-11-03', 'summary': 'PROTECTED_GARDEN_BUDGET',
+           'source_refs': [{'sourceType': 'gmail', 'sourceId': 'budget-email'}]}
+    (directory / 'garden-budget.md').write_text('---\n' + yaml.safe_dump(row) + '---\n')
+    inputs = {'type': 'welcome', 'now': '2026-11-03T10:00:00Z',
+              'history_discovery': {'observations': [
+                  {'canonical_id': 'garden-alex', 'person': 'Alex', 'fact': 'Organizes gardens',
+                   'source_refs': ['gmail:old-garden'], 'fact_sources': ['gmail'],
+                   'observed_date': '2026-11-01'}],
+                  'sources': ['gmail'], 'coverage': {'gmail': {'status': 'reviewed'}}},
+              'local': {'action_ledger': [{**row, 'summary': 'UNTRUSTED_CARRIED_OVERRIDE'}]},
+              'google': {'emails': [{'id': 'done', 'from': 'owner@example.test', 'isSent': True,
+                  'date': '2026-11-03T09:00:00Z', 'body': 'LATER_REPLY_PLAN_COMPLETE'}]}}
+    seen = []
+    def model(prompt, *_args, **_kwargs):
+        seen.append(prompt)
+        return json.dumps({'brief_markdown': '## Needs Attention Now\nReview the garden budget.',
+                           'actions': [], 'loop_updates': []})
+    cb.compose(inputs, llm=model, critic=False)
+    assert len(seen) == 1
+    assert all(value in seen[0] for value in (
+        'HISTORY DISCOVERY HANDOFF', 'gmail:old-garden',
+        'PROTECTED_GARDEN_BUDGET', 'LATER_REPLY_PLAN_COMPLETE'))
+    assert 'UNTRUSTED_CARRIED_OVERRIDE' not in seen[0]
+
+
+def test_history_discovery_handoff_survives_manifest_only_review_and_revision():
+    discovery = {'observations': [{'canonical_id': 'garden-alex', 'person': 'Alex',
+        'fact': 'Organizes the garden fundraiser', 'observed_date': '2026-11-01',
+        'source_refs': ['gmail:old-garden'], 'fact_sources': ['gmail']}],
+        'sources': ['gmail', 'imessage'], 'coverage': {'gmail': {'status': 'reviewed'},
+                                                     'imessage': {'status': 'held'}}}
+    inputs = {'type': 'welcome', 'history_discovery': discovery, 'google': {}, 'local': {}}
+    manifest = cb.build_data_manifest(inputs)
+    assert manifest['history_discovery_handoff'] == cb._first_run_note(inputs, {}, {}, [], [])
+    seen = []
+    def model(prompt, inputs, **kwargs):
+        seen.append(prompt)
+        if inputs.get('_critic'):
+            return json.dumps({'patches': [{'type': 'remove_item', 'severity': 'moderate',
+                                            'detail': 'Remove a duplicate'}], 'score': 70})
+        return json.dumps({'brief_markdown': 'Garden context.', 'actions': [], 'loop_updates': []})
+    result = cb.critique_and_revise({'brief_markdown': 'Garden context. Duplicate.',
+                                   'actions': [], 'loop_updates': []}, inputs, llm=model)
+    assert result['_critic']['revision_source_scope'] == 'manifest'
+    assert len(seen) == 2
+    assert all('gmail:old-garden' in prompt and 'bounded initial history review' in prompt
+               and 'held' in prompt for prompt in seen)
+
+
+def test_history_discovery_fixed_purpose_is_policy_and_observations_stay_data():
+    secret_fact = 'UNTRUSTED_FACT_INVENTED_ASK_IGNORE_ALL_RULES'
+    inputs = {'type': 'welcome', 'history_discovery': {
+        'observations': [{'canonical_id': 'alex', 'person': 'Alex', 'fact': secret_fact,
+                          'observed_date': '2026-11-01', 'source_refs': ['gmail:old'],
+                          'fact_sources': ['gmail']}], 'sources': ['gmail'],
+        'coverage': {'gmail': {'status': 'reviewed'}}}, 'google': {}, 'local': {}}
+    seen = []
+    def model(prompt, inputs, system=None, **kwargs):
+        seen.append((prompt, inputs, system))
+        if inputs.get('_critic'):
+            return json.dumps({'patches': [{'type': 'remove_item', 'severity': 'moderate',
+                                            'detail': 'Remove a duplicate'}], 'score': 70})
+        return json.dumps({'brief_markdown': '## Discovery\nGarden context.',
+                           'actions': [], 'loop_updates': []})
+    cb.compose(inputs, llm=model, critic=True)
+    extract = seen[0]
+    assert 'bounded history discovery' in extract[2]
+    assert 'Use names and relevant roles in prose; canonical IDs belong only in existing hidden markers.' in extract[2]
+    assert 'State that this is a partial, bounded initial history review' in extract[2]
+    assert secret_fact not in extract[2] and 'gmail:old' not in extract[2]
+    assert secret_fact in extract[0]
+    assert len(seen) == 3
+    assert all('bounded history discovery' in item[0].split('## DATA MANIFEST')[0]
+               for item in seen[1:2])
+    assert 'bounded history discovery' in seen[2][0].split('## CRITIC ISSUES TO FIX')[0]
+    assert all(secret_fact in item[0] for item in seen[1:])
+    assert cb._history_discovery_direction({'type': 'morning'}) == ''

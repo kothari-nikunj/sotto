@@ -1,0 +1,38 @@
+{
+  "stages": {
+    "unknown": false,
+    "execution_context": false,
+    "input_validation": true,
+    "authority_before": true,
+    "authority_after": true,
+    "receiver_transport": false,
+    "result_schema": false,
+    "result_contract": true,
+    "target_contract": false,
+    "reader_load": true,
+    "reader_call": true,
+    "credential_setup": true,
+    "projection": true,
+    "provider_transport": true,
+    "provider_bad_request": true,
+    "provider_unauthorized": true,
+    "provider_forbidden": true,
+    "provider_rate_limited": true,
+    "provider_server": true,
+    "provider_http_other": true,
+    "provider_bounds": true,
+    "provider_body": true,
+    "provider_deadline": true,
+    "provider_decode": true,
+    "provider_shape": true
+  },
+  "phases": {
+    "search_list": "gmail_search",
+    "search_metadata": "gmail_search",
+    "message_get": "gmail_get"
+  },
+  "httpStatus": {
+    "minimum": 100,
+    "maximum": 599
+  }
+}

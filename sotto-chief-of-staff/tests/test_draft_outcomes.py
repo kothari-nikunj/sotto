@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from datetime import datetime, timedelta, timezone
+import pytest
 
 HERE = os.path.dirname(__file__)
 SCRIPTS = os.path.join(HERE, "..", "_shared", "scripts")
@@ -182,6 +183,35 @@ def _write_email_signal(tmp_path, ts, to, text, cc=""):
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": _iso(ts), "verdict_class": "signal",
                             "sender": "Me", "event": ev}) + "\n")
+
+
+@pytest.mark.parametrize("sent_body,expected", [
+    ("Thanks for asking. I will pass on reviewing this packet.", "executed"),
+    ("Thanks for asking. I will pass on reviewing this packet. Please keep me posted on the launch.",
+     "edited_and_sent"),
+])
+def test_saved_decline_remains_observable_and_review_tier(tmp_path, monkeypatch, sent_body, expected):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    body = "Thanks for asking. I will pass on reviewing this packet."
+    al.record_draft("email", "alice@example.com", body, "decline")
+    draft = json.loads((tmp_path / "events" / "drafts.jsonl").read_text().splitlines()[0])
+    key = do._draft_key(draft)
+    offered = do._parse_ts(draft["ts"])
+    now = offered + timedelta(hours=2)
+    do.log_outcome.log({"event_id": "synthetic-save:" + key, "action_id": key,
+                       "outcome": "draft_created", "channel": "email",
+                       "contact": "alice@example.com", "action_type": "decline", "tier": "review"})
+    # A saved draft neither proves sending nor prevents later observation.
+    before = do.run(now=now)
+    assert before["pending"] == 1 and before["graded"] == 0
+    assert [row["outcome"] for row in _outcomes(tmp_path)] == ["draft_created"]
+    _write_email_signal(tmp_path, offered + timedelta(minutes=5), "alice@example.com", sent_body)
+    assert do.run(now=now)[expected] == 1
+    outcome = _outcomes(tmp_path)[-1]
+    assert outcome["action_id"] == key and outcome["action_type"] == "decline"
+    assert outcome["tier"] == "review" and outcome["source_event_id"].startswith("email:")
+    assert do.run(now=now)["graded"] == 0
+    assert len(_outcomes(tmp_path)) == 2
 
 
 def test_email_drafts_are_graded_via_the_sent_mail_lane(tmp_path, monkeypatch):

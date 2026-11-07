@@ -1,0 +1,207 @@
+{
+  "name": "two-journey-chronological-commitment-seven-turn",
+  "world": {
+    "savedSourceGrants": [
+      "gmail",
+      "imessage"
+    ],
+    "commitmentJourney": {},
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}, \"imessage\": {\"consented\": true, \"connected\": true}}}"
+    }
+  },
+  "turns": [
+    {
+      "text": "What did I promise Maya Journey? Check the saved obligations.",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "request"
+        }
+      ],
+      "contains": [
+        "pricing document",
+        "launch checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "pricing document",
+        "launch checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700
+    },
+    {
+      "text": "and the checklist?",
+      "contains": [
+        "checklist"
+      ],
+      "returnedEvidenceExcludes": [
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "containsAny": [
+        [
+          "open",
+          "pending",
+          "outstanding",
+          "not yet",
+          "not sent",
+          "no fulfillment",
+          "no completion",
+          "no later",
+          "any later",
+          "no evidence",
+          "still owe",
+          "still need"
+        ]
+      ],
+      "excludes": [
+        "yes, that establishes fulfillment",
+        "yes, that finishes the promise"
+      ]
+    },
+    {
+      "text": "What is 2 plus 2?",
+      "contains": [
+        "4"
+      ],
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "googleReads": 0,
+      "knowledgeQueryReads": 0,
+      "maxCharacters": 100,
+      "latencyClass": "ordinary"
+    },
+    {
+      "text": "What happened with the pricing document I promised Maya Journey?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "fulfillment"
+        },
+        {
+          "journey": "commitment",
+          "stage": "resolve"
+        }
+      ],
+      "resetConversationBefore": true,
+      "contains": [],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "containsAny": [
+        [
+          "text",
+          "imessage"
+        ],
+        [
+          "sent",
+          "delivered",
+          "shared",
+          "followed up",
+          "resolved"
+        ]
+      ],
+      "excludes": [
+        "pricing document was not sent",
+        "pricing document has not been sent",
+        "pricing document is not resolved",
+        "pricing document was not delivered"
+      ]
+    },
+    {
+      "text": "where did that come from?",
+      "contains": [],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "containsAny": [
+        [
+          "text",
+          "imessage"
+        ]
+      ],
+      "excludes": [
+        "pricing document was not sent",
+        "pricing document has not been sent",
+        "pricing document is not resolved",
+        "pricing document was not delivered"
+      ]
+    },
+    {
+      "text": "After restarting, what shows that pricing was done and is the checklist still open?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "restart"
+        }
+      ],
+      "restartBefore": true,
+      "resetConversationBefore": true,
+      "contains": [
+        "pricing",
+        "checklist",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ],
+      "latencyClass": "evidence",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700,
+      "containsAny": [
+        [
+          "text",
+          "imessage"
+        ]
+      ]
+    },
+    {
+      "text": "Is there a new pricing obligation after the earlier delivery?",
+      "receiverBefore": [
+        {
+          "journey": "commitment",
+          "stage": "new-request"
+        }
+      ],
+      "resetConversationBefore": true,
+      "contains": [
+        "revised pricing",
+        "open"
+      ],
+      "returnedEvidenceContains": [
+        "journey-new-pricing-request",
+        "journey-pricing-text"
+      ],
+      "latencyClass": "ordinary",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "maxCharacters": 700
+    }
+  ]
+}

@@ -1,0 +1,181 @@
+{
+  "instructions": "Synthetic machinery contract. Tools are selected by a scripted external provider. Use supplied skill and source tools; no writes.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document and launch checklist are both open, originally due October 19.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The launch checklist remains open, originally due October 19.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "Send the pricing document",
+        "Send the launch checklist"
+      ]
+    },
+    {
+      "text": "4."
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The pricing document was sent by text on October 19. The launch checklist remains open.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The original October 18 email promise and the October 19 outgoing text show pricing was sent; checklist remains open.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "The original email promise and later pricing document text explain the completed pricing item. The checklist remains open.",
+      "toolResultContains": [
+        "journey-promise-mail",
+        "journey-pricing-text",
+        "resolved"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "Maya Journey",
+            "--person-coverage"
+          ]
+        }
+      }
+    },
+    {
+      "text": "A new revised pricing document obligation is open, due October 21. The earlier pricing document was delivered by text.",
+      "toolResultContains": [
+        "journey-new-pricing-request",
+        "journey-pricing-text"
+      ]
+    }
+  ]
+}

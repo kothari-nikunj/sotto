@@ -13,6 +13,8 @@ import sys
 import time
 from datetime import datetime
 
+import pytest
+
 import knowledge as kg
 import knowledge_query as kq
 import knowledge_update as ku
@@ -61,6 +63,199 @@ def test_retrieval_marks_legacy_fact_source_reference_unavailable():
     assert packed == "Synthetic legacy assertion (source reference unavailable)"
 
 
+def test_person_evidence_reads_persisted_fact_refs_and_observation_dates_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    ku.apply({'person_updates': [{'identifier': 'dana@example.test', 'person_name': 'Dana Rivers',
+        'facts': [{'fact': 'Runs the Cedar clinic', 'source': 'observed_message', 'confidence': 0.65,
+                   'source_ref': 'gmail:old-message', 'evidence_refs': ['gmail:old-message'],
+                   'observed_date': '2026-09-02'}]}]}, now=datetime(2026, 10, 20))
+    ku.apply({'person_updates': [{'identifier': 'dana@example.test', 'person_name': 'Dana Rivers',
+        'facts': [{'fact': 'Runs the Cedar clinic', 'source': 'observed_message', 'confidence': 0.65,
+                   'source_ref': 'gmail:later-message', 'evidence_refs': ['gmail:later-message'],
+                   'observed_date': '2026-10-18'}]}]}, now=datetime(2026, 10, 20))
+    monkeypatch.setenv('SOTTO_READ_ONLY', '1')
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    result = _run(tmp_path, '--person', 'Dana Rivers', '--person-coverage', '--interactive')
+    item, = result['fact_evidence']['items']
+    assert item['text'] == 'Runs the Cedar clinic'
+    assert item['fact_id'] and item['canonical_id'] in result['person_knowledge']
+    assert item['source_ref'] == 'gmail:old-message'
+    assert item['evidence_refs'] == ['gmail:old-message', 'gmail:later-message']
+    assert (item['first_observed_date'], item['last_observed_date']) == ('2026-09-02', '2026-10-18')
+    assert item['source_timestamp'] is None and 'do not establish when' in item['uncertainty']
+    assert item['status'] == 'active' and item['effective_confidence'] < 1.0
+    assert kq._fits_interactive(result)
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '[]')
+    withheld = _run(tmp_path, '--person', 'Dana Rivers', '--person-coverage', '--interactive')
+    proof, = withheld['fact_evidence']['items']
+    assert proof['provenance_state'] == 'reference_unavailable'
+    assert not any(field in proof for field in ('source_ref', 'evidence_refs', 'source', 'first_observed_date'))
+    assert 'old-message' not in json.dumps(withheld) and 'later-message' not in json.dumps(withheld)
+
+
+def test_fact_evidence_keeps_selected_conflicts_related_facts_and_bounds_complete_records(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    monkeypatch.setattr(kq, 'FACT_EVIDENCE_BYTES', 1600)
+    facts = [kg.FactMeta(text=f'Cedar assertion {index}', source='observed_message',
+                         source_ref=f'gmail:{index}', evidence_refs=[f'gmail:{index}'],
+                         first='2026-09-02', last='2026-09-02') for index in range(12)]
+    result = {'person_knowledge': {'c_abc111': '\n'.join(f.text for f in facts)}}
+    records = [('c_abc111' if i < 6 else 'c_abc222', f'f_{i}', fact, fact.text, 'c_abc111', i)
+               for i, fact in enumerate(facts)]
+    out = kq.attach_fact_evidence(result, records, datetime(2026, 10, 20), interactive=True,
+                                  retained_units={'c_abc111': set(range(len(facts)))})
+    assert out['fact_evidence']['items'] and out['fact_evidence']['omitted'] > 0
+    assert len(out['fact_evidence']['items']) + out['fact_evidence']['omitted'] == len(facts)
+    assert len(json.dumps(out['fact_evidence']).encode()) <= 1600
+    assert out['suggestion'] == kq.NARROWER_QUERY and kq._fits_interactive(out)
+    for row in out['fact_evidence']['items']:
+        assert row['text'] in result['person_knowledge']['c_abc111']
+        assert row['source_ref'] == row['evidence_refs'][0]
+
+
+def test_fact_evidence_never_releases_partial_mixed_source_refs_or_untyped_ids(monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    for refs in (['gmail:visible', 'whatsapp:PRIVATE'], ['PRIVATE-untyped'], ['mystery:PRIVATE'],
+                 ['gmail:visible', 'whatsapp:' + 'PRIVATE' * 100],
+                 ['gmail:visible', {'source': 'whatsapp', 'id': 'PRIVATE'}],
+                 ['gmail:visible', '']):
+        fact = kg.FactMeta(text='Known graph assertion', source='observed_message',
+                           source_ref=refs[0], evidence_refs=refs)
+        result = kq.attach_fact_evidence({'person_knowledge': {'c_abc111': fact.text}},
+            [('c_abc111', 'f_one', fact, fact.text, 'c_abc111', 1)], datetime(2026, 10, 20),
+            interactive=True, retained_units={'c_abc111': {1}})
+        item, = result['fact_evidence']['items']
+        assert item['provenance_state'] == 'reference_unavailable'
+        assert 'PRIVATE' not in json.dumps(result) and 'visible' not in json.dumps(result)
+    for malformed in ('gmail:visible', {'ref': 'gmail:visible'}, ('gmail:visible',), None):
+        fact = kg.FactMeta(text='Known graph assertion', source='observed_message',
+                           source_ref='gmail:visible', evidence_refs=malformed)
+        result = kq.attach_fact_evidence({'person_knowledge': {'c_abc111': fact.text}},
+            [('c_abc111', 'f_one', fact, fact.text, 'c_abc111', 1)], datetime(2026, 10, 20),
+            interactive=True, retained_units={'c_abc111': {1}})
+        item, = result['fact_evidence']['items']
+        assert item['provenance_state'] == 'reference_unavailable'
+        assert 'visible' not in json.dumps(result)
+    fact = kg.FactMeta(text='Known graph assertion', source='granola', source_ref='gmail:PRIVATE')
+    result = kq.attach_fact_evidence({'person_knowledge': {'c_abc111': fact.text}},
+        [('c_abc111', 'f_one', fact, fact.text, 'c_abc111', 1)], datetime(2026, 10, 20),
+        interactive=True, retained_units={'c_abc111': {1}})
+    assert 'PRIVATE' not in json.dumps(result)  # a permitted ref cannot authorize a revoked origin
+
+
+def test_fact_evidence_accepts_exact_native_versions_only_with_all_source_grants(tmp_path, monkeypatch):
+    from render_local import message_version_reference, native_message_source_ref
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    native = {source: message_version_reference({
+        'source_ref': native_message_source_ref(source, 'Synthetic-A1'),
+        'content_version': 'a' * 64}, source) for source in ('imessage', 'whatsapp')}
+    for sources in (['imessage'], ['whatsapp'], ['imessage', 'whatsapp']):
+        monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', json.dumps(sources))
+        refs = [native[source] for source in sources]
+        fact = kg.FactMeta(text='Native supported assertion', source='observed_message',
+                           source_ref=refs[0], evidence_refs=refs,
+                           first='2026-10-20', last='2026-10-20')
+        person = kg.PersonFile(canonical_id='c_abc111', name='Synthetic Dana', facts={'f_one': fact})
+        evidence, units = [], []
+        packed = kq.pack_person(person, True, datetime(2026, 10, 26),
+                                selected_evidence=evidence, units=units)
+        result = kq.attach_fact_evidence({'person_knowledge': {'c_abc111': packed}}, evidence,
+            datetime(2026, 10, 26), interactive=True,
+            retained_units={'c_abc111': set(range(len(units)))})
+        item, = result['fact_evidence']['items']
+        assert item['source_ref'] == refs[0] and item['evidence_refs'] == refs
+        assert item['provenance_state'] != 'reference_unavailable'
+        assert item['source_timestamp'] is None
+
+
+def test_native_fact_evidence_withholds_revoked_mixed_and_malformed_version_sets(monkeypatch):
+    from render_local import message_version_reference, native_message_source_ref
+    native = {source: message_version_reference({
+        'source_ref': native_message_source_ref(source, 'Synthetic-A1'),
+        'content_version': 'a' * 64}, source) for source in ('imessage', 'whatsapp')}
+    base = native_message_source_ref('imessage', 'Synthetic-A1')
+    cases = [([], 'observed_message', [native['imessage']]),
+             (['imessage'], 'observed_message', list(native.values())),
+             (['whatsapp'], 'observed_message', list(native.values())),
+             (['gmail'], 'observed_message', ['gmail:allowed', native['imessage']]),
+             (['imessage'], 'whatsapp', [native['imessage']])]
+    for malformed in (base, base + ':v:' + 'a' * 63, base + ':v:' + 'z' * 64,
+                      native['imessage'] + ':extra'):
+        cases.extend((['imessage', 'whatsapp'], origin, [native['whatsapp'], malformed])
+                     for origin in ('observed_message', 'imessage'))
+    for sources, origin, refs in cases:
+        monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', json.dumps(sources))
+        fact = kg.FactMeta(text='Native supported assertion', source=origin,
+                           source_ref=refs[0], evidence_refs=refs)
+        result = kq.attach_fact_evidence({'person_knowledge': {'c_abc111': fact.text}},
+            [('c_abc111', 'f_one', fact, fact.text, 'c_abc111', 1)], datetime(2026, 10, 26),
+            interactive=True, retained_units={'c_abc111': {1}})
+        item, = result['fact_evidence']['items']
+        assert item['provenance_state'] == 'reference_unavailable'
+        assert not any(field in item for field in ('source_ref', 'evidence_refs', 'source',
+                                                   'references_omitted', 'first_observed_date'))
+        assert all(ref not in json.dumps(result) for ref in refs)
+
+
+def test_fact_evidence_reserves_envelope_and_final_omission_metadata_at_transport_boundary(monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    projected = kq.interactive_projection({'person_knowledge': {'c_one': 'x' * 48900}})
+    assert kq._fits_interactive(projected)
+    for records in ([], [('c_one', 'f_missing', kg.FactMeta(text='omitted'))] * 100):
+        result = kq.attach_fact_evidence(dict(projected), records, datetime(2026, 10, 20), interactive=True)
+        assert kq._fits_interactive(result)
+        assert result['fact_evidence']['items'] == []
+        assert result['fact_evidence']['omitted'] == len(records)
+
+
+def test_fact_evidence_binds_exact_surviving_group_and_container_not_substrings(monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    fact = kg.FactMeta(text='Runs Cedar', source='observed_message', source_ref='gmail:PRIVATE')
+    for packed in ({'c_one': '= Runs Cedar clinic'}, {'c_other': '= Runs Cedar'}):
+        result = kq.attach_fact_evidence({'person_knowledge': packed},
+            [('c_one', 'f_one', fact, '= Runs Cedar', 'c_one', 1)], datetime(2026, 10, 20),
+            interactive=True, retained_units={'c_one': {1}})
+        assert result['fact_evidence']['items'] == []
+        assert result['fact_evidence']['omitted'] == 1
+        assert 'PRIVATE' not in json.dumps(result)
+
+
+def test_fact_evidence_requires_retained_group_identity_even_when_text_collides(monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    fact = kg.FactMeta(text='Runs Cedar', source='observed_message', source_ref='gmail:PRIVATE')
+    # A retained note/header may contain the exact rendered text of an omitted assertion.
+    result = kq.attach_fact_evidence({'person_knowledge': {'c_one': 'Header\n= Runs Cedar'}},
+        [('c_one', 'f_one', fact, '= Runs Cedar', 'c_one', 2)], datetime(2026, 10, 20),
+        interactive=True, retained_units={'c_one': {0, 1}})
+    assert result['fact_evidence']['items'] == [] and result['fact_evidence']['omitted'] == 1
+    assert 'PRIVATE' not in json.dumps(result)
+
+
+def test_projection_reports_only_group_ordinals_that_survive_budget(monkeypatch):
+    monkeypatch.setattr(kq, 'INTERACTIVE_BYTES', 800)
+    retained = {}
+    groups = ['Header', '= Kept', '= ' + 'x' * 1000]
+    result = kq.interactive_projection({'person_knowledge': {'c_one': '\n'.join(groups)}},
+        packed_groups={'c_one': groups}, retained_units=retained)
+    assert retained == {'c_one': {0, 1}}
+    assert result['person_knowledge']['c_one'] == 'Header\n= Kept'
+    assert kq._fits_interactive(result)
+
+
+def test_pack_person_preserves_research_selected_records_contract_and_separate_evidence_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    fact = kg.FactMeta(text='Runs Cedar', source='user_edit', conf=1.0)
+    person = kg.PersonFile(canonical_id='c_abc111', name='Dana Rivers', facts={'f_one': fact})
+    records, evidence, units = [], [], []
+    packed = kq.pack_person(person, True, datetime(2026, 10, 20), selected_records=records,
+                            selected_evidence=evidence, units=units)
+    assert records == [('c_abc111', 'f_one', fact)]
+    cid, fid, selected = records[0]  # Ask research snapshots unpack exactly this public hook.
+    assert (cid, fid, selected) == evidence[0][:3]
+    assert evidence[0][3] == units[evidence[0][5]] == '= Runs Cedar'
+    assert evidence[0][4] == person.canonical_id and evidence[0][3] in packed
+
+
 
 def test_retrieval_labels_missing_origin_without_relabelling_user_edits():
     for source in ('', ' ', None):
@@ -102,7 +297,7 @@ def test_empty_person_graph_keeps_historical_coverage_and_consent_distinct(tmp_p
     assert '14 days of notes and 36 hours of transcripts' in sources['granola']['scope']
 
     by_name = _run(tmp_path, '--person', 'Alex', '--person-coverage')['coverage']
-    assert by_name['identity_resolution']['next_action'] == 'get_contacts'
+    assert by_name['identity_resolution']['next_action'] == 'search_contacts'
     assert next(row for row in by_name['historical_sources']
                 if row['source'] == 'imessage')['next_action'] == 'resolve_identifier'
 
@@ -120,6 +315,23 @@ def test_empty_person_graph_keeps_historical_coverage_and_consent_distinct(tmp_p
     imessage = next(row for row in offline['coverage']['historical_sources']
                     if row['source'] == 'imessage')
     assert (imessage['status'], imessage['next_action']) == ('unavailable', 'explain_limit')
+
+
+def test_saved_person_still_exposes_history_limits_without_granting_disabled_sources(monkeypatch):
+    import source_context
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setattr(source_context, 'allowed', lambda source: source == 'gmail')
+    monkeypatch.setattr(source_context, 'source_health', lambda: {'sources': [
+        {'source': 'imessage', 'status': 'empty'},
+        {'source': 'whatsapp', 'status': 'disabled'},
+        {'source': 'contacts', 'status': 'disabled'},
+    ]})
+    coverage = kq.person_lookup_coverage(True, 'dana@example.test')
+    assert coverage['graph'] == 'found'
+    assert 'identity_resolution' not in coverage
+    sources = {row['source']: row for row in coverage['historical_sources']}
+    assert sources['imessage']['next_action'] == sources['gmail']['next_action'] == 'check_history'
+    assert sources['whatsapp']['next_action'] == sources['granola']['next_action'] == 'explain_limit'
 
 
 def test_managed_person_coverage_respects_connected_source_grants(tmp_path, monkeypatch):
@@ -345,7 +557,8 @@ def test_topic_finds_old_wrong_fact_then_exact_correction_replaces_retrieved_mem
     assert all(fact['id'] != 'f_wrong' for fact in ordinary['facts'])
     focused = next(iter(_run(tmp_path, '--person', 'peyton@example.com', '--editable-person',
                              '--topic', 'founder Alive').values()))
-    assert focused['facts'][0] == {'id': 'f_wrong', 'text': 'Peyton founded Alive.'}
+    assert focused['facts'][0] == {'id': 'f_wrong', 'text': 'Peyton founded Alive.',
+        'fact_version': kg.person_fact_version(p.canonical_id,'f_wrong',p.facts['f_wrong'])}
 
     env = dict(os.environ, SOTTO_DATA=str(tmp_path))
     corrected = subprocess.run([sys.executable, EDIT, '--slug', 'c_abcdef123456', '--op', 'correct',
@@ -543,7 +756,6 @@ def test_corrected_memory_reaches_chat_brief_prep_and_notification_context(tmp_p
     import compose_meeting_prep as prep
     import compose_notification as notification
     import knowledge_edit as edit
-    import render_local
     from datetime import timezone
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
@@ -567,9 +779,6 @@ def test_corrected_memory_reaches_chat_brief_prep_and_notification_context(tmp_p
     notification_context = notification.enrich([item], datetime.now(timezone.utc))[0]['person_facts']
     for value in (json.dumps(chat), brief_prompt, prep_prompt, json.dumps(notification_context)):
         assert want in value and old not in value
-    # The changed packed format must not trigger paid re-research just because the first fact is short.
-    assert render_local._is_high_quality_profile('Alex\n= Runs clinics.\n= Advises procurement boards on pediatric rollouts and governance.')
-    assert not render_local._is_high_quality_profile('Alex\n= Runs clinics.\nRelated context about Jo: ' + 'expert ' * 30)
 
 
 def test_resolved_work_does_not_become_a_current_topic(tmp_path, monkeypatch):
@@ -608,6 +817,27 @@ def test_malformed_optional_records_cannot_break_primary_retrieval(tmp_path, mon
                   gmail=[None, 'broken'], calendar=[None, 'broken'])
     assert context.participant_identifiers(**inputs) == {'alex@example.com'}
     assert context.participant_topics(**inputs) == {'alex@example.com': 'Clinic procurement'}
+
+
+def test_history_captured_authority_malformed_shapes_never_use_ambient_grants(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda _source: (_ for _ in ()).throw(AssertionError('ambient grant read')))
+    for captured in ('{}', '"gmail"', '["gmail", null]', '["gmail", 1]', '["gmail", {}]', '['):
+        monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', captured)
+        result = kq._person_obligation_history(None, [], 'alex@example.com', '', 'no_match', interactive=True)
+        assert result['status'] == 'unavailable' and result['items'] == []
+        assert result['absence_is_authoritative'] is False
+
+
+def test_malformed_person_identity_stays_unavailable_without_crashing_or_choosing_an_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    _person(tmp_path)
+    directory = tmp_path/'knowledge/people'
+    for malformed in ('---\ncanonical_id: c_999999999999\nname: null\nidentifiers: []\n---\n',
+                      '---\n- malformed YAML shape\n---\n'):
+        (directory/'unreadable.md').write_text(malformed)
+        for selector in ('Alex', 'alex@example.com', 'c_123456789abc'):
+            assert kq._unique_person(selector) == (None, [], 'unavailable')
 
 
 def test_related_limits_and_loaded_identity_are_enforced(tmp_path, monkeypatch):
@@ -693,6 +923,69 @@ def test_omitted_relation_notice_survives_an_active_conflict(tmp_path, monkeypat
     assert query.OMITTED_CONTEXT in packed
 
 
+def test_interactive_projection_preserves_multiline_conflict_as_one_unit(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setattr(kq, 'INTERACTIVE_BYTES', 350)
+    p = _person(tmp_path, facts={
+        'f_a': _fact('The contract is approved.\nOnly after audit.'),
+        'f_b': _fact('The contract is pending.\nUntil audit finishes.')})
+    (tmp_path / 'knowledge/conflicts.json').write_text(json.dumps({'people': {
+        p.canonical_id: {'pairs': [['f_a', 'f_b']]}}}))
+    units, weights = [], []
+    packed = kq.pack_person(p, False, datetime(2026, 9, 20),
+                            units=units, unit_weights=weights)
+    assert any('Unresolved memory conflict' in unit and 'Only after audit.' in unit
+               and 'Until audit finishes.' in unit for unit in units)
+    value = {'person_knowledge': {p.canonical_id: packed}, 'contact_index': [], 'memory_participants': []}
+    result = kq.interactive_projection(value, packed_groups={p.canonical_id: units},
+                                       packed_weights={p.canonical_id: weights})
+    text = result['person_knowledge'][p.canonical_id]
+    assert 'Unresolved memory conflict' not in text
+    assert result['omitted']['assertions'] == 2
+    assert ('The contract is approved.' in text) == ('Only after audit.' in text)
+    assert ('The contract is approved.' in text) == ('The contract is pending.' in text)
+    assert len(json.dumps(result).encode()) <= 350
+
+
+def test_interactive_projection_budgets_unicode_and_whole_huge_assertions(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    p = _person(tmp_path, facts={'f_large': _fact('条件' * 10000 + ' only if approved.'),
+                                 'f_small': _fact('Works on clinics.')})
+    units, stats = [], {}
+    packed = kq.pack_person(p, True, datetime(2026, 9, 20), units=units, stats=stats)
+    result = kq.interactive_projection({p.canonical_id: packed},
+        packed_groups={p.canonical_id: units}, packed_omitted={p.canonical_id: stats['assertions']})
+    assert 'only if approved.' not in result[p.canonical_id]
+    assert 'Works on clinics.' in result[p.canonical_id]
+    assert result['omitted']['assertions'] >= 1
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 48 * 1024
+    assert len(json.dumps(result).encode()) <= 48 * 1024
+
+
+def test_interactive_final_budget_drop_counts_all_retained_assertions(monkeypatch):
+    key = 'person'
+    units = ['Person (person)', '= First assertion.', '= Second assertion.']
+    value = {'person_knowledge': {key: '\n'.join(units)},
+             'contact_index': [], 'memory_participants': []}
+    options = {'packed_groups': {key: units}, 'packed_weights': {key: [0, 1, 1]},
+               'unselected_people': 1}
+    full = kq.interactive_projection(value, **options)
+    assert key in full['person_knowledge']
+    before_reason = json.loads(json.dumps(full))
+    before_reason['omitted']['reason'] = None
+    monkeypatch.setattr(kq, 'INTERACTIVE_BYTES', len(json.dumps(before_reason).encode()) + 1)
+    result = kq.interactive_projection(value, **options)
+    assert key not in result['person_knowledge']
+    assert result['omitted']['assertions'] == 2
+    assert len(json.dumps(result).encode()) <= kq.INTERACTIVE_BYTES
+
+
+def test_interactive_oversize_company_keeps_closed_result_shape():
+    result = kq.interactive_projection({'status': 'saved',
+        'company_knowledge': {'company': '条' * 20000}, 'truncated': False})
+    assert result == {'status': 'unavailable', 'company_knowledge': {}, 'truncated': False}
+
+
 def test_current_mail_topic_survives_busy_phone_alias_and_standing_work(tmp_path, monkeypatch):
     import personal_context as pc
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
@@ -722,3 +1015,323 @@ def test_topic_budget_follows_work_cohort_even_during_chat_burst(tmp_path, monke
     topics = pc.participant_topics(local=local, loops=loops)
     assert len(topics) == pc.PARTICIPANT_LIMIT
     assert all(key.startswith('person') for key in topics)
+
+
+def test_person_context_carries_measured_history_gaps_without_source_content(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'fixture-tenant')
+    config = tmp_path / 'config'
+    config.mkdir()
+    (config / 'managed-capabilities.json').write_text(json.dumps({
+        'tenant_id': 'fixture-tenant', 'sources': {
+            'gmail': {'consented': True, 'connected': True},
+            'whatsapp': {'consented': False, 'connected': True}}}))
+    ku.apply({'person_updates': [{'person_name': 'Dana Reed', 'identifier': 'dana@example.test',
+                                 'facts': [{'fact': 'Runs Cedar', 'confidence': 0.9}]}]})
+    path = tmp_path / 'knowledge/history-state.json'
+    window = {'since': 1791936000, 'until': 1792022400, 'complete': True,
+              'initial_complete': True, 'pages': 3, 'window_page_base': 2,
+              'cursor': 'SECRET-CURSOR', 'error': 'PRIVATE-MESSAGE',
+              'observation_totals': dict(pages=1, rows=20, eligible=20, selected=10,
+                                        skipped=0, omitted=10, truncated=2, rejected_people=0)}
+    path.write_text(json.dumps({'sources': {'gmail': window, 'whatsapp': window}}))
+    out = _run(tmp_path, '--person', 'dana@example.test', '--person-coverage', '--interactive')
+    assert out['coverage']['graph'] == 'found'
+    sources = {row['source']: row for row in out['coverage']['historical_sources']}
+    learned = sources['gmail']['learning']
+    assert learned['checkpoint'] == 'present'
+    assert learned['review_scope'] == 'partial'
+    assert learned['outside_window_review'] == 'unknown'
+    assert learned['initial_traversal_complete'] is True
+    assert learned['observation_counts']['omitted'] == 10
+    assert sources['whatsapp']['learning'] == {'checkpoint': 'withheld'}
+    assert 'SECRET' not in json.dumps(out) and 'PRIVATE' not in json.dumps(out)
+    assert 'not person- or topic-specific completeness' in out['coverage']['learning_scope']
+    assert sources['gmail']['next_action'] == 'check_history'
+
+    # Legacy checkpoint completion cannot manufacture measured coverage.
+    path.write_text(json.dumps({'sources': {'gmail': {'complete': True}}}))
+    legacy = _run(tmp_path, '--person', 'dana@example.test', '--person-coverage')
+    gmail = next(row for row in legacy['coverage']['historical_sources'] if row['source'] == 'gmail')
+    assert gmail['learning']['review_scope'] == 'unknown'
+    path.write_text('{broken')
+    broken = _run(tmp_path, '--person', 'dana@example.test', '--person-coverage')
+    gmail = next(row for row in broken['coverage']['historical_sources'] if row['source'] == 'gmail')
+    assert gmail['learning'] == {'checkpoint': 'unknown'}
+
+
+def test_saved_biography_does_not_require_an_address_book_read(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    monkeypatch.setattr(source_context, 'source_health', lambda: {'sources': [
+        {'source': 'contacts', 'status': 'ok'}, {'source': 'imessage', 'status': 'ok'}]})
+    coverage = kq.person_lookup_coverage(True, 'Dana Reed')
+    assert 'identity_resolution' not in coverage
+    assert coverage['historical_sources']  # outcome questions still have bounded retrieval guidance
+
+
+def test_saved_identifier_does_not_request_contacts_again(monkeypatch):
+    import source_context
+    monkeypatch.setattr(source_context, 'allowed', lambda source: True)
+    monkeypatch.setattr(source_context, 'source_health', lambda: {'sources': [
+        {'source': 'contacts', 'status': 'ok'}, {'source': 'imessage', 'status': 'ok'}]})
+    for identifiers, expected in [(['dana@example.test'], 'check_history'),
+                                  (['+15555550123'], 'check_history'),
+                                  ([], 'resolve_identifier'), (['Dana Reed'], 'resolve_identifier')]:
+        coverage = kq.person_lookup_coverage(True, 'Dana Reed', identifiers)
+        assert next(row for row in coverage['historical_sources'] if row['source'] == 'imessage')['next_action'] == expected
+
+
+def test_history_identity_failures_never_authorize_absence_inference():
+    for identity_status in ('ambiguous','unavailable'):
+        result=kq._person_obligation_history(None,[],'Alex','',identity_status,interactive=True)
+        assert result['absence_is_authoritative'] is False
+        assert result['items']==[] and result['omitted']==0
+
+
+def test_partial_person_lookup_points_to_saved_identity_discovery_without_selecting_history(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    people = tmp_path / 'knowledge/people'
+    people.mkdir(parents=True)
+    for cid, name, email in [('c_abc111', 'Dana Rivers', 'dana.rivers@example.test'),
+                             ('c_abc222', 'Dana Woods', 'dana.woods@example.test')]:
+        kg.write_person_file(str(people / f'{cid}.md'), kg.PersonFile(
+            canonical_id=cid, name=name, identifiers=[email]))
+    unresolved = _run(tmp_path, '--person', 'Dana', '--person-coverage', '--interactive')
+    assert unresolved['person_knowledge'] == {}
+    assert unresolved['obligation_history']['items'] == []
+    discovery = unresolved['coverage']['identity_resolution']['saved_identity_discovery']
+    assert discovery['reader'] == 'knowledge-query' and discovery['argv'] == []
+    assert 'bounded' in discovery['scope'] and 'not a partial-name match' in discovery['scope']
+    assert 'absence' in discovery['scope']
+    candidates = _run(tmp_path, '--interactive')['contact_index']
+    assert {row['canonical_id'] for row in candidates} == {'c_abc111', 'c_abc222'}
+    exact = _run(tmp_path, '--person', 'Dana Rivers', '--person-coverage', '--interactive')
+    assert exact['coverage']['graph'] == 'found'
+    assert 'identity_resolution' not in exact['coverage']
+    identifier = _run(tmp_path, '--person', 'nobody@example.test', '--person-coverage')
+    assert 'saved_identity_discovery' not in identifier['coverage']['identity_resolution']
+
+
+def test_ambiguous_exact_name_does_not_offer_candidate_as_resolved_person(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    people = tmp_path / 'knowledge/people'
+    people.mkdir(parents=True)
+    for cid in ['c_abc111', 'c_abc222']:
+        kg.write_person_file(str(people / f'{cid}.md'), kg.PersonFile(
+            canonical_id=cid, name='Dana Rivers', identifiers=[cid + '@example.test']))
+    result = _run(tmp_path, '--person', 'Dana Rivers', '--person-coverage', '--interactive')
+    assert result['coverage']['identity_resolution'] == {
+        'status': 'ambiguous', 'next_action': 'ask_owner_for_identifier'}
+    assert result['person_knowledge'] == {} and result['obligation_history']['items'] == []
+
+
+def test_recent_identity_discovery_can_omit_old_person_without_blocking_exact_history(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_READ_ONLY', '1')
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    people = tmp_path / 'knowledge/people'
+    people.mkdir(parents=True)
+    identities = [('c_abc111', 'Older Person', 'older@example.test'),
+                  ('c_abc222', 'Current Person', 'current@example.test')]
+    for cid, name, email in identities:
+        path = people / f'{cid}.md'
+        kg.write_person_file(str(path), kg.PersonFile(canonical_id=cid, name=name, identifiers=[email]))
+        old = time.time() - 21 * 86400
+        os.utime(path, (old, old))
+    continuity = tmp_path / 'knowledge/continuity'
+    continuity.mkdir()
+    for cid, name, email in identities:
+        row = {'anchor_key': f'follow_up:cid:{cid}', 'canonical_id': cid,
+               'contact_name': name, 'contact_identifier': email, 'channel': 'gmail',
+               'action_type': 'follow_up', 'status': 'resolved' if cid == 'c_abc111' else 'open',
+               'created_at': datetime.now().strftime('%Y-%m-%dT09:00:00'),
+               'ask': 'Send the research document', 'summary': 'Research document delivery',
+               'source': 'gmail', 'source_thread_id': cid + '-thread',
+               'source_message_id': cid + '-original',
+               'source_refs': [{'sourceType': 'gmail', 'sourceId': cid + '-original',
+                                'snippet': 'I will send the research document.'}]}
+        if row['status'] == 'resolved':
+            row.update(resolution='replied', closed_at=datetime.now().isoformat(),
+                       resolution_reason='Research document supplied.',
+                       resolution_source_refs=[{'sourceType': 'gmail', 'sourceId': cid + '-closing',
+                                                'snippet': 'Here is the research document.'}])
+        (continuity / f'{cid}.md').write_text('---\n' + json.dumps(row) + '\n---\n')
+    cohort = _run(tmp_path, '--interactive')
+    assert {entry['canonical_id'] for entry in cohort['contact_index']} == {'c_abc222'}
+    assert 'c_abc111' not in cohort['person_knowledge']
+    unresolved = _run(tmp_path, '--person', 'Older', '--person-coverage', '--interactive')
+    hint = unresolved['coverage']['identity_resolution']['saved_identity_discovery']['scope']
+    assert 'current/recent' in hint and 'older/outside-cohort' in hint.lower()
+    assert 'not all saved identities' in hint and 'do not establish absence' in hint
+    exact = _run(tmp_path, '--person', 'Older Person', '--person-coverage', '--interactive')
+    assert exact['coverage']['graph'] == 'found'
+    history = exact['obligation_history']
+    assert history['status'] == 'matched' and history['absence_is_authoritative'] is False
+    assert [(row['canonical_id'], row['status']) for row in history['items']] == [('c_abc111', 'resolved')]
+    assert history['items'][0]['source_refs'][0]['sourceId'] == 'c_abc111-original'
+    assert history['items'][0]['resolution_source_refs'][0]['sourceId'] == 'c_abc111-closing'
+
+
+def test_topic_only_query_reads_closed_obligation_evidence_without_graph_cohort(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    directory = tmp_path / 'knowledge/continuity'
+    directory.mkdir(parents=True)
+    row = {'anchor_key': 'orion', 'canonical_id': 'c_abc111', 'contact_name': 'Alex Reed',
+        'contact_identifier': 'alex@example.test', 'status': 'resolved', 'action_type': 'follow_up',
+        'source': 'gmail', 'channel': 'gmail', 'source_thread_id': 'orion-thread',
+        'source_refs': [{'sourceType': 'gmail', 'sourceId': 'original', 'snippet': 'Orion approval'}],
+        'ask': 'Orion approval follow-up', 'created_at': '2026-10-18',
+        'resolution': 'replied', 'resolution_evidence': 'Approved and sent.',
+        'resolution_source_refs': [{'sourceType': 'gmail', 'sourceId': 'sent', 'snippet': 'Approved.'}]}
+    path = directory / 'orion.md'
+    path.write_text('---\n' + json.dumps(row) + '\n---\n')
+    before = path.read_bytes()
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError('topic-only query traversed the graph or broad cohort')
+    monkeypatch.setattr(kg, 'people_dir', forbidden)
+    monkeypatch.setattr(kq, '_unique_person', forbidden)
+    monkeypatch.setattr(kq, 'active_loop_participants', forbidden)
+    monkeypatch.setattr(kq, 'pack_companies', forbidden)
+    args = SimpleNamespace(company=None, person=None, topic='Orion', interactive=True,
+                           calendar=None, gmail=None, local=None, loops=None)
+    kq.query(args, datetime.now())
+    result = json.loads(capsys.readouterr().out)
+    assert result['person_knowledge'] == {} and result['contact_index'] == []
+    assert result['memory_participants'] == []
+    history = result['obligation_history']
+    assert history['status'] == 'matched' and history['absence_is_authoritative'] is False
+    assert history['items'][0]['completion_basis'] == 'source_evidence'
+    assert history['items'][0]['source_refs'][0]['sourceId'] == 'original'
+    assert history['items'][0]['resolution_source_refs'][0]['sourceId'] == 'sent'
+    assert kq._fits_interactive(result)
+    assert path.read_bytes() == before
+
+
+def test_native_topic_query_keeps_empty_and_withheld_outputs_identical(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_READ_ONLY', '1')
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["imessage"]')
+    empty = _run(tmp_path, '--topic', 'Orion', '--interactive')
+    assert empty['obligation_history']['status'] == 'no_match'
+    directory = tmp_path / 'knowledge/continuity'
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {'anchor_key': 'orion', 'canonical_id': 'c_abc111', 'contact_name': 'PRIVATE-NAME',
+        'contact_identifier': 'private@example.test', 'status': 'resolved', 'action_type': 'follow_up',
+        'source': 'gmail', 'channel': 'gmail', 'source_thread_id': 'PRIVATE-THREAD',
+        'source_refs': [{'sourceType': 'gmail', 'sourceId': 'PRIVATE-ORIGINAL'}],
+        'ask': 'Orion PRIVATE-ASK', 'created_at': '2026-10-18', 'resolution': 'replied',
+        'resolution_evidence': 'PRIVATE-CLOSURE',
+        'resolution_source_refs': [{'sourceType': 'gmail', 'sourceId': 'PRIVATE-SENT'}]}
+    path = directory / 'orion.md'
+    path.write_text('---\n' + json.dumps(row) + '\n---\n')
+    assert _run(tmp_path, '--topic', 'Orion', '--interactive') == empty
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    visible = _run(tmp_path, '--topic', 'Orion', '--interactive')
+    assert visible['obligation_history']['status'] == 'matched'
+    assert visible['obligation_history']['items'][0]['anchor_key'] == 'orion'
+    for captured in ('invalid', '{"gmail":true}'):
+        monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', captured)
+        unknown = _run(tmp_path, '--topic', 'Orion', '--interactive')['obligation_history']
+        assert unknown['status'] == 'unavailable' and unknown['items'] == []
+        assert unknown['omitted'] == 0 and unknown['absence_is_authoritative'] is False
+    monkeypatch.delenv('SOTTO_CAPTURED_SOURCES')
+    unknown = _run(tmp_path, '--topic', 'Orion', '--interactive')['obligation_history']
+    assert unknown['status'] == 'unavailable' and unknown['items'] == []
+
+
+def test_complete_topic_result_does_not_invent_omitted_context():
+    import copy
+    history = {'status': 'matched', 'items': [{'anchor_key': 'pricing', 'truncated_fields': []}],
+               'omitted': 0, 'absence_is_authoritative': False,
+               'coverage': 'Source archives were not searched.',
+               'learning': {'gmail': {'status': 'partial'}}}
+    value = {'person_knowledge': {}, 'contact_index': [], 'memory_participants': [],
+             'obligation_history': history}
+    before = copy.deepcopy(value)
+    result = kq.interactive_projection(value)
+    assert 'suggestion' not in result
+    assert result['obligation_history'] == history
+    assert value == before
+    for change in ({'omitted': 1}, {'items': [{'anchor_key': 'pricing', 'truncated_fields': ['ask']}]}):
+        limited = kq.interactive_projection({**value, 'obligation_history': {**history, **change}})
+        assert limited['suggestion'] == kq.NARROWER_QUERY
+    assert kq.interactive_projection(value, unselected_people=1)['suggestion'] == kq.NARROWER_QUERY
+
+
+def test_fact_evidence_unknown_observation_dates_are_null(monkeypatch):
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    fact = kg.FactMeta(text='Known graph assertion', source='observed_message',
+                       source_ref='gmail:visible', first=None, last='not-a-date')
+    result = kq.attach_fact_evidence({'person_knowledge': {'c_one': fact.text}},
+        [('c_one', 'f_one', fact)], datetime(2026, 10, 20), interactive=False)
+    item, = result['fact_evidence']['items']
+    assert item['first_observed_date'] is None
+    assert item['last_observed_date'] is None
+
+
+@pytest.mark.parametrize('interactive', [False, True])
+def test_facts_only_keeps_evidence_and_coverage_without_reading_obligations(tmp_path, monkeypatch, capsys, interactive):
+    import ledger_io
+    import protected_ledger_io
+
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_READ_ONLY', '1')
+    monkeypatch.setenv('SOTTO_CAPTURED_SOURCES', '["gmail"]')
+    ku.apply({'person_updates': [{'identifier': 'dana@example.test', 'person_name': 'Dana Rivers',
+        'facts': [{'fact': 'Builds coastal sensors', 'source': 'observed_message', 'confidence': 0.95,
+                   'source_ref': 'gmail:sensors', 'evidence_refs': ['gmail:sensors']}]}]}, now=datetime.now())
+    sentinel = 'OBLIGATION-ONLY-cedar-packet-7913'
+    directory = tmp_path / 'knowledge/continuity'
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {'anchor_key': 'cedar-packet', 'contact_name': 'Dana Rivers',
+           'contact_identifier': 'dana@example.test', 'status': 'open', 'action_type': 'follow_up',
+           'source': 'gmail', 'channel': 'gmail', 'source_thread_id': 'packet-thread',
+           'source_refs': [{'sourceType': 'gmail', 'sourceId': 'packet-request'}],
+           'ask': sentinel, 'created_at': '2026-10-20'}
+    (directory / 'cedar-packet.md').write_text('---\n' + json.dumps(row) + '\n---\n')
+    argv = [QUERY, '--person', 'dana@example.test', '--person-coverage']
+    if interactive:
+        argv.append('--interactive')
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Facts-only must not read the obligation ledger')
+
+    with monkeypatch.context() as guarded:
+        # Guard the canonical loaders themselves, including the protected history reader.
+        guarded.setattr(ledger_io, 'load_entries', forbidden)
+        guarded.setattr(ledger_io, 'load_active', forbidden)
+        guarded.setattr(protected_ledger_io, 'load_protected_entries', forbidden)
+        guarded.setattr(sys, 'argv', [*argv, '--facts-only'])
+        kq.main()
+        result = json.loads(capsys.readouterr().out)
+        assert 'obligation_history' not in result
+        assert sentinel not in json.dumps(result)
+        assert 'Builds coastal sensors' in json.dumps(result['person_knowledge'])
+        assert result['fact_evidence']['items']
+        assert result['coverage']['historical_sources']
+        assert 'learning' in next(s for s in result['coverage']['historical_sources'] if s['source'] == 'gmail')
+        guarded.setattr(sys, 'argv', argv)
+        with pytest.raises(AssertionError, match='obligation ledger'):
+            kq.main()
+
+    # The real full view must return the seeded obligation in both modes.
+    monkeypatch.setattr(sys, 'argv', argv)
+    kq.main()
+    full = json.loads(capsys.readouterr().out)
+    assert sentinel in json.dumps(full)
+    assert full['obligation_history']['items'][0]['ask'] == sentinel
+
+
+def test_facts_only_cli_rejects_incoherent_scope(tmp_path):
+    for args in [[], ['--person', 'Dana'], ['--person-coverage'],
+                 ['--person', 'Dana', '--person-coverage', '--editable-person'],
+                 ['--person', 'Dana', '--person-coverage', '--relevant-days', '7'],
+                 ['--person', 'Dana', '--person-coverage', '--company', 'Cedar']]:
+        proc = subprocess.run([sys.executable, QUERY, '--facts-only', *args],
+                              capture_output=True, text=True, env=dict(os.environ, SOTTO_DATA=str(tmp_path)))
+        assert proc.returncode == 2
+        assert '--facts-only requires' in proc.stderr

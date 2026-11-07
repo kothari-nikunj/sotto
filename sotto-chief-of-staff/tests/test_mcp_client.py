@@ -2,8 +2,13 @@
 
 Covers both server response styles (plain JSON body and SSE stream), the Mcp-Session-Id
 capture/echo, tool-result text extraction (json-decoded when possible), and 401 → ConnectorAuthError."""
+from email.message import Message
+from io import BytesIO
 import json
 import os
+from urllib import request, response
+
+import pytest
 
 HERE = os.path.dirname(__file__)
 
@@ -132,3 +137,47 @@ def test_tool_is_error_result_raises():
         raise AssertionError("expected McpError")
     except mc.McpError:
         pass
+
+
+@pytest.mark.parametrize('destination,allowed', [
+    ('/moved', True),
+    ('https://provider.invalid:443/moved', True),
+    ('https://other.invalid/moved', False),
+    ('https://provider.invalid:8443/moved', False),
+    ('http://provider.invalid/moved', False),
+    ('https://user@provider.invalid/moved', False),
+])
+@pytest.mark.parametrize('reader', ['mcp', 'rest'])
+def test_connector_redirects_keep_credentials_on_original_https_origin(monkeypatch, reader, destination, allowed):
+    import gather_granola
+
+    calls = []
+
+    def serve(_handler, req):
+        calls.append((req.full_url, req.get_header('Authorization'), req.get_header('Mcp-session-id')))
+        hdrs = Message()
+        if len(calls) == 1:
+            hdrs['Location'] = destination
+        reply = response.addinfourl(BytesIO(b'{}'), hdrs, req.full_url, 302 if len(calls) == 1 else 200)
+        reply.msg = 'fixture'
+        return reply
+
+    monkeypatch.setattr(request, 'getproxies', lambda: {})
+    monkeypatch.setattr(request, '_opener', None)
+    monkeypatch.setattr(request.HTTPSHandler, 'https_open', serve)
+    monkeypatch.setattr(request.HTTPHandler, 'http_open', serve)
+    if reader == 'mcp':
+        client = mc.McpClient('https://provider.invalid/mcp', 'fixture')
+        client.session_id = 'test-session'
+        if allowed:
+            client.list_tools()
+        else:
+            with pytest.raises(mc.McpError, match='redirect'):
+                client.list_tools()
+    else:
+        _, warnings = gather_granola.gather_rest('fixture', 1, 1, base='https://provider.invalid/v1')
+        assert warnings == ([] if allowed else ["GET /notes HTTP 302"])
+    assert len(calls) == (2 if allowed else 1)
+    assert all(auth == 'Bearer fixture' for _, auth, _ in calls)
+    if reader == 'mcp':
+        assert all(session == 'test-session' for _, _, session in calls)

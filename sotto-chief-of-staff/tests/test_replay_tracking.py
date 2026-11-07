@@ -71,3 +71,28 @@ def test_sandbox_restores_environment_on_error(monkeypatch, tmp_path):
             raise RuntimeError('interrupted replay')
     assert not root.exists()
     assert os.environ['SOTTO_DATA'] == str(tmp_path)
+
+
+@pytest.mark.parametrize('source_present,approved,closed', [
+    (True, True, True), (True, False, False), (False, True, False),
+])
+def test_replay_completion_requires_source_and_explicit_critic_verdict(source_present, approved, closed):
+    with probe.sandbox():
+        now = probe.BASE
+        phone = '+12025550101'
+        first = probe.cr.resolve({'today': '2026-08-01', 'new_actions': [
+            probe._action('Ada', phone, 'Send the pricing document')]}, now)
+        row = first['active'][0]
+        now += probe.timedelta(days=1)
+        sent = {'rowid': 104, 'handle': phone, 'is_from_me': True,
+                'timestamp': probe._iso(now), 'text': 'The pricing document is sent.'}
+        update = {'loopId': row['anchor_key'], 'loopVersion': probe.loop_version(row),
+                  'status': 'resolved', 'evidence': [{'sourceType': 'imessage', 'sourceId': '104',
+                                                     'snippet': sent['text']}]}
+        local = {'imessage': [sent] if source_present else []}
+        reviewed = probe._review_completions([update], local, now, approve=approved)
+        result = probe.cr.resolve({'today': '2026-08-02', 'local': local,
+                                   'loopUpdates': reviewed}, now, resolve_existing=False)
+        assert bool(result['resolved']) is closed
+        assert bool(reviewed[0].get('criticReceipt')) is closed
+        assert len(result['active']) == (0 if closed else 1)

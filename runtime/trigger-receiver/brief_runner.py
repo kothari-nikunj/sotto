@@ -33,6 +33,50 @@ class BriefModelBudgetError(Exception):
     """Fresh composition needs an account allowance update, not repeated source reads."""
 
 
+def _stage_prep_offer(artifact, persist=lambda artifact: None):
+    """Only the rendered, source-bound single offer joins existing accepted-delivery effects."""
+    offer = artifact.get('_prep_offer')
+    if not isinstance(offer, dict):
+        return
+    try:
+        import delivery_effects
+        import pending_offer
+        from source_context import allowed
+        if (not delivery_effects.run_id() or not allowed('calendar')
+                or 'calendar' not in artifact.get('_source_permissions', [])
+                or not isinstance(offer, dict) or set(offer) != {'person', 'question', 'meeting', 'ambiguous'}
+                or type(offer['ambiguous']) is not bool
+                or not isinstance(offer['person'], str) or not offer['person']
+                or not isinstance(offer['question'], str) or not offer['question']
+                or str(artifact.get('brief_markdown', '')).count(offer['question']) != 1
+                or str(artifact.get('brief_text', '')).count(offer['question']) != 1
+                or not isinstance(offer['meeting'], dict) or set(offer['meeting']) != {'event_id', 'start'}):
+            return
+        meeting = offer['meeting']
+        proofs = [row for row in artifact.get('_calendar_eligibility', []) if isinstance(row, dict)
+                  and row.get('source') == 'calendar' and row.get('calendar_event_id') == meeting['event_id']
+                  and delivery_effects.instant(row.get('calendar_start')) == delivery_effects.instant(meeting['start'])]
+        if len(proofs) != 1 or delivery_effects.instant(meeting['start']) is None:
+            return
+        saved = artifact.get('_prep_offer_record')
+        if saved is None:
+            saved = pending_offer.set_offer('meeting_prep', offer['question'], person=offer['person'],
+                meeting=meeting, ambiguous=offer['ambiguous'], prepare_only=True)
+            artifact['_prep_offer_record'] = saved
+            persist(artifact)  # preserve the original identity/expiry before any send can accept it
+        elif (not isinstance(saved, dict) or saved.get('kind') != 'meeting_prep'
+              or saved.get('question') != offer['question'] or saved.get('person') != offer['person']
+              or saved.get('meeting') != meeting or bool(saved.get('ambiguous')) != offer['ambiguous']):
+            return
+        delivery_effects.stage([{'kind': 'pending_offer', 'offer': saved}])
+    except Exception as error:  # optional assistance must never hold the brief
+        print(f'[brief_runner] prep offer skipped: {type(error).__name__}', file=sys.stderr)
+
+
+class BriefModelOutcomeUncertainError(Exception):
+    """An upstream brief timeout must not start another paid generation."""
+
+
 class BriefModelAdmissionBusyError(Exception):
     """The shared proxy refused an unbilled attempt; durable work retries within its deadline."""
 
@@ -53,10 +97,13 @@ def run(request):
     sys.path.insert(0, str(pack / '_shared' / 'lib'))
     import jsonstore
     import work_queue
+    from brief_evidence import project_learning_payload
+    from brief_learning import complete_essential
     from gemini_transport import brief_model_preflight, ModelBudgetUnavailableError
     from source_context import (allowed, email_dependency_sources, project_emails, project_local,
                                 project_x, read_local, record_bridge_status, used_sources)
     from local_snapshot import resolve_effective_local
+    from calendar_context import meeting_events, user_participates
     from textutil import unwrap_tool_result
     from timeutil import configured_tz, _user_local_date
 
@@ -67,6 +114,7 @@ def run(request):
     scratch = root / 'events' / 'work-inputs' / ('brief-' + run_key)
     scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
     coverage_until = datetime.now(timezone.utc).isoformat()
+    composition_proof = json.loads(os.environ.get('SOTTO_SKILL_COMPOSITION_PROOF', '{}'))
 
     def command(relative, *args, output=None, timeout=600):
         result = subprocess.run([sys.executable, str(pack / relative), *map(str, args)],
@@ -79,6 +127,9 @@ def run(request):
             if (relative == '_shared/scripts/compose_brief.py'
                     and result.returncode == work_queue.MODEL_BUDGET_EXIT):
                 raise BriefModelBudgetError('Model allowance reached')
+            if (relative == '_shared/scripts/compose_brief.py'
+                    and result.returncode == work_queue.MODEL_OUTCOME_UNCERTAIN_EXIT):
+                raise BriefModelOutcomeUncertainError('Model outcome uncertain')
             # The receiver's sanitizer, not a second one: only an allowlisted exception name or
             # a presence flag may cross from a subprocess's stderr into a persisted error.
             raise RuntimeError(f'{Path(relative).name} failed (exit {result.returncode}; '
@@ -128,7 +179,8 @@ def run(request):
     def stage_artifact(artifact):
         import delivery_effects
         sources = artifact.get('_source_permissions', [])
-        if any(not allowed(source) for source in sources):
+        if (any(not allowed(source) for source in sources)
+                or (request.get('history_discovery') and artifact.get('_composition_proof') != composition_proof)):
             # The saved composition read a source the user has since switched off. It must not
             # be delivered — and it must not be RELOADED either: every retry found the same
             # artifact and raised the same error until the job went terminal and the day's brief
@@ -142,11 +194,11 @@ def run(request):
                                 *artifact.get('_calendar_eligibility', []),
                                 *artifact.get('_parking_notices', []),
                                 *([artifact['_review_candidate']] if artifact.get('_review_candidate') else [])])
+        if artifact.get('_prep_offer'):
+            sys.path.insert(0, str(pack / '_shared' / 'scripts'))
+            _stage_prep_offer(artifact, lambda value: save(scratch / 'artifact.json', value))
 
     def learn(paths, phase):
-        # The composition file is already the effective local view. Reapply current consent at
-        # each learning phase, including a later background retry, and keep the resolver's copy
-        # in step with the exact file passed to style learning.
         local = project_local(load(paths['local'], {}))
         save(paths['local'], local)
         continuity = load(paths['continuity'], {})
@@ -161,7 +213,9 @@ def run(request):
             save(paths['continuity'], continuity)
         if not allowed('granola'):
             save(paths['granola'], {'meetings': []})
-        learning_payload = load(paths['knowledge_out'], {})
+        learning_payload = project_learning_payload(load(paths['knowledge_out'], {}), artifact.get('_source_permissions', []),
+            {'local': local, 'google': {'emails': gmail if isinstance(gmail, list) else gmail.get('emails', []),
+             'events': load(paths['cal'], [])}, 'granola': load(paths['granola'], {})})
         learning_evidence = learning_payload.get('_learning_evidence')
         if isinstance(learning_evidence, dict):
             sources = artifact.get('_source_permissions', [])
@@ -275,6 +329,8 @@ def run(request):
     def followup():
         followup_request = {'pack': str(pack), 'kind': request['kind'], 'day': day,
                             'work_key': key, 'learn_only': True, 'learning_revision': artifact.get('learning_revision')}
+        if request.get('history_discovery'):
+            followup_request['history_discovery'] = True
         return work_queue.enqueue(str(root), 'run', {
             'runner': [sys.executable, str(Path(__file__).resolve())],
             'prompt': json.dumps(followup_request), 'label': 'background:sotto-learn:' + learning_key,
@@ -292,10 +348,7 @@ def run(request):
                 return 'NO_NUDGES'
             paths = paths_at(scratch / 'current')
             # Every learning phase reapplies consent before reading persisted inputs.
-            if not load(scratch / 'essential-done.json', {}).get('complete'):
-                receipt = learn(paths, 'essential')
-                save(scratch / 'essential-done.json', {'complete': True,
-                     'learning_status': receipt['completion'], 'finished_at': time.time()})
+            complete_essential(scratch, lambda: learn(paths, 'essential'))
             if load(paths['granola'], {}).get('warnings'):
                 gather_notes(paths)  # retry missing optional context in the background lane
             receipt = learn(paths, 'ancillary')
@@ -351,19 +404,31 @@ def run(request):
 
     with _generation_lock(scratch):
         artifact = load(scratch / 'artifact.json', {})
+        previous_artifact = artifact
         # A retry hours later must not resend the 6:30 composition: the greeting and every "today"
         # in it were stamped at compose time, so past ARTIFACT_MAX_AGE_SECONDS the saved artifact is
         # treated as absent and this run gathers and composes afresh. Still the SAME brief — the
         # day, the work key, the deliver-once marker and not_before are untouched, and the marker is
         # claimed at the send seam, so a fresher artifact for an undelivered day cannot double-send.
-        if time.time() - float(artifact.get('composed_at') or 0) > ARTIFACT_MAX_AGE_SECONDS:
+        if (artifact.get('_closure_uncommitted') or
+                time.time() - float(artifact.get('composed_at') or 0) > ARTIFACT_MAX_AGE_SECONDS):
             artifact = {}
         paths = paths_at(scratch / 'current')
         if not isinstance(artifact.get('brief_text'), str) or not artifact['brief_text'].strip():
+            discovery = None
+            if request.get('history_discovery'):
+                import onboarding
+                discovery = onboarding.discovery_context(root, pack, allowed)
+                if discovery is None:
+                    raise RuntimeError('history discovery evidence unavailable')
             check_model()
-            # Retire the old generation before touching its inputs. Learning uses this same lock
-            # and a revision-bound job, so a crash during replacement cannot consume partial files
-            # or mistake old completion receipts for learning the new actions.
+            if (previous_artifact.get('brief_text')
+                    and not load(scratch / 'essential-done.json', {}).get('complete')):
+                artifact = previous_artifact
+                learning_key = (run_key + ':' + artifact['learning_revision']
+                                if artifact.get('learning_revision') else run_key)
+                complete_essential(scratch, lambda: learn(paths, 'essential'))
+            # Retire only after essential capture; the shared lock fences old learners.
             for name in ('artifact.json', 'essential-done.json', 'ancillary-done.json'):
                 (scratch / name).unlink(missing_ok=True)
             shutil.rmtree(scratch / 'current', ignore_errors=True)
@@ -379,6 +444,8 @@ def run(request):
             local = resolve_effective_local(project_local(local))
             save(paths['local'], local)
             consumed_sources = set(used_sources(local, already_projected=True))
+            if discovery:
+                consumed_sources.update(discovery['sources'])
             # The pinned Google search makes a metadata GET for every hit. The former two
             # 200-hit slices cost 8,000 quota units before reading a single body (new Google
             # projects allow 6,000/user/minute). Keep a seven-day starter sample, both date
@@ -438,7 +505,7 @@ def run(request):
             x_context = load(paths['x'], {})
             if attendees or (isinstance(x_context, dict) and x_context.get('attendees')):
                 consumed_sources.add('calendar')
-            if request['kind'] == 'welcome':
+            if request['kind'] == 'welcome' and not discovery:
                 # Local-only seeders have ONE small combined allowance on the first reply.
                 # Slow optional learning resumes in the durable background job after delivery.
                 seed_deadline = time.monotonic() + WELCOME_SEED_BUDGET_SECONDS
@@ -452,19 +519,32 @@ def run(request):
                         command(script, *args, timeout=remaining)
                     except (RuntimeError, subprocess.TimeoutExpired):
                         pass  # the durable ancillary job retries learning after delivery
-            command('_shared/knowledge/knowledge_query.py', '--calendar', paths['cal'], '--gmail', paths['gmail'],
-                    '--local', paths['local'], output=paths['knowledge'])
+            if discovery:
+                # The discovery envelope carries each observation's identity, date and sources.
+                # Do not duplicate those facts in a name-keyed map that merges same-name people.
+                save(paths['knowledge'], {'person_knowledge': {}})
+            else:
+                command('_shared/knowledge/knowledge_query.py', '--calendar', paths['cal'], '--gmail', paths['gmail'],
+                        '--local', paths['local'], output=paths['knowledge'])
             if any(not allowed(source) for source in consumed_sources):
                 raise RuntimeError('source permission changed during brief preparation')
             continuity = {'today': day, 'signals': {}, 'local': local, 'emails': emails, 'events': events}
             save(paths['continuity'], continuity)
             command('morning-brief/scripts/continuity_resolve.py', '--resolve-only', paths['continuity'])
+            discovery_args = []
+            if discovery:
+                save(scratch / 'history-discovery.json', discovery)
+                discovery_args = ['--history-discovery', scratch / 'history-discovery.json']
+            direction_args = []
+            if request.get('composition_direction'):
+                save(scratch / 'composition-direction.json', request['composition_direction'])
+                direction_args = ['--composition-direction', scratch / 'composition-direction.json']
             composed = json.loads(command('_shared/scripts/compose_brief.py', '--type', request['kind'],
                 '--local', paths['local'], '--local-resolved', '--effective-local-out', paths['local'],
                 '--gmail', paths['gmail'], '--calendar', paths['cal'],
                 '--granola', paths['granola'], '--knowledge', paths['knowledge'],
                 '--source-results', paths['source_results'],
-                '--attendee-research', paths['research'], '--x-context', paths['x']))
+                '--attendee-research', paths['research'], '--x-context', paths['x'], *discovery_args, *direction_args))
             if not isinstance(composed.get('brief_text'), str) or not composed['brief_text'].strip():
                 raise RuntimeError('composer produced no chat text')
             # Compose can heal a partial Bridge read with permitted cached sources. Its preview
@@ -477,12 +557,22 @@ def run(request):
             composed['_source_permissions'] = sorted(consumed_sources | set(
                 composed.get('_source_permissions') or []))
             composed['_source_cutoff'] = coverage_until
+            if discovery:
+                composed['_composition_proof'] = composition_proof
+            settings = load(root / 'config/settings.json', {})
+            calendar_owner = (os.environ.get('SOTTO_USER_EMAIL') or
+                (settings.get('google_account_email', '') if isinstance(settings, dict) else ''))
+            calendar_owner = calendar_owner.strip().lower() if isinstance(calendar_owner, str) else ''
             composed['_calendar_eligibility'] = [
                 {'kind': 'eligibility', 'source': 'calendar',
                  'calendar_event_id': event['id'], 'calendar_start': event['start'],
                  'calendar_observed_at': source_results.get('calendar', {}).get('observed_at') or coverage_until}
-                for event in events if isinstance(event, dict) and event.get('id') and event.get('start')
-                and event.get('my_response') != 'declined']
+                # Match the receiver's calendar cache projection. Raw invite copies, attached
+                # context and other people's shared events are absent there by design;
+                # treating that absence as cancellation silences the whole brief.
+                for event in meeting_events(events, calendar_owner)
+                if event.get('id') and event.get('start')
+                and user_participates(event, calendar_owner)]
             knowledge_payload = dict(composed.get('extracted_knowledge') or {})
             if isinstance(composed.get('learning_evidence'), dict):
                 knowledge_payload['_learning_evidence'] = {
@@ -495,27 +585,50 @@ def run(request):
             continuity['loop_updates'] = composed.get('loop_updates') or []
             save(paths['continuity'], continuity)
             # Persist last: every input needed to resume required writes now exists atomically.
+            composed['_composition_direction'] = bool(request.get('composition_direction'))
             composed['composed_at'] = time.time()
             composed['learning_revision'] = uuid.uuid4().hex
             save(scratch / 'artifact.json', composed)
             artifact = composed
         learning_key = run_key + ':' + artifact['learning_revision'] if artifact.get('learning_revision') else run_key
         stage_artifact(artifact)
-        if not load(scratch / 'essential-done.json', {}).get('complete'):
-            try:
-                receipt = learn(paths, 'essential')
-                save(scratch / 'essential-done.json', {'complete': True,
-                     'learning_status': receipt['completion'], 'finished_at': time.time()})
-            except Exception as error:  # learning is after the source/consent delivery gate
-                # Consent/source validation and delivery effects are already staged. Preserve the
-                # composed brief for delivery; the durable follow-up completes required writes.
-                print(f'[brief_runner] essential learning deferred: {type(error).__name__}',
-                      file=sys.stderr)
+        try:
+            complete_essential(scratch, lambda: learn(paths, 'essential'))
+        except Exception as error:  # learning is after the source/consent delivery gate
+            # Handoff requires a durable follow-up if this write remains incomplete.
+            print(f'[brief_runner] essential learning deferred: {type(error).__name__}',
+                  file=sys.stderr)
         # Count only the exact obligations represented in this saved artifact. Essential learning
         # may restate bookkeeping; a material change to an obligation invalidates its count.
         import delivery_effects
         import ledger_io
         live = {row.get('anchor_key'): row for row in ledger_io.load_entries()}
+        closures = [u for u in artifact.get('loop_updates', [])
+                    if isinstance(u, dict) and u.get('status') == 'resolved']
+        # Composition independently verifies every proposal and puts rejected tasks back
+        # in Still open. Learning still receives those proposals for rejection receipts,
+        # but delivery must wait only on closures this brief actually presents as closed.
+        # Missing/failed projection (including older artifacts) keeps the conservative gate.
+        projection = artifact.get('_loop_projection')
+        if (isinstance(projection, dict) and not projection.get('unavailable')
+                and isinstance(projection.get('resolved'), list)
+                and all(isinstance(key, str) for key in projection['resolved'])
+                and isinstance(projection.get('rejected_by_reason'), dict)):
+            closures = [u for u in closures if u.get('loopId') in projection['resolved']]
+        for proposal in closures:
+            saved = live.get(proposal.get('loopId')) or {}
+            if (saved.get('status') != 'resolved' or not proposal.get('loopVersion')
+                    or saved.get('resolution_loop_version') != proposal['loopVersion']
+                    or saved.get('resolution_source_refs') != proposal.get('evidence')):
+                # A rejected/stale/deferred write is not a completed outcome. Recompose against
+                # the current ledger on retry; ancillary learning can still finish independently.
+                artifact['_closure_uncommitted'] = True
+                save(scratch / 'artifact.json', artifact)
+                followup()
+                raise RuntimeError('brief closure was not committed; fresh composition required')
+        delivery_effects.stage([{'kind': 'eligibility', 'closed_loop': proposal['loopId'],
+                                 'closed_loop_version': delivery_effects.closure_version(live[proposal['loopId']])}
+                                for proposal in closures])
         represented = []
         for row in artifact.get('_represented_loops', []):
             current = live.get(row.get('anchor_key'))
@@ -535,8 +648,9 @@ def run(request):
             try:
                 followup()  # stable work key; a retry cannot duplicate successful learning
             except Exception as error:
-                # Keep the archived inputs and pending essential marker for recovery. Failure of
-                # background admission cannot withhold an already validated, composed brief.
+                # The parent retries required capture; optional learning never holds handoff.
+                if not load(scratch / 'essential-done.json', {}).get('complete'):
+                    raise RuntimeError('required learning retry admission failed') from error
                 print(f'[brief_runner] learning follow-up admission failed: {type(error).__name__}',
                       file=sys.stderr)
         # Bind reusable content to exact delivery jobs. Only accepted outbox IDs may replay it.
@@ -554,6 +668,10 @@ if __name__ == '__main__':
     except BriefBusyError:
         print('[brief_runner] BriefBusyError', file=sys.stderr)
         sys.exit(75)  # Receiver refunds only this runner's explicit contention signal.
+    except BriefModelOutcomeUncertainError:
+        from work_queue import MODEL_OUTCOME_UNCERTAIN_EXIT
+        print('[brief_runner] Model outcome uncertain; no automatic retry', file=sys.stderr)
+        sys.exit(MODEL_OUTCOME_UNCERTAIN_EXIT)
     except BriefModelBudgetError:
         from work_queue import MODEL_BUDGET_EXIT
         print('[brief_runner] Model allowance reached', file=sys.stderr)

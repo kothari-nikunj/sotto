@@ -49,6 +49,37 @@ def _find(anchor_key: str):
     return None
 
 
+def snooze_row(it: dict, days: int, today: str) -> str:
+    """Original calendar-day snooze transform; persistence belongs to its caller."""
+    until = (date.fromisoformat(today) + timedelta(days=max(1, int(days)))).isoformat()
+    it["snoozed_until"] = until
+    if not ledger_io.is_waiting_on(it.get("action_type")):
+        cr.unpark(it, today)
+    return until
+
+
+def keep_row(it: dict, today: str) -> dict:
+    """Original direction-specific keep transform; caller owns persistence."""
+    waiting = ledger_io.is_waiting_on(it.get("action_type"))
+    if waiting:
+        # "I still care" on a debt someone owes you = a fresh chase clock. Without this, an
+        # item chased to its quota is kept and then never chased again — the verb would mean
+        # nothing on the one direction where it is most often offered. The field list is
+        # ledger_io's (CHASE_STATE_FIELDS): it includes the hand-off stamp, so answering
+        # "keep waiting" both restarts the chases AND makes the loop askable-about again.
+        for k in ledger_io.CHASE_STATE_FIELDS:
+            it.pop(k, None)
+        return {"ok": True, "action": "keep", "anchor_key": it.get("anchor_key"),
+                "detail": "kept (chase clock reset)"}
+    was_parked = it.get("status") in cr.PARKED
+    cr.unpark(it, today)
+    # `created_at` is the evidence cutoff and never moves. `reopened_at` is the park-clock
+    # touch, including when an already-open row is explicitly kept.
+    it["reopened_at"] = today
+    return {"ok": True, "action": "keep", "anchor_key": it.get("anchor_key"),
+            "detail": "kept (un-parked, clock reset)" if was_parked else "kept (clock reset)"}
+
+
 def _apply_unlocked(action: str, anchor_key: str, days: int = 7) -> dict:
     anchor_key = (anchor_key or "").strip()
     if not anchor_key:
@@ -65,36 +96,17 @@ def _apply_unlocked(action: str, anchor_key: str, days: int = 7) -> dict:
     # DIRECTION decides which clock a verb may touch. A `waiting_on` has no park clock to reset,
     # so resetting `created_at` on one only pushes its chase out and hides it from retune_scan —
     # the opposite of what the user just asked for.
-    waiting = ledger_io.is_waiting_on(it.get("action_type"))
     if action == "snooze":
         # Calendar-day intent follows the configured local date, not the Railway host's UTC day.
-        until = (date.fromisoformat(today) + timedelta(days=max(1, int(days)))).isoformat()
-        it["snoozed_until"] = until
-        if not waiting:
-            cr.unpark(it, today)
+        until = snooze_row(it, days, today)
         cr._persist(it)
         return {"ok": True, "action": "snooze", "anchor_key": anchor_key,
                 "detail": f"hidden until {until}"}
     if action == "keep":
-        if waiting:
-            # "I still care" on a debt someone owes you = a fresh chase clock. Without this, an
-            # item chased to its quota is kept and then never chased again — the verb would mean
-            # nothing on the one direction where it is most often offered. The field list is
-            # ledger_io's (CHASE_STATE_FIELDS): it includes the hand-off stamp, so answering
-            # "keep waiting" both restarts the chases AND makes the loop askable-about again.
-            for k in ledger_io.CHASE_STATE_FIELDS:
-                it.pop(k, None)
-            cr._persist(it)
-            return {"ok": True, "action": "keep", "anchor_key": anchor_key,
-                    "detail": "kept (chase clock reset)"}
-        was_parked = it.get("status") in cr.PARKED
-        cr.unpark(it, today)
-        # `created_at` is the evidence cutoff and never moves. `reopened_at` is the park-clock
-        # touch, including when an already-open row is explicitly kept.
-        it["reopened_at"] = today
+        result = keep_row(it, today)
+        result["anchor_key"] = anchor_key
         cr._persist(it)
-        return {"ok": True, "action": "keep", "anchor_key": anchor_key,
-                "detail": "kept (un-parked, clock reset)" if was_parked else "kept (clock reset)"}
+        return result
     return {"ok": False, "detail": f"unknown action: {action}"}
 
 

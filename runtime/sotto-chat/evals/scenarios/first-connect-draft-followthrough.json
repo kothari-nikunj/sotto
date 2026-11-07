@@ -1,0 +1,321 @@
+{
+  "name": "first-connect-discovery-draft-followthrough-seeded",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "gmailMessages": {
+      "old-launch": {
+        "id": "old-launch",
+        "threadId": "launch",
+        "internalDate": "1793545703000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Please send the launch presentation today. This is urgent.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Alex Chen <robotics@example.test>"
+            },
+            {
+              "name": "Date",
+              "value": "2026-11-01T15:08:23+00:00"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar Robotics launch presentation"
+            }
+          ],
+          "body": {
+            "data": "UGxlYXNlIHNlbmQgdGhlIGxhdW5jaCBwcmVzZW50YXRpb24gdG9kYXkuIFRoaXMgaXMgdXJnZW50Lg"
+          }
+        }
+      },
+      "done-launch": {
+        "id": "done-launch",
+        "threadId": "launch",
+        "internalDate": "1793711303000",
+        "labelIds": [
+          "SENT"
+        ],
+        "snippet": "The launch presentation is complete and attached. No further work remains.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Owner <owner@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "robotics@example.test"
+            },
+            {
+              "name": "Date",
+              "value": "2026-11-03T13:08:23+00:00"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar Robotics launch presentation"
+            }
+          ],
+          "body": {
+            "data": "VGhlIGxhdW5jaCBwcmVzZW50YXRpb24gaXMgY29tcGxldGUgYW5kIGF0dGFjaGVkLiBObyBmdXJ0aGVyIHdvcmsgcmVtYWlucy4"
+          }
+        }
+      },
+      "current-budget": {
+        "id": "current-budget",
+        "threadId": "garden",
+        "internalDate": "1793714903000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Please review the attached community garden fundraiser budget by 17:00 today. We need your approval before booking the venue.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Alex Chen <garden@example.test>"
+            },
+            {
+              "name": "Date",
+              "value": "2026-11-03T14:08:23+00:00"
+            },
+            {
+              "name": "Subject",
+              "value": "Community garden fundraiser budget"
+            }
+          ],
+          "body": {
+            "data": "UGxlYXNlIHJldmlldyB0aGUgYXR0YWNoZWQgY29tbXVuaXR5IGdhcmRlbiBmdW5kcmFpc2VyIGJ1ZGdldCBieSAxNzowMCB0b2RheS4gV2UgbmVlZCB5b3VyIGFwcHJvdmFsIGJlZm9yZSBib29raW5nIHRoZSB2ZW51ZS4"
+          }
+        }
+      }
+    },
+    "loopTasks": [
+      {
+        "action_type": "reply",
+        "anchor_key": "garden-budget",
+        "canonical_id": "c_17fd93e15952",
+        "channel": "email",
+        "contact_identifier": "garden@example.test",
+        "contact_name": "Alex Chen",
+        "created_at": "2026-11-03",
+        "source_refs": [
+          {
+            "sourceId": "current-budget",
+            "sourceType": "gmail"
+          }
+        ],
+        "status": "open",
+        "summary": "Review the community garden fundraiser budget by 17:00 today"
+      },
+      {
+        "anchor_key": "robotics-slides",
+        "status": "resolved",
+        "action_type": "reply",
+        "channel": "email",
+        "contact_name": "Alex Chen",
+        "canonical_id": "c_4f6f09b260bc",
+        "contact_identifier": "robotics@example.test",
+        "summary": "Send Cedar Robotics launch presentation",
+        "created_at": "2026-11-03",
+        "source_refs": [
+          {
+            "sourceType": "gmail",
+            "sourceId": "old-launch"
+          }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    {
+      "bridgeSends": 0,
+      "publicReads": 0,
+      "contactReads": 0,
+      "canonicalUnchanged": true,
+      "excludes": [
+        "robotics@example.test",
+        "Cedar Robotics",
+        "launch presentation",
+        "I approve the budget",
+        "I have approved",
+        "I sent",
+        "I\u2019ve sent",
+        "sent the reply",
+        "saved the draft",
+        "c_17fd93e15952",
+        "c_4f6f09b260bc",
+        "right away",
+        "immediately",
+        "I will review",
+        "I\u2019ll review",
+        "I'll review"
+      ],
+      "text": "can you draft that? ask for the budget breakdown before I approve",
+      "backgroundBefore": "In this partial initial review of your history, Gmail has completed its initial window while iMessage remains held. Alex Chen, who organizes the community garden fundraiser, asked you to review the attached community garden fundraiser budget by 17:00 today<!--id:garden@example.test|ch:email--><!--loop:garden-budget--> so the venue can be booked. I can draft a reply with your approval once you have looked over the numbers.",
+      "containsAny": [
+        [
+          "breakdown",
+          "itemized",
+          "itemised"
+        ]
+      ],
+      "maxCharacters": 1200,
+      "taskRecords": [
+        {
+          "title": "Review the community garden fundraiser budget by 17:00 today",
+          "status": "open"
+        },
+        {
+          "title": "Send Cedar Robotics launch presentation",
+          "status": "resolved"
+        }
+      ],
+      "taskAddReceipts": [],
+      "taskStates": {
+        "garden-budget": "open",
+        "robotics-slides": "resolved"
+      }
+    },
+    {
+      "bridgeSends": 0,
+      "publicReads": 0,
+      "contactReads": 0,
+      "canonicalUnchanged": true,
+      "excludes": [
+        "robotics@example.test",
+        "Cedar Robotics",
+        "launch presentation",
+        "I approve the budget",
+        "I have approved",
+        "I sent",
+        "I\u2019ve sent",
+        "sent the reply",
+        "saved the draft",
+        "c_17fd93e15952",
+        "c_4f6f09b260bc",
+        "right away",
+        "immediately",
+        "I will review",
+        "I\u2019ll review",
+        "I'll review"
+      ],
+      "text": "shorter",
+      "containsAny": [
+        [
+          "breakdown",
+          "itemized",
+          "itemised"
+        ]
+      ],
+      "maxCharacters": 500,
+      "taskRecords": [
+        {
+          "title": "Review the community garden fundraiser budget by 17:00 today",
+          "status": "open"
+        },
+        {
+          "title": "Send Cedar Robotics launch presentation",
+          "status": "resolved"
+        }
+      ],
+      "taskAddReceipts": [],
+      "taskStates": {
+        "garden-budget": "open",
+        "robotics-slides": "resolved"
+      }
+    },
+    {
+      "bridgeSends": 0,
+      "publicReads": 0,
+      "contactReads": 0,
+      "canonicalUnchanged": true,
+      "excludes": [
+        "robotics@example.test",
+        "Cedar Robotics",
+        "launch presentation",
+        "I approve the budget",
+        "I have approved",
+        "I sent",
+        "I\u2019ve sent",
+        "sent the reply",
+        "saved the draft",
+        "c_17fd93e15952",
+        "c_4f6f09b260bc",
+        "right away",
+        "immediately",
+        "I will review",
+        "I\u2019ll review",
+        "I'll review"
+      ],
+      "text": "who is this for, and what prompted it?",
+      "containsAny": [
+        [
+          "garden",
+          "fundraiser"
+        ],
+        [
+          "budget",
+          "approval"
+        ]
+      ],
+      "maxCharacters": 700,
+      "contains": [
+        "Alex Chen"
+      ],
+      "taskRecords": [
+        {
+          "title": "Review the community garden fundraiser budget by 17:00 today",
+          "status": "open"
+        },
+        {
+          "title": "Send Cedar Robotics launch presentation",
+          "status": "resolved"
+        }
+      ],
+      "taskAddReceipts": [],
+      "taskStates": {
+        "garden-budget": "open",
+        "robotics-slides": "resolved"
+      }
+    },
+    {
+      "text": "which email address?",
+      "contains": [
+        "garden@example.test"
+      ],
+      "excludes": [
+        "robotics@example.test",
+        "I sent",
+        "I\u2019ve sent"
+      ],
+      "maxCharacters": 400,
+      "bridgeSends": 0,
+      "publicReads": 0,
+      "contactReads": 0,
+      "canonicalUnchanged": true,
+      "taskRecords": [
+        {
+          "title": "Review the community garden fundraiser budget by 17:00 today",
+          "status": "open"
+        },
+        {
+          "title": "Send Cedar Robotics launch presentation",
+          "status": "resolved"
+        }
+      ],
+      "taskAddReceipts": [],
+      "taskStates": {
+        "garden-budget": "open",
+        "robotics-slides": "resolved"
+      }
+    }
+  ]
+}

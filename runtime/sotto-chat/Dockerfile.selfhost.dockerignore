@@ -1,0 +1,3 @@
+# The self-host overlay copies nothing; it only selects the root supervisor entrypoint from its
+# reviewed base image, so no local file (env file, corpus, key) enters its build context.
+**

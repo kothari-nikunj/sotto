@@ -25,7 +25,10 @@ Flow (the documented docsend-scraper shape; every step fails LOUD with the step 
   4. Download the images (≤ DOCSEND_MAX_PAGES) and send them to Gemini in ONE multimodal call:
      per-page text extraction, then the model's read of the deck.
 
-Output (stdout JSON): {status:"ok", url, pages, title, text, pdf, cached}  — `text` is the deck
+Output (stdout JSON): {status:"ok", url, pages, title, text, pdf, cached,
+                       pagesRead, expectedPages:null, complete:null, stopReason}
+           — `text` starts with a coverage warning: a missing page is not proof of the end.
+           `pages`/`pagesRead` count images read, not the deck's total pages; `text` is the deck
            read, `pdf` the saved file's path (or "" when the pages weren't PDF-embeddable)
            or   {status:"error", step, error}                  — always with the failing step.
 Env: GOOGLE_AI_API_KEY (the vision read), SOTTO_GEMINI_MODEL, SOTTO_USER_EMAIL (override only),
@@ -64,7 +67,7 @@ from timeutil import configured_user_email  # noqa: E402
 MODEL = os.environ.get("SOTTO_GEMINI_MODEL", "gemini-3.8-flash")
 DOCSEND_MAX_PAGES = 30        # a seed deck is 10-20 pages; 30 covers the long tail without a book
 HTTP_TIMEOUT = 30
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+UA = "OpenAI File Downloader, XaiImageApiFetch/1.0"
 VIEW_RE = re.compile(
     r"\Ahttps?://(?P<host>(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*docsend\.com)"
     r"/view/(?P<id>[A-Za-z0-9_-]+)/?(?:[?#][^\s]*)?\Z", re.I)
@@ -81,6 +84,19 @@ TITLE_RE = re.compile(r"<title>([^<]*)</title>", re.I)
 
 def is_docsend(url: str) -> bool:
     return bool(VIEW_RE.fullmatch((url or "").strip()))
+
+
+class DocSendHeldError(Exception):
+    """An admitted contact cannot safely be completed or replayed."""
+
+
+def normalized_url(url: str) -> str:
+    match = VIEW_RE.fullmatch((url or "").strip())
+    if not match:
+        raise ValueError("DocSend URL invalid")
+    parsed = urllib.parse.urlsplit(url.strip())
+    return urllib.parse.urlunsplit(("https", match.group("host").lower(),
+                                   "/view/" + match.group("id"), parsed.query, ""))
 
 
 class _Http:
@@ -102,6 +118,116 @@ class _Http:
             "X-Requested-With": "XMLHttpRequest"})
         with self.opener.open(req, timeout=HTTP_TIMEOUT) as r:
             return r.read()
+
+
+class AttendedHttp:
+    """Bounded, pinned public HTTPS session for one admitted deck read."""
+
+    def __init__(self, url, guard, *, seconds=180):
+        import time
+        self.origin = urllib.parse.urlsplit(normalized_url(url)).netloc
+        self.guard = guard
+        self.deadline = time.monotonic() + seconds
+        self.requests = self.total = self.image_bytes = 0
+        self.cookies = {}
+
+    def remaining(self):
+        import time
+        self.guard()
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise DocSendHeldError("deck deadline reached")
+        return remaining
+
+    def _request(self, url, method, data=None, referer=None, accept="text/html"):
+        import http.client
+        import ipaddress
+        import socket
+        import ssl
+        from http.cookies import SimpleCookie
+        for redirects in range(4):
+            timeout = min(30, self.remaining())
+            parsed = urllib.parse.urlsplit(url)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                    or parsed.password is not None or parsed.port not in (None, 443)
+                    or method == "POST" and parsed.netloc != self.origin
+                    or accept != "image/*" and parsed.netloc != self.origin):
+                raise DocSendHeldError("deck destination refused")
+            addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
+                raise DocSendHeldError("deck destination refused")
+            address = addresses[0][4][0]
+            self.requests += 1
+            if self.requests > 80:
+                raise DocSendHeldError("deck request bound reached")
+            self.remaining()  # authority, email and cancellation immediately before contact
+            connection = http.client.HTTPSConnection(parsed.hostname, timeout=timeout)
+            def connect():
+                raw = socket.create_connection((address, 443), timeout)
+                connection.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+            connection.connect = connect
+            headers = {"User-Agent": UA, "Accept": accept}
+            if parsed.netloc == self.origin and self.cookies:
+                headers["Cookie"] = "; ".join(key + "=" + value for key, value in self.cookies.items())
+            if method == "POST":
+                headers.update({"Content-Type": "application/x-www-form-urlencoded",
+                                "Referer": referer, "X-Requested-With": "XMLHttpRequest"})
+            try:
+                connection.request(method, urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, "")), data, headers)
+                wire_socket = connection.sock
+                response = connection.getresponse()
+                chunks, received = [], 0
+                while received <= 2 * 1024 * 1024:
+                    remaining = self.remaining()
+                    if wire_socket is not None:
+                        wire_socket.settimeout(min(30, remaining))
+                    chunk = response.read1(min(65536, 2 * 1024 * 1024 + 1 - received))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    received += len(chunk)
+                body = b"".join(chunks)
+                self.total += len(body)
+                if accept == "image/*":
+                    self.image_bytes += len(body)
+                if (len(body) > 2 * 1024 * 1024 or self.total > 6 * 1024 * 1024
+                        or self.image_bytes > 5 * 1024 * 1024):
+                    raise DocSendHeldError("deck response bound reached")
+                if parsed.netloc == self.origin:
+                    for key, value in response.getheaders():
+                        if key.lower() == "set-cookie":
+                            cookie = SimpleCookie()
+                            cookie.load(value)
+                            self.cookies.update({name: morsel.value for name, morsel in cookie.items()})
+                status, location = response.status, response.getheader("Location")
+            except DocSendHeldError:
+                raise
+            except Exception as exc:
+                raise DocSendHeldError("deck contact uncertain") from exc
+            finally:
+                connection.close()
+            self.remaining()
+            if status in (301, 302, 303, 307, 308):
+                target = urllib.parse.urljoin(url, location or "")
+                if (redirects == 3 or not location or method == "POST" and
+                        (status not in (302, 303) or urllib.parse.urlsplit(target).netloc != self.origin)):
+                    raise DocSendHeldError("deck redirect refused")
+                if method == "POST":
+                    method, data, referer = "GET", None, None
+                url = target
+                continue
+            if status == 404 and method == "GET" and "/page_data/" in parsed.path:
+                raise urllib.error.HTTPError(url, 404, "page unavailable", None, None)
+            if not 200 <= status < 300:
+                raise DocSendHeldError("deck contact refused")
+            return body
+        raise DocSendHeldError("deck redirect bound reached")
+
+    def get(self, url, accept="text/html"):
+        return self._request(url, "GET", accept=accept)
+
+    def post_form(self, url, fields, referer):
+        return self._request(url, "POST", urllib.parse.urlencode(fields).encode(), referer)
 
 
 def _err(step: str, msg: str) -> dict:
@@ -225,9 +351,46 @@ def load_cached(view_id: str) -> dict | None:
     try:
         with open(deck_paths(view_id)[1], encoding="utf-8") as f:
             rec = json.load(f)
-        return rec if isinstance(rec, dict) and rec.get("text") else None
+        return _with_coverage(rec) if isinstance(rec, dict) and rec.get("text") else None
     except Exception:  # noqa: BLE001
         return None
+
+
+_STOP_REASONS = {"page_limit", "page_fetch_failed", "page_end_unverified", "legacy_cache"}
+
+
+def _with_coverage(result: dict) -> dict:
+    """Make the reader's limited evidence explicit, including for pre-coverage caches.
+
+    No supported viewer response currently proves the total page count or the end of a deck.
+    Do not infer either from a 404, empty metadata, an exception, or reaching our page limit.
+    Keep the warning in text because the attended receipt intentionally projects a fixed schema.
+    """
+    reason = result.get("stopReason")
+    if not isinstance(reason, str) or reason not in _STOP_REASONS:
+        reason = "legacy_cache"
+    pages = result.get("pages", 0)
+    detail = {
+        "page_limit": "The page limit was reached; additional pages may exist.",
+        "page_fetch_failed": "The next page could not be fetched; additional pages may exist.",
+        "page_end_unverified": "The next page was unavailable; the end of the deck is unverified.",
+        "legacy_cache": "This cached read did not record how page collection ended.",
+    }[reason]
+    warning = (f"[DocSend coverage: {pages} page(s) read. Full-deck completeness is unknown. "
+               f"{detail} Treat the following text and any PDF as only the pages read.]")
+    text = result["text"]
+    if not text.startswith(warning + "\n\n"):
+        text = warning + "\n\n" + text
+    return {**result, "pagesRead": pages, "expectedPages": None, "complete": None,
+            "stopReason": reason, "text": text}
+
+
+def _cached_result(cached: dict, url: str) -> dict:
+    return {"status": "ok", "cached": True, "pages": cached.get("pages", 0),
+            "url": cached.get("url", url), "title": cached.get("title", ""),
+            **{key: cached[key] for key in
+               ("text", "pagesRead", "expectedPages", "complete", "stopReason")},
+            "pdf": cached.get("pdf", "")}
 
 
 def _save_deck(view_id: str, result: dict, images: list) -> str:
@@ -242,7 +405,8 @@ def _save_deck(view_id: str, result: dict, images: list) -> str:
                 f.write(pdf)
             saved_pdf = pdf_path
         from datetime import datetime, timezone
-        rec = {**{k: result[k] for k in ("url", "pages", "title", "text")}, "pdf": saved_pdf,
+        rec = {**{k: result[k] for k in ("url", "pages", "title", "text", "pagesRead",
+                                       "expectedPages", "complete", "stopReason")}, "pdf": saved_pdf,
                "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         tmp = f"{json_path}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -259,13 +423,13 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
     m = VIEW_RE.fullmatch((url or "").strip())
     if not m:
         return _err("url", f"not a docsend.com/view link: {url!r}")
-    parsed_url = urllib.parse.urlsplit(url.strip())
-    view_url = urllib.parse.urlunsplit(('https', m.group('host').lower(),
-                                       '/view/' + m.group('id'), parsed_url.query, ''))
+    view_url = normalized_url(url)
     http = http or _Http()
 
     try:
         page = http.get(view_url).decode("utf-8", "replace")
+    except DocSendHeldError:
+        raise
     except Exception as e:  # noqa: BLE001
         return _err("open", f"could not open the deck page: {type(e).__name__}: {e}")
     title_m = TITLE_RE.search(page)
@@ -296,6 +460,8 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
         try:
             http.post_form(urllib.parse.urljoin(view_url, action), fields, view_url)
             page = http.get(view_url).decode("utf-8", "replace")
+        except DocSendHeldError:
+            raise
         except Exception as e:  # noqa: BLE001
             return _err("gate", f"email gate refused: {type(e).__name__}: {e}")
         if "link_auth_form" in page and 'name="link_auth_form[email]"' in page:
@@ -308,18 +474,34 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
     # Page images: /view/<id>/page_data/<n> answers {imageUrl: ...} per page while the session
     # cookie from the gate rides along. Page 1 failing = the whole read failing, loudly.
     images = []
+    stop_reason = "page_limit"
     for n in range(1, DOCSEND_MAX_PAGES + 1):
         try:
             page_url = urllib.parse.urlsplit(view_url)
             page_url = page_url._replace(path=page_url.path + f"/page_data/{n}").geturl()
             meta = json.loads(http.get(page_url, accept="application/json"))
-        except Exception:  # noqa: BLE001 — first missing page = the end of the deck
+        except DocSendHeldError:
+            raise
+        except urllib.error.HTTPError as exc:
+            stop_reason = "page_end_unverified" if exc.code == 404 else "page_fetch_failed"
             break
-        img_url = (meta or {}).get("imageUrl") or ""
+        except Exception:  # noqa: BLE001 — preserve usable pages without claiming a complete deck
+            stop_reason = "page_fetch_failed"
+            break
+        if not isinstance(meta, dict):
+            stop_reason = "page_fetch_failed"
+            break
+        img_url = meta.get("imageUrl") or ""
         if not img_url:
+            stop_reason = "page_end_unverified"
+            break
+        if not isinstance(img_url, str):
+            stop_reason = "page_fetch_failed"
             break
         try:
             images.append(http.get(img_url, accept="image/*"))
+        except DocSendHeldError:
+            raise
         except Exception as e:  # noqa: BLE001
             return _err("pages", f"page {n} image failed: {type(e).__name__}: {e}")
     if not images:
@@ -329,24 +511,36 @@ def fetch_deck(url: str, email: str, passcode: str = "", http: _Http | None = No
     read = (vision or _gemini_read)(images, title)
     if not read:
         return _err("vision", "Gemini could not read the page images (check GOOGLE_AI_API_KEY)")
-    return {"status": "ok", "url": view_url, "pages": len(images), "title": title, "text": read,
-            "_images": images}
+    return _with_coverage({"status": "ok", "url": view_url, "pages": len(images),
+                           "title": title, "text": read, "stopReason": stop_reason,
+                           "_images": images})
 
 
-def read_deck(url: str, email: str, passcode: str = "", fresh: bool = False) -> dict:
+def read_deck(url: str, email: str, passcode: str = "", fresh: bool = False, *,
+              http=None, vision=None, exact_cache=False) -> dict:
     """The storing front door: cache first (a re-ask must not re-receipt the founder's analytics),
     else fetch + save. `fresh` forces a new fetch (and a new, visible, view)."""
+    if exact_cache:
+        import jsonstore
+        view_id = VIEW_RE.fullmatch(url.strip()).group("id")
+        with jsonstore.lock(os.path.join(decks_dir(), "read-" + view_id)):
+            return _read_deck(url, email, passcode, fresh, http=http, vision=vision,
+                              exact_cache=True)
+    return _read_deck(url, email, passcode, fresh, http=http, vision=vision)
+
+
+def _read_deck(url, email, passcode, fresh, *, http=None, vision=None, exact_cache=False):
     m = VIEW_RE.fullmatch((url or "").strip())
     if not m:
         return _err("url", f"not a docsend.com/view link: {url!r}")
     view_id = m.group("id")
     if not fresh:
         cached = load_cached(view_id)
+        if cached and exact_cache and cached.get("url") != normalized_url(url):
+            raise DocSendHeldError("cached deck target differs")
         if cached:
-            return {"status": "ok", "cached": True, "pages": cached.get("pages", 0),
-                    "url": cached.get("url", url), "title": cached.get("title", ""),
-                    "text": cached["text"], "pdf": cached.get("pdf", "")}
-    out = fetch_deck(url, email, passcode)
+            return _cached_result(cached, url)
+    out = fetch_deck(url, email, passcode, http=http, vision=vision)
     if out.get("status") != "ok":
         return out
     images = out.pop("_images", [])
@@ -355,10 +549,12 @@ def read_deck(url: str, email: str, passcode: str = "", fresh: bool = False) -> 
     return out
 
 
-def _gemini_read(images: list, title: str) -> str:
+def _gemini_read(images: list, title: str, *, timeout=120, max_body=None, guard=None) -> str:
     """ONE multimodal call: every page image inline, per-page extraction out. Direct REST on the
     same key/model as every other Gemini call in this tree (gemini.py's call shape is text-only by
     design — the brief pipeline never sends images, so this stays here with its one caller)."""
+    import time
+    deadline = time.monotonic() + timeout
     key = gemini_transport.credential()
     if not key:
         return ""
@@ -378,9 +574,37 @@ def _gemini_read(images: list, title: str) -> str:
             request_contract = {"inline_mime_type": "image/png",
                                 "generationConfig": body["generationConfig"]}
             with model_work.attempt('gemini', MODEL, json.dumps(evidence), schema=request_contract):
+                if max_body is not None and len(json.dumps(body).encode("utf-8")) > max_body:
+                    raise DocSendHeldError("deck image request exceeds bound")
                 req = gemini_transport.request(MODEL, body, key)
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    data = json.loads(r.read())
+                if guard is not None:
+                    guard()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DocSendHeldError("deck model deadline reached")
+                with urllib.request.urlopen(req, timeout=remaining) as r:
+                    if max_body is None:
+                        raw = r.read()
+                    else:
+                        chunks, received = [], 0
+                        while received <= 512 * 1024:
+                            if guard is not None:
+                                guard()
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise DocSendHeldError("deck model deadline reached")
+                            socket = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+                            if socket is not None:
+                                socket.settimeout(remaining)
+                            chunk = r.read1(min(65536, 512 * 1024 + 1 - received))
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            received += len(chunk)
+                        raw = b"".join(chunks)
+                        if len(raw) > 512 * 1024:
+                            raise DocSendHeldError("deck model response exceeds bound")
+                    data = json.loads(raw)
                 model_work.note_usage(MODEL, data.get('usageMetadata'))
                 cand = (data.get("candidates") or [{}])[0]
                 if cand.get('finishReason') == 'MAX_TOKENS':
@@ -389,7 +613,11 @@ def _gemini_read(images: list, title: str) -> str:
                                for p in (cand.get("content", {}).get("parts") or [])).strip()
                 if not text:
                     raise ValueError('Gemini deck read returned no text')
-    except Exception:  # noqa: BLE001
+    except DocSendHeldError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if max_body is not None:
+            raise DocSendHeldError("deck model contact uncertain") from exc
         return ""
     return text
 
@@ -411,9 +639,7 @@ def main() -> int:
         m = VIEW_RE.fullmatch((a.url or "").strip())
         cached = load_cached(m.group("id")) if m else None
         if cached:
-            print(json.dumps({"status": "ok", "cached": True, "pages": cached.get("pages", 0),
-                              "url": cached.get("url", a.url), "title": cached.get("title", ""),
-                              "text": cached["text"], "pdf": cached.get("pdf", "")}))
+            print(json.dumps(_cached_result(cached, a.url)))
             return 0
         print(json.dumps(_err("unattended", "refused: unattended run — viewing a DocSend logs "
                               "YOUR visit with the sender. Ask Sotto to read it in chat instead.")))

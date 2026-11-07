@@ -26,16 +26,15 @@ def load(name, path):
 @pytest.fixture
 def browser_server(tmp_path, monkeypatch):
     receiver = load('browser_callback_receiver', HERE / 'receiver.py')
-    helper = load('browser_callback_helper', HERE.parents[1] / 'adapters/hermes/google_setup.py')
-    home = tmp_path / '.hermes'
+    helper = load('browser_callback_helper', HERE.parents[1] / 'adapters/sotto/google_setup.py')
+    home = tmp_path / 'sotto-home'
     home.mkdir()
     monkeypatch.setenv('HOME', str(tmp_path))
-    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setenv('SOTTO_HOME', str(home))
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'self-host')
     monkeypatch.setenv('RAILWAY_PUBLIC_DOMAIN', 'sotto.example')
     monkeypatch.setattr(receiver, 'RAILWAY_DOMAIN', 'sotto.example')
     monkeypatch.setattr(receiver, 'SETUP_CODE', 'setup-fixture')
-    monkeypatch.setattr(receiver, 'GAUTH_FILE', str(tmp_path / 'old-url'))
     monkeypatch.setattr(receiver, 'capture_google_account_email', lambda: None)
     monkeypatch.setattr(receiver, 'google_connected', lambda: ((home / 'google_token.json').exists(), ''))
     monkeypatch.setattr(receiver.shutil, 'which', lambda _name: sys.executable)
@@ -134,6 +133,30 @@ def test_google_browser_success_returns_to_clean_sotto_page(browser_server):
     # Even if an old browser cookie is replayed, no second token exchange occurs.
     status, _, headers = b.request(callback, headers={'Cookie': cookies})
     assert dict(headers)['Location'] == '/google/retry' and len(b.exchanges) == 1
+
+
+def test_dashboard_session_google_flow_does_not_mint_bootstrap_cookie(browser_server, tmp_path, monkeypatch):
+    b = browser_server
+    monkeypatch.setattr(b.receiver, 'DATA', str(tmp_path))
+    status, _, headers = b.request('/app/login', 'POST',
+        {'Content-Type': 'application/x-www-form-urlencoded'}, urlencode({'code': 'setup-fixture'}))
+    assert status == 302
+    session = next(value.split(';', 1)[0] for key, value in headers if key == 'Set-Cookie')
+    assert session.startswith('sotto_session=')
+    status, body, headers = b.request('/google/auth', headers={'Cookie': session})
+    assert status == 200 and 'setup-fixture' not in body
+    csrf = re.search(r"name='csrf' value='([^']+)'", body).group(1)
+    browser = next(value.split(';', 1)[0] for key, value in headers if key == 'Set-Cookie')
+    cookies = session + '; ' + browser
+    assert start(b, cookies, csrf)[0] == 200
+    pending = json.loads((b.home / 'google_oauth_pending.json').read_text())
+    path = '/google/oauth/callback?' + urlencode({'state': pending['state'], 'code': 'fixture-code'})
+    status, _, headers = b.request(path, headers={'Cookie': cookies})
+    assert status == 302 and dict(headers)['Location'] == '/google/connected'
+    assert all('sotto_setup=' not in value for key, value in headers if key == 'Set-Cookie')
+    assert b.request('/google/connected', headers={'Cookie': session})[0] == 200
+    b.receiver.DASHBOARD._write_sessions({})
+    assert b.request('/google/connected', headers={'Cookie': cookies})[0] == 403
 
 
 @pytest.mark.parametrize('failure', ['wrong-browser', 'wrong-state', 'denied', 'expired', 'duplicate-code'])

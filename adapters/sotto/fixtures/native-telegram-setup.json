@@ -1,0 +1,229 @@
+{
+  "request": {
+    "version": 1,
+    "channel": "telegram",
+    "tenantId": "native-fixture",
+    "railway": {
+      "projectId": "11111111-1111-1111-1111-111111111111",
+      "environmentId": "22222222-2222-2222-2222-222222222222",
+      "provisionRequest": "fixture-request-aaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "owner": {
+      "accountId": "fixture-account"
+    },
+    "lineKey": "primary",
+    "instructions": "Answer clearly.",
+    "telegram": {
+      "botToken": "123456789:synthetic-telegram-bot-token-0123456789"
+    },
+    "model": {
+      "apiKey": "gggggggggggggggggggggggggggggggggggggggggggggggg",
+      "chatModelId": "gemini-chat-fixture",
+      "nativeMediaModelId": "gemini-media-fixture"
+    },
+    "timezone": "America/Los_Angeles",
+    "backgroundUnmetered": false
+  },
+  "attachment": {
+    "projectId": "11111111-1111-1111-1111-111111111111",
+    "environmentId": "22222222-2222-2222-2222-222222222222",
+    "provisionRequest": "fixture-request-aaaaaaaaaaaaaaaaaaaaaaaa",
+    "serviceId": "33333333-3333-3333-3333-333333333333",
+    "volumeId": "44444444-4444-4444-4444-444444444444",
+    "domain": "fixture.up.railway.app",
+    "volumeCreationReceipt": {
+      "service_id": "33333333-3333-3333-3333-333333333333",
+      "volume_id": "44444444-4444-4444-4444-444444444444"
+    }
+  },
+  "generatedSecrets": {
+    "runtimeBearer": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+    "bridgeToken": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "controlToken": "ccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "telegramCapture": {
+    "version": 1,
+    "provisionRequest": "fixture-request-aaaaaaaaaaaaaaaaaaaaaaaa",
+    "phrase": "ppppppppppppppppppppppppppppppppppppppppppp",
+    "bot": {
+      "id": 123456789,
+      "is_bot": true,
+      "username": "fixture_bot"
+    },
+    "webhook": {
+      "url": ""
+    },
+    "update": {
+      "update_id": 17,
+      "message": {
+        "message_id": 3,
+        "chat": {
+          "id": 8675309,
+          "type": "private"
+        },
+        "from": {
+          "id": 8675309,
+          "is_bot": false,
+          "first_name": "Fixture"
+        },
+        "text": "/start ppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    "updates": [
+      {
+        "update_id": 17,
+        "message": {
+          "message_id": 3,
+          "chat": {
+            "id": 8675309,
+            "type": "private"
+          },
+          "from": {
+            "id": 8675309,
+            "is_bot": false,
+            "first_name": "Fixture"
+          },
+          "text": "/start ppppppppppppppppppppppppppppppppppppppppppp"
+        }
+      }
+    ],
+    "acknowledgedOffset": 18,
+    "acknowledgement": [],
+    "requestDigest": "d53b4be1900859dad98ee12ec5fcdfefd01f21b12f9adb2a54620fe8a4c7c494"
+  },
+  "envelope": {
+    "version": 1,
+    "provider": {
+      "projectId": "11111111-1111-1111-1111-111111111111",
+      "environmentId": "22222222-2222-2222-2222-222222222222",
+      "serviceId": "33333333-3333-3333-3333-333333333333",
+      "volumeId": "44444444-4444-4444-4444-444444444444",
+      "domain": "fixture.up.railway.app",
+      "provisionRequest": "fixture-request-aaaaaaaaaaaaaaaaaaaaaaaa",
+      "volumeCreationReceipt": {
+        "service_id": "33333333-3333-3333-3333-333333333333",
+        "volume_id": "44444444-4444-4444-4444-444444444444"
+      }
+    },
+    "bundle": {
+      "version": 1,
+      "tenantRoot": "/data",
+      "manifest": {
+        "version": 1,
+        "deployment": "self_host",
+        "channel": "telegram",
+        "tenantId": "native-fixture",
+        "owner": {
+          "accountId": "fixture-account",
+          "ownerId": "8675309"
+        },
+        "lineKey": "primary",
+        "target": "telegram",
+        "stateDirectory": "/data/node-state",
+        "mediaRoot": "/data/node-media",
+        "instructions": "Answer clearly.",
+        "runtime": {
+          "port": 8081,
+          "bearerToken": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+        },
+        "relay": {
+          "receiverPort": 8080,
+          "rootBearer": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "modelDirect": {
+          "provider": "google",
+          "apiKey": "gggggggggggggggggggggggggggggggggggggggggggggggg",
+          "chatModelId": "gemini-chat-fixture",
+          "nativeMediaModelId": "gemini-media-fixture"
+        },
+        "providerThreadId": "telegram:8675309",
+        "telegramLink": {
+          "bot_token": "123456789:synthetic-telegram-bot-token-0123456789",
+          "allowed_user": 8675309
+        },
+        "credentials": {
+          "telegramToken": "123456789:synthetic-telegram-bot-token-0123456789"
+        }
+      },
+      "receiverAuthority": {
+        "SOTTO_MCP_TOKEN": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "SOTTO_CONTROL_TOKEN": "ccccccccccccccccccccccccccccccccccccccccccc",
+        "SOTTO_TENANT_ID": "native-fixture",
+        "SOTTO_DATA": "/data",
+        "SOTTO_HOME": "/data/sotto-home",
+        "SOTTO_VOLUME_ID": "44444444-4444-4444-4444-444444444444"
+      },
+      "stableIdentity": {
+        "channel": "telegram",
+        "target": "telegram",
+        "tenantId": "native-fixture",
+        "accountId": "fixture-account",
+        "ownerId": "8675309",
+        "lineKey": "primary",
+        "providerThreadId": "telegram:8675309",
+        "botFingerprint": "06221974da0ff49d8fafdd03de02aefd46f49e3a789c76b7296642f48d7eb277"
+      },
+      "publicReceiverAuthority": {
+        "tenantId": "native-fixture",
+        "serviceId": "33333333-3333-3333-3333-333333333333",
+        "domain": "fixture.up.railway.app",
+        "targetPort": 8080
+      },
+      "trustedServiceId": "33333333-3333-3333-3333-333333333333",
+      "receiverOverrides": {
+        "SOTTO_TIMEZONE": "America/Los_Angeles",
+        "SOTTO_BACKGROUND_UNMETERED": "false"
+      }
+    },
+    "telegramCapture": {
+      "version": 1,
+      "provisionRequest": "fixture-request-aaaaaaaaaaaaaaaaaaaaaaaa",
+      "phrase": "ppppppppppppppppppppppppppppppppppppppppppp",
+      "bot": {
+        "id": 123456789,
+        "is_bot": true,
+        "username": "fixture_bot"
+      },
+      "webhook": {
+        "url": ""
+      },
+      "update": {
+        "update_id": 17,
+        "message": {
+          "message_id": 3,
+          "chat": {
+            "id": 8675309,
+            "type": "private"
+          },
+          "from": {
+            "id": 8675309,
+            "is_bot": false,
+            "first_name": "Fixture"
+          },
+          "text": "/start ppppppppppppppppppppppppppppppppppppppppppp"
+        }
+      },
+      "updates": [
+        {
+          "update_id": 17,
+          "message": {
+            "message_id": 3,
+            "chat": {
+              "id": 8675309,
+              "type": "private"
+            },
+            "from": {
+              "id": 8675309,
+              "is_bot": false,
+              "first_name": "Fixture"
+            },
+            "text": "/start ppppppppppppppppppppppppppppppppppppppppppp"
+          }
+        }
+      ],
+      "acknowledgedOffset": 18,
+      "acknowledgement": [],
+      "requestDigest": "d53b4be1900859dad98ee12ec5fcdfefd01f21b12f9adb2a54620fe8a4c7c494"
+    }
+  }
+}

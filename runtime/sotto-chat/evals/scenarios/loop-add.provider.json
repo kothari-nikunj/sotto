@@ -1,0 +1,27 @@
+{
+  "instructions": "Synthetic scalar private task creation contract. Use only the supplied owner task tools. Each add is exact owner text; runtime receipts and canonical state determine completion.",
+  "steps": [
+    {
+      "tool": {
+        "name": "owner_task_add",
+        "arguments": {
+          "text": "Sotto loop check elm"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "owner_task_add",
+        "arguments": {
+          "text": "Sotto loop check fir"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "owner_task_list",
+        "arguments": {}
+      }
+    }
+  ]
+}
