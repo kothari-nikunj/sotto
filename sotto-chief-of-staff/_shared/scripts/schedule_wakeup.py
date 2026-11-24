@@ -398,7 +398,13 @@ def list_admitted(identity_digest: str, limit: int = 50) -> list[dict]:
                 and row.get('status') == 'scheduled'
                 and isinstance(row.get('owner_create'), dict)
                 and row['owner_create'].get('identity_digest') == identity_digest]
-        return sorted(rows, key=lambda row: (row['due'], row['id']))[:limit]
+    items = []
+    for row in sorted(rows, key=lambda row: (row['due'], row['id']))[:limit]:
+        item = {key: row[key] for key in ('id', 'due', 'action', 'status')}
+        if _admitted_conditional(row):
+            item['trigger'] = 'conditional'
+        items.append(item)
+    return items
 
 
 def main() -> int:

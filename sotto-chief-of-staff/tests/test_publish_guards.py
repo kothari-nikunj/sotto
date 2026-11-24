@@ -316,7 +316,7 @@ def test_the_published_tree_ships_exactly_one_workflow():
         shutil.rmtree(target, ignore_errors=True)
 
 
-def test_the_shipped_ci_workflow_names_no_credential():
+def test_the_shipped_ci_workflow_names_no_credential(monkeypatch):
     """It runs tests and nothing else — a CI file in a public repo that reads a secret is either a
     mistake or an exfiltration, and neither belongs in a tree this script publishes unattended."""
     target = tempfile.mkdtemp(prefix="sotto-dist-")
@@ -332,6 +332,9 @@ def test_the_shipped_ci_workflow_names_no_credential():
         assert "python3 sotto-chief-of-staff/tools/verify.py" in ci
         assert "tools/verify-public-image.sh ." in ci, \
             "public CI does not build the same container context users deploy"
+        # Inspect the generated workflow under its own environment when the private runner runs this test.
+        assert "SOTTO_CHECK_RUNNER" not in ci
+        monkeypatch.delenv("SOTTO_CHECK_RUNNER", raising=False)
         import importlib.util
         verifier = os.path.join(target, "sotto-chief-of-staff", "tools", "verify.py")
         spec = importlib.util.spec_from_file_location("published_verification", verifier)

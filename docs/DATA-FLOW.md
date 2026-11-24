@@ -48,6 +48,11 @@ Each call needs both a granted tool and current source permission, checked again
 content. A source marked available does not prove it has been read. Mac sources need an online,
 permitted Bridge; hosted clients reach it through the existing outbound relay.
 
+Clients that require stdio can run `python3 tools/sotto_mcp_client.py` with
+`SOTTO_CLIENT_MCP_URL` set to the exact endpoint and `SOTTO_CLIENT_MCP_CREDENTIAL_FILE` set
+to the dedicated client grant's JSON file. The file contains a `token` field and needs
+private access permissions such as mode `0600`.
+
 These grants are read-only. They cannot send messages, change tasks or start Sotto's agent.
 Adding a tool to the server does not add it to existing grants. Disconnecting prevents future
 reads; it cannot recall context already returned to another assistant. The dashboard exposes a

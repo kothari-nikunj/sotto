@@ -59,25 +59,28 @@ def _local_page(payload, arguments):
     if offset is None:
         return _changed()
     result = {key: [] if isinstance(value, list) else value for key, value in payload.items()}
-    end = offset
-    def page():
+    def page(end):
         return {'offset': offset, 'returned_rows': end - offset, 'total_rows': len(rows),
                 'complete': end == len(rows), 'next_cursor': f'{version}:{end}' if end < len(rows) else None,
                 'byte_limit': PAGE_BYTES}
-    result['client_page'] = page()
-    if len(_encoded(result)) > PAGE_BYTES:
+    result['client_page'] = page(offset)
+    size = len(_encoded(result))
+    if size > PAGE_BYTES:
         raise RuntimeError('Mac metadata exceeds client page byte limit')
-    for key, row in rows[offset:offset + 100]:
-        result[key].append(row)
-        end += 1
-        result['client_page'] = page()
-        if len(_encoded(result)) > PAGE_BYTES:
-            result[key].pop()
-            end -= 1
-            result['client_page'] = page()
-            if end == offset:
+    # The empty lists already contribute their brackets. Only their row bytes,
+    # JSON item separators, and the page metadata change as rows are added.
+    page_size = len(_encoded(result['client_page']))
+    fixed_size = size - page_size
+    for end, (key, row) in enumerate(rows[offset:offset + 100], start=offset + 1):
+        next_page = page(end)
+        row_size = len(_encoded(row)) + (len(', ') if result[key] else 0)
+        if fixed_size + row_size + len(_encoded(next_page)) > PAGE_BYTES:
+            if end == offset + 1:
                 raise RuntimeError('Mac row exceeds client page byte limit')
             break
+        fixed_size += row_size
+        result[key].append(row)
+        result['client_page'] = next_page
     return result
 
 

@@ -686,7 +686,7 @@ def test_build_data_manifest_shape():
                         "imessage": [{"handle": "+15551234567", "is_from_me": False, "is_group_chat": False}],
                         "action_ledger": [{"status": "open"}, {"status": "resolved"}]}}
     m = cb.build_data_manifest(inputs)
-    assert m["email_count"] == 2 and len(m["email_threads"]) == 1   # deduped by threadId
+    assert m["email_count"] == 2 and len(m["email_threads"]) == 1   # same-thread rows without message IDs collapse
     assert m["imessage_contacts"] == ["Sarah"]
     assert m["calendar_event_count"] == 1 and m["action_ledger_open"] == 1
 

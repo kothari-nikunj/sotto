@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export const ownerReminderListTriggerSchema = z.literal('conditional').optional();
+
 export const ownerReminderToolKind = 'owner_reminder_tool';
 export function offsetDate(value: string): boolean {
   const m = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)(?::(\d\d)(?:\.\d{1,6})?)?(Z|[+-](\d\d):(\d\d))$/.exec(value);

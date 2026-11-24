@@ -1,4 +1,7 @@
 import {createHash} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {z} from 'zod';
 /** Conservative smoke assertion, not a semantic judge of the answer. */
 export function claimsQueuedWork(text: string): boolean {
   return text.split(/[.!?\n]+/u).some(sentence => {
@@ -58,4 +61,59 @@ export function chatPrepOfferMatches(event:any,preview:any,recorded:any,proof:an
      offer.question!==review.question||!sends.some(send=>send.id===recorded.provider_message_id&&send.text===review.question))return false;
   return prepExecutionMatches({kind:'focused-meeting-prep',offerId:offer.offer_id,offerMeeting:offer.meeting},
     {...event,id:scoped},true,proof);
+}
+
+const completeGmailThread = z.object({
+  version: z.literal(1),
+  source: z.literal('gmail'),
+  operation: z.literal('gmail_thread_get'),
+  thread_id: z.string(),
+  observation: z.object({status: z.literal('ok'), complete: z.literal(true)}),
+  omitted_messages: z.literal(0),
+  items: z.array(z.object({id: z.string().min(1), threadId: z.string(),
+    body: z.string(), body_truncated: z.literal(false)})).min(1),
+});
+
+function parseToolJson(content: unknown): unknown {
+  if (typeof content !== 'string') return undefined;
+  try { return JSON.parse(content); } catch { return undefined; }
+}
+
+const gmailThreadArguments = z.object({thread_id: z.string()});
+
+/** Require a fresh tool result after the current owner message. */
+export async function hasCompleteGmailThread(
+  output: string, afterRequest: number, lastRequest: number,
+  {id: threadId, messages: messageIds}: {id: string; messages: string[]},
+): Promise<boolean> {
+  for (let request = afterRequest + 1; request <= lastRequest; request++) {
+    let input: string;
+    try {
+      input = await readFile(join(output, `model-input-${request}.json`), 'utf8');
+    } catch (error) {
+      // The request counter advances before the model input is captured.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const {messages = []} = JSON.parse(input);
+    const ownerMessage = messages.findLastIndex((message: any) => message.role === 'user');
+    if (ownerMessage < 0) continue;
+    const current = messages.slice(ownerMessage + 1);
+    const threadCalls = new Set(current.filter((message: any) => message.role === 'assistant')
+      .flatMap((message: any) => message.tool_calls ?? [])
+      .filter((call: any) => {
+        if (call.function?.name !== 'gmail_thread_get') return false;
+        const args = gmailThreadArguments.safeParse(parseToolJson(call.function.arguments));
+        return args.success && args.data.thread_id === threadId;
+      }).map((call: any) => call.id));
+    for (const message of current) {
+      if (message.role !== 'tool' || typeof message.tool_call_id !== 'string' ||
+          !threadCalls.has(message.tool_call_id)) continue;
+      const result = completeGmailThread.safeParse(parseToolJson(message.content));
+      if (result.success && result.data.thread_id === threadId &&
+          result.data.items.length === messageIds.length &&
+          messageIds.every(id => result.data.items.some(item => item.id === id && item.threadId === threadId))) return true;
+    }
+  }
+  return false;
 }

@@ -1504,8 +1504,11 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         _, ident = _resolve_sender(event, ctx["lookup"])
         return not _message_noise(event, _event_text(event), ident)[0]
 
-    ctx['conversation_rows'] = ([] if ctx['quiet'] or ctx['snoozed'] else
-                                conversation_snapshot(events, include=context_allowed))
+    # These synthetic events leave classification at Tier 0, before the conversation read is used.
+    ctx['conversation_rows'] = []
+    if (not ctx['quiet'] and not ctx['snoozed']
+            and any(_s(event.get('source')) not in NON_EVIDENCE_SOURCES for event in events)):
+        ctx['conversation_rows'] = conversation_snapshot(events, include=context_allowed)
     if not ctx["lookup"] and any(_s(e.get("source")) in ("imessage", "whatsapp", "calls")
                                  for e in events):
         try:

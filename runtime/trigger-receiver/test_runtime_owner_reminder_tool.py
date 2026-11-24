@@ -342,6 +342,23 @@ def _conditional_args(context):
             'loop_identity': loop_identity(row), 'source_revision': 'e' * 64}, row, cr
 
 
+def test_owner_lists_distinguish_conditional_and_one_time_reminders(context):
+    args, _, _ = _conditional_args(context)
+    conditional = call(request(args=args, text="Remind me if Dana hasn't replied."), context)
+    one_time = call(request(event='c' * 64), context)
+    expected = {
+        conditional['reminder_id']: {'trigger': 'conditional'},
+        one_time['reminder_id']: {},
+    }
+    natural = call(request('list', event='d' * 64), context)
+    slash = command_call(command_request('/reminder list', 'list', event='e' * 64), context)
+    for receipt in (natural, slash):
+        assert {item['id']: {k: v for k, v in item.items() if k not in ('id', 'due', 'action', 'status')}
+                for item in receipt['items']} == expected
+        assert all(item['due'] == conditional['due'] and item['action'] == ARGS['action']
+                   and item['status'] == 'scheduled' for item in receipt['items'])
+
+
 def test_conditional_create_and_historical_inspect_preserve_original_proof(context, monkeypatch):
     args, row, cr = _conditional_args(context)
     body = request(args=args, text="Remind me if Dana hasn't replied.")

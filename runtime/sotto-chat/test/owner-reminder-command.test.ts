@@ -23,6 +23,7 @@ test('literal create, list, and cancel are private owner commands with exact rec
   const journal = new OperationalJournal(join(folder, 'operations.sqlite'));
   try {
     const operations: string[] = [];
+    const conditionalId = `int_${'c'.repeat(32)}`;
     const admittedFeedback: string[] = [], acceptedFeedback: string[] = [];
     const client = createOwnerReminderClient({ bridgeUrl: 'http://127.0.0.1:8080/mcp',
       bearer: 'c'.repeat(64), identity, fetch: async (_url, init) => {
@@ -31,7 +32,9 @@ test('literal create, list, and cancel are private owner commands with exact rec
         assert.equal(body.identity.owner_id, 'owner');
         assert.equal(body.text_hash.length, 64);
         if (body.operation === 'list') return reply({ version: 1, status: 'listed', items: [
-          { id: reminderId, due: '2026-10-09T08:15:00Z', action: 'Review the cedar packet', status: 'scheduled' }] });
+          { id: reminderId, due: '2026-10-09T08:15:00Z', action: 'Review the cedar packet', status: 'scheduled' },
+          { id: conditionalId, due: '2026-10-09T08:15:00Z', action: 'Review the cedar packet', status: 'scheduled',
+            trigger: 'conditional' }] });
         return reply({ version: 1, status: 'committed', operation: body.operation,
           action_id: body.action_id, event_id: body.event_id, payload_hash: body.payload_hash,
           reminder_id: reminderId, reminder_status: body.operation === 'create' ? 'scheduled' : 'canceled' });
@@ -49,7 +52,8 @@ test('literal create, list, and cancel are private owner commands with exact rec
     assert.deepEqual(admittedFeedback, ['create', 'list', 'cancel']);
     assert.deepEqual(acceptedFeedback, ['create', 'list', 'cancel']);
     assert.match(sent[0]!, new RegExp(reminderId));
-    assert.match(sent[1]!, /Review the cedar packet/);
+    assert.ok(sent[1]!.includes(`${reminderId} at 2026-10-09T08:15:00Z: Review the cedar packet`));
+    assert.ok(sent[1]!.includes(`${conditionalId} at 2026-10-09T08:15:00Z (if still waiting): Review the cedar packet`));
     assert.match(sent[2]!, /already in progress may still arrive/);
     assert.equal((await service.receive(inbound('create', atCommand), context)).status, 'duplicate');
     assert.deepEqual(operations, ['create', 'list', 'cancel']);

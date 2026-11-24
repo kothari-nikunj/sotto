@@ -755,18 +755,22 @@ def pack_companies(domains, companies) -> dict:
     step writes. Sources, in order: today's attendees' email domains, then the packed people's
     `company` field. Resolution and dedup are knowledge_update's, so a domain and a name that
     mean one company pack once. Best-effort: a missing or unreadable companies dir packs nothing."""
+    names = list(domains) + list(companies)
+    if not names:
+        return {}
     try:
         import knowledge_update as ku  # noqa: PLC0415 — lazy: reading companies must never break a query
+        index = ku.company_index()
     except Exception:  # noqa: BLE001
         return {}
     out: dict = {}
-    for name in list(domains) + list(companies):
+    for name in names:
         if len(out) >= MAX_COMPANIES_PACKED:
             break
         if not str(name).strip():
             continue
         try:
-            known = ku.company_knowledge(company_name=str(name))
+            known = ku.company_knowledge(company_name=str(name), index=index)
         except Exception:  # noqa: BLE001
             continue
         slug = known.get("slug") if known else ""

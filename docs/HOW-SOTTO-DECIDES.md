@@ -1216,6 +1216,10 @@ Gmail thread background is bounded the same way everywhere: a daily-brief inbox 
 is at most 4,000 characters; focused prep reads at most 2 threads per attendee, 8 messages per
 thread (the opening two and the latest six), 8,000 characters per thread and 24,000 per run.
 
+The brief critic can review 50 Gmail message excerpts. It takes one message per thread in gather
+order before returning for siblings. Each excerpt retains its own ID, sender, date, direction,
+and up to 120 characters. The critic counts messages after applying the same Gmail permissions and sender mutes as the writer. Within one thread, an identical coverage note may reference the first message that carries it.
+
 Archive is inbox placement, not proof of handling. In the daily brief an archived human email
 keeps its body (the same 30,000-character email body cap) so its ask can still be captured. It is
 labelled "no later reply" only when the exact thread read shows no later message you sent, and
@@ -2027,7 +2031,8 @@ in the checked traction field. Prep and Ask hold certification terms in unchecke
 including profile summaries and activity. The graph writer applies the same check. A link
 alone, a generated answer span, or a result without a resolved domain leaves the claim out.
 Company writes and their retry receipts use the domain first. Same-name companies on different
-known domains stay separate. A legacy record can still match by a compatible name or alias.
+known domains stay separate. When two saved companies claim the requested domain, the brief omits
+that match and automatic updates leave both records alone. A legacy record can still match by a compatible name or alias.
 An Ask job that resumes before composing an answer applies the same checks to its saved research.
 Raw provider responses stay in the audit receipt and out of the answer prompt.
 

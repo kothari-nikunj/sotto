@@ -120,9 +120,7 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
         return {'version': 1, 'status': 'rejected', 'code': 'due_unavailable'}
     store = _writer()
     if command == 'list':
-        return {'version': 1, 'status': 'listed', 'items': [
-            {'id': row['id'], 'due': row['due'], 'action': row['action'], 'status': row['status']}
-            for row in store.list_admitted(proof['identity_digest'], 50)]}
+        return {'version': 1, 'status': 'listed', 'items': store.list_admitted(proof['identity_digest'])}
     if body['operation'] == 'inspect':
         try:
             row = store.inspect_admitted(proof, cancel=command == 'cancel')

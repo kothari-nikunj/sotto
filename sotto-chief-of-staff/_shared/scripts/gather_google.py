@@ -467,8 +467,11 @@ def _attachments_for(mids: list, payloads=None, quota_stop=None) -> dict:
         # Each worker owns and closes its connection; cohort ordering stays unchanged.
         service = None
         try:
-            service = _gmail_service()
             payload = (payloads or {}).get(mid)
+            # Use MIME before opening a client.
+            if payload is not None and not _attachment_parts(payload):
+                return mid, []
+            service = _gmail_service()
             if quota_stop is not None:
                 return mid, _fetch_attachments(service, mid, payload, quota_stop=quota_stop)
             return mid, (_fetch_attachments(service, mid, payload) if payload is not None

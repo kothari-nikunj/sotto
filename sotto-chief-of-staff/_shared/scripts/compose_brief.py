@@ -1441,12 +1441,19 @@ def _catch_up_note(inputs) -> str:
             f"{BRIEF_WINDOW_HOURS}. Say so in one line, and treat asks from that gap as new today.\n\n")
 
 
+def _brief_emails(google, lookup, prefs):
+    from source_context import project_emails
+    rows = [_trim_email(row, lookup) for row in project_emails(_arr(google, "emails"))
+            if not relevance.is_automated_assistant(row)]
+    muted = prefs["mute_senders"]
+    return [row for row in rows if not _sender_is_muted(_sender_addr(row.get("from")), muted)] if muted else rows
+
+
 def build_prompt(template: str, inputs: dict) -> str:
     brief_type = _s(inputs.get("type")) or "morning"
     google = _obj(inputs, "google")
     # A meeting you declined is not on your day: it never reaches the prompt at all.
     events = _brief_calendar_events(inputs)
-    emails_raw = [e for e in _arr(google, "emails") if not relevance.is_automated_assistant(e)]
 
     local = _normalize_local(inputs)
     loop_evidence = _visible_loop_message_evidence(local)
@@ -1526,10 +1533,7 @@ def build_prompt(template: str, inputs: dict) -> str:
 
     # Trim with the contact lookup so senders the user has in Contacts surface under the SAME name
     # they carry on iMessage/WhatsApp/calendar (the cross-channel identity reconciliation).
-    trimmed_emails = [_trim_email(e, contact_lookup) for e in emails_raw]
-    if prefs["mute_senders"]:
-        trimmed_emails = [e for e in trimmed_emails
-                          if not _sender_is_muted(_sender_addr(e.get("from")), prefs["mute_senders"])]
+    trimmed_emails = _brief_emails(google, contact_lookup, prefs)
     missed = _arr(local, "missed_calls")
 
     # Cross-channel escalation: computed HERE, always (port of detectEscalation). There is no
@@ -1876,29 +1880,47 @@ If the brief is good, return an empty patches array and a high score. Do NOT inv
 
 
 
+CRITIC_GMAIL_MESSAGE_LIMIT = 50
+
+
 def build_data_manifest(inputs: dict) -> dict:
     """Port of brief-critic.ts buildDataManifest — a compact summary of the raw data the brief had."""
     google = _obj(inputs, "google")
     local = resolve_contact_names(_normalize_local(inputs))
     lookup = build_contact_lookup(_arr(local, "contacts"))
-    emails = [_trim_email(e, lookup) for e in _arr(google, "emails")]
+    emails = _brief_emails(google, lookup, explicit_prefs())
     events = _brief_calendar_events(inputs)
 
-    seen, threads = set(), []
+    # Give each thread a first turn before taking its second message, within the existing budget.
+    seen_ids, ranks, candidates = set(), Counter(), []
     for e in emails:
-        tid = _s(e.get("threadId"))
-        if tid and tid in seen:
+        tid, mid = _s(e.get("threadId")), e.get("messageId")
+        rank = ranks[tid] if tid else 0
+        if (mid and mid in seen_ids) or (rank and not mid):
             continue
+        if mid:
+            seen_ids.add(mid)
         if tid:
-            seen.add(tid)
+            ranks[tid] += 1
+        candidates.append((rank, e))
+    threads = []
+    context_ids = {}
+    for _, e in sorted(candidates, key=lambda candidate: candidate[0])[:CRITIC_GMAIL_MESSAGE_LIMIT]:
         from_ = (f"{e['resolvedName']} <{e.get('senderEmail', '')}>" if e.get("resolvedName")
                  else e.get("from"))  # same reconciled name the brief prompt saw
         body = _s(e.get("body"))
+        context = _s(e.get('thread_context'))[:4000] or None
+        if context and e.get('threadId') and e.get('messageId'):
+            original_id = context_ids.setdefault((e['threadId'], context), e['messageId'])
+            if original_id != e['messageId']:
+                reference = f"Same thread context as message {original_id}."
+                if len(reference) < len(context):
+                    context = reference
         threads.append({"subject": e.get("subject") or "(no subject)", "from": from_,
-                        "thread_id": tid or None, "message_id": e.get("messageId"),
+                        "thread_id": e.get("threadId") or None, "message_id": e.get("messageId"),
                         "date": e.get("date"), "sent_by_owner": e.get("isSent") is True,
                         "snippet": body[:120] or None, "snippet_truncated": len(body) > 120,
-                        "thread_context": _s(e.get('thread_context'))[:4000] or None})
+                        "thread_context": context})
 
     def contacts(arr, name_key):
         out = []
@@ -1923,7 +1945,7 @@ def build_data_manifest(inputs: dict) -> dict:
         "user_local_time": _local_now(_brief_tz(inputs), _brief_now(inputs)).isoformat(),
         "loop_evidence": _visible_loop_message_evidence(local),
         "email_count": len(emails),
-        "email_threads": threads[:50],
+        "email_threads": threads,
         "imessage_contacts": contacts(_arr(local, "imessage"), "handle"),
         "whatsapp_contacts": contacts(_arr(local, "whatsapp"), "partner_name"),
         "birthday_evidence": birthday_lines[:20],
@@ -1995,6 +2017,13 @@ def _task_mention_review(out: dict, inputs: dict) -> dict:
     from personal_context import conversation_message
     rows = {_s(row.get('anchor_key')): row for row in _open_ledger_entries(inputs)
             if row.get('anchor_key')}
+    marked_lines = []
+    for line in _actionable_task_lines(out.get('brief_markdown')):
+        keys = [key for key in re.findall(r'<!--loop:([^<>\s]+)-->', line) if key in rows]
+        if keys:
+            marked_lines.append((line, keys))
+    if not marked_lines:
+        return {}
     senders = _source_thread_senders(inputs)
     local = _normalize_local(inputs)
     lookup = build_contact_lookup(_arr(local, 'contacts'))
@@ -2006,12 +2035,10 @@ def _task_mention_review(out: dict, inputs: dict) -> dict:
     recipients = _verified_loop_recipients(list(rows.values()), local)
     import ledger_io
     today = _brief_day(_brief_tz(inputs), _brief_now(inputs))
-    for line in _actionable_task_lines(out.get('brief_markdown')):
+    for line, keys in marked_lines:
         identities = brief_validate._brief_marker_ids(line)
-        for key in re.findall(r'<!--loop:([^<>\s]+)-->', line):
-            row = rows.get(key)
-            if row is None:
-                continue
+        for key in keys:
+            row = rows[key]
             row_ids = brief_validate._entry_identifiers(row)
             # A recipient may be shown through another verified channel. Reuse the
             # completion validator's collision-aware alias boundary for review identity;

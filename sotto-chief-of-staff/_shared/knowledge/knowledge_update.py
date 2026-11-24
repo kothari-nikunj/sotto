@@ -511,7 +511,7 @@ def _s(v) -> str:
 
 # ── Entity-dedup lite: companies (prevention, not repair) ─────────────────────
 
-def _company_index() -> dict:
+def company_index() -> dict:
     """Index saved names and domains in one pass over the company files."""
     by_alias: dict = {}
     by_domain: dict = {}
@@ -531,7 +531,7 @@ def _company_index() -> dict:
         dom = _s(fm.get("domain")).strip().lower().lstrip("@")
         domains[path] = dom
         if dom:
-            by_domain.setdefault(dom, path)
+            by_domain.setdefault(dom, set()).add(path)
     return {"by_alias": by_alias, "by_domain": by_domain, "domains": domains}
 
 
@@ -556,8 +556,11 @@ def resolve_company_path(upd: dict, index: dict) -> tuple:
     directory = kg.companies_dir()
     path = kg.safe_path(directory, slug)
     domain = _company_domain_of(upd)
-    hit = index["by_domain"].get(domain)
-    if hit:
+    matches = index["by_domain"].get(domain)
+    if matches:
+        if len(matches) != 1:
+            return None, None
+        hit = next(iter(matches))
         return hit, _stem(hit)
     if explicit_slug and not domain and os.path.exists(path):
         return path, slug
@@ -631,18 +634,15 @@ def _unique_company_path(upd):
     path = candidates.pop()
     return path, _stem(path)
 
-def company_knowledge(company_name: str = "", domain: str = "", company_slug: str = "", *, unique: bool = False) -> dict:
-    """What is ALREADY on file about a company — the read side of the writer above, and the only
-    one. Returns {slug, name, domain, about, news[], context, updated_by, last_researched} for the file the
-    same resolution (domain, then compatible slug or alias) would write to, or {} when nothing is on file.
-
-    Two callers, one purpose — never buy a fact twice: `research_attendees` injects it into the
-    focus pass as "already on file, don't repeat it", and `persist_prep` asks it whether the About
-    it is about to write would be an upgrade or a downgrade. Best-effort: an unreadable graph
-    returns {} and the caller simply researches as if cold."""
+def company_knowledge(company_name: str = "", domain: str = "", company_slug: str = "", *, unique: bool = False, index=None) -> dict:
+    """Read saved research, or {} without a match. Briefs may reuse the current request's index.
+    Strict reads distinguish an ambiguous or unreadable graph."""
     upd = {"company_name": company_name, "domain": domain, "company_slug": company_slug}
     try:
-        path, slug = _unique_company_path(upd) if unique else resolve_company_path(upd, _company_index())
+        if unique:
+            path, slug = _unique_company_path(upd)
+        else:
+            path, slug = resolve_company_path(upd, company_index() if index is None else index)
         if not slug or not path or not os.path.exists(path):
             return {}
         with open(path, encoding="utf-8") as f:
@@ -1234,9 +1234,9 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
 
     _apply_relations(pending_relations, index, counts, dropped_relation_types, person_files, now)
 
-    company_index = _company_index()
+    companies = company_index()
     for upd in extracted.get("company_updates", []):
-        path, slug = resolve_company_path(upd, company_index)
+        path, slug = resolve_company_path(upd, companies)
         if not slug:
             continue
         existing_news = []
@@ -1267,11 +1267,11 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
         for a in aliases:
             a_slug = kg.safe_slug(kg.company_slug(_s(a))) if a else None
             if a_slug:
-                company_index["by_alias"].setdefault(a_slug, set()).add(path)
+                companies["by_alias"].setdefault(a_slug, set()).add(path)
         indexed_domain = _company_domain_of({"domain": domain})
-        company_index["domains"][path] = indexed_domain
+        companies["domains"][path] = indexed_domain
         if indexed_domain:
-            company_index["by_domain"].setdefault(indexed_domain, path)
+            companies["by_domain"].setdefault(indexed_domain, set()).add(path)
 
         existing_urls = {_url_of(n) for n in existing_news if _url_of(n)}
         existing_texts = set(existing_news)
