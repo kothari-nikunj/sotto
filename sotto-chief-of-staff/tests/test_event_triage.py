@@ -259,7 +259,11 @@ def _cal_change(**kw):
 def test_calendar_change_nudges_deterministically_and_skips_the_budget(tmp_path, monkeypatch):
     """A decline/last-minute invite is Tier-0 (the calendar already made the judgment), and it is
     budget-exempt — 'Ali declined your 11am' at 10:40 must land even on a spent day."""
+    import personal_context
+
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    monkeypatch.setattr(personal_context, 'conversation_snapshot',
+                        lambda *a, **k: pytest.fail('Deterministic calendar changes need no Tier-1 history'))
     monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
     (tmp_path / "events").mkdir(parents=True)
     (tmp_path / "events" / "budget.json").write_text(

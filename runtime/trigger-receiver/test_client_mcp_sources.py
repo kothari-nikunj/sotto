@@ -415,3 +415,27 @@ def test_three_parallel_mac_reads_all_succeed_through_a_serial_bridge(tmp_path, 
         thread.join(30)
     assert errors == [] and len(results) == 3
     assert executed.count('read_history') == 3 and executed.count('health') <= 3
+
+
+def test_mac_page_encodes_metadata_once_and_keeps_exact_utf8_byte_limit(monkeypatch):
+    rows = [{'title': 'Synthetic café \\" meeting', 'count': i} for i in range(15)]
+    payload = {'reminders': rows, 'source_status': {'reminders': 'ok'}}
+    args = {'sources': ['reminders']}
+    encode = backend._encoded
+    original = backend._local_page(payload, args)
+    page = {**original['client_page'], 'returned_rows': 10, 'complete': False,
+            'next_cursor': 'x' * 64 + ':10'}
+    exact_size = len(encode({**original, 'reminders': rows[:10], 'client_page': page}))
+    # byte_limit is part of the response and contributes its own decimal length.
+    limit = exact_size - len(str(backend.PAGE_BYTES)) + len(str(exact_size))
+    monkeypatch.setattr(backend, 'PAGE_BYTES', limit)
+    metadata_encodes = []
+    def count(value):
+        if isinstance(value, dict) and 'client_page' in value:
+            metadata_encodes.append(value)
+        return encode(value)
+    monkeypatch.setattr(backend, '_encoded', count)
+    result = backend._local_page(payload, args)
+    assert result['reminders'] == rows[:10]
+    assert len(encode(result)) == limit
+    assert len(metadata_encodes) == 1

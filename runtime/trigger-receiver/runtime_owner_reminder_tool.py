@@ -79,9 +79,8 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
             raise UnavailableError('owner reminder tool timezone unavailable')
         if body['operation'] == 'list':
             return {'version': 1, 'status': 'listed', 'event_id': body['event_id'],
-                    'payload_hash': body['payload_hash'], 'zone': zone, 'items': [
-                        {'id': row['id'], 'due': row['due'], 'action': row['action'], 'status': row['status']}
-                        for row in reminders._writer().list_admitted(proof['identity_digest'], 50)]}
+                    'payload_hash': body['payload_hash'], 'zone': zone, 'items':
+                        reminders._writer().list_admitted(proof['identity_digest'])}
         return {'version': 1, 'status': 'context', 'event_id': body['event_id'],
                 'payload_hash': body['payload_hash'], 'zone': zone,
                 'now': datetime.now(timezone.utc).astimezone(tz).isoformat(timespec='milliseconds')}

@@ -443,6 +443,7 @@ max-complexity = 15
 "tools/bundle_railway_oauth.py" = ["PLR2004"]
 "tools/bundle_runtime_descriptor.py" = ["PLR2004"]
 "tools/setup_selfhost_railway.py" = ["PLR0912", "PLR0913", "PLR0917", "PLR2004"]
+"tools/sotto_mcp_client.py" = ["PLR2004"]
 "tools/test_setup_selfhost_railway.py" = ["PLR0913", "PLR2004"]
 
 "runtime/trigger-receiver/setup_markup.py" = ["PLR2004"]

@@ -29,6 +29,7 @@ TOOLING = (('pytest', 'pytest'), ('ruff', 'ruff'), ('yaml', 'pyyaml'), ('vulture
 # time), at most 8 (a container can report more host CPUs than its quota). Each Node shard still
 # runs its files one at a time.
 SHARD_CAP = 8
+RECEIVER_SHARDS = 2
 SHARDS = max(1, min(SHARD_CAP, (os.cpu_count() or 4) // 4))
 # These pack test files each run the publication generator many times and dominate the suite; they
 # are dealt first so no two share a shard.
@@ -223,19 +224,21 @@ class FileList:
         files = sorted({item.path.relative_to(base).as_posix() for item in session.items})
         Path(sys.argv[1]).write_text(json.dumps(files), encoding='utf-8')
 
-raise SystemExit(pytest.main(['--collect-only', '-qq', '-p', 'no:cacheprovider', 'tests'], plugins=[FileList()]))
+raise SystemExit(pytest.main(['--collect-only', '-qq', '-p', 'no:cacheprovider', sys.argv[2]], plugins=[FileList()]))
 """
 
 
-def pytest_shards(pack, count):
+def pytest_shards(root, count, suite='tests'):
     """Split pytest's own discovery by file, without importing the suite into the gate process."""
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix='sotto-pytest-files-') as directory:
         listing = Path(directory) / 'files.json'
-        result = subprocess.run([sys.executable, '-c', PYTEST_FILE_LIST, str(listing)], cwd=pack,
+        result = subprocess.run([sys.executable, '-c', PYTEST_FILE_LIST, str(listing), suite], cwd=root,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if result.returncode:
             raise SystemExit(f'verify: pytest discovery failed (exit {result.returncode}):\n{result.stdout}')
         files = json.loads(listing.read_text(encoding='utf-8'))
+    print(f'[verify] {suite} collection: passed in {time.monotonic() - started:.0f}s', flush=True)
     return [[sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', *files]
             for files in shard(files, count, GENERATOR_TEST_FILES)]
 
@@ -335,22 +338,24 @@ def lanes(root, count=SHARDS):
     python = sys.executable
     pack = root / 'sotto-chief-of-staff'
     chat = root / 'runtime/sotto-chat'
-    suites = ['runtime/trigger-receiver', 'adapters/sotto', 'cloud/model-proxy', 'cloud/accounts',
+    receiver = 'runtime/trigger-receiver'
+    suites = ['adapters/sotto', 'cloud/model-proxy', 'cloud/accounts',
               *smoke_suites(root)]
     steps = static_steps(root)
     steps.append((pack, pytest_shards(pack, count)))
     steps.append((pack, [[python, 'tools/validate_skills.py']]))
     # The receiver, adapter, proxy, account and smoke suites share nothing with the pack suite, so
     # they are a lane of their own: in sequence they took longer than every pack shard together.
-    others = [(cwd, [argv]) for cwd, argv in [
-        (root, [python, '-m', 'pytest', 'tools/test_setup_selfhost_railway.py',
-                        'tools/test_bundle_runtime_descriptor.py',
-                        'tools/test_bundle_railway_oauth.py',
-                        *(['tools/test_runtime_release_artifact.py'] if (root / 'tools/test_runtime_release_artifact.py').is_file() else []), '-q']),
-        # One contract, two trees: the public distribution has no cloud/accounts (the hosted broker
-        # never ships), so a suite runs where its directory is and is simply absent otherwise.
-        *((root, [python, '-m', 'pytest', suite, '-q']) for suite in suites if (root / suite).is_dir()),
-    ]]
+    tool_tests = ['tools/test_setup_selfhost_railway.py', 'tools/test_bundle_runtime_descriptor.py',
+                  'tools/test_bundle_railway_oauth.py']
+    if (root / 'tools/test_runtime_release_artifact.py').is_file():
+        tool_tests.append('tools/test_runtime_release_artifact.py')
+    others = [(root, [[python, '-m', 'pytest', *tool_tests, '-q']])]
+    if (root / receiver).is_dir():
+        receiver_commands = (pytest_shards(root, RECEIVER_SHARDS, receiver) if RUNNER and count >= RECEIVER_SHARDS else
+                             [[python, '-m', 'pytest', receiver, '-q']])
+        others.append((root, receiver_commands))
+    others.extend((root, [[python, '-m', 'pytest', suite, '-q']]) for suite in suites if (root / suite).is_dir())
     result = {'python': steps, 'suites': others}
     # Installed from the committed lock with lifecycle scripts disabled. These steps are
     # `npm run check` (typecheck, test, build) with the tests sharded; none installs packages or

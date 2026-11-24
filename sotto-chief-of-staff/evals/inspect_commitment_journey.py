@@ -21,7 +21,9 @@ def network_guard(event, args):
 sys.addaudithook(network_guard)
 
 checkout = Path(sys.argv[1])
-pack = checkout / 'sotto-agent/sotto-chief-of-staff'
+pack = checkout / 'sotto-chief-of-staff'
+if not pack.is_dir():
+    pack = checkout / 'sotto-agent/sotto-chief-of-staff'
 sys.path.insert(0, str(pack / 'tests'))
 import conftest  # noqa: F401 — reuse the fixture suite's production module paths
 import commitment_journey_fixture as fixture

@@ -67,6 +67,25 @@ def test_weekly_optional_names_share_quiet_detail_budget_and_preserve_required_c
     assert len(out.get('_rendered_loop_lines', {})) == shown
 
 
+@pytest.mark.parametrize('markdown', [
+    '## Needs Attention Now\nConfirm the meeting.',
+    '## Needs Attention Now\nConfirm the meeting. <!--loop:unknown-->',
+    '## Filtered\nConfirm the meeting. <!--loop:coffee-->',
+])
+def test_mention_review_skips_conversation_work_without_a_matching_action_line(monkeypatch, markdown):
+    monkeypatch.delenv('SOTTO_DATA', raising=False)
+    row = {'anchor_key': 'coffee', 'status': 'open', 'action_type': 'follow_up',
+           'contact_identifier': 'dana@example.com', 'summary': 'Confirm the coffee time'}
+    inputs = {'local': {'action_ledger': [row]}}
+    assert cb._open_ledger_entries(inputs) == [row]
+
+    def unexpected_identity_work(*args):
+        pytest.fail('No saved task is eligible for conversation review')
+
+    monkeypatch.setattr(cb, 'build_identity_resolver', unexpected_identity_work)
+    assert cb._task_mention_review({'brief_markdown': markdown}, inputs) == {}
+
+
 def test_selected_help_coherence_reaches_single_revision_and_keeps_other_ask(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'self-hosted')

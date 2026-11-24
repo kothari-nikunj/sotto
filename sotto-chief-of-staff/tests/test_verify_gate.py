@@ -97,7 +97,8 @@ def test_the_failure_summary_keeps_pytest_and_node_result_lines():
         '\u2139 tests 3', '\u2139 pass 2', '\u2139 fail 1', '\u2716 failing tests:']
 
 
-def test_the_fast_check_runs_only_cheap_gate_commands():
+def test_the_fast_check_runs_only_cheap_gate_commands(monkeypatch):
+    monkeypatch.setattr(VERIFY, 'RUNNER', False)
     def flat(lanes):
         return [argv for steps in lanes.values() for _cwd, argvs in steps for argv in argvs]
     full, fast = flat(VERIFY.lanes(ROOT)), flat(VERIFY.fast_lanes(ROOT))
@@ -111,12 +112,33 @@ def test_the_fast_check_runs_only_cheap_gate_commands():
     assert not any(argv in shards for argv in fast) and ['npm', 'run', 'build'] not in fast
 
 
-def test_the_other_python_suites_are_a_lane_of_their_own():
+def test_the_other_python_suites_are_a_lane_of_their_own(monkeypatch):
+    monkeypatch.setattr(VERIFY, 'RUNNER', False)
     lanes = VERIFY.lanes(ROOT)
     def suites_in(name):
         return {argv[-2] for _cwd, argvs in lanes[name] for argv in argvs if argv[-1] == '-q' and 'pytest' in argv}
     assert 'runtime/trigger-receiver' in suites_in('suites')
     assert not suites_in('python') & suites_in('suites')
+
+
+@pytest.mark.parametrize(('runner', 'workers', 'expected_processes'), [(False, 8, 1), (True, 1, 1), (True, 8, 2)])
+def test_receiver_gate_preserves_discovery_and_limits_processes(tmp_path, monkeypatch, runner, workers, expected_processes):
+    receiver = 'runtime/trigger-receiver'
+    for name in ('sotto-chief-of-staff/tests/test_pack.py', f'{receiver}/test_first.py',
+                 f'{receiver}/nested/second_test.py'):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('def test_fixture(): pass\n')
+    monkeypatch.setattr(VERIFY, 'RUNNER', runner)
+    lanes = VERIFY.lanes(tmp_path, workers)
+    [commands] = [argvs for cwd, argvs in lanes['suites'] if any(receiver in arg for arg in argvs[0])]
+    assert len(commands) == expected_processes
+    if expected_processes == 1:
+        assert commands == [[sys.executable, '-m', 'pytest', receiver, '-q']]
+    else:
+        files = [arg for argv in commands for arg in argv if arg.startswith(receiver)]
+        assert sorted(files) == [f'{receiver}/nested/second_test.py', f'{receiver}/test_first.py']
+    assert all(receiver not in arg for _, argvs in lanes['python'] for argv in argvs for arg in argv)
 
 
 def test_failed_node_shard_reports_real_tap_output(tmp_path):
@@ -128,7 +150,8 @@ def test_failed_node_shard_reports_real_tap_output(tmp_path):
     assert '\n    # fail 1' in failures[0]
 
 
-def test_no_gate_command_runs_twice_and_the_provider_contracts_run_once():
+def test_no_gate_command_runs_twice_and_the_provider_contracts_run_once(monkeypatch):
+    monkeypatch.setattr(VERIFY, 'RUNNER', False)
     full = [argv for steps in VERIFY.lanes(ROOT).values() for _cwd, argvs in steps for argv in argvs]
     assert len({tuple(argv) for argv in full}) == len(full)
     if (ROOT / 'runtime/sotto-chat/package.json').is_file():

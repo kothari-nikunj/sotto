@@ -1,7 +1,7 @@
 /** Existing production conversation harness with actual-model and explicit scripted contract modes. */
 import {createPhotonTextFormatter} from '../src/channels/photon-text-formatter.js';
 import {startNativePrepRelay} from './native-prep-relay.js';
-import {claimsQueuedWork, deliveredArtifactText, prepExecutionMatches, chatPrepOfferMatches} from './assertions.js';
+import {claimsQueuedWork, deliveredArtifactText, prepExecutionMatches, chatPrepOfferMatches, hasCompleteGmailThread} from './assertions.js';
 import {measureTurn, summarizeMeasurements} from './measurements.js';
 import {observeReceiverJson,receiverObservationErrors,type ReceiverObservation} from './receiver-observation.js';
 import {assertScriptedEndpoint,createScriptedProvider,scriptedProviderSchema} from './scripted-provider.js';
@@ -27,6 +27,7 @@ const turnSchema=z.object({text:z.string().min(1).max(16000),contains:z.array(z.
   minReplies:z.number().int().min(1).optional(),restartBefore:z.boolean().optional(),
   maxCharacters:z.number().int().positive().optional(),websiteReads:z.number().int().nonnegative().optional(),researchReads:z.number().int().nonnegative().optional(),publicReads:z.number().int().nonnegative().optional(),
   contactReads:z.number().int().nonnegative().optional(),googleReads:z.number().int().nonnegative().optional(),
+  gmailThread:z.object({id:z.string(),messages:z.array(z.string()).min(1)}).optional(),
   taskStates:z.record(z.string(),z.enum(['open','resolved'])).optional(),
   taskRecords:z.array(z.object({title:z.string().min(1),status:z.enum(['open','resolved'])}).strict()).optional(),
   taskAddReceipts:z.array(z.string().min(1)).optional(),
@@ -270,7 +271,7 @@ try {
     const inbound=conversationInbound(i,thread,turn.text,config.owner.ownerId,quotedBackground?.id);
     await runtime.gateway.chat.processMessage(adapter,thread,inbound);
     const deadline=Date.now()+330000;
-    // Read production health to wait for completion, never the first queued acknowledgement alone.
+    // Wait for the final reply.
     let health:any;
     do {
       await new Promise(r=>setTimeout(r,200));
@@ -341,12 +342,15 @@ try {
          nativePrepRelay?.calls.filter(call=>call.status>=200&&call.status<300).length!==1+briefCompositionCalls)errors.push('native_prep_artifact_content_missing');
       work.prepSkillLoadedAtOrBeforeTurn=loadedSkills.has('sotto-meeting-prep');
     }
-    errors.push(...receiverObservationErrors(requests.slice(requestBefore)));
-    const returnedEvidence=JSON.stringify(requests.slice(requestBefore).filter(request=>request.returnedEvidence!==undefined&&request.path==='/runtime/knowledge-read'&&request.operation==='knowledge_query').map(request=>request.returnedEvidence));
+    const observed=requests.slice(requestBefore);
+    errors.push(...receiverObservationErrors(observed));
+    if(turn.gmailThread&&!(await hasCompleteGmailThread(output,modelRequestBefore,requestCount,turn.gmailThread)))
+      errors.push('required_complete_gmail_thread_missing');
+    const returnedEvidence=JSON.stringify(observed.filter(request=>request.returnedEvidence!==undefined&&request.path==='/runtime/knowledge-read'&&request.operation==='knowledge_query').map(request=>request.returnedEvidence));
     for(const expected of turn.returnedEvidenceContains??[])if(!returnedEvidence.includes(expected))errors.push(`missing_returned_evidence:${expected}`);
     for(const forbidden of turn.returnedEvidenceExcludes??[])if(returnedEvidence.includes(forbidden))errors.push(`forbidden_returned_evidence:${forbidden}`);
-    if(turn.knowledgeQueryReads!==undefined&&requests.slice(requestBefore).filter(request=>request.path==='/runtime/knowledge-read'&&request.operation==='knowledge_query').length!==turn.knowledgeQueryReads)errors.push('unexpected_knowledge_query_reads');
-    const details=requests.slice(requestBefore).filter(request=>request.path==='/runtime/brief-detail');
+    if(turn.knowledgeQueryReads!==undefined&&observed.filter(request=>request.path==='/runtime/knowledge-read'&&request.operation==='knowledge_query').length!==turn.knowledgeQueryReads)errors.push('unexpected_knowledge_query_reads');
+    const details=observed.filter(request=>request.path==='/runtime/brief-detail');
     const detailEvidence=JSON.stringify(details.map(request=>request.returnedEvidence));
     for(const expected of turn.returnedBriefDetailContains??[])if(!detailEvidence.includes(expected))errors.push(`missing_brief_detail_evidence:${expected}`);
     for(const forbidden of turn.returnedBriefDetailExcludes??[])if(detailEvidence.includes(forbidden))errors.push(`forbidden_brief_detail_evidence:${forbidden}`);
@@ -360,7 +364,7 @@ try {
     // Count Google-read dispatches to the receiver, including failed/aborted fetches. This
     // does not count tool choices refused locally before dispatch. A saved-memory fallback
     // must not hide an unnecessary receiver request.
-    if(turn.googleReads!==undefined && requests.slice(requestBefore).filter(request=>request.path==='/runtime/google-read').length!==turn.googleReads)errors.push('unexpected_google_reads');
+    if(turn.googleReads!==undefined && observed.filter(request=>request.path==='/runtime/google-read').length!==turn.googleReads)errors.push('unexpected_google_reads');
     if(turn.researchReads!==undefined && reads.filter(read=>read.source==='company_research').length!==turn.researchReads)errors.push('unexpected_research_reads');
     if(turn.publicReads!==undefined && reads.filter(read=>['website','company_research','prep_public_profile'].includes(read.source)).length!==turn.publicReads)errors.push('unexpected_public_reads');
     if(turn.maxCharacters!==undefined && text.length>turn.maxCharacters)errors.push('reply_too_long');
@@ -370,9 +374,9 @@ try {
     if((work.claimed && replies.length<2) || (!work.claimed && claimsQueuedWork(text))) errors.push('queued_is_not_completion');
     const measurements=measureTurn({startedAtMs:started,replies,health,
       modelRequests:requestCount-modelRequestBefore,sourceReads:reads.length,latencyClass:turn.latencyClass,errors,
-      requests:requests.slice(requestBefore),outputCharacters:text.length,scriptedProvider:Boolean(scripted)});
+      requests:observed,outputCharacters:text.length,scriptedProvider:Boolean(scripted)});
     turns.push({input:turn.text,quotedBackground,journeyReceipts,journeyMeasurements,canonicalBefore,canonicalAfter,taskState,taskRecords,taskActions:turnTaskActions,replies,sourceReads:reads,elapsedMs:Date.now()-started,
-      measurements,requests:requests.slice(requestBefore),health,work,errors});
+      measurements,requests:observed,health,work,errors});
     await writeFile(join(output,'report.json'),JSON.stringify({name:scenario.name,status:'in_progress',turns},null,2),{mode:0o600});
     console.log(JSON.stringify({turn:i+1,elapsedMs:Date.now()-started,replies:replies.length,errors}));
   }

@@ -1236,7 +1236,7 @@ The read side of all of the above, and the one place the retrieval question is a
 | Emits | From | Gated by |
 |---|---|---|
 | `person_knowledge` — the compact packed block per person | `knowledge/people/*.md` | Current participants from consented `--local`, `--gmail`, `--calendar` and active loops, resolved through canonical aliases. The `--relevant-days 7` fallback applies only when no current participant identifiers can be obtained. |
-| `company_knowledge` — About + the 3 newest news lines, ≤5 companies | `knowledge/companies/*.md`, via `knowledge_update.company_knowledge()` | today's attendee email domains + the packed people's `company`, deduped by file |
+| `company_knowledge` — About + the 3 newest news lines, ≤5 companies | `knowledge/companies/*.md`, via `knowledge_update.company_knowledge()` | today’s attendee email domains and the packed people’s companies, resolved against one index for this brief and deduplicated by file; ambiguous domains are omitted |
 | `contact_index` — the identity map | EVERY person file | ungated: it is what resolves a phone and an email to one person |
 
 `mtime` says when a file was last *rewritten*, which was never the same question as "does this

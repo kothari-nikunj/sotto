@@ -425,7 +425,7 @@ this mutation tool. Current source authority is checked before contact; a post-w
 change can invalidate model prose but cannot recreate the effect. Acknowledgements use only
 the verified saved status, without exposing internal IDs or UTC timestamps. A lost response retains exact arguments for
 inspection without another create, while unrelated safe owner chat can continue. The existing
-list/cancel commands and proactive delivery apply. An explicitly requested conditional reminder can bind one exact current waiting-on loop selected through protected loops-query, with the owner's condition quoted verbatim. The original due scanner rechecks that identity and current source grants: resolved loops cancel the reminder; missing, snoozed, ambiguous or revoked context holds it. This grants no arbitrary condition evaluator, recurring jobs, external writes or outbound-send approval.
+list/cancel commands and proactive delivery apply. An explicitly requested conditional reminder can bind one exact current waiting-on loop selected through protected loops-query, with the owner's condition quoted verbatim. The owner reminder lists identify reminders that apply only if the owner is still waiting. The original due scanner rechecks that identity and current source grants: resolved loops cancel the reminder; missing, snoozed, ambiguous or revoked context holds it. This grants no arbitrary condition evaluator, recurring jobs, external writes or outbound-send approval.
 
 Ordinary owner chat also exposes `owner_task_add` and `owner_task_close` for one explicit private
 task correction per admitted message. Add extracts a trimmed, exact span of the owner's words

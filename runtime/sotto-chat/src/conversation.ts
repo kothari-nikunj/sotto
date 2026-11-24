@@ -2645,7 +2645,8 @@ export class ConversationCoordinator {
         const shown = listed.items.slice(0, 10);
         payload = shown.length ? 'Scheduled reminders:\n' + shown.map(item => {
           const words = Array.from(item.action);
-          return `${item.id} at ${item.due}: ${words.slice(0, 100).join('')}${words.length > 100 ? '…' : ''}`;
+          const trigger = item.trigger === 'conditional' ? ' (if still waiting)' : '';
+          return `${item.id} at ${item.due}${trigger}: ${words.slice(0, 100).join('')}${words.length > 100 ? '…' : ''}`;
         }).join('\n') + (listed.items.length > shown.length || shown.some(item => Array.from(item.action).length > 100)
           ? `\nShowing the first ${shown.length} scheduled reminders; long descriptions may be shortened.` : '')
           : 'You have no scheduled reminders.';

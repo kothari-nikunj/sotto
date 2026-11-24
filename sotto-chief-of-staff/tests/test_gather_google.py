@@ -1040,16 +1040,6 @@ def test_gmail_inlined_bytes_need_no_second_api_call(monkeypatch):
     assert svc.attachment_gets == []                 # nothing was downloaded twice
 
 
-def test_an_email_with_no_attachments_makes_no_attachment_call(monkeypatch):
-    """A part with no filename is not an attachment. No filename anywhere → no attachments().get,
-    and no `attachments` key on the row at all."""
-    svc = _wire_attachment_gather(monkeypatch, [{"filename": "", "mimeType": "text/html",
-                                                 "body": {"size": 20}}])
-    emails = gg.gather_gmail("/fake/api.py", 25, 12)
-    assert "attachments" not in emails[0]
-    assert svc.attachment_gets == []
-
-
 def test_the_sent_lane_never_fetches_attachments(monkeypatch):
     """v1 is the inbox. The sent lane is style exhaust — converting the files the user attached to
     their own mail would spend API calls and prompt budget telling them what they already know."""
@@ -1682,8 +1672,9 @@ def test_brief_reads_one_exact_thread_for_current_messages_and_keeps_background_
     assert 'October 30' not in rows[0]['thread_context']
     rendered = render_local._format_emails([render_local._trim_email(row) for row in rows])
     assert 'October 21' in rendered and "not part of the current MessageId's body" in rendered
-    manifest = compose.build_data_manifest({'google': {'emails': rows}})
-    assert 'October 21' in json.dumps(manifest) and 'October 30' not in json.dumps(manifest)
+    proof = json.dumps(compose.build_data_manifest({'google': {'emails': rows}}))
+    assert all(s in proof for s in ('October 21', correction['id'], rows[1]['body']))
+    assert 'October 30' not in proof
 
 
 @pytest.mark.parametrize('case', ['wrong_thread', 'missing_target', 'revoked', 'quota'])

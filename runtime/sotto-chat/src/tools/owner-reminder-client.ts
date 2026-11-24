@@ -1,6 +1,7 @@
 import {createOwnerToolTransport, OwnerToolConfigurationError} from './owner-tool-transport.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { ownerReminderListTriggerSchema } from './owner-reminder-tool-contract.js';
 import type { OwnerToolClientOptions } from './owner-contract.js';
 
 const hex = z.string().regex(/^[a-f0-9]{64}$/);
@@ -11,7 +12,7 @@ const committed = z.object({ version: z.literal(1), status: z.literal('committed
   reminder_id: reminderId, reminder_status: z.enum(['scheduled', 'canceled', 'fired']) }).strict();
 const listed = z.object({ version: z.literal(1), status: z.literal('listed'), items: z.array(z.object({
   id: reminderId, due: z.string().min(1).max(64), action: reminderText,
-  status: z.literal('scheduled'),
+  status: z.literal('scheduled'), trigger: ownerReminderListTriggerSchema,
 }).strict()).max(50) }).strict();
 const replySchema = z.discriminatedUnion('status', [committed, listed,
   z.object({ version: z.literal(1), status: z.literal('not_found') }).strict(),

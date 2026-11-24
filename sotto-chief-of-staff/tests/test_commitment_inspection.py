@@ -7,13 +7,13 @@ import pytest
 
 @pytest.mark.parametrize('event', ['socket.connect', 'socket.sendto', 'socket.getaddrinfo'])
 def test_inspection_fails_on_caught_external_connection(event):
-    checkout = Path(__file__).resolve().parents[3]
-    script = checkout / 'sotto-agent/sotto-chief-of-staff/evals/inspect_commitment_journey.py'
+    checkout = Path(__file__).resolve().parents[2]
+    script = checkout / 'sotto-chief-of-staff/evals/inspect_commitment_journey.py'
     code = '''
 import runpy, sys
 from pathlib import Path
 script, checkout, event = sys.argv[1:]
-sys.path.insert(0, str(Path(checkout) / 'sotto-agent/sotto-chief-of-staff/tests'))
+sys.path.insert(0, str(Path(checkout) / 'sotto-chief-of-staff/tests'))
 import conftest
 import commitment_journey_fixture as fixture
 original = fixture.run_journey

@@ -112,6 +112,10 @@
   "turns": [
     {
       "text": "What did I say in my Cedar clinic pilot introduction email to Dana Vale and Ellis Cole? Read that conversation, but do not change anything.",
+      "gmailThread": {
+        "id": "cedar-introduction-thread",
+        "messages": ["cedar-intro", "cedar-scheduling-proposal"]
+      },
       "canonicalUnchanged": true,
       "publicReads": 0,
       "latencyClass": "evidence"

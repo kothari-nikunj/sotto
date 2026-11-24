@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { OwnerToolClientOptions } from './owner-contract.js';
 import { stableActionIdentity } from './action-gate.js';
 import { ownerReminderToolArgsSchema, ownerReminderToolKind, ownerReminderToolReceiptSchema, offsetDate, reminderReceiptMatches, ownerReminderCreateArgsSchema,
-  ownerReminderRejectionSchema, type OwnerReminderToolArgs } from './owner-reminder-tool-contract.js';
+  ownerReminderRejectionSchema, ownerReminderListTriggerSchema, type OwnerReminderToolArgs } from './owner-reminder-tool-contract.js';
 const hex = z.string().regex(/^[a-f0-9]{64}$/);
 const schema = z.discriminatedUnion('status', [ownerReminderToolReceiptSchema,
   z.object({version: z.literal(1), status: z.literal('context'), event_id: hex, payload_hash: hex,
@@ -13,7 +13,7 @@ const schema = z.discriminatedUnion('status', [ownerReminderToolReceiptSchema,
     zone: z.string().regex(/^[A-Za-z0-9_+./:-]{1,64}$/),
     items: z.array(z.object({id: z.string().regex(/^int_[a-f0-9]{32}$/),
       due: z.string().max(64).refine(offsetDate), action: ownerReminderCreateArgsSchema.shape.action,
-      status: z.literal('scheduled')}).strict()).max(50)}).strict(),
+      status: z.literal('scheduled'), trigger: ownerReminderListTriggerSchema}).strict()).max(50)}).strict(),
   z.object({version: z.literal(1), status: z.literal('not_found')}).strict(),
   z.object({version: z.literal(1), status: z.literal('rejected'), code: ownerReminderRejectionSchema}).strict(),
 ]);

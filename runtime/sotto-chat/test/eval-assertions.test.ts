@@ -3,7 +3,10 @@ import {chatPrepOfferMatches,prepExecutionMatches} from '../evals/assertions.js'
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {claimsQueuedWork} from '../evals/assertions.js';
+import {claimsQueuedWork,hasCompleteGmailThread} from '../evals/assertions.js';
+import {mkdtemp,rm,writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 
 test('queued-only evaluation catches phantom jobs but preserves truthful no-new-job answers', () => {
   for (const text of ['Your research is queued. It will arrive separately.', "I've queued that.", 'No research is queued. The answer will arrive separately.'])
@@ -159,4 +162,73 @@ test('natural chat prep requires the exact source occurrence and accepted typed-
   assert.equal(chatPrepOfferMatches(event,preview,recorded,undefined,sends),false);
   assert.equal(chatPrepOfferMatches(event,preview,recorded,proof,[{...sends[0],text:'Paraphrased offer'}]),false);
   assert.equal(chatPrepOfferMatches(event,preview,recorded,{...proof,receipt:{...receipt,message_id:'other-send'}},sends),false);
+});
+
+test('Gmail thread proof comes from a complete exact tool result in this turn', async t => {
+  const output = await mkdtemp(join(tmpdir(), 'sotto-thread-proof-'));
+  t.after(() => rm(output, {recursive: true, force: true}));
+  const threadId = 'cedar-introduction-thread';
+  const call = {role: 'assistant', tool_calls: [{id: 'first', function: {name: 'gmail_thread_get', arguments: JSON.stringify({thread_id: threadId})}}]};
+  const message = {id: 'cedar-intro', threadId, body: 'Dana, meet Ellis.', body_truncated: false};
+  const evidence = {
+    version: 1, source: 'gmail', operation: 'gmail_thread_get', thread_id: threadId,
+    observation: {status: 'ok', complete: true}, omitted_messages: 0, items: [message],
+  };
+  const tool = (content: unknown, id = 'first') => ({role: 'tool', tool_call_id: id, content: JSON.stringify(content)});
+  const record = (request: number, messages: unknown[]) =>
+    writeFile(join(output, `model-input-${request}.json`), JSON.stringify({messages}));
+
+  const earlier = {role: 'user', content: 'Read the thread.'};
+  const expected = {id: threadId, messages: [message.id]};
+  await record(1, [earlier, call, tool(evidence)]);
+  assert.equal(await hasCompleteGmailThread(output, 0, 1, expected), true);
+
+  const insufficient = [
+    {name: 'no tool result', messages: [call]},
+    {name: 'search result', messages: [call, tool({...evidence, operation: 'gmail_search'})]},
+    {name: 'source denial', messages: [call, tool({error: 'Google read unavailable', read_stage: 'authority_after'})]},
+    {name: 'unlinked result', messages: [call, tool(evidence, 'other')]},
+    {name: 'matching data from a different tool', messages: [tool(evidence), {...call,
+      tool_calls: [{id: 'first', function: {name: 'gmail_search'}}]}]},
+    {name: 'different requested thread', messages: [tool(evidence), {...call, tool_calls: [{id: 'first',
+      function: {name: 'gmail_thread_get', arguments: JSON.stringify({thread_id: 'other-thread'})}}]}]},
+    {name: 'answer text alone', messages: [call, {role: 'assistant', content: JSON.stringify(evidence)}]},
+    {name: 'other thread', messages: [call, tool({...evidence, thread_id: 'other-thread'})]},
+    {name: 'wrong message thread', messages: [call, tool({...evidence, items: [{...message, threadId: 'other-thread'}]})]},
+    {name: 'missing body', messages: [call, tool({...evidence, items: [{...message, body: undefined}]})]},
+    {name: 'empty thread', messages: [call, tool({...evidence, items: []})]},
+    {name: 'partial thread', messages: [call, tool({...evidence, observation: {status: 'partial', complete: false}})]},
+    {name: 'omitted rows', messages: [call, tool({...evidence, omitted_messages: 1})]},
+    {name: 'truncated body', messages: [call, tool({...evidence, items: [{...message, body_truncated: true}]})]},
+  ];
+  for (const sample of insufficient) {
+    await record(2, [earlier, ...sample.messages]);
+    assert.equal(await hasCompleteGmailThread(output, 1, 2, expected), false, sample.name);
+  }
+
+  const latest = {role: 'user', content: 'Read it again.'};
+  const secondId = 'cedar-scheduling-proposal';
+  const expectedBoth = {id: threadId, messages: [message.id, secondId]};
+  const complete = {...evidence, items: [message, {...message, id: secondId, body: 'Can we find twenty minutes?'}]};
+
+  await record(3, [earlier, call, tool(complete), latest]);
+  const priorOnly = await hasCompleteGmailThread(output, 2, 3, expectedBoth);
+
+  await record(4, [earlier, call, tool(complete), latest, {...call, tool_calls: [{...call.tool_calls[0], id: 'fresh'}]},
+    tool(evidence, 'fresh')]);
+  const missingMessage = await hasCompleteGmailThread(output, 3, 4, expectedBoth);
+
+  await record(6, [earlier, call, tool(complete), latest, {...call, tool_calls: [{...call.tool_calls[0], id: 'fresh'}]},
+    tool(complete, 'fresh')]);
+  const fresh = await hasCompleteGmailThread(output, 4, 6, expectedBoth);
+  assert.deepEqual({priorOnly, missingMessage, fresh}, {priorOnly: false, missingMessage: false, fresh: true});
+});
+
+test('an uncaptured model request cannot mask the Gmail grading result', async t => {
+  const output = await mkdtemp(join(tmpdir(), 'sotto-thread-capture-'));
+  t.after(() => rm(output, {recursive: true, force: true}));
+  const expected = {id: 'cedar-introduction-thread', messages: ['cedar-intro']};
+  assert.equal(await hasCompleteGmailThread(output, 0, 1, expected), false);
+  await writeFile(join(output, 'model-input-2.json'), '{bad JSON');
+  await assert.rejects(hasCompleteGmailThread(output, 0, 2, expected), SyntaxError);
 });
